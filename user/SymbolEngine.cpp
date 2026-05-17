@@ -413,7 +413,12 @@ bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std
 
         ULONG required = 0;
         NTSTATUS status = query(KnDbgSystemModuleInformation, nullptr, 0, &required);
-        if (required == 0 && status != STATUS_INFO_LENGTH_MISMATCH)
+        if (required == 0)
+        {
+            required = 64 * 1024;
+        }
+
+        if (!NT_SUCCESS(status) && status != STATUS_INFO_LENGTH_MISMATCH)
         {
             if (error != nullptr)
             {
@@ -424,8 +429,31 @@ bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std
             break;
         }
 
-        std::vector<uint8_t> buffer(required + 64 * 1024);
-        status = query(KnDbgSystemModuleInformation, buffer.data(), static_cast<ULONG>(buffer.size()), &required);
+        std::vector<uint8_t> buffer;
+        for (ULONG attempt = 0; attempt < 8; ++attempt)
+        {
+            buffer.assign(static_cast<size_t>(required) + 64 * 1024, 0);
+            ULONG returnedLength = 0;
+            status = query(
+                KnDbgSystemModuleInformation,
+                buffer.data(),
+                static_cast<ULONG>(buffer.size()),
+                &returnedLength);
+
+            if (NT_SUCCESS(status))
+            {
+                required = returnedLength;
+                break;
+            }
+
+            if (status != STATUS_INFO_LENGTH_MISMATCH)
+            {
+                break;
+            }
+
+            required = returnedLength != 0 ? returnedLength : static_cast<ULONG>(buffer.size() * 2);
+        }
+
         if (!NT_SUCCESS(status))
         {
             if (error != nullptr)
@@ -798,6 +826,12 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
         }
 
         SymGetTypeInfo(process_, moduleBase, typeId, TI_GET_LENGTH, &layout->Size);
+
+        if (childrenCount == 0)
+        {
+            ok = true;
+            break;
+        }
 
         size_t findChildrenSize = FIELD_OFFSET(TI_FINDCHILDREN_PARAMS, ChildId) + sizeof(ULONG) * childrenCount;
         std::vector<uint8_t> findChildrenBuffer(findChildrenSize);

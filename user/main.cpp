@@ -1,3 +1,4 @@
+#include "CallbackScanner.h"
 #include "CommandRegistry.h"
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
@@ -203,6 +204,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  ln nt!PsLoadedModuleList\n";
     std::wcout << L"  dq nt!PsLoadedModuleList 8\n";
     std::wcout << L"  dt nt!_EPROCESS <address>\n";
+    std::wcout << L"  callbacks all\n";
     std::wcout << L"  vtop nt!PsLoadedModuleList\n";
     std::wcout << L"  pdb <physical-address> 80\n";
     std::wcout << L"  kdinit\n";
@@ -1349,17 +1351,24 @@ static void HandlePhysicalEnterCommand(
         }
 
         std::vector<uint8_t> bytes;
+        bool valuesOk = true;
         for (size_t index = 2; index < args.size(); ++index)
         {
             uint64_t value = 0;
             if (!ParseUnsigned(args[index], state.NumberBase, &value))
             {
                 std::wcerr << L"invalid value: " << args[index] << L"\n";
-                return;
+                valuesOk = false;
+                break;
             }
 
             std::vector<uint8_t> encoded = EncodeInteger(value, width);
             bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+        }
+
+        if (!valuesOk)
+        {
+            break;
         }
 
         if (!IsSafeTransferSize(bytes.size()))
@@ -1426,17 +1435,24 @@ static void HandleEnterCommand(
                 width = 8;
             }
 
+            bool valuesOk = true;
             for (size_t index = 2; index < args.size(); ++index)
             {
                 uint64_t value = 0;
                 if (!ParseUnsigned(args[index], state.NumberBase, &value))
                 {
                     std::wcerr << L"invalid value: " << args[index] << L"\n";
-                    return;
+                    valuesOk = false;
+                    break;
                 }
 
                 std::vector<uint8_t> encoded = EncodeInteger(value, width);
                 bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+            }
+
+            if (!valuesOk)
+            {
+                break;
             }
         }
 
@@ -1548,13 +1564,15 @@ static void HandleFill(const std::vector<std::wstring>& args, const DebuggerStat
 
         std::vector<uint8_t> pattern;
         size_t width = command == L"fp" ? sizeof(uint64_t) : 1;
+        bool valuesOk = true;
         for (size_t index = 3; index < args.size(); ++index)
         {
             uint64_t value = 0;
             if (!ParseUnsigned(args[index], state.NumberBase, &value))
             {
                 std::wcerr << L"invalid fill value\n";
-                return;
+                valuesOk = false;
+                break;
             }
 
             if (width == 1)
@@ -1566,6 +1584,11 @@ static void HandleFill(const std::vector<std::wstring>& args, const DebuggerStat
                 std::vector<uint8_t> encoded = EncodeInteger(value, width);
                 pattern.insert(pattern.end(), encoded.begin(), encoded.end());
             }
+        }
+
+        if (!valuesOk)
+        {
+            break;
         }
 
         if (pattern.empty())
@@ -1695,17 +1718,24 @@ static void HandleSearch(const std::vector<std::wstring>& args, const DebuggerSt
         }
 
         std::vector<uint8_t> pattern;
+        bool valuesOk = true;
         for (size_t index = argIndex + 2; index < args.size(); ++index)
         {
             uint64_t value = 0;
             if (!ParseUnsigned(args[index], state.NumberBase, &value))
             {
                 std::wcerr << L"invalid search value\n";
-                return;
+                valuesOk = false;
+                break;
             }
 
             std::vector<uint8_t> encoded = EncodeInteger(value, width);
             pattern.insert(pattern.end(), encoded.begin(), encoded.end());
+        }
+
+        if (!valuesOk)
+        {
+            break;
         }
 
         std::vector<uint8_t> bytes;
@@ -1733,7 +1763,7 @@ static void PrintVersion(DeviceClient& device)
 {
     std::wstring error;
 
-    std::wcout << L"KnLiveDbg version 0.2\n";
+    std::wcout << L"KnLiveDbg version 0.3\n";
     if (device.QueryVersion(&error))
     {
         std::wcout << L"driver ABI ok\n";
@@ -1764,6 +1794,239 @@ static void PrintTarget()
     {
         std::wcout << L"local live kernel target: current machine\n";
     }
+}
+
+static std::wstring ObjectOperationsText(uint32_t operations)
+{
+    std::wstring text;
+
+    do
+    {
+        if ((operations & 0x1) != 0)
+        {
+            text += L"create";
+        }
+
+        if ((operations & 0x2) != 0)
+        {
+            if (!text.empty())
+            {
+                text += L"|";
+            }
+            text += L"duplicate";
+        }
+
+        if (text.empty())
+        {
+            text = L"none";
+        }
+    } while (false);
+
+    return text;
+}
+
+static void PrintCallbackAddress(
+    const wchar_t* label,
+    uint64_t address,
+    const std::wstring& moduleName,
+    const std::wstring& symbolName)
+{
+    do
+    {
+        if (address == 0)
+        {
+            break;
+        }
+
+        std::wcout << L"  " << label << L"=0x"
+                   << std::hex << std::setw(16) << std::setfill(L'0') << address << std::dec;
+        if (!moduleName.empty())
+        {
+            std::wcout << L" module=" << moduleName;
+        }
+        else
+        {
+            std::wcout << L" module=<non-image>";
+        }
+
+        if (!symbolName.empty())
+        {
+            std::wcout << L" symbol=" << symbolName;
+        }
+
+        std::wcout << L"\n";
+    } while (false);
+}
+
+static void HandleCallbacksCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        std::wstring scope = L"all";
+        if (args.size() >= 2)
+        {
+            scope = args[1];
+        }
+
+        if (symbols.Modules().empty())
+        {
+            if (!symbols.LoadKernelModules(&error))
+            {
+                std::wcerr << L"callback scan failed: " << error << L"\n";
+                break;
+            }
+        }
+
+        KernelCallbackScanner scanner(device, symbols);
+        KernelCallbackScanResult result = {};
+        if (!scanner.Scan(scope, &result, &error))
+        {
+            std::wcerr << L"callback scan failed: " << error << L"\n";
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"callback warning: " << warning << L"\n";
+        }
+
+        std::wcout << L"callback records=" << result.Records.size() << L"\n";
+        for (const KernelCallbackRecord& record : result.Records)
+        {
+            std::wcout << L"[" << record.Kind << L"] " << record.Target;
+            if (!record.Altitude.empty())
+            {
+                std::wcout << L" altitude=\"" << record.Altitude << L"\"";
+            }
+
+            if (!record.CallbackName.empty())
+            {
+                std::wcout << L" callback=" << record.CallbackName;
+            }
+
+            if (record.Kind == L"ob")
+            {
+                std::wcout << L" operations=0x" << std::hex << record.Operations
+                           << L"(" << ObjectOperationsText(record.Operations) << L")" << std::dec;
+            }
+
+            if (record.Kind == L"minifilter")
+            {
+                std::wcout << L" filterFlags=0x" << std::hex << record.FilterFlags << std::dec;
+                if (record.MajorFunction != 0xffffffffu)
+                {
+                    std::wcout << L" major=0x" << std::hex << record.MajorFunction << std::dec;
+                }
+                if (record.CallbackFlags != 0)
+                {
+                    std::wcout << L" cbFlags=0x" << std::hex << record.CallbackFlags << std::dec;
+                }
+            }
+
+            std::wcout << L" slot=" << record.Slot;
+
+            std::wcout << L"\n";
+
+            if (record.RootAddress != 0)
+            {
+                std::wcout << L"  root=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.RootAddress << std::dec;
+                if (!record.RootSource.empty())
+                {
+                    std::wcout << L" source=" << record.RootSource;
+                }
+                std::wcout << L"\n";
+            }
+
+            if (record.Filter != 0)
+            {
+                std::wcout << L"  filter=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.Filter << std::dec;
+                if (record.Frame != 0)
+                {
+                    std::wcout << L" frame=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                               << record.Frame << std::dec;
+                }
+                if (record.FrameId != 0xffffffffu)
+                {
+                    std::wcout << L" frameId=" << record.FrameId;
+                }
+                std::wcout << L"\n";
+            }
+
+            if (record.DriverObject != 0)
+            {
+                std::wcout << L"  driverObject=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.DriverObject << std::dec << L"\n";
+            }
+
+            if (record.ObjectType != 0)
+            {
+                std::wcout << L"  objectType=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.ObjectType << std::dec;
+                if (!record.ObjectTypeSource.empty())
+                {
+                    std::wcout << L" source=" << record.ObjectTypeSource;
+                }
+                std::wcout << L"\n";
+            }
+
+            if (record.ListEntry != 0)
+            {
+                std::wcout << L"  list=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.ListEntry << std::dec << L"\n";
+            }
+
+            if (record.Entry != 0)
+            {
+                std::wcout << L"  entry=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.Entry << std::dec << L"\n";
+            }
+
+            if (record.CallbackBlock != 0)
+            {
+                std::wcout << L"  block=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.CallbackBlock << L" raw=0x" << std::setw(16)
+                           << record.RawValue << std::dec << L"\n";
+            }
+
+            if (record.CallbackEntry != 0)
+            {
+                std::wcout << L"  callbackEntry=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.CallbackEntry << std::dec << L"\n";
+            }
+
+            const wchar_t* primaryLabel = L"pre";
+            if (record.Kind == L"process" || (record.Kind == L"minifilter" && record.PostFunction == 0))
+            {
+                primaryLabel = L"function";
+            }
+
+            PrintCallbackAddress(
+                primaryLabel,
+                record.Function,
+                record.FunctionModule,
+                record.FunctionSymbol);
+            PrintCallbackAddress(L"post", record.PostFunction, record.PostFunctionModule, record.PostFunctionSymbol);
+            PrintCallbackAddress(L"context", record.Context, record.ContextModule, record.ContextSymbol);
+
+            if (record.Cookie != 0)
+            {
+                std::wcout << L"  cookie=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+                           << record.Cookie << std::dec << L"\n";
+            }
+
+            if (!record.Notes.empty())
+            {
+                std::wcout << L"  notes=" << record.Notes << L"\n";
+            }
+        }
+    } while (false);
 }
 
 static bool HandleCommand(
@@ -1864,7 +2127,8 @@ static bool HandleCommand(
         else if (state.Backend == DebuggerState::BackendMode::DbgEng &&
                  command != L"q" && command != L"qq" && command != L"qd" &&
                  command != L"quit" && command != L"exit" &&
-                 command != L"unload" && command != L"drvstatus")
+                 command != L"unload" && command != L"drvstatus" &&
+                 command != L"callbacks" && command != L"kcallbacks" && command != L"cb")
         {
             ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true);
         }
@@ -2041,6 +2305,10 @@ static bool HandleCommand(
         else if (command == L"dt" || command == L"dtx")
         {
             HandleDtCommand(args, state, device, symbols);
+        }
+        else if (command == L"callbacks" || command == L"kcallbacks" || command == L"cb")
+        {
+            HandleCallbacksCommand(args, device, symbols);
         }
         else if (command == L"write" && args.size() >= 2)
         {

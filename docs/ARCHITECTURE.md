@@ -18,6 +18,7 @@ Kn Live Dbg follows a LiveKD-style split:
    - Owns driver install/load/unload through SCM.
    - Owns kernel module enumeration.
    - Owns symbol path, PDB loading, type lookup, and field offset resolution.
+   - Owns PDB-driven callback list decoding for object, registry, process, and minifilter callbacks.
    - Presents Windbg-like commands.
    - Optionally attaches a DbgEng local-kernel backend for commands that need debugger-engine semantics.
 
@@ -57,7 +58,15 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 3. TUI calls `SymLoadModuleExW` for each loaded kernel image.
 4. `addr` uses `SymFromNameW`.
 5. `dt` uses `SymGetTypeFromNameW` and `SymGetTypeInfo`.
-6. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
+6. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
+7. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
+
+## Callback Scanner Flow
+
+1. Object callbacks: resolve `_OBJECT_TYPE.CallbackList`, discover object type objects from `ObTypeIndexTable`, read `_OBJECT_TYPE.Name`, then walk each callback list.
+2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk `_CM_CALLBACK_CONTEXT_BLOCK` records.
+3. Process callbacks: enumerate `PspCreateProcessNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read `_EX_CALLBACK_ROUTINE_BLOCK` records.
+4. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
 
 ## DbgEng Flow
 

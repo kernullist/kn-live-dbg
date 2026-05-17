@@ -513,7 +513,7 @@ static NTSTATUS KnDbgHandleGetVersion(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID 
         response->Size = sizeof(KNDBG_VERSION_RESPONSE);
         response->AbiVersion = KNDBG_ABI_VERSION;
         response->DriverMajor = 0;
-        response->DriverMinor = 1;
+        response->DriverMinor = 3;
         response->MaxTransferSize = KNDBG_MAX_TRANSFER_SIZE;
         response->Flags = 0;
 
@@ -568,6 +568,10 @@ static NTSTATUS KnDbgHandleReadVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID
         status = KnDbgReadVirtualAddress(request.Address, response->Data, request.Length, &bytesCopied);
         response->Length = static_cast<KNDBG_UINT32>(bytesCopied);
         information = FIELD_OFFSET(KNDBG_READ_REQUEST, Data) + bytesCopied;
+        if (!NT_SUCCESS(status) && bytesCopied != 0)
+        {
+            status = STATUS_SUCCESS;
+        }
     } while (false);
 
     return KnDbgCompleteIrp(Irp, status, information);
@@ -617,8 +621,11 @@ static NTSTATUS KnDbgHandleWriteVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
 
         SIZE_T bytesCopied = 0;
         status = KnDbgWriteVirtualAddress(request->Address, request->Data, request->Length, &bytesCopied);
-        information = sizeof(KNDBG_UINT32);
         request->Length = static_cast<KNDBG_UINT32>(bytesCopied);
+        if (NT_SUCCESS(status))
+        {
+            information = FIELD_OFFSET(KNDBG_WRITE_REQUEST, Data);
+        }
     } while (false);
 
     return KnDbgCompleteIrp(Irp, status, information);
@@ -807,6 +814,10 @@ static NTSTATUS KnDbgHandleReadPhysical(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
         status = KnDbgReadPhysicalAddress(request.PhysicalAddress, response->Data, request.Length, &bytesCopied);
         response->Length = static_cast<KNDBG_UINT32>(bytesCopied);
         information = FIELD_OFFSET(KNDBG_PHYSICAL_READ_REQUEST, Data) + bytesCopied;
+        if (!NT_SUCCESS(status) && bytesCopied != 0)
+        {
+            status = STATUS_SUCCESS;
+        }
     } while (false);
 
     return KnDbgCompleteIrp(Irp, status, information);
@@ -856,8 +867,11 @@ static NTSTATUS KnDbgHandleWritePhysical(PIRP Irp, PIO_STACK_LOCATION Stack, PVO
 
         SIZE_T bytesCopied = 0;
         status = KnDbgWritePhysicalAddress(request->PhysicalAddress, request->Data, request->Length, &bytesCopied);
-        information = sizeof(KNDBG_UINT32);
         request->Length = static_cast<KNDBG_UINT32>(bytesCopied);
+        if (NT_SUCCESS(status))
+        {
+            information = FIELD_OFFSET(KNDBG_PHYSICAL_WRITE_REQUEST, Data);
+        }
     } while (false);
 
     return KnDbgCompleteIrp(Irp, status, information);

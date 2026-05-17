@@ -51,6 +51,7 @@ vtop, !vtop
 phys, pdb, pdw, pdd, pdq
 peb, pew, ped, peq
 dt, dtx
+callbacks, kcallbacks, cb
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 c, f, fp, m, s
 n, sq
@@ -90,3 +91,7 @@ z
 7. Native `dt` supports layout-only output, value output when an address is supplied, recursive UDT expansion with `-rN`, verbose diagnostics with `-v`, bare output with `-b`, and field filters.
 8. `vtop` and native `!vtop` translate a virtual address to a physical address using the current CR3 or a supplied directory-table base.
 9. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory; `peb`, `pew`, `ped`, and `peq` write physical memory through the same write gate as virtual writes.
+10. `callbacks [all|ob|registry|process|minifilter]` parses kernel PDB type layouts and live memory to list object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with module, symbol, altitude, context, root, and object/filter address annotations.
+11. Object callback scanning discovers `_OBJECT_TYPE` objects from `ObTypeIndexTable` before walking each `_OBJECT_TYPE.CallbackList`, with documented type globals used only as fallback.
+12. Registry and process callback scanning enumerate candidate root symbols and validate the expected list/table shape before emitting records.
+13. Minifilter scanning discovers `fltmgr!FltGlobals`, validates the frame-list root, walks frames and registered filters, and reports operation, unload, instance, name provider, KTM, section, and volume-mount callbacks. Non-exact globals candidates must produce concrete callback records before they are accepted.

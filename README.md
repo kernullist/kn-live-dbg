@@ -27,6 +27,7 @@ kn-live-dbg/
 11. Implements native live-memory support for memory, symbol, module, type, compare, fill, move, and search commands.
 12. Routes stop-state, parser-heavy, extension, and meta commands through the DbgEng backend.
 13. Provides an optional DbgEng backend for raw WinDbg command execution against the local kernel target.
+14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with function/module/context annotations.
 
 ## Build
 
@@ -89,6 +90,9 @@ dds, dps, dqs
 phys, pdb, pdw, pdd, pdq
 dt [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
+callbacks [all|ob|registry|process|minifilter]
+kcallbacks [all|ob|registry|process|minifilter]
+cb [all|ob|registry|process|minifilter]
 c <address1> <address2> <length>
 s [-b|-w|-d|-q] <address> <length> <value...>
 f <address> <length> <byte-pattern...>
@@ -113,6 +117,9 @@ knkd> vtop nt!PsLoadedModuleList
 knkd> pdb <physical-address> 80
 knkd> dt nt!_EPROCESS
 knkd> dt -r1 nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
+knkd> callbacks all
+knkd> callbacks ob
+knkd> callbacks minifilter
 ```
 
 The registry also knows the standard execution, breakpoint, stack, register, source, exception, I/O port, and script commands. Native live-memory commands stay on the custom driver backend, while stop-state or parser-heavy commands are routed to DbgEng in `auto` or `dbgeng` mode.
@@ -158,6 +165,27 @@ Supported options:
 
 Field filters are case-insensitive substring filters applied to field names and type names.
 
+## Kernel Callback Scanner
+
+`callbacks` walks live kernel callback lists using kernel PDB type layouts and the native memory reader:
+
+```text
+callbacks all
+callbacks ob
+callbacks registry
+callbacks process
+callbacks minifilter
+```
+
+The scanner currently covers:
+
+1. Object-manager filters from `_OBJECT_TYPE.CallbackList`. The scanner first discovers `_OBJECT_TYPE` objects through `ObTypeIndexTable` and `_OBJECT_TYPE.Name`, then falls back to `PsProcessType`, `PsThreadType`, and `ExDesktopObjectType` when the table is unavailable.
+2. Registry callbacks by enumerating and validating registry callback list-head candidates such as `CmpCallbackListHead`, then walking `_CM_CALLBACK_CONTEXT_BLOCK` entries.
+3. Process creation callbacks by enumerating and validating create-process notify routine table candidates such as `PspCreateProcessNotifyRoutine`, then decoding `_EX_CALLBACK_ROUTINE_BLOCK` entries.
+4. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
+
+Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/context pointer. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Context pointers are also annotated with a module and nearest symbol when they point into a loaded kernel image. The implementation is intentionally PDB-driven; if a private structure field is renamed on a target build, the command reports a warning instead of guessing offsets.
+
 ## Virtual-To-Physical And Physical Memory
 
 Native physical memory support is intentionally explicit:
@@ -183,6 +211,7 @@ peq <physical-address> <qword-value>
 4. Native VA-to-PA translation currently assumes x64 4-level paging and the supplied or current CR3.
 5. Physical memory writes can corrupt page tables, code, pool, device memory, or firmware-owned ranges.
 6. Type dumping depends on matching PDBs and the local `DbgHelp` behavior.
-7. Do not hard-code kernel structure offsets for production use; resolve them from symbols at runtime.
-8. Live loading requires test-signing or another valid code integrity path.
-9. Native mode intentionally differs from full WinDbg for commands that stop or control the target. Use `backend dbgeng` for DbgEng-backed command execution, and still expect local-kernel debugging limitations.
+7. Callback enumeration depends on internal kernel symbols and type names. Field drift is reported as a warning; Filter Manager callback decoding depends on matching `fltmgr` private type layouts.
+8. Do not hard-code kernel structure offsets for production use; resolve them from symbols at runtime.
+9. Live loading requires test-signing or another valid code integrity path.
+10. Native mode intentionally differs from full WinDbg for commands that stop or control the target. Use `backend dbgeng` for DbgEng-backed command execution, and still expect local-kernel debugging limitations.

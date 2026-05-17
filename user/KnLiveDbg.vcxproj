@@ -87,6 +87,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="CallbackScanner.cpp" />
     <ClCompile Include="CommandRegistry.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
     <ClCompile Include="DeviceClient.cpp" />
@@ -95,6 +96,7 @@
     <ClCompile Include="SymbolEngine.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="CallbackScanner.h" />
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />

@@ -11,6 +11,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="CallbackScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="CommandRegistry.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -31,6 +34,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="CallbackScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="CommandRegistry.h">
       <Filter>Header Files</Filter>
     </ClInclude>

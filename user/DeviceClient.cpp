@@ -199,6 +199,15 @@ bool DeviceClient::ReadMemory(uint64_t address, uint32_t length, std::vector<uin
             break;
         }
 
+        if (returned < FIELD_OFFSET(KNDBG_READ_REQUEST, Data) + copied)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short read data response";
+            }
+            break;
+        }
+
         bytes->assign(buffer.begin() + FIELD_OFFSET(KNDBG_READ_REQUEST, Data), buffer.begin() + FIELD_OFFSET(KNDBG_READ_REQUEST, Data) + copied);
         ok = true;
     } while (false);
@@ -233,6 +242,15 @@ bool DeviceClient::WriteMemory(uint64_t address, const std::vector<uint8_t>& byt
         DWORD returned = 0;
         if (!Ioctl(IOCTL_KNDBG_WRITE_VIRTUAL, buffer.data(), bufferLength, bufferLength, &returned, error))
         {
+            break;
+        }
+
+        if (returned < FIELD_OFFSET(KNDBG_WRITE_REQUEST, Data) || request->Length != bytes.size())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short write response";
+            }
             break;
         }
 
@@ -426,6 +444,15 @@ bool DeviceClient::ReadPhysical(uint64_t physicalAddress, uint32_t length, std::
             break;
         }
 
+        if (returned < FIELD_OFFSET(KNDBG_PHYSICAL_READ_REQUEST, Data) + copied)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short physical read data response";
+            }
+            break;
+        }
+
         bytes->assign(
             buffer.begin() + FIELD_OFFSET(KNDBG_PHYSICAL_READ_REQUEST, Data),
             buffer.begin() + FIELD_OFFSET(KNDBG_PHYSICAL_READ_REQUEST, Data) + copied);
@@ -462,6 +489,15 @@ bool DeviceClient::WritePhysical(uint64_t physicalAddress, const std::vector<uin
         DWORD returned = 0;
         if (!Ioctl(IOCTL_KNDBG_WRITE_PHYSICAL, buffer.data(), bufferLength, bufferLength, &returned, error))
         {
+            break;
+        }
+
+        if (returned < FIELD_OFFSET(KNDBG_PHYSICAL_WRITE_REQUEST, Data) || request->Length != bytes.size())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short physical write response";
+            }
             break;
         }
 
