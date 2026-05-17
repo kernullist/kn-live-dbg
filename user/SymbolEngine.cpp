@@ -1,0 +1,1110 @@
+#include "SymbolEngine.h"
+
+#include <winternl.h>
+
+#include <algorithm>
+#include <cwctype>
+#include <memory>
+#include <sstream>
+
+#pragma comment(lib, "Dbghelp.lib")
+
+typedef LONG NTSTATUS;
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
+
+typedef enum _KNDBG_SYSTEM_INFORMATION_CLASS
+{
+    KnDbgSystemModuleInformation = 11
+} KNDBG_SYSTEM_INFORMATION_CLASS;
+
+typedef struct _KNDBG_RTL_PROCESS_MODULE_INFORMATION
+{
+    HANDLE Section;
+    PVOID MappedBase;
+    PVOID ImageBase;
+    ULONG ImageSize;
+    ULONG Flags;
+    USHORT LoadOrderIndex;
+    USHORT InitOrderIndex;
+    USHORT LoadCount;
+    USHORT OffsetToFileName;
+    UCHAR FullPathName[256];
+} KNDBG_RTL_PROCESS_MODULE_INFORMATION, *PKNDBG_RTL_PROCESS_MODULE_INFORMATION;
+
+typedef struct _KNDBG_RTL_PROCESS_MODULES
+{
+    ULONG NumberOfModules;
+    KNDBG_RTL_PROCESS_MODULE_INFORMATION Modules[1];
+} KNDBG_RTL_PROCESS_MODULES, *PKNDBG_RTL_PROCESS_MODULES;
+
+typedef NTSTATUS (NTAPI* NtQuerySystemInformationPtr)(
+    KNDBG_SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength);
+
+static std::wstring DbgHelpErrorText(const wchar_t* prefix, DWORD error)
+{
+    wchar_t buffer[512] = {};
+    FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        error,
+        0,
+        buffer,
+        static_cast<DWORD>(std::size(buffer)),
+        nullptr);
+
+    std::wstringstream stream;
+    stream << prefix << L": " << error << L" " << buffer;
+    return stream.str();
+}
+
+static std::wstring AsWide(const char* value)
+{
+    std::wstring result;
+
+    do
+    {
+        if (value == nullptr)
+        {
+            break;
+        }
+
+        int count = MultiByteToWideChar(CP_ACP, 0, value, -1, nullptr, 0);
+        if (count <= 0)
+        {
+            break;
+        }
+
+        result.resize(static_cast<size_t>(count - 1));
+        MultiByteToWideChar(CP_ACP, 0, value, -1, result.data(), count);
+    } while (false);
+
+    return result;
+}
+
+static std::wstring ToLowerString(const std::wstring& value)
+{
+    std::wstring result = value;
+
+    for (wchar_t& ch : result)
+    {
+        ch = static_cast<wchar_t>(std::towlower(ch));
+    }
+
+    return result;
+}
+
+static std::wstring StripExtension(const std::wstring& value)
+{
+    std::wstring result = value;
+    size_t dot = result.find_last_of(L'.');
+
+    if (dot != std::wstring::npos)
+    {
+        result.resize(dot);
+    }
+
+    return result;
+}
+
+static bool ModuleNameMatches(const std::wstring& imageName, const std::wstring& filter)
+{
+    bool matches = false;
+
+    do
+    {
+        if (filter.empty())
+        {
+            matches = true;
+            break;
+        }
+
+        std::wstring image = ToLowerString(imageName);
+        std::wstring imageNoExtension = StripExtension(image);
+        std::wstring normalizedFilter = StripExtension(ToLowerString(filter));
+
+        if (image == normalizedFilter || imageNoExtension == normalizedFilter)
+        {
+            matches = true;
+            break;
+        }
+    } while (false);
+
+    return matches;
+}
+
+static std::wstring GetTypeSymbolName(HANDLE process, DWORD64 moduleBase, ULONG typeId)
+{
+    std::wstring name;
+    WCHAR* rawName = nullptr;
+
+    if (SymGetTypeInfo(process, moduleBase, typeId, TI_GET_SYMNAME, &rawName) && rawName != nullptr)
+    {
+        name = rawName;
+        LocalFree(rawName);
+    }
+
+    return name;
+}
+
+static std::wstring BaseTypeName(DWORD baseType, ULONG64 length)
+{
+    std::wstring name;
+
+    switch (baseType)
+    {
+    case 0:
+        name = L"<no type>";
+        break;
+    case 1:
+        name = L"void";
+        break;
+    case 2:
+        name = L"char";
+        break;
+    case 3:
+        name = L"wchar_t";
+        break;
+    case 6:
+        name = length == 8 ? L"__int64" : (length == 2 ? L"short" : L"long");
+        break;
+    case 7:
+        name = length == 8 ? L"unsigned __int64" : (length == 2 ? L"unsigned short" : L"unsigned long");
+        break;
+    case 8:
+        name = length == 8 ? L"double" : L"float";
+        break;
+    case 10:
+        name = L"bool";
+        break;
+    case 13:
+        name = L"long";
+        break;
+    case 14:
+        name = L"unsigned long";
+        break;
+    case 31:
+        name = L"HRESULT";
+        break;
+    case 32:
+        name = L"char16_t";
+        break;
+    case 33:
+        name = L"char32_t";
+        break;
+    case 34:
+        name = L"char8_t";
+        break;
+    default:
+        name = L"<base>";
+        break;
+    }
+
+    return name;
+}
+
+static std::wstring DescribeType(HANDLE process, DWORD64 moduleBase, ULONG typeId, ULONG depth)
+{
+    std::wstring name;
+
+    do
+    {
+        if (typeId == 0)
+        {
+            break;
+        }
+
+        DWORD tag = 0;
+        SymGetTypeInfo(process, moduleBase, typeId, TI_GET_SYMTAG, &tag);
+
+        if (tag == KNDBG_SYMTAG_POINTER_TYPE)
+        {
+            ULONG childTypeId = 0;
+            if (depth < 8 && SymGetTypeInfo(process, moduleBase, typeId, TI_GET_TYPEID, &childTypeId))
+            {
+                name = DescribeType(process, moduleBase, childTypeId, depth + 1);
+            }
+
+            if (name.empty())
+            {
+                name = L"void";
+            }
+
+            name += L" *";
+            break;
+        }
+
+        if (tag == KNDBG_SYMTAG_ARRAY_TYPE)
+        {
+            ULONG childTypeId = 0;
+            ULONG count = 0;
+            if (depth < 8 && SymGetTypeInfo(process, moduleBase, typeId, TI_GET_TYPEID, &childTypeId))
+            {
+                name = DescribeType(process, moduleBase, childTypeId, depth + 1);
+            }
+
+            if (name.empty())
+            {
+                name = L"<array>";
+            }
+
+            if (SymGetTypeInfo(process, moduleBase, typeId, TI_GET_COUNT, &count))
+            {
+                std::wstringstream stream;
+                stream << name << L"[" << count << L"]";
+                name = stream.str();
+            }
+            else
+            {
+                name += L"[]";
+            }
+            break;
+        }
+
+        if (tag == KNDBG_SYMTAG_BASE_TYPE)
+        {
+            DWORD baseType = 0;
+            ULONG64 length = 0;
+            SymGetTypeInfo(process, moduleBase, typeId, TI_GET_BASETYPE, &baseType);
+            SymGetTypeInfo(process, moduleBase, typeId, TI_GET_LENGTH, &length);
+            name = BaseTypeName(baseType, length);
+            break;
+        }
+
+        name = GetTypeSymbolName(process, moduleBase, typeId);
+        if (!name.empty())
+        {
+            break;
+        }
+
+        ULONG childTypeId = 0;
+        if (depth < 8 && SymGetTypeInfo(process, moduleBase, typeId, TI_GET_TYPEID, &childTypeId))
+        {
+            name = DescribeType(process, moduleBase, childTypeId, depth + 1);
+        }
+    } while (false);
+
+    if (name.empty())
+    {
+        name = L"<unnamed>";
+    }
+
+    return name;
+}
+
+SymbolEngine::SymbolEngine() :
+    process_(GetCurrentProcess()),
+    ready_(false),
+    symbolPath_(L"SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols")
+{
+}
+
+SymbolEngine::~SymbolEngine()
+{
+    Shutdown();
+}
+
+bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        Shutdown();
+
+        symbolPath_ = symbolPath;
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_EXACT_SYMBOLS);
+
+        if (!SymInitializeW(process_, symbolPath_.c_str(), FALSE))
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymInitializeW failed", GetLastError());
+            }
+            break;
+        }
+
+        ready_ = true;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+void SymbolEngine::Shutdown()
+{
+    if (ready_)
+    {
+        SymCleanup(process_);
+        ready_ = false;
+    }
+
+    modules_.clear();
+}
+
+bool SymbolEngine::IsReady() const
+{
+    return ready_;
+}
+
+const std::wstring& SymbolEngine::SymbolPath() const
+{
+    return symbolPath_;
+}
+
+void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
+{
+    symbolPath_ = symbolPath;
+
+    if (ready_)
+    {
+        SymSetSearchPathW(process_, symbolPath_.c_str());
+    }
+}
+
+const std::vector<KernelModuleInfo>& SymbolEngine::Modules() const
+{
+    return modules_;
+}
+
+bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (modules == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid modules output";
+            }
+            break;
+        }
+
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"GetModuleHandleW ntdll failed", GetLastError());
+            }
+            break;
+        }
+
+        auto query = reinterpret_cast<NtQuerySystemInformationPtr>(GetProcAddress(ntdll, "NtQuerySystemInformation"));
+        if (query == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"GetProcAddress NtQuerySystemInformation failed", GetLastError());
+            }
+            break;
+        }
+
+        ULONG required = 0;
+        NTSTATUS status = query(KnDbgSystemModuleInformation, nullptr, 0, &required);
+        if (required == 0 && status != STATUS_INFO_LENGTH_MISMATCH)
+        {
+            if (error != nullptr)
+            {
+                std::wstringstream stream;
+                stream << L"NtQuerySystemInformation length query failed: 0x" << std::hex << status;
+                *error = stream.str();
+            }
+            break;
+        }
+
+        std::vector<uint8_t> buffer(required + 64 * 1024);
+        status = query(KnDbgSystemModuleInformation, buffer.data(), static_cast<ULONG>(buffer.size()), &required);
+        if (!NT_SUCCESS(status))
+        {
+            if (error != nullptr)
+            {
+                std::wstringstream stream;
+                stream << L"NtQuerySystemInformation modules failed: 0x" << std::hex << status;
+                *error = stream.str();
+            }
+            break;
+        }
+
+        auto rawModules = reinterpret_cast<PKNDBG_RTL_PROCESS_MODULES>(buffer.data());
+        modules->clear();
+        modules->reserve(rawModules->NumberOfModules);
+
+        for (ULONG index = 0; index < rawModules->NumberOfModules; ++index)
+        {
+            const KNDBG_RTL_PROCESS_MODULE_INFORMATION& raw = rawModules->Modules[index];
+            KernelModuleInfo module = {};
+            module.Base = reinterpret_cast<uint64_t>(raw.ImageBase);
+            module.Size = raw.ImageSize;
+            module.ImagePath = AsWide(reinterpret_cast<const char*>(raw.FullPathName));
+            module.ImageName = AsWide(reinterpret_cast<const char*>(raw.FullPathName + raw.OffsetToFileName));
+            modules->push_back(module);
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+std::wstring SymbolEngine::ResolveModuleImagePath(const KernelModuleInfo& module) const
+{
+    std::wstring result = module.ImagePath;
+
+    if (result.rfind(L"\\SystemRoot\\", 0) == 0)
+    {
+        wchar_t windowsPath[MAX_PATH] = {};
+        if (GetWindowsDirectoryW(windowsPath, static_cast<UINT>(std::size(windowsPath))) != 0)
+        {
+            result = std::wstring(windowsPath) + result.substr(std::wstring(L"\\SystemRoot").size());
+        }
+    }
+    else if (result.rfind(L"\\??\\", 0) == 0)
+    {
+        result = result.substr(4);
+    }
+
+    return result;
+}
+
+bool SymbolEngine::LoadKernelModules(std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        std::vector<KernelModuleInfo> modules;
+        if (!EnumKernelModules(&modules, error))
+        {
+            break;
+        }
+
+        for (const KernelModuleInfo& module : modules)
+        {
+            std::wstring imagePath = ResolveModuleImagePath(module);
+            DWORD64 loaded = SymLoadModuleExW(
+                process_,
+                nullptr,
+                imagePath.empty() ? nullptr : imagePath.c_str(),
+                module.ImageName.empty() ? nullptr : module.ImageName.c_str(),
+                module.Base,
+                module.Size,
+                nullptr,
+                0);
+
+            if (loaded == 0)
+            {
+                DWORD lastError = GetLastError();
+                if (lastError != ERROR_SUCCESS)
+                {
+                    continue;
+                }
+            }
+        }
+
+        modules_ = std::move(modules);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::ResolveSymbol(const std::wstring& name, uint64_t* address, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (address == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid address output";
+            }
+            break;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        wchar_t buffer[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t)] = {};
+        PSYMBOL_INFOW symbol = reinterpret_cast<PSYMBOL_INFOW>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+
+        if (!SymFromNameW(process_, name.c_str(), symbol))
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymFromNameW failed", GetLastError());
+            }
+            break;
+        }
+
+        *address = symbol->Address;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::FindNearestSymbol(uint64_t address, std::wstring* name, uint64_t* displacement, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (name == nullptr || displacement == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid nearest-symbol output";
+            }
+            break;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        wchar_t buffer[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t)] = {};
+        PSYMBOL_INFOW symbol = reinterpret_cast<PSYMBOL_INFOW>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+
+        DWORD64 localDisplacement = 0;
+        if (!SymFromAddrW(process_, address, &localDisplacement, symbol))
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymFromAddrW failed", GetLastError());
+            }
+            break;
+        }
+
+        *name = symbol->Name;
+        *displacement = localDisplacement;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+typedef struct _KNDBG_ENUM_SYMBOL_CONTEXT
+{
+    std::vector<SymbolMatchInfo>* Matches;
+    size_t Limit;
+} KNDBG_ENUM_SYMBOL_CONTEXT;
+
+static BOOL CALLBACK KnDbgEnumSymbolsCallback(PSYMBOL_INFOW SymbolInfo, ULONG SymbolSize, PVOID UserContext)
+{
+    BOOL keepGoing = TRUE;
+
+    do
+    {
+        auto context = reinterpret_cast<KNDBG_ENUM_SYMBOL_CONTEXT*>(UserContext);
+        if (context == nullptr || context->Matches == nullptr || SymbolInfo == nullptr)
+        {
+            keepGoing = FALSE;
+            break;
+        }
+
+        SymbolMatchInfo match = {};
+        match.Address = SymbolInfo->Address;
+        match.Size = SymbolSize;
+        match.Name = SymbolInfo->Name;
+        context->Matches->push_back(match);
+
+        if (context->Limit != 0 && context->Matches->size() >= context->Limit)
+        {
+            keepGoing = FALSE;
+        }
+    } while (false);
+
+    return keepGoing;
+}
+
+bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std::vector<SymbolMatchInfo>* matches, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (matches == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid symbol output";
+            }
+            break;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        std::wstring effectiveMask = mask.empty() ? L"*" : mask;
+        std::wstring moduleFilter;
+        std::wstring symbolMask = effectiveMask;
+        size_t bang = effectiveMask.find(L'!');
+        if (bang != std::wstring::npos)
+        {
+            moduleFilter = effectiveMask.substr(0, bang);
+            symbolMask = effectiveMask.substr(bang + 1);
+            if (symbolMask.empty())
+            {
+                symbolMask = L"*";
+            }
+        }
+
+        matches->clear();
+        KNDBG_ENUM_SYMBOL_CONTEXT context = {};
+        context.Matches = matches;
+        context.Limit = limit;
+
+        bool foundThroughModule = false;
+        DWORD lastError = ERROR_SUCCESS;
+
+        if (moduleFilter.empty())
+        {
+            if (!SymEnumSymbolsW(process_, 0, symbolMask.c_str(), KnDbgEnumSymbolsCallback, &context))
+            {
+                lastError = GetLastError();
+            }
+            else
+            {
+                foundThroughModule = true;
+            }
+        }
+
+        if (matches->empty() || !moduleFilter.empty())
+        {
+            for (const KernelModuleInfo& module : modules_)
+            {
+                if (!ModuleNameMatches(module.ImageName, moduleFilter))
+                {
+                    continue;
+                }
+
+                if (SymEnumSymbolsW(process_, module.Base, symbolMask.c_str(), KnDbgEnumSymbolsCallback, &context))
+                {
+                    foundThroughModule = true;
+                }
+                else
+                {
+                    lastError = GetLastError();
+                }
+
+                if (limit != 0 && matches->size() >= limit)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (!foundThroughModule && matches->empty())
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymEnumSymbolsW failed", lastError);
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (layout == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid type layout output";
+            }
+            break;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        if (moduleBase == 0 || typeId == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid type identity";
+            }
+            break;
+        }
+
+        layout->Name = typeName.empty() ? DescribeType(process_, moduleBase, typeId, 0) : typeName;
+        layout->ModuleBase = moduleBase;
+        layout->TypeId = typeId;
+        layout->Size = 0;
+        layout->Fields.clear();
+
+        ULONG childrenCount = 0;
+        if (!SymGetTypeInfo(process_, moduleBase, typeId, TI_GET_CHILDRENCOUNT, &childrenCount))
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"TI_GET_CHILDRENCOUNT failed", GetLastError());
+            }
+            break;
+        }
+
+        SymGetTypeInfo(process_, moduleBase, typeId, TI_GET_LENGTH, &layout->Size);
+
+        size_t findChildrenSize = FIELD_OFFSET(TI_FINDCHILDREN_PARAMS, ChildId) + sizeof(ULONG) * childrenCount;
+        std::vector<uint8_t> findChildrenBuffer(findChildrenSize);
+        auto findChildren = reinterpret_cast<TI_FINDCHILDREN_PARAMS*>(findChildrenBuffer.data());
+        findChildren->Count = childrenCount;
+        findChildren->Start = 0;
+
+        if (!SymGetTypeInfo(process_, moduleBase, typeId, TI_FINDCHILDREN, findChildren))
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"TI_FINDCHILDREN failed", GetLastError());
+            }
+            break;
+        }
+
+        layout->Fields.reserve(childrenCount);
+
+        for (ULONG index = 0; index < childrenCount; ++index)
+        {
+            ULONG childId = findChildren->ChildId[index];
+            TypeFieldInfo field = {};
+            field.ModuleBase = moduleBase;
+            field.TypeId = childId;
+            field.ChildTypeId = 0;
+            field.Offset = 0;
+            field.Length = 0;
+            field.Tag = 0;
+            field.ChildTag = 0;
+            field.BaseType = 0;
+            field.IsBitField = false;
+            field.BitPosition = 0;
+
+            WCHAR* rawName = nullptr;
+            if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMNAME, &rawName) && rawName != nullptr)
+            {
+                field.Name = rawName;
+                LocalFree(rawName);
+            }
+
+            SymGetTypeInfo(process_, moduleBase, childId, TI_GET_OFFSET, &field.Offset);
+            SymGetTypeInfo(process_, moduleBase, childId, TI_GET_LENGTH, &field.Length);
+            SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMTAG, &field.Tag);
+
+            if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_BITPOSITION, &field.BitPosition))
+            {
+                field.IsBitField = true;
+            }
+
+            if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_TYPEID, &field.ChildTypeId))
+            {
+                SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_LENGTH, &field.Length);
+                SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_BASETYPE, &field.BaseType);
+                SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_SYMTAG, &field.ChildTag);
+                field.TypeName = DescribeType(process_, moduleBase, field.ChildTypeId, 0);
+            }
+
+            if (field.TypeName.empty())
+            {
+                field.TypeName = L"<unknown>";
+            }
+
+            if (!field.Name.empty())
+            {
+                layout->Fields.push_back(field);
+            }
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (layout == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid type layout output";
+            }
+            break;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        ULONG typeId = 0;
+        DWORD64 moduleBase = 0;
+        std::vector<uint8_t> symbolBuffer(sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t));
+        PSYMBOL_INFOW symbol = reinterpret_cast<PSYMBOL_INFOW>(symbolBuffer.data());
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+
+        std::wstring lookupTypeName = typeName;
+        std::wstring moduleFilter;
+        size_t bang = typeName.find(L'!');
+        if (bang != std::wstring::npos)
+        {
+            moduleFilter = typeName.substr(0, bang);
+            lookupTypeName = typeName.substr(bang + 1);
+        }
+
+        if (!moduleFilter.empty())
+        {
+            for (const KernelModuleInfo& module : modules_)
+            {
+                if (!ModuleNameMatches(module.ImageName, moduleFilter))
+                {
+                    continue;
+                }
+
+                RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+                symbol->MaxNameLen = MAX_SYM_NAME;
+
+                if (SymGetTypeFromNameW(process_, module.Base, lookupTypeName.c_str(), symbol))
+                {
+                    typeId = symbol->TypeIndex;
+                    moduleBase = symbol->ModBase != 0 ? symbol->ModBase : module.Base;
+                    break;
+                }
+            }
+        }
+
+        if (typeId == 0 && !SymGetTypeFromNameW(process_, 0, typeName.c_str(), symbol))
+        {
+            bool found = false;
+            for (const KernelModuleInfo& module : modules_)
+            {
+                RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+                symbol->MaxNameLen = MAX_SYM_NAME;
+
+                if (SymGetTypeFromNameW(process_, module.Base, lookupTypeName.c_str(), symbol))
+                {
+                    typeId = symbol->TypeIndex;
+                    moduleBase = symbol->ModBase != 0 ? symbol->ModBase : module.Base;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                if (error != nullptr)
+                {
+                    *error = DbgHelpErrorText(L"SymGetTypeFromNameW failed", GetLastError());
+                }
+                break;
+            }
+        }
+        else
+        {
+            if (typeId == 0)
+            {
+                typeId = symbol->TypeIndex;
+                moduleBase = symbol->ModBase;
+            }
+        }
+
+        if (moduleBase == 0)
+        {
+            for (const KernelModuleInfo& module : modules_)
+            {
+                RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+                symbol->MaxNameLen = MAX_SYM_NAME;
+
+                if (SymGetTypeFromNameW(process_, module.Base, lookupTypeName.c_str(), symbol))
+                {
+                    moduleBase = symbol->ModBase != 0 ? symbol->ModBase : module.Base;
+                    typeId = symbol->TypeIndex;
+                    break;
+                }
+            }
+        }
+
+        if (moduleBase == 0 && !modules_.empty())
+        {
+            moduleBase = modules_.front().Base;
+        }
+
+        if (!GetTypeLayoutById(moduleBase, typeId, typeName, layout, error))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::GetTypeFields(const std::wstring& typeName, std::vector<TypeFieldInfo>* fields, ULONG64* typeSize, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (fields == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid field output";
+            }
+            break;
+        }
+
+        TypeLayoutInfo layout = {};
+        if (!GetTypeLayout(typeName, &layout, error))
+        {
+            break;
+        }
+
+        *fields = layout.Fields;
+        if (typeSize != nullptr)
+        {
+            *typeSize = layout.Size;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::FindField(const std::wstring& typeName, const std::wstring& fieldName, TypeFieldInfo* field, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (field == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid field output";
+            }
+            break;
+        }
+
+        std::vector<TypeFieldInfo> fields;
+        if (!GetTypeFields(typeName, &fields, nullptr, error))
+        {
+            break;
+        }
+
+        auto match = std::find_if(fields.begin(), fields.end(), [&](const TypeFieldInfo& candidate)
+        {
+            return _wcsicmp(candidate.Name.c_str(), fieldName.c_str()) == 0;
+        });
+
+        if (match == fields.end())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Field was not found";
+            }
+            break;
+        }
+
+        *field = *match;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+std::optional<uint64_t> SymbolEngine::ParseAddressOrSymbol(const std::wstring& value, std::wstring* error)
+{
+    std::optional<uint64_t> result;
+
+    do
+    {
+        if (value.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Empty address";
+            }
+            break;
+        }
+
+        wchar_t* end = nullptr;
+        uint64_t address = wcstoull(value.c_str(), &end, 0);
+        if (end != nullptr && *end == L'\0')
+        {
+            result = address;
+            break;
+        }
+
+        if (ResolveSymbol(value, &address, error))
+        {
+            result = address;
+        }
+    } while (false);
+
+    return result;
+}
