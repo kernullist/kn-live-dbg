@@ -29,6 +29,12 @@ kn-live-dbg/
 13. Provides an optional DbgEng backend for raw WinDbg command execution against the local kernel target.
 14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with function/module/context annotations.
 
+## Design Notes
+
+- `docs/ARCHITECTURE.md` describes the driver/user split and backend routing.
+- `docs/WINDBG_COMMAND_COVERAGE.md` tracks native and DbgEng-routed WinDbg command coverage.
+- `docs/AI_ASSISTED_WORKFLOWS.md` captures planned AI-assisted command planning, callback analysis, `dt` interpretation, disassembly annotation, write safety, playbooks, and session reporting.
+
 ## Build
 
 Requirements:
