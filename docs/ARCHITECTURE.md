@@ -120,7 +120,7 @@ Backend routing is mode-dependent:
 17. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
 18. `ai transcript max <bytes|off>` rotates long transcript files, and `ai transcript redact <on|off>` controls stdout/stderr redaction for long hex addresses and `sk-...` style tokens.
 19. `ai audit <path|off|status>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher.
-20. Transcript command records include origin, backend mode, command class, write-like status, stdout, stderr, and keep-running state.
+20. Transcript command records include origin, backend mode, command class, write-like status, stdout/stderr character counts, deterministic output summaries, raw stdout/stderr, and keep-running state.
 21. `ai report` writes a Markdown report with session context, provider status, transcript settings, write-audit path, parsed plan, and raw AI plan response.
 22. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
 
@@ -143,3 +143,5 @@ Completed hardening items:
 11. DIA fallback is implemented for UDT field metadata when `DbgHelp` fails.
 12. `KnLiveDbgProbe.sys` provides a positive-control contiguous virtual and physical test buffer.
 13. Remote KD attach is available through `kdinit /remote <connection-options>`.
+14. AI command proposal validation is versioned as `kn-live-dbg.ai-plan.v2` and rejects missing purpose metadata, command chaining, session mutation, raw `kd` blocked-command wrappers, and unsupported backend expectations.
+15. AI command evidence and transcripts include deterministic output summaries before raw stdout/stderr.

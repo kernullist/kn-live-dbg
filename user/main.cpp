@@ -64,12 +64,15 @@ struct AiCommandProposal
     std::wstring Command;
     std::wstring Purpose;
     std::wstring Risk;
+    std::wstring Backend;
+    std::wstring ExpectedOutput;
     bool RequiresConfirmation;
     bool WriteLike;
 };
 
 struct AiPlanState
 {
+    std::wstring Schema;
     std::wstring Title;
     std::wstring Summary;
     std::wstring RawResponse;
@@ -146,6 +149,35 @@ static std::wstring ToLower(const std::wstring& value)
     {
         ch = static_cast<wchar_t>(std::towlower(ch));
     }
+
+    return result;
+}
+
+static std::wstring TrimWhitespace(const std::wstring& value)
+{
+    std::wstring result;
+
+    do
+    {
+        size_t first = 0;
+        while (first < value.size() && std::iswspace(value[first]) != 0)
+        {
+            ++first;
+        }
+
+        if (first >= value.size())
+        {
+            break;
+        }
+
+        size_t last = value.size();
+        while (last > first && std::iswspace(value[last - 1]) != 0)
+        {
+            --last;
+        }
+
+        result = value.substr(first, last - first);
+    } while (false);
 
     return result;
 }
@@ -3926,6 +3958,135 @@ static void WriteAiTranscriptEvent(
     } while (false);
 }
 
+static std::wstring FirstNonEmptySummaryLine(const std::wstring& text, bool fromEnd)
+{
+    std::wstring result;
+    std::wistringstream stream(text);
+    std::wstring line;
+
+    if (fromEnd)
+    {
+        while (std::getline(stream, line))
+        {
+            if (!line.empty() && line.back() == L'\r')
+            {
+                line.pop_back();
+            }
+
+            if (!TrimWhitespace(line).empty())
+            {
+                result = line;
+            }
+        }
+    }
+    else
+    {
+        while (std::getline(stream, line))
+        {
+            if (!line.empty() && line.back() == L'\r')
+            {
+                line.pop_back();
+            }
+
+            if (!TrimWhitespace(line).empty())
+            {
+                result = line;
+                break;
+            }
+        }
+    }
+
+    if (result.size() > 180)
+    {
+        result.resize(180);
+        result += L"...";
+    }
+
+    return result;
+}
+
+static size_t CountTextLinesForSummary(const std::wstring& text)
+{
+    size_t lines = 0;
+
+    do
+    {
+        if (text.empty())
+        {
+            break;
+        }
+
+        lines = 1;
+        for (wchar_t ch : text)
+        {
+            if (ch == L'\n')
+            {
+                ++lines;
+            }
+        }
+    } while (false);
+
+    return lines;
+}
+
+static size_t CountInterestingLinesForSummary(const std::wstring& text)
+{
+    size_t count = 0;
+    std::wistringstream stream(text);
+    std::wstring line;
+
+    while (std::getline(stream, line))
+    {
+        if (ContainsNoCase(line, L"error") ||
+            ContainsNoCase(line, L"failed") ||
+            ContainsNoCase(line, L"warning") ||
+            ContainsNoCase(line, L"invalid") ||
+            ContainsNoCase(line, L"denied") ||
+            ContainsNoCase(line, L"partial"))
+        {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+static std::wstring BuildTextOutputSummary(const std::wstring& label, const std::wstring& text)
+{
+    std::wstringstream stream;
+    size_t lineCount = CountTextLinesForSummary(text);
+    size_t interesting = CountInterestingLinesForSummary(text);
+
+    stream << label << L": chars=" << text.size() << L" lines=" << lineCount;
+    if (interesting != 0)
+    {
+        stream << L" interesting-lines=" << interesting;
+    }
+
+    std::wstring first = FirstNonEmptySummaryLine(text, false);
+    std::wstring last = FirstNonEmptySummaryLine(text, true);
+    if (!first.empty())
+    {
+        stream << L" first=\"" << first << L"\"";
+    }
+    if (!last.empty() && last != first)
+    {
+        stream << L" last=\"" << last << L"\"";
+    }
+
+    return stream.str();
+}
+
+static std::wstring BuildCommandOutputSummary(const CommandExecutionResult& result)
+{
+    std::wstringstream stream;
+
+    stream << BuildTextOutputSummary(L"stdout", result.Output) << L"\n";
+    stream << BuildTextOutputSummary(L"stderr", result.Error);
+
+    return stream.str();
+}
+
 static void WriteCommandTranscriptEvent(
     AiPlanState& aiState,
     const std::wstring& origin,
@@ -3952,6 +4113,10 @@ static void WriteCommandTranscriptEvent(
         line << L"\"write_like\":" << (writeLike ? L"true" : L"false") << L",";
         line << L"\"command\":\"" << EscapeJsonText(command) << L"\",";
         line << L"\"keep_running\":" << (result.KeepRunning ? L"true" : L"false") << L",";
+        std::wstring outputSummary = MaybeRedactTranscriptText(aiState, BuildCommandOutputSummary(result));
+        line << L"\"stdout_chars\":" << result.Output.size() << L",";
+        line << L"\"stderr_chars\":" << result.Error.size() << L",";
+        line << L"\"output_summary\":\"" << EscapeJsonText(outputSummary) << L"\",";
         line << L"\"stdout\":\"" << EscapeJsonText(MaybeRedactTranscriptText(aiState, result.Output)) << L"\",";
         line << L"\"stderr\":\"" << EscapeJsonText(MaybeRedactTranscriptText(aiState, result.Error)) << L"\"";
         line << L"}";
@@ -3986,6 +4151,10 @@ static void WriteCommandAuditEvent(
         line << L"\"write_like\":true,";
         line << L"\"command\":\"" << EscapeJsonText(command) << L"\",";
         line << L"\"keep_running\":" << (result.KeepRunning ? L"true" : L"false") << L",";
+        std::wstring outputSummary = MaybeRedactTranscriptText(aiState, BuildCommandOutputSummary(result));
+        line << L"\"stdout_chars\":" << result.Output.size() << L",";
+        line << L"\"stderr_chars\":" << result.Error.size() << L",";
+        line << L"\"output_summary\":\"" << EscapeJsonText(outputSummary) << L"\",";
         line << L"\"stdout\":\"" << EscapeJsonText(MaybeRedactTranscriptText(aiState, result.Output)) << L"\",";
         line << L"\"stderr\":\"" << EscapeJsonText(MaybeRedactTranscriptText(aiState, result.Error)) << L"\"";
         line << L"}";
@@ -4278,6 +4447,145 @@ static std::vector<std::wstring> ExtractJsonArrayObjects(const std::wstring& jso
     return objects;
 }
 
+static bool IsShutdownOrUnloadCommand(const std::wstring& command)
+{
+    bool blocked = false;
+
+    if (command == L"q" ||
+        command == L"qq" ||
+        command == L"qd" ||
+        command == L"quit" ||
+        command == L"exit" ||
+        command == L"unload")
+    {
+        blocked = true;
+    }
+
+    return blocked;
+}
+
+static bool ContainsUnsafeAiCommandCharacters(const std::wstring& line, std::wstring* reason)
+{
+    bool unsafe = false;
+
+    do
+    {
+        for (wchar_t ch : line)
+        {
+            if (ch == L';' || ch == L'\r' || ch == L'\n')
+            {
+                unsafe = true;
+                if (reason != nullptr)
+                {
+                    *reason = L"command chaining and multiline commands are not allowed in AI plans";
+                }
+                break;
+            }
+
+            if (std::iswcntrl(ch) != 0 && ch != L'\t')
+            {
+                unsafe = true;
+                if (reason != nullptr)
+                {
+                    *reason = L"control characters are not allowed in AI plan commands";
+                }
+                break;
+            }
+        }
+    } while (false);
+
+    return unsafe;
+}
+
+static std::wstring NormalizeAiRiskText(const std::wstring& risk, bool writeLike, const std::wstring& commandClass)
+{
+    std::wstring normalized = ToLower(TrimWhitespace(risk));
+
+    do
+    {
+        if (writeLike)
+        {
+            normalized = L"write-like";
+            break;
+        }
+
+        if (normalized.empty())
+        {
+            if (commandClass == L"dbgeng")
+            {
+                normalized = L"dbgeng";
+            }
+            else
+            {
+                normalized = L"read-only";
+            }
+            break;
+        }
+
+        if (normalized.find(L"write") != std::wstring::npos)
+        {
+            normalized = L"write-like";
+            break;
+        }
+
+        if (normalized.find(L"dbgeng") != std::wstring::npos || normalized.find(L"debugger") != std::wstring::npos)
+        {
+            normalized = L"dbgeng";
+            break;
+        }
+
+        if (normalized.find(L"unknown") != std::wstring::npos)
+        {
+            normalized = L"unknown";
+            break;
+        }
+
+        if (normalized.find(L"read") != std::wstring::npos || normalized.find(L"low") != std::wstring::npos)
+        {
+            normalized = L"read-only";
+            break;
+        }
+    } while (false);
+
+    return normalized;
+}
+
+static std::wstring InferAiPlanBackend(const std::wstring& commandLine, const std::wstring& commandClass)
+{
+    std::wstring backend = L"native";
+    std::vector<std::wstring> args = Split(commandLine);
+
+    do
+    {
+        if (args.empty())
+        {
+            backend = L"unknown";
+            break;
+        }
+
+        std::wstring command = NormalizeInputCommand(args[0]);
+        if (command == L"kd" || commandClass == L"dbgeng" || (!command.empty() && command[0] == L'!'))
+        {
+            backend = L"dbgeng";
+            break;
+        }
+
+        if (command == L"u" || command == L"uf")
+        {
+            backend = L"native+dbgeng";
+            break;
+        }
+
+        if (commandClass == L"session" || commandClass == L"ai")
+        {
+            backend = L"tui";
+            break;
+        }
+    } while (false);
+
+    return backend;
+}
+
 static bool IsWriteLikeCommandLine(const std::wstring& line)
 {
     bool writeLike = false;
@@ -4291,6 +4599,17 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
         }
 
         std::wstring command = NormalizeInputCommand(args[0]);
+        if (command == L"kd" && args.size() >= 2)
+        {
+            std::wstring inner = NormalizeInputCommand(args[1]);
+            if (inner == L"setfield" || inner == L"write" || inner == L"f" || inner == L"fp" || inner == L"m" ||
+                IsEnterCommand(inner) || IsPhysicalEnterCommand(inner))
+            {
+                writeLike = true;
+            }
+            break;
+        }
+
         if (command == L"setfield" || command == L"write" || command == L"f" || command == L"fp" || command == L"m")
         {
             writeLike = true;
@@ -4475,6 +4794,11 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
     return commandClass;
 }
 
+static bool ValidateAiPlanArgumentShape(
+    const std::wstring& command,
+    const std::vector<std::wstring>& args,
+    std::wstring* reason);
+
 static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* reason)
 {
     bool ok = false;
@@ -4491,11 +4815,43 @@ static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* r
             break;
         }
 
+        if (ContainsUnsafeAiCommandCharacters(item.Command, reason))
+        {
+            break;
+        }
+
         if (item.Command.size() > 1024)
         {
             if (reason != nullptr)
             {
                 *reason = L"command is too long";
+            }
+            break;
+        }
+
+        if (args.size() > 64)
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"command has too many arguments";
+            }
+            break;
+        }
+
+        if (TrimWhitespace(item.Purpose).empty())
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"plan command is missing purpose";
+            }
+            break;
+        }
+
+        if (item.Purpose.size() > 512 || item.Risk.size() > 128 || item.ExpectedOutput.size() > 512)
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"plan command metadata is too long";
             }
             break;
         }
@@ -4510,12 +4866,29 @@ static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* r
             break;
         }
 
-        if (command == L"q" || command == L"qq" || command == L"qd" ||
-            command == L"quit" || command == L"exit" || command == L"unload")
+        if (IsShutdownOrUnloadCommand(command))
         {
             if (reason != nullptr)
             {
                 *reason = L"shutdown and unload commands are not allowed in plans";
+            }
+            break;
+        }
+
+        if (command == L"backend" || command == L"kdinit" || command == L"kddetach")
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"backend/session mutation commands are not allowed in AI plans";
+            }
+            break;
+        }
+
+        if (command == L"probe")
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"probe service control is not allowed in AI plans";
             }
             break;
         }
@@ -4529,6 +4902,48 @@ static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* r
             break;
         }
 
+        if (command == L"kd" && args.size() >= 2)
+        {
+            std::wstring inner = NormalizeInputCommand(args[1]);
+            if (inner == L"ai" || IsShutdownOrUnloadCommand(inner))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"raw kd command wraps a blocked session command";
+                }
+                break;
+            }
+
+            if (IsWriteLikeCommandLine(item.Command))
+            {
+                if (!item.RequiresConfirmation)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"raw kd write-like command must require confirmation";
+                    }
+                    break;
+                }
+            }
+        }
+
+        if ((command == L"dt" || command == L"dtx" || command == L"ln" || command == L"x" ||
+             command == L"vtop" || command == L"u" || command == L"uf" ||
+             IsNativeMemoryDisplayCommand(command) || IsNativePhysicalReadCommand(command)) &&
+            args.size() < 2)
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"command is missing its required target argument";
+            }
+            break;
+        }
+
+        if (!ValidateAiPlanArgumentShape(command, args, reason))
+        {
+            break;
+        }
+
         if (!CommandRegistry::IsKnown(command) &&
             command != L"kd" &&
             (command.empty() || (command[0] != L'!' && command[0] != L'.')))
@@ -4538,6 +4953,107 @@ static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* r
                 *reason = L"unknown command; use kd <command> for raw DbgEng execution";
             }
             break;
+        }
+
+        if (!item.Backend.empty())
+        {
+            std::wstring backend = ToLower(TrimWhitespace(item.Backend));
+            if (backend != L"native" && backend != L"dbgeng" && backend != L"native+dbgeng" &&
+                backend != L"tui" && backend != L"auto" && backend != L"unknown")
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"unsupported backend expectation";
+                }
+                break;
+            }
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ValidateAiPlanArgumentShape(
+    const std::wstring& command,
+    const std::vector<std::wstring>& args,
+    std::wstring* reason)
+{
+    bool ok = false;
+
+    do
+    {
+        if (command == L"c")
+        {
+            if (args.size() < 4)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"compare command requires two addresses and a length";
+                }
+                break;
+            }
+        }
+        else if (command == L"s")
+        {
+            bool hasWidthOption = args.size() >= 2 &&
+                (ToLower(args[1]) == L"-b" || ToLower(args[1]) == L"-w" ||
+                 ToLower(args[1]) == L"-d" || ToLower(args[1]) == L"-q");
+            size_t minimum = hasWidthOption ? 5 : 4;
+            if (args.size() < minimum)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"search command requires address, length, and at least one value";
+                }
+                break;
+            }
+        }
+        else if (command == L"f" || command == L"fp")
+        {
+            if (args.size() < 4)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"fill command requires address, length, and byte pattern";
+                }
+                break;
+            }
+        }
+        else if (command == L"m")
+        {
+            if (args.size() < 4)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"move command requires source, destination, and length";
+                }
+                break;
+            }
+        }
+        else if (IsEnterCommand(command) || IsPhysicalEnterCommand(command))
+        {
+            if (args.size() < 3)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"write command requires target and at least one value";
+                }
+                break;
+            }
+        }
+        else if (command == L"vtop" && args.size() >= 2)
+        {
+            std::wstring option = ToLower(args[1]);
+            if ((option == L"/cr3" || option == L"/pid" || option == L"/process") && args.size() < 4)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"vtop option requires context value and address";
+                }
+                break;
+            }
         }
 
         ok = true;
@@ -4574,8 +5090,7 @@ static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason
             break;
         }
 
-        if (command == L"q" || command == L"qq" || command == L"qd" || command == L"quit" ||
-            command == L"exit" || command == L"unload")
+        if (IsShutdownOrUnloadCommand(command))
         {
             blocked = true;
             if (reason != nullptr)
@@ -4583,6 +5098,30 @@ static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason
                 *reason = L"session shutdown commands are blocked";
             }
             break;
+        }
+
+        if (command == L"backend" || command == L"kdinit" || command == L"kddetach" || command == L"probe")
+        {
+            blocked = true;
+            if (reason != nullptr)
+            {
+                *reason = L"session mutation commands are blocked";
+            }
+            break;
+        }
+
+        if (command == L"kd" && args.size() >= 2)
+        {
+            std::wstring inner = NormalizeInputCommand(args[1]);
+            if (IsShutdownOrUnloadCommand(inner))
+            {
+                blocked = true;
+                if (reason != nullptr)
+                {
+                    *reason = L"raw kd wraps a blocked session command";
+                }
+                break;
+            }
         }
 
         if (IsWriteLikeCommandLine(line))
@@ -4623,25 +5162,99 @@ static bool ParseAiPlanResponse(const std::wstring& responseText, AiPlanState* p
         AiPlanState parsed = {};
         PreserveAiSessionSettings(parsed, *plan);
         parsed.RawResponse = responseText;
+        ExtractJsonStringValue(json, L"schema", &parsed.Schema);
         ExtractJsonStringValue(json, L"title", &parsed.Title);
         ExtractJsonStringValue(json, L"summary", &parsed.Summary);
 
+        if (!parsed.Schema.empty() &&
+            parsed.Schema != L"kn-live-dbg.ai-plan.v1" &&
+            parsed.Schema != L"kn-live-dbg.ai-plan.v2")
+        {
+            if (error != nullptr)
+            {
+                *error = L"unsupported AI plan schema: " + parsed.Schema;
+            }
+            break;
+        }
+
         std::vector<std::wstring> objects = ExtractJsonArrayObjects(json, L"commands");
+        bool strictV2 = parsed.Schema == L"kn-live-dbg.ai-plan.v2";
+        if (objects.size() > 32)
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI plan has too many commands";
+            }
+            break;
+        }
+
         bool validationFailed = false;
         for (const std::wstring& object : objects)
         {
             AiCommandProposal item = {};
             ExtractJsonStringValue(object, L"command", &item.Command);
+            std::wstring rawCommand = item.Command;
             ExtractJsonStringValue(object, L"purpose", &item.Purpose);
             if (item.Purpose.empty())
             {
                 ExtractJsonStringValue(object, L"reason", &item.Purpose);
             }
             ExtractJsonStringValue(object, L"risk", &item.Risk);
+            ExtractJsonStringValue(object, L"backend", &item.Backend);
+            ExtractJsonStringValue(object, L"expected_output", &item.ExpectedOutput);
+            std::wstring rawRisk = item.Risk;
+            std::wstring rawBackend = item.Backend;
+            std::wstring rawExpectedOutput = item.ExpectedOutput;
             ExtractJsonBoolValue(object, L"requires_confirmation", &item.RequiresConfirmation);
             ExtractJsonBoolValue(object, L"write_like", &item.WriteLike);
+
+            std::wstring unsafeReason;
+            if (ContainsUnsafeAiCommandCharacters(rawCommand, &unsafeReason))
+            {
+                validationFailed = true;
+                if (error != nullptr)
+                {
+                    *error = L"AI plan command failed validation: " + unsafeReason;
+                }
+                break;
+            }
+
             item.Command = JoinArgs(Split(item.Command), 0);
+
+            if (item.Command.empty())
+            {
+                validationFailed = true;
+                if (error != nullptr)
+                {
+                    *error = L"AI plan command failed validation: empty command";
+                }
+                break;
+            }
+
+            if (strictV2 &&
+                (TrimWhitespace(rawRisk).empty() ||
+                 TrimWhitespace(rawBackend).empty() ||
+                 TrimWhitespace(rawExpectedOutput).empty()))
+            {
+                validationFailed = true;
+                if (error != nullptr)
+                {
+                    *error = L"AI plan command failed validation: v2 command metadata requires risk, backend, and expected_output command=" + item.Command;
+                }
+                break;
+            }
+
+            std::wstring commandClass = ClassifyCommandLine(item.Command, item.WriteLike || IsWriteLikeCommandLine(item.Command));
             item.WriteLike = item.WriteLike || IsWriteLikeCommandLine(item.Command);
+            item.Risk = NormalizeAiRiskText(item.Risk, item.WriteLike, commandClass);
+            if (item.Backend.empty())
+            {
+                item.Backend = InferAiPlanBackend(item.Command, commandClass);
+            }
+            else
+            {
+                item.Backend = ToLower(TrimWhitespace(item.Backend));
+            }
             if (item.WriteLike)
             {
                 item.RequiresConfirmation = true;
@@ -4650,10 +5263,7 @@ static bool ParseAiPlanResponse(const std::wstring& responseText, AiPlanState* p
                     item.Risk = L"write-like";
                 }
             }
-            else if (item.Risk.empty())
-            {
-                item.Risk = L"read-only";
-            }
+
             if (!item.Command.empty())
             {
                 std::wstring validationReason;
@@ -4699,14 +5309,16 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"Create a KnLiveDbg command plan for this operator request.\n";
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
-    stream << L"{\"title\":\"short title\",\"summary\":\"short summary\",\"commands\":[";
-    stream << L"{\"command\":\"exact KnLiveDbg command\",\"purpose\":\"why this command is useful\",\"risk\":\"read-only|write-like|dbgeng|unknown\",\"requires_confirmation\":true,\"write_like\":false}";
+    stream << L"{\"schema\":\"kn-live-dbg.ai-plan.v2\",\"title\":\"short title\",\"summary\":\"short summary\",\"commands\":[";
+    stream << L"{\"command\":\"exact KnLiveDbg command\",\"purpose\":\"why this command is useful\",\"risk\":\"read-only|write-like|dbgeng|unknown\",\"backend\":\"native|dbgeng|native+dbgeng|tui|auto|unknown\",\"expected_output\":\"what evidence this should produce\",\"requires_confirmation\":true,\"write_like\":false}";
     stream << L"]}\n";
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
     stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, vtop, pdb, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
+    stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
-    stream << L"- Do not include q, quit, exit, unload, or nested ai commands.\n";
+    stream << L"- Every command must include purpose, risk, backend, and expected_output.\n";
     stream << L"Operator request:\n";
     stream << prompt << L"\n";
 
@@ -4764,6 +5376,14 @@ static void PrintAiPlan(const AiPlanState& plan)
                 }
                 std::wcout << L"\n";
             }
+            if (!item.Backend.empty())
+            {
+                std::wcout << L"    backend: " << item.Backend << L"\n";
+            }
+            if (!item.ExpectedOutput.empty())
+            {
+                std::wcout << L"    expected: " << item.ExpectedOutput << L"\n";
+            }
         }
     } while (false);
 }
@@ -4816,6 +5436,10 @@ static std::wstring BuildAiSessionReport(
     }
     else
     {
+        if (!plan.Schema.empty())
+        {
+            stream << L"Schema: `" << plan.Schema << L"`\n\n";
+        }
         if (!plan.Title.empty())
         {
             stream << L"Title: " << plan.Title << L"\n\n";
@@ -4835,6 +5459,14 @@ static std::wstring BuildAiSessionReport(
             if (!item.Risk.empty())
             {
                 stream << L"- risk: " << item.Risk << L"\n";
+            }
+            if (!item.Backend.empty())
+            {
+                stream << L"- backend: " << item.Backend << L"\n";
+            }
+            if (!item.ExpectedOutput.empty())
+            {
+                stream << L"- expected output: " << item.ExpectedOutput << L"\n";
             }
             stream << L"- write-like: " << (item.WriteLike ? L"yes" : L"no") << L"\n";
             stream << L"- requires confirmation: " << (item.RequiresConfirmation ? L"yes" : L"no") << L"\n\n";
@@ -5084,7 +5716,14 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
         }
 
         std::wstring command = NormalizeInputCommand(commandArgs[0]);
-        if (IsEnterCommand(command))
+        if (command == L"kd")
+        {
+            plan.TargetKind = L"dbgeng-raw-write";
+            plan.Target = commandLine;
+            plan.ByteCountText = L"unknown";
+            plan.Warning = L"raw kd write-like command: automatic backup and restore are unavailable; prefer native e*, pe*, setfield, f, or m commands when possible";
+        }
+        else if (IsEnterCommand(command))
         {
             if (commandArgs.size() < 3)
             {
@@ -5545,6 +6184,9 @@ static std::wstring BuildAiEvidencePrompt(
     stream << instructions << L"\n\n";
     stream << L"Command:\n";
     stream << commandLine << L"\n\n";
+    stream << L"Deterministic output summary:\n```text\n";
+    stream << BuildCommandOutputSummary(result);
+    stream << L"\n```\n\n";
     stream << L"Stdout:\n```text\n";
     stream << TruncateForAiPrompt(result.Output, 60000);
     stream << L"\n```\n\n";
@@ -5638,6 +6280,7 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
 {
     AiPlanState plan = {};
     std::wstring key = ToLower(name);
+    plan.Schema = L"kn-live-dbg.ai-plan.v2";
 
     auto add = [&plan](const std::wstring& command, const std::wstring& purpose)
     {
@@ -5645,6 +6288,8 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
         item.Command = command;
         item.Purpose = purpose;
         item.Risk = L"read-only";
+        item.Backend = InferAiPlanBackend(command, ClassifyCommandLine(command, false));
+        item.ExpectedOutput = L"operator evidence for the playbook step";
         item.RequiresConfirmation = false;
         item.WriteLike = IsWriteLikeCommandLine(command);
         plan.Commands.push_back(item);
@@ -5758,7 +6403,7 @@ static bool RunAiPlannedCommands(
         else
         {
             size_t index = 0;
-            if (!ParseDecimalIndex(args[2], &index) || index > aiState.Commands.size())
+            if (!ParseDecimalIndex(args[2], &index) || index == 0 || index > aiState.Commands.size())
             {
                 std::wcerr << L"invalid AI plan index\n";
                 break;
@@ -5887,7 +6532,7 @@ static void HandleAiPlannedWrite(
         }
 
         size_t index = 0;
-        if (!ParseDecimalIndex(args[2], &index) || index > aiState.Commands.size())
+        if (!ParseDecimalIndex(args[2], &index) || index == 0 || index > aiState.Commands.size())
         {
             std::wcerr << L"invalid AI plan index\n";
             break;
