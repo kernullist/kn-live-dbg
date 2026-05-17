@@ -11,7 +11,7 @@ public:
     DbgEngBackend();
     ~DbgEngBackend();
 
-    bool Initialize(const std::wstring& symbolPath, const std::wstring& connectOptions, std::wstring* error);
+    bool Initialize(const std::wstring& symbolPath, const std::wstring& connectOptions, bool remoteKernel, std::wstring* error);
     void Shutdown();
     bool IsReady() const;
 

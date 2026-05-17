@@ -141,6 +141,110 @@ bool DeviceClient::QueryVersion(std::wstring* error)
     return ok;
 }
 
+bool DeviceClient::QuerySessionStatus(DriverSessionStatus* status, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (status == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid session status output";
+            }
+            break;
+        }
+
+        KNDBG_SESSION_STATUS_RESPONSE response = {};
+        DWORD returned = 0;
+        if (!Ioctl(IOCTL_KNDBG_GET_SESSION_STATUS, &response, 0, sizeof(response), &returned, error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(response))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short session status response";
+            }
+            break;
+        }
+
+        status->Flags = response.Flags;
+        status->OwnerPid = response.OwnerPid;
+        status->CurrentPid = response.CurrentPid;
+        status->OpenHandleCount = response.OpenHandleCount;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DeviceClient::ResolveProcess(
+    uint32_t processId,
+    uint32_t directoryTableBaseOffset,
+    uint32_t userDirectoryTableBaseOffset,
+    ProcessAddressContext* context,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (context == nullptr || processId == 0 || directoryTableBaseOffset == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid process resolve request";
+            }
+            break;
+        }
+
+        union
+        {
+            KNDBG_PROCESS_RESOLVE_REQUEST Request;
+            KNDBG_PROCESS_RESOLVE_RESPONSE Response;
+        } buffer = {};
+
+        buffer.Request.Size = sizeof(KNDBG_PROCESS_RESOLVE_REQUEST);
+        buffer.Request.ProcessId = processId;
+        buffer.Request.DirectoryTableBaseOffset = directoryTableBaseOffset;
+        buffer.Request.UserDirectoryTableBaseOffset = userDirectoryTableBaseOffset;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_RESOLVE_PROCESS,
+                &buffer,
+                sizeof(KNDBG_PROCESS_RESOLVE_REQUEST),
+                sizeof(KNDBG_PROCESS_RESOLVE_RESPONSE),
+                &returned,
+                error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(KNDBG_PROCESS_RESOLVE_RESPONSE))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short process resolve response";
+            }
+            break;
+        }
+
+        context->Flags = buffer.Response.Flags;
+        context->ProcessId = buffer.Response.ProcessId;
+        context->Eprocess = buffer.Response.Eprocess;
+        context->DirectoryTableBase = buffer.Response.DirectoryTableBase;
+        context->UserDirectoryTableBase = buffer.Response.UserDirectoryTableBase;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::SetWriteMode(bool enabled, std::wstring* error)
 {
     KNDBG_WRITE_MODE_REQUEST request = {};
@@ -381,6 +485,7 @@ bool DeviceClient::TranslateVirtual(
         info->RequestedLength = buffer.Response.RequestedLength;
         info->TranslatedLength = buffer.Response.TranslatedLength;
         info->Pml4e = buffer.Response.Pml4e;
+        info->Pml5e = buffer.Response.Pml5e;
         info->Pdpte = buffer.Response.Pdpte;
         info->Pde = buffer.Response.Pde;
         info->Pte = buffer.Response.Pte;

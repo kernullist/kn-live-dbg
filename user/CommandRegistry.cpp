@@ -86,6 +86,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"pdw", L"pdw", L"memory", L"display physical words", CommandSupport::Native),
         Make(L"pdd", L"pdd", L"memory", L"display physical dwords", CommandSupport::Native),
         Make(L"pdq", L"pdq", L"memory", L"display physical qwords", CommandSupport::Native),
+        Make(L"probe", L"probe", L"session", L"manage positive-control test driver", CommandSupport::Native),
+        Make(L"procctx", L"procctx", L"memory", L"set process DTB context for vtop", CommandSupport::Native),
         Make(L"peb", L"peb", L"memory", L"enter physical byte values", CommandSupport::Native),
         Make(L"pew", L"pew", L"memory", L"enter physical word values", CommandSupport::Native),
         Make(L"ped", L"ped", L"memory", L"enter physical dword values", CommandSupport::Native),

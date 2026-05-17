@@ -1,5 +1,6 @@
 #include "SymbolEngine.h"
 
+#include <dia2.h>
 #include <winternl.h>
 
 #include <algorithm>
@@ -8,6 +9,8 @@
 #include <sstream>
 
 #pragma comment(lib, "Dbghelp.lib")
+#pragma comment(lib, "diaguids.lib")
+#pragma comment(lib, "OleAut32.lib")
 
 typedef LONG NTSTATUS;
 
@@ -299,6 +302,165 @@ static std::wstring DescribeType(HANDLE process, DWORD64 moduleBase, ULONG typeI
     }
 
     return name;
+}
+
+template <typename T>
+static void ReleaseCom(T*& value)
+{
+    if (value != nullptr)
+    {
+        value->Release();
+        value = nullptr;
+    }
+}
+
+static std::wstring HResultText(const wchar_t* prefix, HRESULT hr)
+{
+    std::wstringstream stream;
+    stream << prefix << L": 0x" << std::hex << static_cast<unsigned long>(hr);
+    return stream.str();
+}
+
+static std::wstring BstrToWide(BSTR value)
+{
+    std::wstring result;
+
+    if (value != nullptr)
+    {
+        result.assign(value, SysStringLen(value));
+    }
+
+    return result;
+}
+
+static std::wstring DiaSymbolName(IDiaSymbol* symbol)
+{
+    std::wstring name;
+    BSTR rawName = nullptr;
+
+    if (symbol != nullptr && SUCCEEDED(symbol->get_name(&rawName)))
+    {
+        name = BstrToWide(rawName);
+    }
+
+    if (rawName != nullptr)
+    {
+        SysFreeString(rawName);
+    }
+
+    return name;
+}
+
+static std::wstring DiaDescribeType(IDiaSymbol* type, ULONG depth)
+{
+    std::wstring name;
+
+    do
+    {
+        if (type == nullptr)
+        {
+            break;
+        }
+
+        DWORD tag = 0;
+        type->get_symTag(&tag);
+
+        if (tag == SymTagPointerType)
+        {
+            IDiaSymbol* child = nullptr;
+            if (depth < 8 && SUCCEEDED(type->get_type(&child)) && child != nullptr)
+            {
+                name = DiaDescribeType(child, depth + 1);
+            }
+            ReleaseCom(child);
+
+            if (name.empty())
+            {
+                name = L"void";
+            }
+            name += L"*";
+            break;
+        }
+
+        if (tag == SymTagArrayType)
+        {
+            IDiaSymbol* child = nullptr;
+            if (depth < 8 && SUCCEEDED(type->get_type(&child)) && child != nullptr)
+            {
+                name = DiaDescribeType(child, depth + 1);
+            }
+            ReleaseCom(child);
+
+            DWORD count = 0;
+            type->get_count(&count);
+            if (name.empty())
+            {
+                name = L"<array>";
+            }
+
+            std::wstringstream stream;
+            stream << name << L"[" << count << L"]";
+            name = stream.str();
+            break;
+        }
+
+        if (tag == SymTagBaseType)
+        {
+            DWORD baseType = 0;
+            ULONGLONG length = 0;
+            type->get_baseType(&baseType);
+            type->get_length(&length);
+            name = BaseTypeName(baseType, length);
+            break;
+        }
+
+        name = DiaSymbolName(type);
+        if (!name.empty())
+        {
+            break;
+        }
+
+        IDiaSymbol* child = nullptr;
+        if (depth < 8 && SUCCEEDED(type->get_type(&child)) && child != nullptr)
+        {
+            name = DiaDescribeType(child, depth + 1);
+        }
+        ReleaseCom(child);
+    } while (false);
+
+    if (name.empty())
+    {
+        name = L"<unknown>";
+    }
+
+    return name;
+}
+
+static std::wstring GetLoadedPdbPath(HANDLE process, uint64_t moduleBase)
+{
+    std::wstring path;
+
+    do
+    {
+        if (moduleBase == 0)
+        {
+            break;
+        }
+
+        IMAGEHLP_MODULEW64 moduleInfo = {};
+        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
+        if (!SymGetModuleInfoW64(process, moduleBase, &moduleInfo))
+        {
+            break;
+        }
+
+        if (moduleInfo.LoadedPdbName[0] != L'\0')
+        {
+            path = moduleInfo.LoadedPdbName;
+        }
+    } while (false);
+
+    return path;
 }
 
 SymbolEngine::SymbolEngine() :
@@ -777,6 +939,300 @@ bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std:
     return ok;
 }
 
+bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t preferredModuleBase, TypeLayoutInfo* layout, std::wstring* error)
+{
+    bool ok = false;
+    bool coInitialized = false;
+
+    do
+    {
+        if (layout == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid DIA layout output";
+            }
+            break;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        if (modules_.empty())
+        {
+            if (!LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        std::wstring lookupTypeName = typeName;
+        std::wstring moduleFilter;
+        size_t bang = typeName.find(L'!');
+        if (bang != std::wstring::npos)
+        {
+            moduleFilter = typeName.substr(0, bang);
+            lookupTypeName = typeName.substr(bang + 1);
+        }
+
+        if (lookupTypeName.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid DIA type name";
+            }
+            break;
+        }
+
+        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(coHr))
+        {
+            coInitialized = true;
+        }
+        else if (coHr != RPC_E_CHANGED_MODE)
+        {
+            if (error != nullptr)
+            {
+                *error = HResultText(L"CoInitializeEx failed", coHr);
+            }
+            break;
+        }
+
+        std::wstring lastError;
+
+        for (const KernelModuleInfo& module : modules_)
+        {
+            if (preferredModuleBase != 0 && module.Base != preferredModuleBase)
+            {
+                continue;
+            }
+
+            if (!moduleFilter.empty() && !ModuleNameMatches(module.ImageName, moduleFilter))
+            {
+                continue;
+            }
+
+            std::wstring pdbPath = GetLoadedPdbPath(process_, module.Base);
+            if (pdbPath.empty())
+            {
+                continue;
+            }
+
+            IDiaDataSource* source = nullptr;
+            IDiaSession* session = nullptr;
+            IDiaSymbol* global = nullptr;
+            IDiaEnumSymbols* udtEnum = nullptr;
+            IDiaSymbol* udt = nullptr;
+
+            HRESULT hr = CoCreateInstance(CLSID_DiaSource, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), reinterpret_cast<void**>(&source));
+            if (FAILED(hr))
+            {
+                lastError = HResultText(L"CoCreateInstance CLSID_DiaSource failed", hr);
+                ReleaseCom(udt);
+                ReleaseCom(udtEnum);
+                ReleaseCom(global);
+                ReleaseCom(session);
+                ReleaseCom(source);
+                continue;
+            }
+
+            hr = source->loadDataFromPdb(pdbPath.c_str());
+            if (FAILED(hr))
+            {
+                lastError = HResultText(L"IDiaDataSource::loadDataFromPdb failed", hr);
+                ReleaseCom(udt);
+                ReleaseCom(udtEnum);
+                ReleaseCom(global);
+                ReleaseCom(session);
+                ReleaseCom(source);
+                continue;
+            }
+
+            hr = source->openSession(&session);
+            if (FAILED(hr))
+            {
+                lastError = HResultText(L"IDiaDataSource::openSession failed", hr);
+                ReleaseCom(udt);
+                ReleaseCom(udtEnum);
+                ReleaseCom(global);
+                ReleaseCom(session);
+                ReleaseCom(source);
+                continue;
+            }
+
+            session->put_loadAddress(module.Base);
+
+            hr = session->get_globalScope(&global);
+            if (FAILED(hr) || global == nullptr)
+            {
+                lastError = HResultText(L"IDiaSession::get_globalScope failed", hr);
+                ReleaseCom(udt);
+                ReleaseCom(udtEnum);
+                ReleaseCom(global);
+                ReleaseCom(session);
+                ReleaseCom(source);
+                continue;
+            }
+
+            hr = global->findChildren(SymTagUDT, lookupTypeName.c_str(), nsCaseInsensitive, &udtEnum);
+            if (FAILED(hr) || udtEnum == nullptr)
+            {
+                lastError = HResultText(L"DIA findChildren UDT failed", hr);
+                ReleaseCom(udt);
+                ReleaseCom(udtEnum);
+                ReleaseCom(global);
+                ReleaseCom(session);
+                ReleaseCom(source);
+                continue;
+            }
+
+            ULONG fetched = 0;
+            hr = udtEnum->Next(1, &udt, &fetched);
+            if (FAILED(hr) || fetched != 1 || udt == nullptr)
+            {
+                ReleaseCom(udt);
+                ReleaseCom(udtEnum);
+                ReleaseCom(global);
+                ReleaseCom(session);
+                ReleaseCom(source);
+                continue;
+            }
+
+            TypeLayoutInfo local = {};
+            local.Name = typeName;
+            local.ModuleBase = module.Base;
+            local.TypeId = 0;
+            local.Size = 0;
+
+            ULONGLONG typeLength = 0;
+            if (SUCCEEDED(udt->get_length(&typeLength)))
+            {
+                local.Size = typeLength;
+            }
+
+            IDiaEnumSymbols* dataEnum = nullptr;
+            hr = udt->findChildren(SymTagData, nullptr, nsNone, &dataEnum);
+            if (SUCCEEDED(hr) && dataEnum != nullptr)
+            {
+                while (true)
+                {
+                    IDiaSymbol* data = nullptr;
+                    fetched = 0;
+                    hr = dataEnum->Next(1, &data, &fetched);
+                    if (FAILED(hr) || fetched != 1 || data == nullptr)
+                    {
+                        ReleaseCom(data);
+                        break;
+                    }
+
+                    TypeFieldInfo field = {};
+                    field.ModuleBase = module.Base;
+                    field.TypeId = 0;
+                    field.ChildTypeId = 0;
+                    field.Offset = 0;
+                    field.Length = 0;
+                    field.Tag = SymTagData;
+                    field.ChildTag = 0;
+                    field.BaseType = 0;
+                    field.IsBitField = false;
+                    field.BitPosition = 0;
+                    field.Name = DiaSymbolName(data);
+
+                    LONG offset = 0;
+                    if (FAILED(data->get_offset(&offset)) || offset < 0 || field.Name.empty())
+                    {
+                        ReleaseCom(data);
+                        continue;
+                    }
+
+                    field.Offset = static_cast<ULONG>(offset);
+
+                    ULONGLONG dataLength = 0;
+                    if (SUCCEEDED(data->get_length(&dataLength)))
+                    {
+                        field.Length = dataLength;
+                    }
+
+                    DWORD bitPosition = 0;
+                    if (SUCCEEDED(data->get_bitPosition(&bitPosition)))
+                    {
+                        field.IsBitField = true;
+                        field.BitPosition = bitPosition;
+                    }
+
+                    IDiaSymbol* dataType = nullptr;
+                    if (SUCCEEDED(data->get_type(&dataType)) && dataType != nullptr)
+                    {
+                        DWORD childTag = 0;
+                        dataType->get_symTag(&childTag);
+                        field.ChildTag = childTag;
+                        dataType->get_baseType(&field.BaseType);
+                        if (field.Length == 0 || !field.IsBitField)
+                        {
+                            ULONGLONG childLength = 0;
+                            if (SUCCEEDED(dataType->get_length(&childLength)))
+                            {
+                                field.Length = childLength;
+                            }
+                        }
+                        field.TypeName = DiaDescribeType(dataType, 0);
+                    }
+                    ReleaseCom(dataType);
+
+                    if (field.TypeName.empty())
+                    {
+                        field.TypeName = L"<unknown>";
+                    }
+
+                    local.Fields.push_back(field);
+                    ReleaseCom(data);
+                }
+            }
+            ReleaseCom(dataEnum);
+
+            std::sort(
+                local.Fields.begin(),
+                local.Fields.end(),
+                [](const TypeFieldInfo& left, const TypeFieldInfo& right)
+                {
+                    if (left.Offset != right.Offset)
+                    {
+                        return left.Offset < right.Offset;
+                    }
+
+                    return left.BitPosition < right.BitPosition;
+                });
+
+            *layout = local;
+            ok = true;
+
+            ReleaseCom(udt);
+            ReleaseCom(udtEnum);
+            ReleaseCom(global);
+            ReleaseCom(session);
+            ReleaseCom(source);
+            break;
+        }
+
+        if (!ok && error != nullptr)
+        {
+            *error = lastError.empty() ? L"DIA type lookup failed" : lastError;
+        }
+    } while (false);
+
+    if (coInitialized)
+    {
+        CoUninitialize();
+    }
+
+    return ok;
+}
+
 bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
 {
     bool ok = false;
@@ -987,9 +1443,17 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
 
             if (!found)
             {
+                std::wstring dbgHelpError = DbgHelpErrorText(L"SymGetTypeFromNameW failed", GetLastError());
+                std::wstring diaError;
+                if (GetTypeLayoutWithDia(typeName, 0, layout, &diaError))
+                {
+                    ok = true;
+                    break;
+                }
+
                 if (error != nullptr)
                 {
-                    *error = DbgHelpErrorText(L"SymGetTypeFromNameW failed", GetLastError());
+                    *error = dbgHelpError + L"; DIA fallback failed: " + diaError;
                 }
                 break;
             }
@@ -1027,6 +1491,18 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
 
         if (!GetTypeLayoutById(moduleBase, typeId, typeName, layout, error))
         {
+            std::wstring dbgHelpError = error != nullptr ? *error : L"DbgHelp type layout failed";
+            std::wstring diaError;
+            if (GetTypeLayoutWithDia(typeName, moduleBase, layout, &diaError))
+            {
+                ok = true;
+                break;
+            }
+
+            if (error != nullptr)
+            {
+                *error = dbgHelpError + L"; DIA fallback failed: " + diaError;
+            }
             break;
         }
 

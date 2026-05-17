@@ -3,14 +3,23 @@
 #include <intrin.h>
 #include "../shared/KnLiveDbgIoctl.h"
 
+extern "C"
+NTKERNELAPI
+NTSTATUS
+PsLookupProcessByProcessId(
+    HANDLE ProcessId,
+    PEPROCESS* Process);
+
 #if defined(_M_X64)
 #pragma intrinsic(__readcr3)
+#pragma intrinsic(__readcr4)
 #endif
 
 typedef struct _KNDBG_FILE_CONTEXT
 {
     ULONG OwnerPid;
     BOOLEAN WriteEnabled;
+    BOOLEAN OwnsController;
 } KNDBG_FILE_CONTEXT, *PKNDBG_FILE_CONTEXT;
 
 static DRIVER_UNLOAD KnDbgUnload;
@@ -26,6 +35,7 @@ static const ULONGLONG KNDBG_PTE_2MB_BASE_MASK = 0x000fffffffe00000ull;
 static const ULONGLONG KNDBG_PTE_1GB_BASE_MASK = 0x000fffffc0000000ull;
 static const ULONGLONG KNDBG_2MB_PAGE_SIZE = 0x200000ull;
 static const ULONGLONG KNDBG_1GB_PAGE_SIZE = 0x40000000ull;
+static const ULONGLONG KNDBG_CR4_LA57 = 0x1000ull;
 static const GUID KNDBG_DEVICE_CLASS_GUID =
 {
     0x4c2d7102,
@@ -33,6 +43,10 @@ static const GUID KNDBG_DEVICE_CLASS_GUID =
     0x4e3f,
     {0x95, 0x92, 0x6f, 0x9f, 0xb0, 0x2d, 0x46, 0x78}
 };
+
+static FAST_MUTEX g_KnDbgOwnerLock;
+static ULONG g_KnDbgOwnerPid = 0;
+static ULONG g_KnDbgOwnerOpenCount = 0;
 
 static NTSTATUS KnDbgCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
@@ -173,14 +187,31 @@ static SIZE_T KnDbgMinSize(SIZE_T Left, SIZE_T Right)
     return Left < Right ? Left : Right;
 }
 
-static bool KnDbgIsCanonicalAddress(ULONGLONG VirtualAddress)
+static bool KnDbgIsLa57Active()
+{
+    bool active = false;
+
+    do
+    {
+#if defined(_M_X64)
+        active = (__readcr4() & KNDBG_CR4_LA57) != 0;
+#endif
+    } while (false);
+
+    return active;
+}
+
+static bool KnDbgIsCanonicalAddress(ULONGLONG VirtualAddress, bool La57Active)
 {
     bool canonical = false;
 
     do
     {
-        ULONGLONG high = VirtualAddress >> 48;
-        ULONGLONG sign = (VirtualAddress >> 47) & 0x1ull;
+        ULONG signBit = La57Active ? 56u : 47u;
+        ULONG highShift = La57Active ? 57u : 48u;
+        ULONGLONG high = VirtualAddress >> highShift;
+        ULONGLONG sign = (VirtualAddress >> signBit) & 0x1ull;
+        ULONGLONG expectedHigh = La57Active ? 0x7full : 0xffffull;
 
         if (sign == 0)
         {
@@ -188,11 +219,74 @@ static bool KnDbgIsCanonicalAddress(ULONGLONG VirtualAddress)
         }
         else
         {
-            canonical = high == 0xffffull;
+            canonical = high == expectedHigh;
         }
     } while (false);
 
     return canonical;
+}
+
+static NTSTATUS KnDbgAcquireController(PKNDBG_FILE_CONTEXT FileContext)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    do
+    {
+        if (FileContext == nullptr)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        ULONG currentPid = HandleToULong(PsGetCurrentProcessId());
+        ExAcquireFastMutex(&g_KnDbgOwnerLock);
+
+        if (g_KnDbgOwnerPid != 0 && g_KnDbgOwnerPid != currentPid)
+        {
+            status = STATUS_DEVICE_BUSY;
+        }
+        else
+        {
+            g_KnDbgOwnerPid = currentPid;
+            ++g_KnDbgOwnerOpenCount;
+            FileContext->OwnerPid = currentPid;
+            FileContext->OwnsController = TRUE;
+            status = STATUS_SUCCESS;
+        }
+
+        ExReleaseFastMutex(&g_KnDbgOwnerLock);
+    } while (false);
+
+    return status;
+}
+
+static void KnDbgReleaseController(PKNDBG_FILE_CONTEXT FileContext)
+{
+    do
+    {
+        if (FileContext == nullptr || FileContext->OwnsController == FALSE)
+        {
+            break;
+        }
+
+        ExAcquireFastMutex(&g_KnDbgOwnerLock);
+
+        if (g_KnDbgOwnerPid == FileContext->OwnerPid)
+        {
+            if (g_KnDbgOwnerOpenCount > 0)
+            {
+                --g_KnDbgOwnerOpenCount;
+            }
+
+            if (g_KnDbgOwnerOpenCount == 0)
+            {
+                g_KnDbgOwnerPid = 0;
+            }
+        }
+
+        ExReleaseFastMutex(&g_KnDbgOwnerLock);
+        FileContext->OwnsController = FALSE;
+    } while (false);
 }
 
 static NTSTATUS KnDbgReadPhysicalAddress(ULONGLONG PhysicalAddress, PVOID Output, SIZE_T Length, PSIZE_T BytesCopied)
@@ -357,7 +451,8 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
             break;
         }
 
-        if (!KnDbgIsCanonicalAddress(VirtualAddress))
+        bool la57Active = KnDbgIsLa57Active();
+        if (!KnDbgIsCanonicalAddress(VirtualAddress, la57Active))
         {
             status = STATUS_ACCESS_VIOLATION;
             break;
@@ -386,16 +481,40 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
         RtlZeroMemory(Response, sizeof(KNDBG_TRANSLATE_VIRTUAL_RESPONSE));
         Response->Size = sizeof(KNDBG_TRANSLATE_VIRTUAL_RESPONSE);
         Response->Flags = flags;
+        if (la57Active)
+        {
+            Response->Flags |= KNDBG_TRANSLATE_FLAG_LA57_ACTIVE;
+        }
         Response->DirectoryTableBase = directoryTableBase;
         Response->VirtualAddress = VirtualAddress;
         Response->RequestedLength = Length;
+
+        ULONGLONG pml4Base = directoryTableBase;
+        if (la57Active)
+        {
+            ULONGLONG pml5Index = (VirtualAddress >> 48) & 0x1ffull;
+            ULONGLONG pml5eAddress = directoryTableBase + pml5Index * sizeof(ULONGLONG);
+            status = KnDbgReadPhysicalU64(pml5eAddress, &Response->Pml5e);
+            if (!NT_SUCCESS(status))
+            {
+                break;
+            }
+
+            if ((Response->Pml5e & KNDBG_PTE_PRESENT) == 0)
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                break;
+            }
+
+            pml4Base = Response->Pml5e & KNDBG_PTE_4K_BASE_MASK;
+        }
 
         ULONGLONG pml4Index = (VirtualAddress >> 39) & 0x1ffull;
         ULONGLONG pdptIndex = (VirtualAddress >> 30) & 0x1ffull;
         ULONGLONG pdIndex = (VirtualAddress >> 21) & 0x1ffull;
         ULONGLONG ptIndex = (VirtualAddress >> 12) & 0x1ffull;
 
-        ULONGLONG pml4eAddress = directoryTableBase + pml4Index * sizeof(ULONGLONG);
+        ULONGLONG pml4eAddress = pml4Base + pml4Index * sizeof(ULONGLONG);
         status = KnDbgReadPhysicalU64(pml4eAddress, &Response->Pml4e);
         if (!NT_SUCCESS(status))
         {
@@ -513,13 +632,148 @@ static NTSTATUS KnDbgHandleGetVersion(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID 
         response->Size = sizeof(KNDBG_VERSION_RESPONSE);
         response->AbiVersion = KNDBG_ABI_VERSION;
         response->DriverMajor = 0;
-        response->DriverMinor = 3;
+        response->DriverMinor = 4;
         response->MaxTransferSize = KNDBG_MAX_TRANSFER_SIZE;
-        response->Flags = 0;
+        response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER;
+        if (KnDbgIsLa57Active())
+        {
+            response->Flags |= KNDBG_VERSION_FLAG_LA57_ACTIVE;
+        }
 
         information = sizeof(KNDBG_VERSION_RESPONSE);
         status = STATUS_SUCCESS;
     } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
+static NTSTATUS KnDbgHandleSessionStatus(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        if (Buffer == nullptr || Stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(KNDBG_SESSION_STATUS_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, Stack->Parameters.DeviceIoControl.OutputBufferLength);
+
+        KNDBG_SESSION_STATUS_RESPONSE* response = reinterpret_cast<KNDBG_SESSION_STATUS_RESPONSE*>(Buffer);
+        response->Size = sizeof(KNDBG_SESSION_STATUS_RESPONSE);
+        response->CurrentPid = HandleToULong(PsGetCurrentProcessId());
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext != nullptr && fileContext->WriteEnabled != FALSE)
+        {
+            response->Flags |= KNDBG_SESSION_FLAG_WRITE_ENABLED;
+        }
+
+        ExAcquireFastMutex(&g_KnDbgOwnerLock);
+        response->OwnerPid = g_KnDbgOwnerPid;
+        response->OpenHandleCount = g_KnDbgOwnerOpenCount;
+        if (g_KnDbgOwnerPid != 0)
+        {
+            response->Flags |= KNDBG_SESSION_FLAG_OWNER_ACTIVE;
+        }
+        ExReleaseFastMutex(&g_KnDbgOwnerLock);
+
+        information = sizeof(KNDBG_SESSION_STATUS_RESPONSE);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
+static NTSTATUS KnDbgHandleResolveProcess(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+    PEPROCESS process = nullptr;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_PROCESS_RESOLVE_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (outputLength < sizeof(KNDBG_PROCESS_RESOLVE_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        KNDBG_PROCESS_RESOLVE_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+        if (request.ProcessId == 0 || request.DirectoryTableBaseOffset == 0 || request.DirectoryTableBaseOffset > 0x4000)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (request.UserDirectoryTableBaseOffset > 0x4000)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        status = PsLookupProcessByProcessId(ULongToHandle(request.ProcessId), &process);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+
+        ULONGLONG directoryTableBase = 0;
+        ULONGLONG userDirectoryTableBase = 0;
+        __try
+        {
+            PUCHAR base = reinterpret_cast<PUCHAR>(process);
+            RtlCopyMemory(&directoryTableBase, base + request.DirectoryTableBaseOffset, sizeof(directoryTableBase));
+            if (request.UserDirectoryTableBaseOffset != 0)
+            {
+                RtlCopyMemory(&userDirectoryTableBase, base + request.UserDirectoryTableBaseOffset, sizeof(userDirectoryTableBase));
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            status = GetExceptionCode();
+            break;
+        }
+
+        if (directoryTableBase == 0)
+        {
+            status = STATUS_INVALID_ADDRESS;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, outputLength);
+        KNDBG_PROCESS_RESOLVE_RESPONSE* response = reinterpret_cast<KNDBG_PROCESS_RESOLVE_RESPONSE*>(Buffer);
+        response->Size = sizeof(KNDBG_PROCESS_RESOLVE_RESPONSE);
+        response->ProcessId = request.ProcessId;
+        response->Eprocess = reinterpret_cast<KNDBG_UINT64>(process);
+        response->DirectoryTableBase = directoryTableBase & KNDBG_PTE_4K_BASE_MASK;
+        response->UserDirectoryTableBase = userDirectoryTableBase & KNDBG_PTE_4K_BASE_MASK;
+        if (response->UserDirectoryTableBase != 0)
+        {
+            response->Flags |= KNDBG_PROCESS_FLAG_USER_DTB_AVAILABLE;
+        }
+
+        information = sizeof(KNDBG_PROCESS_RESOLVE_RESPONSE);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    if (process != nullptr)
+    {
+        ObDereferenceObject(process);
+    }
 
     return KnDbgCompleteIrp(Irp, status, information);
 }
@@ -891,6 +1145,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     do
     {
+        ExInitializeFastMutex(&g_KnDbgOwnerLock);
+        g_KnDbgOwnerPid = 0;
+        g_KnDbgOwnerOpenCount = 0;
+
         for (ULONG index = 0; index <= IRP_MJ_MAXIMUM_FUNCTION; ++index)
         {
             DriverObject->MajorFunction[index] = KnDbgNotSupportedDispatch;
@@ -980,8 +1238,14 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
 
             RtlZeroMemory(fileContext, sizeof(KNDBG_FILE_CONTEXT));
-            fileContext->OwnerPid = HandleToULong(PsGetCurrentProcessId());
             fileContext->WriteEnabled = TRUE;
+            status = KnDbgAcquireController(fileContext);
+            if (!NT_SUCCESS(status))
+            {
+                ExFreePoolWithTag(fileContext, 'gDnK');
+                break;
+            }
+
             stack->FileObject->FsContext = fileContext;
         }
         else
@@ -990,6 +1254,7 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             if (fileContext != nullptr)
             {
                 stack->FileObject->FsContext = nullptr;
+                KnDbgReleaseController(fileContext);
                 ExFreePoolWithTag(fileContext, 'gDnK');
             }
         }
@@ -1031,6 +1296,12 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_WRITE_PHYSICAL:
         status = KnDbgHandleWritePhysical(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_GET_SESSION_STATUS:
+        status = KnDbgHandleSessionStatus(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_RESOLVE_PROCESS:
+        status = KnDbgHandleResolveProcess(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

@@ -61,5 +61,8 @@
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

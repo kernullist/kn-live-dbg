@@ -6,6 +6,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgDriver", "driver\K
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbg", "user\KnLiveDbg.vcxproj", "{7C391075-4214-49AB-A269-A0E7A37C1B45}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgProbeDriver", "probe_driver\KnLiveDbgProbeDriver.vcxproj", "{C2F86C86-6E65-4F53-A35A-D92B91B7A2C3}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -20,6 +22,10 @@ Global
 		{7C391075-4214-49AB-A269-A0E7A37C1B45}.Debug|x64.Build.0 = Debug|x64
 		{7C391075-4214-49AB-A269-A0E7A37C1B45}.Release|x64.ActiveCfg = Release|x64
 		{7C391075-4214-49AB-A269-A0E7A37C1B45}.Release|x64.Build.0 = Release|x64
+		{C2F86C86-6E65-4F53-A35A-D92B91B7A2C3}.Debug|x64.ActiveCfg = Debug|x64
+		{C2F86C86-6E65-4F53-A35A-D92B91B7A2C3}.Debug|x64.Build.0 = Debug|x64
+		{C2F86C86-6E65-4F53-A35A-D92B91B7A2C3}.Release|x64.ActiveCfg = Release|x64
+		{C2F86C86-6E65-4F53-A35A-D92B91B7A2C3}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

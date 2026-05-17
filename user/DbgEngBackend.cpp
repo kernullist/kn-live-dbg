@@ -134,7 +134,11 @@ DbgEngBackend::~DbgEngBackend()
     impl_ = nullptr;
 }
 
-bool DbgEngBackend::Initialize(const std::wstring& symbolPath, const std::wstring& connectOptions, std::wstring* error)
+bool DbgEngBackend::Initialize(
+    const std::wstring& symbolPath,
+    const std::wstring& connectOptions,
+    bool remoteKernel,
+    std::wstring* error)
 {
     bool ok = false;
 
@@ -221,13 +225,24 @@ bool DbgEngBackend::Initialize(const std::wstring& symbolPath, const std::wstrin
             }
         }
 
+        if (remoteKernel && connectOptions.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"remote KD requires connection options";
+            }
+            break;
+        }
+
         const wchar_t* options = connectOptions.empty() ? nullptr : connectOptions.c_str();
-        result = impl_->Client->AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, options);
+        result = impl_->Client->AttachKernelWide(
+            remoteKernel ? DEBUG_ATTACH_KERNEL_CONNECTION : DEBUG_ATTACH_LOCAL_KERNEL,
+            options);
         if (FAILED(result))
         {
             if (error != nullptr)
             {
-                *error = HResultText(L"AttachKernelWide local kernel failed", result);
+                *error = HResultText(remoteKernel ? L"AttachKernelWide remote kernel failed" : L"AttachKernelWide local kernel failed", result);
             }
             break;
         }

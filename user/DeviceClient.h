@@ -17,9 +17,27 @@ struct PhysicalTranslationInfo
     uint32_t RequestedLength;
     uint32_t TranslatedLength;
     uint64_t Pml4e;
+    uint64_t Pml5e;
     uint64_t Pdpte;
     uint64_t Pde;
     uint64_t Pte;
+};
+
+struct DriverSessionStatus
+{
+    uint32_t Flags;
+    uint32_t OwnerPid;
+    uint32_t CurrentPid;
+    uint32_t OpenHandleCount;
+};
+
+struct ProcessAddressContext
+{
+    uint32_t Flags;
+    uint32_t ProcessId;
+    uint64_t Eprocess;
+    uint64_t DirectoryTableBase;
+    uint64_t UserDirectoryTableBase;
 };
 
 class DeviceClient
@@ -33,6 +51,13 @@ public:
     bool IsOpen() const;
 
     bool QueryVersion(std::wstring* error);
+    bool QuerySessionStatus(DriverSessionStatus* status, std::wstring* error);
+    bool ResolveProcess(
+        uint32_t processId,
+        uint32_t directoryTableBaseOffset,
+        uint32_t userDirectoryTableBaseOffset,
+        ProcessAddressContext* context,
+        std::wstring* error);
     bool SetWriteMode(bool enabled, std::wstring* error);
     bool ReadMemory(uint64_t address, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error);
     bool WriteMemory(uint64_t address, const std::vector<uint8_t>& bytes, std::wstring* error);

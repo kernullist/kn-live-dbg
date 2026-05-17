@@ -10,14 +10,17 @@ Kn Live Dbg follows a LiveKD-style split:
    - Validates IOCTL buffers and sizes.
    - Uses `MmCopyMemory` for virtual reads.
    - Walks x64 page tables for VA-to-PA translation.
+   - Detects active LA57 and includes PML5E in translation responses when five-level paging is enabled.
    - Uses `MmCopyMemory` for physical reads.
    - Uses page-sized `MmMapIoSpaceEx` mappings for physical writes.
    - Keeps write access controlled per open handle, with writes enabled by default.
+   - Enforces one active controller PID at a time.
 
 2. User-mode TUI
    - Owns driver install/load/unload through SCM.
    - Owns kernel module enumeration.
    - Owns symbol path, PDB loading, type lookup, and field offset resolution.
+   - Uses DIA SDK as a fallback when `DbgHelp` cannot return complete UDT field metadata.
    - Owns PDB-driven callback list decoding for object, registry, process, and minifilter callbacks.
    - Presents Windbg-like commands.
    - Optionally attaches a DbgEng local-kernel backend for commands that need debugger-engine semantics.
@@ -38,6 +41,8 @@ Current calls:
 6. `IOCTL_KNDBG_TRANSLATE_VIRTUAL`
 7. `IOCTL_KNDBG_READ_PHYSICAL`
 8. `IOCTL_KNDBG_WRITE_PHYSICAL`
+9. `IOCTL_KNDBG_GET_SESSION_STATUS`
+10. `IOCTL_KNDBG_RESOLVE_PROCESS`
 
 All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size.
 
@@ -45,11 +50,13 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 
 1. `vtop` sends a virtual address, optional directory-table base, and requested length to the driver.
 2. If the directory-table base is zero, the driver uses the current x64 CR3.
-3. The driver reads PML4E, PDPTE, PDE, and PTE entries with `MmCopyMemory(..., MM_COPY_MEMORY_PHYSICAL)`.
-4. The walk supports 4 KB pages plus 2 MB and 1 GB large pages.
-5. The response reports CR3, VA, PA, page size, page offset, contiguous translated bytes, and the page-table entries that were used.
-6. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
-7. `peb`, `pew`, `ped`, and `peq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; write mode starts enabled and can be disabled with `write off`.
+3. `vtop /pid` and `procctx <pid>` resolve process DTBs by asking the driver to read PDB-resolved EPROCESS offsets.
+4. The driver reads PML5E when LA57 is active, then PML4E, PDPTE, PDE, and PTE entries with `MmCopyMemory(..., MM_COPY_MEMORY_PHYSICAL)`.
+5. The walk supports 4 KB pages plus 2 MB and 1 GB large pages.
+6. The response reports CR3, VA, PA, page size, page offset, contiguous translated bytes, and the page-table entries that were used.
+7. `d*` and `e*` can use `/pid <pid>` or a stored `procctx` to translate user VAs page-by-page and then perform physical reads/writes.
+8. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
+9. `peb`, `pew`, `ped`, and `peq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; write mode starts enabled and can be disabled with `write off`.
 
 ## Symbol Flow
 
@@ -58,10 +65,11 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 3. TUI calls `SymLoadModuleExW` for each loaded kernel image.
 4. `addr` uses `SymFromNameW`.
 5. `dt` uses `SymGetTypeFromNameW` and `SymGetTypeInfo`.
-6. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
-7. `u` resolves an address or symbol with the native symbol engine, then calls DbgEng `DisassembleWide` directly for bounded instruction output.
-8. `uf` is an explicit function-disassembly command that uses DbgEng function-boundary logic.
-9. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
+6. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA and recovers field names, offsets, lengths, bit positions, and type names.
+7. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
+8. `u` resolves an address or symbol with the native symbol engine, then calls DbgEng `DisassembleWide` directly for bounded instruction output.
+9. `uf` is an explicit function-disassembly command that uses DbgEng function-boundary logic.
+10. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
 
 ## Callback Scanner Flow
 
@@ -77,7 +85,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 3. It installs an `IDebugOutputCallbacksWide` capture sink.
 4. It queries `IDebugControl4` and `IDebugSymbols3`.
 5. It mirrors the current symbol path into DbgEng.
-6. It attaches with `AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, nullptr)`.
+6. It attaches with `AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, nullptr)` for local mode or `AttachKernelWide(DEBUG_ATTACH_KERNEL_CONNECTION, connectionOptions)` for remote mode.
 7. Raw commands are executed with `IDebugControl4::ExecuteWide`.
 
 The DbgEng backend is intentionally isolated from the native memory backend. Native read/write operations still go through `KnLiveDbg.sys`, while DbgEng commands execute through the debugger engine.
@@ -118,12 +126,7 @@ Backend routing is mode-dependent:
 
 ## Hardening Backlog
 
-1. Add a global single-controller policy so only one PID can own the device at a time.
-2. Add an optional EPROCESS/DirectoryTableBase resolver for process-specific user VA translation.
-3. Add LA57 detection if five-level paging becomes a supported target.
-4. Add DIA fallback for richer type metadata and bitfield handling.
-5. Add a positive-control test driver that exposes known virtual and physical test buffers.
-6. Add an optional remote KD connection mode once the local-kernel path is stable.
+No large hardening backlog item is currently left open in this document. New work should be added here once it is scoped.
 
 Completed hardening items:
 
@@ -134,3 +137,9 @@ Completed hardening items:
 5. Write verification before/after diff rendering is implemented for confirmed AI write commands.
 6. AI plan command schema validation is implemented before plan storage.
 7. Local-only AI provider policy is implemented with `ai policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`.
+8. Single-controller ownership is implemented in the driver and reported by `drvstatus`.
+9. Process DTB resolution is implemented with PDB-resolved EPROCESS offsets and `procctx`/`vtop /pid`.
+10. LA57 detection and PML5E reporting are implemented in the page-table walker.
+11. DIA fallback is implemented for UDT field metadata when `DbgHelp` fails.
+12. `KnLiveDbgProbe.sys` provides a positive-control contiguous virtual and physical test buffer.
+13. Remote KD attach is available through `kdinit /remote <connection-options>`.

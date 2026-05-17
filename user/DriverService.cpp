@@ -85,6 +85,13 @@ static bool ResolveDriverPath(const std::wstring& driverPath, std::wstring* reso
 }
 
 DriverService::DriverService() :
+    DriverService(KNDBG_SERVICE_NAME, KNDBG_DISPLAY_NAME)
+{
+}
+
+DriverService::DriverService(const wchar_t* serviceName, const wchar_t* displayName) :
+    serviceName_(serviceName != nullptr ? serviceName : L""),
+    displayName_(displayName != nullptr ? displayName : L""),
     manager_(nullptr),
     service_(nullptr)
 {
@@ -191,7 +198,7 @@ bool DriverService::OpenServiceHandle(DWORD access, DWORD* serviceError, std::ws
             break;
         }
 
-        service_ = OpenServiceW(manager_, KNDBG_SERVICE_NAME, access);
+        service_ = OpenServiceW(manager_, serviceName_.c_str(), access);
         if (service_ == nullptr)
         {
             DWORD lastError = GetLastError();
@@ -311,7 +318,7 @@ bool DriverService::WaitUntilDeleted(DWORD timeoutMs, std::wstring* error)
 
         while (true)
         {
-            SC_HANDLE service = OpenServiceW(manager_, KNDBG_SERVICE_NAME, SERVICE_QUERY_STATUS);
+            SC_HANDLE service = OpenServiceW(manager_, serviceName_.c_str(), SERVICE_QUERY_STATUS);
             if (service == nullptr)
             {
                 DWORD lastError = GetLastError();
@@ -450,7 +457,7 @@ bool DriverService::Install(const std::wstring& driverPath, std::wstring* error)
 
         service_ = OpenServiceW(
             manager_,
-            KNDBG_SERVICE_NAME,
+            serviceName_.c_str(),
             SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
 
         if (service_ != nullptr)
@@ -466,7 +473,7 @@ bool DriverService::Install(const std::wstring& driverPath, std::wstring* error)
                 nullptr,
                 nullptr,
                 nullptr,
-                KNDBG_DISPLAY_NAME))
+                displayName_.c_str()))
             {
                 if (error != nullptr)
                 {
@@ -499,8 +506,8 @@ bool DriverService::Install(const std::wstring& driverPath, std::wstring* error)
         CloseServiceHandle();
         service_ = CreateServiceW(
             manager_,
-            KNDBG_SERVICE_NAME,
-            KNDBG_DISPLAY_NAME,
+            serviceName_.c_str(),
+            displayName_.c_str(),
             SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE,
             SERVICE_KERNEL_DRIVER,
             SERVICE_DEMAND_START,

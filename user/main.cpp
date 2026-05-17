@@ -7,6 +7,7 @@
 #include "SymbolEngine.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
+#include "../shared/KnLiveDbgProbeIoctl.h"
 
 #include <Windows.h>
 #include <shellapi.h>
@@ -22,14 +23,34 @@
 
 static std::atomic_bool g_StopRequested = false;
 
+static std::wstring FormatWin32Error(const wchar_t* prefix, DWORD error)
+{
+    wchar_t buffer[512] = {};
+    FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        error,
+        0,
+        buffer,
+        static_cast<DWORD>(_countof(buffer)),
+        nullptr);
+
+    std::wstringstream stream;
+    stream << prefix << L": " << error << L" " << buffer;
+    return stream.str();
+}
+
 struct DebuggerState
 {
     uint32_t NumberBase;
     bool Quiet;
     std::wstring LastCommand;
     std::wstring DbgEngConnectOptions;
+    bool DbgEngRemoteKernel;
     uint64_t LastDisassemblyAddress;
     bool HasLastDisassemblyAddress;
+    bool HasProcessContext;
+    ProcessAddressContext ProcessContext;
     enum class BackendMode
     {
         Auto,
@@ -384,8 +405,13 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  dt nt!_EPROCESS <address>\n";
     std::wcout << L"  callbacks all\n";
     std::wcout << L"  callbacks json all .\\callbacks.json\n";
+    std::wcout << L"  procctx <pid>\n";
+    std::wcout << L"  vtop /pid <pid> <user-address>\n";
+    std::wcout << L"  db /pid <pid> <user-address> 80\n";
     std::wcout << L"  vtop nt!PsLoadedModuleList\n";
     std::wcout << L"  pdb <physical-address> 80\n";
+    std::wcout << L"  probe load\n";
+    std::wcout << L"  probe info\n";
     std::wcout << L"  kdinit\n";
     std::wcout << L"  backend dbgeng\n";
     std::wcout << L"  !process 0 0\n";
@@ -426,7 +452,7 @@ static bool EnsureDbgEng(DbgEngBackend& dbgeng, SymbolEngine& symbols, const Deb
             break;
         }
 
-        if (!dbgeng.Initialize(symbols.SymbolPath(), state.DbgEngConnectOptions, error))
+        if (!dbgeng.Initialize(symbols.SymbolPath(), state.DbgEngConnectOptions, state.DbgEngRemoteKernel, error))
         {
             break;
         }
@@ -1194,6 +1220,22 @@ static void HandleDtCommand(
     } while (false);
 }
 
+static bool ResolveProcessAddressContext(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint32_t processId,
+    ProcessAddressContext* context,
+    std::wstring* error);
+
+static bool ReadMemoryWithProcessContext(
+    DeviceClient& device,
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address,
+    uint32_t length,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error);
+
 static void HandleDisplayCommand(
     const std::vector<std::wstring>& args,
     const DebuggerState& state,
@@ -1207,12 +1249,40 @@ static void HandleDisplayCommand(
     {
         if (args.size() < 2)
         {
-            std::wcerr << L"usage: " << command << L" <address|symbol> [count]\n";
+            std::wcerr << L"usage: " << command << L" [/pid <process-id>] <address|symbol> [count]\n";
             break;
         }
 
+        size_t argIndex = 1;
+        ProcessAddressContext explicitContext = {};
+        bool hasExplicitContext = false;
+        if (ToLower(args[argIndex]) == L"/pid" || ToLower(args[argIndex]) == L"/process")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"usage: " << command << L" /pid <process-id> <address|symbol> [count]\n";
+                break;
+            }
+
+            uint64_t processId = 0;
+            if (!ParseUnsigned(args[argIndex + 1], state.NumberBase, &processId) || processId == 0 || processId > 0xffffffffull)
+            {
+                std::wcerr << L"invalid process id\n";
+                break;
+            }
+
+            if (!ResolveProcessAddressContext(device, symbols, static_cast<uint32_t>(processId), &explicitContext, &error))
+            {
+                std::wcerr << L"process context failed: " << error << L"\n";
+                break;
+            }
+
+            hasExplicitContext = true;
+            argIndex += 2;
+        }
+
         uint64_t address = 0;
-        if (!ParseAddressOrSymbol(symbols, state, args[1], &address, &error))
+        if (!ParseAddressOrSymbol(symbols, state, args[argIndex], &address, &error))
         {
             std::wcerr << L"display failed: " << error << L"\n";
             break;
@@ -1231,7 +1301,7 @@ static void HandleDisplayCommand(
         }
 
         uint64_t count = 0;
-        if (!GetCountArgument(args, 2, defaultCount, state, &count))
+        if (!GetCountArgument(args, argIndex + 1, defaultCount, state, &count))
         {
             std::wcerr << L"invalid count\n";
             break;
@@ -1255,7 +1325,8 @@ static void HandleDisplayCommand(
         }
 
         std::vector<uint8_t> bytes;
-        if (!device.ReadMemory(address, byteCount, &bytes, &error))
+        const ProcessAddressContext* memoryContext = hasExplicitContext ? &explicitContext : nullptr;
+        if (!ReadMemoryWithProcessContext(device, state, memoryContext, address, byteCount, &bytes, &error))
         {
             std::wcerr << L"read failed: " << error << L"\n";
             break;
@@ -1288,7 +1359,7 @@ static void HandleDisplayCommand(
                 if (command[2] == L'a')
                 {
                     std::vector<uint8_t> refBytes;
-                    if (device.ReadMemory(pointer, 128, &refBytes, &error))
+                    if (ReadMemoryWithProcessContext(device, state, memoryContext, pointer, 128, &refBytes, &error))
                     {
                         PrintAsciiString(pointer, refBytes);
                     }
@@ -1300,7 +1371,7 @@ static void HandleDisplayCommand(
                 else if (command[2] == L'u')
                 {
                     std::vector<uint8_t> refBytes;
-                    if (device.ReadMemory(pointer, 128 * sizeof(wchar_t), &refBytes, &error))
+                    if (ReadMemoryWithProcessContext(device, state, memoryContext, pointer, 128 * sizeof(wchar_t), &refBytes, &error))
                     {
                         PrintUnicodeString(pointer, refBytes);
                     }
@@ -1332,6 +1403,378 @@ static void HandleDisplayCommand(
     } while (false);
 }
 
+static bool FindFieldAny(
+    SymbolEngine& symbols,
+    const std::vector<std::wstring>& typeNames,
+    const std::wstring& fieldName,
+    TypeFieldInfo* field,
+    std::wstring* error)
+{
+    bool ok = false;
+    std::wstring lastError;
+
+    do
+    {
+        if (field == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid field output";
+            }
+            break;
+        }
+
+        for (const std::wstring& typeName : typeNames)
+        {
+            std::wstring localError;
+            if (symbols.FindField(typeName, fieldName, field, &localError))
+            {
+                ok = true;
+                break;
+            }
+
+            if (!localError.empty())
+            {
+                lastError = localError;
+            }
+        }
+
+        if (!ok && error != nullptr)
+        {
+            *error = lastError.empty() ? L"field not found" : lastError;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool ResolveProcessDirectoryTableBaseOffsets(
+    SymbolEngine& symbols,
+    uint32_t* directoryTableBaseOffset,
+    uint32_t* userDirectoryTableBaseOffset,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (directoryTableBaseOffset == nullptr || userDirectoryTableBaseOffset == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid process offset output";
+            }
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            if (!symbols.LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        TypeFieldInfo pcbField = {};
+        if (!FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"Pcb", &pcbField, error))
+        {
+            break;
+        }
+
+        TypeFieldInfo dtbField = {};
+        if (!FindFieldAny(symbols, {L"nt!_KPROCESS", L"_KPROCESS"}, L"DirectoryTableBase", &dtbField, error))
+        {
+            break;
+        }
+
+        uint64_t dtbOffset = static_cast<uint64_t>(pcbField.Offset) + dtbField.Offset;
+        if (dtbOffset > 0xffffffffull)
+        {
+            if (error != nullptr)
+            {
+                *error = L"DirectoryTableBase offset is too large";
+            }
+            break;
+        }
+
+        *directoryTableBaseOffset = static_cast<uint32_t>(dtbOffset);
+        *userDirectoryTableBaseOffset = 0;
+
+        TypeFieldInfo userDtbField = {};
+        std::wstring ignored;
+        if (FindFieldAny(symbols, {L"nt!_KPROCESS", L"_KPROCESS"}, L"UserDirectoryTableBase", &userDtbField, &ignored))
+        {
+            uint64_t userDtbOffset = static_cast<uint64_t>(pcbField.Offset) + userDtbField.Offset;
+            if (userDtbOffset <= 0xffffffffull)
+            {
+                *userDirectoryTableBaseOffset = static_cast<uint32_t>(userDtbOffset);
+            }
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ResolveProcessAddressContext(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint32_t processId,
+    ProcessAddressContext* context,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (context == nullptr || processId == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid process id";
+            }
+            break;
+        }
+
+        uint32_t dtbOffset = 0;
+        uint32_t userDtbOffset = 0;
+        if (!ResolveProcessDirectoryTableBaseOffsets(symbols, &dtbOffset, &userDtbOffset, error))
+        {
+            break;
+        }
+
+        if (!device.ResolveProcess(processId, dtbOffset, userDtbOffset, context, error))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool IsLikelyUserVirtualAddress(uint64_t virtualAddress)
+{
+    return virtualAddress < 0x0000800000000000ull;
+}
+
+static uint64_t SelectProcessDirectoryTableBase(const ProcessAddressContext& context, uint64_t virtualAddress)
+{
+    uint64_t directoryTableBase = context.DirectoryTableBase;
+
+    if (context.UserDirectoryTableBase != 0 && IsLikelyUserVirtualAddress(virtualAddress))
+    {
+        directoryTableBase = context.UserDirectoryTableBase;
+    }
+
+    return directoryTableBase;
+}
+
+static void PrintProcessAddressContext(const ProcessAddressContext& context)
+{
+    std::wcout << L"pid=" << context.ProcessId
+               << L" eprocess=0x" << std::hex << std::setw(16) << std::setfill(L'0') << context.Eprocess
+               << L" dtb=0x" << std::setw(16) << context.DirectoryTableBase;
+    if (context.UserDirectoryTableBase != 0)
+    {
+        std::wcout << L" user-dtb=0x" << std::setw(16) << context.UserDirectoryTableBase;
+    }
+    std::wcout << std::dec << L"\n";
+}
+
+static bool ReadProcessVirtualMemory(
+    DeviceClient& device,
+    const ProcessAddressContext& context,
+    uint64_t address,
+    uint32_t length,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (bytes == nullptr || length == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid process read request";
+            }
+            break;
+        }
+
+        bytes->clear();
+        bytes->reserve(length);
+
+        uint64_t current = address;
+        uint32_t remaining = length;
+        while (remaining != 0)
+        {
+            PhysicalTranslationInfo translation = {};
+            uint64_t directoryTableBase = SelectProcessDirectoryTableBase(context, current);
+            if (!device.TranslateVirtual(directoryTableBase, current, remaining, &translation, error))
+            {
+                break;
+            }
+
+            uint32_t chunk = translation.TranslatedLength;
+            if (chunk == 0 || chunk > remaining)
+            {
+                chunk = remaining;
+            }
+
+            std::vector<uint8_t> pageBytes;
+            if (!device.ReadPhysical(translation.PhysicalAddress, chunk, &pageBytes, error))
+            {
+                break;
+            }
+
+            if (pageBytes.size() != chunk)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Short process physical read";
+                }
+                break;
+            }
+
+            bytes->insert(bytes->end(), pageBytes.begin(), pageBytes.end());
+            current += chunk;
+            remaining -= chunk;
+        }
+
+        ok = remaining == 0;
+    } while (false);
+
+    return ok;
+}
+
+static bool WriteProcessVirtualMemory(
+    DeviceClient& device,
+    const ProcessAddressContext& context,
+    uint64_t address,
+    const std::vector<uint8_t>& bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (bytes.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid process write request";
+            }
+            break;
+        }
+
+        uint64_t current = address;
+        size_t offset = 0;
+        size_t remaining = bytes.size();
+        while (remaining != 0)
+        {
+            PhysicalTranslationInfo translation = {};
+            uint64_t directoryTableBase = SelectProcessDirectoryTableBase(context, current);
+            uint32_t requestLength = static_cast<uint32_t>(std::min<size_t>(remaining, KNDBG_MAX_TRANSFER_SIZE));
+            if (!device.TranslateVirtual(directoryTableBase, current, requestLength, &translation, error))
+            {
+                break;
+            }
+
+            uint32_t chunk = translation.TranslatedLength;
+            if (chunk == 0 || chunk > requestLength)
+            {
+                chunk = requestLength;
+            }
+
+            std::vector<uint8_t> pageBytes(bytes.begin() + offset, bytes.begin() + offset + chunk);
+            if (!device.WritePhysical(translation.PhysicalAddress, pageBytes, error))
+            {
+                break;
+            }
+
+            current += chunk;
+            offset += chunk;
+            remaining -= chunk;
+        }
+
+        ok = remaining == 0;
+    } while (false);
+
+    return ok;
+}
+
+static const ProcessAddressContext* SelectMemoryAccessContext(
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address)
+{
+    const ProcessAddressContext* context = explicitContext;
+
+    if (context == nullptr && state.HasProcessContext && IsLikelyUserVirtualAddress(address))
+    {
+        context = &state.ProcessContext;
+    }
+
+    return context;
+}
+
+static bool ReadMemoryWithProcessContext(
+    DeviceClient& device,
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address,
+    uint32_t length,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        const ProcessAddressContext* context = SelectMemoryAccessContext(state, explicitContext, address);
+        if (context != nullptr)
+        {
+            ok = ReadProcessVirtualMemory(device, *context, address, length, bytes, error);
+        }
+        else
+        {
+            ok = device.ReadMemory(address, length, bytes, error);
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool WriteMemoryWithProcessContext(
+    DeviceClient& device,
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address,
+    const std::vector<uint8_t>& bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        const ProcessAddressContext* context = SelectMemoryAccessContext(state, explicitContext, address);
+        if (context != nullptr)
+        {
+            ok = WriteProcessVirtualMemory(device, *context, address, bytes, error);
+        }
+        else
+        {
+            ok = device.WriteMemory(address, bytes, error);
+        }
+    } while (false);
+
+    return ok;
+}
+
 static void HandleTranslateVirtualCommand(
     const std::vector<std::wstring>& args,
     const DebuggerState& state,
@@ -1347,6 +1790,7 @@ static void HandleTranslateVirtualCommand(
         {
             std::wcerr << L"usage: vtop <address|symbol> [length]\n";
             std::wcerr << L"usage: vtop /cr3 <directory-table-base> <address|symbol> [length]\n";
+            std::wcerr << L"usage: vtop /pid <process-id> <address|symbol> [length]\n";
             std::wcerr << L"usage: !vtop <address|symbol> [length]\n";
             std::wcerr << L"usage: !vtop <directory-table-base> <address|symbol> [length]\n";
             break;
@@ -1356,6 +1800,8 @@ static void HandleTranslateVirtualCommand(
         uint64_t virtualAddress = 0;
         uint64_t length = 1;
         size_t index = 1;
+        bool hasProcessContext = false;
+        ProcessAddressContext processContext = {};
 
         if (command == L"vtop" && ToLower(args[index]) == L"/cr3")
         {
@@ -1377,6 +1823,37 @@ static void HandleTranslateVirtualCommand(
                 break;
             }
 
+            index = 4;
+        }
+        else if (command == L"vtop" && (ToLower(args[index]) == L"/pid" || ToLower(args[index]) == L"/process"))
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"usage: vtop /pid <process-id> <address|symbol> [length]\n";
+                break;
+            }
+
+            uint64_t pid64 = 0;
+            if (!ParseUnsigned(args[2], 10, &pid64) || pid64 == 0 || pid64 > 0xffffffffull)
+            {
+                std::wcerr << L"invalid process id\n";
+                break;
+            }
+
+            if (!ParseAddressOrSymbol(symbols, state, args[3], &virtualAddress, &error))
+            {
+                std::wcerr << L"vtop failed: " << error << L"\n";
+                break;
+            }
+
+            if (!ResolveProcessAddressContext(device, symbols, static_cast<uint32_t>(pid64), &processContext, &error))
+            {
+                std::wcerr << L"vtop process resolve failed: " << error << L"\n";
+                break;
+            }
+
+            directoryTableBase = SelectProcessDirectoryTableBase(processContext, virtualAddress);
+            hasProcessContext = true;
             index = 4;
         }
         else if (command == L"!vtop" && args.size() >= 3)
@@ -1406,6 +1883,13 @@ static void HandleTranslateVirtualCommand(
             index = 2;
         }
 
+        if (directoryTableBase == 0 && state.HasProcessContext)
+        {
+            processContext = state.ProcessContext;
+            directoryTableBase = SelectProcessDirectoryTableBase(processContext, virtualAddress);
+            hasProcessContext = true;
+        }
+
         if (args.size() > index && !ParseUnsigned(args[index], state.NumberBase, &length))
         {
             std::wcerr << L"invalid vtop length\n";
@@ -1430,6 +1914,12 @@ static void HandleTranslateVirtualCommand(
             break;
         }
 
+        if (hasProcessContext)
+        {
+            std::wcout << L"process-context ";
+            PrintProcessAddressContext(processContext);
+        }
+
         std::wcout << L"va=0x" << std::hex << std::setw(16) << std::setfill(L'0') << info.VirtualAddress
                    << L" pa=0x" << std::setw(16) << info.PhysicalAddress
                    << L" cr3=0x" << std::setw(16) << info.DirectoryTableBase << std::dec << L"\n";
@@ -1437,10 +1927,68 @@ static void HandleTranslateVirtualCommand(
                    << L" page-offset=0x" << info.PageOffset
                    << L" page-bytes=0x" << info.PageBytes
                    << L" translated=0x" << info.TranslatedLength << std::dec << L"\n";
+        if ((info.Flags & KNDBG_TRANSLATE_FLAG_LA57_ACTIVE) != 0)
+        {
+            std::wcout << L"pml5e=0x" << std::hex << std::setw(16) << info.Pml5e << L"\n";
+        }
         std::wcout << L"pml4e=0x" << std::hex << std::setw(16) << info.Pml4e
                    << L" pdpte=0x" << std::setw(16) << info.Pdpte
                    << L" pde=0x" << std::setw(16) << info.Pde
                    << L" pte=0x" << std::setw(16) << info.Pte << std::dec << L"\n";
+    } while (false);
+}
+
+static void HandleProcessContextCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        if (args.size() < 2 || ToLower(args[1]) == L"status")
+        {
+            if (state.HasProcessContext)
+            {
+                std::wcout << L"process context: ";
+                PrintProcessAddressContext(state.ProcessContext);
+            }
+            else
+            {
+                std::wcout << L"process context: off\n";
+            }
+            break;
+        }
+
+        std::wstring action = ToLower(args[1]);
+        if (action == L"off" || action == L"clear")
+        {
+            state.HasProcessContext = false;
+            state.ProcessContext = {};
+            std::wcout << L"process context: off\n";
+            break;
+        }
+
+        uint64_t pid64 = 0;
+        if (!ParseUnsigned(args[1], 10, &pid64) || pid64 == 0 || pid64 > 0xffffffffull)
+        {
+            std::wcerr << L"usage: procctx <process-id|off|status>\n";
+            break;
+        }
+
+        ProcessAddressContext context = {};
+        if (!ResolveProcessAddressContext(device, symbols, static_cast<uint32_t>(pid64), &context, &error))
+        {
+            std::wcerr << L"procctx failed: " << error << L"\n";
+            break;
+        }
+
+        state.ProcessContext = context;
+        state.HasProcessContext = true;
+        std::wcout << L"process context: ";
+        PrintProcessAddressContext(state.ProcessContext);
     } while (false);
 }
 
@@ -1589,12 +2137,40 @@ static void HandleEnterCommand(
     {
         if (args.size() < 3)
         {
-            std::wcerr << L"usage: " << command << L" <address|symbol> <value...>\n";
+            std::wcerr << L"usage: " << command << L" [/pid <process-id>] <address|symbol> <value...>\n";
             break;
         }
 
+        size_t argIndex = 1;
+        ProcessAddressContext explicitContext = {};
+        bool hasExplicitContext = false;
+        if (ToLower(args[argIndex]) == L"/pid" || ToLower(args[argIndex]) == L"/process")
+        {
+            if (args.size() < 5)
+            {
+                std::wcerr << L"usage: " << command << L" /pid <process-id> <address|symbol> <value...>\n";
+                break;
+            }
+
+            uint64_t processId = 0;
+            if (!ParseUnsigned(args[argIndex + 1], state.NumberBase, &processId) || processId == 0 || processId > 0xffffffffull)
+            {
+                std::wcerr << L"invalid process id\n";
+                break;
+            }
+
+            if (!ResolveProcessAddressContext(device, symbols, static_cast<uint32_t>(processId), &explicitContext, &error))
+            {
+                std::wcerr << L"process context failed: " << error << L"\n";
+                break;
+            }
+
+            hasExplicitContext = true;
+            argIndex += 2;
+        }
+
         uint64_t address = 0;
-        if (!ParseAddressOrSymbol(symbols, state, args[1], &address, &error))
+        if (!ParseAddressOrSymbol(symbols, state, args[argIndex], &address, &error))
         {
             std::wcerr << L"write failed: " << error << L"\n";
             break;
@@ -1605,7 +2181,7 @@ static void HandleEnterCommand(
         {
             bool unicode = command == L"eu" || command == L"ezu";
             bool zeroTerminate = command == L"eza" || command == L"ezu";
-            bytes = EncodeString(JoinArgs(args, 2), unicode, zeroTerminate);
+            bytes = EncodeString(JoinArgs(args, argIndex + 1), unicode, zeroTerminate);
         }
         else
         {
@@ -1624,7 +2200,7 @@ static void HandleEnterCommand(
             }
 
             bool valuesOk = true;
-            for (size_t index = 2; index < args.size(); ++index)
+            for (size_t index = argIndex + 1; index < args.size(); ++index)
             {
                 uint64_t value = 0;
                 if (!ParseUnsigned(args[index], state.NumberBase, &value))
@@ -1656,7 +2232,8 @@ static void HandleEnterCommand(
             break;
         }
 
-        if (device.WriteMemory(address, bytes, &error))
+        const ProcessAddressContext* memoryContext = hasExplicitContext ? &explicitContext : nullptr;
+        if (WriteMemoryWithProcessContext(device, state, memoryContext, address, bytes, &error))
         {
             std::wcout << L"wrote " << bytes.size() << L" bytes\n";
         }
@@ -1951,7 +2528,7 @@ static void PrintVersion(DeviceClient& device)
 {
     std::wstring error;
 
-    std::wcout << L"KnLiveDbg version 0.3\n";
+    std::wcout << L"KnLiveDbg version 0.4\n";
     if (device.QueryVersion(&error))
     {
         std::wcout << L"driver ABI ok\n";
@@ -1982,6 +2559,253 @@ static void PrintTarget()
     {
         std::wcout << L"local live kernel target: current machine\n";
     }
+}
+
+static HANDLE OpenProbeDevice(std::wstring* error)
+{
+    HANDLE device = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        device = CreateFileW(
+            KNDBG_PROBE_USER_DEVICE_NAME,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+
+        if (device == INVALID_HANDLE_VALUE && error != nullptr)
+        {
+            *error = FormatWin32Error(L"CreateFileW KnLiveDbgProbe failed", GetLastError());
+        }
+    } while (false);
+
+    return device;
+}
+
+static bool QueryProbeInfo(KNDBG_PROBE_INFO_RESPONSE* response, std::wstring* error)
+{
+    bool ok = false;
+    HANDLE device = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        if (response == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid probe info output";
+            }
+            break;
+        }
+
+        device = OpenProbeDevice(error);
+        if (device == INVALID_HANDLE_VALUE)
+        {
+            break;
+        }
+
+        KNDBG_PROBE_INFO_RESPONSE local = {};
+        DWORD returned = 0;
+        if (!DeviceIoControl(
+                device,
+                IOCTL_KNDBG_PROBE_GET_INFO,
+                nullptr,
+                0,
+                &local,
+                sizeof(local),
+                &returned,
+                nullptr))
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"IOCTL_KNDBG_PROBE_GET_INFO failed", GetLastError());
+            }
+            break;
+        }
+
+        if (returned < sizeof(local) ||
+            local.Size != sizeof(local) ||
+            local.AbiVersion != KNDBG_PROBE_ABI_VERSION ||
+            local.BufferLength != KNDBG_PROBE_BUFFER_LENGTH)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Probe driver ABI response is invalid";
+            }
+            break;
+        }
+
+        *response = local;
+        ok = true;
+    } while (false);
+
+    if (device != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(device);
+    }
+
+    return ok;
+}
+
+static bool ResetProbePattern(std::wstring* error)
+{
+    bool ok = false;
+    HANDLE device = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        device = OpenProbeDevice(error);
+        if (device == INVALID_HANDLE_VALUE)
+        {
+            break;
+        }
+
+        DWORD returned = 0;
+        if (!DeviceIoControl(
+                device,
+                IOCTL_KNDBG_PROBE_RESET_PATTERN,
+                nullptr,
+                0,
+                nullptr,
+                0,
+                &returned,
+                nullptr))
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"IOCTL_KNDBG_PROBE_RESET_PATTERN failed", GetLastError());
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    if (device != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(device);
+    }
+
+    return ok;
+}
+
+static void PrintProbeInfo(const KNDBG_PROBE_INFO_RESPONSE& info)
+{
+    std::wcout << L"probe abi=" << info.AbiVersion
+               << L" length=0x" << std::hex << info.BufferLength
+               << L" seed=0x" << info.PatternSeed << std::dec << L"\n";
+    std::wcout << L"probe virtual=0x" << std::hex << std::setw(16) << std::setfill(L'0')
+               << info.BufferVirtualAddress << L"\n";
+    std::wcout << L"probe physical=0x" << std::setw(16) << info.BufferPhysicalAddress
+               << std::setfill(L' ') << std::dec << L"\n";
+    std::wcout << L"try: db 0x" << std::hex << info.BufferVirtualAddress
+               << L" 40; pdb 0x" << info.BufferPhysicalAddress
+               << L" 40" << std::dec << L"\n";
+}
+
+static void HandleProbeCommand(const std::vector<std::wstring>& args)
+{
+    std::wstring action = args.size() >= 2 ? ToLower(args[1]) : L"status";
+    std::wstring error;
+    DriverService probeService(KNDBG_PROBE_SERVICE_NAME, KNDBG_PROBE_DISPLAY_NAME);
+
+    do
+    {
+        if (action == L"load" || action == L"install" || action == L"start")
+        {
+            std::wstring driverPath = args.size() >= 3 ? JoinArgs(args, 2) : GetExecutableDirectory() + L"\\KnLiveDbgProbe.sys";
+            if (!probeService.EnsureLoaded(driverPath, &error))
+            {
+                std::wcerr << L"probe load failed: " << error << L"\n";
+                std::wcerr << L"expected probe path: " << driverPath << L"\n";
+                break;
+            }
+
+            std::wcout << L"probe driver loaded: " << driverPath << L"\n";
+            KNDBG_PROBE_INFO_RESPONSE info = {};
+            if (QueryProbeInfo(&info, &error))
+            {
+                PrintProbeInfo(info);
+            }
+            else
+            {
+                std::wcerr << L"probe info failed: " << error << L"\n";
+            }
+        }
+        else if (action == L"unload" || action == L"remove" || action == L"stop")
+        {
+            DriverUnloadResult unloadResult = {};
+            if (!probeService.StopAndDelete(&unloadResult, &error))
+            {
+                std::wcerr << L"probe unload failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << L"probe service removed";
+            if (!unloadResult.FinalState.empty())
+            {
+                std::wcout << L": " << unloadResult.FinalState;
+            }
+            std::wcout << L"\n";
+        }
+        else if (action == L"status")
+        {
+            DriverStatus status = {};
+            if (!probeService.Query(&status, &error))
+            {
+                std::wcerr << L"probe service query failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << L"probe service: " << (status.Installed ? L"installed" : L"not installed");
+            if (!status.StateText.empty())
+            {
+                std::wcout << L" state=" << status.StateText;
+            }
+            std::wcout << L"\n";
+
+            if (status.CurrentState == SERVICE_RUNNING)
+            {
+                KNDBG_PROBE_INFO_RESPONSE info = {};
+                if (QueryProbeInfo(&info, &error))
+                {
+                    PrintProbeInfo(info);
+                }
+                else
+                {
+                    std::wcerr << L"probe info failed: " << error << L"\n";
+                }
+            }
+        }
+        else if (action == L"info")
+        {
+            KNDBG_PROBE_INFO_RESPONSE info = {};
+            if (!QueryProbeInfo(&info, &error))
+            {
+                std::wcerr << L"probe info failed: " << error << L"\n";
+                break;
+            }
+
+            PrintProbeInfo(info);
+        }
+        else if (action == L"reset")
+        {
+            if (!ResetProbePattern(&error))
+            {
+                std::wcerr << L"probe reset failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << L"probe pattern reset\n";
+        }
+        else
+        {
+            std::wcerr << L"usage: probe [status|load [sys-path]|info|reset|unload]\n";
+        }
+    } while (false);
 }
 
 static std::wstring ObjectOperationsText(uint32_t operations)
@@ -5653,18 +6477,44 @@ static bool HandleCommand(
             }
 
             std::wcout << L"backend: " << BackendModeText(state.Backend)
-                       << L" dbgeng-ready=" << (dbgeng.IsReady() ? L"yes" : L"no") << L"\n";
+                       << L" dbgeng-ready=" << (dbgeng.IsReady() ? L"yes" : L"no")
+                       << L" kd-mode=" << (state.DbgEngRemoteKernel ? L"remote" : L"local") << L"\n";
         }
         else if (command == L"kdinit")
         {
-            if (args.size() >= 2)
+            state.DbgEngRemoteKernel = false;
+            if (args.size() >= 2 && (ToLower(args[1]) == L"/remote" || ToLower(args[1]) == L"remote"))
+            {
+                if (args.size() < 3)
+                {
+                    std::wcerr << L"usage: kdinit /remote <connection-options>\n";
+                    break;
+                }
+
+                state.DbgEngRemoteKernel = true;
+                state.DbgEngConnectOptions = JoinArgs(args, 2);
+            }
+            else if (args.size() >= 2 && (ToLower(args[1]) == L"/local" || ToLower(args[1]) == L"local"))
+            {
+                state.DbgEngConnectOptions = args.size() >= 3 ? JoinArgs(args, 2) : L"";
+            }
+            else if (args.size() >= 2)
             {
                 state.DbgEngConnectOptions = JoinArgs(args, 1);
+            }
+            else
+            {
+                state.DbgEngConnectOptions.clear();
+            }
+
+            if (dbgeng.IsReady())
+            {
+                dbgeng.Shutdown();
             }
 
             if (EnsureDbgEng(dbgeng, symbols, state, &error))
             {
-                std::wcout << L"DbgEng local-kernel backend ready\n";
+                std::wcout << L"DbgEng " << (state.DbgEngRemoteKernel ? L"remote-kernel" : L"local-kernel") << L" backend ready\n";
             }
             else
             {
@@ -5680,6 +6530,10 @@ static bool HandleCommand(
             }
 
             std::wcout << L"DbgEng backend detached\n";
+        }
+        else if (command == L"probe")
+        {
+            HandleProbeCommand(args);
         }
         else if (command == L"kd")
         {
@@ -5710,6 +6564,8 @@ static bool HandleCommand(
                  command != L"q" && command != L"qq" && command != L"qd" &&
                  command != L"quit" && command != L"exit" &&
                  command != L"unload" && command != L"drvstatus" &&
+                 command != L"probe" &&
+                 command != L"procctx" &&
                  command != L"callbacks" && command != L"kcallbacks" && command != L"cb" &&
                  command != L"ai")
         {
@@ -5877,6 +6733,10 @@ static bool HandleCommand(
         {
             HandleTranslateVirtualCommand(args, state, device, symbols);
         }
+        else if (command == L"procctx")
+        {
+            HandleProcessContextCommand(args, state, device, symbols);
+        }
         else if (IsPhysicalDisplayCommand(command))
         {
             HandlePhysicalDisplayCommand(args, state, device);
@@ -6031,6 +6891,16 @@ static bool HandleCommand(
                     std::wcout << L" state=" << status.StateText;
                 }
                 std::wcout << L"\n";
+
+                DriverSessionStatus session = {};
+                if (device.IsOpen() && device.QuerySessionStatus(&session, &error))
+                {
+                    std::wcout << L"driver session: owner-pid=" << session.OwnerPid
+                               << L" current-pid=" << session.CurrentPid
+                               << L" handles=" << session.OpenHandleCount
+                               << L" write=" << ((session.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) != 0 ? L"on" : L"off")
+                               << L"\n";
+                }
             }
             else
             {

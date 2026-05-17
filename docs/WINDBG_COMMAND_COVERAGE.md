@@ -32,9 +32,10 @@ KnLiveDbg currently has a native live-memory backend, not a KD transport backend
 
 ```text
 backend [auto|native|dbgeng]
-kdinit [connect-options]
+kdinit [/local [connect-options]|/remote <connect-options>]
 kd <windbg-command>
 kddetach
+probe [status|load [sys-path]|info|reset|unload]
 ai [status|providers|provider|policy|model|baseurl|effort|auth|preview|ask|plan|analyze|explain|annotate|diagnose|playbook|show|run|write|transcript|audit|report]
 ```
 
@@ -48,7 +49,7 @@ Backend mode differences:
 | `native` | Enabled. | Disabled except for explicitly wired commands that intentionally use DbgEng internally, such as `u` and `uf`. | Verifying driver-backed behavior without accidental raw WinDbg execution. |
 | `dbgeng` | Only session/TUI exceptions run before the raw DbgEng catch-all. | Enabled for most commands through `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
 
-The `dbgeng` catch-all intentionally excludes `q`, `qq`, `qd`, `quit`, `exit`, `unload`, `drvstatus`, `callbacks`, `kcallbacks`, `cb`, and `ai` so shutdown, service control, status, native callback scanning, and AI provider control stay under the TUI. The explicit `u`/`uf` handler also runs before that catch-all. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+The `dbgeng` catch-all intentionally excludes `q`, `qq`, `qd`, `quit`, `exit`, `unload`, `drvstatus`, `probe`, `procctx`, `callbacks`, `kcallbacks`, `cb`, and `ai` so shutdown, service control, status, probe control, native process context, callback scanning, and AI provider control stay under the TUI. The explicit `u`/`uf` handler also runs before that catch-all. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
 
 ## Native Commands
 
@@ -58,7 +59,7 @@ lm, ld, ln, x
 d, da, db, dc, dd, dD, df, dp, dq, du, dw, dW, dyb, dyd
 dda, ddp, ddu, dpa, dpp, dpu, dqa, dqp, dqu
 dds, dps, dqs
-vtop, !vtop
+vtop, !vtop, procctx
 phys, pdb, pdw, pdd, pdq
 peb, pew, ped, peq
 dt, dtx
@@ -69,7 +70,7 @@ ai
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 c, f, fp, m, s
 n, sq
-version, vertarget, vercommand
+version, vertarget, vercommand, drvstatus, probe
 q, qq, qd
 ```
 
@@ -102,16 +103,19 @@ z
 4. `dpa`, `dpu`, `dqa`, and `dqu` read a pointer value first, then display the referenced string.
 5. Write commands start enabled per handle; `write off` disables the driver gate and `write on` re-enables it.
 6. Single transfer size is capped by `KNDBG_MAX_TRANSFER_SIZE`.
-7. Native `dt` supports layout-only output, value output when an address is supplied, recursive UDT expansion with `-rN`, verbose diagnostics with `-v`, bare output with `-b`, and field filters.
-8. `vtop` and native `!vtop` translate a virtual address to a physical address using the current CR3 or a supplied directory-table base.
-9. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory; `peb`, `pew`, `ped`, and `peq` write physical memory through the same write gate as virtual writes.
-10. `callbacks [all|ob|registry|process|minifilter]` parses kernel PDB type layouts and live memory to list object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with module, symbol, altitude, context, root, and object/filter address annotations. `callbacks json [scope] [path|-]` emits the same records as stable JSON for AI/reporting pipelines.
-11. Object callback scanning discovers `_OBJECT_TYPE` objects from `ObTypeIndexTable` before walking each `_OBJECT_TYPE.CallbackList`, with documented type globals used only as fallback.
-12. Registry and process callback scanning enumerate candidate root symbols and validate the expected list/table shape before emitting records.
-13. Minifilter scanning discovers `fltmgr!FltGlobals`, validates the frame-list root, walks frames and registered filters, and reports operation, unload, instance, name provider, KTM, section, and volume-mount callbacks. Non-exact globals candidates must produce concrete callback records before they are accepted.
-14. `u <address|symbol> [instruction-count]` uses `IDebugControl::DisassembleWide` directly, prints DbgEng-quality instruction text, caps explicit counts at 256 instructions, and remembers the next offset for a following bare `u`.
-15. `uf <address|symbol>` is an explicit function-disassembly command routed through DbgEng so symbol-aware function boundary discovery stays consistent with WinDbg.
-16. `ai plan <prompt>` stores model-proposed commands in a parsed in-memory plan after schema validation rejects empty, nested-AI, shutdown/unload, bare `kd`, overlong, and unknown non-DbgEng commands. `ai run <index|all>` executes only non-write, non-shutdown planned commands through the normal TUI dispatcher.
-17. `ai analyze callbacks`, `ai explain dt`, `ai annotate u|uf`, and `ai diagnose` provide evidence-backed AI assistance on top of implemented native command output. Callback analysis uses `callbacks json <scope>` evidence so the model does not need to parse the human-readable callback view.
-18. `ai playbook <callbacks|minifilter|object|address|driver>` creates repeatable read-only command plans with dry-run output and optional guarded execution.
-19. `ai write <index> confirm` is required to dispatch planned write-like commands and performs backup/read-current plus verification preflight when the write form is recognized. It also renders a deterministic before/after diff for verification stdout/stderr. `ai transcript <path>` captures AI events and command output as JSONL, `ai transcript max` rotates long transcript files, `ai transcript redact` redacts captured stdout/stderr, `ai audit <path>` captures write-command JSONL audit records, and `ai report <path>` exports the current AI session summary.
+7. Native `dt` supports layout-only output, value output when an address is supplied, recursive UDT expansion with `-rN`, verbose diagnostics with `-v`, bare output with `-b`, and field filters. When `DbgHelp` cannot provide a usable UDT layout, DIA fallback recovers field offsets, lengths, bit positions, and type names from the loaded PDB.
+8. `vtop` and native `!vtop` translate a virtual address to a physical address using the current CR3, a supplied directory-table base, or `/pid <process-id>`. Active LA57 paging is reported with a PML5E entry.
+9. `procctx <pid>` stores a process DTB context. `d*` and `e*` can use `/pid <pid>` or the stored context for process-aware user VA physical read/write.
+10. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory; `peb`, `pew`, `ped`, and `peq` write physical memory through the same write gate as virtual writes.
+11. `probe` manages `KnLiveDbgProbe.sys` and prints a deterministic positive-control virtual/physical test buffer.
+12. `callbacks [all|ob|registry|process|minifilter]` parses kernel PDB type layouts and live memory to list object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with module, symbol, altitude, context, root, and object/filter address annotations. `callbacks json [scope] [path|-]` emits the same records as stable JSON for AI/reporting pipelines.
+13. Object callback scanning discovers `_OBJECT_TYPE` objects from `ObTypeIndexTable` before walking each `_OBJECT_TYPE.CallbackList`, with documented type globals used only as fallback.
+14. Registry and process callback scanning enumerate candidate root symbols and validate the expected list/table shape before emitting records.
+15. Minifilter scanning discovers `fltmgr!FltGlobals`, validates the frame-list root, walks frames and registered filters, and reports operation, unload, instance, name provider, KTM, section, and volume-mount callbacks. Non-exact globals candidates must produce concrete callback records before they are accepted.
+16. `u <address|symbol> [instruction-count]` uses `IDebugControl::DisassembleWide` directly, prints DbgEng-quality instruction text, caps explicit counts at 256 instructions, and remembers the next offset for a following bare `u`.
+17. `uf <address|symbol>` is an explicit function-disassembly command routed through DbgEng so symbol-aware function boundary discovery stays consistent with WinDbg.
+18. `kdinit /remote <connection-options>` attaches DbgEng with `DEBUG_ATTACH_KERNEL_CONNECTION`; plain `kdinit` and `kdinit /local` use local-kernel attach.
+19. `ai plan <prompt>` stores model-proposed commands in a parsed in-memory plan after schema validation rejects empty, nested-AI, shutdown/unload, bare `kd`, overlong, and unknown non-DbgEng commands. `ai run <index|all>` executes only non-write, non-shutdown planned commands through the normal TUI dispatcher.
+20. `ai analyze callbacks`, `ai explain dt`, `ai annotate u|uf`, and `ai diagnose` provide evidence-backed AI assistance on top of implemented native command output. Callback analysis uses `callbacks json <scope>` evidence so the model does not need to parse the human-readable callback view.
+21. `ai playbook <callbacks|minifilter|object|address|driver>` creates repeatable read-only command plans with dry-run output and optional guarded execution.
+22. `ai write <index> confirm` is required to dispatch planned write-like commands and performs backup/read-current plus verification preflight when the write form is recognized. It also renders a deterministic before/after diff for verification stdout/stderr. `ai transcript <path>` captures AI events and command output as JSONL, `ai transcript max` rotates long transcript files, `ai transcript redact` redacts captured stdout/stderr, `ai audit <path>` captures write-command JSONL audit records, and `ai report <path>` exports the current AI session summary.

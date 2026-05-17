@@ -22,6 +22,7 @@ class DriverService
 {
 public:
     DriverService();
+    DriverService(const wchar_t* serviceName, const wchar_t* displayName);
     ~DriverService();
 
     bool Query(DriverStatus* status, std::wstring* error);
@@ -46,6 +47,8 @@ private:
     static bool IsServiceMarkedForDeleteError(DWORD error);
     static std::wstring ServiceStateText(DWORD state);
 
+    std::wstring serviceName_;
+    std::wstring displayName_;
     SC_HANDLE manager_;
     SC_HANDLE service_;
 };

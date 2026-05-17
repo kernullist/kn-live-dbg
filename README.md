@@ -7,7 +7,9 @@ Kn Live Dbg is a Windows kernel live-debugging experiment shaped after the usefu
 ```text
 kn-live-dbg/
   shared/KnLiveDbgIoctl.h       stable user/kernel ABI
+  shared/KnLiveDbgProbeIoctl.h  positive-control probe ABI
   driver/Driver.cpp             WDM driver with virtual/physical memory IOCTLs
+  probe_driver/ProbeDriver.cpp  WDM positive-control test buffer driver
   user/*.cpp                    elevated TUI, SCM lifecycle, DbgHelp symbols
   tools/build.ps1               Release/Debug x64 build helper
 ```
@@ -29,6 +31,12 @@ kn-live-dbg/
 13. Provides an optional DbgEng backend for raw WinDbg command execution against the local kernel target.
 14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with function/module/context annotations.
 15. Provides an initial AI assistant provider layer for advisory command planning and result interpretation through Codex CLI, ChatGPT/Codex OAuth, DeepSeek, and OpenRouter.
+16. Enforces a single-controller device owner and exposes owner/write-mode state through `drvstatus`.
+17. Resolves process DTBs from `_EPROCESS.Pcb.DirectoryTableBase` and optional `UserDirectoryTableBase` for process-aware `vtop`, `d*`, and `e*` commands.
+18. Detects active LA57 paging and reports the PML5E entry when five-level paging is enabled.
+19. Supports DbgEng local-kernel and remote-kernel attach modes through `kdinit /local` and `kdinit /remote`.
+20. Falls back to DIA SDK type parsing when `DbgHelp` cannot provide enough UDT/field metadata.
+21. Builds and manages `KnLiveDbgProbe.sys`, a positive-control test driver with known virtual and physical buffer addresses.
 
 ## Design Notes
 
@@ -50,13 +58,14 @@ Build:
 .\tools\build.ps1 -Configuration Release
 ```
 
-The driver project uses WDK `TestSign` for Debug and Release x64 builds. The build helper now verifies that `KnLiveDbg.sys` has an Authenticode signer and prints the signature status/thumbprint after MSBuild completes.
+The driver projects use WDK `TestSign` for Debug and Release x64 builds. The build helper verifies that both `KnLiveDbg.sys` and `KnLiveDbgProbe.sys` have Authenticode signers and prints signature status/thumbprints after MSBuild completes.
 
 Expected outputs:
 
 ```text
 x64\Release\KnLiveDbg.exe
 x64\Release\KnLiveDbg.sys
+x64\Release\KnLiveDbgProbe.sys
 ```
 
 ## Run
@@ -68,7 +77,7 @@ cd .\x64\Release
 .\KnLiveDbg.exe
 ```
 
-The EXE expects `KnLiveDbg.sys` beside it. It resolves the absolute driver path, updates an existing service config when present, creates the service when missing, starts it, and waits for `SERVICE_RUNNING`. `quit` leaves the service loaded. Use `unload` to close the device handle, stop the driver, delete the service, and wait for deletion before exit. Use `drvstatus` to inspect the current SCM state.
+The EXE expects `KnLiveDbg.sys` beside it. It resolves the absolute driver path, updates an existing service config when present, creates the service when missing, starts it, and waits for `SERVICE_RUNNING`. `quit` leaves the service loaded. Use `unload` to close the device handle, stop the driver, delete the service, and wait for deletion before exit. Use `drvstatus` to inspect SCM state plus the active single-controller owner/write-mode state. Use `probe load` when you want the optional positive-control driver loaded from the same output directory.
 
 ## TUI Commands
 
@@ -76,11 +85,12 @@ The EXE expects `KnLiveDbg.sys` beside it. It resolves the absolute driver path,
 help
 help all
 backend [auto|native|dbgeng]
-kdinit [connect-options]
+kdinit [/local [connect-options]|/remote <connect-options>]
 kd <windbg-command>
 kddetach
 version
 drvstatus
+probe [status|load [sys-path]|info|reset|unload]
 .sympath [path]
 .sympath+ <path>
 .reload
@@ -91,12 +101,15 @@ addr <symbol|address>
 query <address|symbol> [length]
 vtop <address|symbol> [length]
 vtop /cr3 <directory-table-base> <address|symbol> [length]
+vtop /pid <process-id> <address|symbol> [length]
 !vtop <address|symbol> [length]
 !vtop <directory-table-base> <address|symbol> [length]
 d, da, db, dc, dd, dD, df, dp, dq, du, dw, dW, dyb, dyd
+d* /pid <process-id> <address|symbol> [count]
 dda, ddp, ddu, dpa, dpp, dpu, dqa, dqp, dqu
 dds, dps, dqs
 phys, pdb, pdw, pdd, pdq
+procctx [status|off|<process-id>]
 u <address|symbol> [instruction-count]
 uf <address|symbol>
 dt [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
@@ -132,6 +145,7 @@ f <address> <length> <byte-pattern...>
 m <source> <destination> <length>
 write on|off
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
+e* /pid <process-id> <address|symbol> <value...>
 peb, pew, ped, peq
 setfield <type> <address|symbol> <field> <value>
 unload
@@ -149,6 +163,9 @@ knkd> u nt!KiSystemCall64 8
 knkd> uf nt!KiSystemCall64
 knkd> dq nt!PsLoadedModuleList 4
 knkd> vtop nt!PsLoadedModuleList
+knkd> procctx 1234
+knkd> db 0000012345678000 80
+knkd> db /pid 1234 0000012345678000 80
 knkd> pdb <physical-address> 80
 knkd> dt nt!_EPROCESS
 knkd> dt -r1 nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
@@ -166,6 +183,8 @@ knkd> ai transcript max 10485760
 knkd> ai transcript redact on
 knkd> ai audit .\kn-write-audit.jsonl
 knkd> ai report .\kn-ai-report.md
+knkd> probe load
+knkd> probe info
 ```
 
 The registry also knows the standard execution, breakpoint, stack, register, source, exception, I/O port, and script commands. Native live-memory commands stay on the custom driver backend, while stop-state or parser-heavy commands are routed to DbgEng in `auto` or `dbgeng` mode.
@@ -261,6 +280,7 @@ Examples:
 
 ```text
 knkd> kdinit
+knkd> kdinit /remote net:port=50000,key=1.2.3.4
 knkd> !process 0 0
 knkd> backend dbgeng
 knkd> k
@@ -268,7 +288,7 @@ knkd> backend auto
 knkd> kddetach
 ```
 
-DbgEng uses `IDebugClient5::AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, ...)`. It still follows the limits of Windows local kernel debugging; not every KD command has the same behavior as a remote break-in session.
+DbgEng uses `IDebugClient5::AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, ...)` for local mode and `DEBUG_ATTACH_KERNEL_CONNECTION` for `kdinit /remote <connection-options>`. Local mode still follows the limits of Windows local kernel debugging; not every KD command has the same behavior as a remote break-in session.
 
 ## Native `dt`
 
@@ -288,6 +308,8 @@ Supported options:
 - `-b`: bare output, omitting type names.
 
 Field filters are case-insensitive substring filters applied to field names and type names.
+
+When `DbgHelp` cannot return a usable UDT layout, the symbol engine tries a DIA SDK fallback against the loaded PDB path. The fallback is especially useful for field offsets, bit positions, and private type metadata used by callback scanning and `dt`; recursive expansion still prefers the normal `DbgHelp` type-id path when it is available.
 
 ## Kernel Callback Scanner
 
@@ -317,24 +339,44 @@ Native physical memory support is intentionally explicit:
 ```text
 vtop nt!PsLoadedModuleList
 vtop /cr3 <directory-table-base> <virtual-address> 100
+vtop /pid <process-id> <user-virtual-address> 100
 !vtop <virtual-address>
 !vtop <directory-table-base> <virtual-address>
+procctx <process-id>
+db <user-virtual-address> 80
+db /pid <process-id> <user-virtual-address> 80
 pdb <physical-address> 80
 pdq <physical-address> 10
 write off
 peq <physical-address> <qword-value>
 ```
 
-`vtop` uses the current CR3 when no directory-table base is supplied. The driver walks x64 4-level paging structures through physical reads, reports the PML4E/PDPTE/PDE/PTE chain, handles 4 KB, 2 MB, and 1 GB pages, and returns the number of contiguous bytes remaining in the translated page. Physical writes are routed through page-sized `MmMapIoSpaceEx` mappings. Write mode is enabled by default for each device handle; use `write off` when you want a read-only console session.
+`vtop` uses the current CR3 when no directory-table base is supplied. `vtop /pid` asks the driver to resolve the target EPROCESS, reads the DTB offsets from PDB type metadata, and walks that process address space. `procctx <pid>` stores the same process context for later user VA reads/writes; `d*` and `e*` commands also accept `/pid <pid>` for one-shot process-aware access. These paths translate each VA range to physical pages and then use physical read/write IOCTLs. The driver walks x64 paging structures through physical reads, reports PML5E/PML4E/PDPTE/PDE/PTE entries when applicable, handles 4 KB, 2 MB, and 1 GB pages, and returns the number of contiguous bytes remaining in the translated page. Physical writes are routed through page-sized `MmMapIoSpaceEx` mappings. Write mode is enabled by default for each device handle; use `write off` when you want a read-only console session.
+
+## Positive-Control Probe
+
+`KnLiveDbgProbe.sys` is an optional test driver that exposes a deterministic 4 KB contiguous nonpaged buffer. It is intended for smoke tests of virtual reads, VA-to-PA translation, physical reads, physical writes, and restore flows without guessing at arbitrary kernel memory.
+
+```text
+probe load
+probe status
+probe info
+db <probe-virtual-address> 40
+pdb <probe-physical-address> 40
+probe reset
+probe unload
+```
+
+The buffer pattern is `(index * 13 + 0x5a) & 0xff`. `probe info` prints both the virtual and physical buffer addresses and example `db`/`pdb` commands.
 
 ## Operational Caveats
 
 1. This is a live kernel memory tool. Bad writes can crash or corrupt the machine.
 2. `MmCopyMemory` makes reads fault-tolerant, but it does not make all addresses meaningful.
 3. Writes are enabled by default, can be disabled with `write off`, and still require an IOCTL acknowledgment magic.
-4. Native VA-to-PA translation currently assumes x64 4-level paging and the supplied or current CR3.
+4. Native VA-to-PA translation supports x64 4-level paging and reports active LA57 five-level paging when the machine enables it.
 5. Physical memory writes can corrupt page tables, code, pool, device memory, or firmware-owned ranges.
-6. Type dumping depends on matching PDBs and the local `DbgHelp` behavior.
+6. Type dumping depends on matching PDBs and the local `DbgHelp`/DIA behavior.
 7. Callback enumeration depends on internal kernel symbols and type names. Field drift is reported as a warning; Filter Manager callback decoding depends on matching `fltmgr` private type layouts.
 8. Do not hard-code kernel structure offsets for production use; resolve them from symbols at runtime.
 9. Live loading requires test-signing or another valid code integrity path.

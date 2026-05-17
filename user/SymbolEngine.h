@@ -81,6 +81,7 @@ public:
 private:
     bool EnumKernelModules(std::vector<KernelModuleInfo>* modules, std::wstring* error);
     std::wstring ResolveModuleImagePath(const KernelModuleInfo& module) const;
+    bool GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t preferredModuleBase, TypeLayoutInfo* layout, std::wstring* error);
 
     HANDLE process_;
     bool ready_;
