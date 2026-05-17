@@ -84,6 +84,13 @@ The DbgEng backend is intentionally isolated from the native memory backend. Nat
 
 `u` and `uf` are deliberately wired as explicit commands instead of falling through the generic command router. This keeps unassembly available even when the operator is otherwise using native command mode, while still relying on DbgEng for the instruction decoder and function-boundary semantics.
 
+Backend routing is mode-dependent:
+
+1. `auto` is the default. Implemented native commands stay on the driver/`DbgHelp` path, while registered DbgEng commands, `!extension` commands, and unknown dot meta-commands initialize or reuse DbgEng.
+2. `native` disables generic DbgEng fallback. Commands that require WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, or exception semantics are reported as DbgEng-only instead of being executed.
+3. `dbgeng` routes most non-session commands through `IDebugControl4::ExecuteWide`. The TUI still intercepts shutdown/service commands, backend management, native callback scanning, and explicit `u`/`uf`.
+4. `kd <command>` is a raw DbgEng escape hatch independent of the selected backend mode.
+
 ## Hardening Backlog
 
 1. Add a global single-controller policy so only one PID can own the device at a time.

@@ -39,6 +39,16 @@ kddetach
 
 `auto` is the default. Native commands stay on the custom driver backend, while DbgEng-routed commands and extension/meta commands are sent to DbgEng when possible.
 
+Backend mode differences:
+
+| Mode | Native handlers | DbgEng fallback | Typical use |
+| --- | --- | --- | --- |
+| `auto` | Enabled for implemented live-memory commands. | Enabled for DbgEng-routed commands, `!extension` commands, and unknown `.meta` commands. | Normal mixed operation. |
+| `native` | Enabled. | Disabled except for explicitly wired commands that intentionally use DbgEng internally, such as `u` and `uf`. | Verifying driver-backed behavior without accidental raw WinDbg execution. |
+| `dbgeng` | Only session/TUI exceptions run before the raw DbgEng catch-all. | Enabled for most commands through `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
+
+The `dbgeng` catch-all intentionally excludes `q`, `qq`, `qd`, `quit`, `exit`, `unload`, `drvstatus`, `callbacks`, `kcallbacks`, and `cb` so shutdown, service control, status, and native callback scanning stay under the TUI. The explicit `u`/`uf` handler also runs before that catch-all. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+
 ## Native Commands
 
 ```text

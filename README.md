@@ -141,6 +141,16 @@ The default backend mode is `auto`:
 3. `backend dbgeng` sends commands directly to `IDebugControl::ExecuteWide`.
 4. `backend native` disables automatic DbgEng routing.
 
+Backend mode behavior:
+
+| Mode | Command routing | Best fit | Notes |
+| --- | --- | --- | --- |
+| `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
+| `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` remain available and may initialize DbgEng for decoding. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+
+`kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
+
 Examples:
 
 ```text
