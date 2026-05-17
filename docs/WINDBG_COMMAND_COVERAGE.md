@@ -35,6 +35,7 @@ backend [auto|native|dbgeng]
 kdinit [connect-options]
 kd <windbg-command>
 kddetach
+ai [status|providers|provider|model|baseurl|effort|auth|preview|ask|plan|show|run|write|transcript|report]
 ```
 
 `auto` is the default. Native commands stay on the custom driver backend, while DbgEng-routed commands and extension/meta commands are sent to DbgEng when possible.
@@ -47,7 +48,7 @@ Backend mode differences:
 | `native` | Enabled. | Disabled except for explicitly wired commands that intentionally use DbgEng internally, such as `u` and `uf`. | Verifying driver-backed behavior without accidental raw WinDbg execution. |
 | `dbgeng` | Only session/TUI exceptions run before the raw DbgEng catch-all. | Enabled for most commands through `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
 
-The `dbgeng` catch-all intentionally excludes `q`, `qq`, `qd`, `quit`, `exit`, `unload`, `drvstatus`, `callbacks`, `kcallbacks`, and `cb` so shutdown, service control, status, and native callback scanning stay under the TUI. The explicit `u`/`uf` handler also runs before that catch-all. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+The `dbgeng` catch-all intentionally excludes `q`, `qq`, `qd`, `quit`, `exit`, `unload`, `drvstatus`, `callbacks`, `kcallbacks`, `cb`, and `ai` so shutdown, service control, status, native callback scanning, and AI provider control stay under the TUI. The explicit `u`/`uf` handler also runs before that catch-all. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
 
 ## Native Commands
 
@@ -63,6 +64,7 @@ peb, pew, ped, peq
 dt, dtx
 callbacks, kcallbacks, cb
 u, uf
+ai
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 c, f, fp, m, s
 n, sq
@@ -108,3 +110,5 @@ z
 13. Minifilter scanning discovers `fltmgr!FltGlobals`, validates the frame-list root, walks frames and registered filters, and reports operation, unload, instance, name provider, KTM, section, and volume-mount callbacks. Non-exact globals candidates must produce concrete callback records before they are accepted.
 14. `u <address|symbol> [instruction-count]` uses `IDebugControl::DisassembleWide` directly, prints DbgEng-quality instruction text, caps explicit counts at 256 instructions, and remembers the next offset for a following bare `u`.
 15. `uf <address|symbol>` is an explicit function-disassembly command routed through DbgEng so symbol-aware function boundary discovery stays consistent with WinDbg.
+16. `ai plan <prompt>` stores model-proposed commands in a parsed in-memory plan. `ai run <index|all>` executes only non-write, non-shutdown planned commands through the normal TUI dispatcher.
+17. `ai write <index> confirm` is required to dispatch planned write-like commands. `ai transcript <path>` captures AI events and command output as JSONL, and `ai report <path>` exports the current AI session summary.

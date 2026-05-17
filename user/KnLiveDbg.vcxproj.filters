@@ -11,6 +11,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AiProvider.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="CallbackScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -34,6 +37,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AiProvider.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="CallbackScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>

@@ -63,7 +63,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <AdditionalLibraryDirectories>C:\Program Files (x86)\Windows Kits\10\Debuggers\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;Ole32.lib;Shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;Ole32.lib;Shell32.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -83,10 +83,11 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>C:\Program Files (x86)\Windows Kits\10\Debuggers\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;Ole32.lib;Shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;Ole32.lib;Shell32.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="AiProvider.cpp" />
     <ClCompile Include="CallbackScanner.cpp" />
     <ClCompile Include="CommandRegistry.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
@@ -96,6 +97,7 @@
     <ClCompile Include="SymbolEngine.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AiProvider.h" />
     <ClInclude Include="CallbackScanner.h" />
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="DbgEngBackend.h" />

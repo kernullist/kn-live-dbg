@@ -199,6 +199,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"reload", L".reload", L"symbols", L"reload kernel modules and symbols", CommandSupport::Alias),
         Make(L"modules", L"lm", L"symbols", L"list loaded modules", CommandSupport::Alias),
         Make(L"addr", L"ln", L"symbols", L"resolve address or symbol", CommandSupport::Alias),
+        Make(L"ai", L"ai", L"ai", L"configure and query AI assistant providers", CommandSupport::Native),
         Make(L"backend", L"backend", L"session", L"show or set native/dbgeng/auto backend mode", CommandSupport::Native),
         Make(L"kd", L"kd", L"session", L"execute a raw command through DbgEng", CommandSupport::Native),
         Make(L"kdinit", L"kdinit", L"session", L"initialize local-kernel DbgEng backend", CommandSupport::Native),

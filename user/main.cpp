@@ -1,3 +1,4 @@
+#include "AiProvider.h"
 #include "CallbackScanner.h"
 #include "CommandRegistry.h"
 #include "DbgEngBackend.h"
@@ -35,6 +36,32 @@ struct DebuggerState
         Native,
         DbgEng
     } Backend;
+};
+
+struct AiCommandProposal
+{
+    std::wstring Command;
+    std::wstring Purpose;
+    std::wstring Risk;
+    bool RequiresConfirmation;
+    bool WriteLike;
+};
+
+struct AiPlanState
+{
+    std::wstring Title;
+    std::wstring Summary;
+    std::wstring RawResponse;
+    std::vector<AiCommandProposal> Commands;
+    std::wstring TranscriptPath;
+    bool TranscriptEnabled;
+};
+
+struct CommandExecutionResult
+{
+    bool KeepRunning;
+    std::wstring Output;
+    std::wstring Error;
 };
 
 static BOOL WINAPI ConsoleHandler(DWORD controlType)
@@ -159,6 +186,120 @@ static std::wstring GetExecutableDirectory()
     return result;
 }
 
+static std::wstring GetCurrentDirectoryString()
+{
+    std::wstring result;
+
+    do
+    {
+        DWORD required = GetCurrentDirectoryW(0, nullptr);
+        if (required == 0)
+        {
+            break;
+        }
+
+        std::wstring buffer(required, L'\0');
+        DWORD written = GetCurrentDirectoryW(required, &buffer[0]);
+        if (written == 0 || written >= required)
+        {
+            break;
+        }
+
+        buffer.resize(written);
+        result = buffer;
+    } while (false);
+
+    return result;
+}
+
+static std::wstring GetFullPathString(const std::wstring& path)
+{
+    std::wstring result = path;
+
+    do
+    {
+        if (path.empty())
+        {
+            break;
+        }
+
+        DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (required == 0)
+        {
+            break;
+        }
+
+        std::wstring buffer(required, L'\0');
+        DWORD written = GetFullPathNameW(path.c_str(), required, &buffer[0], nullptr);
+        if (written == 0 || written >= required)
+        {
+            break;
+        }
+
+        buffer.resize(written);
+        result = buffer;
+    } while (false);
+
+    return result;
+}
+
+static void AddUniquePath(std::vector<std::wstring>& paths, const std::wstring& path)
+{
+    do
+    {
+        if (path.empty())
+        {
+            break;
+        }
+
+        std::wstring normalized = GetFullPathString(path);
+        std::wstring lowered = ToLower(normalized);
+        for (const std::wstring& existing : paths)
+        {
+            if (ToLower(existing) == lowered)
+            {
+                return;
+            }
+        }
+
+        paths.push_back(normalized);
+    } while (false);
+}
+
+static bool EndsWithNoCase(const std::wstring& value, const std::wstring& suffix)
+{
+    bool result = false;
+
+    if (value.size() >= suffix.size())
+    {
+        result = ToLower(value.substr(value.size() - suffix.size())) == ToLower(suffix);
+    }
+
+    return result;
+}
+
+static std::vector<std::wstring> BuildDotEnvSearchPaths(const std::wstring& exeDir)
+{
+    std::vector<std::wstring> paths;
+
+    std::wstring cwd = GetCurrentDirectoryString();
+    if (!cwd.empty())
+    {
+        AddUniquePath(paths, cwd + L"\\.env");
+    }
+
+    if (!exeDir.empty())
+    {
+        AddUniquePath(paths, exeDir + L"\\.env");
+        if (EndsWithNoCase(exeDir, L"\\x64\\Debug") || EndsWithNoCase(exeDir, L"\\x64\\Release"))
+        {
+            AddUniquePath(paths, exeDir + L"\\..\\..\\.env");
+        }
+    }
+
+    return paths;
+}
+
 static std::vector<std::wstring> Split(const std::wstring& line)
 {
     std::vector<std::wstring> parts;
@@ -217,6 +358,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  write off\n";
     std::wcout << L"  ed <address> <value>\n";
     std::wcout << L"  peq <physical-address> <value>\n";
+    std::wcout << L"  ai ask explain this callback scan result\n";
     std::wcout << L"  drvstatus\n";
     std::wcout << L"\n";
     CommandRegistry::PrintSummary(includeDbgEng);
@@ -2132,6 +2274,944 @@ static void HandleUnassembleCommand(
     } while (false);
 }
 
+static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const SymbolEngine& symbols)
+{
+    std::wstringstream stream;
+
+    stream << L"KnLiveDbg session context:\n";
+    stream << L"- backend: " << BackendModeText(state.Backend) << L"\n";
+    stream << L"- number base: " << state.NumberBase << L"\n";
+    stream << L"- symbol path: " << symbols.SymbolPath() << L"\n";
+    stream << L"- loaded kernel modules: " << symbols.Modules().size() << L"\n";
+    stream << L"- write mode is enabled by default per device handle unless the operator ran write off\n";
+    stream << L"Rules:\n";
+    stream << L"- Prefer concrete KnLiveDbg commands and exact preview text.\n";
+    stream << L"- Treat AI output as advisory and require operator confirmation for writes.\n";
+    stream << L"- For memory writes, mention backup, restore, and readback verification commands.\n";
+    stream << L"- Do not claim live state was inspected unless command output was provided in the prompt.\n";
+
+    return stream.str();
+}
+
+static void PrintAiProviders()
+{
+    std::wcout << L"supported AI providers:\n";
+    for (const std::wstring& provider : AiProviderRuntime::SupportedProviderNames())
+    {
+        std::wcout << L"  " << provider << L"\n";
+    }
+}
+
+static bool ParseDecimalIndex(const std::wstring& value, size_t* output)
+{
+    bool ok = false;
+
+    do
+    {
+        if (output == nullptr || value.empty())
+        {
+            break;
+        }
+
+        wchar_t* end = nullptr;
+        unsigned long parsed = wcstoul(value.c_str(), &end, 10);
+        if (end == nullptr || *end != L'\0' || parsed == 0)
+        {
+            break;
+        }
+
+        *output = static_cast<size_t>(parsed);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring EscapeJsonText(const std::wstring& value)
+{
+    std::wstringstream stream;
+
+    for (wchar_t ch : value)
+    {
+        switch (ch)
+        {
+        case L'\"':
+            stream << L"\\\"";
+            break;
+        case L'\\':
+            stream << L"\\\\";
+            break;
+        case L'\b':
+            stream << L"\\b";
+            break;
+        case L'\f':
+            stream << L"\\f";
+            break;
+        case L'\n':
+            stream << L"\\n";
+            break;
+        case L'\r':
+            stream << L"\\r";
+            break;
+        case L'\t':
+            stream << L"\\t";
+            break;
+        default:
+            if (ch < 0x20)
+            {
+                stream << L"\\u" << std::hex << std::setw(4) << std::setfill(L'0') << static_cast<unsigned int>(ch);
+            }
+            else
+            {
+                stream << ch;
+            }
+            break;
+        }
+    }
+
+    return stream.str();
+}
+
+static std::string WideToUtf8ForLog(const std::wstring& value)
+{
+    std::string result;
+
+    do
+    {
+        if (value.empty())
+        {
+            break;
+        }
+
+        int required = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+        if (required <= 0)
+        {
+            break;
+        }
+
+        result.resize(required);
+        WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), &result[0], required, nullptr, nullptr);
+    } while (false);
+
+    return result;
+}
+
+static std::wstring CurrentUtcTimestamp()
+{
+    SYSTEMTIME now = {};
+    wchar_t buffer[64] = {};
+
+    GetSystemTime(&now);
+    swprintf_s(
+        buffer,
+        L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        now.wMilliseconds);
+
+    return buffer;
+}
+
+static bool AppendUtf8Line(const std::wstring& path, const std::wstring& line, std::wstring* error)
+{
+    bool ok = false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        if (path.empty())
+        {
+            break;
+        }
+
+        file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"open transcript failed";
+            }
+            break;
+        }
+
+        std::string bytes = WideToUtf8ForLog(line + L"\n");
+        DWORD written = 0;
+        if (!bytes.empty() && !WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr))
+        {
+            if (error != nullptr)
+            {
+                *error = L"write transcript failed";
+            }
+            break;
+        }
+
+        ok = written == bytes.size();
+    } while (false);
+
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+    }
+
+    return ok;
+}
+
+static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text, std::wstring* error)
+{
+    bool ok = false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        if (path.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"empty output path";
+            }
+            break;
+        }
+
+        file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"open output file failed";
+            }
+            break;
+        }
+
+        std::string bytes = WideToUtf8ForLog(text);
+        DWORD written = 0;
+        if (!bytes.empty() && !WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr))
+        {
+            if (error != nullptr)
+            {
+                *error = L"write output file failed";
+            }
+            break;
+        }
+
+        ok = written == bytes.size();
+    } while (false);
+
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+    }
+
+    return ok;
+}
+
+static void WriteAiTranscriptEvent(
+    const AiPlanState& aiState,
+    const std::wstring& event,
+    const std::wstring& detail,
+    const std::wstring& command)
+{
+    do
+    {
+        if (!aiState.TranscriptEnabled || aiState.TranscriptPath.empty())
+        {
+            break;
+        }
+
+        std::wstringstream line;
+        line << L"{";
+        line << L"\"ts\":\"" << EscapeJsonText(CurrentUtcTimestamp()) << L"\",";
+        line << L"\"event\":\"" << EscapeJsonText(event) << L"\",";
+        line << L"\"detail\":\"" << EscapeJsonText(detail) << L"\",";
+        line << L"\"command\":\"" << EscapeJsonText(command) << L"\"";
+        line << L"}";
+
+        std::wstring ignored;
+        AppendUtf8Line(aiState.TranscriptPath, line.str(), &ignored);
+    } while (false);
+}
+
+static void WriteCommandTranscriptEvent(
+    const AiPlanState& aiState,
+    const std::wstring& origin,
+    const std::wstring& backend,
+    bool writeLike,
+    const std::wstring& command,
+    const CommandExecutionResult& result)
+{
+    do
+    {
+        if (!aiState.TranscriptEnabled || aiState.TranscriptPath.empty())
+        {
+            break;
+        }
+
+        std::wstringstream line;
+        line << L"{";
+        line << L"\"ts\":\"" << EscapeJsonText(CurrentUtcTimestamp()) << L"\",";
+        line << L"\"event\":\"command\",";
+        line << L"\"origin\":\"" << EscapeJsonText(origin) << L"\",";
+        line << L"\"backend\":\"" << EscapeJsonText(backend) << L"\",";
+        line << L"\"write_like\":" << (writeLike ? L"true" : L"false") << L",";
+        line << L"\"command\":\"" << EscapeJsonText(command) << L"\",";
+        line << L"\"keep_running\":" << (result.KeepRunning ? L"true" : L"false") << L",";
+        line << L"\"stdout\":\"" << EscapeJsonText(result.Output) << L"\",";
+        line << L"\"stderr\":\"" << EscapeJsonText(result.Error) << L"\"";
+        line << L"}";
+
+        std::wstring ignored;
+        AppendUtf8Line(aiState.TranscriptPath, line.str(), &ignored);
+    } while (false);
+}
+
+static bool ExtractBalancedJsonObject(const std::wstring& text, std::wstring* json)
+{
+    bool ok = false;
+
+    do
+    {
+        if (json == nullptr)
+        {
+            break;
+        }
+
+        size_t start = text.find(L'{');
+        if (start == std::wstring::npos)
+        {
+            break;
+        }
+
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (size_t index = start; index < text.size(); ++index)
+        {
+            wchar_t ch = text[index];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == L'\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == L'\"')
+                {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (ch == L'\"')
+            {
+                inString = true;
+            }
+            else if (ch == L'{')
+            {
+                ++depth;
+            }
+            else if (ch == L'}')
+            {
+                --depth;
+                if (depth == 0)
+                {
+                    *json = text.substr(start, index - start + 1);
+                    ok = true;
+                    break;
+                }
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool ParseJsonStringAt(const std::wstring& text, size_t quote, std::wstring* value, size_t* next)
+{
+    bool ok = false;
+    std::wstring result;
+
+    do
+    {
+        if (value == nullptr || quote >= text.size() || text[quote] != L'\"')
+        {
+            break;
+        }
+
+        for (size_t index = quote + 1; index < text.size(); ++index)
+        {
+            wchar_t ch = text[index];
+            if (ch == L'\"')
+            {
+                *value = result;
+                if (next != nullptr)
+                {
+                    *next = index + 1;
+                }
+                ok = true;
+                break;
+            }
+
+            if (ch != L'\\' || index + 1 >= text.size())
+            {
+                result += ch;
+                continue;
+            }
+
+            wchar_t escaped = text[++index];
+            switch (escaped)
+            {
+            case L'\"':
+            case L'\\':
+            case L'/':
+                result += escaped;
+                break;
+            case L'b':
+                result += L'\b';
+                break;
+            case L'f':
+                result += L'\f';
+                break;
+            case L'n':
+                result += L'\n';
+                break;
+            case L'r':
+                result += L'\r';
+                break;
+            case L't':
+                result += L'\t';
+                break;
+            default:
+                result += escaped;
+                break;
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool ExtractJsonStringValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
+{
+    bool ok = false;
+    std::wstring pattern = L"\"" + key + L"\"";
+    size_t pos = 0;
+
+    do
+    {
+        if (value == nullptr)
+        {
+            break;
+        }
+
+        while ((pos = json.find(pattern, pos)) != std::wstring::npos)
+        {
+            size_t colon = json.find(L':', pos + pattern.size());
+            if (colon == std::wstring::npos)
+            {
+                break;
+            }
+
+            size_t quote = colon + 1;
+            while (quote < json.size() && iswspace(json[quote]) != 0)
+            {
+                ++quote;
+            }
+
+            if (quote < json.size() && json[quote] == L'\"')
+            {
+                ok = ParseJsonStringAt(json, quote, value, nullptr);
+                break;
+            }
+
+            pos = colon + 1;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool ExtractJsonBoolValue(const std::wstring& json, const std::wstring& key, bool* value)
+{
+    bool ok = false;
+    std::wstring pattern = L"\"" + key + L"\"";
+    size_t pos = json.find(pattern);
+
+    do
+    {
+        if (value == nullptr || pos == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t colon = json.find(L':', pos + pattern.size());
+        if (colon == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t item = colon + 1;
+        while (item < json.size() && iswspace(json[item]) != 0)
+        {
+            ++item;
+        }
+
+        if (json.compare(item, 4, L"true") == 0)
+        {
+            *value = true;
+            ok = true;
+        }
+        else if (json.compare(item, 5, L"false") == 0)
+        {
+            *value = false;
+            ok = true;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static std::vector<std::wstring> ExtractJsonArrayObjects(const std::wstring& json, const std::wstring& key)
+{
+    std::vector<std::wstring> objects;
+    std::wstring pattern = L"\"" + key + L"\"";
+    size_t pos = json.find(pattern);
+
+    do
+    {
+        if (pos == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t bracket = json.find(L'[', pos + pattern.size());
+        if (bracket == std::wstring::npos)
+        {
+            break;
+        }
+
+        bool inString = false;
+        bool escaped = false;
+        int objectDepth = 0;
+        size_t objectStart = std::wstring::npos;
+        for (size_t index = bracket + 1; index < json.size(); ++index)
+        {
+            wchar_t ch = json[index];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == L'\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == L'\"')
+                {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (ch == L'\"')
+            {
+                inString = true;
+            }
+            else if (ch == L'{')
+            {
+                if (objectDepth == 0)
+                {
+                    objectStart = index;
+                }
+                ++objectDepth;
+            }
+            else if (ch == L'}')
+            {
+                --objectDepth;
+                if (objectDepth == 0 && objectStart != std::wstring::npos)
+                {
+                    objects.push_back(json.substr(objectStart, index - objectStart + 1));
+                    objectStart = std::wstring::npos;
+                }
+            }
+            else if (ch == L']' && objectDepth == 0)
+            {
+                break;
+            }
+        }
+    } while (false);
+
+    return objects;
+}
+
+static bool IsWriteLikeCommandLine(const std::wstring& line)
+{
+    bool writeLike = false;
+    std::vector<std::wstring> args = Split(line);
+
+    do
+    {
+        if (args.empty())
+        {
+            break;
+        }
+
+        std::wstring command = NormalizeInputCommand(args[0]);
+        if (command == L"setfield" || command == L"write" || command == L"f" || command == L"fp" || command == L"m")
+        {
+            writeLike = true;
+            break;
+        }
+
+        if (IsEnterCommand(command) || IsPhysicalEnterCommand(command))
+        {
+            writeLike = true;
+            break;
+        }
+    } while (false);
+
+    return writeLike;
+}
+
+static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason)
+{
+    bool blocked = false;
+    std::vector<std::wstring> args = Split(line);
+
+    do
+    {
+        if (args.empty())
+        {
+            blocked = true;
+            if (reason != nullptr)
+            {
+                *reason = L"empty command";
+            }
+            break;
+        }
+
+        std::wstring command = NormalizeInputCommand(args[0]);
+        if (command == L"ai")
+        {
+            blocked = true;
+            if (reason != nullptr)
+            {
+                *reason = L"nested ai commands are not executed from plans";
+            }
+            break;
+        }
+
+        if (command == L"q" || command == L"qq" || command == L"qd" || command == L"quit" ||
+            command == L"exit" || command == L"unload")
+        {
+            blocked = true;
+            if (reason != nullptr)
+            {
+                *reason = L"session shutdown commands are blocked";
+            }
+            break;
+        }
+
+        if (IsWriteLikeCommandLine(line))
+        {
+            blocked = true;
+            if (reason != nullptr)
+            {
+                *reason = L"write-like commands require manual execution";
+            }
+            break;
+        }
+    } while (false);
+
+    return blocked;
+}
+
+static bool ParseAiPlanResponse(const std::wstring& responseText, AiPlanState* plan, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (plan == nullptr)
+        {
+            break;
+        }
+
+        std::wstring json;
+        if (!ExtractBalancedJsonObject(responseText, &json))
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI response did not contain a JSON object";
+            }
+            break;
+        }
+
+        AiPlanState parsed = {};
+        parsed.RawResponse = responseText;
+        ExtractJsonStringValue(json, L"title", &parsed.Title);
+        ExtractJsonStringValue(json, L"summary", &parsed.Summary);
+
+        std::vector<std::wstring> objects = ExtractJsonArrayObjects(json, L"commands");
+        for (const std::wstring& object : objects)
+        {
+            AiCommandProposal item = {};
+            ExtractJsonStringValue(object, L"command", &item.Command);
+            ExtractJsonStringValue(object, L"purpose", &item.Purpose);
+            if (item.Purpose.empty())
+            {
+                ExtractJsonStringValue(object, L"reason", &item.Purpose);
+            }
+            ExtractJsonStringValue(object, L"risk", &item.Risk);
+            ExtractJsonBoolValue(object, L"requires_confirmation", &item.RequiresConfirmation);
+            ExtractJsonBoolValue(object, L"write_like", &item.WriteLike);
+            item.Command = JoinArgs(Split(item.Command), 0);
+            item.WriteLike = item.WriteLike || IsWriteLikeCommandLine(item.Command);
+            if (!item.Command.empty())
+            {
+                parsed.Commands.push_back(item);
+            }
+        }
+
+        if (parsed.Commands.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI plan JSON did not contain commands";
+            }
+            break;
+        }
+
+        *plan = parsed;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
+{
+    std::wstringstream stream;
+
+    stream << L"Create a KnLiveDbg command plan for this operator request.\n";
+    stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
+    stream << L"Schema:\n";
+    stream << L"{\"title\":\"short title\",\"summary\":\"short summary\",\"commands\":[";
+    stream << L"{\"command\":\"exact KnLiveDbg command\",\"purpose\":\"why this command is useful\",\"risk\":\"read-only|write-like|dbgeng|unknown\",\"requires_confirmation\":true,\"write_like\":false}";
+    stream << L"]}\n";
+    stream << L"Rules:\n";
+    stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
+    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, vtop, pdb, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
+    stream << L"- Do not include q, quit, exit, unload, or nested ai commands.\n";
+    stream << L"Operator request:\n";
+    stream << prompt << L"\n";
+
+    return stream.str();
+}
+
+static void PrintAiPlan(const AiPlanState& plan)
+{
+    do
+    {
+        if (plan.Commands.empty())
+        {
+            std::wcout << L"no AI command plan is loaded\n";
+            break;
+        }
+
+        std::wcout << L"AI command plan";
+        if (!plan.Title.empty())
+        {
+            std::wcout << L": " << plan.Title;
+        }
+        std::wcout << L"\n";
+        if (!plan.Summary.empty())
+        {
+            std::wcout << plan.Summary << L"\n";
+        }
+
+        for (size_t index = 0; index < plan.Commands.size(); ++index)
+        {
+            const AiCommandProposal& item = plan.Commands[index];
+            std::wcout << L"[" << (index + 1) << L"] " << item.Command << L"\n";
+            if (!item.Purpose.empty())
+            {
+                std::wcout << L"    purpose: " << item.Purpose << L"\n";
+            }
+            if (!item.Risk.empty() || item.WriteLike)
+            {
+                std::wcout << L"    risk: " << (item.Risk.empty() ? L"(unspecified)" : item.Risk);
+                if (item.WriteLike)
+                {
+                    std::wcout << L" write-like";
+                }
+                std::wcout << L"\n";
+            }
+        }
+    } while (false);
+}
+
+static std::wstring BuildAiSessionReport(
+    const DebuggerState& state,
+    const SymbolEngine& symbols,
+    const AiProviderRuntime& ai,
+    const AiPlanState& plan)
+{
+    std::wstringstream stream;
+
+    stream << L"# KnLiveDbg AI Session Report\n\n";
+    stream << L"- generated: " << CurrentUtcTimestamp() << L"\n";
+    stream << L"- backend: " << BackendModeText(state.Backend) << L"\n";
+    stream << L"- number base: " << state.NumberBase << L"\n";
+    stream << L"- symbol path: `" << symbols.SymbolPath() << L"`\n";
+    stream << L"- loaded kernel modules: " << symbols.Modules().size() << L"\n";
+    stream << L"- ai provider: " << ai.ProviderName() << L"\n";
+    stream << L"- ai model: " << (ai.Settings().Model.empty() ? L"(default)" : ai.Settings().Model) << L"\n";
+    stream << L"- ai credential: " << ai.CredentialStatus() << L"\n";
+    stream << L"- transcript: " << (plan.TranscriptEnabled ? L"enabled" : L"disabled");
+    if (!plan.TranscriptPath.empty())
+    {
+        stream << L" `" << plan.TranscriptPath << L"`";
+    }
+    stream << L"\n\n";
+
+    stream << L"## Current AI Plan\n\n";
+    if (plan.Commands.empty())
+    {
+        stream << L"No AI command plan is loaded.\n";
+    }
+    else
+    {
+        if (!plan.Title.empty())
+        {
+            stream << L"Title: " << plan.Title << L"\n\n";
+        }
+        if (!plan.Summary.empty())
+        {
+            stream << plan.Summary << L"\n\n";
+        }
+        for (size_t index = 0; index < plan.Commands.size(); ++index)
+        {
+            const AiCommandProposal& item = plan.Commands[index];
+            stream << L"### " << (index + 1) << L". `" << item.Command << L"`\n\n";
+            if (!item.Purpose.empty())
+            {
+                stream << L"- purpose: " << item.Purpose << L"\n";
+            }
+            if (!item.Risk.empty())
+            {
+                stream << L"- risk: " << item.Risk << L"\n";
+            }
+            stream << L"- write-like: " << (item.WriteLike ? L"yes" : L"no") << L"\n";
+            stream << L"- requires confirmation: " << (item.RequiresConfirmation ? L"yes" : L"no") << L"\n\n";
+        }
+    }
+
+    if (!plan.RawResponse.empty())
+    {
+        stream << L"## Raw AI Plan Response\n\n";
+        stream << L"```text\n";
+        stream << plan.RawResponse << L"\n";
+        stream << L"```\n";
+    }
+
+    return stream.str();
+}
+
+class TeeWideStreamBuffer : public std::wstreambuf
+{
+public:
+    TeeWideStreamBuffer(std::wstreambuf* target, std::wstring* capture) :
+        target_(target),
+        capture_(capture)
+    {
+    }
+
+protected:
+    int_type overflow(int_type value) override
+    {
+        if (traits_type::eq_int_type(value, traits_type::eof()))
+        {
+            return traits_type::not_eof(value);
+        }
+
+        wchar_t ch = traits_type::to_char_type(value);
+        if (capture_ != nullptr)
+        {
+            capture_->push_back(ch);
+        }
+
+        if (target_ != nullptr)
+        {
+            return target_->sputc(ch);
+        }
+
+        return value;
+    }
+
+    std::streamsize xsputn(const wchar_t* text, std::streamsize count) override
+    {
+        if (capture_ != nullptr && text != nullptr && count > 0)
+        {
+            capture_->append(text, static_cast<size_t>(count));
+        }
+
+        if (target_ != nullptr)
+        {
+            return target_->sputn(text, count);
+        }
+
+        return count;
+    }
+
+    int sync() override
+    {
+        if (target_ != nullptr)
+        {
+            return target_->pubsync();
+        }
+
+        return 0;
+    }
+
+private:
+    std::wstreambuf* target_;
+    std::wstring* capture_;
+};
+
+class ScopedWideStreamCapture
+{
+public:
+    ScopedWideStreamCapture(std::wstring* output, std::wstring* error) :
+        outBuffer_(std::wcout.rdbuf(), output),
+        errBuffer_(std::wcerr.rdbuf(), error),
+        oldOut_(std::wcout.rdbuf(&outBuffer_)),
+        oldErr_(std::wcerr.rdbuf(&errBuffer_))
+    {
+    }
+
+    ~ScopedWideStreamCapture()
+    {
+        std::wcout.flush();
+        std::wcerr.flush();
+        std::wcout.rdbuf(oldOut_);
+        std::wcerr.rdbuf(oldErr_);
+    }
+
+private:
+    TeeWideStreamBuffer outBuffer_;
+    TeeWideStreamBuffer errBuffer_;
+    std::wstreambuf* oldOut_;
+    std::wstreambuf* oldErr_;
+};
+
 static bool HandleCommand(
     const std::vector<std::wstring>& args,
     const std::wstring& originalLine,
@@ -2139,7 +3219,434 @@ static bool HandleCommand(
     DbgEngBackend& dbgeng,
     DeviceClient& device,
     DriverService& service,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState);
+
+static CommandExecutionResult ExecuteCommandWithTranscript(
+    const std::vector<std::wstring>& args,
+    const std::wstring& originalLine,
+    const std::wstring& origin,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState);
+
+static bool RunAiPlannedCommands(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    bool keepRunning = true;
+
+    do
+    {
+        if (aiState.Commands.empty())
+        {
+            std::wcerr << L"no AI command plan is loaded. run ai plan <prompt> first\n";
+            break;
+        }
+
+        if (args.size() < 3)
+        {
+            std::wcerr << L"usage: ai run <index|all>\n";
+            break;
+        }
+
+        std::vector<size_t> indexes;
+        if (ToLower(args[2]) == L"all")
+        {
+            for (size_t index = 1; index <= aiState.Commands.size(); ++index)
+            {
+                indexes.push_back(index);
+            }
+        }
+        else
+        {
+            size_t index = 0;
+            if (!ParseDecimalIndex(args[2], &index) || index > aiState.Commands.size())
+            {
+                std::wcerr << L"invalid AI plan index\n";
+                break;
+            }
+            indexes.push_back(index);
+        }
+
+        for (size_t index : indexes)
+        {
+            const AiCommandProposal& item = aiState.Commands[index - 1];
+            std::wstring reason;
+            if (IsBlockedAiRunCommand(item.Command, &reason))
+            {
+                std::wcerr << L"ai run blocked [" << index << L"]: " << reason << L" command=" << item.Command << L"\n";
+                WriteAiTranscriptEvent(aiState, L"ai_run_blocked", reason, item.Command);
+                continue;
+            }
+
+            std::wcout << L"ai run [" << index << L"]: " << item.Command << L"\n";
+            WriteAiTranscriptEvent(aiState, L"ai_run", L"executing planned command", item.Command);
+
+            std::vector<std::wstring> commandArgs = Split(item.Command);
+            CommandExecutionResult result = ExecuteCommandWithTranscript(
+                commandArgs,
+                item.Command,
+                L"ai_run",
+                state,
+                dbgeng,
+                device,
+                service,
+                symbols,
+                ai,
+                aiState);
+            if (!result.KeepRunning)
+            {
+                keepRunning = false;
+                break;
+            }
+        }
+    } while (false);
+
+    return keepRunning;
+}
+
+static void HandleAiPlannedWrite(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        if (aiState.Commands.empty())
+        {
+            std::wcerr << L"no AI command plan is loaded. run ai plan <prompt> first\n";
+            break;
+        }
+
+        if (args.size() < 3)
+        {
+            std::wcerr << L"usage: ai write <index> [confirm]\n";
+            break;
+        }
+
+        size_t index = 0;
+        if (!ParseDecimalIndex(args[2], &index) || index > aiState.Commands.size())
+        {
+            std::wcerr << L"invalid AI plan index\n";
+            break;
+        }
+
+        const AiCommandProposal& item = aiState.Commands[index - 1];
+        std::wstring reason;
+        if (IsBlockedAiRunCommand(item.Command, &reason) && !IsWriteLikeCommandLine(item.Command))
+        {
+            std::wcerr << L"ai write blocked: " << reason << L"\n";
+            WriteAiTranscriptEvent(aiState, L"ai_write_blocked", reason, item.Command);
+            break;
+        }
+
+        if (!IsWriteLikeCommandLine(item.Command))
+        {
+            std::wcerr << L"selected command is not write-like; use ai run " << index << L"\n";
+            break;
+        }
+
+        bool confirmed = args.size() >= 4 && ToLower(args[3]) == L"confirm";
+        if (!confirmed)
+        {
+            std::wcout << L"AI write preview [" << index << L"]\n";
+            std::wcout << L"command: " << item.Command << L"\n";
+            if (!item.Purpose.empty())
+            {
+                std::wcout << L"purpose: " << item.Purpose << L"\n";
+            }
+            if (!item.Risk.empty())
+            {
+                std::wcout << L"risk: " << item.Risk << L"\n";
+            }
+            std::wcout << L"operator action required: inspect the command, prepare backup/readback commands, then type:\n";
+            std::wcout << L"  ai write " << index << L" confirm\n";
+            WriteAiTranscriptEvent(aiState, L"ai_write_preview", L"confirmation required", item.Command);
+            break;
+        }
+
+        std::wcout << L"ai write confirm [" << index << L"]: " << item.Command << L"\n";
+        WriteAiTranscriptEvent(aiState, L"ai_write_confirm", L"operator confirmed write-like command", item.Command);
+
+        std::vector<std::wstring> commandArgs = Split(item.Command);
+        ExecuteCommandWithTranscript(
+            commandArgs,
+            item.Command,
+            L"ai_write_confirm",
+            state,
+            dbgeng,
+            device,
+            service,
+            symbols,
+            ai,
+            aiState);
+    } while (false);
+}
+
+static void HandleAiCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        if (args.size() == 1 || args[1] == L"status")
+        {
+            std::wcout << ai.StatusText();
+            break;
+        }
+
+        std::wstring action = ToLower(args[1]);
+        if (action == L"help")
+        {
+            std::wcout << L"ai commands:\n";
+            std::wcout << L"  ai status\n";
+            std::wcout << L"  ai providers\n";
+            std::wcout << L"  ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>\n";
+            std::wcout << L"  ai model <model>\n";
+            std::wcout << L"  ai baseurl <url>\n";
+            std::wcout << L"  ai effort <minimal|low|medium|high|xhigh>\n";
+            std::wcout << L"  ai auth\n";
+            std::wcout << L"  ai preview <prompt>\n";
+            std::wcout << L"  ai ask <prompt>\n";
+            std::wcout << L"  ai plan <prompt>\n";
+            std::wcout << L"  ai show\n";
+            std::wcout << L"  ai run <index|all>\n";
+            std::wcout << L"  ai write <index> [confirm]\n";
+            std::wcout << L"  ai transcript <path|off|status>\n";
+            std::wcout << L"  ai report <path>\n";
+        }
+        else if (action == L"providers")
+        {
+            PrintAiProviders();
+        }
+        else if (action == L"provider")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai provider <name>\n";
+                break;
+            }
+
+            std::wstring error;
+            if (!ai.SetProvider(args[2], &error))
+            {
+                std::wcerr << L"ai provider failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << ai.StatusText();
+        }
+        else if (action == L"model")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai model <model>\n";
+                break;
+            }
+
+            ai.SetModel(JoinArgs(args, 2));
+            std::wcout << ai.StatusText();
+        }
+        else if (action == L"baseurl" || action == L"base-url")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai baseurl <url>\n";
+                break;
+            }
+
+            ai.SetBaseUrl(JoinArgs(args, 2));
+            std::wcout << ai.StatusText();
+        }
+        else if (action == L"effort")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai effort <minimal|low|medium|high|xhigh>\n";
+                break;
+            }
+
+            ai.SetReasoningEffort(args[2]);
+            std::wcout << ai.StatusText();
+        }
+        else if (action == L"auth")
+        {
+            std::wcout << ai.AuthHelpText();
+        }
+        else if (action == L"show")
+        {
+            PrintAiPlan(aiState);
+        }
+        else if (action == L"write")
+        {
+            HandleAiPlannedWrite(args, state, dbgeng, device, service, symbols, ai, aiState);
+        }
+        else if (action == L"transcript")
+        {
+            if (args.size() < 3 || ToLower(args[2]) == L"status")
+            {
+                std::wcout << L"ai transcript: " << (aiState.TranscriptEnabled ? L"on" : L"off");
+                if (!aiState.TranscriptPath.empty())
+                {
+                    std::wcout << L" path=" << aiState.TranscriptPath;
+                }
+                std::wcout << L"\n";
+                break;
+            }
+
+            if (ToLower(args[2]) == L"off")
+            {
+                WriteAiTranscriptEvent(aiState, L"transcript_off", L"transcript disabled", L"");
+                aiState.TranscriptEnabled = false;
+                std::wcout << L"ai transcript: off\n";
+                break;
+            }
+
+            aiState.TranscriptPath = JoinArgs(args, 2);
+            aiState.TranscriptEnabled = true;
+            WriteAiTranscriptEvent(aiState, L"transcript_on", L"transcript enabled", L"");
+            std::wcout << L"ai transcript: on path=" << aiState.TranscriptPath << L"\n";
+        }
+        else if (action == L"report")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai report <path>\n";
+                break;
+            }
+
+            std::wstring path = JoinArgs(args, 2);
+            std::wstring error;
+            if (!WriteUtf8TextFile(path, BuildAiSessionReport(state, symbols, ai, aiState), &error))
+            {
+                std::wcerr << L"ai report failed: " << error << L"\n";
+                break;
+            }
+
+            WriteAiTranscriptEvent(aiState, L"ai_report", L"report written", path);
+            std::wcout << L"ai report written: " << path << L"\n";
+        }
+        else if (action == L"preview" || action == L"ask")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai " << action << L" <prompt>\n";
+                break;
+            }
+
+            AiCompletionRequest request = {};
+            request.System = BuildAiSystemPrompt(state, symbols);
+            request.Prompt = JoinArgs(args, 2);
+
+            if (action == L"preview")
+            {
+                std::wcout << ai.PreviewText(request);
+                break;
+            }
+
+            std::wcout << L"ai request: provider=" << ai.ProviderName()
+                       << L" model=" << ai.Settings().Model
+                       << L" credential=" << ai.CredentialStatus() << L"\n";
+            AiCompletionResponse response = {};
+            std::wstring error;
+            if (!ai.Complete(request, &response, &error))
+            {
+                std::wcerr << L"ai request failed: " << error << L"\n";
+                WriteAiTranscriptEvent(aiState, L"ai_ask_failed", error, L"");
+                break;
+            }
+
+            WriteAiTranscriptEvent(aiState, L"ai_ask", L"request completed", L"");
+            if (!response.Text.empty())
+            {
+                std::wcout << response.Text;
+                if (response.Text.back() != L'\n')
+                {
+                    std::wcout << L"\n";
+                }
+            }
+        }
+        else if (action == L"plan")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai plan <prompt>\n";
+                break;
+            }
+
+            AiCompletionRequest request = {};
+            request.System = BuildAiSystemPrompt(state, symbols);
+            request.Prompt = BuildAiPlanPrompt(JoinArgs(args, 2));
+
+            std::wcout << L"ai plan request: provider=" << ai.ProviderName()
+                       << L" model=" << ai.Settings().Model
+                       << L" credential=" << ai.CredentialStatus() << L"\n";
+
+            AiCompletionResponse response = {};
+            std::wstring error;
+            if (!ai.Complete(request, &response, &error))
+            {
+                std::wcerr << L"ai plan failed: " << error << L"\n";
+                WriteAiTranscriptEvent(aiState, L"ai_plan_failed", error, L"");
+                break;
+            }
+
+            AiPlanState parsed = {};
+            parsed.TranscriptEnabled = aiState.TranscriptEnabled;
+            parsed.TranscriptPath = aiState.TranscriptPath;
+            if (!ParseAiPlanResponse(response.Text, &parsed, &error))
+            {
+                aiState.RawResponse = response.Text;
+                std::wcerr << L"ai plan parse failed: " << error << L"\n";
+                std::wcerr << L"raw response:\n" << response.Text << L"\n";
+                WriteAiTranscriptEvent(aiState, L"ai_plan_parse_failed", error, L"");
+                break;
+            }
+
+            aiState = parsed;
+            WriteAiTranscriptEvent(aiState, L"ai_plan", L"plan loaded", L"");
+            PrintAiPlan(aiState);
+        }
+        else
+        {
+            std::wcerr << L"unknown ai command. type ai help\n";
+        }
+    } while (false);
+}
+
+static bool HandleCommand(
+    const std::vector<std::wstring>& args,
+    const std::wstring& originalLine,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
 {
     bool keepRunning = true;
 
@@ -2231,11 +3738,23 @@ static bool HandleCommand(
         {
             HandleUnassembleCommand(args, originalLine, state, dbgeng, symbols);
         }
+        else if (command == L"ai")
+        {
+            if (args.size() >= 2 && ToLower(args[1]) == L"run")
+            {
+                keepRunning = RunAiPlannedCommands(args, state, dbgeng, device, service, symbols, ai, aiState);
+            }
+            else
+            {
+                HandleAiCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
+            }
+        }
         else if (state.Backend == DebuggerState::BackendMode::DbgEng &&
                  command != L"q" && command != L"qq" && command != L"qd" &&
                  command != L"quit" && command != L"exit" &&
                  command != L"unload" && command != L"drvstatus" &&
-                 command != L"callbacks" && command != L"kcallbacks" && command != L"cb")
+                 command != L"callbacks" && command != L"kcallbacks" && command != L"cb" &&
+                 command != L"ai")
         {
             ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true);
         }
@@ -2629,6 +4148,47 @@ static bool HandleCommand(
     return keepRunning;
 }
 
+static CommandExecutionResult ExecuteCommandWithTranscript(
+    const std::vector<std::wstring>& args,
+    const std::wstring& originalLine,
+    const std::wstring& origin,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    CommandExecutionResult result = {};
+    result.KeepRunning = true;
+    std::wstring backendBefore = BackendModeText(state.Backend);
+    bool writeLike = IsWriteLikeCommandLine(originalLine);
+
+    do
+    {
+        if (aiState.TranscriptEnabled && !aiState.TranscriptPath.empty())
+        {
+            ScopedWideStreamCapture capture(&result.Output, &result.Error);
+            result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
+        }
+        else
+        {
+            result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
+        }
+
+        WriteCommandTranscriptEvent(
+            aiState,
+            origin,
+            backendBefore,
+            writeLike,
+            originalLine,
+            result);
+    } while (false);
+
+    return result;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     UNREFERENCED_PARAMETER(argc);
@@ -2697,8 +4257,17 @@ int wmain(int argc, wchar_t** argv)
         state.Backend = DebuggerState::BackendMode::Auto;
 
         DbgEngBackend dbgeng;
+        AiProviderRuntime ai;
+        AiPlanState aiState = {};
+        std::wstring loadedDotEnv;
+        std::wstring dotEnvError;
+        ai.LoadDotEnvFiles(BuildDotEnvSearchPaths(exeDir), &loadedDotEnv, &dotEnvError);
 
         std::wcout << L"KnLiveDbg ready. backend=auto. type help or help all\n";
+        if (!loadedDotEnv.empty())
+        {
+            std::wcout << L"AI config: loaded " << loadedDotEnv << L"\n";
+        }
 
         while (!g_StopRequested)
         {
@@ -2721,7 +4290,18 @@ int wmain(int argc, wchar_t** argv)
                 state.LastCommand = line;
             }
 
-            if (!HandleCommand(args, line, state, dbgeng, device, service, symbols))
+            CommandExecutionResult commandResult = ExecuteCommandWithTranscript(
+                args,
+                line,
+                L"operator",
+                state,
+                dbgeng,
+                device,
+                service,
+                symbols,
+                ai,
+                aiState);
+            if (!commandResult.KeepRunning)
             {
                 break;
             }

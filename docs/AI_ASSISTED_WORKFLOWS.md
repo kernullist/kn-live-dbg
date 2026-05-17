@@ -12,6 +12,35 @@ This document captures implementation ideas for adding AI assistance to Kn Live 
 6. Sensitive memory and symbol output should be handled through a configurable model provider policy. Offline/local models should be possible for private kernel state.
 7. The driver should remain a narrow memory primitive provider. AI parsing, planning, risk scoring, and report generation belong in user mode.
 
+## Current Implementation
+
+The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory:
+
+1. `ai status` reports the selected provider, model, base URL, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
+2. `ai providers` lists the supported provider names.
+3. `ai provider <name>` switches between `openai-codex-cli`, `openai-codex-subscription`, `deepseek`, `openrouter`, and `off`.
+4. `ai model <model>`, `ai baseurl <url>`, and `ai effort <effort>` update the in-memory provider settings for the current session.
+5. `ai auth` prints the supported `.env` keys, environment variables, and Codex auth file search paths.
+6. `ai preview <prompt>` prints the outbound provider plan without sending a request.
+7. `ai ask <prompt>` sends an advisory request. The assistant receives session context such as backend mode, number base, symbol path, loaded module count, and write-safety rules.
+8. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
+9. `ai show` prints the most recent parsed command plan.
+10. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
+11. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints the command, purpose, risk, and confirmation syntax.
+12. `ai transcript <path|off|status>` controls JSONL transcript capture for AI events and command stdout/stderr.
+13. `ai report <path>` exports a Markdown report with session context, provider status, transcript path, the parsed plan, and the raw AI plan response.
+
+Initial provider support:
+
+1. `openai-codex-cli` shells out to `codex exec`, mirroring KernForge's Codex CLI bridge pattern.
+2. `openai-codex-subscription` uses ChatGPT/Codex OAuth-style bearer tokens and the Codex Responses endpoint. It can read `KNLIVEDBG_CODEX_ACCESS_TOKEN`, `KERNFORGE_CODEX_ACCESS_TOKEN`, configured auth files, `%USERPROFILE%\.kernforge\codex_auth.json`, and `%USERPROFILE%\.codex\auth.json`.
+3. `deepseek` uses an OpenAI-compatible chat-completions request with DeepSeek defaults and optional reasoning effort.
+4. `openrouter` uses an OpenAI-compatible chat-completions request with OpenRouter defaults and metadata headers.
+
+The runtime automatically loads the first `.env` file found in the current directory, executable directory, or repository root when running from `x64\Debug` or `x64\Release`. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys, while `.env` and `.env.local` are ignored by Git.
+
+The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Transcript mode captures full command output after it is enabled, including backend mode, origin, write-like classification, stdout, stderr, and keep-running state. The command proposal JSON is the first structured tool-call contract; richer schema validation and command-output summarization remain future hardening targets.
+
 ## Candidate Features
 
 ### Natural-Language Command Planner

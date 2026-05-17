@@ -1,4 +1,6 @@
 .vs/
+.env
+.env.local
 *.user
 *.suo
 *.opensdf

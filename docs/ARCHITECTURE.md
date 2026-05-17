@@ -91,6 +91,23 @@ Backend routing is mode-dependent:
 3. `dbgeng` routes most non-session commands through `IDebugControl4::ExecuteWide`. The TUI still intercepts shutdown/service commands, backend management, native callback scanning, and explicit `u`/`uf`.
 4. `kd <command>` is a raw DbgEng escape hatch independent of the selected backend mode.
 
+## AI Provider Flow
+
+1. `AiProviderRuntime` lives entirely in user mode.
+2. Provider selection defaults to `.env` plus environment variables and can be changed for the current TUI session with `ai provider`, `ai model`, `ai baseurl`, and `ai effort`.
+3. `openai-codex-cli` executes `codex exec` as an external process and captures stdout/stderr.
+4. `openai-codex-subscription` reads Codex OAuth credentials from environment variables or auth files and calls the Codex Responses endpoint.
+5. `deepseek` and `openrouter` use OpenAI-compatible chat-completions requests over WinHTTP.
+6. `.env` is searched in the current directory, executable directory, and repository root when running from `x64\Debug` or `x64\Release`; real environment variables override `.env` values.
+7. AI requests receive only curated session context and the operator prompt. The model cannot call memory IOCTLs or execute generated debugger commands directly.
+8. `ai plan` requires a strict JSON command proposal object, parses it into in-memory plan state, and shows numbered commands with purpose and risk notes.
+9. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
+10. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
+11. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands.
+12. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
+13. `ai report` writes a Markdown report with session context, provider status, transcript path, parsed plan, and raw AI plan response.
+14. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
+
 ## Hardening Backlog
 
 1. Add a global single-controller policy so only one PID can own the device at a time.
@@ -99,6 +116,6 @@ Backend routing is mode-dependent:
 4. Add LA57 detection if five-level paging becomes a supported target.
 5. Add DIA fallback for richer type metadata and bitfield handling.
 6. Add a positive-control test driver that exposes known virtual and physical test buffers.
-7. Add a command transcript mode for reproducible debugging sessions.
-8. Add transcript logging for DbgEng command output.
+7. Add transcript rotation and redaction controls for long live sessions.
+8. Add DbgEng command classification to transcript records beyond the current backend-mode field.
 9. Add an optional remote KD connection mode once the local-kernel path is stable.

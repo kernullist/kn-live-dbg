@@ -28,6 +28,7 @@ kn-live-dbg/
 12. Routes stop-state, parser-heavy, extension, and meta commands through the DbgEng backend.
 13. Provides an optional DbgEng backend for raw WinDbg command execution against the local kernel target.
 14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with function/module/context annotations.
+15. Provides an initial AI assistant provider layer for advisory command planning and result interpretation through Codex CLI, ChatGPT/Codex OAuth, DeepSeek, and OpenRouter.
 
 ## Design Notes
 
@@ -103,6 +104,18 @@ dtx [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
 callbacks [all|ob|registry|process|minifilter]
 kcallbacks [all|ob|registry|process|minifilter]
 cb [all|ob|registry|process|minifilter]
+ai status
+ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
+ai model <model>
+ai auth
+ai preview <prompt>
+ai ask <prompt>
+ai plan <prompt>
+ai show
+ai run <index|all>
+ai write <index> [confirm]
+ai transcript <path|off|status>
+ai report <path>
 c <address1> <address2> <length>
 s [-b|-w|-d|-q] <address> <length> <value...>
 f <address> <length> <byte-pattern...>
@@ -132,11 +145,71 @@ knkd> dt -r1 nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
 knkd> callbacks all
 knkd> callbacks ob
 knkd> callbacks minifilter
+knkd> ai provider openai-codex-cli
+knkd> ai preview explain the callback surfaces I pasted above
+knkd> ai plan inspect unknown object callbacks
+knkd> ai show
+knkd> ai run 1
+knkd> ai transcript .\kn-ai-session.jsonl
+knkd> ai report .\kn-ai-report.md
 ```
 
 The registry also knows the standard execution, breakpoint, stack, register, source, exception, I/O port, and script commands. Native live-memory commands stay on the custom driver backend, while stop-state or parser-heavy commands are routed to DbgEng in `auto` or `dbgeng` mode.
 
 `u` and `uf` are explicit disassembly commands. `u` resolves an address or symbol, disassembles a bounded instruction count, and remembers the next offset for a following bare `u`; `uf` uses the DbgEng function disassembler for function-boundary-aware output.
+
+## AI Assistant Providers
+
+The `ai` command is an advisory provider bridge. It does not execute generated debugger commands automatically, and it does not hide write operations. Use it to ask for command plans, explain pasted command output, or draft investigation next steps.
+
+```text
+ai status
+ai providers
+ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
+ai model <model>
+ai baseurl <url>
+ai effort <minimal|low|medium|high|xhigh>
+ai auth
+ai preview <prompt>
+ai ask <prompt>
+ai plan <prompt>
+ai show
+ai run <index|all>
+ai write <index> [confirm]
+ai transcript <path|off|status>
+ai report <path>
+```
+
+Provider configuration is loaded from `.env` first and can be overridden by real process environment variables. Kn Live Dbg checks the current directory, the executable directory, and the repository root when running from `x64\Debug` or `x64\Release`. Copy `.env.example` to `.env` and fill in only the provider you want to use:
+
+```text
+KNLIVEDBG_AI_PROVIDER=openrouter
+KNLIVEDBG_AI_MODEL=openai/gpt-oss-120b
+KNLIVEDBG_OPENROUTER_API_KEY=sk-or-...
+```
+
+Or:
+
+```text
+KNLIVEDBG_AI_PROVIDER=deepseek
+KNLIVEDBG_AI_MODEL=deepseek-chat
+KNLIVEDBG_DEEPSEEK_API_KEY=sk-...
+```
+
+Supported keys:
+
+1. `KNLIVEDBG_AI_PROVIDER` selects `openai-codex-cli`, `openai-codex-subscription`, `deepseek`, or `openrouter`.
+2. `KNLIVEDBG_AI_MODEL` overrides the provider default model.
+3. `KNLIVEDBG_AI_BASE_URL` overrides the provider base URL.
+4. `KNLIVEDBG_DEEPSEEK_API_KEY` or `DEEPSEEK_API_KEY` supplies the DeepSeek API key.
+5. `KNLIVEDBG_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` supplies the OpenRouter API key.
+6. `KNLIVEDBG_CODEX_ACCESS_TOKEN`, `KERNFORGE_CODEX_ACCESS_TOKEN`, `KNLIVEDBG_CODEX_AUTH_FILE`, or `KERNFORGE_CODEX_AUTH_FILE` supplies ChatGPT/Codex OAuth credentials.
+7. If no Codex auth file is configured, Kn Live Dbg checks `%USERPROFILE%\.kernforge\codex_auth.json` and `%USERPROFILE%\.codex\auth.json`.
+8. `KNLIVEDBG_CODEX_CLI_PATH` overrides the `codex` executable used by `openai-codex-cli`.
+
+Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path and credential source. `ai preview` shows provider, model, credential source, and prompt size without sending a request.
+
+`ai plan <prompt>` asks the selected model to return a strict command proposal JSON object, stores the parsed plan in memory, and prints numbered commands with purpose and risk notes. `ai run <index|all>` executes only non-write, non-shutdown planned commands. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, and `m` are blocked from `ai run`; `ai write <index>` prints a write preview and `ai write <index> confirm` is required before a planned write-like command is dispatched. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode and write-like classification. `ai report <path>` exports a Markdown summary of the current AI session and plan.
 
 ## DbgEng Backend
 
