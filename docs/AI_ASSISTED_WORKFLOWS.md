@@ -16,24 +16,27 @@ This document captures implementation ideas for adding AI assistance to Kn Live 
 
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory:
 
-1. `ai status` reports the selected provider, model, base URL, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
+1. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
 2. `ai providers` lists the supported provider names.
 3. `ai provider <name>` switches between `openai-codex-cli`, `openai-codex-subscription`, `deepseek`, `openrouter`, and `off`.
-4. `ai model <model>`, `ai baseurl <url>`, and `ai effort <effort>` update the in-memory provider settings for the current session.
-5. `ai auth` prints the supported `.env` keys, environment variables, and Codex auth file search paths.
-6. `ai preview <prompt>` prints the outbound provider plan without sending a request.
-7. `ai ask <prompt>` sends an advisory request. The assistant receives session context such as backend mode, number base, symbol path, loaded module count, and write-safety rules.
-8. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
-9. `ai analyze callbacks [scope]` runs a callback scan as read-only evidence, then asks the selected model for a callback analysis report.
-10. `ai explain dt <dt-args...>` runs native `dt` or `dtx`, preserves raw output, then asks the model for structure-field interpretation and follow-up commands.
-11. `ai annotate <u|uf> <address|symbol> [count]` runs disassembly and asks the model for call-target, routine-purpose, and suspicious-pattern annotation.
-12. `ai diagnose <prompt>` sends a setup/symbol/backend failure note with current session context and asks for likely root causes and remediation commands.
-13. `ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]` loads repeatable read-only investigation command plans. Dry-run is the default.
-14. `ai show` prints the most recent parsed or playbook command plan.
-15. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
-16. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
-17. `ai transcript <path|off|status>` controls JSONL transcript capture for AI events and command stdout/stderr.
-18. `ai report <path>` exports a Markdown report with session context, provider status, transcript path, the parsed plan, and the raw AI plan response.
+4. `ai policy <allow-remote|local-only|status>` controls whether HTTP-backed providers are allowed in the current session.
+5. `ai model <model>`, `ai baseurl <url>`, and `ai effort <effort>` update the in-memory provider settings for the current session.
+6. `ai auth` prints the supported `.env` keys, environment variables, and Codex auth file search paths.
+7. `ai preview <prompt>` prints the outbound provider plan without sending a request.
+8. `ai ask <prompt>` sends an advisory request. The assistant receives session context such as backend mode, number base, symbol path, loaded module count, and write-safety rules.
+9. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
+10. `ai analyze callbacks [scope]` runs `callbacks json <scope>` as read-only structured evidence, then asks the selected model for a callback analysis report.
+11. `ai explain dt <dt-args...>` runs native `dt` or `dtx`, preserves raw output, then asks the model for structure-field interpretation and follow-up commands.
+12. `ai annotate <u|uf> <address|symbol> [count]` runs disassembly and asks the model for call-target, routine-purpose, and suspicious-pattern annotation.
+13. `ai diagnose <prompt>` sends a setup/symbol/backend failure note with current session context and asks for likely root causes and remediation commands.
+14. `ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]` loads repeatable read-only investigation command plans. Dry-run is the default.
+15. `ai show` prints the most recent parsed or playbook command plan.
+16. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
+17. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
+18. `ai transcript <path|off|status>` controls JSONL transcript capture for AI events and command stdout/stderr.
+19. `ai transcript max <bytes|off>` rotates long transcript files, and `ai transcript redact <on|off>` controls stdout/stderr redaction for long hex addresses and `sk-...` style tokens.
+20. `ai audit <path|off|status>` controls a separate write-command JSONL audit log.
+21. `ai report <path>` exports a Markdown report with session context, provider status, transcript settings, write-audit path, the parsed plan, and the raw AI plan response.
 
 Initial provider support:
 
@@ -42,9 +45,9 @@ Initial provider support:
 3. `deepseek` uses an OpenAI-compatible chat-completions request with DeepSeek defaults and optional reasoning effort.
 4. `openrouter` uses an OpenAI-compatible chat-completions request with OpenRouter defaults and metadata headers.
 
-The runtime automatically loads the first `.env` file found in the current directory, executable directory, or repository root when running from `x64\Debug` or `x64\Release`. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys, while `.env` and `.env.local` are ignored by Git.
+The runtime automatically loads the first `.env` file found in the current directory, executable directory, or repository root when running from `x64\Debug` or `x64\Release`. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys plus `KNLIVEDBG_AI_REMOTE_POLICY`. `.env` and `.env.local` are ignored by Git.
 
-The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, and runs verification reads afterward when the command can be classified. Transcript mode captures full command output after it is enabled, including backend mode, origin, write-like classification, stdout, stderr, and keep-running state. The command proposal JSON is the first structured tool-call contract; richer schema validation and command-output summarization remain future hardening targets.
+The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, and keep-running state. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. Callback scans can now be exported through `callbacks json [scope] [path|-]`, and AI callback analysis consumes that structured JSON instead of parsing the human-readable view. The command proposal JSON is the first structured tool-call contract; richer schema validation and command-output summarization remain future hardening targets.
 
 ## Candidate Features
 
@@ -165,11 +168,16 @@ The report format should be stable enough to compare sessions across Windows bui
 
 ## Suggested Implementation Order
 
-1. Add transcript/event rotation and redaction controls for long live sessions.
-2. Add structured callback JSON export so callback reports do not need to parse human-readable command output.
-3. Add deterministic before/after diff rendering for write verification output.
-4. Add richer command schema validation for model-proposed plans.
-5. Add local/offline model provider policy when a supported local backend is selected.
+No immediate AI workflow backlog items remain in this document. Larger platform items are tracked in `ARCHITECTURE.md`.
+
+Completed implementation-order items:
+
+1. Transcript/event rotation and redaction controls are implemented with `ai transcript max` and `ai transcript redact`.
+2. Write-command JSONL audit logging is implemented with `ai audit <path>`.
+3. Structured callback JSON export is implemented with `callbacks json [scope] [path|-]`, and `ai analyze callbacks` consumes that JSON evidence.
+4. Deterministic before/after diff rendering is implemented for `ai write <index> confirm` verification output.
+5. Model-proposed command plans are validated at ingestion: empty commands, nested `ai`, shutdown/unload commands, bare `kd`, overlong commands, and unknown non-DbgEng commands are rejected before they can be shown as a runnable plan. Write-like proposals are forced to require confirmation.
+6. Local/offline provider policy is implemented with `ai policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`, which block HTTP-backed providers.
 
 ## Non-Goals
 

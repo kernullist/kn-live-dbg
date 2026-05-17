@@ -35,7 +35,7 @@ backend [auto|native|dbgeng]
 kdinit [connect-options]
 kd <windbg-command>
 kddetach
-ai [status|providers|provider|model|baseurl|effort|auth|preview|ask|plan|show|run|write|transcript|report]
+ai [status|providers|provider|policy|model|baseurl|effort|auth|preview|ask|plan|analyze|explain|annotate|diagnose|playbook|show|run|write|transcript|audit|report]
 ```
 
 `auto` is the default. Native commands stay on the custom driver backend, while DbgEng-routed commands and extension/meta commands are sent to DbgEng when possible.
@@ -63,6 +63,7 @@ phys, pdb, pdw, pdd, pdq
 peb, pew, ped, peq
 dt, dtx
 callbacks, kcallbacks, cb
+callbacks json [all|ob|registry|process|minifilter] [path|-]
 u, uf
 ai
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
@@ -104,13 +105,13 @@ z
 7. Native `dt` supports layout-only output, value output when an address is supplied, recursive UDT expansion with `-rN`, verbose diagnostics with `-v`, bare output with `-b`, and field filters.
 8. `vtop` and native `!vtop` translate a virtual address to a physical address using the current CR3 or a supplied directory-table base.
 9. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory; `peb`, `pew`, `ped`, and `peq` write physical memory through the same write gate as virtual writes.
-10. `callbacks [all|ob|registry|process|minifilter]` parses kernel PDB type layouts and live memory to list object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with module, symbol, altitude, context, root, and object/filter address annotations.
+10. `callbacks [all|ob|registry|process|minifilter]` parses kernel PDB type layouts and live memory to list object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with module, symbol, altitude, context, root, and object/filter address annotations. `callbacks json [scope] [path|-]` emits the same records as stable JSON for AI/reporting pipelines.
 11. Object callback scanning discovers `_OBJECT_TYPE` objects from `ObTypeIndexTable` before walking each `_OBJECT_TYPE.CallbackList`, with documented type globals used only as fallback.
 12. Registry and process callback scanning enumerate candidate root symbols and validate the expected list/table shape before emitting records.
 13. Minifilter scanning discovers `fltmgr!FltGlobals`, validates the frame-list root, walks frames and registered filters, and reports operation, unload, instance, name provider, KTM, section, and volume-mount callbacks. Non-exact globals candidates must produce concrete callback records before they are accepted.
 14. `u <address|symbol> [instruction-count]` uses `IDebugControl::DisassembleWide` directly, prints DbgEng-quality instruction text, caps explicit counts at 256 instructions, and remembers the next offset for a following bare `u`.
 15. `uf <address|symbol>` is an explicit function-disassembly command routed through DbgEng so symbol-aware function boundary discovery stays consistent with WinDbg.
-16. `ai plan <prompt>` stores model-proposed commands in a parsed in-memory plan. `ai run <index|all>` executes only non-write, non-shutdown planned commands through the normal TUI dispatcher.
-17. `ai analyze callbacks`, `ai explain dt`, `ai annotate u|uf`, and `ai diagnose` provide evidence-backed AI assistance on top of implemented native command output.
+16. `ai plan <prompt>` stores model-proposed commands in a parsed in-memory plan after schema validation rejects empty, nested-AI, shutdown/unload, bare `kd`, overlong, and unknown non-DbgEng commands. `ai run <index|all>` executes only non-write, non-shutdown planned commands through the normal TUI dispatcher.
+17. `ai analyze callbacks`, `ai explain dt`, `ai annotate u|uf`, and `ai diagnose` provide evidence-backed AI assistance on top of implemented native command output. Callback analysis uses `callbacks json <scope>` evidence so the model does not need to parse the human-readable callback view.
 18. `ai playbook <callbacks|minifilter|object|address|driver>` creates repeatable read-only command plans with dry-run output and optional guarded execution.
-19. `ai write <index> confirm` is required to dispatch planned write-like commands and performs backup/read-current plus verification preflight when the write form is recognized. `ai transcript <path>` captures AI events and command output as JSONL, and `ai report <path>` exports the current AI session summary.
+19. `ai write <index> confirm` is required to dispatch planned write-like commands and performs backup/read-current plus verification preflight when the write form is recognized. It also renders a deterministic before/after diff for verification stdout/stderr. `ai transcript <path>` captures AI events and command output as JSONL, `ai transcript max` rotates long transcript files, `ai transcript redact` redacts captured stdout/stderr, `ai audit <path>` captures write-command JSONL audit records, and `ai report <path>` exports the current AI session summary.

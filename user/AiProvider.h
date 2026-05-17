@@ -13,9 +13,16 @@ enum class AiProviderKind
     OpenRouter
 };
 
+enum class AiRemotePolicy
+{
+    AllowRemote,
+    LocalOnly
+};
+
 struct AiProviderSettings
 {
     AiProviderKind Provider;
+    AiRemotePolicy RemotePolicy;
     std::wstring Model;
     std::wstring BaseUrl;
     std::wstring ApiKey;
@@ -24,6 +31,7 @@ struct AiProviderSettings
     std::wstring CodexAuthFile;
     std::wstring ReasoningEffort;
     std::wstring DotEnvPath;
+    std::wstring RemotePolicySource;
     uint32_t TimeoutSeconds;
 };
 
@@ -53,8 +61,10 @@ public:
     void SetModel(const std::wstring& model);
     void SetBaseUrl(const std::wstring& baseUrl);
     void SetReasoningEffort(const std::wstring& effort);
+    bool SetRemotePolicy(const std::wstring& policy, std::wstring* error);
 
     std::wstring ProviderName() const;
+    std::wstring RemotePolicyName() const;
     std::wstring CredentialStatus() const;
     std::wstring StatusText() const;
     std::wstring AuthHelpText() const;

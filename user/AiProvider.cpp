@@ -47,6 +47,55 @@ static std::wstring ToLowerString(const std::wstring& value)
     return result;
 }
 
+static bool NormalizeRemotePolicyName(const std::wstring& value, AiRemotePolicy* policy, std::wstring* normalized)
+{
+    bool ok = false;
+    std::wstring text = ToLowerString(Trim(value));
+
+    do
+    {
+        if (policy == nullptr)
+        {
+            break;
+        }
+
+        if (text.empty() || text == L"allow" || text == L"allow-remote" || text == L"remote" || text == L"online")
+        {
+            *policy = AiRemotePolicy::AllowRemote;
+            if (normalized != nullptr)
+            {
+                *normalized = L"allow-remote";
+            }
+            ok = true;
+        }
+        else if (text == L"local" || text == L"local-only" || text == L"offline" || text == L"block-remote")
+        {
+            *policy = AiRemotePolicy::LocalOnly;
+            if (normalized != nullptr)
+            {
+                *normalized = L"local-only";
+            }
+            ok = true;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool IsRemoteNetworkProvider(AiProviderKind provider)
+{
+    bool remote = false;
+
+    if (provider == AiProviderKind::OpenAICodex ||
+        provider == AiProviderKind::DeepSeek ||
+        provider == AiProviderKind::OpenRouter)
+    {
+        remote = true;
+    }
+
+    return remote;
+}
+
 static std::wstring GetEnvString(const wchar_t* name)
 {
     std::wstring value;
@@ -1344,6 +1393,7 @@ static std::wstring RenderPrompt(const AiCompletionRequest& request)
 AiProviderRuntime::AiProviderRuntime()
 {
     settings_.Provider = AiProviderKind::Disabled;
+    settings_.RemotePolicy = AiRemotePolicy::AllowRemote;
     settings_.TimeoutSeconds = 120;
     ReloadFromEnvironment();
 }
@@ -1502,6 +1552,24 @@ void AiProviderRuntime::ReloadFromEnvironment()
         }
     }
 
+    std::wstring policySource;
+    std::wstring policyText = ConfigValue(L"KNLIVEDBG_AI_REMOTE_POLICY", &policySource);
+    if (!policyText.empty())
+    {
+        AiRemotePolicy policy = AiRemotePolicy::AllowRemote;
+        std::wstring normalized;
+        if (NormalizeRemotePolicyName(policyText, &policy, &normalized))
+        {
+            settings_.RemotePolicy = policy;
+            settings_.RemotePolicySource = policySource;
+        }
+    }
+    else
+    {
+        settings_.RemotePolicy = AiRemotePolicy::AllowRemote;
+        settings_.RemotePolicySource.clear();
+    }
+
     settings_.Model = ConfigValue(L"KNLIVEDBG_AI_MODEL", nullptr);
     settings_.BaseUrl = ConfigValue(L"KNLIVEDBG_AI_BASE_URL", nullptr);
     settings_.CodexCliPath = ConfigValue(L"KNLIVEDBG_CODEX_CLI_PATH", nullptr);
@@ -1540,6 +1608,15 @@ bool AiProviderRuntime::SetProvider(const std::wstring& provider, std::wstring* 
             break;
         }
 
+        if (settings_.RemotePolicy == AiRemotePolicy::LocalOnly && IsRemoteNetworkProvider(kind))
+        {
+            if (error != nullptr)
+            {
+                *error = L"provider is blocked by local-only AI remote policy";
+            }
+            break;
+        }
+
         settings_.Provider = kind;
         ApplyProviderDefaults(false);
         LoadCredentials();
@@ -1566,6 +1643,38 @@ void AiProviderRuntime::SetReasoningEffort(const std::wstring& effort)
     settings_.ReasoningEffort = Trim(effort);
 }
 
+bool AiProviderRuntime::SetRemotePolicy(const std::wstring& policy, std::wstring* error)
+{
+    bool ok = false;
+    AiRemotePolicy parsed = AiRemotePolicy::AllowRemote;
+    std::wstring normalized;
+
+    do
+    {
+        if (!NormalizeRemotePolicyName(policy, &parsed, &normalized))
+        {
+            if (error != nullptr)
+            {
+                *error = L"usage: ai policy <allow-remote|local-only>";
+            }
+            break;
+        }
+
+        if (parsed == AiRemotePolicy::LocalOnly && IsRemoteNetworkProvider(settings_.Provider))
+        {
+            settings_.Provider = AiProviderKind::Disabled;
+            ApplyProviderDefaults(false);
+            LoadCredentials();
+        }
+
+        settings_.RemotePolicy = parsed;
+        settings_.RemotePolicySource = L"session";
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 std::wstring AiProviderRuntime::ProviderName() const
 {
     std::wstring name = L"disabled";
@@ -1586,6 +1695,18 @@ std::wstring AiProviderRuntime::ProviderName() const
         break;
     default:
         break;
+    }
+
+    return name;
+}
+
+std::wstring AiProviderRuntime::RemotePolicyName() const
+{
+    std::wstring name = L"allow-remote";
+
+    if (settings_.RemotePolicy == AiRemotePolicy::LocalOnly)
+    {
+        name = L"local-only";
     }
 
     return name;
@@ -1628,6 +1749,12 @@ std::wstring AiProviderRuntime::StatusText() const
     stream << L"ai provider: " << ProviderName() << L"\n";
     stream << L"model: " << (settings_.Model.empty() ? L"(default)" : settings_.Model) << L"\n";
     stream << L"base url: " << (settings_.BaseUrl.empty() ? L"(default)" : settings_.BaseUrl) << L"\n";
+    stream << L"remote policy: " << RemotePolicyName();
+    if (!settings_.RemotePolicySource.empty())
+    {
+        stream << L" from " << settings_.RemotePolicySource;
+    }
+    stream << L"\n";
     stream << L"credential: " << CredentialStatus() << L"\n";
     stream << L"dotenv: " << (settings_.DotEnvPath.empty() ? L"(none)" : settings_.DotEnvPath) << L"\n";
     stream << L"codex cli: " << (settings_.CodexCliPath.empty() ? L"codex" : settings_.CodexCliPath) << L"\n";
@@ -1647,6 +1774,7 @@ std::wstring AiProviderRuntime::AuthHelpText() const
     stream << L"AI auth sources:\n";
     stream << L"  .env file is loaded from current directory, executable directory, or x64 output parent\n";
     stream << L"  KNLIVEDBG_AI_PROVIDER=openai-codex-cli|openai-codex-subscription|deepseek|openrouter\n";
+    stream << L"  KNLIVEDBG_AI_REMOTE_POLICY=allow-remote|local-only\n";
     stream << L"  KNLIVEDBG_AI_MODEL=<model>\n";
     stream << L"  KNLIVEDBG_AI_BASE_URL=<provider base url>\n";
     stream << L"  KNLIVEDBG_DEEPSEEK_API_KEY or DEEPSEEK_API_KEY\n";
@@ -1669,6 +1797,7 @@ std::wstring AiProviderRuntime::PreviewText(const AiCompletionRequest& request) 
     stream << L"provider: " << ProviderName() << L"\n";
     stream << L"model: " << (settings_.Model.empty() ? L"(default)" : settings_.Model) << L"\n";
     stream << L"base url: " << (settings_.BaseUrl.empty() ? L"(default)" : settings_.BaseUrl) << L"\n";
+    stream << L"remote policy: " << RemotePolicyName() << L"\n";
     stream << L"credential: " << CredentialStatus() << L"\n";
     stream << L"system-bytes: " << WideToUtf8(request.System).size() << L"\n";
     stream << L"prompt-bytes: " << WideToUtf8(request.Prompt).size() << L"\n";
@@ -1693,6 +1822,15 @@ bool AiProviderRuntime::Complete(const AiCompletionRequest& request, AiCompletio
             if (error != nullptr)
             {
                 *error = L"empty AI prompt";
+            }
+            break;
+        }
+
+        if (settings_.RemotePolicy == AiRemotePolicy::LocalOnly && IsRemoteNetworkProvider(settings_.Provider))
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI provider is blocked by local-only remote policy";
             }
             break;
         }

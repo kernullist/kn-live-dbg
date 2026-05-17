@@ -94,31 +94,43 @@ Backend routing is mode-dependent:
 ## AI Provider Flow
 
 1. `AiProviderRuntime` lives entirely in user mode.
-2. Provider selection defaults to `.env` plus environment variables and can be changed for the current TUI session with `ai provider`, `ai model`, `ai baseurl`, and `ai effort`.
+2. Provider selection defaults to `.env` plus environment variables and can be changed for the current TUI session with `ai provider`, `ai policy`, `ai model`, `ai baseurl`, and `ai effort`.
 3. `openai-codex-cli` executes `codex exec` as an external process and captures stdout/stderr.
 4. `openai-codex-subscription` reads Codex OAuth credentials from environment variables or auth files and calls the Codex Responses endpoint.
 5. `deepseek` and `openrouter` use OpenAI-compatible chat-completions requests over WinHTTP.
 6. `.env` is searched in the current directory, executable directory, and repository root when running from `x64\Debug` or `x64\Release`; real environment variables override `.env` values.
 7. AI requests receive only curated session context and the operator prompt. The model cannot call memory IOCTLs or execute generated debugger commands directly.
-8. `ai plan` requires a strict JSON command proposal object, parses it into in-memory plan state, and shows numbered commands with purpose and risk notes.
-9. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
-10. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
-11. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model.
-12. `ai diagnose` uses current session context plus an operator note to explain symbol, type-layout, DbgEng, or setup failures.
-13. `ai playbook` creates deterministic read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations. `run` still goes through the guarded `ai run` path.
-14. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands. The preflight path builds backup/read-current, small-range restore, translation, and verification commands for recognized write forms.
-15. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
-16. `ai report` writes a Markdown report with session context, provider status, transcript path, parsed plan, and raw AI plan response.
-17. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
+8. `KNLIVEDBG_AI_REMOTE_POLICY=local-only` or `ai policy local-only` blocks HTTP-backed providers (`openai-codex-subscription`, `deepseek`, and `openrouter`) for private sessions.
+9. `ai plan` requires a strict JSON command proposal object, parses it into in-memory plan state, and shows numbered commands with purpose and risk notes.
+10. `ai plan` validates each proposed command before storing it: empty commands, nested `ai`, shutdown/unload commands, bare `kd`, overlong commands, and unknown non-DbgEng commands are rejected. Write-like proposals are forced to require explicit confirmation.
+11. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
+12. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
+13. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model. Callback analysis uses `callbacks json <scope>` so the model receives structured records instead of the human-readable callback view.
+14. `ai diagnose` uses current session context plus an operator note to explain symbol, type-layout, DbgEng, or setup failures.
+15. `ai playbook` creates deterministic read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations. `run` still goes through the guarded `ai run` path.
+16. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands. The preflight path builds backup/read-current, small-range restore, translation, and verification commands for recognized write forms, then prints a deterministic before/after diff of verification stdout/stderr after the write.
+17. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
+18. `ai transcript max <bytes|off>` rotates long transcript files, and `ai transcript redact <on|off>` controls stdout/stderr redaction for long hex addresses and `sk-...` style tokens.
+19. `ai audit <path|off|status>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher.
+20. Transcript command records include origin, backend mode, command class, write-like status, stdout, stderr, and keep-running state.
+21. `ai report` writes a Markdown report with session context, provider status, transcript settings, write-audit path, parsed plan, and raw AI plan response.
+22. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
 
 ## Hardening Backlog
 
 1. Add a global single-controller policy so only one PID can own the device at a time.
-2. Add JSONL audit logging for every write command.
-3. Add an optional EPROCESS/DirectoryTableBase resolver for process-specific user VA translation.
-4. Add LA57 detection if five-level paging becomes a supported target.
-5. Add DIA fallback for richer type metadata and bitfield handling.
-6. Add a positive-control test driver that exposes known virtual and physical test buffers.
-7. Add transcript rotation and redaction controls for long live sessions.
-8. Add DbgEng command classification to transcript records beyond the current backend-mode field.
-9. Add an optional remote KD connection mode once the local-kernel path is stable.
+2. Add an optional EPROCESS/DirectoryTableBase resolver for process-specific user VA translation.
+3. Add LA57 detection if five-level paging becomes a supported target.
+4. Add DIA fallback for richer type metadata and bitfield handling.
+5. Add a positive-control test driver that exposes known virtual and physical test buffers.
+6. Add an optional remote KD connection mode once the local-kernel path is stable.
+
+Completed hardening items:
+
+1. JSONL write-command audit logging is implemented with `ai audit <path>`.
+2. Transcript rotation and redaction controls are implemented with `ai transcript max` and `ai transcript redact`.
+3. Transcript command records now include command-class labels such as `memory-read`, `physical-write`, `type`, `callbacks`, `disassembly`, `symbols`, `dbgeng`, and `session`.
+4. Structured callback JSON export is implemented with `callbacks json [scope] [path|-]`.
+5. Write verification before/after diff rendering is implemented for confirmed AI write commands.
+6. AI plan command schema validation is implemented before plan storage.
+7. Local-only AI provider policy is implemented with `ai policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`.

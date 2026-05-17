@@ -104,8 +104,10 @@ dtx [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
 callbacks [all|ob|registry|process|minifilter]
 kcallbacks [all|ob|registry|process|minifilter]
 cb [all|ob|registry|process|minifilter]
+callbacks json [all|ob|registry|process|minifilter] [path|-]
 ai status
 ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
+ai policy <allow-remote|local-only|status>
 ai model <model>
 ai auth
 ai preview <prompt>
@@ -120,6 +122,9 @@ ai show
 ai run <index|all>
 ai write <index> [confirm]
 ai transcript <path|off|status>
+ai transcript max <bytes|off>
+ai transcript redact <on|off>
+ai audit <path|off|status>
 ai report <path>
 c <address1> <address2> <length>
 s [-b|-w|-d|-q] <address> <length> <value...>
@@ -150,12 +155,16 @@ knkd> dt -r1 nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
 knkd> callbacks all
 knkd> callbacks ob
 knkd> callbacks minifilter
+knkd> callbacks json all .\callbacks.json
 knkd> ai provider openai-codex-cli
 knkd> ai preview explain the callback surfaces I pasted above
 knkd> ai plan inspect unknown object callbacks
 knkd> ai show
 knkd> ai run 1
 knkd> ai transcript .\kn-ai-session.jsonl
+knkd> ai transcript max 10485760
+knkd> ai transcript redact on
+knkd> ai audit .\kn-write-audit.jsonl
 knkd> ai report .\kn-ai-report.md
 ```
 
@@ -171,6 +180,7 @@ The `ai` command is an advisory provider bridge. It does not execute generated d
 ai status
 ai providers
 ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
+ai policy <allow-remote|local-only|status>
 ai model <model>
 ai baseurl <url>
 ai effort <minimal|low|medium|high|xhigh>
@@ -187,6 +197,9 @@ ai show
 ai run <index|all>
 ai write <index> [confirm]
 ai transcript <path|off|status>
+ai transcript max <bytes|off>
+ai transcript redact <on|off>
+ai audit <path|off|status>
 ai report <path>
 ```
 
@@ -194,6 +207,7 @@ Provider configuration is loaded from `.env` first and can be overridden by real
 
 ```text
 KNLIVEDBG_AI_PROVIDER=openrouter
+KNLIVEDBG_AI_REMOTE_POLICY=allow-remote
 KNLIVEDBG_AI_MODEL=openai/gpt-oss-120b
 KNLIVEDBG_OPENROUTER_API_KEY=sk-or-...
 ```
@@ -209,19 +223,20 @@ KNLIVEDBG_DEEPSEEK_API_KEY=sk-...
 Supported keys:
 
 1. `KNLIVEDBG_AI_PROVIDER` selects `openai-codex-cli`, `openai-codex-subscription`, `deepseek`, or `openrouter`.
-2. `KNLIVEDBG_AI_MODEL` overrides the provider default model.
-3. `KNLIVEDBG_AI_BASE_URL` overrides the provider base URL.
-4. `KNLIVEDBG_DEEPSEEK_API_KEY` or `DEEPSEEK_API_KEY` supplies the DeepSeek API key.
-5. `KNLIVEDBG_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` supplies the OpenRouter API key.
-6. `KNLIVEDBG_CODEX_ACCESS_TOKEN`, `KERNFORGE_CODEX_ACCESS_TOKEN`, `KNLIVEDBG_CODEX_AUTH_FILE`, or `KERNFORGE_CODEX_AUTH_FILE` supplies ChatGPT/Codex OAuth credentials.
-7. If no Codex auth file is configured, Kn Live Dbg checks `%USERPROFILE%\.kernforge\codex_auth.json` and `%USERPROFILE%\.codex\auth.json`.
-8. `KNLIVEDBG_CODEX_CLI_PATH` overrides the `codex` executable used by `openai-codex-cli`.
+2. `KNLIVEDBG_AI_REMOTE_POLICY` selects `allow-remote` or `local-only`; `local-only` blocks HTTP-backed providers such as ChatGPT/Codex OAuth, DeepSeek, and OpenRouter.
+3. `KNLIVEDBG_AI_MODEL` overrides the provider default model.
+4. `KNLIVEDBG_AI_BASE_URL` overrides the provider base URL.
+5. `KNLIVEDBG_DEEPSEEK_API_KEY` or `DEEPSEEK_API_KEY` supplies the DeepSeek API key.
+6. `KNLIVEDBG_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` supplies the OpenRouter API key.
+7. `KNLIVEDBG_CODEX_ACCESS_TOKEN`, `KERNFORGE_CODEX_ACCESS_TOKEN`, `KNLIVEDBG_CODEX_AUTH_FILE`, or `KERNFORGE_CODEX_AUTH_FILE` supplies ChatGPT/Codex OAuth credentials.
+8. If no Codex auth file is configured, Kn Live Dbg checks `%USERPROFILE%\.kernforge\codex_auth.json` and `%USERPROFILE%\.codex\auth.json`.
+9. `KNLIVEDBG_CODEX_CLI_PATH` overrides the `codex` executable used by `openai-codex-cli`.
 
-Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path and credential source. `ai preview` shows provider, model, credential source, and prompt size without sending a request.
+Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. `ai preview` shows provider, model, remote policy, credential source, and prompt size without sending a request.
 
-`ai plan <prompt>` asks the selected model to return a strict command proposal JSON object, stores the parsed plan in memory, and prints numbered commands with purpose and risk notes. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` run a read-only evidence command, preserve stdout/stderr, then ask the selected model for a callback report, structure interpretation, or disassembly annotation. `ai diagnose` produces setup and symbol/backend remediation guidance from an operator note. `ai playbook` loads repeatable read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations; `dry-run` is the default, and `run` dispatches the plan through the same guarded executor as `ai run`.
+`ai plan <prompt>` asks the selected model to return a strict command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose and risk notes. Empty commands, nested `ai`, shutdown/unload commands, bare `kd`, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` run a read-only evidence command, preserve stdout/stderr, then ask the selected model for a callback report, structure interpretation, or disassembly annotation. Callback analysis uses `callbacks json <scope>` so the model sees stable callback records instead of parsing the human-readable callback view. `ai diagnose` produces setup and symbol/backend remediation guidance from an operator note. `ai playbook` loads repeatable read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations; `dry-run` is the default, and `run` dispatches the plan through the same guarded executor as `ai run`.
 
-`ai run <index|all>` executes only non-write, non-shutdown planned commands. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, and `m` are blocked from `ai run`; `ai write <index>` prints a write preview with target class, byte count, backup/read-current command, restore-current command for small ranges, verification command, and safe read-only preflight output. `ai write <index> confirm` re-runs the backup read, dispatches the write-like command, then re-runs the verification command. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode and write-like classification. `ai report <path>` exports a Markdown summary of the current AI session and plan.
+`ai run <index|all>` executes only non-write, non-shutdown planned commands. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, and `m` are blocked from `ai run`; `ai write <index>` prints a write preview with target class, byte count, backup/read-current command, restore-current command for small ranges, verification command, and safe read-only preflight output. `ai write <index> confirm` re-runs the backup read, dispatches the write-like command, re-runs the verification command, and prints a deterministic before/after stdout/stderr diff for the verification command. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode, command class, write-like classification, stdout, stderr, and keep-running state. `ai transcript max <bytes>` rotates long transcript files, `ai transcript redact on` redacts long hex addresses and `sk-...` style tokens from captured stdout/stderr, and `ai audit <path>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher. `ai report <path>` exports a Markdown summary of the current AI session, transcript settings, write-audit path, and plan.
 
 ## DbgEng Backend
 
