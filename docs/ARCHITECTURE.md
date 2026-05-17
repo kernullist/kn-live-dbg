@@ -103,10 +103,13 @@ Backend routing is mode-dependent:
 8. `ai plan` requires a strict JSON command proposal object, parses it into in-memory plan state, and shows numbered commands with purpose and risk notes.
 9. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
 10. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
-11. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands.
-12. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
-13. `ai report` writes a Markdown report with session context, provider status, transcript path, parsed plan, and raw AI plan response.
-14. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
+11. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model.
+12. `ai diagnose` uses current session context plus an operator note to explain symbol, type-layout, DbgEng, or setup failures.
+13. `ai playbook` creates deterministic read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations. `run` still goes through the guarded `ai run` path.
+14. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands. The preflight path builds backup/read-current, small-range restore, translation, and verification commands for recognized write forms.
+15. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
+16. `ai report` writes a Markdown report with session context, provider status, transcript path, parsed plan, and raw AI plan response.
+17. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
 
 ## Hardening Backlog
 

@@ -111,4 +111,6 @@ z
 14. `u <address|symbol> [instruction-count]` uses `IDebugControl::DisassembleWide` directly, prints DbgEng-quality instruction text, caps explicit counts at 256 instructions, and remembers the next offset for a following bare `u`.
 15. `uf <address|symbol>` is an explicit function-disassembly command routed through DbgEng so symbol-aware function boundary discovery stays consistent with WinDbg.
 16. `ai plan <prompt>` stores model-proposed commands in a parsed in-memory plan. `ai run <index|all>` executes only non-write, non-shutdown planned commands through the normal TUI dispatcher.
-17. `ai write <index> confirm` is required to dispatch planned write-like commands. `ai transcript <path>` captures AI events and command output as JSONL, and `ai report <path>` exports the current AI session summary.
+17. `ai analyze callbacks`, `ai explain dt`, `ai annotate u|uf`, and `ai diagnose` provide evidence-backed AI assistance on top of implemented native command output.
+18. `ai playbook <callbacks|minifilter|object|address|driver>` creates repeatable read-only command plans with dry-run output and optional guarded execution.
+19. `ai write <index> confirm` is required to dispatch planned write-like commands and performs backup/read-current plus verification preflight when the write form is recognized. `ai transcript <path>` captures AI events and command output as JSONL, and `ai report <path>` exports the current AI session summary.

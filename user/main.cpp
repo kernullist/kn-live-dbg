@@ -64,6 +64,18 @@ struct CommandExecutionResult
     std::wstring Error;
 };
 
+struct AiWriteSafetyPlan
+{
+    std::wstring TargetKind;
+    std::wstring Target;
+    std::wstring ByteCountText;
+    std::wstring BackupCommand;
+    std::wstring RestoreCommand;
+    std::wstring VerifyCommand;
+    std::wstring TranslationCommand;
+    std::wstring Warning;
+};
+
 static BOOL WINAPI ConsoleHandler(DWORD controlType)
 {
     BOOL handled = FALSE;
@@ -447,6 +459,14 @@ static bool ExecuteDbgEngCommand(
     } while (false);
 
     return ok;
+}
+
+static std::wstring HexText(uint64_t value)
+{
+    std::wstringstream stream;
+
+    stream << L"0x" << std::hex << value << std::dec;
+    return stream.str();
 }
 
 static bool ShouldRouteToDbgEng(const std::wstring& command)
@@ -3016,6 +3036,19 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     return stream.str();
 }
 
+static std::wstring TruncateForAiPrompt(const std::wstring& text, size_t limit)
+{
+    std::wstring result = text;
+
+    if (result.size() > limit)
+    {
+        result.resize(limit);
+        result += L"\n[truncated]\n";
+    }
+
+    return result;
+}
+
 static void PrintAiPlan(const AiPlanState& plan)
 {
     do
@@ -3235,6 +3268,670 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     AiProviderRuntime& ai,
     AiPlanState& aiState);
 
+static std::wstring ByteCountText(uint64_t byteCount)
+{
+    std::wstringstream stream;
+
+    if (byteCount == 0)
+    {
+        stream << L"unknown";
+    }
+    else
+    {
+        stream << byteCount << L" bytes";
+    }
+
+    return stream.str();
+}
+
+static bool EstimateEnterWriteSize(const std::vector<std::wstring>& commandArgs, uint64_t* byteCount)
+{
+    bool ok = false;
+
+    do
+    {
+        if (byteCount == nullptr || commandArgs.size() < 3)
+        {
+            break;
+        }
+
+        std::wstring command = NormalizeInputCommand(commandArgs[0]);
+        if (command == L"ea" || command == L"eza" || command == L"eu" || command == L"ezu")
+        {
+            std::wstring value = JoinArgs(commandArgs, 2);
+            bool unicode = command == L"eu" || command == L"ezu";
+            bool zeroTerminate = command == L"eza" || command == L"ezu";
+            uint64_t unit = unicode ? sizeof(wchar_t) : 1;
+            uint64_t terminator = zeroTerminate ? unit : 0;
+            if (value.size() <= ((~0ull - terminator) / unit))
+            {
+                *byteCount = value.size() * unit + terminator;
+                ok = true;
+            }
+            break;
+        }
+
+        uint64_t width = 1;
+        if (command == L"ew")
+        {
+            width = 2;
+        }
+        else if (command == L"ed" || command == L"ef")
+        {
+            width = 4;
+        }
+        else if (command == L"eq" || command == L"ep")
+        {
+            width = 8;
+        }
+
+        uint64_t count = static_cast<uint64_t>(commandArgs.size() - 2);
+        if (count <= (~0ull / width))
+        {
+            *byteCount = count * width;
+            ok = true;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool EstimatePhysicalEnterWriteSize(const std::vector<std::wstring>& commandArgs, uint64_t* byteCount)
+{
+    bool ok = false;
+
+    do
+    {
+        if (byteCount == nullptr || commandArgs.size() < 3)
+        {
+            break;
+        }
+
+        std::wstring command = NormalizeInputCommand(commandArgs[0]);
+        uint64_t width = 1;
+        if (command == L"pew")
+        {
+            width = 2;
+        }
+        else if (command == L"ped")
+        {
+            width = 4;
+        }
+        else if (command == L"peq")
+        {
+            width = 8;
+        }
+
+        uint64_t count = static_cast<uint64_t>(commandArgs.size() - 2);
+        if (count <= (~0ull / width))
+        {
+            *byteCount = count * width;
+            ok = true;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static AiWriteSafetyPlan BuildWriteSafetyPlan(
+    const std::wstring& commandLine,
+    const DebuggerState& state,
+    SymbolEngine& symbols)
+{
+    AiWriteSafetyPlan plan = {};
+    std::vector<std::wstring> commandArgs = Split(commandLine);
+
+    do
+    {
+        if (commandArgs.empty())
+        {
+            plan.Warning = L"empty command";
+            break;
+        }
+
+        std::wstring command = NormalizeInputCommand(commandArgs[0]);
+        if (IsEnterCommand(command))
+        {
+            if (commandArgs.size() < 3)
+            {
+                plan.Warning = L"cannot build write safety plan: enter command has too few arguments";
+                break;
+            }
+
+            uint64_t address = 0;
+            std::wstring error;
+            bool resolved = ParseAddressOrSymbol(symbols, state, commandArgs[1], &address, &error);
+            uint64_t byteCount = 0;
+            EstimateEnterWriteSize(commandArgs, &byteCount);
+
+            plan.TargetKind = L"virtual";
+            plan.Target = resolved ? HexText(address) : commandArgs[1];
+            plan.ByteCountText = ByteCountText(byteCount);
+            plan.BackupCommand = L"db " + commandArgs[1] + L" " + std::to_wstring(byteCount == 0 ? 16 : byteCount);
+            plan.VerifyCommand = plan.BackupCommand;
+            plan.TranslationCommand = L"vtop " + commandArgs[1] + L" " + std::to_wstring(byteCount == 0 ? 1 : byteCount);
+            plan.Warning = L"virtual write: verify page ownership, target module, and whether the range touches code, callbacks, list links, or reference counts";
+        }
+        else if (IsPhysicalEnterCommand(command))
+        {
+            if (commandArgs.size() < 3)
+            {
+                plan.Warning = L"cannot build write safety plan: physical enter command has too few arguments";
+                break;
+            }
+
+            uint64_t physicalAddress = 0;
+            ParseUnsigned(commandArgs[1], state.NumberBase, &physicalAddress);
+            uint64_t byteCount = 0;
+            EstimatePhysicalEnterWriteSize(commandArgs, &byteCount);
+
+            plan.TargetKind = L"physical";
+            plan.Target = HexText(physicalAddress);
+            plan.ByteCountText = ByteCountText(byteCount);
+            plan.BackupCommand = L"pdb " + commandArgs[1] + L" " + std::to_wstring(byteCount == 0 ? 16 : byteCount);
+            plan.VerifyCommand = plan.BackupCommand;
+            plan.Warning = L"physical write: confirm this is not page table, MMIO, firmware-owned, or device memory before confirming";
+        }
+        else if (command == L"setfield")
+        {
+            if (commandArgs.size() < 5)
+            {
+                plan.Warning = L"cannot build write safety plan: setfield has too few arguments";
+                break;
+            }
+
+            uint64_t address = 0;
+            std::wstring error;
+            ParseAddressOrSymbol(symbols, state, commandArgs[2], &address, &error);
+
+            TypeFieldInfo field = {};
+            uint64_t byteCount = 0;
+            if (symbols.FindField(commandArgs[1], commandArgs[3], &field, &error))
+            {
+                byteCount = static_cast<uint64_t>(field.Length);
+                if (byteCount == 0 || byteCount > sizeof(uint64_t))
+                {
+                    byteCount = sizeof(uint64_t);
+                }
+            }
+
+            plan.TargetKind = L"type-field";
+            plan.Target = commandArgs[1] + L"." + commandArgs[3] + L" at " + commandArgs[2];
+            if (address != 0 && field.Offset != 0)
+            {
+                plan.Target += L" field-address=" + HexText(address + field.Offset);
+            }
+            plan.ByteCountText = ByteCountText(byteCount);
+            plan.BackupCommand = L"dt " + commandArgs[1] + L" " + commandArgs[2] + L" " + commandArgs[3];
+            plan.VerifyCommand = plan.BackupCommand;
+            plan.TranslationCommand = L"vtop " + commandArgs[2] + L" " + std::to_wstring(byteCount == 0 ? 1 : byteCount);
+            plan.Warning = L"type field write: check field drift, bitfield width, pointer ownership, and list/refcount semantics";
+        }
+        else if (command == L"f" || command == L"fp")
+        {
+            if (commandArgs.size() < 4)
+            {
+                plan.Warning = L"cannot build write safety plan: fill command has too few arguments";
+                break;
+            }
+
+            uint64_t length = 0;
+            ParseUnsigned(commandArgs[2], state.NumberBase, &length);
+            plan.TargetKind = L"virtual-fill";
+            plan.Target = commandArgs[1];
+            plan.ByteCountText = ByteCountText(length);
+            plan.BackupCommand = L"db " + commandArgs[1] + L" " + std::to_wstring(length == 0 ? 16 : length);
+            plan.VerifyCommand = plan.BackupCommand;
+            plan.TranslationCommand = L"vtop " + commandArgs[1] + L" " + std::to_wstring(length == 0 ? 1 : length);
+            plan.Warning = L"fill write: confirm the whole target range is intended and does not cross into adjacent structure fields";
+        }
+        else if (command == L"m")
+        {
+            if (commandArgs.size() < 4)
+            {
+                plan.Warning = L"cannot build write safety plan: move command has too few arguments";
+                break;
+            }
+
+            uint64_t length = 0;
+            ParseUnsigned(commandArgs[3], state.NumberBase, &length);
+            plan.TargetKind = L"virtual-move";
+            plan.Target = L"destination " + commandArgs[2] + L" from source " + commandArgs[1];
+            plan.ByteCountText = ByteCountText(length);
+            plan.BackupCommand = L"db " + commandArgs[2] + L" " + std::to_wstring(length == 0 ? 16 : length);
+            plan.VerifyCommand = plan.BackupCommand;
+            plan.TranslationCommand = L"vtop " + commandArgs[2] + L" " + std::to_wstring(length == 0 ? 1 : length);
+            plan.Warning = L"move write: confirm source and destination do not overlap unexpectedly";
+        }
+        else
+        {
+            plan.Warning = L"write-like command is not recognized by the safety planner";
+        }
+    } while (false);
+
+    return plan;
+}
+
+static bool ResolveWriteTargetForRestore(
+    const std::wstring& commandLine,
+    const DebuggerState& state,
+    SymbolEngine& symbols,
+    bool* physical,
+    uint64_t* address,
+    uint64_t* byteCount)
+{
+    bool ok = false;
+    std::vector<std::wstring> commandArgs = Split(commandLine);
+
+    do
+    {
+        if (physical == nullptr || address == nullptr || byteCount == nullptr || commandArgs.empty())
+        {
+            break;
+        }
+
+        *physical = false;
+        *address = 0;
+        *byteCount = 0;
+
+        std::wstring command = NormalizeInputCommand(commandArgs[0]);
+        std::wstring error;
+        if (IsEnterCommand(command))
+        {
+            if (commandArgs.size() < 3 ||
+                !ParseAddressOrSymbol(symbols, state, commandArgs[1], address, &error) ||
+                !EstimateEnterWriteSize(commandArgs, byteCount))
+            {
+                break;
+            }
+            ok = true;
+        }
+        else if (IsPhysicalEnterCommand(command))
+        {
+            if (commandArgs.size() < 3 ||
+                !ParseUnsigned(commandArgs[1], state.NumberBase, address) ||
+                !EstimatePhysicalEnterWriteSize(commandArgs, byteCount))
+            {
+                break;
+            }
+            *physical = true;
+            ok = true;
+        }
+        else if (command == L"setfield")
+        {
+            if (commandArgs.size() < 5)
+            {
+                break;
+            }
+
+            TypeFieldInfo field = {};
+            if (!symbols.FindField(commandArgs[1], commandArgs[3], &field, &error) ||
+                !ParseAddressOrSymbol(symbols, state, commandArgs[2], address, &error) ||
+                !TryAddOffset(*address, field.Offset, address))
+            {
+                break;
+            }
+
+            *byteCount = static_cast<uint64_t>(field.Length);
+            if (*byteCount == 0 || *byteCount > sizeof(uint64_t))
+            {
+                *byteCount = sizeof(uint64_t);
+            }
+            ok = true;
+        }
+        else if (command == L"f" || command == L"fp")
+        {
+            if (commandArgs.size() < 4 ||
+                !ParseAddressOrSymbol(symbols, state, commandArgs[1], address, &error) ||
+                !ParseUnsigned(commandArgs[2], state.NumberBase, byteCount))
+            {
+                break;
+            }
+            ok = true;
+        }
+        else if (command == L"m")
+        {
+            if (commandArgs.size() < 4 ||
+                !ParseAddressOrSymbol(symbols, state, commandArgs[2], address, &error) ||
+                !ParseUnsigned(commandArgs[3], state.NumberBase, byteCount))
+            {
+                break;
+            }
+            ok = true;
+        }
+
+        if (ok && !IsSafeTransferSize(*byteCount))
+        {
+            ok = false;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring BuildByteRestoreCommand(const std::wstring& prefix, uint64_t address, const std::vector<uint8_t>& bytes)
+{
+    std::wstringstream stream;
+
+    stream << prefix << L" " << HexText(address);
+    for (uint8_t value : bytes)
+    {
+        stream << L" " << std::hex << std::setw(2) << std::setfill(L'0')
+               << static_cast<unsigned>(value) << std::setfill(L' ') << std::dec;
+    }
+
+    return stream.str();
+}
+
+static void PopulateWriteRestoreCommand(
+    AiWriteSafetyPlan* plan,
+    const std::wstring& commandLine,
+    const DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (plan == nullptr)
+        {
+            break;
+        }
+
+        bool physical = false;
+        uint64_t address = 0;
+        uint64_t byteCount = 0;
+        if (!ResolveWriteTargetForRestore(commandLine, state, symbols, &physical, &address, &byteCount))
+        {
+            break;
+        }
+
+        if (byteCount == 0 || byteCount > 64)
+        {
+            std::wstring note = L"restore command omitted for large or unknown range; use backup/read-current output to build an explicit restore command";
+            plan->Warning = plan->Warning.empty() ? note : plan->Warning + L"; " + note;
+            break;
+        }
+
+        std::vector<uint8_t> bytes;
+        std::wstring error;
+        bool readOk = physical ?
+            device.ReadPhysical(address, static_cast<uint32_t>(byteCount), &bytes, &error) :
+            device.ReadMemory(address, static_cast<uint32_t>(byteCount), &bytes, &error);
+        if (!readOk)
+        {
+            std::wstring note = L"restore read failed: " + error;
+            plan->Warning = plan->Warning.empty() ? note : plan->Warning + L"; " + note;
+            break;
+        }
+
+        plan->RestoreCommand = BuildByteRestoreCommand(physical ? L"peb" : L"eb", address, bytes);
+    } while (false);
+}
+
+static void PrintWriteSafetyPlan(const AiWriteSafetyPlan& plan)
+{
+    std::wcout << L"write safety preflight\n";
+    if (!plan.TargetKind.empty())
+    {
+        std::wcout << L"  target-kind: " << plan.TargetKind << L"\n";
+    }
+    if (!plan.Target.empty())
+    {
+        std::wcout << L"  target: " << plan.Target << L"\n";
+    }
+    if (!plan.ByteCountText.empty())
+    {
+        std::wcout << L"  size: " << plan.ByteCountText << L"\n";
+    }
+    if (!plan.TranslationCommand.empty())
+    {
+        std::wcout << L"  translation: " << plan.TranslationCommand << L"\n";
+    }
+    if (!plan.BackupCommand.empty())
+    {
+        std::wcout << L"  backup/read-current: " << plan.BackupCommand << L"\n";
+    }
+    if (!plan.RestoreCommand.empty())
+    {
+        std::wcout << L"  restore-current: " << plan.RestoreCommand << L"\n";
+    }
+    if (!plan.VerifyCommand.empty())
+    {
+        std::wcout << L"  verify-after: " << plan.VerifyCommand << L"\n";
+    }
+    if (!plan.Warning.empty())
+    {
+        std::wcout << L"  warning: " << plan.Warning << L"\n";
+    }
+}
+
+static void ExecuteReadOnlySafetyCommand(
+    const std::wstring& commandLine,
+    const std::wstring& origin,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        if (commandLine.empty())
+        {
+            break;
+        }
+
+        if (IsWriteLikeCommandLine(commandLine))
+        {
+            std::wcerr << L"preflight command blocked because it is write-like: " << commandLine << L"\n";
+            break;
+        }
+
+        std::wcout << L"preflight> " << commandLine << L"\n";
+        ExecuteCommandWithTranscript(
+            Split(commandLine),
+            commandLine,
+            origin,
+            state,
+            dbgeng,
+            device,
+            service,
+            symbols,
+            ai,
+            aiState);
+    } while (false);
+}
+
+static std::wstring BuildAiEvidencePrompt(
+    const std::wstring& title,
+    const std::wstring& instructions,
+    const std::wstring& commandLine,
+    const CommandExecutionResult& result)
+{
+    std::wstringstream stream;
+
+    stream << title << L"\n\n";
+    stream << instructions << L"\n\n";
+    stream << L"Command:\n";
+    stream << commandLine << L"\n\n";
+    stream << L"Stdout:\n```text\n";
+    stream << TruncateForAiPrompt(result.Output, 60000);
+    stream << L"\n```\n\n";
+    stream << L"Stderr:\n```text\n";
+    stream << TruncateForAiPrompt(result.Error, 12000);
+    stream << L"\n```\n";
+
+    return stream.str();
+}
+
+static void CompleteAndPrintAiRequest(
+    const std::wstring& eventName,
+    const AiCompletionRequest& request,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        std::wcout << L"ai request: provider=" << ai.ProviderName()
+                   << L" model=" << ai.Settings().Model
+                   << L" credential=" << ai.CredentialStatus() << L"\n";
+
+        AiCompletionResponse response = {};
+        std::wstring error;
+        if (!ai.Complete(request, &response, &error))
+        {
+            std::wcerr << L"ai request failed: " << error << L"\n";
+            WriteAiTranscriptEvent(aiState, eventName + L"_failed", error, L"");
+            break;
+        }
+
+        WriteAiTranscriptEvent(aiState, eventName, L"request completed", L"");
+        if (!response.Text.empty())
+        {
+            std::wcout << response.Text;
+            if (response.Text.back() != L'\n')
+            {
+                std::wcout << L"\n";
+            }
+        }
+    } while (false);
+}
+
+static void HandleAiEvidenceAnalysis(
+    const std::wstring& eventName,
+    const std::wstring& commandLine,
+    const std::wstring& title,
+    const std::wstring& instructions,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        std::wstring reason;
+        if (IsBlockedAiRunCommand(commandLine, &reason))
+        {
+            std::wcerr << L"ai analysis command blocked: " << reason << L"\n";
+            break;
+        }
+
+        std::wcout << L"ai evidence> " << commandLine << L"\n";
+        CommandExecutionResult result = ExecuteCommandWithTranscript(
+            Split(commandLine),
+            commandLine,
+            L"ai_evidence",
+            state,
+            dbgeng,
+            device,
+            service,
+            symbols,
+            ai,
+            aiState);
+        if (!result.KeepRunning)
+        {
+            break;
+        }
+
+        AiCompletionRequest request = {};
+        request.System = BuildAiSystemPrompt(state, symbols);
+        request.Prompt = BuildAiEvidencePrompt(title, instructions, commandLine, result);
+        CompleteAndPrintAiRequest(eventName, request, ai, aiState);
+    } while (false);
+}
+
+static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstring& argument, std::wstring* error)
+{
+    AiPlanState plan = {};
+    std::wstring key = ToLower(name);
+
+    auto add = [&plan](const std::wstring& command, const std::wstring& purpose)
+    {
+        AiCommandProposal item = {};
+        item.Command = command;
+        item.Purpose = purpose;
+        item.Risk = L"read-only";
+        item.RequiresConfirmation = false;
+        item.WriteLike = IsWriteLikeCommandLine(command);
+        plan.Commands.push_back(item);
+    };
+
+    do
+    {
+        if (key == L"callbacks" || key == L"callback-audit")
+        {
+            plan.Title = L"Callback surface audit";
+            plan.Summary = L"Enumerate callback surfaces and module baseline for follow-up AI analysis.";
+            add(L"callbacks all", L"enumerate object, registry, process, and minifilter callbacks");
+            add(L"lm", L"capture loaded module baseline");
+        }
+        else if (key == L"minifilter")
+        {
+            plan.Title = L"Minifilter chain review";
+            plan.Summary = L"Enumerate minifilter callbacks and baseline fltmgr symbols.";
+            add(L"callbacks minifilter", L"enumerate registered minifilter callbacks");
+            add(L"x fltmgr!*Flt*", L"list FltMgr symbols useful for manual follow-up");
+        }
+        else if (key == L"object" || key == L"object-callbacks")
+        {
+            plan.Title = L"Object callback integrity review";
+            plan.Summary = L"Enumerate object-manager callback lists discovered from object type objects.";
+            add(L"callbacks ob", L"enumerate object-manager filters by object type");
+            add(L"dt nt!_OBJECT_TYPE", L"show object type layout for offset verification");
+        }
+        else if (key == L"address")
+        {
+            if (argument.empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"usage: ai playbook address <address|symbol> [run|dry-run]";
+                }
+                break;
+            }
+
+            plan.Title = L"Address provenance";
+            plan.Summary = L"Resolve ownership, translation, data view, and code view for one address.";
+            add(L"ln " + argument, L"resolve nearest symbol and module ownership");
+            add(L"vtop " + argument, L"translate virtual address to physical context");
+            add(L"dq " + argument + L" 4", L"display qword data at the target");
+            add(L"u " + argument + L" 16", L"disassemble if the target is executable code");
+        }
+        else if (key == L"driver" || key == L"suspect-driver")
+        {
+            plan.Title = L"Suspect driver surface map";
+            if (argument.empty())
+            {
+                plan.Summary = L"Capture module list and callback registrations; pass a module name for symbol enumeration.";
+                add(L"lm", L"list loaded kernel modules");
+                add(L"callbacks all", L"find callback surfaces owned by loaded modules");
+            }
+            else
+            {
+                plan.Summary = L"Capture module, symbols, and callback registrations for a suspected driver.";
+                add(L"lm " + argument, L"show matching loaded module");
+                add(L"x " + argument + L"!*", L"list public symbols for the suspected module");
+                add(L"callbacks all", L"find callback surfaces owned by the module");
+            }
+        }
+        else
+        {
+            if (error != nullptr)
+            {
+                *error = L"unknown playbook. supported: callbacks, minifilter, object, address, driver";
+            }
+            break;
+        }
+    } while (false);
+
+    return plan;
+}
+
 static bool RunAiPlannedCommands(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -3317,6 +4014,66 @@ static bool RunAiPlannedCommands(
     return keepRunning;
 }
 
+static void HandleAiPlaybookCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        if (args.size() < 3)
+        {
+            std::wcerr << L"usage: ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]\n";
+            break;
+        }
+
+        std::wstring mode = L"dry-run";
+        std::wstring argument;
+        if (args.size() >= 4)
+        {
+            std::wstring last = ToLower(args.back());
+            if (last == L"run" || last == L"dry-run")
+            {
+                mode = last;
+                if (args.size() > 4)
+                {
+                    std::vector<std::wstring> argumentArgs(args.begin() + 3, args.end() - 1);
+                    argument = JoinArgs(argumentArgs, 0);
+                }
+            }
+            else
+            {
+                argument = JoinArgs(args, 3);
+            }
+        }
+
+        std::wstring error;
+        AiPlanState plan = BuildPlaybookPlan(args[2], argument, &error);
+        if (plan.Commands.empty())
+        {
+            std::wcerr << L"ai playbook failed: " << error << L"\n";
+            break;
+        }
+
+        plan.TranscriptEnabled = aiState.TranscriptEnabled;
+        plan.TranscriptPath = aiState.TranscriptPath;
+        aiState = plan;
+        WriteAiTranscriptEvent(aiState, L"ai_playbook", L"playbook loaded", args[2]);
+        PrintAiPlan(aiState);
+
+        if (mode == L"run")
+        {
+            std::vector<std::wstring> runArgs = {L"ai", L"run", L"all"};
+            RunAiPlannedCommands(runArgs, state, dbgeng, device, service, symbols, ai, aiState);
+        }
+    } while (false);
+}
+
 static void HandleAiPlannedWrite(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -3363,6 +4120,8 @@ static void HandleAiPlannedWrite(
             break;
         }
 
+        AiWriteSafetyPlan safety = BuildWriteSafetyPlan(item.Command, state, symbols);
+        PopulateWriteRestoreCommand(&safety, item.Command, state, device, symbols);
         bool confirmed = args.size() >= 4 && ToLower(args[3]) == L"confirm";
         if (!confirmed)
         {
@@ -3376,7 +4135,10 @@ static void HandleAiPlannedWrite(
             {
                 std::wcout << L"risk: " << item.Risk << L"\n";
             }
-            std::wcout << L"operator action required: inspect the command, prepare backup/readback commands, then type:\n";
+            PrintWriteSafetyPlan(safety);
+            ExecuteReadOnlySafetyCommand(safety.TranslationCommand, L"ai_write_preflight", state, dbgeng, device, service, symbols, ai, aiState);
+            ExecuteReadOnlySafetyCommand(safety.BackupCommand, L"ai_write_preflight", state, dbgeng, device, service, symbols, ai, aiState);
+            std::wcout << L"operator action required: inspect the command, backup/readback output, then type:\n";
             std::wcout << L"  ai write " << index << L" confirm\n";
             WriteAiTranscriptEvent(aiState, L"ai_write_preview", L"confirmation required", item.Command);
             break;
@@ -3384,6 +4146,8 @@ static void HandleAiPlannedWrite(
 
         std::wcout << L"ai write confirm [" << index << L"]: " << item.Command << L"\n";
         WriteAiTranscriptEvent(aiState, L"ai_write_confirm", L"operator confirmed write-like command", item.Command);
+        PrintWriteSafetyPlan(safety);
+        ExecuteReadOnlySafetyCommand(safety.BackupCommand, L"ai_write_prewrite", state, dbgeng, device, service, symbols, ai, aiState);
 
         std::vector<std::wstring> commandArgs = Split(item.Command);
         ExecuteCommandWithTranscript(
@@ -3397,6 +4161,7 @@ static void HandleAiPlannedWrite(
             symbols,
             ai,
             aiState);
+        ExecuteReadOnlySafetyCommand(safety.VerifyCommand, L"ai_write_verify", state, dbgeng, device, service, symbols, ai, aiState);
     } while (false);
 }
 
@@ -3432,6 +4197,11 @@ static void HandleAiCommand(
             std::wcout << L"  ai preview <prompt>\n";
             std::wcout << L"  ai ask <prompt>\n";
             std::wcout << L"  ai plan <prompt>\n";
+            std::wcout << L"  ai analyze callbacks [all|ob|registry|process|minifilter]\n";
+            std::wcout << L"  ai explain dt <dt-args...>\n";
+            std::wcout << L"  ai annotate <u|uf> <address|symbol> [count]\n";
+            std::wcout << L"  ai diagnose <prompt>\n";
+            std::wcout << L"  ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]\n";
             std::wcout << L"  ai show\n";
             std::wcout << L"  ai run <index|all>\n";
             std::wcout << L"  ai write <index> [confirm]\n";
@@ -3548,6 +4318,95 @@ static void HandleAiCommand(
 
             WriteAiTranscriptEvent(aiState, L"ai_report", L"report written", path);
             std::wcout << L"ai report written: " << path << L"\n";
+        }
+        else if (action == L"analyze")
+        {
+            if (args.size() < 3 || ToLower(args[2]) != L"callbacks")
+            {
+                std::wcerr << L"usage: ai analyze callbacks [all|ob|registry|process|minifilter]\n";
+                break;
+            }
+
+            std::wstring scope = args.size() >= 4 ? args[3] : L"all";
+            HandleAiEvidenceAnalysis(
+                L"ai_analyze_callbacks",
+                L"callbacks " + scope,
+                L"Analyze this KnLiveDbg kernel callback scan.",
+                L"Produce a callback analysis report. Count records by surface, group by module, call out non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes.",
+                state,
+                dbgeng,
+                device,
+                service,
+                symbols,
+                ai,
+                aiState);
+        }
+        else if (action == L"explain")
+        {
+            if (args.size() < 4 || (ToLower(args[2]) != L"dt" && ToLower(args[2]) != L"dtx"))
+            {
+                std::wcerr << L"usage: ai explain dt <dt-args...>\n";
+                break;
+            }
+
+            std::wstring commandLine = JoinArgs(args, 2);
+            HandleAiEvidenceAnalysis(
+                L"ai_explain_dt",
+                commandLine,
+                L"Explain this KnLiveDbg dt/dtx structure output.",
+                L"Explain important fields, pointer and LIST_ENTRY follow-ups, suspicious null or out-of-module values, and exact commands to inspect referenced fields. Keep raw offsets and values auditable.",
+                state,
+                dbgeng,
+                device,
+                service,
+                symbols,
+                ai,
+                aiState);
+        }
+        else if (action == L"annotate")
+        {
+            if (args.size() < 4 || (ToLower(args[2]) != L"u" && ToLower(args[2]) != L"uf"))
+            {
+                std::wcerr << L"usage: ai annotate <u|uf> <address|symbol> [instruction-count]\n";
+                break;
+            }
+
+            std::wstring commandLine = JoinArgs(args, 2);
+            HandleAiEvidenceAnalysis(
+                L"ai_annotate_disassembly",
+                commandLine,
+                L"Annotate this KnLiveDbg disassembly.",
+                L"Summarize likely routine purpose, call targets, direct and indirect call evidence, callback/dispatch/minifilter/process classification hints, suspicious code patterns, uncertainty, and next commands such as ln, x, dt, dq, or uf.",
+                state,
+                dbgeng,
+                device,
+                service,
+                symbols,
+                ai,
+                aiState);
+        }
+        else if (action == L"diagnose")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: ai diagnose <symbol/backend/type failure or operator note>\n";
+                break;
+            }
+
+            AiCompletionRequest request = {};
+            request.System = BuildAiSystemPrompt(state, symbols);
+            std::wstringstream prompt;
+            prompt << L"Diagnose this KnLiveDbg setup or symbol/backend issue.\n";
+            prompt << L"Return likely root causes first, then concrete remediation commands.\n";
+            prompt << L"Consider PDB mismatch, missing private types, field drift, DbgEng local-kernel attach limits, missing callback symbols, backend mode, elevation, and symbol path.\n\n";
+            prompt << L"Operator note:\n";
+            prompt << JoinArgs(args, 2) << L"\n";
+            request.Prompt = prompt.str();
+            CompleteAndPrintAiRequest(L"ai_diagnose", request, ai, aiState);
+        }
+        else if (action == L"playbook")
+        {
+            HandleAiPlaybookCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
         }
         else if (action == L"preview" || action == L"ask")
         {
@@ -4167,15 +5026,8 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
 
     do
     {
-        if (aiState.TranscriptEnabled && !aiState.TranscriptPath.empty())
-        {
-            ScopedWideStreamCapture capture(&result.Output, &result.Error);
-            result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
-        }
-        else
-        {
-            result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
-        }
+        ScopedWideStreamCapture capture(&result.Output, &result.Error);
+        result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
 
         WriteCommandTranscriptEvent(
             aiState,

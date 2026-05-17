@@ -111,6 +111,11 @@ ai auth
 ai preview <prompt>
 ai ask <prompt>
 ai plan <prompt>
+ai analyze callbacks [all|ob|registry|process|minifilter]
+ai explain dt <dt-args...>
+ai annotate <u|uf> <address|symbol> [instruction-count]
+ai diagnose <prompt>
+ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]
 ai show
 ai run <index|all>
 ai write <index> [confirm]
@@ -173,6 +178,11 @@ ai auth
 ai preview <prompt>
 ai ask <prompt>
 ai plan <prompt>
+ai analyze callbacks [all|ob|registry|process|minifilter]
+ai explain dt <dt-args...>
+ai annotate <u|uf> <address|symbol> [instruction-count]
+ai diagnose <prompt>
+ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]
 ai show
 ai run <index|all>
 ai write <index> [confirm]
@@ -209,7 +219,9 @@ Supported keys:
 
 Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path and credential source. `ai preview` shows provider, model, credential source, and prompt size without sending a request.
 
-`ai plan <prompt>` asks the selected model to return a strict command proposal JSON object, stores the parsed plan in memory, and prints numbered commands with purpose and risk notes. `ai run <index|all>` executes only non-write, non-shutdown planned commands. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, and `m` are blocked from `ai run`; `ai write <index>` prints a write preview and `ai write <index> confirm` is required before a planned write-like command is dispatched. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode and write-like classification. `ai report <path>` exports a Markdown summary of the current AI session and plan.
+`ai plan <prompt>` asks the selected model to return a strict command proposal JSON object, stores the parsed plan in memory, and prints numbered commands with purpose and risk notes. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` run a read-only evidence command, preserve stdout/stderr, then ask the selected model for a callback report, structure interpretation, or disassembly annotation. `ai diagnose` produces setup and symbol/backend remediation guidance from an operator note. `ai playbook` loads repeatable read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations; `dry-run` is the default, and `run` dispatches the plan through the same guarded executor as `ai run`.
+
+`ai run <index|all>` executes only non-write, non-shutdown planned commands. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, and `m` are blocked from `ai run`; `ai write <index>` prints a write preview with target class, byte count, backup/read-current command, restore-current command for small ranges, verification command, and safe read-only preflight output. `ai write <index> confirm` re-runs the backup read, dispatches the write-like command, then re-runs the verification command. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode and write-like classification. `ai report <path>` exports a Markdown summary of the current AI session and plan.
 
 ## DbgEng Backend
 

@@ -24,11 +24,16 @@ The first integration layer is implemented as a user-mode `ai` command and `AiPr
 6. `ai preview <prompt>` prints the outbound provider plan without sending a request.
 7. `ai ask <prompt>` sends an advisory request. The assistant receives session context such as backend mode, number base, symbol path, loaded module count, and write-safety rules.
 8. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
-9. `ai show` prints the most recent parsed command plan.
-10. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
-11. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints the command, purpose, risk, and confirmation syntax.
-12. `ai transcript <path|off|status>` controls JSONL transcript capture for AI events and command stdout/stderr.
-13. `ai report <path>` exports a Markdown report with session context, provider status, transcript path, the parsed plan, and the raw AI plan response.
+9. `ai analyze callbacks [scope]` runs a callback scan as read-only evidence, then asks the selected model for a callback analysis report.
+10. `ai explain dt <dt-args...>` runs native `dt` or `dtx`, preserves raw output, then asks the model for structure-field interpretation and follow-up commands.
+11. `ai annotate <u|uf> <address|symbol> [count]` runs disassembly and asks the model for call-target, routine-purpose, and suspicious-pattern annotation.
+12. `ai diagnose <prompt>` sends a setup/symbol/backend failure note with current session context and asks for likely root causes and remediation commands.
+13. `ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]` loads repeatable read-only investigation command plans. Dry-run is the default.
+14. `ai show` prints the most recent parsed or playbook command plan.
+15. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
+16. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
+17. `ai transcript <path|off|status>` controls JSONL transcript capture for AI events and command stdout/stderr.
+18. `ai report <path>` exports a Markdown report with session context, provider status, transcript path, the parsed plan, and the raw AI plan response.
 
 Initial provider support:
 
@@ -39,7 +44,7 @@ Initial provider support:
 
 The runtime automatically loads the first `.env` file found in the current directory, executable directory, or repository root when running from `x64\Debug` or `x64\Release`. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys, while `.env` and `.env.local` are ignored by Git.
 
-The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Transcript mode captures full command output after it is enabled, including backend mode, origin, write-like classification, stdout, stderr, and keep-running state. The command proposal JSON is the first structured tool-call contract; richer schema validation and command-output summarization remain future hardening targets.
+The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, and runs verification reads afterward when the command can be classified. Transcript mode captures full command output after it is enabled, including backend mode, origin, write-like classification, stdout, stderr, and keep-running state. The command proposal JSON is the first structured tool-call contract; richer schema validation and command-output summarization remain future hardening targets.
 
 ## Candidate Features
 
@@ -61,7 +66,9 @@ Implementation notes:
 
 ### Callback Analysis Report
 
-Post-process `callbacks all` output into an investigation report:
+Implemented entrypoint: `ai analyze callbacks [all|ob|registry|process|minifilter]`.
+
+The command post-processes `callbacks` output into an investigation report:
 
 1. Count object-manager, registry, process creation, and minifilter callbacks.
 2. Group records by owning module and callback surface.
@@ -75,7 +82,9 @@ The report should include module name, callback address, nearest symbol, callbac
 
 ### `dt` and Structure Interpretation
 
-Layer semantic explanations on top of native `dt` and `dtx` output:
+Implemented entrypoint: `ai explain dt <dt-args...>`.
+
+The command layers semantic explanations on top of native `dt` and `dtx` output:
 
 1. Explain important fields for common kernel types such as `_EPROCESS`, `_ETHREAD`, `_DRIVER_OBJECT`, `_DEVICE_OBJECT`, `_OBJECT_TYPE`, `_CALLBACK_ENTRY`, `_CM_CALLBACK_CONTEXT_BLOCK`, `_EX_CALLBACK_ROUTINE_BLOCK`, `_FLT_FILTER`, and `_FLT_OPERATION_REGISTRATION`.
 2. Suggest follow-up commands for pointer fields, `LIST_ENTRY` fields, callback routine fields, and object name fields.
@@ -84,7 +93,9 @@ Layer semantic explanations on top of native `dt` and `dtx` output:
 
 ### Write Safety Assistant
 
-Because write mode is enabled by default per device handle, AI should add an operator safety layer around mutations:
+Implemented entrypoint: `ai write <index> [confirm]`.
+
+Because write mode is enabled by default per device handle, the AI path adds an operator safety layer around planned mutations:
 
 1. Before a write, read and display the current value.
 2. Show the exact target range, write width, interpreted type field when available, and whether the write crosses a page boundary.
@@ -98,7 +109,9 @@ This feature should never hide the exact command being executed.
 
 ### Disassembly Annotator
 
-Add AI analysis on top of `u` and `uf` output:
+Implemented entrypoint: `ai annotate <u|uf> <address|symbol> [instruction-count]`.
+
+The command adds AI analysis on top of `u` and `uf` output:
 
 1. Summarize the likely purpose of a function.
 2. Identify direct and indirect call targets when symbols are available.
@@ -110,7 +123,9 @@ The annotator should treat disassembly as evidence, not proof. The output should
 
 ### Symbol and Layout Diagnostics
 
-Use AI to explain failures in symbol, type, and backend setup:
+Implemented entrypoint: `ai diagnose <prompt>`.
+
+The command uses AI to explain failures in symbol, type, and backend setup:
 
 1. PDB mismatch, missing private type information, or DIA/DbgHelp failure.
 2. Field drift between Windows builds.
@@ -123,7 +138,9 @@ The diagnostic output should recommend concrete remediation steps such as `.symp
 
 ### Investigation Playbooks
 
-Package common multi-command investigations into repeatable workflows:
+Implemented entrypoint: `ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]`.
+
+The command packages common multi-command investigations into repeatable workflows:
 
 1. Callback surface audit: `callbacks all`, module grouping, disassembly of unknown callbacks, report generation.
 2. Suspect driver surface map: list modules, enumerate symbols, find callbacks, inspect dispatch table, inspect minifilter registrations.
@@ -131,7 +148,7 @@ Package common multi-command investigations into repeatable workflows:
 4. Minifilter chain review: enumerate filters, sort by altitude, inspect operation callbacks, summarize unload/name-provider/instance routines.
 5. Object callback integrity review: discover object types, walk callback lists, inspect pre/post operation routines and contexts.
 
-Each playbook should have a dry-run mode that prints the planned command sequence before execution.
+Each playbook has a dry-run mode that prints the planned command sequence before execution. `run` dispatches the plan through the same guarded executor used by `ai run`.
 
 ### Session Report Generation
 
@@ -148,13 +165,11 @@ The report format should be stable enough to compare sessions across Windows bui
 
 ## Suggested Implementation Order
 
-1. Add a transcript/event sink that records commands, backend routing, output, errors, and write operations.
-2. Add command preview and confirmation infrastructure for AI-generated commands.
-3. Implement callback analysis report generation from structured callback records.
-4. Implement `dt` and disassembly annotation as read-only post-processing.
-5. Add write safety assistant with backup/readback/diff support.
-6. Add investigation playbooks and session report export.
-7. Add configurable model provider policy for local/offline and remote model use.
+1. Add transcript/event rotation and redaction controls for long live sessions.
+2. Add structured callback JSON export so callback reports do not need to parse human-readable command output.
+3. Add deterministic before/after diff rendering for write verification output.
+4. Add richer command schema validation for model-proposed plans.
+5. Add local/offline model provider policy when a supported local backend is selected.
 
 ## Non-Goals
 
