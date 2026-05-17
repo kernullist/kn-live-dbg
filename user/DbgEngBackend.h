@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <cstdint>
 #include <string>
 
 class DbgEngBackend
@@ -15,6 +16,7 @@ public:
     bool IsReady() const;
 
     bool Execute(const std::wstring& command, std::wstring* output, std::wstring* error);
+    bool Disassemble(uint64_t offset, uint32_t instructionCount, std::wstring* output, uint64_t* nextOffset, std::wstring* error);
     bool SetSymbolPath(const std::wstring& symbolPath, std::wstring* error);
     bool Reload(std::wstring* output, std::wstring* error);
 

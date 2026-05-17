@@ -24,7 +24,7 @@ kn-live-dbg/
 8. Enumerates loaded kernel modules with `NtQuerySystemInformation`.
 9. Loads kernel symbols with `DbgHelp` using `SRV*C:\Symbols*https://msdl.microsoft.com/download/symbols`.
 10. Provides a WinDbg-compatible command registry for the official base command list.
-11. Implements native live-memory support for memory, symbol, module, type, compare, fill, move, and search commands.
+11. Implements native live-memory support for memory, symbol, module, type, compare, fill, move, search, and explicit disassembly commands.
 12. Routes stop-state, parser-heavy, extension, and meta commands through the DbgEng backend.
 13. Provides an optional DbgEng backend for raw WinDbg command execution against the local kernel target.
 14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process creation callbacks, and minifilter callbacks with function/module/context annotations.
@@ -42,6 +42,8 @@ Build:
 ```powershell
 .\tools\build.ps1 -Configuration Release
 ```
+
+The driver project uses WDK `TestSign` for Debug and Release x64 builds. The build helper now verifies that `KnLiveDbg.sys` has an Authenticode signer and prints the signature status/thumbprint after MSBuild completes.
 
 Expected outputs:
 
@@ -88,6 +90,8 @@ d, da, db, dc, dd, dD, df, dp, dq, du, dw, dW, dyb, dyd
 dda, ddp, ddu, dpa, dpp, dpu, dqa, dqp, dqu
 dds, dps, dqs
 phys, pdb, pdw, pdd, pdq
+u <address|symbol> [instruction-count]
+uf <address|symbol>
 dt [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
 callbacks [all|ob|registry|process|minifilter]
@@ -112,6 +116,8 @@ knkd> reload
 knkd> lm nt
 knkd> x nt!*Process*
 knkd> ln nt!PsLoadedModuleList
+knkd> u nt!KiSystemCall64 8
+knkd> uf nt!KiSystemCall64
 knkd> dq nt!PsLoadedModuleList 4
 knkd> vtop nt!PsLoadedModuleList
 knkd> pdb <physical-address> 80
@@ -123,6 +129,8 @@ knkd> callbacks minifilter
 ```
 
 The registry also knows the standard execution, breakpoint, stack, register, source, exception, I/O port, and script commands. Native live-memory commands stay on the custom driver backend, while stop-state or parser-heavy commands are routed to DbgEng in `auto` or `dbgeng` mode.
+
+`u` and `uf` are explicit disassembly commands. `u` resolves an address or symbol, disassembles a bounded instruction count, and remembers the next offset for a following bare `u`; `uf` uses the DbgEng function disassembler for function-boundary-aware output.
 
 ## DbgEng Backend
 

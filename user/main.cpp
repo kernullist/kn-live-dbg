@@ -27,6 +27,8 @@ struct DebuggerState
     bool Quiet;
     std::wstring LastCommand;
     std::wstring DbgEngConnectOptions;
+    uint64_t LastDisassemblyAddress;
+    bool HasLastDisassemblyAddress;
     enum class BackendMode
     {
         Auto,
@@ -202,6 +204,8 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  lm nt\n";
     std::wcout << L"  x nt!*Process*\n";
     std::wcout << L"  ln nt!PsLoadedModuleList\n";
+    std::wcout << L"  u nt!KiSystemCall64 8\n";
+    std::wcout << L"  uf nt!KiSystemCall64\n";
     std::wcout << L"  dq nt!PsLoadedModuleList 8\n";
     std::wcout << L"  dt nt!_EPROCESS <address>\n";
     std::wcout << L"  callbacks all\n";
@@ -2029,6 +2033,105 @@ static void HandleCallbacksCommand(
     } while (false);
 }
 
+static void HandleUnassembleCommand(
+    const std::vector<std::wstring>& args,
+    const std::wstring& originalLine,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    SymbolEngine& symbols)
+{
+    std::wstring command = NormalizeInputCommand(args[0]);
+    std::wstring error;
+
+    do
+    {
+        if (command == L"uf")
+        {
+            if (args.size() < 2)
+            {
+                std::wcerr << L"usage: uf <address|symbol>\n";
+                break;
+            }
+
+            ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true);
+            break;
+        }
+
+        uint64_t address = 0;
+        bool hasAddress = false;
+        if (args.size() >= 2)
+        {
+            if (symbols.Modules().empty())
+            {
+                symbols.LoadKernelModules(nullptr);
+            }
+
+            if (ParseAddressOrSymbol(symbols, state, args[1], &address, &error))
+            {
+                hasAddress = true;
+            }
+            else
+            {
+                ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true);
+                break;
+            }
+        }
+        else if (state.HasLastDisassemblyAddress)
+        {
+            address = state.LastDisassemblyAddress;
+            hasAddress = true;
+        }
+
+        if (!hasAddress)
+        {
+            if (!ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true))
+            {
+                std::wcerr << L"usage: u <address|symbol> [instruction-count]\n";
+            }
+            break;
+        }
+
+        uint64_t count = 8;
+        if (args.size() >= 3 && !ParseUnsigned(args[2], state.NumberBase, &count))
+        {
+            std::wcerr << L"invalid instruction count\n";
+            break;
+        }
+
+        if (count == 0 || count > 256)
+        {
+            std::wcerr << L"instruction count must be between 1 and 256\n";
+            break;
+        }
+
+        if (!EnsureDbgEng(dbgeng, symbols, state, &error))
+        {
+            std::wcerr << L"DbgEng init failed: " << error << L"\n";
+            break;
+        }
+
+        std::wstring output;
+        uint64_t nextOffset = address;
+        if (!dbgeng.Disassemble(address, static_cast<uint32_t>(count), &output, &nextOffset, &error))
+        {
+            std::wcerr << L"u failed: " << error << L"\n";
+            break;
+        }
+
+        if (!output.empty())
+        {
+            std::wcout << output;
+            if (output.back() != L'\n')
+            {
+                std::wcout << L"\n";
+            }
+        }
+
+        state.LastDisassemblyAddress = nextOffset;
+        state.HasLastDisassemblyAddress = true;
+    } while (false);
+}
+
 static bool HandleCommand(
     const std::vector<std::wstring>& args,
     const std::wstring& originalLine,
@@ -2123,6 +2226,10 @@ static bool HandleCommand(
             }
 
             ExecuteDbgEngCommand(dbgeng, symbols, state, JoinArgs(args, 1), true);
+        }
+        else if (command == L"u" || command == L"uf")
+        {
+            HandleUnassembleCommand(args, originalLine, state, dbgeng, symbols);
         }
         else if (state.Backend == DebuggerState::BackendMode::DbgEng &&
                  command != L"q" && command != L"qq" && command != L"qd" &&

@@ -13,7 +13,7 @@ KnLiveDbg currently has a native live-memory backend, not a KD transport backend
 
 1. Native
    - Can be implemented using the current driver, `DbgHelp`, and local system APIs.
-   - Examples: virtual/physical memory display/write/search/compare/fill/move, VA-to-PA translation, module list, symbol lookup, type display.
+   - Examples: virtual/physical memory display/write/search/compare/fill/move, VA-to-PA translation, module list, symbol lookup, type display, explicit disassembly commands.
 
 2. DbgEng-routed
    - The command exists in the WinDbg command surface, but it needs debugger-engine parser or stop-state semantics.
@@ -52,6 +52,7 @@ phys, pdb, pdw, pdd, pdq
 peb, pew, ped, peq
 dt, dtx
 callbacks, kcallbacks, cb
+u, uf
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 c, f, fp, m, s
 n, sq
@@ -76,7 +77,7 @@ p, pa, pc, pct, ph, pt
 r, rdmsr, rm, wrmsr
 so, ss, sx, sxd, sxe, sxi, sxn, sxr, sx-
 t, ta, tb, tc, tct, th, tt, wt
-u, uf, up, ur, ux
+up, ur, ux
 z
 ```
 
@@ -95,3 +96,5 @@ z
 11. Object callback scanning discovers `_OBJECT_TYPE` objects from `ObTypeIndexTable` before walking each `_OBJECT_TYPE.CallbackList`, with documented type globals used only as fallback.
 12. Registry and process callback scanning enumerate candidate root symbols and validate the expected list/table shape before emitting records.
 13. Minifilter scanning discovers `fltmgr!FltGlobals`, validates the frame-list root, walks frames and registered filters, and reports operation, unload, instance, name provider, KTM, section, and volume-mount callbacks. Non-exact globals candidates must produce concrete callback records before they are accepted.
+14. `u <address|symbol> [instruction-count]` uses `IDebugControl::DisassembleWide` directly, prints DbgEng-quality instruction text, caps explicit counts at 256 instructions, and remembers the next offset for a following bare `u`.
+15. `uf <address|symbol>` is an explicit function-disassembly command routed through DbgEng so symbol-aware function boundary discovery stays consistent with WinDbg.

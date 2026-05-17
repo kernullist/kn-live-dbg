@@ -341,6 +341,91 @@ bool DbgEngBackend::Execute(const std::wstring& command, std::wstring* output, s
     return ok;
 }
 
+bool DbgEngBackend::Disassemble(
+    uint64_t offset,
+    uint32_t instructionCount,
+    std::wstring* output,
+    uint64_t* nextOffset,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!IsReady())
+        {
+            if (error != nullptr)
+            {
+                *error = L"DbgEng backend is not initialized. Run kdinit or backend dbgeng first.";
+            }
+            break;
+        }
+
+        if (output == nullptr || nextOffset == nullptr || instructionCount == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid disassemble request";
+            }
+            break;
+        }
+
+        output->clear();
+        ULONG64 current = offset;
+        ULONG64 endOffset = offset;
+        for (uint32_t index = 0; index < instructionCount; ++index)
+        {
+            wchar_t buffer[1024] = {};
+            ULONG disassemblySize = 0;
+            HRESULT result = impl_->Control->DisassembleWide(
+                current,
+                DEBUG_DISASM_EFFECTIVE_ADDRESS | DEBUG_DISASM_MATCHING_SYMBOLS,
+                buffer,
+                static_cast<ULONG>(std::size(buffer)),
+                &disassemblySize,
+                &endOffset);
+            if (FAILED(result))
+            {
+                if (output->empty() && error != nullptr)
+                {
+                    *error = HResultText(L"IDebugControl::DisassembleWide failed", result);
+                }
+                break;
+            }
+
+            if (buffer[0] != 0)
+            {
+                *output += buffer;
+                if (output->back() != L'\n')
+                {
+                    *output += L"\n";
+                }
+            }
+
+            if (endOffset <= current)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Disassembler did not advance";
+                }
+                break;
+            }
+
+            current = endOffset;
+        }
+
+        if (output->empty())
+        {
+            break;
+        }
+
+        *nextOffset = current;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DbgEngBackend::SetSymbolPath(const std::wstring& symbolPath, std::wstring* error)
 {
     bool ok = false;

@@ -59,7 +59,9 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 4. `addr` uses `SymFromNameW`.
 5. `dt` uses `SymGetTypeFromNameW` and `SymGetTypeInfo`.
 6. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
-7. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
+7. `u` resolves an address or symbol with the native symbol engine, then calls DbgEng `DisassembleWide` directly for bounded instruction output.
+8. `uf` is an explicit function-disassembly command that uses DbgEng function-boundary logic.
+9. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
 
 ## Callback Scanner Flow
 
@@ -79,6 +81,8 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 7. Raw commands are executed with `IDebugControl4::ExecuteWide`.
 
 The DbgEng backend is intentionally isolated from the native memory backend. Native read/write operations still go through `KnLiveDbg.sys`, while DbgEng commands execute through the debugger engine.
+
+`u` and `uf` are deliberately wired as explicit commands instead of falling through the generic command router. This keeps unassembly available even when the operator is otherwise using native command mode, while still relying on DbgEng for the instruction decoder and function-boundary semantics.
 
 ## Hardening Backlog
 
