@@ -108,7 +108,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"dt", L"dt", L"type", L"display type fields or enumerate type patterns", CommandSupport::Native),
         Make(L"dtx", L"dtx", L"type", L"display type fields through native type reader", CommandSupport::Alias),
         Make(L"callbacks", L"callbacks", L"kernel", L"list callbacks: all|object|registry|process|thread|minifilter [module]", CommandSupport::Native),
-        Make(L"!dml_proc", L"!dml_proc", L"kernel", L"list all processes from EPROCESS ActiveProcessLinks", CommandSupport::Native),
+        Make(L"!dml_proc", L"!dml_proc [pid]", L"kernel", L"list processes from EPROCESS ActiveProcessLinks, optionally filtered by PID", CommandSupport::Native),
         Make(L"dv", L"dv", L"locals", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"dx", L"dx", L"data-model", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"e", L"e", L"memory", L"enter byte values", CommandSupport::Native),
