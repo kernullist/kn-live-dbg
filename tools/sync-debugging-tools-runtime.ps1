@@ -15,6 +15,7 @@ $runtimeFiles = @(
     "dbghelp.dll",
     "dbgeng.dll",
     "dbgcore.dll",
+    "DbgModel.dll",
     "msdia140.dll",
     "symsrv.dll",
     "srcsrv.dll",
@@ -108,7 +109,7 @@ function New-Manifest
     $lines.Add('```text')
     $lines.Add("Latest complete x64-compatible Debugging Tools runtime set found by tools\sync-debugging-tools-runtime.ps1.")
     $lines.Add("The selection requires dbghelp.dll and symsrv.dll in the same directory and prefers x64 Debuggers paths.")
-    $lines.Add("If symsrv.yes is missing from the selected source, the script creates a one-byte consent marker.")
+    $lines.Add("The script normalizes symsrv.yes to an ASCII consent marker.")
     $lines.Add("msdia140.dll is selected separately from the newest installed Visual Studio DIA SDK x64 path.")
     $lines.Add('```')
     $lines.Add("")
@@ -196,7 +197,7 @@ foreach ($name in $runtimeFiles)
     {
         if ($name -eq "symsrv.yes")
         {
-            [System.IO.File]::WriteAllBytes((Join-Path $destinationDir $name), [byte[]](0x20))
+            Set-Content -LiteralPath (Join-Path $destinationDir $name) -Value "yes" -NoNewline -Encoding ascii
             Write-Host "Vendor runtime: created $name"
             continue
         }
@@ -238,10 +239,10 @@ else
 
 $destinationSymsrv = Join-Path $destinationDir "symsrv.dll"
 $destinationConsent = Join-Path $destinationDir "symsrv.yes"
-if ((Test-Path $destinationSymsrv) -and -not (Test-Path $destinationConsent))
+if (Test-Path $destinationSymsrv)
 {
-    [System.IO.File]::WriteAllBytes($destinationConsent, [byte[]](0x20))
-    Write-Host "Vendor runtime: created symsrv.yes"
+    Set-Content -LiteralPath $destinationConsent -Value "yes" -NoNewline -Encoding ascii
+    Write-Host "Vendor runtime: normalized symsrv.yes"
 }
 
 New-Manifest -SourceDir $selected.Directory -Destination $destinationDir

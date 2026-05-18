@@ -74,6 +74,9 @@
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -91,12 +94,19 @@
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Driver.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
+    <ClInclude Include="..\shared\KnLiveDbgVersion.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="KnLiveDbg.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

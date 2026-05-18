@@ -52,10 +52,46 @@ static std::wstring FormatInstructionBytes(const uint8_t* bytes, uint8_t length)
     return stream.str();
 }
 
-bool DisassembleX64CodeBytes(
+static bool IsNativeFunctionTerminal(const ZydisDisassembledInstruction& instruction)
+{
+    bool terminal = false;
+
+    switch (instruction.info.meta.category)
+    {
+    case ZYDIS_CATEGORY_RET:
+        terminal = true;
+        break;
+    default:
+        break;
+    }
+
+    if (!terminal)
+    {
+        switch (instruction.info.mnemonic)
+        {
+        case ZYDIS_MNEMONIC_INT3:
+        case ZYDIS_MNEMONIC_IRET:
+        case ZYDIS_MNEMONIC_IRETD:
+        case ZYDIS_MNEMONIC_IRETQ:
+        case ZYDIS_MNEMONIC_SYSEXIT:
+        case ZYDIS_MNEMONIC_SYSRET:
+        case ZYDIS_MNEMONIC_HLT:
+        case ZYDIS_MNEMONIC_UD2:
+            terminal = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    return terminal;
+}
+
+static bool DisassembleX64BytesInternal(
     uint64_t address,
     const std::vector<uint8_t>& bytes,
-    uint32_t instructionCount,
+    uint32_t instructionLimit,
+    bool stopAtFunctionEnd,
     NativeDisassemblyResult* result,
     std::wstring* error)
 {
@@ -63,7 +99,7 @@ bool DisassembleX64CodeBytes(
 
     do
     {
-        if (result == nullptr || instructionCount == 0)
+        if (result == nullptr || instructionLimit == 0)
         {
             if (error != nullptr)
             {
@@ -90,7 +126,7 @@ bool DisassembleX64CodeBytes(
         uint64_t current = address;
         std::wstringstream output;
 
-        while (result->InstructionsDecoded < instructionCount && offset < bytes.size())
+        while (result->InstructionsDecoded < instructionLimit && offset < bytes.size())
         {
             ZydisDisassembledInstruction instruction = {};
             ZyanStatus status = ZydisDisassembleIntel(
@@ -138,6 +174,11 @@ bool DisassembleX64CodeBytes(
             result->InstructionsDecoded += 1;
             result->BytesConsumed = static_cast<uint32_t>(offset);
             result->NextOffset = current;
+
+            if (stopAtFunctionEnd && IsNativeFunctionTerminal(instruction))
+            {
+                break;
+            }
         }
 
         if (result->InstructionsDecoded == 0)
@@ -154,4 +195,24 @@ bool DisassembleX64CodeBytes(
     } while (false);
 
     return ok;
+}
+
+bool DisassembleX64CodeBytes(
+    uint64_t address,
+    const std::vector<uint8_t>& bytes,
+    uint32_t instructionCount,
+    NativeDisassemblyResult* result,
+    std::wstring* error)
+{
+    return DisassembleX64BytesInternal(address, bytes, instructionCount, false, result, error);
+}
+
+bool DisassembleX64FunctionBytes(
+    uint64_t address,
+    const std::vector<uint8_t>& bytes,
+    uint32_t maxInstructions,
+    NativeDisassemblyResult* result,
+    std::wstring* error)
+{
+    return DisassembleX64BytesInternal(address, bytes, maxInstructions, true, result, error);
 }

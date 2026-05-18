@@ -66,6 +66,9 @@
       <AdditionalLibraryDirectories>C:\Program Files (x86)\Windows Kits\10\Debuggers\lib\x64;C:\Program Files\Microsoft Visual Studio\2022\Professional\DIA SDK\lib\amd64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -87,6 +90,9 @@
       <AdditionalLibraryDirectories>C:\Program Files (x86)\Windows Kits\10\Debuggers\lib\x64;C:\Program Files\Microsoft Visual Studio\2022\Professional\DIA SDK\lib\amd64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AiProvider.cpp" />
@@ -103,6 +109,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="KnLiveDbg.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClInclude Include="AiProvider.h" />
     <ClInclude Include="CallbackScanner.h" />
     <ClInclude Include="CommandRegistry.h" />
@@ -113,6 +122,7 @@
     <ClInclude Include="SymbolEngine.h" />
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h" />
+    <ClInclude Include="..\shared\KnLiveDbgVersion.h" />
     <ClInclude Include="..\third_party\zydis\amalgamated\Zydis.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

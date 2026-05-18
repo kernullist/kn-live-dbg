@@ -13,6 +13,10 @@
       <UniqueIdentifier>{D081A6C3-AB53-43C7-BE3B-EE9301889CB4}</UniqueIdentifier>
       <Extensions>c;h</Extensions>
     </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{71E094DA-3E54-4721-A951-59229E5A2DDF}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="AiProvider.cpp">
@@ -77,8 +81,16 @@
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\shared\KnLiveDbgVersion.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\third_party\zydis\amalgamated\Zydis.h">
       <Filter>Third Party</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="KnLiveDbg.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

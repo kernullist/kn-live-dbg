@@ -12,6 +12,7 @@ kn-live-dbg/
   probe_driver/ProbeDriver.cpp  WDM positive-control test buffer driver
   user/*.cpp                    elevated TUI, SCM lifecycle, DbgHelp symbols
   tools/build.ps1               Release/Debug x64 build helper
+  tools/release.ps1             build and zip release package helper
 ```
 
 ## Current Capabilities
@@ -66,7 +67,16 @@ Refresh the pinned Debugging Tools runtime from the newest complete local x64 se
 ```
 
 The driver projects use WDK `TestSign` for Debug and Release x64 builds. The build helper verifies that both `KnLiveDbg.sys` and `KnLiveDbgProbe.sys` have Authenticode signers and prints signature status/thumbprints after MSBuild completes.
-The build helper also stages the pinned `vendor\debugging-tools\x64` runtime beside the EXE (`dbghelp.dll`, `dbgeng.dll`, `dbgcore.dll`, `msdia140.dll`, `symsrv.dll`, `srcsrv.dll`, and `symsrv.yes`) so DbgHelp can use the Microsoft symbol server instead of falling back to the limited System32 runtime. If the vendor pair is missing, the script falls back to the locally installed Windows Kits Debugging Tools copy. If `symsrv.dll` is staged but `symsrv.yes` is missing, the sync script, build script, and EXE startup path create `symsrv.yes` before symbol loading. Startup creates `<exe-dir>\symbols` and uses it as the downstream symbol store, so downloaded PDBs stay with the runnable EXE bundle rather than going to `C:\Symbols`. When `msdia140.dll` is staged, startup registers it automatically with `DllRegisterServer` before symbol initialization. The symbol engine also has a no-reg fallback that loads the staged `msdia*.dll` directly and creates `IDiaDataSource` through `DllGetClassObject`, so type fallback can still work when COM registration is unavailable.
+Each scripted build increments the PE file version stored under `.build\version-state.json`; with no previous state, the baseline is `0.0.0`, so the first build stamps `0.0.1` into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys`. The generated resource header is written under `.build\generated`, while `shared\KnLiveDbgVersion.h` remains a `0.0.0` fallback for direct Visual Studio builds that do not run the helper script.
+The build helper also stages the pinned `vendor\debugging-tools\x64` runtime beside the EXE (`dbghelp.dll`, `dbgeng.dll`, `dbgcore.dll`, `DbgModel.dll`, `msdia140.dll`, `symsrv.dll`, `srcsrv.dll`, and `symsrv.yes`) so DbgHelp and DbgEng can use the Microsoft symbol server instead of falling back to the limited System32 runtime. If the vendor pair is missing, the script falls back to the locally installed Windows Kits Debugging Tools copy. If `symsrv.dll` is staged but `symsrv.yes` is missing, the sync script, build script, and EXE startup path create `symsrv.yes` before symbol loading. Startup creates `<exe-dir>\symbols` and uses it as the downstream symbol store, so downloaded PDBs stay with the runnable EXE bundle rather than going to `C:\Symbols`. When `msdia140.dll` is staged, startup registers it automatically with `DllRegisterServer` before symbol initialization. The symbol engine also has a no-reg fallback that loads the staged `msdia*.dll` directly and creates `IDiaDataSource` through `DllGetClassObject`, so type fallback can still work when COM registration is unavailable.
+
+Create a release zip:
+
+```powershell
+.\tools\release.ps1 -Configuration Release
+```
+
+The release helper runs the build unless `-SkipBuild` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the vendored runtime manifest when present, and `kn-live-dbg-version.json`.
 
 Expected outputs:
 
@@ -75,6 +85,7 @@ x64\Release\KnLiveDbg.exe
 x64\Release\KnLiveDbg.sys
 x64\Release\KnLiveDbgProbe.sys
 x64\Release\dbghelp.dll
+x64\Release\DbgModel.dll
 x64\Release\symsrv.dll
 ```
 
@@ -128,7 +139,7 @@ dds, dps, dqs
 phys, pdb, pdw, pdd, pdq
 procctx [status|off|<process-id>]
 u <address|symbol> [instruction-count]
-uf <address|symbol>
+uf <address|symbol> [max-instructions]
 dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|ob|registry|process|minifilter]
@@ -206,7 +217,9 @@ knkd> probe info
 
 The registry also knows the standard execution, breakpoint, stack, register, source, exception, I/O port, and script commands. Native live-memory commands stay on the custom driver backend, while stop-state or parser-heavy commands are routed to DbgEng in `auto` or `dbgeng` mode.
 
-`u` and `uf` are explicit disassembly commands. `u` resolves an address or symbol, reads code bytes through the loaded driver, disassembles them with the vendored Zydis x64 decoder, and remembers the next offset for a following bare `u`; if the driver device is not open, it falls back to the DbgEng disassembly path. `uf` uses the DbgEng function disassembler for function-boundary-aware output.
+Memory display commands use sparse reads. If part of a requested virtual or physical range cannot be read, the printable dump stays aligned and unknown bytes are shown as `??`, with wider unit displays using `0x????...` for unreadable units.
+
+`u` and `uf` are explicit disassembly commands. `u` resolves an address or symbol, reads code bytes through the loaded driver, disassembles them with the vendored Zydis x64 decoder, and remembers the next offset for a following bare `u`; if the driver device is not open, it falls back to the DbgEng disassembly path. `uf` uses the same driver-backed Zydis path and linearly disassembles from the start address until a function terminal instruction such as `ret`, `iret`, `sysret`, `sysexit`, `hlt`, `ud2`, or `int3`, with an optional instruction cap.
 
 ## AI Assistant Providers
 
@@ -288,7 +301,7 @@ Backend mode behavior:
 | Mode | Command routing | Best fit | Notes |
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
-| `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` stays driver-backed when the device is open; `uf` may initialize DbgEng for function-boundary disassembly. |
+| `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
 | `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.

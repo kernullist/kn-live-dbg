@@ -18,3 +18,10 @@ bool DisassembleX64CodeBytes(
     uint32_t instructionCount,
     NativeDisassemblyResult* result,
     std::wstring* error);
+
+bool DisassembleX64FunctionBytes(
+    uint64_t address,
+    const std::vector<uint8_t>& bytes,
+    uint32_t maxInstructions,
+    NativeDisassemblyResult* result,
+    std::wstring* error);
