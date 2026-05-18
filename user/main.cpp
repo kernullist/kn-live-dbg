@@ -18,6 +18,8 @@
 #include <cwctype>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -27,6 +29,8 @@ static std::atomic_bool g_StopRequested = false;
 static HANDLE g_MainThreadHandle = nullptr;
 static HANDLE g_InstanceMutexHandle = nullptr;
 static bool g_InstanceMutexOwned = false;
+static std::recursive_mutex g_ConsoleOutputMutex;
+static std::atomic_uint64_t g_CommandStreamOutputSerial = 0;
 
 static constexpr WORD KNDBG_COLOR_TEXT = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
 static constexpr WORD KNDBG_COLOR_DIM = FOREGROUND_BLUE | FOREGROUND_GREEN;
@@ -70,6 +74,7 @@ class ScopedConsoleColor
 public:
     ScopedConsoleColor(HANDLE handle, WORD foreground) :
         handle_(handle),
+        lock_(g_ConsoleOutputMutex),
         oldAttributes_(0),
         active_(false)
     {
@@ -109,6 +114,7 @@ public:
 
 private:
     HANDLE handle_;
+    std::unique_lock<std::recursive_mutex> lock_;
     WORD oldAttributes_;
     bool active_;
 };
@@ -4266,11 +4272,24 @@ static bool IsConsoleOutputHandle(HANDLE handle)
     return isConsole;
 }
 
-static void WriteConsoleTuiLineDirect(HANDLE handle, const std::wstring& value, WORD color)
+static bool WriteConsoleTuiLineDirect(
+    HANDLE handle,
+    const std::wstring& value,
+    WORD color,
+    uint64_t expectedOutputSerial = std::numeric_limits<uint64_t>::max())
 {
+    bool writtenOk = false;
+
     do
     {
         if (!IsConsoleOutputHandle(handle))
+        {
+            break;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
+        if (expectedOutputSerial != std::numeric_limits<uint64_t>::max() &&
+            g_CommandStreamOutputSerial.load(std::memory_order_relaxed) != expectedOutputSerial)
         {
             break;
         }
@@ -4288,13 +4307,18 @@ static void WriteConsoleTuiLineDirect(HANDLE handle, const std::wstring& value, 
 
         std::wstring line = L"| " + TuiFitText(value, 76) + L" |\n";
         DWORD written = 0;
-        WriteConsoleW(handle, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr);
+        if (WriteConsoleW(handle, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr))
+        {
+            writtenOk = true;
+        }
 
         if (hasOldAttributes)
         {
             SetConsoleTextAttribute(handle, oldAttributes);
         }
     } while (false);
+
+    return writtenOk;
 }
 
 static std::wstring FormatElapsedSeconds(uint64_t milliseconds)
@@ -4352,6 +4376,7 @@ public:
         origin_(origin.empty() ? L"command" : origin),
         handle_(GetStdHandle(STD_OUTPUT_HANDLE)),
         startTick_(GetTickCount64()),
+        initialOutputSerial_(g_CommandStreamOutputSerial.load(std::memory_order_relaxed)),
         stopRequested_(false),
         completed_(false),
         displayed_(false)
@@ -4411,12 +4436,21 @@ private:
             uint64_t elapsed = GetTickCount64() - startTick_;
             if (elapsed >= nextUpdate)
             {
-                displayed_ = true;
-                WriteConsoleTuiLineDirect(
-                    handle_,
-                    L"[ .. ] " + origin_ + L" still running: " + command_ + L" elapsed=" + FormatElapsedSeconds(elapsed),
-                    KNDBG_COLOR_STEP);
-                nextUpdate += UPDATE_INTERVAL_MS;
+                if (g_CommandStreamOutputSerial.load(std::memory_order_relaxed) != initialOutputSerial_)
+                {
+                    Sleep(100);
+                    continue;
+                }
+
+                if (WriteConsoleTuiLineDirect(
+                        handle_,
+                        L"[ .. ] " + origin_ + L" still running: " + command_ + L" elapsed=" + FormatElapsedSeconds(elapsed),
+                        KNDBG_COLOR_STEP,
+                        initialOutputSerial_))
+                {
+                    displayed_ = true;
+                    nextUpdate += UPDATE_INTERVAL_MS;
+                }
             }
 
             Sleep(100);
@@ -4427,6 +4461,7 @@ private:
     std::wstring origin_;
     HANDLE handle_;
     uint64_t startTick_;
+    uint64_t initialOutputSerial_;
     std::atomic_bool stopRequested_;
     std::atomic_bool completed_;
     std::atomic_bool displayed_;
@@ -7597,10 +7632,12 @@ protected:
         if (capture_ != nullptr)
         {
             capture_->push_back(ch);
+            g_CommandStreamOutputSerial.fetch_add(1, std::memory_order_relaxed);
         }
 
         if (target_ != nullptr)
         {
+            std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
             return target_->sputc(ch);
         }
 
@@ -7612,10 +7649,12 @@ protected:
         if (capture_ != nullptr && text != nullptr && count > 0)
         {
             capture_->append(text, static_cast<size_t>(count));
+            g_CommandStreamOutputSerial.fetch_add(1, std::memory_order_relaxed);
         }
 
         if (target_ != nullptr)
         {
+            std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
             return target_->sputn(text, count);
         }
 
@@ -7626,6 +7665,7 @@ protected:
     {
         if (target_ != nullptr)
         {
+            std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
             return target_->pubsync();
         }
 
