@@ -143,6 +143,7 @@ struct DebuggerState
     bool ProbeDriverCleanupRequested;
     bool ProbeDriverUnloaded;
     std::wstring LastCommand;
+    std::vector<std::wstring> CommandHistory;
     std::wstring DbgEngConnectOptions;
     bool DbgEngRemoteKernel;
     uint64_t LastDisassemblyAddress;
@@ -292,6 +293,30 @@ static std::wstring TrimWhitespace(const std::wstring& value)
     } while (false);
 
     return result;
+}
+
+static void AddCommandHistory(DebuggerState* state, const std::wstring& line)
+{
+    static constexpr size_t kCommandHistoryLimit = 256;
+
+    do
+    {
+        if (state == nullptr || TrimWhitespace(line).empty())
+        {
+            break;
+        }
+
+        if (!state->CommandHistory.empty() && state->CommandHistory.back() == line)
+        {
+            break;
+        }
+
+        state->CommandHistory.push_back(line);
+        while (state->CommandHistory.size() > kCommandHistoryLimit)
+        {
+            state->CommandHistory.erase(state->CommandHistory.begin());
+        }
+    } while (false);
 }
 
 static std::wstring NormalizeInputCommand(const std::wstring& value)
@@ -1186,7 +1211,7 @@ static bool HasHelpToken(const std::vector<std::wstring>& args, size_t first)
 static void PrintHelp(bool includeDbgEng)
 {
     std::wcout << L"KnLiveDbg WinDbg-compatible command surface\n";
-    std::wcout << L"interactive: press Tab to complete commands and context subcommands\n";
+    std::wcout << L"interactive: press Tab to complete commands; Up/Down recalls command history\n";
     std::wcout << L"\n";
     std::wcout << L"how to read this help:\n";
     std::wcout << L"  help                 show native and TUI command summary\n";
@@ -1196,7 +1221,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  ai help <topic>      show AI subcommand help\n";
     std::wcout << L"\n";
     std::wcout << L"syntax notes:\n";
-    std::wcout << L"  <address|symbol> accepts numbers or loaded symbols such as nt!PsLoadedModuleList\n";
+    std::wcout << L"  <address|symbol> accepts numbers, loaded symbols, and + or - arithmetic\n";
     std::wcout << L"  nt! is normalized to the loaded kernel image when resolving symbols and types\n";
     std::wcout << L"  d*/e*/vtop support /process <process-id>; procctx pins a default process context\n";
     std::wcout << L"  virtual e* writes default to System(pid 4) context for kernel addresses\n";
@@ -1240,7 +1265,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  probe info\n";
     std::wcout << L"  kdinit\n";
     std::wcout << L"  backend dbgeng\n";
-    std::wcout << L"  !dml_proc\n";
+    std::wcout << L"  !dml_proc [pid]\n";
     std::wcout << L"  write off\n";
     std::wcout << L"  ed <address> <value>\n";
     std::wcout << L"  peq <physical-address> <value>\n";
@@ -1589,10 +1614,26 @@ static bool ParseUnsigned(const std::wstring& value, uint32_t numberBase, uint64
             break;
         }
 
+        if (value[0] == L'+' || value[0] == L'-')
+        {
+            break;
+        }
+
         std::wstring text = value;
         if (!text.empty() && (text[0] == L'L' || text[0] == L'l'))
         {
             text = text.substr(1);
+        }
+
+        if (!text.empty() && (text[0] == L'+' || text[0] == L'-'))
+        {
+            break;
+        }
+
+        text.erase(std::remove(text.begin(), text.end(), L'`'), text.end());
+        if (text.empty())
+        {
+            break;
         }
 
         int base = static_cast<int>(numberBase);
@@ -1624,6 +1665,185 @@ static bool ParseUnsigned(const std::wstring& value, uint32_t numberBase, uint64
     return ok;
 }
 
+static bool ContainsAddressExpressionOperator(const std::wstring& value)
+{
+    bool contains = false;
+
+    for (size_t index = 1; index < value.size(); ++index)
+    {
+        if (value[index] == L'+' || value[index] == L'-')
+        {
+            contains = true;
+            break;
+        }
+    }
+
+    return contains;
+}
+
+static size_t FindAddressExpressionOperator(const std::wstring& value, size_t start)
+{
+    size_t found = std::wstring::npos;
+
+    for (size_t index = start; index < value.size(); ++index)
+    {
+        if (value[index] == L'+' || value[index] == L'-')
+        {
+            found = index;
+            break;
+        }
+    }
+
+    return found;
+}
+
+static bool ResolveAddressTerm(
+    SymbolEngine& symbols,
+    const DebuggerState& state,
+    const std::wstring& term,
+    uint64_t* value,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (value == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid address term output";
+            }
+            break;
+        }
+
+        if (term.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Empty address expression term";
+            }
+            break;
+        }
+
+        uint64_t parsed = 0;
+        if (ParseUnsigned(term, state.NumberBase, &parsed))
+        {
+            *value = parsed;
+            ok = true;
+            break;
+        }
+
+        if (symbols.ResolveSymbol(term, value, error))
+        {
+            ok = true;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool EvaluateAddressExpression(
+    SymbolEngine& symbols,
+    const DebuggerState& state,
+    const std::wstring& expression,
+    uint64_t* address,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (address == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid address expression output";
+            }
+            break;
+        }
+
+        size_t termStart = 0;
+        wchar_t pendingOperator = 0;
+        uint64_t result = 0;
+        bool hasResult = false;
+
+        while (termStart <= expression.size())
+        {
+            size_t operatorIndex = FindAddressExpressionOperator(expression, termStart);
+            std::wstring term = expression.substr(
+                termStart,
+                operatorIndex == std::wstring::npos ? std::wstring::npos : operatorIndex - termStart);
+
+            uint64_t termValue = 0;
+            if (!ResolveAddressTerm(symbols, state, term, &termValue, error))
+            {
+                break;
+            }
+
+            if (!hasResult)
+            {
+                result = termValue;
+                hasResult = true;
+            }
+            else if (pendingOperator == L'+')
+            {
+                if (result > (~0ull - termValue))
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"Address expression overflow";
+                    }
+                    break;
+                }
+
+                result += termValue;
+            }
+            else if (pendingOperator == L'-')
+            {
+                if (result < termValue)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"Address expression underflow";
+                    }
+                    break;
+                }
+
+                result -= termValue;
+            }
+            else
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Invalid address expression operator";
+                }
+                break;
+            }
+
+            if (operatorIndex == std::wstring::npos)
+            {
+                *address = result;
+                ok = true;
+                break;
+            }
+
+            pendingOperator = expression[operatorIndex];
+            termStart = operatorIndex + 1;
+            if (termStart >= expression.size())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Address expression is missing a trailing term";
+                }
+                break;
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
 static bool ParseAddressOrSymbol(SymbolEngine& symbols, const DebuggerState& state, const std::wstring& value, uint64_t* address, std::wstring* error)
 {
     bool ok = false;
@@ -1644,6 +1864,15 @@ static bool ParseAddressOrSymbol(SymbolEngine& symbols, const DebuggerState& sta
         {
             *address = parsed;
             ok = true;
+            break;
+        }
+
+        if (ContainsAddressExpressionOperator(value))
+        {
+            if (EvaluateAddressExpression(symbols, state, value, address, error))
+            {
+                ok = true;
+            }
             break;
         }
 
@@ -2769,15 +2998,530 @@ static void PrintCompletionMatches(const std::vector<std::wstring>& matches)
     }
 }
 
+struct InteractiveRenderState
+{
+    HANDLE Output;
+    bool ConsoleOutput;
+    COORD Start;
+    size_t RenderedLength;
+};
+
+class ScopedConsoleCursorVisibility
+{
+public:
+    ScopedConsoleCursorVisibility(HANDLE handle, bool visible) :
+        handle_(handle),
+        oldInfo_(),
+        active_(false)
+    {
+        do
+        {
+            if (handle_ == nullptr || handle_ == INVALID_HANDLE_VALUE)
+            {
+                break;
+            }
+
+            if (!GetConsoleCursorInfo(handle_, &oldInfo_))
+            {
+                break;
+            }
+
+            CONSOLE_CURSOR_INFO newInfo = oldInfo_;
+            newInfo.bVisible = visible ? TRUE : FALSE;
+            if (!SetConsoleCursorInfo(handle_, &newInfo))
+            {
+                break;
+            }
+
+            active_ = true;
+        } while (false);
+    }
+
+    ~ScopedConsoleCursorVisibility()
+    {
+        if (active_)
+        {
+            SetConsoleCursorInfo(handle_, &oldInfo_);
+        }
+    }
+
+private:
+    HANDLE handle_;
+    CONSOLE_CURSOR_INFO oldInfo_;
+    bool active_;
+};
+
+static bool CaptureInteractiveRenderStart(InteractiveRenderState* render)
+{
+    bool captured = false;
+
+    do
+    {
+        if (render == nullptr)
+        {
+            break;
+        }
+
+        render->Output = GetStdHandle(STD_OUTPUT_HANDLE);
+        render->ConsoleOutput = false;
+        render->Start = {};
+        render->RenderedLength = 0;
+
+        if (render->Output == nullptr || render->Output == INVALID_HANDLE_VALUE)
+        {
+            break;
+        }
+
+        DWORD mode = 0;
+        if (!GetConsoleMode(render->Output, &mode))
+        {
+            break;
+        }
+
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (!GetConsoleScreenBufferInfo(render->Output, &info))
+        {
+            break;
+        }
+
+        render->ConsoleOutput = true;
+        render->Start = info.dwCursorPosition;
+        captured = true;
+    } while (false);
+
+    return captured;
+}
+
+static bool GetInteractiveConsolePosition(
+    const InteractiveRenderState& render,
+    size_t offset,
+    COORD* position)
+{
+    bool ok = false;
+
+    do
+    {
+        if (position == nullptr || !render.ConsoleOutput)
+        {
+            break;
+        }
+
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (!GetConsoleScreenBufferInfo(render.Output, &info) || info.dwSize.X <= 0)
+        {
+            break;
+        }
+
+        uint64_t absolute = static_cast<uint64_t>(render.Start.X) + static_cast<uint64_t>(offset);
+        uint64_t rowOffset = absolute / static_cast<uint64_t>(info.dwSize.X);
+        uint64_t y = static_cast<uint64_t>(render.Start.Y) + rowOffset;
+        if (y > static_cast<uint64_t>(std::numeric_limits<SHORT>::max()))
+        {
+            break;
+        }
+
+        position->X = static_cast<SHORT>(absolute % static_cast<uint64_t>(info.dwSize.X));
+        position->Y = static_cast<SHORT>(y);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool InteractiveConsolePositionEquals(
+    const COORD& left,
+    const COORD& right)
+{
+    return left.X == right.X && left.Y == right.Y;
+}
+
+static bool SetInteractiveConsoleCursor(
+    const InteractiveRenderState& render,
+    const std::wstring& prompt,
+    size_t cursor)
+{
+    bool ok = false;
+
+    do
+    {
+        COORD position = {};
+        if (!GetInteractiveConsolePosition(render, prompt.size() + cursor, &position))
+        {
+            break;
+        }
+
+        ok = SetConsoleCursorPosition(render.Output, position) != FALSE;
+    } while (false);
+
+    return ok;
+}
+
+static bool TryRenderInteractiveAppendCharacter(
+    const std::wstring& prompt,
+    const std::wstring& line,
+    size_t cursor,
+    wchar_t ch,
+    InteractiveRenderState* render)
+{
+    bool rendered = false;
+
+    do
+    {
+        if (render == nullptr || !render->ConsoleOutput || cursor == 0 || cursor != line.size())
+        {
+            break;
+        }
+
+        size_t visibleLength = prompt.size() + line.size();
+        if (render->RenderedLength + 1 != visibleLength)
+        {
+            break;
+        }
+
+        COORD expected = {};
+        if (!GetInteractiveConsolePosition(*render, prompt.size() + cursor - 1, &expected))
+        {
+            break;
+        }
+
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (!GetConsoleScreenBufferInfo(render->Output, &info) ||
+            !InteractiveConsolePositionEquals(info.dwCursorPosition, expected))
+        {
+            break;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
+        std::wcout << ch;
+        std::wcout.flush();
+        render->RenderedLength = visibleLength;
+        rendered = true;
+    } while (false);
+
+    return rendered;
+}
+
+static bool TryRenderInteractiveEraseLastCharacter(
+    const std::wstring& prompt,
+    const std::wstring& line,
+    size_t cursor,
+    InteractiveRenderState* render)
+{
+    bool rendered = false;
+
+    do
+    {
+        if (render == nullptr || !render->ConsoleOutput || cursor != line.size())
+        {
+            break;
+        }
+
+        size_t visibleLength = prompt.size() + line.size();
+        if (render->RenderedLength != visibleLength + 1)
+        {
+            break;
+        }
+
+        COORD currentExpected = {};
+        if (!GetInteractiveConsolePosition(*render, prompt.size() + cursor + 1, &currentExpected))
+        {
+            break;
+        }
+
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (!GetConsoleScreenBufferInfo(render->Output, &info) ||
+            !InteractiveConsolePositionEquals(info.dwCursorPosition, currentExpected))
+        {
+            break;
+        }
+
+        COORD erasePosition = {};
+        if (!GetInteractiveConsolePosition(*render, prompt.size() + cursor, &erasePosition))
+        {
+            break;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
+        if (!SetConsoleCursorPosition(render->Output, erasePosition))
+        {
+            break;
+        }
+
+        std::wcout << L" ";
+        std::wcout.flush();
+        SetConsoleCursorPosition(render->Output, erasePosition);
+        render->RenderedLength = visibleLength;
+        rendered = true;
+    } while (false);
+
+    return rendered;
+}
+
+static int ReadInteractiveInputKey(std::vector<int>* pendingKeys)
+{
+    int key = 0;
+
+    do
+    {
+        if (pendingKeys != nullptr && !pendingKeys->empty())
+        {
+            key = pendingKeys->front();
+            pendingKeys->erase(pendingKeys->begin());
+            break;
+        }
+
+        key = _getwch();
+    } while (false);
+
+    return key;
+}
+
+static void PushInteractiveInputKey(std::vector<int>* pendingKeys, int key)
+{
+    if (pendingKeys != nullptr)
+    {
+        pendingKeys->insert(pendingKeys->begin(), key);
+    }
+}
+
+static bool TryReadInteractiveInputKey(std::vector<int>* pendingKeys, int* key)
+{
+    static constexpr int kInputSequenceWaitAttempts = 50;
+    bool ok = false;
+
+    do
+    {
+        if (key == nullptr)
+        {
+            break;
+        }
+
+        if (pendingKeys != nullptr && !pendingKeys->empty())
+        {
+            *key = pendingKeys->front();
+            pendingKeys->erase(pendingKeys->begin());
+            ok = true;
+            break;
+        }
+
+        for (int attempt = 0; attempt < kInputSequenceWaitAttempts; ++attempt)
+        {
+            if (_kbhit())
+            {
+                *key = _getwch();
+                ok = true;
+                break;
+            }
+
+            Sleep(1);
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool MapVirtualTerminalLetterKey(int key, int* extended)
+{
+    bool mapped = true;
+
+    do
+    {
+        if (extended == nullptr)
+        {
+            mapped = false;
+            break;
+        }
+
+        switch (key)
+        {
+        case L'A':
+            *extended = 72;
+            break;
+        case L'B':
+            *extended = 80;
+            break;
+        case L'C':
+            *extended = 77;
+            break;
+        case L'D':
+            *extended = 75;
+            break;
+        case L'H':
+            *extended = 71;
+            break;
+        case L'F':
+            *extended = 79;
+            break;
+        default:
+            mapped = false;
+            break;
+        }
+    } while (false);
+
+    return mapped;
+}
+
+static bool MapVirtualTerminalTildeKey(const std::wstring& parameters, int* extended)
+{
+    bool mapped = false;
+
+    do
+    {
+        if (extended == nullptr || parameters.empty())
+        {
+            break;
+        }
+
+        size_t end = parameters.find(L';');
+        std::wstring first = parameters.substr(0, end);
+        uint64_t value = 0;
+        if (!ParseUnsigned(first, 10, &value))
+        {
+            break;
+        }
+
+        if (value == 1 || value == 7)
+        {
+            *extended = 71;
+            mapped = true;
+        }
+        else if (value == 3)
+        {
+            *extended = 83;
+            mapped = true;
+        }
+        else if (value == 4 || value == 8)
+        {
+            *extended = 79;
+            mapped = true;
+        }
+    } while (false);
+
+    return mapped;
+}
+
+static bool TryReadVirtualTerminalExtendedKey(std::vector<int>* pendingKeys, int* extended)
+{
+    bool mapped = false;
+
+    do
+    {
+        int introducer = 0;
+        if (!TryReadInteractiveInputKey(pendingKeys, &introducer))
+        {
+            break;
+        }
+
+        if (introducer != L'[' && introducer != L'O')
+        {
+            PushInteractiveInputKey(pendingKeys, introducer);
+            break;
+        }
+
+        int key = 0;
+        if (!TryReadInteractiveInputKey(pendingKeys, &key))
+        {
+            break;
+        }
+
+        if (introducer == L'O')
+        {
+            mapped = MapVirtualTerminalLetterKey(key, extended);
+            break;
+        }
+
+        if (MapVirtualTerminalLetterKey(key, extended))
+        {
+            mapped = true;
+            break;
+        }
+
+        std::wstring parameters;
+        int current = key;
+        while (parameters.size() < 16)
+        {
+            parameters.push_back(static_cast<wchar_t>(current));
+
+            if (current == L'~')
+            {
+                parameters.pop_back();
+                mapped = MapVirtualTerminalTildeKey(parameters, extended);
+                break;
+            }
+
+            if ((current >= L'A' && current <= L'Z') ||
+                (current >= L'a' && current <= L'z'))
+            {
+                mapped = MapVirtualTerminalLetterKey(current, extended);
+                break;
+            }
+
+            if (!TryReadInteractiveInputKey(pendingKeys, &current))
+            {
+                break;
+            }
+        }
+    } while (false);
+
+    return mapped;
+}
+
+static void ResetInteractiveRenderStart(InteractiveRenderState* render)
+{
+    do
+    {
+        if (render == nullptr)
+        {
+            break;
+        }
+
+        if (!render->ConsoleOutput)
+        {
+            render->RenderedLength = 0;
+            break;
+        }
+
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (GetConsoleScreenBufferInfo(render->Output, &info))
+        {
+            render->Start = info.dwCursorPosition;
+        }
+
+        render->RenderedLength = 0;
+    } while (false);
+}
+
 static void RenderInteractiveCommandLine(
     const std::wstring& prompt,
     const std::wstring& line,
     size_t cursor,
-    size_t* renderedLength)
+    InteractiveRenderState* render)
 {
     std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
     size_t visibleLength = prompt.size() + line.size();
 
+    if (render != nullptr && render->ConsoleOutput)
+    {
+        ScopedConsoleCursorVisibility hiddenCursor(render->Output, false);
+        if (SetConsoleCursorPosition(render->Output, render->Start))
+        {
+            PrintColoredText(prompt, KNDBG_COLOR_PROMPT);
+            std::wcout << line;
+
+            while (render->RenderedLength > visibleLength)
+            {
+                std::wcout << L" ";
+                --render->RenderedLength;
+            }
+
+            std::wcout.flush();
+            render->RenderedLength = visibleLength;
+            SetInteractiveConsoleCursor(*render, prompt, cursor);
+            return;
+        }
+    }
+
+    size_t* renderedLength = render != nullptr ? &render->RenderedLength : nullptr;
     std::wcout << L"\r";
     PrintColoredText(prompt, KNDBG_COLOR_PROMPT);
     std::wcout << line;
@@ -2897,7 +3641,10 @@ static bool ApplyInteractiveTabCompletion(std::wstring* line, size_t* cursor, bo
     return changed;
 }
 
-static bool ReadInteractiveCommandLine(const std::wstring& prompt, std::wstring* line)
+static bool ReadInteractiveCommandLine(
+    const std::wstring& prompt,
+    const std::vector<std::wstring>& history,
+    std::wstring* line)
 {
     bool ok = false;
 
@@ -2915,7 +3662,14 @@ static bool ReadInteractiveCommandLine(const std::wstring& prompt, std::wstring*
             input != INVALID_HANDLE_VALUE &&
             GetConsoleMode(input, &mode);
 
+        InteractiveRenderState render = {};
+        if (consoleInput)
+        {
+            CaptureInteractiveRenderStart(&render);
+        }
+
         PrintColoredText(prompt, KNDBG_COLOR_PROMPT);
+        render.RenderedLength = prompt.size();
         if (!consoleInput)
         {
             ok = static_cast<bool>(std::getline(std::wcin, *line));
@@ -2923,46 +3677,150 @@ static bool ReadInteractiveCommandLine(const std::wstring& prompt, std::wstring*
         }
 
         size_t cursor = 0;
-        size_t renderedLength = prompt.size();
+        size_t historyIndex = history.size();
+        std::wstring historyDraft;
+        bool hasHistoryDraft = false;
+
+        auto resetHistoryNavigation = [&history, &historyIndex, &historyDraft, &hasHistoryDraft]()
+        {
+            historyIndex = history.size();
+            historyDraft.clear();
+            hasHistoryDraft = false;
+        };
+
+        auto moveInteractiveCursor = [&prompt, &line, &cursor, &render]()
+        {
+            if (!SetInteractiveConsoleCursor(render, prompt, cursor))
+            {
+                RenderInteractiveCommandLine(prompt, *line, cursor, &render);
+            }
+        };
+
+        auto recallHistoryLine = [&prompt, &history, line, &cursor, &render, &historyIndex, &historyDraft, &hasHistoryDraft](bool older)
+        {
+            bool recalled = false;
+
+            do
+            {
+                if (history.empty() || line == nullptr)
+                {
+                    MessageBeep(MB_OK);
+                    break;
+                }
+
+                if (older)
+                {
+                    if (historyIndex == history.size())
+                    {
+                        historyDraft = *line;
+                        hasHistoryDraft = true;
+                        historyIndex = history.size() - 1;
+                    }
+                    else if (historyIndex > 0)
+                    {
+                        --historyIndex;
+                    }
+                    else
+                    {
+                        MessageBeep(MB_OK);
+                        break;
+                    }
+
+                    *line = history[historyIndex];
+                }
+                else
+                {
+                    if (historyIndex >= history.size())
+                    {
+                        MessageBeep(MB_OK);
+                        break;
+                    }
+
+                    if (historyIndex + 1 < history.size())
+                    {
+                        ++historyIndex;
+                        *line = history[historyIndex];
+                    }
+                    else
+                    {
+                        historyIndex = history.size();
+                        *line = hasHistoryDraft ? historyDraft : L"";
+                    }
+                }
+
+                cursor = line->size();
+                RenderInteractiveCommandLine(prompt, *line, cursor, &render);
+                recalled = true;
+            } while (false);
+
+            return recalled;
+        };
+
+        auto handleExtendedKey = [&line, &cursor, &render, &prompt, &recallHistoryLine, &moveInteractiveCursor, &resetHistoryNavigation](int extended)
+        {
+            if (extended == 72)
+            {
+                recallHistoryLine(true);
+            }
+            else if (extended == 80)
+            {
+                recallHistoryLine(false);
+            }
+            else if (extended == 75)
+            {
+                if (cursor > 0)
+                {
+                    --cursor;
+                    moveInteractiveCursor();
+                }
+            }
+            else if (extended == 77)
+            {
+                if (cursor < line->size())
+                {
+                    ++cursor;
+                    moveInteractiveCursor();
+                }
+            }
+            else if (extended == 71)
+            {
+                cursor = 0;
+                moveInteractiveCursor();
+            }
+            else if (extended == 79)
+            {
+                cursor = line->size();
+                moveInteractiveCursor();
+            }
+            else if (extended == 83)
+            {
+                if (cursor < line->size())
+                {
+                    line->erase(cursor, 1);
+                    resetHistoryNavigation();
+                    RenderInteractiveCommandLine(prompt, *line, cursor, &render);
+                }
+            }
+        };
+
+        std::vector<int> pendingInputKeys;
+
         while (!g_StopRequested)
         {
-            int key = _getwch();
+            int key = ReadInteractiveInputKey(&pendingInputKeys);
             if (key == 0 || key == 0xe0)
             {
-                int extended = _getwch();
-                if (extended == 75)
+                int extended = ReadInteractiveInputKey(&pendingInputKeys);
+                handleExtendedKey(extended);
+                continue;
+            }
+
+            if (key == 27)
+            {
+                int extended = 0;
+                if (TryReadVirtualTerminalExtendedKey(&pendingInputKeys, &extended))
                 {
-                    if (cursor > 0)
-                    {
-                        --cursor;
-                        RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
-                    }
-                }
-                else if (extended == 77)
-                {
-                    if (cursor < line->size())
-                    {
-                        ++cursor;
-                        RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
-                    }
-                }
-                else if (extended == 71)
-                {
-                    cursor = 0;
-                    RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
-                }
-                else if (extended == 79)
-                {
-                    cursor = line->size();
-                    RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
-                }
-                else if (extended == 83)
-                {
-                    if (cursor < line->size())
-                    {
-                        line->erase(cursor, 1);
-                        RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
-                    }
+                    handleExtendedKey(extended);
                 }
                 continue;
             }
@@ -2993,12 +3851,13 @@ static bool ReadInteractiveCommandLine(const std::wstring& prompt, std::wstring*
                 bool changed = ApplyInteractiveTabCompletion(line, &cursor, &listed);
                 if (listed)
                 {
-                    renderedLength = 0;
-                    RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
+                    ResetInteractiveRenderStart(&render);
+                    RenderInteractiveCommandLine(prompt, *line, cursor, &render);
                 }
                 else if (changed)
                 {
-                    RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
+                    resetHistoryNavigation();
+                    RenderInteractiveCommandLine(prompt, *line, cursor, &render);
                 }
                 continue;
             }
@@ -3007,18 +3866,31 @@ static bool ReadInteractiveCommandLine(const std::wstring& prompt, std::wstring*
             {
                 if (cursor > 0)
                 {
+                    bool eraseLastCharacter = cursor == line->size();
                     line->erase(cursor - 1, 1);
                     --cursor;
-                    RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
+                    resetHistoryNavigation();
+                    if (!eraseLastCharacter ||
+                        !TryRenderInteractiveEraseLastCharacter(prompt, *line, cursor, &render))
+                    {
+                        RenderInteractiveCommandLine(prompt, *line, cursor, &render);
+                    }
                 }
                 continue;
             }
 
             if (key >= 32 && key != 127)
             {
-                line->insert(cursor, 1, static_cast<wchar_t>(key));
+                wchar_t ch = static_cast<wchar_t>(key);
+                bool appendCharacter = cursor == line->size();
+                line->insert(cursor, 1, ch);
                 ++cursor;
-                RenderInteractiveCommandLine(prompt, *line, cursor, &renderedLength);
+                resetHistoryNavigation();
+                if (!appendCharacter ||
+                    !TryRenderInteractiveAppendCharacter(prompt, *line, cursor, ch, &render))
+                {
+                    RenderInteractiveCommandLine(prompt, *line, cursor, &render);
+                }
             }
         }
     } while (false);
@@ -4642,6 +5514,57 @@ static bool DmlProcessAlreadyVisited(const std::vector<uint64_t>& visited, uint6
     return std::find(visited.begin(), visited.end(), entry) != visited.end();
 }
 
+static bool DmlProcessMatchesFilter(const DmlProcessRecord& record, bool hasPidFilter, uint64_t pidFilter)
+{
+    bool matched = true;
+
+    if (hasPidFilter)
+    {
+        matched = record.ProcessId == pidFilter;
+    }
+
+    return matched;
+}
+
+static bool ParseDmlProcessPidFilter(const std::wstring& value, uint64_t* pid)
+{
+    bool ok = false;
+
+    do
+    {
+        if (pid == nullptr || value.empty() || IsSwitchLikeToken(value))
+        {
+            break;
+        }
+
+        bool decimalOnly = true;
+        for (wchar_t ch : value)
+        {
+            if (ch < L'0' || ch > L'9')
+            {
+                decimalOnly = false;
+                break;
+            }
+        }
+
+        if (!decimalOnly)
+        {
+            break;
+        }
+
+        uint64_t parsed = 0;
+        if (!ParseUnsigned(value, 10, &parsed) || parsed > 0xffffffffull)
+        {
+            break;
+        }
+
+        *pid = parsed;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static void HandleDmlProcCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -4652,10 +5575,23 @@ static void HandleDmlProcCommand(
 
     do
     {
-        if (args.size() != 1)
+        if (args.size() > 2)
         {
-            std::wcerr << L"usage: !dml_proc\n";
+            std::wcerr << L"usage: !dml_proc [pid]\n";
             break;
+        }
+
+        bool hasPidFilter = false;
+        uint64_t pidFilter = 0;
+        if (args.size() == 2)
+        {
+            if (!ParseDmlProcessPidFilter(args[1], &pidFilter))
+            {
+                std::wcerr << L"invalid process id\n";
+                break;
+            }
+
+            hasPidFilter = true;
         }
 
         DmlProcessLayout layout = {};
@@ -4689,6 +5625,7 @@ static void HandleDmlProcCommand(
 
         uint64_t current = 0;
         size_t count = 0;
+        size_t scannedCount = 0;
         constexpr size_t maxProcessRecords = 4096;
         std::vector<uint64_t> visited;
 
@@ -4711,14 +5648,19 @@ static void HandleDmlProcCommand(
                 break;
             }
 
-            PrintDmlProcessRecord(systemRecord);
+            if (DmlProcessMatchesFilter(systemRecord, hasPidFilter, pidFilter))
+            {
+                PrintDmlProcessRecord(systemRecord);
+                ++count;
+            }
+
             current = systemRecord.Flink;
-            count = 1;
+            scannedCount = 1;
             listHead = systemListEntry;
             visited.push_back(systemListEntry);
         }
 
-        while (current != 0 && current != listHead && count < maxProcessRecords)
+        while (current != 0 && current != listHead && scannedCount < maxProcessRecords)
         {
             if (DmlProcessAlreadyVisited(visited, current))
             {
@@ -4738,8 +5680,13 @@ static void HandleDmlProcCommand(
             DmlProcessRecord record = {};
             if (ReadDmlProcessRecord(device, layout, eprocess, &record, &error))
             {
-                PrintDmlProcessRecord(record);
-                ++count;
+                if (DmlProcessMatchesFilter(record, hasPidFilter, pidFilter))
+                {
+                    PrintDmlProcessRecord(record);
+                    ++count;
+                }
+
+                ++scannedCount;
                 current = record.Flink;
             }
             else
@@ -4771,7 +5718,13 @@ static void HandleDmlProcCommand(
 
         PrintColoredText(L"process records", KNDBG_COLOR_TITLE);
         std::wcout << L"=" << count;
-        if (count >= maxProcessRecords)
+        if (hasPidFilter)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"pid", KNDBG_COLOR_ACCENT);
+            std::wcout << L"=" << std::dec << pidFilter;
+        }
+        if (scannedCount >= maxProcessRecords)
         {
             std::wcout << L" truncated=yes";
         }
@@ -7466,7 +8419,7 @@ static void PrintStartupTui(
     PrintTuiLine(L"  dt nt!_EPROCESS <addr>   dq nt!PsLoadedModuleList 8", KNDBG_COLOR_DIM);
     PrintTuiLine(L"  vtop <addr>              pdb <physical-address> 80", KNDBG_COLOR_DIM);
     PrintTuiLine(L"  u nt!KiSystemCall64 8    uf nt!KiSystemCall64", KNDBG_COLOR_DIM);
-    PrintTuiLine(L"  !dml_proc                backend native", KNDBG_COLOR_DIM);
+    PrintTuiLine(L"  !dml_proc [pid]          backend native", KNDBG_COLOR_DIM);
     PrintTuiRule();
     PrintTuiLine(L"Type home to redraw this screen. Type q, quit, or exit to unload and leave.", KNDBG_COLOR_WARN);
     PrintTuiRule();
@@ -8299,6 +9252,7 @@ static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const Symbol
     stream << L"- loaded kernel modules: " << symbols.Modules().size() << L"\n";
     stream << L"- write mode is enabled by default per device handle unless the operator ran write off\n";
     stream << L"- native e* virtual writes default to System(pid 4) page-table context; use /process for a specific process\n";
+    stream << L"- address arguments support arithmetic such as nt!Symbol+20 or 0xfffff80000000000-10\n";
     stream << L"Rules:\n";
     stream << L"- Prefer concrete KnLiveDbg commands and exact preview text.\n";
     stream << L"- Treat AI output as advisory and require operator confirmation for writes.\n";
@@ -8408,11 +9362,15 @@ static void PrintWriteHelp()
 static void PrintDmlProcHelp()
 {
     std::wcout << L"!dml_proc command:\n";
-    std::wcout << L"  !dml_proc\n";
+    std::wcout << L"  !dml_proc [pid]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands/options:\n";
+    std::wcout << L"  pid   optional decimal process ID filter, for example !dml_proc 4\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Native process listing that does not require a DbgEng current process/thread.\n";
     std::wcout << L"  The all-process form resolves PID 4, then walks _EPROCESS.ActiveProcessLinks.\n";
+    std::wcout << L"  With a PID argument, only matching process records are printed.\n";
     std::wcout << L"  Output includes EPROCESS, PID, parent PID, active thread count, DTB, and image name.\n";
 }
 
@@ -8430,6 +9388,7 @@ static void PrintVtopHelp()
     std::wcout << L"notes:\n";
     std::wcout << L"  The output includes PML4/PML5 state, leaf entry PA, page size, and writable state.\n";
     std::wcout << L"  Without /cr3 or /process, user addresses use procctx when set; kernel addresses use the native kernel context.\n";
+    std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  length is bytes and is used to report the contiguous translated range.\n";
 }
 
@@ -8449,6 +9408,7 @@ static void PrintDtHelp(const std::wstring& command)
     std::wcout << L"notes:\n";
     std::wcout << L"  Wildcard type patterns such as nt!* enumerate matching type names only.\n";
     std::wcout << L"  Exact type names can dump field layouts and read field values when an address is supplied.\n";
+    std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20 or 0xffff`0000-10.\n";
     std::wcout << L"  nt! is treated as the loaded kernel image, including ntoskrnl/ntkrnlmp PDB names.\n";
     std::wcout << L"  Field filters match field names or field type names case-insensitively.\n";
     std::wcout << L"\n";
@@ -8467,6 +9427,7 @@ static void PrintDisassemblyHelp()
     std::wcout << L"notes:\n";
     std::wcout << L"  u disassembles forward and remembers the next address.\n";
     std::wcout << L"  uf uses native byte reads when the driver is open, then follows local branch targets.\n";
+    std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  u defaults to 8 instructions and caps explicit counts at 256.\n";
     std::wcout << L"  uf defaults to 512 instructions and caps explicit counts at 4096.\n";
 }
@@ -8486,6 +9447,7 @@ static void PrintDisplayHelp(const std::wstring& command)
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  count is element count for unit dumps and character count for string dumps.\n";
+    std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  unreadable bytes are shown as ?? when sparse reads can continue.\n";
     std::wcout << L"  dds/dps/dqs annotate values with nearest loaded symbols.\n";
 }
@@ -8504,6 +9466,7 @@ static void PrintEnterHelp(const std::wstring& command)
     std::wcout << L"notes:\n";
     std::wcout << L"  Address-only form prompts for replacement bytes. Kernel virtual writes use System(pid 4) context by default.\n";
     std::wcout << L"  /process <process-id> writes through that process page table for this command only.\n";
+    std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  Read-only leaf PTEs are temporarily marked writable, flushed, written, and restored.\n";
     std::wcout << L"  Integer values are little-endian and clipped to the command width.\n";
 }
@@ -10904,13 +11867,26 @@ static bool ValidateAiPlanArgumentShape(
         }
         else if (command == L"!dml_proc")
         {
-            if (args.size() != 1)
+            if (args.size() > 2)
             {
                 if (reason != nullptr)
                 {
-                    *reason = L"!dml_proc does not accept arguments";
+                    *reason = L"!dml_proc accepts at most one decimal PID argument";
                 }
                 break;
+            }
+
+            if (args.size() == 2)
+            {
+                uint64_t pid = 0;
+                if (!ParseDmlProcessPidFilter(args[1], &pid))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!dml_proc PID argument must be a decimal process ID";
+                    }
+                    break;
+                }
             }
         }
 
@@ -13927,7 +14903,7 @@ int wmain(int argc, wchar_t** argv)
         while (!g_StopRequested)
         {
             std::wstring line;
-            if (!ReadInteractiveCommandLine(L"knkd> ", &line))
+            if (!ReadInteractiveCommandLine(L"knkd> ", state.CommandHistory, &line))
             {
                 break;
             }
@@ -13942,6 +14918,7 @@ int wmain(int argc, wchar_t** argv)
             if (!args.empty())
             {
                 state.LastCommand = line;
+                AddCommandHistory(&state, line);
             }
 
             CommandExecutionResult commandResult = ExecuteCommandWithTranscript(
