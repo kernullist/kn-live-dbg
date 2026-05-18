@@ -40,6 +40,25 @@ struct ObjectCallbackLayout
     bool UsedSyntheticFields = false;
 };
 
+struct ExCallbackBlockLayout
+{
+    TypeFieldInfo Function = {};
+    TypeFieldInfo Context = {};
+    bool UsedSyntheticFields = false;
+};
+
+struct RegistryCallbackLayout
+{
+    std::wstring BlockType;
+    TypeFieldInfo ListEntry = {};
+    TypeFieldInfo PreCallback = {};
+    TypeFieldInfo PostCallback = {};
+    TypeFieldInfo Context = {};
+    TypeFieldInfo Cookie = {};
+    TypeFieldInfo Altitude = {};
+    bool UsedSyntheticFields = false;
+};
+
 class CallbackScanContext
 {
 public:
@@ -756,6 +775,23 @@ public:
         return value >= 0xffff800000000000ull;
     }
 
+    bool IsKernelImagePointer(uint64_t value) const
+    {
+        bool result = false;
+
+        do
+        {
+            if (value == 0)
+            {
+                break;
+            }
+
+            result = FindModuleForAddress(value) != nullptr;
+        } while (false);
+
+        return result;
+    }
+
     uint64_t DecodeFastRef(uint64_t value) const
     {
         return value & ~0xfull;
@@ -1455,6 +1491,115 @@ static bool BuildObjectCallbackLayout(
     return ok;
 }
 
+static bool BuildExCallbackBlockLayout(
+    CallbackScanContext& context,
+    ExCallbackBlockLayout* layout,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (layout == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid EX callback block layout output";
+            }
+            break;
+        }
+
+        *layout = {};
+        (void)context;
+
+        layout->Function = MakeSyntheticField(
+            L"Function",
+            L"void*",
+            0x8,
+            sizeof(uint64_t),
+            KNDBG_SYMTAG_POINTER_TYPE);
+        layout->Context = MakeSyntheticField(
+            L"Context",
+            L"void*",
+            0x10,
+            sizeof(uint64_t),
+            KNDBG_SYMTAG_POINTER_TYPE);
+        layout->UsedSyntheticFields = true;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool BuildRegistryCallbackLayouts(
+    CallbackScanContext& context,
+    std::vector<RegistryCallbackLayout>* layouts,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (layouts == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid registry callback layout output";
+            }
+            break;
+        }
+
+        layouts->clear();
+        (void)context;
+
+        RegistryCallbackLayout syntheticCurrent = {};
+        syntheticCurrent.BlockType = L"x64::_CM_CALLBACK_CONTEXT_BLOCK";
+        syntheticCurrent.ListEntry = MakeSyntheticField(
+            L"CallbackListEntry",
+            L"_LIST_ENTRY",
+            0x0,
+            sizeof(uint64_t) * 2,
+            KNDBG_SYMTAG_UDT);
+        syntheticCurrent.Cookie = MakeSyntheticField(
+            L"Cookie",
+            L"uint64_t",
+            0x10,
+            sizeof(uint64_t),
+            KNDBG_SYMTAG_BASE_TYPE);
+        syntheticCurrent.Context = MakeSyntheticField(
+            L"Context",
+            L"void*",
+            0x18,
+            sizeof(uint64_t),
+            KNDBG_SYMTAG_POINTER_TYPE);
+        syntheticCurrent.PreCallback = MakeSyntheticField(
+            L"Function",
+            L"void*",
+            0x20,
+            sizeof(uint64_t),
+            KNDBG_SYMTAG_POINTER_TYPE);
+        syntheticCurrent.Altitude = MakeSyntheticField(
+            L"Altitude",
+            L"_UNICODE_STRING",
+            0x28,
+            sizeof(uint64_t) * 2,
+            KNDBG_SYMTAG_UDT);
+        syntheticCurrent.UsedSyntheticFields = true;
+        layouts->push_back(syntheticCurrent);
+
+        RegistryCallbackLayout syntheticLegacy = syntheticCurrent;
+        syntheticLegacy.PreCallback.Offset = 0x10;
+        syntheticLegacy.Context.Offset = 0x18;
+        syntheticLegacy.Cookie.Offset = 0x20;
+        syntheticLegacy.Altitude.Offset = 0x28;
+        layouts->push_back(syntheticLegacy);
+
+        ok = !layouts->empty();
+    } while (false);
+
+    return ok;
+}
+
 static std::wstring ToLowerLocal(const std::wstring& value)
 {
     std::wstring result = value;
@@ -1663,11 +1808,13 @@ static void AddEnumeratedCallbackRoots(
     } while (false);
 }
 
-static bool ScanProcessCallbackTableRoot(
+static bool ScanExCallbackTableRoot(
     CallbackScanContext& context,
     const CallbackRoot& root,
-    const TypeFieldInfo& functionField,
-    const TypeFieldInfo& contextField,
+    const ExCallbackBlockLayout& layout,
+    const std::wstring& kind,
+    const std::wstring& target,
+    const std::wstring& fallbackNote,
     bool allowEmpty,
     KernelCallbackScanResult* result,
     uint32_t* recordCount,
@@ -1681,7 +1828,7 @@ static bool ScanProcessCallbackTableRoot(
         {
             if (error != nullptr)
             {
-                *error = L"Invalid process callback table output";
+                *error = L"Invalid callback table output";
             }
             break;
         }
@@ -1698,7 +1845,7 @@ static bool ScanProcessCallbackTableRoot(
             {
                 if (error != nullptr)
                 {
-                    *error = L"Process callback table slot address overflow";
+                    *error = L"Callback table slot address overflow";
                 }
                 tableReadOk = false;
                 break;
@@ -1730,7 +1877,7 @@ static bool ScanProcessCallbackTableRoot(
             }
 
             uint64_t functionAddressField = 0;
-            if (!context.TryAdd(blockAddress, functionField.Offset, &functionAddressField))
+            if (!context.TryAdd(blockAddress, layout.Function.Offset, &functionAddressField))
             {
                 continue;
             }
@@ -1748,14 +1895,14 @@ static bool ScanProcessCallbackTableRoot(
 
             uint64_t callbackContext = 0;
             uint64_t contextAddressField = 0;
-            if (context.TryAdd(blockAddress, contextField.Offset, &contextAddressField))
+            if (context.TryAdd(blockAddress, layout.Context.Offset, &contextAddressField))
             {
                 context.ReadU64(contextAddressField, &callbackContext, nullptr);
             }
 
             KernelCallbackRecord record = {};
-            record.Kind = L"process";
-            record.Target = L"create-process";
+            record.Kind = kind;
+            record.Target = target;
             record.Slot = slot;
             record.RootAddress = root.Address;
             record.RootSource = root.Source;
@@ -1763,8 +1910,11 @@ static bool ScanProcessCallbackTableRoot(
             record.CallbackBlock = blockAddress;
             record.Function = functionAddress;
             record.Context = callbackContext;
+            if (layout.UsedSyntheticFields)
+            {
+                record.Notes = fallbackNote;
+            }
             context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
-            context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
             records.push_back(record);
         }
 
@@ -1778,7 +1928,7 @@ static bool ScanProcessCallbackTableRoot(
             if (error != nullptr)
             {
                 std::wstringstream stream;
-                stream << L"No valid process callback blocks at " << root.Source
+                stream << L"No valid " << kind << L" callback blocks at " << root.Source
                        << L" nonZeroSlots=" << nonZeroSlots;
                 *error = stream.str();
             }
@@ -1796,8 +1946,7 @@ static bool ScanProcessCallbackTableRoot(
 static bool ScanRegistryCallbackListRoot(
     CallbackScanContext& context,
     const CallbackRoot& root,
-    const std::wstring& blockType,
-    const TypeFieldInfo& listField,
+    const RegistryCallbackLayout& layout,
     bool allowEmpty,
     KernelCallbackScanResult* result,
     uint32_t* recordCount,
@@ -1885,7 +2034,7 @@ static bool ScanRegistryCallbackListRoot(
             }
 
             uint64_t blockAddress = 0;
-            if (!context.TrySubtract(current, listField.Offset, &blockAddress))
+            if (!context.TrySubtract(current, layout.ListEntry.Offset, &blockAddress))
             {
                 listWalkOk = false;
                 if (error != nullptr)
@@ -1899,18 +2048,40 @@ static bool ScanRegistryCallbackListRoot(
             uint64_t postCallback = 0;
             uint64_t callbackContext = 0;
             uint64_t cookie = 0;
-            TypeFieldInfo altitudeField = {};
 
-            context.ReadFieldU64(blockAddress, blockType, {L"PreCallback", L"CallbackFunction", L"Function"}, &preCallback, nullptr, nullptr);
-            context.ReadFieldU64(blockAddress, blockType, {L"PostCallback"}, &postCallback, nullptr, nullptr);
-            context.ReadFieldU64(blockAddress, blockType, {L"Context", L"CallbackContext"}, &callbackContext, nullptr, nullptr);
-            context.ReadFieldU64(blockAddress, blockType, {L"Cookie"}, &cookie, nullptr, nullptr);
+            if (layout.PreCallback.Length != 0)
+            {
+                ReadFieldValueByDescriptor(context, blockAddress, layout.PreCallback, &preCallback, nullptr);
+                if (preCallback != 0 && !context.IsKernelImagePointer(preCallback))
+                {
+                    preCallback = 0;
+                }
+            }
+
+            if (layout.PostCallback.Length != 0)
+            {
+                ReadFieldValueByDescriptor(context, blockAddress, layout.PostCallback, &postCallback, nullptr);
+                if (postCallback != 0 && !context.IsKernelImagePointer(postCallback))
+                {
+                    postCallback = 0;
+                }
+            }
+
+            if (layout.Context.Length != 0)
+            {
+                ReadFieldValueByDescriptor(context, blockAddress, layout.Context, &callbackContext, nullptr);
+            }
+
+            if (layout.Cookie.Length != 0)
+            {
+                ReadFieldValueByDescriptor(context, blockAddress, layout.Cookie, &cookie, nullptr);
+            }
 
             std::wstring altitude;
-            if (context.FindField(blockType, {L"Altitude"}, &altitudeField, nullptr))
+            if (layout.Altitude.Length != 0)
             {
                 uint64_t altitudeAddress = 0;
-                if (context.TryAdd(blockAddress, altitudeField.Offset, &altitudeAddress))
+                if (context.TryAdd(blockAddress, layout.Altitude.Offset, &altitudeAddress))
                 {
                     context.ReadUnicodeString(altitudeAddress, &altitude, nullptr);
                 }
@@ -1931,9 +2102,16 @@ static bool ScanRegistryCallbackListRoot(
                 record.Context = callbackContext;
                 record.Cookie = cookie;
                 record.Altitude = altitude;
+                if (layout.UsedSyntheticFields)
+                {
+                    record.Notes = L"x64 fallback registry callback block layout";
+                }
                 context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
                 context.AnnotateAddress(record.PostFunction, &record.PostFunctionModule, &record.PostFunctionSymbol);
-                context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
+                if (context.IsKernelImagePointer(record.Context))
+                {
+                    context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
+                }
                 records.push_back(record);
             }
 
@@ -2776,15 +2954,17 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
         bool scanRegistry = scanAll || normalized == L"reg" || normalized == L"registry";
         bool scanProcess = scanAll || normalized == L"proc" || normalized == L"process" ||
             normalized == L"processes" || normalized == L"ps";
+        bool scanThread = scanAll || normalized == L"thread" || normalized == L"threads" ||
+            normalized == L"thr" || normalized == L"th";
         bool scanMini = scanAll || normalized == L"mini" || normalized == L"minifilter" ||
             normalized == L"minifilters" || normalized == L"flt" || normalized == L"fltmgr" ||
             normalized == L"filter" || normalized == L"filters";
 
-        if (!scanOb && !scanRegistry && !scanProcess && !scanMini)
+        if (!scanOb && !scanRegistry && !scanProcess && !scanThread && !scanMini)
         {
             if (error != nullptr)
             {
-                *error = L"usage: callbacks [all|ob|registry|process|minifilter]";
+                *error = L"usage: callbacks [all|ob|registry|process|thread|minifilter]";
             }
             break;
         }
@@ -2827,6 +3007,19 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
             else
             {
                 result->Warnings.push_back(L"process: " + localError);
+            }
+        }
+
+        if (scanThread)
+        {
+            localError.clear();
+            if (ScanThreadCallbacks(result, &localError))
+            {
+                anyScannerSucceeded = true;
+            }
+            else
+            {
+                result->Warnings.push_back(L"thread: " + localError);
             }
         }
 
@@ -2874,15 +3067,8 @@ bool KernelCallbackScanner::ScanProcessCallbacks(KernelCallbackScanResult* resul
         }
 
         CallbackScanContext context(device_, symbols_);
-        const std::wstring blockType = L"nt!_EX_CALLBACK_ROUTINE_BLOCK";
-        TypeFieldInfo functionField = {};
-        TypeFieldInfo contextField = {};
-        if (!context.FindField(blockType, {L"Function"}, &functionField, error))
-        {
-            break;
-        }
-
-        if (!context.FindField(blockType, {L"Context"}, &contextField, error))
+        ExCallbackBlockLayout layout = {};
+        if (!BuildExCallbackBlockLayout(context, &layout, error))
         {
             break;
         }
@@ -2916,11 +3102,98 @@ bool KernelCallbackScanner::ScanProcessCallbacks(KernelCallbackScanResult* resul
             uint32_t recordCount = 0;
             std::wstring localError;
             bool allowEmpty = SourceMatchesSymbolName(root.Source, L"PspCreateProcessNotifyRoutine");
-            if (ScanProcessCallbackTableRoot(
+            if (ScanExCallbackTableRoot(
                     context,
                     root,
-                    functionField,
-                    contextField,
+                    layout,
+                    L"process",
+                    L"create-process",
+                    L"x64 fallback process callback block layout",
+                    allowEmpty,
+                    result,
+                    &recordCount,
+                    &localError))
+            {
+                any = true;
+                break;
+            }
+
+            warnings.push_back(root.Source + L": " + localError);
+        }
+
+        if (!any)
+        {
+            if (error != nullptr)
+            {
+                *error = JoinWarnings(warnings);
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool KernelCallbackScanner::ScanThreadCallbacks(KernelCallbackScanResult* result, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid thread callback scan output";
+            }
+            break;
+        }
+
+        CallbackScanContext context(device_, symbols_);
+        ExCallbackBlockLayout layout = {};
+        if (!BuildExCallbackBlockLayout(context, &layout, error))
+        {
+            break;
+        }
+
+        std::vector<CallbackRoot> roots;
+        std::vector<std::wstring> warnings;
+        AddEnumeratedCallbackRoots(
+            context,
+            {
+                L"nt!PspCreateThreadNotifyRoutine",
+                L"nt!*CreateThread*Notify*Routine*",
+                L"nt!Psp*Thread*Notify*Routine*"
+            },
+            128,
+            &roots,
+            &warnings);
+        AddResolvedCallbackRoot(context, L"nt!PspCreateThreadNotifyRoutine", &roots, &warnings);
+
+        if (roots.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = JoinWarnings(warnings);
+            }
+            break;
+        }
+
+        bool any = false;
+        for (const CallbackRoot& root : roots)
+        {
+            uint32_t recordCount = 0;
+            std::wstring localError;
+            bool allowEmpty = SourceMatchesSymbolName(root.Source, L"PspCreateThreadNotifyRoutine");
+            if (ScanExCallbackTableRoot(
+                    context,
+                    root,
+                    layout,
+                    L"thread",
+                    L"create-thread",
+                    L"x64 fallback thread callback block layout",
                     allowEmpty,
                     result,
                     &recordCount,
@@ -2964,20 +3237,8 @@ bool KernelCallbackScanner::ScanRegistryCallbacks(KernelCallbackScanResult* resu
         }
 
         CallbackScanContext context(device_, symbols_);
-        std::vector<std::wstring> contextBlockTypes =
-        {
-            L"nt!_CM_CALLBACK_CONTEXT_BLOCK",
-            L"_CM_CALLBACK_CONTEXT_BLOCK"
-        };
-
-        std::wstring blockType;
-        TypeFieldInfo listField = {};
-        if (!context.FindFieldInTypes(
-                contextBlockTypes,
-                {L"CallbackListEntry", L"ListEntry", L"CallbackEntry", L"CallbackList"},
-                &blockType,
-                &listField,
-                error))
+        std::vector<RegistryCallbackLayout> layouts;
+        if (!BuildRegistryCallbackLayouts(context, &layouts, error))
         {
             break;
         }
@@ -3009,24 +3270,31 @@ bool KernelCallbackScanner::ScanRegistryCallbacks(KernelCallbackScanResult* resu
         bool any = false;
         for (const CallbackRoot& root : roots)
         {
-            uint32_t recordCount = 0;
-            std::wstring localError;
-            bool allowEmpty = SourceMatchesSymbolName(root.Source, L"CmpCallbackListHead");
-            if (ScanRegistryCallbackListRoot(
-                    context,
-                    root,
-                    blockType,
-                    listField,
-                    allowEmpty,
-                    result,
-                    &recordCount,
-                    &localError))
+            for (const RegistryCallbackLayout& layout : layouts)
             {
-                any = true;
-                break;
+                uint32_t recordCount = 0;
+                std::wstring localError;
+                bool allowEmpty = SourceMatchesSymbolName(root.Source, L"CmpCallbackListHead");
+                if (ScanRegistryCallbackListRoot(
+                        context,
+                        root,
+                        layout,
+                        allowEmpty,
+                        result,
+                        &recordCount,
+                        &localError))
+                {
+                    any = true;
+                    break;
+                }
+
+                warnings.push_back(root.Source + L" " + layout.BlockType + L": " + localError);
             }
 
-            warnings.push_back(root.Source + L": " + localError);
+            if (any)
+            {
+                break;
+            }
         }
 
         if (!any)
@@ -3420,7 +3688,10 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 }
                 context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
                 context.AnnotateAddress(record.PostFunction, &record.PostFunctionModule, &record.PostFunctionSymbol);
-                context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
+                if (context.IsKernelImagePointer(record.Context))
+                {
+                    context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
+                }
                 result->Records.push_back(record);
             }
 

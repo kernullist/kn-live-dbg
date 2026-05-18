@@ -16,11 +16,17 @@ struct PhysicalTranslationInfo
     uint64_t PageBytes;
     uint32_t RequestedLength;
     uint32_t TranslatedLength;
+    uint32_t PagingLevels;
     uint64_t Pml4e;
     uint64_t Pml5e;
     uint64_t Pdpte;
     uint64_t Pde;
     uint64_t Pte;
+    uint64_t Pml5eAddress;
+    uint64_t Pml4eAddress;
+    uint64_t PdpteAddress;
+    uint64_t PdeAddress;
+    uint64_t PteAddress;
 };
 
 struct DriverSessionStatus
@@ -68,6 +74,7 @@ public:
         uint32_t length,
         PhysicalTranslationInfo* info,
         std::wstring* error);
+    bool FlushVirtual(uint64_t virtualAddress, uint32_t length, std::wstring* error);
     bool ReadPhysical(uint64_t physicalAddress, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error);
     bool WritePhysical(uint64_t physicalAddress, const std::vector<uint8_t>& bytes, std::wstring* error);
 

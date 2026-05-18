@@ -10,7 +10,7 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SERVICE_NAME L"KnLiveDbg"
 #define KNDBG_DISPLAY_NAME L"Kn Live Debug Driver"
 
-#define KNDBG_ABI_VERSION 3u
+#define KNDBG_ABI_VERSION 5u
 #define KNDBG_MAX_TRANSFER_SIZE (1024u * 1024u)
 #define KNDBG_WRITE_ACK_MAGIC 0x4B4E444247574F4Full
 
@@ -81,6 +81,9 @@ typedef unsigned __int64 KNDBG_UINT64;
 
 #define IOCTL_KNDBG_RESOLVE_PROCESS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80A, METHOD_BUFFERED, FILE_READ_DATA)
+
+#define IOCTL_KNDBG_FLUSH_VIRTUAL \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80B, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 
 #pragma pack(push, 8)
 
@@ -195,11 +198,18 @@ typedef struct _KNDBG_TRANSLATE_VIRTUAL_RESPONSE
     KNDBG_UINT64 PageBytes;
     KNDBG_UINT32 RequestedLength;
     KNDBG_UINT32 TranslatedLength;
+    KNDBG_UINT32 PagingLevels;
+    KNDBG_UINT32 Reserved2;
     KNDBG_UINT64 Pml4e;
     KNDBG_UINT64 Pml5e;
     KNDBG_UINT64 Pdpte;
     KNDBG_UINT64 Pde;
     KNDBG_UINT64 Pte;
+    KNDBG_UINT64 Pml5eAddress;
+    KNDBG_UINT64 Pml4eAddress;
+    KNDBG_UINT64 PdpteAddress;
+    KNDBG_UINT64 PdeAddress;
+    KNDBG_UINT64 PteAddress;
 } KNDBG_TRANSLATE_VIRTUAL_RESPONSE;
 
 typedef struct _KNDBG_PHYSICAL_READ_REQUEST
@@ -222,5 +232,15 @@ typedef struct _KNDBG_PHYSICAL_WRITE_REQUEST
     KNDBG_UINT64 Acknowledge;
     KNDBG_UINT8 Data[1];
 } KNDBG_PHYSICAL_WRITE_REQUEST;
+
+typedef struct _KNDBG_FLUSH_VIRTUAL_REQUEST
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 Flags;
+    KNDBG_UINT64 VirtualAddress;
+    KNDBG_UINT32 Length;
+    KNDBG_UINT32 Reserved;
+    KNDBG_UINT64 Acknowledge;
+} KNDBG_FLUSH_VIRTUAL_REQUEST;
 
 #pragma pack(pop)

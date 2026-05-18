@@ -1,7 +1,8 @@
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$NoVersionBump
 )
 
 $ErrorActionPreference = "Stop"
@@ -160,7 +161,14 @@ if (-not (Test-Path $buildScript))
 
 if (-not $SkipBuild)
 {
-    & $buildScript -Configuration $Configuration
+    if ($NoVersionBump)
+    {
+        & $buildScript -Configuration $Configuration
+    }
+    else
+    {
+        & $buildScript -Configuration $Configuration -BumpVersion
+    }
     if ($LASTEXITCODE -ne 0)
     {
         exit $LASTEXITCODE

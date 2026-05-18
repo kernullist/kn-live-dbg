@@ -1,6 +1,7 @@
 param(
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [switch]$BumpVersion
 )
 
 $ErrorActionPreference = "Stop"
@@ -275,10 +276,21 @@ if (-not (Test-Path $msbuild))
 }
 
 $baselineVersion = Get-BaselineVersion
-$nextParts = Increment-Version -Parts (Parse-VersionParts -VersionText $baselineVersion)
-$nextVersion = Format-Version -Parts $nextParts
-Write-VersionHeader -Parts $nextParts
-Write-Host "PE version: $baselineVersion -> $nextVersion"
+$versionParts = Parse-VersionParts -VersionText $baselineVersion
+if ($BumpVersion)
+{
+    $versionParts = Increment-Version -Parts $versionParts
+}
+$buildVersion = Format-Version -Parts $versionParts
+Write-VersionHeader -Parts $versionParts
+if ($BumpVersion)
+{
+    Write-Host "PE version: $baselineVersion -> $buildVersion"
+}
+else
+{
+    Write-Host "PE version: $buildVersion"
+}
 
 & $msbuild $solution /m /p:Configuration=$Configuration /p:Platform=x64 /v:minimal
 
@@ -287,9 +299,9 @@ if ($LASTEXITCODE -ne 0)
     exit $LASTEXITCODE
 }
 
-Assert-PEVersion -Path $exePath -Parts $nextParts
-Assert-PEVersion -Path $sysPath -Parts $nextParts
-Assert-PEVersion -Path $probeSysPath -Parts $nextParts
+Assert-PEVersion -Path $exePath -Parts $versionParts
+Assert-PEVersion -Path $sysPath -Parts $versionParts
+Assert-PEVersion -Path $probeSysPath -Parts $versionParts
 
 Assert-DriverSignature -Path $sysPath
 Assert-DriverSignature -Path $probeSysPath
@@ -305,7 +317,10 @@ if (-not (Test-Path (Join-Path $runtimeSourceDir "dbghelp.dll")) -or
 Write-Host "Runtime source: $runtimeSourceDir"
 Copy-DebuggingToolsRuntime -SourceDir $runtimeSourceDir -DestinationDir $outputDir
 
-Save-VersionState -Version $nextVersion
+if ($BumpVersion)
+{
+    Save-VersionState -Version $buildVersion
+}
 
 Write-Host "EXE: $exePath"
 Write-Host "SYS: $sysPath"

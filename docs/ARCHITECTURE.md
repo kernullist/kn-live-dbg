@@ -12,7 +12,7 @@ Kn Live Dbg follows a LiveKD-style split:
    - Walks x64 page tables for VA-to-PA translation.
    - Detects active LA57 and includes PML5E in translation responses when five-level paging is enabled.
    - Uses `MmCopyMemory` for physical reads.
-   - Uses page-sized `MmMapIoSpaceEx` mappings for physical writes.
+   - Uses page-sized `MmMapIoSpaceEx` mappings for physical writes, with `MmGetVirtualForPhysical` fallback when the kernel already has a direct mapping for the target PFN.
    - Keeps write access controlled per open handle, with writes enabled by default.
    - Enforces one active controller PID at a time.
 
@@ -26,7 +26,7 @@ Kn Live Dbg follows a LiveKD-style split:
    - Owns kernel module enumeration.
    - Owns symbol path, PDB loading, type lookup, and field offset resolution.
    - Uses DIA SDK as a fallback when `DbgHelp` cannot return complete UDT field metadata.
-   - Owns PDB-driven callback list decoding for object, registry, process, and minifilter callbacks.
+   - Owns PDB-driven callback list decoding for object, registry, process, thread, and minifilter callbacks.
    - Presents Windbg-like commands.
    - Redraws the dashboard with `home` or `dashboard`.
    - Optionally attaches a DbgEng local-kernel backend for commands that need debugger-engine semantics.
@@ -49,18 +49,19 @@ Current calls:
 8. `IOCTL_KNDBG_WRITE_PHYSICAL`
 9. `IOCTL_KNDBG_GET_SESSION_STATUS`
 10. `IOCTL_KNDBG_RESOLVE_PROCESS`
+11. `IOCTL_KNDBG_FLUSH_VIRTUAL`
 
-All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size.
+All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size. ABI version 5 adds `IOCTL_KNDBG_FLUSH_VIRTUAL` plus explicit translation metadata for paging level and page-table entry physical addresses.
 
 ## Physical Memory Flow
 
 1. `vtop` sends a virtual address, optional directory-table base, and requested length to the driver.
 2. If the directory-table base is zero, the driver uses the current x64 CR3.
 3. `vtop /pid` and `procctx <pid>` resolve process DTBs by asking the driver to read PDB-resolved EPROCESS offsets.
-4. The driver reads PML5E when LA57 is active, then PML4E, PDPTE, PDE, and PTE entries with `MmCopyMemory(..., MM_COPY_MEMORY_PHYSICAL)`.
+4. The driver checks CR4.LA57, records whether the walk is PML4 or PML5, reads PML5E when LA57 is active, then reads PML4E, PDPTE, PDE, and PTE entries with `MmCopyMemory(..., MM_COPY_MEMORY_PHYSICAL)`.
 5. The walk supports 4 KB pages plus 2 MB and 1 GB large pages.
-6. The response reports CR3, VA, PA, page size, page offset, contiguous translated bytes, and the page-table entries that were used.
-7. `d*` and `e*` can use `/pid <pid>` or a stored `procctx` to translate user VAs page-by-page and then perform physical reads/writes.
+6. The response reports CR3, VA, PA, paging level, page size, page offset, contiguous translated bytes, the page-table entries that were used, the physical address of each entry, and the leaf PTE/PDE/PDPTE physical address plus writable state.
+7. `d*` can use `/pid <pid>` or a stored `procctx` to translate user VAs page-by-page for physical reads. Native `e*` virtual writes default to the System process context (`pid 4`) and can use `/pid <pid>` for process-specific user VAs. Address-only `e*` first reads the current value through the selected context and opens a one-line replacement prompt before writing. If the translated leaf PTE/PDE/PDPTE is not writable, `e*` writes that leaf entry through physical memory with the write bit set, flushes the VA through `IOCTL_KNDBG_FLUSH_VIRTUAL`, performs kernel-VA edits through the original virtual address, uses physical writes for translated user VAs, restores the original write state, and flushes again before continuing.
 8. Virtual and physical display commands perform sparse reads for dump output. Readable bytes are printed normally, while unreadable bytes keep the requested layout and are shown as `??` or `0x????...` for wider units.
 9. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
 10. `peb`, `pew`, `ped`, and `peq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; write mode starts enabled and can be disabled with `write off`.
@@ -82,17 +83,18 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 13. If exact `SymGetTypeFromNameW` lookup fails, the symbol engine reuses `SymEnumTypesW` exact matching to recover module base plus type id before falling back to DIA; the match accepts module-qualified names, leaf type names, and leading-underscore variants.
 14. Wildcard `dt` patterns such as `dt nt!*` use `SymEnumTypesW` against matching loaded kernel modules, apply the `*`/`?` filter in user mode, fall back to DIA UDT enumeration when DbgHelp cannot enumerate the type stream, and print list-only type matches.
 15. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA, or asks DIA to resolve the PDB from the module image plus symbol path, and recovers field names, offsets, lengths, bit positions, and type names. DIA activation first uses registered COM, then falls back to creating `IDiaDataSource` directly from the staged `msdia*.dll` through `DllGetClassObject` so COM registration failures are reported separately from PDB/type lookup failures.
-16. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
+16. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process/thread callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates callback routine addresses plus image-backed context addresses with loaded module ownership.
 17. `u` resolves an address or symbol with the native symbol engine, reads bounded code bytes through `IOCTL_KNDBG_READ_VIRTUAL`, and formats x64 instructions with the vendored Zydis decoder. This keeps local live-kernel disassembly independent from DbgEng memory callbacks, which can fail in local-kernel sessions. If the driver device is not open, `u` still falls back to the DbgEng disassembly path.
 18. `uf` resolves an address or symbol, reads a bounded code window through the driver, and uses the same Zydis decoder as `u` while stopping at common function terminal instructions. If the driver device is not open, it falls back to the DbgEng command path.
 19. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
 
 ## Callback Scanner Flow
 
-1. Object callbacks: resolve `_OBJECT_TYPE.CallbackList`, discover object type objects from `ObTypeIndexTable`, read `_OBJECT_TYPE.Name` and table index, then walk each callback list. Human output and JSON carry the object type name/index alongside the `_OBJECT_TYPE` address. If the target nt PDB exposes `_OBJECT_TYPE` but omits the private callback item type, the scanner falls back to the guarded x64 object-callback item field layout, validates live list pointers, callback-entry pointers, operation masks, and callback routine pointers, and treats that as the normal public-symbol path unless validation fails.
-2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk `_CM_CALLBACK_CONTEXT_BLOCK` records.
-3. Process callbacks: enumerate `PspCreateProcessNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read `_EX_CALLBACK_ROUTINE_BLOCK` records.
-4. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
+1. Object callbacks: resolve `_OBJECT_TYPE.CallbackList`, discover object type objects from `ObTypeIndexTable`, read `_OBJECT_TYPE.Name` and table index, then walk each callback list. Human output carries the object type name/index alongside the `_OBJECT_TYPE` address. If the target nt PDB exposes `_OBJECT_TYPE` but omits the private callback item type, the scanner falls back to the guarded x64 object-callback item field layout, validates live list pointers, callback-entry pointers, operation masks, and callback routine pointers, and treats that as the normal public-symbol path unless validation fails.
+2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk callback context records. Public nt PDBs can omit `_CM_CALLBACK_CONTEXT_BLOCK`, so the scanner uses guarded x64 fallback layouts and accepts only records whose callback routine fields resolve inside loaded kernel images. Callback context values are module-annotated only when they also point into a loaded kernel image.
+3. Process callbacks: enumerate `PspCreateProcessNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks. Public nt PDBs can omit `_EX_CALLBACK_ROUTINE_BLOCK`, so the scanner uses the stable x64 function/context fallback layout for this block. The block context value is decoded as `notifyType` metadata and is not module-annotated.
+4. Thread callbacks: enumerate `PspCreateThreadNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
+5. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
 
 ## DbgEng Flow
 
@@ -117,17 +119,20 @@ Backend routing is mode-dependent:
 
 Interactive command execution is wrapped by a delayed progress watchdog. If a dispatched command runs longer than about one second without producing stdout/stderr, the watchdog writes elapsed-time status rows directly to the console with `WriteConsoleW`, outside stdout/stderr transcript capture, and stops once the command returns. After command output starts, progress rows are suppressed for that command so watchdog text does not split normal output lines. Console color scopes, captured stdout/stderr forwarding, and watchdog writes share a console-output lock so attribute restore cannot race with progress rendering.
 
-Human-readable native command output uses scoped console attributes for high-signal tokens such as callback kind tags, object types, modules, symbols, translated physical addresses, and type/field names. The color layer is applied only while writing to the console stream, so transcript capture and JSON evidence remain plain text.
+The interactive prompt uses a console key reader instead of plain line input. Tab completion is built from `CommandRegistry` plus context-specific subcommand tables for `callbacks`, `ai`, `backend`, `kdinit`, `probe`, `procctx`, `write`, `dt`, `vtop`, `s`, and native memory commands. The completer replaces the current token with a unique match or the longest common prefix; if the prefix is ambiguous, it prints candidates and redraws the current `knkd>` line.
+
+Human-readable native command output uses scoped console attributes for high-signal tokens such as callback kind tags, object types, modules, symbols, translated physical addresses, and type/field names. The color layer is applied only while writing to the console stream, so transcript capture and JSONL records remain plain text.
 
 ## Build and Release Flow
 
-1. `tools\build.ps1` is the authoritative scripted build path for versioned artifacts.
+1. `tools\build.ps1` is the authoritative scripted build path for PE-stamped artifacts.
 2. It reads `.build\version-state.json`, falls back to the existing output PE version, and otherwise starts from `0.0.0`.
-3. The next build version increments the patch component by one; the first scripted build is therefore `0.0.1`.
-4. The script writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys` before the WDK TestSign step.
-5. After a successful build, the script verifies the stamped PE versions, verifies driver signatures, stages Debugging Tools runtime DLLs beside the EXE, and saves the new version state.
-6. `tools\release.ps1` runs the build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory.
-7. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, README/runtime manifest metadata, and `kn-live-dbg-version.json`.
+3. Normal builds do not increment the version; `-BumpVersion` increments the patch component by one and saves the new version state after a successful build.
+4. The first bumped build is therefore `0.0.1`.
+5. The script writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys` before the WDK TestSign step.
+6. After a successful build, the script verifies the stamped PE versions, verifies driver signatures, and stages Debugging Tools runtime DLLs beside the EXE.
+7. `tools\release.ps1` runs a version-bumped build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory. `-NoVersionBump` keeps the current version for ad hoc packages.
+8. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, README/runtime manifest metadata, and `kn-live-dbg-version.json`.
 
 ## AI Provider Flow
 
@@ -143,7 +148,7 @@ Human-readable native command output uses scoped console attributes for high-sig
 10. `ai plan` validates each proposed command before storing it: empty commands, nested `ai`, shutdown/unload commands, bare `kd`, overlong commands, and unknown non-DbgEng commands are rejected. Write-like proposals are forced to require explicit confirmation.
 11. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
 12. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
-13. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model. Callback analysis uses `callbacks json <scope>` so the model receives structured records instead of the human-readable callback view.
+13. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model. Callback analysis uses `callbacks <scope> [module]` output.
 14. `ai diagnose` uses current session context plus an operator note to explain symbol, type-layout, DbgEng, or setup failures.
 15. `ai playbook` creates deterministic read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations. `run` still goes through the guarded `ai run` path.
 16. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands. The preflight path builds backup/read-current, small-range restore, translation, and verification commands for recognized write forms, then prints a deterministic before/after diff of verification stdout/stderr after the write.
@@ -163,12 +168,12 @@ Completed hardening items:
 1. JSONL write-command audit logging is implemented with `ai audit <path>`.
 2. Transcript rotation and redaction controls are implemented with `ai transcript max` and `ai transcript redact`.
 3. Transcript command records now include command-class labels such as `memory-read`, `physical-write`, `type`, `callbacks`, `disassembly`, `symbols`, `dbgeng`, and `session`.
-4. Structured callback JSON export is implemented with `callbacks json [scope] [path|-]`.
+4. Callback module filtering is implemented with `callbacks [scope] [module]`.
 5. Write verification before/after diff rendering is implemented for confirmed AI write commands.
 6. AI plan command schema validation is implemented before plan storage.
 7. Local-only AI provider policy is implemented with `ai policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`.
 8. Single-controller ownership is implemented in the driver and reported by `drvstatus`.
-9. Process DTB resolution is implemented with PDB-resolved EPROCESS offsets and `procctx`/`vtop /pid`.
+9. Process DTB resolution is implemented with PDB-resolved EPROCESS offsets and `procctx`/`vtop /pid`; native `e*` writes use System (`pid 4`) as the default context.
 10. LA57 detection and PML5E reporting are implemented in the page-table walker.
 11. DIA fallback is implemented for UDT field metadata when `DbgHelp` fails.
 12. `KnLiveDbgProbe.sys` provides a positive-control contiguous virtual and physical test buffer.
