@@ -31,5 +31,8 @@ ipch/
 
 logs/
 symbols/
-vendor/
-!vendor/README.md
+vendor/*
+!vendor/
+!vendor/**
+!third_party/
+!third_party/**

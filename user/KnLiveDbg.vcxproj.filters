@@ -9,6 +9,10 @@
       <UniqueIdentifier>{071AC011-0CB7-4EAF-BCB4-A7FC781018A2}</UniqueIdentifier>
       <Extensions>h;hpp;hxx</Extensions>
     </Filter>
+    <Filter Include="Third Party">
+      <UniqueIdentifier>{D081A6C3-AB53-43C7-BE3B-EE9301889CB4}</UniqueIdentifier>
+      <Extensions>c;h</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="AiProvider.cpp">
@@ -32,8 +36,14 @@
     <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="NativeDisassembler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="SymbolEngine.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\third_party\zydis\amalgamated\Zydis.c">
+      <Filter>Third Party</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -55,6 +65,9 @@
     <ClInclude Include="DriverService.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="NativeDisassembler.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="SymbolEngine.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -63,6 +76,9 @@
     </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\third_party\zydis\amalgamated\Zydis.h">
+      <Filter>Third Party</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

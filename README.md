@@ -24,7 +24,7 @@ kn-live-dbg/
 6. Writes physical memory with per-handle write mode enabled by default.
 7. Writes kernel virtual memory with per-handle write mode enabled by default.
 8. Enumerates loaded kernel modules with `NtQuerySystemInformation`.
-9. Loads kernel symbols with `DbgHelp` using `SRV*C:\Symbols*https://msdl.microsoft.com/download/symbols`.
+9. Loads kernel symbols with `DbgHelp`; the EXE directory and its non-cache subdirectories are searched first, followed by `SRV*<exe-dir>\symbols*https://msdl.microsoft.com/download/symbols`, and the `nt` kernel PDB is downloaded/loaded into that EXE-local cache during startup by default.
 10. Provides a WinDbg-compatible command registry for the official base command list.
 11. Implements native live-memory support for memory, symbol, module, type, compare, fill, move, search, and explicit disassembly commands.
 12. Routes stop-state, parser-heavy, extension, and meta commands through the DbgEng backend.
@@ -51,6 +51,7 @@ Requirements:
 1. Visual Studio 2022.
 2. Windows Driver Kit 10.0.26100.0.
 3. x64 developer shell or normal PowerShell with MSBuild at the default VS Professional path.
+4. Vendored Zydis v4.1.1 amalgamated sources under `third_party\zydis\amalgamated` for native x64 disassembly.
 
 Build:
 
@@ -58,7 +59,14 @@ Build:
 .\tools\build.ps1 -Configuration Release
 ```
 
+Refresh the pinned Debugging Tools runtime from the newest complete local x64 set:
+
+```powershell
+.\tools\sync-debugging-tools-runtime.ps1
+```
+
 The driver projects use WDK `TestSign` for Debug and Release x64 builds. The build helper verifies that both `KnLiveDbg.sys` and `KnLiveDbgProbe.sys` have Authenticode signers and prints signature status/thumbprints after MSBuild completes.
+The build helper also stages the pinned `vendor\debugging-tools\x64` runtime beside the EXE (`dbghelp.dll`, `dbgeng.dll`, `dbgcore.dll`, `msdia140.dll`, `symsrv.dll`, `srcsrv.dll`, and `symsrv.yes`) so DbgHelp can use the Microsoft symbol server instead of falling back to the limited System32 runtime. If the vendor pair is missing, the script falls back to the locally installed Windows Kits Debugging Tools copy. If `symsrv.dll` is staged but `symsrv.yes` is missing, the sync script, build script, and EXE startup path create `symsrv.yes` before symbol loading. Startup creates `<exe-dir>\symbols` and uses it as the downstream symbol store, so downloaded PDBs stay with the runnable EXE bundle rather than going to `C:\Symbols`. When `msdia140.dll` is staged, startup registers it automatically with `DllRegisterServer` before symbol initialization. The symbol engine also has a no-reg fallback that loads the staged `msdia*.dll` directly and creates `IDiaDataSource` through `DllGetClassObject`, so type fallback can still work when COM registration is unavailable.
 
 Expected outputs:
 
@@ -66,6 +74,8 @@ Expected outputs:
 x64\Release\KnLiveDbg.exe
 x64\Release\KnLiveDbg.sys
 x64\Release\KnLiveDbgProbe.sys
+x64\Release\dbghelp.dll
+x64\Release\symsrv.dll
 ```
 
 ## Run
@@ -77,13 +87,18 @@ cd .\x64\Release
 .\KnLiveDbg.exe
 ```
 
-The EXE expects `KnLiveDbg.sys` beside it. It resolves the absolute driver path, updates an existing service config when present, creates the service when missing, starts it, and waits for `SERVICE_RUNNING`. Startup, single-instance acquisition, install/update, driver load, device open, ABI verification, symbol initialization, probe load, and unload paths are printed as colored staged `[ .. ]`, `[ OK ]`, `[WARN]`, and `[FAIL]` rows. Only one `KnLiveDbg.exe` instance can run at a time; a second elevated process exits before touching SCM or the driver. On successful startup the console prints a colored welcome banner plus a dashboard with driver, write gate, backend, symbols, AI, probe, and quick-action hints before the `knkd>` prompt. `home` or `dashboard` redraws that screen. `q`, `quit`, `exit`, EOF, Ctrl+C, and `unload` close the device handle, stop the main driver, delete the service, and wait for deletion before exit. If the session loaded `KnLiveDbgProbe.sys` with `probe load`, that probe service is also stopped and deleted during process cleanup. Use `drvstatus` to inspect SCM state plus the active single-controller owner/write-mode state. Use `probe load` when you want the optional positive-control driver loaded from the same output directory.
+The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs beside the EXE as well when copying the tool to another directory; otherwise Windows may load `C:\Windows\System32\dbghelp.dll` without `symsrv.dll`, and startup can report `symType=0 (SymNone)` while trying to download the kernel PDB. If `symsrv.dll` is present but `symsrv.yes` is missing, startup creates `symsrv.yes` before calling DbgHelp so first-run symbol-server consent does not block noninteractive PDB downloads. Startup creates `<exe-dir>\symbols`, excludes that cache tree from plain local-directory scanning, and then uses `SRV*<exe-dir>\symbols*https://msdl.microsoft.com/download/symbols` as the default Microsoft symbol path. If `msdia140.dll` is present, startup registers DIA COM automatically before DbgHelp/DIA initialization; if registration is not available, DIA type fallback can still instantiate the staged DLL directly without registry state. It resolves the absolute driver path, updates an existing service config when present, creates the service when missing, starts it, and waits for `SERVICE_RUNNING`. Startup, single-instance acquisition, install/update, driver load, device open, ABI verification, automatic EXE-directory symbol path discovery, EXE-local symbol cache setup, symbol initialization, default `nt` kernel PDB download/load, probe load, and unload paths are printed as colored staged `[ .. ]`, `[ OK ]`, `[WARN]`, and `[FAIL]` rows. Only one `KnLiveDbg.exe` instance can run at a time; a second elevated process exits before touching SCM or the driver. On successful startup the console prints a colored welcome banner plus a dashboard with driver, write gate, backend, symbols, AI, probe, and quick-action hints before the `knkd>` prompt. `home` or `dashboard` redraws that screen. `q`, `quit`, `exit`, EOF, Ctrl+C, and `unload` close the device handle, stop the main driver, delete the service, and wait for deletion before exit. If the session loaded `KnLiveDbgProbe.sys` with `probe load`, that probe service is also stopped and deleted during process cleanup. Use `drvstatus` to inspect SCM state plus the active single-controller owner/write-mode state. Use `probe load` when you want the optional positive-control driver loaded from the same output directory.
+
+Interactive command dispatch has a delayed progress watchdog. Commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. The watchdog writes directly to the console so transcript/stdout capture does not include progress noise.
+
+Interactive output highlights high-signal categories and identifiers with console colors. Callback record tags such as `[ob]`, object type names, modules, symbols, translated physical addresses, module/symbol names, type names, field names, and dump line addresses are colored for scanning, while captured stdout/transcript text remains plain.
 
 ## TUI Commands
 
 ```text
 help
 help all
+help callbacks
 home
 dashboard
 backend [auto|native|dbgeng]
@@ -114,8 +129,8 @@ phys, pdb, pdw, pdd, pdq
 procctx [status|off|<process-id>]
 u <address|symbol> [instruction-count]
 uf <address|symbol>
-dt [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
-dtx [-rN] [-v] [-b] <type> [address|symbol] [field-filter...]
+dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
+dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|ob|registry|process|minifilter]
 kcallbacks [all|ob|registry|process|minifilter]
 cb [all|ob|registry|process|minifilter]
@@ -191,7 +206,7 @@ knkd> probe info
 
 The registry also knows the standard execution, breakpoint, stack, register, source, exception, I/O port, and script commands. Native live-memory commands stay on the custom driver backend, while stop-state or parser-heavy commands are routed to DbgEng in `auto` or `dbgeng` mode.
 
-`u` and `uf` are explicit disassembly commands. `u` resolves an address or symbol, disassembles a bounded instruction count, and remembers the next offset for a following bare `u`; `uf` uses the DbgEng function disassembler for function-boundary-aware output.
+`u` and `uf` are explicit disassembly commands. `u` resolves an address or symbol, reads code bytes through the loaded driver, disassembles them with the vendored Zydis x64 decoder, and remembers the next offset for a following bare `u`; if the driver device is not open, it falls back to the DbgEng disassembly path. `uf` uses the DbgEng function disassembler for function-boundary-aware output.
 
 ## AI Assistant Providers
 
@@ -273,7 +288,7 @@ Backend mode behavior:
 | Mode | Command routing | Best fit | Notes |
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
-| `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` remain available and may initialize DbgEng for decoding. |
+| `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` stays driver-backed when the device is open; `uf` may initialize DbgEng for function-boundary disassembly. |
 | `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
@@ -301,6 +316,8 @@ dt nt!_EPROCESS
 dt nt!_EPROCESS <address>
 dt -r1 nt!_EPROCESS <address>
 dt -v nt!_EPROCESS <address> UniqueProcessId
+dt nt!*EPROCESS*
+dt nt!*
 ```
 
 Supported options:
@@ -311,7 +328,13 @@ Supported options:
 
 Field filters are case-insensitive substring filters applied to field names and type names.
 
-When `DbgHelp` cannot return a usable UDT layout, the symbol engine tries a DIA SDK fallback against the loaded PDB path. The fallback is especially useful for field offsets, bit positions, and private type metadata used by callback scanning and `dt`; recursive expansion still prefers the normal `DbgHelp` type-id path when it is available.
+Wildcard type patterns such as `dt nt!*EPROCESS*` and `dt nt!*` enumerate PDB types through `SymEnumTypesW` and apply the `*`/`?` filter in user mode. If DbgHelp cannot enumerate a loaded module's type stream, the symbol engine falls back to DIA UDT enumeration from either the loaded PDB path or the module image plus symbol path. Wildcard `dt` is list-only; use an exact type name when dumping fields or reading a value at an address.
+
+The native symbol engine treats `nt` as the kernel-image alias and loads `ntoskrnl.exe`/`ntkrnl*` into DbgHelp under the `nt` module name, so commands such as `x nt!*`, `ln nt!PsLoadedModuleList`, and `dt nt!*` do not depend on the on-disk kernel image name.
+
+Exact type layouts first try `SymGetTypeFromNameW`. If that lookup fails for an alias-qualified type such as `nt!_TP_POOL`, the symbol engine reuses `SymEnumTypesW` to find the exact type and dumps the layout by module base plus type id before trying DIA. The enumeration fallback matches module-qualified names, leaf names, and leading-underscore variants, so `nt!_OBJECT_TYPE`, `_OBJECT_TYPE`, `OBJECT_TYPE`, and enumerated `nt!_OBJECT_TYPE` spellings resolve to the same type. DIA fallback uses the same full-enumeration matcher and reports module/PDB/image details when a type is not found.
+
+When `DbgHelp` cannot return a usable UDT layout, the symbol engine tries a DIA SDK fallback against the loaded PDB path or resolves the PDB from the module image plus symbol path. DIA creation first uses registered COM and then falls back to direct `DllGetClassObject` activation from the staged `msdia*.dll`, which makes registration failures distinct from real type lookup failures. The fallback is especially useful for field offsets, bit positions, and private type metadata used by callback scanning and `dt`; recursive expansion still prefers the normal `DbgHelp` type-id path when it is available.
 
 ## Kernel Callback Scanner
 
@@ -327,12 +350,12 @@ callbacks minifilter
 
 The scanner currently covers:
 
-1. Object-manager filters from `_OBJECT_TYPE.CallbackList`. The scanner first discovers `_OBJECT_TYPE` objects through `ObTypeIndexTable` and `_OBJECT_TYPE.Name`, then falls back to `PsProcessType`, `PsThreadType`, and `ExDesktopObjectType` when the table is unavailable.
+1. Object-manager filters from `_OBJECT_TYPE.CallbackList`. The scanner first discovers `_OBJECT_TYPE` objects through `ObTypeIndexTable` and `_OBJECT_TYPE.Name`, then falls back to `PsProcessType`, `PsThreadType`, and `ExDesktopObjectType` when the table is unavailable. Some public nt PDBs expose `_OBJECT_TYPE.CallbackList` but omit the private callback item type; in that expected public-symbol case the scanner uses a guarded x64 item-layout fallback, validates live list pointers, callback-entry pointers, operation masks, and callback routine pointers, and only reports a warning if the PDB exposes a partial/drifted item layout or the live validation fails.
 2. Registry callbacks by enumerating and validating registry callback list-head candidates such as `CmpCallbackListHead`, then walking `_CM_CALLBACK_CONTEXT_BLOCK` entries.
 3. Process creation callbacks by enumerating and validating create-process notify routine table candidates such as `PspCreateProcessNotifyRoutine`, then decoding `_EX_CALLBACK_ROUTINE_BLOCK` entries.
 4. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
 
-Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/context pointer. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Context pointers are also annotated with a module and nearest symbol when they point into a loaded kernel image. The implementation is intentionally PDB-driven; if a private structure field is renamed on a target build, the command reports a warning instead of guessing offsets.
+Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Context pointers are also annotated with a module and nearest symbol when they point into a loaded kernel image. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
 
 ## Virtual-To-Physical And Physical Memory
 

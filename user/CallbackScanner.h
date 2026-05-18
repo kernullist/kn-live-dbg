@@ -25,6 +25,7 @@ struct KernelCallbackRecord
     std::wstring Notes;
     uint32_t Slot = 0;
     uint32_t Operations = 0;
+    uint32_t ObjectTypeIndex = 0xffffffffu;
     uint32_t MajorFunction = 0xffffffffu;
     uint32_t CallbackFlags = 0;
     uint32_t FilterFlags = 0;
@@ -66,6 +67,7 @@ private:
     bool ScanObjectTypeCallbacks(
         const std::wstring& target,
         uint64_t objectTypeAddress,
+        uint32_t objectTypeIndex,
         const std::wstring& objectTypeSource,
         KernelCallbackScanResult* result,
         std::wstring* error);

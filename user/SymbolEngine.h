@@ -13,6 +13,8 @@ constexpr DWORD KNDBG_SYMTAG_POINTER_TYPE = 14;
 constexpr DWORD KNDBG_SYMTAG_ARRAY_TYPE = 15;
 constexpr DWORD KNDBG_SYMTAG_BASE_TYPE = 16;
 
+struct IDiaDataSource;
+
 struct KernelModuleInfo
 {
     uint64_t Base;
@@ -46,6 +48,15 @@ struct TypeLayoutInfo
     std::vector<TypeFieldInfo> Fields;
 };
 
+struct TypeMatchInfo
+{
+    std::wstring ModuleName;
+    std::wstring Name;
+    uint64_t ModuleBase;
+    ULONG TypeId;
+    ULONG64 Size;
+};
+
 struct SymbolMatchInfo
 {
     uint64_t Address;
@@ -67,11 +78,13 @@ public:
     void SetSymbolPath(const std::wstring& symbolPath);
 
     bool LoadKernelModules(std::wstring* error);
+    bool PreloadKernelSymbols(size_t* loadedCount, std::wstring* error);
     const std::vector<KernelModuleInfo>& Modules() const;
 
     bool ResolveSymbol(const std::wstring& name, uint64_t* address, std::wstring* error);
     bool FindNearestSymbol(uint64_t address, std::wstring* name, uint64_t* displacement, std::wstring* error);
     bool EnumerateSymbols(const std::wstring& mask, size_t limit, std::vector<SymbolMatchInfo>* matches, std::wstring* error);
+    bool EnumerateTypes(const std::wstring& mask, size_t limit, std::vector<TypeMatchInfo>* matches, std::wstring* error);
     bool GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error);
     bool GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error);
     bool GetTypeFields(const std::wstring& typeName, std::vector<TypeFieldInfo>* fields, ULONG64* typeSize, std::wstring* error);
@@ -81,6 +94,17 @@ public:
 private:
     bool EnumKernelModules(std::vector<KernelModuleInfo>* modules, std::wstring* error);
     std::wstring ResolveModuleImagePath(const KernelModuleInfo& module) const;
+    bool EnsureModuleLoaded(const KernelModuleInfo& module, std::wstring* error);
+    bool EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std::wstring* error);
+    bool ReloadModuleWithImmediateSymbols(const KernelModuleInfo& module, std::wstring* error);
+    bool LoadDiaDataForModule(const KernelModuleInfo& module, IDiaDataSource* source, std::wstring* error);
+    bool EnumerateTypesWithDia(
+        const KernelModuleInfo& module,
+        const std::wstring& typeMask,
+        size_t limit,
+        std::vector<TypeMatchInfo>* matches,
+        bool* stoppedAtLimit,
+        std::wstring* error);
     bool GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t preferredModuleBase, TypeLayoutInfo* layout, std::wstring* error);
 
     HANDLE process_;

@@ -5,6 +5,7 @@
 
 #include <sstream>
 #include <string>
+#include <vector>
 
 #pragma comment(lib, "Dbgeng.lib")
 
@@ -27,6 +28,14 @@ static std::wstring HResultText(const wchar_t* prefix, HRESULT result)
         stream << L" " << buffer;
     }
 
+    return stream.str();
+}
+
+static std::wstring FormatDbgEngHex64(uint64_t value)
+{
+    std::wstringstream stream;
+
+    stream << L"0x" << std::hex << value << std::dec;
     return stream.str();
 }
 
@@ -386,24 +395,73 @@ bool DbgEngBackend::Disassemble(
         }
 
         output->clear();
-        ULONG64 current = offset;
         ULONG64 endOffset = offset;
+        ULONG flags = DEBUG_DISASM_EFFECTIVE_ADDRESS | DEBUG_DISASM_MATCHING_SYMBOLS;
+        std::wstring firstError;
+
+        std::vector<ULONG64> lineOffsets(instructionCount);
+        impl_->Callbacks->SetOutput(output);
+        HRESULT result = impl_->Control->OutputDisassemblyLines(
+            DEBUG_OUTCTL_THIS_CLIENT,
+            0,
+            instructionCount,
+            offset,
+            flags,
+            nullptr,
+            nullptr,
+            &endOffset,
+            lineOffsets.data());
+        impl_->Callbacks->SetOutput(nullptr);
+
+        if (SUCCEEDED(result) && !output->empty())
+        {
+            ULONG64 computedNextOffset = endOffset;
+            if (computedNextOffset <= offset)
+            {
+                ULONG64 nearOffset = 0;
+                if (SUCCEEDED(impl_->Control->GetNearInstruction(offset, static_cast<LONG>(instructionCount), &nearOffset)) &&
+                    nearOffset > offset)
+                {
+                    computedNextOffset = nearOffset;
+                }
+                else
+                {
+                    computedNextOffset = offset;
+                }
+            }
+
+            *nextOffset = computedNextOffset;
+            ok = true;
+            break;
+        }
+
+        if (FAILED(result))
+        {
+            firstError = HResultText(L"IDebugControl::OutputDisassemblyLines failed", result);
+        }
+        output->clear();
+
+        ULONG64 current = offset;
         for (uint32_t index = 0; index < instructionCount; ++index)
         {
             wchar_t buffer[1024] = {};
             ULONG disassemblySize = 0;
-            HRESULT result = impl_->Control->DisassembleWide(
+            result = impl_->Control->DisassembleWide(
                 current,
-                DEBUG_DISASM_EFFECTIVE_ADDRESS | DEBUG_DISASM_MATCHING_SYMBOLS,
+                0,
                 buffer,
                 static_cast<ULONG>(std::size(buffer)),
                 &disassemblySize,
                 &endOffset);
             if (FAILED(result))
             {
+                if (firstError.empty())
+                {
+                    firstError = HResultText(L"IDebugControl::DisassembleWide failed", result);
+                }
                 if (output->empty() && error != nullptr)
                 {
-                    *error = HResultText(L"IDebugControl::DisassembleWide failed", result);
+                    *error = firstError;
                 }
                 break;
             }
@@ -431,7 +489,45 @@ bool DbgEngBackend::Disassemble(
 
         if (output->empty())
         {
-            break;
+            std::wstringstream command;
+            command << L"u " << FormatDbgEngHex64(offset) << L" L" << std::dec << instructionCount;
+
+            impl_->Callbacks->SetOutput(output);
+            result = impl_->Control->ExecuteWide(
+                DEBUG_OUTCTL_THIS_CLIENT,
+                command.str().c_str(),
+                DEBUG_EXECUTE_DEFAULT);
+            impl_->Callbacks->SetOutput(nullptr);
+
+            if (FAILED(result))
+            {
+                if (error != nullptr)
+                {
+                    std::wstring executeError = HResultText(L"IDebugControl::ExecuteWide fallback failed", result);
+                    *error = firstError.empty() ? executeError : firstError + L"; " + executeError;
+                }
+                break;
+            }
+
+            if (output->empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = firstError.empty() ? L"DbgEng disassembly produced no output" : firstError;
+                }
+                break;
+            }
+
+            ULONG64 nearOffset = 0;
+            if (SUCCEEDED(impl_->Control->GetNearInstruction(offset, static_cast<LONG>(instructionCount), &nearOffset)) &&
+                nearOffset > offset)
+            {
+                current = nearOffset;
+            }
+            else
+            {
+                current = offset;
+            }
         }
 
         *nextOffset = current;
