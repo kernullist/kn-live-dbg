@@ -25,7 +25,7 @@ The first integration layer is implemented as a user-mode `ai` command and `AiPr
 7. `ai preview <prompt>` prints the outbound provider plan without sending a request.
 8. `ai ask <prompt>` sends an advisory request. The assistant receives session context such as backend mode, number base, symbol path, loaded module count, and write-safety rules.
 9. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
-10. `ai analyze callbacks [scope]` runs `callbacks json <scope>` as read-only structured evidence, then asks the selected model for a callback analysis report.
+10. `ai analyze callbacks [scope] [module]` runs `callbacks <scope> [module]` as read-only evidence, then asks the selected model for a callback analysis report.
 11. `ai explain dt <dt-args...>` runs native `dt` or `dtx`, preserves raw output, then asks the model for structure-field interpretation and follow-up commands.
 12. `ai annotate <u|uf> <address|symbol> [count]` runs disassembly and asks the model for call-target, routine-purpose, and suspicious-pattern annotation.
 13. `ai diagnose <prompt>` sends a setup/symbol/backend failure note with current session context and asks for likely root causes and remediation commands.
@@ -47,7 +47,7 @@ Initial provider support:
 
 The runtime automatically loads the first `.env` file found in the current directory, executable directory, or repository root when running from `x64\Debug` or `x64\Release`. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys plus `KNLIVEDBG_AI_REMOTE_POLICY`. `.env` and `.env.local` are ignored by Git.
 
-The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. Callback scans can now be exported through `callbacks json [scope] [path|-]`, and AI callback analysis consumes that structured JSON instead of parsing the human-readable callback view. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
+The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. AI callback analysis consumes normal `callbacks <scope> [module]` evidence. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
 
 ## Candidate Features
 
@@ -69,11 +69,11 @@ Implementation notes:
 
 ### Callback Analysis Report
 
-Implemented entrypoint: `ai analyze callbacks [all|ob|registry|process|minifilter]`.
+Implemented entrypoint: `ai analyze callbacks [all|ob|registry|process|thread|minifilter] [module]`.
 
 The command post-processes `callbacks` output into an investigation report:
 
-1. Count object-manager, registry, process creation, and minifilter callbacks.
+1. Count object-manager, registry, process creation, thread creation, and minifilter callbacks.
 2. Group records by owning module and callback surface.
 3. Flag callback addresses that do not resolve to a loaded module or nearest symbol.
 4. Flag addresses outside expected executable image ranges.
@@ -102,11 +102,12 @@ Because write mode is enabled by default per device handle, the AI path adds an 
 
 1. Before a write, read and display the current value.
 2. Show the exact target range, write width, interpreted type field when available, and whether the write crosses a page boundary.
-3. For virtual writes, offer `vtop` context when useful.
-4. For physical writes, warn when the target could be page tables, device memory, or firmware-owned memory.
-5. Generate backup and restore commands before applying the write.
-6. Re-read the target after the write and show a compact before/after diff.
-7. Mark high-risk targets such as list links, reference counts, callback routine pointers, dispatch tables, page table entries, and executable code.
+3. For native `e*` virtual writes, treat the default address-space context as System (`pid 4`) unless the command includes `/pid <process-id>`.
+4. For virtual writes, offer `vtop` context when useful, including the leaf entry physical address, writable state, and whether a temporary write-bit flip plus VA flush is expected. Kernel VA edits should be described as temporary write-enable plus original-VA write; translated user VA edits should be described as physical writes through the selected process context.
+5. For physical writes, warn when the target could be page tables, device memory, or firmware-owned memory.
+6. Generate backup and restore commands before applying the write.
+7. Re-read the target after the write and show a compact before/after diff.
+8. Mark high-risk targets such as list links, reference counts, callback routine pointers, dispatch tables, page table entries, and executable code.
 
 This feature should never hide the exact command being executed.
 
@@ -118,7 +119,7 @@ The command adds AI analysis on top of `u` and `uf` output:
 
 1. Summarize the likely purpose of a function.
 2. Identify direct and indirect call targets when symbols are available.
-3. Classify routines as object callback, registry callback, process callback, minifilter operation callback, dispatch routine, or unknown.
+3. Classify routines as object callback, registry callback, process callback, thread callback, minifilter operation callback, dispatch routine, or unknown.
 4. Highlight suspicious patterns such as indirect calls through writable memory, global list mutation, callback registration, page table access, MSR access, or code patching.
 5. Suggest next commands such as `ln`, `x`, `dt`, `dq`, or `uf` on a discovered call target.
 
@@ -174,7 +175,7 @@ Completed implementation-order items:
 
 1. Transcript/event rotation and redaction controls are implemented with `ai transcript max` and `ai transcript redact`.
 2. Write-command JSONL audit logging is implemented with `ai audit <path>`.
-3. Structured callback JSON export is implemented with `callbacks json [scope] [path|-]`, and `ai analyze callbacks` consumes that JSON evidence.
+3. Callback module filtering is implemented with `callbacks [scope] [module]`, and `ai analyze callbacks` consumes the same filtered command output as evidence.
 4. Deterministic before/after diff rendering is implemented for `ai write <index> confirm` verification output.
 5. Model-proposed command plans are validated at ingestion with the v2 schema contract: empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected before they can be shown as a runnable plan. Write-like proposals, including raw `kd` write-like wrappers, are forced to require confirmation.
 6. Command transcript and AI evidence prompts include deterministic output summaries with stdout/stderr character counts, line counts, interesting-line counts, and first/last non-empty lines before raw output.

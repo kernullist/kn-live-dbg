@@ -13,6 +13,7 @@ PsLookupProcessByProcessId(
 #if defined(_M_X64)
 #pragma intrinsic(__readcr3)
 #pragma intrinsic(__readcr4)
+#pragma intrinsic(__invlpg)
 #endif
 
 typedef struct _KNDBG_FILE_CONTEXT
@@ -47,6 +48,12 @@ static const GUID KNDBG_DEVICE_CLASS_GUID =
 static FAST_MUTEX g_KnDbgOwnerLock;
 static ULONG g_KnDbgOwnerPid = 0;
 static ULONG g_KnDbgOwnerOpenCount = 0;
+
+typedef struct _KNDBG_TLB_FLUSH_CONTEXT
+{
+    ULONGLONG StartAddress;
+    SIZE_T PageCount;
+} KNDBG_TLB_FLUSH_CONTEXT, *PKNDBG_TLB_FLUSH_CONTEXT;
 
 static NTSTATUS KnDbgCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
@@ -226,6 +233,77 @@ static bool KnDbgIsCanonicalAddress(ULONGLONG VirtualAddress, bool La57Active)
     return canonical;
 }
 
+static ULONG_PTR KnDbgFlushVirtualRangeWorker(ULONG_PTR Context)
+{
+    PKNDBG_TLB_FLUSH_CONTEXT flushContext = reinterpret_cast<PKNDBG_TLB_FLUSH_CONTEXT>(Context);
+
+    do
+    {
+        if (flushContext == nullptr)
+        {
+            break;
+        }
+
+#if defined(_M_X64)
+        for (SIZE_T index = 0; index < flushContext->PageCount; ++index)
+        {
+            ULONGLONG address = flushContext->StartAddress + index * PAGE_SIZE;
+            __invlpg(reinterpret_cast<void*>(static_cast<ULONG_PTR>(address)));
+        }
+#endif
+    } while (false);
+
+    return 0;
+}
+
+static NTSTATUS KnDbgFlushVirtualRange(ULONGLONG VirtualAddress, SIZE_T Length)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    do
+    {
+        if (Length == 0 || Length > KNDBG_MAX_TRANSFER_SIZE)
+        {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+
+        if (KnDbgRangeOverflows(VirtualAddress, Length))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        bool la57Active = KnDbgIsLa57Active();
+        if (!KnDbgIsCanonicalAddress(VirtualAddress, la57Active))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        ULONGLONG endAddress = VirtualAddress + Length - 1;
+        if (!KnDbgIsCanonicalAddress(endAddress, la57Active))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        ULONGLONG startPage = VirtualAddress & ~KNDBG_PAGE_OFFSET_MASK;
+        ULONGLONG endPage = endAddress & ~KNDBG_PAGE_OFFSET_MASK;
+        SIZE_T pageCount = static_cast<SIZE_T>(((endPage - startPage) / PAGE_SIZE) + 1);
+        KNDBG_TLB_FLUSH_CONTEXT context = {};
+        context.StartAddress = startPage;
+        context.PageCount = pageCount;
+
+#if defined(_M_X64)
+        KeIpiGenericCall(KnDbgFlushVirtualRangeWorker, reinterpret_cast<ULONG_PTR>(&context));
+#endif
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return status;
+}
+
 static NTSTATUS KnDbgAcquireController(PKNDBG_FILE_CONTEXT FileContext)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -395,6 +473,15 @@ static NTSTATUS KnDbgWritePhysicalAddress(ULONGLONG PhysicalAddress, const VOID*
             mapAddress.QuadPart = static_cast<LONGLONG>(alignedPhysical);
 
             PVOID mapped = MmMapIoSpaceEx(mapAddress, mapLength, PAGE_READWRITE);
+            bool mappedWithIoSpace = true;
+            if (mapped == nullptr)
+            {
+                PHYSICAL_ADDRESS exactAddress = {};
+                exactAddress.QuadPart = static_cast<LONGLONG>(currentPhysical);
+                mapped = MmGetVirtualForPhysical(exactAddress);
+                mappedWithIoSpace = false;
+            }
+
             if (mapped == nullptr)
             {
                 status = STATUS_INSUFFICIENT_RESOURCES;
@@ -403,10 +490,11 @@ static NTSTATUS KnDbgWritePhysicalAddress(ULONGLONG PhysicalAddress, const VOID*
 
             __try
             {
-                RtlCopyMemory(
-                    reinterpret_cast<PUCHAR>(mapped) + pageOffset,
-                    reinterpret_cast<const UCHAR*>(Input) + offset,
-                    chunk);
+                PUCHAR destination = mappedWithIoSpace ?
+                    reinterpret_cast<PUCHAR>(mapped) + pageOffset :
+                    reinterpret_cast<PUCHAR>(mapped);
+                RtlCopyMemory(destination, reinterpret_cast<const UCHAR*>(Input) + offset, chunk);
+                KeMemoryBarrier();
                 status = STATUS_SUCCESS;
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
@@ -414,7 +502,10 @@ static NTSTATUS KnDbgWritePhysicalAddress(ULONGLONG PhysicalAddress, const VOID*
                 status = GetExceptionCode();
             }
 
-            MmUnmapIoSpace(mapped, mapLength);
+            if (mappedWithIoSpace)
+            {
+                MmUnmapIoSpace(mapped, mapLength);
+            }
 
             if (!NT_SUCCESS(status))
             {
@@ -488,12 +579,14 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
         Response->DirectoryTableBase = directoryTableBase;
         Response->VirtualAddress = VirtualAddress;
         Response->RequestedLength = Length;
+        Response->PagingLevels = la57Active ? 5u : 4u;
 
         ULONGLONG pml4Base = directoryTableBase;
         if (la57Active)
         {
             ULONGLONG pml5Index = (VirtualAddress >> 48) & 0x1ffull;
             ULONGLONG pml5eAddress = directoryTableBase + pml5Index * sizeof(ULONGLONG);
+            Response->Pml5eAddress = pml5eAddress;
             status = KnDbgReadPhysicalU64(pml5eAddress, &Response->Pml5e);
             if (!NT_SUCCESS(status))
             {
@@ -515,6 +608,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
         ULONGLONG ptIndex = (VirtualAddress >> 12) & 0x1ffull;
 
         ULONGLONG pml4eAddress = pml4Base + pml4Index * sizeof(ULONGLONG);
+        Response->Pml4eAddress = pml4eAddress;
         status = KnDbgReadPhysicalU64(pml4eAddress, &Response->Pml4e);
         if (!NT_SUCCESS(status))
         {
@@ -528,6 +622,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
         }
 
         ULONGLONG pdpteAddress = (Response->Pml4e & KNDBG_PTE_4K_BASE_MASK) + pdptIndex * sizeof(ULONGLONG);
+        Response->PdpteAddress = pdpteAddress;
         status = KnDbgReadPhysicalU64(pdpteAddress, &Response->Pdpte);
         if (!NT_SUCCESS(status))
         {
@@ -557,6 +652,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
         }
 
         ULONGLONG pdeAddress = (Response->Pdpte & KNDBG_PTE_4K_BASE_MASK) + pdIndex * sizeof(ULONGLONG);
+        Response->PdeAddress = pdeAddress;
         status = KnDbgReadPhysicalU64(pdeAddress, &Response->Pde);
         if (!NT_SUCCESS(status))
         {
@@ -586,6 +682,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
         }
 
         ULONGLONG pteAddress = (Response->Pde & KNDBG_PTE_4K_BASE_MASK) + ptIndex * sizeof(ULONGLONG);
+        Response->PteAddress = pteAddress;
         status = KnDbgReadPhysicalU64(pteAddress, &Response->Pte);
         if (!NT_SUCCESS(status))
         {
@@ -1131,6 +1228,45 @@ static NTSTATUS KnDbgHandleWritePhysical(PIRP Irp, PIO_STACK_LOCATION Stack, PVO
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+static NTSTATUS KnDbgHandleFlushVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        KNDBG_FLUSH_VIRTUAL_REQUEST* request = reinterpret_cast<KNDBG_FLUSH_VIRTUAL_REQUEST*>(Buffer);
+        if (request->Acknowledge != KNDBG_WRITE_ACK_MAGIC)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        status = KnDbgFlushVirtualRange(request->VirtualAddress, request->Length);
+        if (NT_SUCCESS(status))
+        {
+            information = sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST);
+        }
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
@@ -1302,6 +1438,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_RESOLVE_PROCESS:
         status = KnDbgHandleResolveProcess(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_FLUSH_VIRTUAL:
+        status = KnDbgHandleFlushVirtual(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

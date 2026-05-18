@@ -484,11 +484,65 @@ bool DeviceClient::TranslateVirtual(
         info->PageBytes = buffer.Response.PageBytes;
         info->RequestedLength = buffer.Response.RequestedLength;
         info->TranslatedLength = buffer.Response.TranslatedLength;
+        info->PagingLevels = buffer.Response.PagingLevels;
         info->Pml4e = buffer.Response.Pml4e;
         info->Pml5e = buffer.Response.Pml5e;
         info->Pdpte = buffer.Response.Pdpte;
         info->Pde = buffer.Response.Pde;
         info->Pte = buffer.Response.Pte;
+        info->Pml5eAddress = buffer.Response.Pml5eAddress;
+        info->Pml4eAddress = buffer.Response.Pml4eAddress;
+        info->PdpteAddress = buffer.Response.PdpteAddress;
+        info->PdeAddress = buffer.Response.PdeAddress;
+        info->PteAddress = buffer.Response.PteAddress;
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DeviceClient::FlushVirtual(uint64_t virtualAddress, uint32_t length, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (length == 0 || length > KNDBG_MAX_TRANSFER_SIZE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid virtual flush length";
+            }
+            break;
+        }
+
+        KNDBG_FLUSH_VIRTUAL_REQUEST request = {};
+        request.Size = sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST);
+        request.VirtualAddress = virtualAddress;
+        request.Length = length;
+        request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_FLUSH_VIRTUAL,
+                &request,
+                sizeof(request),
+                sizeof(request),
+                &returned,
+                error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short virtual flush response";
+            }
+            break;
+        }
 
         ok = true;
     } while (false);
