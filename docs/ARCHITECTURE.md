@@ -57,14 +57,22 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 
 1. `vtop` sends a virtual address, optional directory-table base, and requested length to the driver.
 2. If the directory-table base is zero, the driver uses the current x64 CR3.
-3. `vtop /pid` and `procctx <pid>` resolve process DTBs by asking the driver to read PDB-resolved EPROCESS offsets.
+3. `vtop /process` and `procctx <pid>` resolve process DTBs by asking the driver to read PDB-resolved EPROCESS offsets.
 4. The driver checks CR4.LA57, records whether the walk is PML4 or PML5, reads PML5E when LA57 is active, then reads PML4E, PDPTE, PDE, and PTE entries with `MmCopyMemory(..., MM_COPY_MEMORY_PHYSICAL)`.
 5. The walk supports 4 KB pages plus 2 MB and 1 GB large pages.
 6. The response reports CR3, VA, PA, paging level, page size, page offset, contiguous translated bytes, the page-table entries that were used, the physical address of each entry, and the leaf PTE/PDE/PDPTE physical address plus writable state.
-7. `d*` can use `/pid <pid>` or a stored `procctx` to translate user VAs page-by-page for physical reads. Native `e*` virtual writes default to the System process context (`pid 4`) and can use `/pid <pid>` for process-specific user VAs. Address-only `e*` first reads the current value through the selected context and opens a one-line replacement prompt before writing. If the translated leaf PTE/PDE/PDPTE is not writable, `e*` writes that leaf entry through physical memory with the write bit set, flushes the VA through `IOCTL_KNDBG_FLUSH_VIRTUAL`, performs kernel-VA edits through the original virtual address, uses physical writes for translated user VAs, restores the original write state, and flushes again before continuing.
+7. `d*` can use `/process <pid>` or a stored `procctx` to translate user VAs page-by-page for physical reads. Native `e*` virtual writes default to the System process context (`pid 4`) and can use `/process <pid>` for process-specific user VAs. Address-only `e*` first reads the current value through the selected context and opens a one-line replacement prompt before writing. If the translated leaf PTE/PDE/PDPTE is not writable, `e*` writes that leaf entry through physical memory with the write bit set, flushes the VA through `IOCTL_KNDBG_FLUSH_VIRTUAL`, performs kernel-VA edits through the original virtual address, uses physical writes for translated user VAs, restores the original write state, and flushes again before continuing.
 8. Virtual and physical display commands perform sparse reads for dump output. Readable bytes are printed normally, while unreadable bytes keep the requested layout and are shown as `??` or `0x????...` for wider units.
-9. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
-10. `peb`, `pew`, `ped`, and `peq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; write mode starts enabled and can be disabled with `write off`.
+9. `phys`, `pdb`, `pdw`, `pdd`, `pdq`, `!db`, `!dw`, `!dd`, and `!dq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
+10. `peb`, `pew`, `ped`, `peq`, `!eb`, `!ew`, `!ed`, and `!eq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; address-only form prompts with the current physical value before writing, and write mode starts enabled and can be disabled with `write off`.
+
+## Native Process Listing Flow
+
+1. `!dml_proc` stays on the native TUI path, takes no arguments, and is not routed to DbgEng extension loading.
+2. The all-process form resolves PID 4 through `IOCTL_KNDBG_RESOLVE_PROCESS` using PDB-resolved `_KPROCESS.DirectoryTableBase` offsets.
+3. User mode resolves `_EPROCESS.ActiveProcessLinks`, `_EPROCESS.UniqueProcessId`, and optional display fields from the loaded kernel PDB.
+4. The walker prefers `nt!PsActiveProcessHead` as the list anchor. If that symbol is unavailable, it falls back to PID 4's `ActiveProcessLinks`, prints the System process first, then follows `Flink` with a guard for the hidden list head.
+5. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a `dt nt!_EPROCESS <address>` follow-up.
 
 ## Symbol Flow
 
@@ -119,7 +127,7 @@ Backend routing is mode-dependent:
 
 Interactive command execution is wrapped by a delayed progress watchdog. If a dispatched command runs longer than about one second without producing stdout/stderr, the watchdog writes elapsed-time status rows directly to the console with `WriteConsoleW`, outside stdout/stderr transcript capture, and stops once the command returns. After command output starts, progress rows are suppressed for that command so watchdog text does not split normal output lines. Console color scopes, captured stdout/stderr forwarding, and watchdog writes share a console-output lock so attribute restore cannot race with progress rendering.
 
-The interactive prompt uses a console key reader instead of plain line input. Tab completion is built from `CommandRegistry` plus context-specific subcommand tables for `callbacks`, `ai`, `backend`, `kdinit`, `probe`, `procctx`, `write`, `dt`, `vtop`, `s`, and native memory commands. The completer replaces the current token with a unique match or the longest common prefix; if the prefix is ambiguous, it prints candidates and redraws the current `knkd>` line.
+The interactive prompt uses a console key reader instead of plain line input. Tab completion is built from `CommandRegistry` plus context-specific subcommand tables for `callbacks`, `ai`, `backend`, `kdinit`, `probe`, `procctx`, `write`, `dt`, `vtop`, `s`, and native memory commands. The same command-family tables feed detailed help routing: `help <command>`, `<command> help`, `callbacks <scope> help`, `ai <subcommand> help`, and `ai help <subcommand>` all stop before command execution and print operator-focused usage for that command family. The top-level help explains state tags (`native`, `alias`, `dbgeng`), symbol/address conventions, `/process` versus `procctx`, count units, sparse-read `??` output, and write-context defaults so operators do not have to infer those rules from examples. The completer replaces the current token with a unique match or the longest common prefix; if the prefix is ambiguous, it prints candidates and redraws the current `knkd>` line.
 
 Human-readable native command output uses scoped console attributes for high-signal tokens such as callback kind tags, object types, modules, symbols, translated physical addresses, and type/field names. The color layer is applied only while writing to the console stream, so transcript capture and JSONL records remain plain text.
 
@@ -137,7 +145,7 @@ Human-readable native command output uses scoped console attributes for high-sig
 ## AI Provider Flow
 
 1. `AiProviderRuntime` lives entirely in user mode.
-2. Provider selection defaults to `.env` plus environment variables and can be changed for the current TUI session with `ai provider`, `ai policy`, `ai model`, `ai baseurl`, and `ai effort`.
+2. Provider selection defaults to `.env` plus environment variables and can be changed for the current TUI session with `ai provider`, `ai policy`, `ai model`, `ai base-url`, and `ai effort`.
 3. `openai-codex-cli` executes `codex exec` as an external process and captures stdout/stderr.
 4. `openai-codex-subscription` reads Codex OAuth credentials from environment variables or auth files and calls the Codex Responses endpoint.
 5. `deepseek` and `openrouter` use OpenAI-compatible chat-completions requests over WinHTTP.
@@ -173,7 +181,7 @@ Completed hardening items:
 6. AI plan command schema validation is implemented before plan storage.
 7. Local-only AI provider policy is implemented with `ai policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`.
 8. Single-controller ownership is implemented in the driver and reported by `drvstatus`.
-9. Process DTB resolution is implemented with PDB-resolved EPROCESS offsets and `procctx`/`vtop /pid`; native `e*` writes use System (`pid 4`) as the default context.
+9. Process DTB resolution is implemented with PDB-resolved EPROCESS offsets and `procctx`/`vtop /process`; native `e*` writes use System (`pid 4`) as the default context.
 10. LA57 detection and PML5E reporting are implemented in the page-table walker.
 11. DIA fallback is implemented for UDT field metadata when `DbgHelp` fails.
 12. `KnLiveDbgProbe.sys` provides a positive-control contiguous virtual and physical test buffer.

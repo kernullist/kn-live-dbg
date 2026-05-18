@@ -1161,11 +1161,60 @@ static std::wstring JoinArgs(const std::vector<std::wstring>& args, size_t first
     return result;
 }
 
+static bool IsHelpToken(const std::wstring& value)
+{
+    std::wstring token = ToLower(value);
+    return token == L"help" || token == L"?" || token == L"/?" || token == L"-?";
+}
+
+static bool HasHelpToken(const std::vector<std::wstring>& args, size_t first)
+{
+    bool found = false;
+
+    for (size_t index = first; index < args.size(); ++index)
+    {
+        if (IsHelpToken(args[index]))
+        {
+            found = true;
+            break;
+        }
+    }
+
+    return found;
+}
+
 static void PrintHelp(bool includeDbgEng)
 {
     std::wcout << L"KnLiveDbg WinDbg-compatible command surface\n";
     std::wcout << L"interactive: press Tab to complete commands and context subcommands\n";
+    std::wcout << L"\n";
+    std::wcout << L"how to read this help:\n";
+    std::wcout << L"  help                 show native and TUI command summary\n";
+    std::wcout << L"  help all             include DbgEng-routed WinDbg commands\n";
+    std::wcout << L"  help <command>       show detailed syntax and notes for one command family\n";
+    std::wcout << L"  <command> help       same as help <command>\n";
+    std::wcout << L"  ai help <topic>      show AI subcommand help\n";
+    std::wcout << L"\n";
+    std::wcout << L"syntax notes:\n";
+    std::wcout << L"  <address|symbol> accepts numbers or loaded symbols such as nt!PsLoadedModuleList\n";
+    std::wcout << L"  nt! is normalized to the loaded kernel image when resolving symbols and types\n";
+    std::wcout << L"  d*/e*/vtop support /process <process-id>; procctx pins a default process context\n";
+    std::wcout << L"  virtual e* writes default to System(pid 4) context for kernel addresses\n";
+    std::wcout << L"  unreadable memory is rendered as ?? where sparse reads can continue\n";
+    std::wcout << L"  native means implemented by KnLiveDbg; dbgeng means routed to IDebugControl\n";
+    std::wcout << L"\n";
+    std::wcout << L"high-value help topics:\n";
+    std::wcout << L"  help callbacks       callback scanners and module filters\n";
+    std::wcout << L"  help dt              type layout, wildcard, and field filters\n";
+    std::wcout << L"  help e               virtual memory editing and /process behavior\n";
+    std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
+    std::wcout << L"  ai help              AI provider, plan, run, write, and transcript commands\n";
+    std::wcout << L"\n";
     std::wcout << L"usage examples:\n";
+    std::wcout << L"  help <command>\n";
+    std::wcout << L"  <command> help\n";
+    std::wcout << L"  ai help <subcommand>\n";
+    std::wcout << L"  ai <subcommand> help\n";
     std::wcout << L"  home\n";
     std::wcout << L"  .sympath SRV*<exe-dir>\\symbols*https://msdl.microsoft.com/download/symbols\n";
     std::wcout << L"  .reload\n";
@@ -1178,53 +1227,184 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  dt nt!_EPROCESS <address>\n";
     std::wcout << L"  callbacks all\n";
     std::wcout << L"  callbacks all WdFilter.sys\n";
+    std::wcout << L"  callbacks process WdFilter.sys\n";
     std::wcout << L"  procctx <pid>\n";
-    std::wcout << L"  vtop /pid <pid> <user-address>\n";
-    std::wcout << L"  db /pid <pid> <user-address> 80\n";
+    std::wcout << L"  vtop /process <pid> <user-address>\n";
+    std::wcout << L"  db /process <pid> <user-address> 80\n";
     std::wcout << L"  eb nt!SomeSymbol 90\n";
-    std::wcout << L"  eb /pid <pid> <user-address> 90\n";
+    std::wcout << L"  eb /process <pid> <user-address> 90\n";
     std::wcout << L"  vtop nt!PsLoadedModuleList\n";
     std::wcout << L"  pdb <physical-address> 80\n";
+    std::wcout << L"  !db <physical-address> 80\n";
     std::wcout << L"  probe load\n";
     std::wcout << L"  probe info\n";
     std::wcout << L"  kdinit\n";
     std::wcout << L"  backend dbgeng\n";
-    std::wcout << L"  !process 0 0\n";
+    std::wcout << L"  !dml_proc\n";
     std::wcout << L"  write off\n";
     std::wcout << L"  ed <address> <value>\n";
     std::wcout << L"  peq <physical-address> <value>\n";
+    std::wcout << L"  !eb <physical-address>\n";
+    std::wcout << L"  !eq <physical-address> <value>\n";
     std::wcout << L"  ai ask explain this callback scan result\n";
     std::wcout << L"  drvstatus\n";
     std::wcout << L"\n";
     CommandRegistry::PrintSummary(includeDbgEng);
+    if (!includeDbgEng)
+    {
+        std::wcout << L"\n";
+        std::wcout << L"type help all to include DbgEng-routed WinDbg commands.\n";
+    }
 }
 
 static void PrintCallbacksHelp()
 {
     std::wcout << L"callbacks command:\n";
-    std::wcout << L"  callbacks [all|ob|object|registry|reg|process|proc|ps|thread|thr|minifilter|mini|flt|fltmgr] [module]\n";
+    std::wcout << L"  callbacks [all|object|registry|process|thread|minifilter] [module]\n";
     std::wcout << L"  callbacks [scope] /module <module>\n";
-    std::wcout << L"  kcallbacks [scope] [module]\n";
-    std::wcout << L"  cb [scope] [module]\n";
+    std::wcout << L"  callbacks <scope> help\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
     std::wcout << L"  all          object-manager, registry, process, thread, and minifilter callbacks\n";
-    std::wcout << L"  ob           object-manager filters from _OBJECT_TYPE.CallbackList\n";
+    std::wcout << L"  object       object-manager filters from _OBJECT_TYPE.CallbackList\n";
     std::wcout << L"  registry     registry callbacks from CmpCallbackListHead candidates\n";
     std::wcout << L"  process      process creation callbacks from PspCreateProcessNotifyRoutine candidates\n";
     std::wcout << L"  thread       thread creation callbacks from PspCreateThreadNotifyRoutine candidates\n";
     std::wcout << L"  minifilter   minifilter filters and operation callbacks from fltmgr!FltGlobals\n";
     std::wcout << L"  module       case-insensitive module name or stem, for example WdFilter or wdfilter.sys\n";
     std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  The scanner locates callback roots from symbols or self-discovered kernel lists.\n";
+    std::wcout << L"  Module filters match callback function owners case-insensitively by image name or stem.\n";
+    std::wcout << L"  Some private callback item layouts are absent from public PDBs; fallback notes are printed per record.\n";
+    std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  callbacks all\n";
-    std::wcout << L"  callbacks ob\n";
+    std::wcout << L"  callbacks object\n";
     std::wcout << L"  callbacks registry\n";
     std::wcout << L"  callbacks process\n";
     std::wcout << L"  callbacks thread\n";
     std::wcout << L"  callbacks minifilter\n";
-    std::wcout << L"  callbacks ob WdFilter.sys\n";
+    std::wcout << L"  callbacks object WdFilter.sys\n";
     std::wcout << L"  callbacks minifilter UnionFS\n";
+}
+
+static std::wstring NormalizeCallbackHelpScope(const std::wstring& value)
+{
+    std::wstring scope = ToLower(value);
+
+    return scope;
+}
+
+static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
+{
+    bool handled = true;
+    std::wstring scope = NormalizeCallbackHelpScope(requestedScope);
+
+    if (scope == L"all")
+    {
+        PrintCallbacksHelp();
+    }
+    else if (scope == L"object")
+    {
+        std::wcout << L"callbacks object:\n";
+        std::wcout << L"  callbacks object [module]\n";
+        std::wcout << L"  callbacks object /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"what it scans:\n";
+        std::wcout << L"  Object-manager pre/post filters from each _OBJECT_TYPE.CallbackList.\n";
+        std::wcout << L"  Object type addresses are discovered automatically from kernel object-type roots.\n";
+        std::wcout << L"\n";
+        std::wcout << L"important output:\n";
+        std::wcout << L"  object/typeIndex/objectType/source identify the protected object type.\n";
+        std::wcout << L"  pre/post are callback routines; registrationContext is the callback entry context.\n";
+        std::wcout << L"  operations decodes create and duplicate filter bits.\n";
+    }
+    else if (scope == L"registry")
+    {
+        std::wcout << L"callbacks registry:\n";
+        std::wcout << L"  callbacks registry [module]\n";
+        std::wcout << L"  callbacks registry /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"what it scans:\n";
+        std::wcout << L"  Registry callbacks from CmpCallbackListHead-style callback-list candidates.\n";
+        std::wcout << L"\n";
+        std::wcout << L"important output:\n";
+        std::wcout << L"  function is the Cm callback routine owner.\n";
+        std::wcout << L"  callbackContext is operator-supplied registration context, not a module owner.\n";
+        std::wcout << L"  cookie is printed when the kernel record exposes it.\n";
+    }
+    else if (scope == L"process")
+    {
+        std::wcout << L"callbacks process:\n";
+        std::wcout << L"  callbacks process [module]\n";
+        std::wcout << L"  callbacks process /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"what it scans:\n";
+        std::wcout << L"  Process creation notification blocks from PspCreateProcessNotifyRoutine candidates.\n";
+        std::wcout << L"\n";
+        std::wcout << L"important output:\n";
+        std::wcout << L"  function is the create-process notify routine.\n";
+        std::wcout << L"  notifyMetadata is low-bit metadata from the encoded notify entry, not a callback context.\n";
+        std::wcout << L"  raw is the encoded pointer value before routine/metadata separation.\n";
+    }
+    else if (scope == L"thread")
+    {
+        std::wcout << L"callbacks thread:\n";
+        std::wcout << L"  callbacks thread [module]\n";
+        std::wcout << L"  callbacks thread /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"what it scans:\n";
+        std::wcout << L"  Thread creation notification blocks from PspCreateThreadNotifyRoutine candidates.\n";
+        std::wcout << L"\n";
+        std::wcout << L"important output:\n";
+        std::wcout << L"  function is the create-thread notify routine.\n";
+        std::wcout << L"  callbackContext is printed when the record layout exposes a context-like field.\n";
+    }
+    else if (scope == L"minifilter")
+    {
+        std::wcout << L"callbacks minifilter:\n";
+        std::wcout << L"  callbacks minifilter [module]\n";
+        std::wcout << L"  callbacks minifilter /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"what it scans:\n";
+        std::wcout << L"  Minifilter filters and operation callbacks discovered from fltmgr!FltGlobals.\n";
+        std::wcout << L"\n";
+        std::wcout << L"important output:\n";
+        std::wcout << L"  altitude, filter, frame, driverObject, major, function, and post identify filter ownership.\n";
+        std::wcout << L"  module filters match operation callback function owners case-insensitively.\n";
+    }
+    else
+    {
+        handled = false;
+    }
+
+    return handled;
+}
+
+static void PrintCallbacksHelpFromArgs(const std::vector<std::wstring>& args, size_t first)
+{
+    size_t index = first;
+    bool printed = false;
+
+    do
+    {
+        if (index < args.size() && IsHelpToken(args[index]))
+        {
+            ++index;
+        }
+
+        if (index < args.size() && PrintCallbackScopeHelp(args[index]))
+        {
+            printed = true;
+            break;
+        }
+    } while (false);
+
+    if (!printed)
+    {
+        PrintCallbacksHelp();
+    }
 }
 
 static const wchar_t* BackendModeText(DebuggerState::BackendMode mode)
@@ -1333,6 +1513,38 @@ static std::wstring HexTextWidth(uint64_t value, int width, bool prefix)
     return stream.str();
 }
 
+static bool IsNativePhysicalBangCommand(const std::wstring& command)
+{
+    bool result = false;
+
+    if (command == L"!db" ||
+        command == L"!dw" ||
+        command == L"!dd" ||
+        command == L"!dq" ||
+        command == L"!eb" ||
+        command == L"!ew" ||
+        command == L"!ed" ||
+        command == L"!eq")
+    {
+        result = true;
+    }
+
+    return result;
+}
+
+static bool IsNativeBangCommand(const std::wstring& command)
+{
+    bool result = false;
+
+    if (IsNativePhysicalBangCommand(command) ||
+        command == L"!dml_proc")
+    {
+        result = true;
+    }
+
+    return result;
+}
+
 static bool ShouldRouteToDbgEng(const std::wstring& command)
 {
     bool route = false;
@@ -1346,7 +1558,7 @@ static bool ShouldRouteToDbgEng(const std::wstring& command)
 
         if (command[0] == L'!' || command[0] == L'.')
         {
-            if (command == L"!vtop")
+            if (command == L"!vtop" || IsNativeBangCommand(command))
             {
                 break;
             }
@@ -1738,7 +1950,25 @@ static bool IsEnterCommand(const std::wstring& command)
 static bool IsProcessContextOption(const std::wstring& value)
 {
     std::wstring option = ToLower(value);
-    return option == L"/pid" || option == L"/process";
+    return option == L"/process";
+}
+
+static bool IsDeprecatedProcessContextOption(const std::wstring& value)
+{
+    std::wstring option = ToLower(value);
+    return option == L"/pid";
+}
+
+static bool IsSwitchLikeToken(const std::wstring& value)
+{
+    bool result = false;
+
+    if (!value.empty() && (value[0] == L'/' || value[0] == L'-'))
+    {
+        result = true;
+    }
+
+    return result;
 }
 
 static bool IsEnterStringCommand(const std::wstring& command)
@@ -1770,15 +2000,35 @@ static size_t UnitWidthForPhysicalDisplayCommand(const std::wstring& command)
 {
     size_t width = 1;
 
-    if (command == L"pdw")
+    if (command == L"pdw" || command == L"!dw")
     {
         width = 2;
     }
-    else if (command == L"pdd")
+    else if (command == L"pdd" || command == L"!dd")
     {
         width = 4;
     }
-    else if (command == L"pdq")
+    else if (command == L"pdq" || command == L"!dq")
+    {
+        width = 8;
+    }
+
+    return width;
+}
+
+static size_t UnitWidthForPhysicalEnterCommand(const std::wstring& command)
+{
+    size_t width = 1;
+
+    if (command == L"pew" || command == L"!ew")
+    {
+        width = 2;
+    }
+    else if (command == L"ped" || command == L"!ed")
+    {
+        width = 4;
+    }
+    else if (command == L"peq" || command == L"!eq")
     {
         width = 8;
     }
@@ -1789,12 +2039,17 @@ static size_t UnitWidthForPhysicalDisplayCommand(const std::wstring& command)
 static bool IsPhysicalDisplayCommand(const std::wstring& command)
 {
     return command == L"phys" || command == L"pdb" || command == L"pdw" ||
-        command == L"pdd" || command == L"pdq";
+        command == L"pdd" || command == L"pdq" ||
+        command == L"!db" || command == L"!dw" || command == L"!dd" ||
+        command == L"!dq";
 }
 
 static bool IsPhysicalEnterCommand(const std::wstring& command)
 {
-    return command == L"peb" || command == L"pew" || command == L"ped" || command == L"peq";
+    return command == L"peb" || command == L"pew" || command == L"ped" ||
+        command == L"peq" ||
+        command == L"!eb" || command == L"!ew" || command == L"!ed" ||
+        command == L"!eq";
 }
 
 static void AddCompletionCandidate(std::vector<std::wstring>* candidates, const wchar_t* value)
@@ -1856,22 +2111,12 @@ static void AddCallbackScopeCompletionCandidates(std::vector<std::wstring>* cand
     static const wchar_t* values[] =
     {
         L"all",
-        L"ob",
         L"object",
         L"registry",
-        L"reg",
         L"process",
-        L"proc",
-        L"ps",
         L"thread",
-        L"thr",
         L"minifilter",
-        L"mini",
-        L"flt",
-        L"fltmgr",
         L"/module",
-        L"--module",
-        L"-m",
         L"help"
     };
 
@@ -1883,8 +2128,7 @@ static void AddCallbackModuleOptionCompletionCandidates(std::vector<std::wstring
     static const wchar_t* values[] =
     {
         L"/module",
-        L"--module",
-        L"-m"
+        L"help"
     };
 
     AddCompletionCandidates(candidates, values);
@@ -1900,7 +2144,6 @@ static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidate
         L"provider",
         L"policy",
         L"model",
-        L"baseurl",
         L"base-url",
         L"effort",
         L"auth",
@@ -1951,6 +2194,7 @@ static void AddAiCompletionCandidates(
                 }
 
                 AddCompletionCandidate(candidates, L"off");
+                AddCompletionCandidate(candidates, L"help");
             }
         }
         else if (action == L"policy")
@@ -1959,7 +2203,8 @@ static void AddAiCompletionCandidates(
             {
                 L"allow-remote",
                 L"local-only",
-                L"status"
+                L"status",
+                L"help"
             };
 
             AddCompletionCandidates(candidates, values);
@@ -1972,7 +2217,8 @@ static void AddAiCompletionCandidates(
                 L"low",
                 L"medium",
                 L"high",
-                L"xhigh"
+                L"xhigh",
+                L"help"
             };
 
             AddCompletionCandidates(candidates, values);
@@ -1981,7 +2227,8 @@ static void AddAiCompletionCandidates(
         {
             static const wchar_t* values[] =
             {
-                L"all"
+                L"all",
+                L"help"
             };
 
             AddCompletionCandidates(candidates, values);
@@ -1992,7 +2239,8 @@ static void AddAiCompletionCandidates(
             {
                 static const wchar_t* values[] =
                 {
-                    L"confirm"
+                    L"confirm",
+                    L"help"
                 };
 
                 AddCompletionCandidates(candidates, values);
@@ -2004,7 +2252,8 @@ static void AddAiCompletionCandidates(
             {
                 static const wchar_t* values[] =
                 {
-                    L"callbacks"
+                    L"callbacks",
+                    L"help"
                 };
 
                 AddCompletionCandidates(candidates, values);
@@ -2026,7 +2275,8 @@ static void AddAiCompletionCandidates(
             static const wchar_t* values[] =
             {
                 L"dt",
-                L"dtx"
+                L"dtx",
+                L"help"
             };
 
             AddCompletionCandidates(candidates, values);
@@ -2036,7 +2286,8 @@ static void AddAiCompletionCandidates(
             static const wchar_t* values[] =
             {
                 L"u",
-                L"uf"
+                L"uf",
+                L"help"
             };
 
             AddCompletionCandidates(candidates, values);
@@ -2051,7 +2302,8 @@ static void AddAiCompletionCandidates(
                     L"minifilter",
                     L"object",
                     L"address",
-                    L"driver"
+                    L"driver",
+                    L"help"
                 };
 
                 AddCompletionCandidates(candidates, values);
@@ -2061,7 +2313,8 @@ static void AddAiCompletionCandidates(
                 static const wchar_t* values[] =
                 {
                     L"run",
-                    L"dry-run"
+                    L"dry-run",
+                    L"help"
                 };
 
                 AddCompletionCandidates(candidates, values);
@@ -2076,7 +2329,8 @@ static void AddAiCompletionCandidates(
                     L"status",
                     L"off",
                     L"max",
-                    L"redact"
+                    L"redact",
+                    L"help"
                 };
 
                 AddCompletionCandidates(candidates, values);
@@ -2085,7 +2339,8 @@ static void AddAiCompletionCandidates(
             {
                 static const wchar_t* values[] =
                 {
-                    L"off"
+                    L"off",
+                    L"help"
                 };
 
                 AddCompletionCandidates(candidates, values);
@@ -2095,7 +2350,8 @@ static void AddAiCompletionCandidates(
                 static const wchar_t* values[] =
                 {
                     L"on",
-                    L"off"
+                    L"off",
+                    L"help"
                 };
 
                 AddCompletionCandidates(candidates, values);
@@ -2106,10 +2362,15 @@ static void AddAiCompletionCandidates(
             static const wchar_t* values[] =
             {
                 L"status",
-                L"off"
+                L"off",
+                L"help"
             };
 
             AddCompletionCandidates(candidates, values);
+        }
+        else if (action == L"help")
+        {
+            AddAiActionCompletionCandidates(candidates);
         }
     } while (false);
 }
@@ -2142,7 +2403,80 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         std::wstring command = CompletionCanonicalCommand(argsBefore[0]);
         if (command == L"help" || command == L"?")
         {
-            AddHelpCompletionCandidates(&candidates);
+            if (argsBefore.size() <= 1)
+            {
+                AddHelpCompletionCandidates(&candidates);
+            }
+            else
+            {
+                std::wstring topic = CompletionCanonicalCommand(argsBefore[1]);
+                if (topic == L"ai")
+                {
+                    AddAiActionCompletionCandidates(&candidates);
+                }
+                else if (topic == L"callbacks")
+                {
+                    AddCallbackScopeCompletionCandidates(&candidates);
+                }
+                else if (topic == L"backend")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"auto",
+                        L"native",
+                        L"dbgeng"
+                    };
+
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"kdinit")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"/local",
+                        L"/remote"
+                    };
+
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"probe")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"status",
+                        L"load",
+                        L"info",
+                        L"reset",
+                        L"unload"
+                    };
+
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"procctx")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"status",
+                        L"clear"
+                    };
+
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"write")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"on",
+                        L"off"
+                    };
+
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else
+                {
+                    AddHelpCompletionCandidates(&candidates);
+                }
+            }
         }
         else if (command == L"callbacks")
         {
@@ -2165,7 +2499,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             {
                 L"auto",
                 L"native",
-                L"dbgeng"
+                L"dbgeng",
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2175,9 +2510,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             static const wchar_t* values[] =
             {
                 L"/local",
-                L"local",
                 L"/remote",
-                L"remote"
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2188,13 +2522,10 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             {
                 L"status",
                 L"load",
-                L"install",
-                L"start",
                 L"info",
                 L"reset",
                 L"unload",
-                L"remove",
-                L"stop"
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2204,8 +2535,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             static const wchar_t* values[] =
             {
                 L"status",
-                L"off",
-                L"clear"
+                L"clear",
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2215,7 +2546,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             static const wchar_t* values[] =
             {
                 L"on",
-                L"off"
+                L"off",
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2224,12 +2556,9 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         {
             static const wchar_t* values[] =
             {
-                L"on",
-                L"off",
                 L"true",
                 L"false",
-                L"1",
-                L"0"
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2239,7 +2568,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             static const wchar_t* values[] =
             {
                 L"10",
-                L"16"
+                L"16",
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2249,8 +2579,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             static const wchar_t* values[] =
             {
                 L"/cr3",
-                L"/pid",
-                L"/process"
+                L"/process",
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2264,7 +2594,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"-r2",
                 L"-r3",
                 L"-v",
-                L"-b"
+                L"-b",
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2276,7 +2607,17 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"-b",
                 L"-w",
                 L"-d",
-                L"-q"
+                L"-q",
+                L"help"
+            };
+
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"setfield")
+        {
+            static const wchar_t* values[] =
+            {
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2285,8 +2626,17 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         {
             static const wchar_t* values[] =
             {
-                L"/pid",
-                L"/process"
+                L"/process",
+                L"help"
+            };
+
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (IsPhysicalDisplayCommand(command) || IsPhysicalEnterCommand(command))
+        {
+            static const wchar_t* values[] =
+            {
+                L"help"
             };
 
             AddCompletionCandidates(&candidates, values);
@@ -2754,6 +3104,29 @@ static bool TryAddOffset(uint64_t address, uint64_t offset, uint64_t* result)
         }
 
         *result = address + offset;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool TrySubtractOffset(uint64_t address, uint64_t offset, uint64_t* result)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        if (address < offset)
+        {
+            break;
+        }
+
+        *result = address - offset;
         ok = true;
     } while (false);
 
@@ -3424,18 +3797,24 @@ static void HandleDisplayCommand(
     {
         if (args.size() < 2)
         {
-            std::wcerr << L"usage: " << command << L" [/pid <process-id>] <address|symbol> [count]\n";
+            std::wcerr << L"usage: " << command << L" [/process <process-id>] <address|symbol> [count]\n";
             break;
         }
 
         size_t argIndex = 1;
         ProcessAddressContext explicitContext = {};
         bool hasExplicitContext = false;
+        if (IsDeprecatedProcessContextOption(args[argIndex]))
+        {
+            std::wcerr << L"usage: " << command << L" [/process <process-id>] <address|symbol> [count]\n";
+            break;
+        }
+
         if (IsProcessContextOption(args[argIndex]))
         {
             if (args.size() < 4)
             {
-                std::wcerr << L"usage: " << command << L" /pid <process-id> <address|symbol> [count]\n";
+                std::wcerr << L"usage: " << command << L" /process <process-id> <address|symbol> [count]\n";
                 break;
             }
 
@@ -3784,6 +4163,11 @@ static bool IsLikelyUserVirtualAddress(uint64_t virtualAddress)
     return virtualAddress < 0x0000800000000000ull;
 }
 
+static bool IsLikelyKernelVirtualAddress(uint64_t virtualAddress)
+{
+    return virtualAddress >= 0xff00000000000000ull;
+}
+
 static uint64_t SelectProcessDirectoryTableBase(const ProcessAddressContext& context, uint64_t virtualAddress)
 {
     uint64_t directoryTableBase = context.DirectoryTableBase;
@@ -3811,6 +4195,588 @@ static void PrintProcessAddressContext(const ProcessAddressContext& context)
         std::wcout << L"=" << HexTextWidth(context.UserDirectoryTableBase, 16, true);
     }
     std::wcout << std::dec << L"\n";
+}
+
+struct DmlProcessLayout
+{
+    TypeFieldInfo ActiveProcessLinks = {};
+    TypeFieldInfo UniqueProcessId = {};
+    TypeFieldInfo ImageFileName = {};
+    TypeFieldInfo InheritedFromUniqueProcessId = {};
+    TypeFieldInfo ActiveThreads = {};
+    TypeFieldInfo Peb = {};
+    uint32_t DirectoryTableBaseOffset = 0;
+    uint32_t UserDirectoryTableBaseOffset = 0;
+    bool HasInheritedFromUniqueProcessId = false;
+    bool HasActiveThreads = false;
+    bool HasPeb = false;
+};
+
+struct DmlProcessRecord
+{
+    uint64_t Eprocess = 0;
+    uint64_t ListEntry = 0;
+    uint64_t Flink = 0;
+    uint64_t Blink = 0;
+    uint64_t ProcessId = 0;
+    uint64_t ParentProcessId = 0;
+    uint64_t DirectoryTableBase = 0;
+    uint64_t UserDirectoryTableBase = 0;
+    uint64_t Peb = 0;
+    uint32_t ActiveThreads = 0;
+    std::wstring ImageName;
+    bool HasParentProcessId = false;
+    bool HasActiveThreads = false;
+    bool HasPeb = false;
+};
+
+static bool ReadKernelBytes(
+    DeviceClient& device,
+    uint64_t address,
+    uint32_t length,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (bytes == nullptr || length == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid kernel read request";
+            }
+            break;
+        }
+
+        if (!device.ReadMemory(address, length, bytes, error))
+        {
+            break;
+        }
+
+        if (bytes->size() != length)
+        {
+            if (error != nullptr)
+            {
+                *error = L"short kernel read";
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ReadKernelInteger(
+    DeviceClient& device,
+    uint64_t address,
+    size_t width,
+    uint64_t* value,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (value == nullptr || width == 0 || width > sizeof(uint64_t))
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid integer read request";
+            }
+            break;
+        }
+
+        std::vector<uint8_t> bytes;
+        if (!ReadKernelBytes(device, address, static_cast<uint32_t>(width), &bytes, error))
+        {
+            break;
+        }
+
+        *value = DecodeInteger(bytes.data(), width);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static size_t FieldReadWidth(const TypeFieldInfo& field, size_t fallbackWidth)
+{
+    size_t width = fallbackWidth;
+
+    if (field.Length > 0 && field.Length <= sizeof(uint64_t))
+    {
+        width = static_cast<size_t>(field.Length);
+    }
+
+    return width;
+}
+
+static bool ReadKernelFieldInteger(
+    DeviceClient& device,
+    uint64_t base,
+    const TypeFieldInfo& field,
+    size_t fallbackWidth,
+    uint64_t* value,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        uint64_t fieldAddress = 0;
+        if (!TryAddOffset(base, field.Offset, &fieldAddress))
+        {
+            if (error != nullptr)
+            {
+                *error = L"field address overflow";
+            }
+            break;
+        }
+
+        if (!ReadKernelInteger(device, fieldAddress, FieldReadWidth(field, fallbackWidth), value, error))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ReadKernelPointer(DeviceClient& device, uint64_t address, uint64_t* value, std::wstring* error)
+{
+    return ReadKernelInteger(device, address, sizeof(uint64_t), value, error);
+}
+
+static bool ResolveDmlProcessLayout(SymbolEngine& symbols, DmlProcessLayout* layout, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (layout == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid dml process layout output";
+            }
+            break;
+        }
+
+        *layout = DmlProcessLayout{};
+
+        if (!FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"ActiveProcessLinks", &layout->ActiveProcessLinks, error))
+        {
+            break;
+        }
+
+        if (!FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"UniqueProcessId", &layout->UniqueProcessId, error))
+        {
+            break;
+        }
+
+        std::wstring ignored;
+        FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"ImageFileName", &layout->ImageFileName, &ignored);
+        layout->HasInheritedFromUniqueProcessId =
+            FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"InheritedFromUniqueProcessId", &layout->InheritedFromUniqueProcessId, &ignored);
+        layout->HasActiveThreads =
+            FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"ActiveThreads", &layout->ActiveThreads, &ignored);
+        layout->HasPeb =
+            FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"Peb", &layout->Peb, &ignored);
+
+        if (!ResolveProcessDirectoryTableBaseOffsets(symbols, &layout->DirectoryTableBaseOffset, &layout->UserDirectoryTableBaseOffset, error))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring ReadDmlProcessImageName(
+    DeviceClient& device,
+    uint64_t eprocess,
+    const TypeFieldInfo& field)
+{
+    std::wstring result = L"<unknown>";
+
+    do
+    {
+        if (field.Name.empty())
+        {
+            break;
+        }
+
+        uint64_t fieldAddress = 0;
+        if (!TryAddOffset(eprocess, field.Offset, &fieldAddress))
+        {
+            break;
+        }
+
+        size_t length = static_cast<size_t>(field.Length);
+        if (length == 0 || length > 64)
+        {
+            length = 16;
+        }
+
+        std::vector<uint8_t> bytes;
+        std::wstring ignored;
+        if (!ReadKernelBytes(device, fieldAddress, static_cast<uint32_t>(length), &bytes, &ignored))
+        {
+            break;
+        }
+
+        std::wstring name;
+        for (uint8_t byte : bytes)
+        {
+            if (byte == 0)
+            {
+                break;
+            }
+
+            if (byte < 32 || byte > 126)
+            {
+                name.push_back(L'.');
+            }
+            else
+            {
+                name.push_back(static_cast<wchar_t>(byte));
+            }
+        }
+
+        if (!name.empty())
+        {
+            result = name;
+        }
+    } while (false);
+
+    return result;
+}
+
+static bool ReadDmlProcessRecord(
+    DeviceClient& device,
+    const DmlProcessLayout& layout,
+    uint64_t eprocess,
+    DmlProcessRecord* record,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (record == nullptr || eprocess == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid EPROCESS address";
+            }
+            break;
+        }
+
+        *record = DmlProcessRecord{};
+        record->Eprocess = eprocess;
+
+        if (!TryAddOffset(eprocess, layout.ActiveProcessLinks.Offset, &record->ListEntry))
+        {
+            if (error != nullptr)
+            {
+                *error = L"ActiveProcessLinks address overflow";
+            }
+            break;
+        }
+
+        if (!ReadKernelPointer(device, record->ListEntry, &record->Flink, error))
+        {
+            break;
+        }
+
+        uint64_t blinkAddress = 0;
+        if (!TryAddOffset(record->ListEntry, sizeof(uint64_t), &blinkAddress))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Blink address overflow";
+            }
+            break;
+        }
+
+        if (!ReadKernelPointer(device, blinkAddress, &record->Blink, error))
+        {
+            break;
+        }
+
+        if (!IsLikelyKernelVirtualAddress(record->Flink) ||
+            !IsLikelyKernelVirtualAddress(record->Blink))
+        {
+            if (error != nullptr)
+            {
+                *error = L"ActiveProcessLinks contains a non-kernel list pointer";
+            }
+            break;
+        }
+
+        if (!ReadKernelFieldInteger(device, eprocess, layout.UniqueProcessId, sizeof(uint64_t), &record->ProcessId, error))
+        {
+            break;
+        }
+
+        if (record->ProcessId > 0xffffffffull)
+        {
+            if (error != nullptr)
+            {
+                *error = L"UniqueProcessId is outside the expected 32-bit PID range";
+            }
+            break;
+        }
+
+        if (layout.HasInheritedFromUniqueProcessId)
+        {
+            record->HasParentProcessId =
+                ReadKernelFieldInteger(
+                    device,
+                    eprocess,
+                    layout.InheritedFromUniqueProcessId,
+                    sizeof(uint64_t),
+                    &record->ParentProcessId,
+                    nullptr);
+        }
+
+        if (layout.HasActiveThreads)
+        {
+            uint64_t activeThreads = 0;
+            if (ReadKernelFieldInteger(device, eprocess, layout.ActiveThreads, sizeof(uint32_t), &activeThreads, nullptr))
+            {
+                record->ActiveThreads = static_cast<uint32_t>(activeThreads);
+                record->HasActiveThreads = true;
+            }
+        }
+
+        if (layout.HasPeb)
+        {
+            record->HasPeb =
+                ReadKernelFieldInteger(device, eprocess, layout.Peb, sizeof(uint64_t), &record->Peb, nullptr);
+        }
+
+        uint64_t directoryTableBaseAddress = 0;
+        if (TryAddOffset(eprocess, layout.DirectoryTableBaseOffset, &directoryTableBaseAddress))
+        {
+            ReadKernelInteger(device, directoryTableBaseAddress, sizeof(uint64_t), &record->DirectoryTableBase, nullptr);
+        }
+
+        if (layout.UserDirectoryTableBaseOffset != 0)
+        {
+            uint64_t userDirectoryTableBaseAddress = 0;
+            if (TryAddOffset(eprocess, layout.UserDirectoryTableBaseOffset, &userDirectoryTableBaseAddress))
+            {
+                ReadKernelInteger(device, userDirectoryTableBaseAddress, sizeof(uint64_t), &record->UserDirectoryTableBase, nullptr);
+            }
+        }
+
+        record->DirectoryTableBase &= KNDBG_X64_PTE_4K_BASE_MASK;
+        record->UserDirectoryTableBase &= KNDBG_X64_PTE_4K_BASE_MASK;
+        record->ImageName = ReadDmlProcessImageName(device, eprocess, layout.ImageFileName);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void PrintDmlProcessRecord(const DmlProcessRecord& record)
+{
+    PrintColoredText(HexTextWidth(record.Eprocess, 16, true), KNDBG_COLOR_ACCENT);
+    std::wcout << L" ";
+    std::wcout << std::setw(6) << std::dec << record.ProcessId << L" ";
+
+    if (record.HasParentProcessId)
+    {
+        std::wcout << std::setw(6) << record.ParentProcessId << L" ";
+    }
+    else
+    {
+        std::wcout << std::setw(6) << L"?" << L" ";
+    }
+
+    if (record.HasActiveThreads)
+    {
+        std::wcout << std::setw(5) << record.ActiveThreads << L" ";
+    }
+    else
+    {
+        std::wcout << std::setw(5) << L"?" << L" ";
+    }
+
+    PrintColoredText(HexTextWidth(record.DirectoryTableBase, 16, true), KNDBG_COLOR_TITLE);
+    std::wcout << L" ";
+    std::wcout << std::left << std::setw(18) << record.ImageName << std::right;
+    std::wcout << L" ";
+    PrintColoredText(L"dt", KNDBG_COLOR_DIM);
+    std::wcout << L"=dt nt!_EPROCESS " << HexTextWidth(record.Eprocess, 16, true);
+    std::wcout << L"\n";
+}
+
+static void PrintDmlProcessHeader()
+{
+    PrintColoredText(L"EPROCESS", KNDBG_COLOR_TITLE);
+    std::wcout << L"             ";
+    PrintColoredText(L"PID", KNDBG_COLOR_TITLE);
+    std::wcout << L"   ";
+    PrintColoredText(L"PPID", KNDBG_COLOR_TITLE);
+    std::wcout << L"  ";
+    PrintColoredText(L"Thrd", KNDBG_COLOR_TITLE);
+    std::wcout << L"  ";
+    PrintColoredText(L"DirBase", KNDBG_COLOR_TITLE);
+    std::wcout << L"           ";
+    PrintColoredText(L"Image", KNDBG_COLOR_TITLE);
+    std::wcout << L"\n";
+}
+
+static bool DmlProcessAlreadyVisited(const std::vector<uint64_t>& visited, uint64_t entry)
+{
+    return std::find(visited.begin(), visited.end(), entry) != visited.end();
+}
+
+static void HandleDmlProcCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        if (args.size() != 1)
+        {
+            std::wcerr << L"usage: !dml_proc\n";
+            break;
+        }
+
+        DmlProcessLayout layout = {};
+        if (!ResolveDmlProcessLayout(symbols, &layout, &error))
+        {
+            std::wcerr << L"!dml_proc failed: " << error << L"\n";
+            break;
+        }
+
+        PrintColoredText(L"!dml_proc", KNDBG_COLOR_TITLE);
+        std::wcout << L"\n";
+        PrintDmlProcessHeader();
+
+        ProcessAddressContext systemContext = {};
+        if (!EnsureKernelProcessAddressContext(state, device, symbols, &systemContext, &error))
+        {
+            std::wcerr << L"!dml_proc failed: " << error << L"\n";
+            break;
+        }
+
+        uint64_t systemListEntry = 0;
+        if (!TryAddOffset(systemContext.Eprocess, layout.ActiveProcessLinks.Offset, &systemListEntry))
+        {
+            std::wcerr << L"!dml_proc failed: ActiveProcessLinks address overflow\n";
+            break;
+        }
+
+        uint64_t listHead = 0;
+        std::wstring ignored;
+        bool hasGlobalHead = symbols.ResolveSymbol(L"nt!PsActiveProcessHead", &listHead, &ignored);
+
+        uint64_t current = 0;
+        size_t count = 0;
+        constexpr size_t maxProcessRecords = 4096;
+        std::vector<uint64_t> visited;
+
+        if (hasGlobalHead)
+        {
+            if (!ReadKernelPointer(device, listHead, &current, &error))
+            {
+                std::wcerr << L"!dml_proc failed: " << error << L"\n";
+                break;
+            }
+
+            visited.push_back(listHead);
+        }
+        else
+        {
+            DmlProcessRecord systemRecord = {};
+            if (!ReadDmlProcessRecord(device, layout, systemContext.Eprocess, &systemRecord, &error))
+            {
+                std::wcerr << L"!dml_proc failed: " << error << L"\n";
+                break;
+            }
+
+            PrintDmlProcessRecord(systemRecord);
+            current = systemRecord.Flink;
+            count = 1;
+            listHead = systemListEntry;
+            visited.push_back(systemListEntry);
+        }
+
+        while (current != 0 && current != listHead && count < maxProcessRecords)
+        {
+            if (DmlProcessAlreadyVisited(visited, current))
+            {
+                std::wcerr << L"!dml_proc warning: loop detected at " << HexTextWidth(current, 16, true) << L"\n";
+                break;
+            }
+
+            visited.push_back(current);
+
+            uint64_t eprocess = 0;
+            if (!TrySubtractOffset(current, layout.ActiveProcessLinks.Offset, &eprocess))
+            {
+                std::wcerr << L"!dml_proc warning: list entry underflow at " << HexTextWidth(current, 16, true) << L"\n";
+                break;
+            }
+
+            DmlProcessRecord record = {};
+            if (ReadDmlProcessRecord(device, layout, eprocess, &record, &error))
+            {
+                PrintDmlProcessRecord(record);
+                ++count;
+                current = record.Flink;
+            }
+            else
+            {
+                if (!hasGlobalHead)
+                {
+                    uint64_t hiddenHeadFlink = 0;
+                    if (ReadKernelPointer(device, current, &hiddenHeadFlink, nullptr) &&
+                        IsLikelyKernelVirtualAddress(hiddenHeadFlink))
+                    {
+                        if (hiddenHeadFlink == systemListEntry)
+                        {
+                            break;
+                        }
+
+                        if (!DmlProcessAlreadyVisited(visited, hiddenHeadFlink))
+                        {
+                            current = hiddenHeadFlink;
+                            continue;
+                        }
+                    }
+                }
+
+                std::wcerr << L"!dml_proc warning: failed to read EPROCESS "
+                           << HexTextWidth(eprocess, 16, true) << L": " << error << L"\n";
+                break;
+            }
+        }
+
+        PrintColoredText(L"process records", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << count;
+        if (count >= maxProcessRecords)
+        {
+            std::wcout << L" truncated=yes";
+        }
+        std::wcout << L"\n";
+    } while (false);
 }
 
 struct LeafPageTableEntry
@@ -4399,7 +5365,7 @@ static void HandleTranslateVirtualCommand(
         {
             std::wcerr << L"usage: vtop <address|symbol> [length]\n";
             std::wcerr << L"usage: vtop /cr3 <directory-table-base> <address|symbol> [length]\n";
-            std::wcerr << L"usage: vtop /pid <process-id> <address|symbol> [length]\n";
+            std::wcerr << L"usage: vtop /process <process-id> <address|symbol> [length]\n";
             break;
         }
 
@@ -4432,11 +5398,16 @@ static void HandleTranslateVirtualCommand(
 
             index = 4;
         }
+        else if (command == L"vtop" && IsDeprecatedProcessContextOption(args[index]))
+        {
+            std::wcerr << L"usage: vtop /process <process-id> <address|symbol> [length]\n";
+            break;
+        }
         else if (command == L"vtop" && IsProcessContextOption(args[index]))
         {
             if (args.size() < 4)
             {
-                std::wcerr << L"usage: vtop /pid <process-id> <address|symbol> [length]\n";
+                std::wcerr << L"usage: vtop /process <process-id> <address|symbol> [length]\n";
                 break;
             }
 
@@ -4594,7 +5565,7 @@ static void HandleProcessContextCommand(
         }
 
         std::wstring action = ToLower(args[1]);
-        if (action == L"off" || action == L"clear")
+        if (action == L"clear")
         {
             state.HasProcessContext = false;
             state.ProcessContext = {};
@@ -4606,7 +5577,7 @@ static void HandleProcessContextCommand(
         uint64_t pid64 = 0;
         if (!ParseUnsigned(args[1], 10, &pid64) || pid64 == 0 || pid64 > 0xffffffffull)
         {
-            std::wcerr << L"usage: procctx <process-id|off|status>\n";
+            std::wcerr << L"usage: procctx <process-id|clear|status>\n";
             break;
         }
 
@@ -4671,7 +5642,7 @@ static void HandlePhysicalDisplayCommand(
             break;
         }
 
-        if (command == L"phys" || command == L"pdb")
+        if (command == L"phys" || command == L"pdb" || command == L"!db")
         {
             HexDump(physicalAddress, memory);
         }
@@ -4681,6 +5652,15 @@ static void HandlePhysicalDisplayCommand(
         }
     } while (false);
 }
+
+static bool PromptForPhysicalEnterBytes(
+    const std::wstring& command,
+    const DebuggerState& state,
+    DeviceClient& device,
+    uint64_t physicalAddress,
+    std::vector<uint8_t>* bytes,
+    bool* cancelled,
+    std::wstring* error);
 
 static void HandlePhysicalEnterCommand(
     const std::vector<std::wstring>& args,
@@ -4692,9 +5672,9 @@ static void HandlePhysicalEnterCommand(
 
     do
     {
-        if (args.size() < 3)
+        if (args.size() < 2)
         {
-            std::wcerr << L"usage: " << command << L" <physical-address> <value...>\n";
+            std::wcerr << L"usage: " << command << L" <physical-address> [value...]\n";
             break;
         }
 
@@ -4705,38 +5685,51 @@ static void HandlePhysicalEnterCommand(
             break;
         }
 
-        size_t width = 1;
-        if (command == L"pew")
-        {
-            width = 2;
-        }
-        else if (command == L"ped")
-        {
-            width = 4;
-        }
-        else if (command == L"peq")
-        {
-            width = 8;
-        }
-
+        size_t width = UnitWidthForPhysicalEnterCommand(command);
         std::vector<uint8_t> bytes;
-        bool valuesOk = true;
-        for (size_t index = 2; index < args.size(); ++index)
+        bool interactiveEdit = args.size() < 3;
+        if (interactiveEdit)
         {
-            uint64_t value = 0;
-            if (!ParseUnsigned(args[index], state.NumberBase, &value))
+            bool cancelled = false;
+            if (!PromptForPhysicalEnterBytes(command, state, device, physicalAddress, &bytes, &cancelled, &error))
             {
-                std::wcerr << L"invalid value: " << args[index] << L"\n";
-                valuesOk = false;
+                std::wcerr << L"edit failed: " << error << L"\n";
                 break;
             }
 
-            std::vector<uint8_t> encoded = EncodeInteger(value, width);
-            bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+            if (cancelled)
+            {
+                PrintColoredText(L"edit cancelled", KNDBG_COLOR_DIM);
+                std::wcout << L"\n";
+                break;
+            }
+        }
+        else
+        {
+            bool valuesOk = true;
+            for (size_t index = 2; index < args.size(); ++index)
+            {
+                uint64_t value = 0;
+                if (!ParseUnsigned(args[index], state.NumberBase, &value))
+                {
+                    std::wcerr << L"invalid value: " << args[index] << L"\n";
+                    valuesOk = false;
+                    break;
+                }
+
+                std::vector<uint8_t> encoded = EncodeInteger(value, width);
+                bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+            }
+
+            if (!valuesOk)
+            {
+                break;
+            }
         }
 
-        if (!valuesOk)
+        if (bytes.empty())
         {
+            std::wcerr << L"no bytes to write\n";
             break;
         }
 
@@ -4791,6 +5784,98 @@ static bool ReadEnterPromptLine(std::wstring* line, bool* cancelled, std::wstrin
         }
 
         ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool PromptForPhysicalEnterBytes(
+    const std::wstring& command,
+    const DebuggerState& state,
+    DeviceClient& device,
+    uint64_t physicalAddress,
+    std::vector<uint8_t>* bytes,
+    bool* cancelled,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (bytes == nullptr || cancelled == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid edit prompt output";
+            }
+            break;
+        }
+
+        bytes->clear();
+        *cancelled = false;
+
+        PrintColoredText(HexTextWidth(physicalAddress, 16, false), KNDBG_COLOR_ACCENT);
+        std::wcout << L"  ";
+
+        size_t width = UnitWidthForPhysicalEnterCommand(command);
+        std::vector<uint8_t> currentBytes;
+        std::wstring ignored;
+        if (device.ReadPhysical(
+                physicalAddress,
+                static_cast<uint32_t>(width),
+                &currentBytes,
+                &ignored) &&
+            currentBytes.size() == width)
+        {
+            uint64_t currentValue = DecodeInteger(currentBytes.data(), width);
+            std::wcout << HexTextWidth(currentValue, static_cast<int>(width * 2), false);
+        }
+        else
+        {
+            std::wcout << UnknownHexText(width, false);
+        }
+
+        std::wcout << L" : ";
+
+        std::wstring line;
+        if (!ReadEnterPromptLine(&line, cancelled, error))
+        {
+            break;
+        }
+
+        if (*cancelled)
+        {
+            ok = true;
+            break;
+        }
+
+        std::vector<std::wstring> values = Split(line);
+        if (values.empty())
+        {
+            *cancelled = true;
+            ok = true;
+            break;
+        }
+
+        bool valuesOk = true;
+        for (const std::wstring& text : values)
+        {
+            uint64_t value = 0;
+            if (!ParseUnsigned(text, state.NumberBase, &value))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid value: " + text;
+                }
+                valuesOk = false;
+                break;
+            }
+
+            std::vector<uint8_t> encoded = EncodeInteger(value, width);
+            bytes->insert(bytes->end(), encoded.begin(), encoded.end());
+        }
+
+        ok = valuesOk && !bytes->empty();
     } while (false);
 
     return ok;
@@ -4928,18 +6013,24 @@ static void HandleEnterCommand(
     {
         if (args.size() < 2)
         {
-            std::wcerr << L"usage: " << command << L" [/pid <process-id>] <address|symbol> [value...]\n";
+            std::wcerr << L"usage: " << command << L" [/process <process-id>] <address|symbol> [value...]\n";
             break;
         }
 
         size_t argIndex = 1;
         ProcessAddressContext explicitContext = {};
         bool hasExplicitContext = false;
+        if (IsDeprecatedProcessContextOption(args[argIndex]))
+        {
+            std::wcerr << L"usage: " << command << L" [/process <process-id>] <address|symbol> [value...]\n";
+            break;
+        }
+
         if (IsProcessContextOption(args[argIndex]))
         {
             if (args.size() < argIndex + 3)
             {
-                std::wcerr << L"usage: " << command << L" /pid <process-id> <address|symbol> [value...]\n";
+                std::wcerr << L"usage: " << command << L" /process <process-id> <address|symbol> [value...]\n";
                 break;
             }
 
@@ -4962,7 +6053,7 @@ static void HandleEnterCommand(
 
         if (argIndex >= args.size())
         {
-            std::wcerr << L"usage: " << command << L" [/pid <process-id>] <address|symbol> [value...]\n";
+            std::wcerr << L"usage: " << command << L" [/process <process-id>] <address|symbol> [value...]\n";
             break;
         }
 
@@ -5546,6 +6637,7 @@ static bool UnloadDriverServiceWithUx(
     const std::wstring& title,
     DriverUnloadResult* unloadResult,
     std::wstring* error);
+static void PrintProbeHelp();
 
 static void HandleProbeCommand(const std::vector<std::wstring>& args, DebuggerState& state)
 {
@@ -5555,7 +6647,13 @@ static void HandleProbeCommand(const std::vector<std::wstring>& args, DebuggerSt
 
     do
     {
-        if (action == L"load" || action == L"install" || action == L"start")
+        if (HasHelpToken(args, 1))
+        {
+            PrintProbeHelp();
+            break;
+        }
+
+        if (action == L"load")
         {
             std::wstring driverPath = args.size() >= 3 ? JoinArgs(args, 2) : GetExecutableDirectory() + L"\\KnLiveDbgProbe.sys";
             state.ProbeDriverCleanupRequested = true;
@@ -5575,7 +6673,7 @@ static void HandleProbeCommand(const std::vector<std::wstring>& args, DebuggerSt
                 std::wcerr << L"probe info failed: " << error << L"\n";
             }
         }
-        else if (action == L"unload" || action == L"remove" || action == L"stop")
+        else if (action == L"unload")
         {
             DriverUnloadResult unloadResult = {};
             if (!UnloadDriverServiceWithUx(probeService, L"Probe driver unload", &unloadResult, &error))
@@ -6368,7 +7466,7 @@ static void PrintStartupTui(
     PrintTuiLine(L"  dt nt!_EPROCESS <addr>   dq nt!PsLoadedModuleList 8", KNDBG_COLOR_DIM);
     PrintTuiLine(L"  vtop <addr>              pdb <physical-address> 80", KNDBG_COLOR_DIM);
     PrintTuiLine(L"  u nt!KiSystemCall64 8    uf nt!KiSystemCall64", KNDBG_COLOR_DIM);
-    PrintTuiLine(L"  backend dbgeng           kd !process 0 0", KNDBG_COLOR_DIM);
+    PrintTuiLine(L"  !dml_proc                backend native", KNDBG_COLOR_DIM);
     PrintTuiRule();
     PrintTuiLine(L"Type home to redraw this screen. Type q, quit, or exit to unload and leave.", KNDBG_COLOR_WARN);
     PrintTuiRule();
@@ -6409,23 +7507,35 @@ static bool IsCallbackScopeName(const std::wstring& value)
     std::wstring lowered = ToLower(value);
 
     if (lowered == L"all" ||
-        lowered == L"ob" ||
         lowered == L"object" ||
+        lowered == L"registry" ||
+        lowered == L"process" ||
+        lowered == L"thread" ||
+        lowered == L"minifilter")
+    {
+        result = true;
+    }
+
+    return result;
+}
+
+static bool IsDeprecatedCallbackScopeAlias(const std::wstring& value)
+{
+    bool result = false;
+    std::wstring lowered = ToLower(value);
+
+    if (lowered == L"ob" ||
         lowered == L"objects" ||
         lowered == L"object-manager" ||
-        lowered == L"registry" ||
         lowered == L"reg" ||
-        lowered == L"process" ||
-        lowered == L"processes" ||
         lowered == L"proc" ||
+        lowered == L"processes" ||
         lowered == L"ps" ||
-        lowered == L"thread" ||
         lowered == L"threads" ||
         lowered == L"thr" ||
         lowered == L"th" ||
-        lowered == L"minifilter" ||
-        lowered == L"minifilters" ||
         lowered == L"mini" ||
+        lowered == L"minifilters" ||
         lowered == L"flt" ||
         lowered == L"fltmgr" ||
         lowered == L"filter" ||
@@ -6440,7 +7550,13 @@ static bool IsCallbackScopeName(const std::wstring& value)
 static bool IsCallbackModuleOption(const std::wstring& value)
 {
     std::wstring lowered = ToLower(value);
-    return lowered == L"/module" || lowered == L"--module" || lowered == L"-m";
+    return lowered == L"/module";
+}
+
+static bool IsDeprecatedCallbackModuleOption(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"--module" || lowered == L"-m";
 }
 
 static std::wstring CallbackComparableModuleName(const std::wstring& value, bool removeExtension)
@@ -6741,10 +7857,9 @@ static void HandleCallbacksCommand(
         std::wstring moduleFilter;
         if (args.size() >= 2)
         {
-            std::wstring first = ToLower(args[1]);
-            if (first == L"help" || first == L"?" || first == L"/?" || first == L"-?")
+            if (HasHelpToken(args, 1))
             {
-                PrintCallbacksHelp();
+                PrintCallbacksHelpFromArgs(args, 1);
                 break;
             }
 
@@ -6754,11 +7869,17 @@ static void HandleCallbacksCommand(
                 scope = args[index];
                 ++index;
             }
-            else if (!IsCallbackModuleOption(args[index]))
+            else if (IsDeprecatedCallbackModuleOption(args[index]) ||
+                     IsDeprecatedCallbackScopeAlias(args[index]))
             {
-                std::wcerr << L"usage: callbacks [all|ob|registry|process|thread|minifilter] [module]\n";
+                std::wcerr << L"usage: callbacks [all|object|registry|process|thread|minifilter] [module]\n";
                 PrintCallbacksHelp();
                 break;
+            }
+            else if (!IsCallbackModuleOption(args[index]))
+            {
+                moduleFilter = args[index];
+                ++index;
             }
 
             while (index < args.size())
@@ -6771,9 +7892,22 @@ static void HandleCallbacksCommand(
                         break;
                     }
 
+                    if (!moduleFilter.empty())
+                    {
+                        std::wcerr << L"usage: callbacks [scope] [module]\n";
+                        break;
+                    }
+
                     moduleFilter = args[index + 1];
                     index += 2;
                     continue;
+                }
+
+                if (IsDeprecatedCallbackModuleOption(args[index]) ||
+                    IsDeprecatedCallbackScopeAlias(args[index]))
+                {
+                    std::wcerr << L"usage: callbacks [scope] [module]\n";
+                    break;
                 }
 
                 if (moduleFilter.empty())
@@ -7164,7 +8298,7 @@ static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const Symbol
     stream << L"- symbol path: " << symbols.SymbolPath() << L"\n";
     stream << L"- loaded kernel modules: " << symbols.Modules().size() << L"\n";
     stream << L"- write mode is enabled by default per device handle unless the operator ran write off\n";
-    stream << L"- native e* virtual writes default to System(pid 4) page-table context; use /pid for a specific process\n";
+    stream << L"- native e* virtual writes default to System(pid 4) page-table context; use /process for a specific process\n";
     stream << L"Rules:\n";
     stream << L"- Prefer concrete KnLiveDbg commands and exact preview text.\n";
     stream << L"- Treat AI output as advisory and require operator confirmation for writes.\n";
@@ -7181,6 +8315,795 @@ static void PrintAiProviders()
     {
         std::wcout << L"  " << provider << L"\n";
     }
+}
+
+static void PrintBackendHelp()
+{
+    std::wcout << L"backend command:\n";
+    std::wcout << L"  backend [auto|native|dbgeng]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  auto     prefer native implementations, route unsupported commands to DbgEng\n";
+    std::wcout << L"  native   disable generic DbgEng fallback\n";
+    std::wcout << L"  dbgeng   force DbgEng routing for most non-session commands\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Session, service, callbacks, AI, native memory, dt, and u/uf commands stay intercepted by the TUI.\n";
+    std::wcout << L"  Use kd <command> for a one-off raw DbgEng command without changing backend mode.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  backend\n";
+    std::wcout << L"  backend native\n";
+    std::wcout << L"  backend dbgeng\n";
+}
+
+static void PrintKdInitHelp()
+{
+    std::wcout << L"kdinit command:\n";
+    std::wcout << L"  kdinit\n";
+    std::wcout << L"  kdinit /local [connect-options]\n";
+    std::wcout << L"  kdinit /remote <connect-options>\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  /local    initialize a local live-kernel DbgEng backend\n";
+    std::wcout << L"  /remote   initialize a remote-kernel DbgEng backend with connection options\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  kdinit is needed before reliable DbgEng-only command routing.\n";
+    std::wcout << L"  Local live-kernel DbgEng support depends on Debugging Tools runtime availability and Windows policy.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  kdinit\n";
+    std::wcout << L"  kdinit /local\n";
+    std::wcout << L"  kdinit /remote com:port=COM1,baud=115200\n";
+}
+
+static void PrintProbeHelp()
+{
+    std::wcout << L"probe command:\n";
+    std::wcout << L"  probe [status|load [sys-path]|info|reset|unload]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  status   show KnLiveDbgProbe service state and buffer addresses\n";
+    std::wcout << L"  load     install/start KnLiveDbgProbe.sys from the EXE directory or sys-path\n";
+    std::wcout << L"  info     query the probe buffer virtual and physical addresses\n";
+    std::wcout << L"  reset    rewrite the probe pattern\n";
+    std::wcout << L"  unload   stop/delete the probe service\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  probe load\n";
+    std::wcout << L"  probe info\n";
+    std::wcout << L"  probe unload\n";
+}
+
+static void PrintProcCtxHelp()
+{
+    std::wcout << L"procctx command:\n";
+    std::wcout << L"  procctx [status|clear|<process-id>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  status       show the active process page-table context\n";
+    std::wcout << L"  clear        clear the active process context\n";
+    std::wcout << L"  <process-id> resolve EPROCESS, kernel DTB, and user DTB for that PID\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  d*/e*/vtop use the active context for user virtual addresses unless /process is supplied.\n";
+    std::wcout << L"  /process on a single command does not change the persistent procctx setting.\n";
+}
+
+static void PrintWriteHelp()
+{
+    std::wcout << L"write command:\n";
+    std::wcout << L"  write on|off\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  on    enable native write IOCTLs for the active device session\n";
+    std::wcout << L"  off   disable native write IOCTLs for the active device session\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Write mode defaults to on at startup. e* defaults to System(pid 4) context for kernel addresses.\n";
+    std::wcout << L"  This is the driver session write gate; it does not validate that a target patch is semantically safe.\n";
+}
+
+static void PrintDmlProcHelp()
+{
+    std::wcout << L"!dml_proc command:\n";
+    std::wcout << L"  !dml_proc\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Native process listing that does not require a DbgEng current process/thread.\n";
+    std::wcout << L"  The all-process form resolves PID 4, then walks _EPROCESS.ActiveProcessLinks.\n";
+    std::wcout << L"  Output includes EPROCESS, PID, parent PID, active thread count, DTB, and image name.\n";
+}
+
+static void PrintVtopHelp()
+{
+    std::wcout << L"vtop command:\n";
+    std::wcout << L"  vtop <address|symbol> [length]\n";
+    std::wcout << L"  vtop /cr3 <directory-table-base> <address|symbol> [length]\n";
+    std::wcout << L"  vtop /process <process-id> <address|symbol> [length]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands/options:\n";
+    std::wcout << L"  /cr3       translate with an explicit directory-table base\n";
+    std::wcout << L"  /process   resolve the process DTB and translate in that context\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  The output includes PML4/PML5 state, leaf entry PA, page size, and writable state.\n";
+    std::wcout << L"  Without /cr3 or /process, user addresses use procctx when set; kernel addresses use the native kernel context.\n";
+    std::wcout << L"  length is bytes and is used to report the contiguous translated range.\n";
+}
+
+static void PrintDtHelp(const std::wstring& command)
+{
+    std::wstring name = command == L"dtx" ? L"dtx" : L"dt";
+
+    std::wcout << name << L" command:\n";
+    std::wcout << L"  " << name << L" [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  -r      recurse one level into nested UDT fields\n";
+    std::wcout << L"  -rN     recurse N levels\n";
+    std::wcout << L"  -v      print verbose type metadata\n";
+    std::wcout << L"  -b      bare field/type names where possible\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Wildcard type patterns such as nt!* enumerate matching type names only.\n";
+    std::wcout << L"  Exact type names can dump field layouts and read field values when an address is supplied.\n";
+    std::wcout << L"  nt! is treated as the loaded kernel image, including ntoskrnl/ntkrnlmp PDB names.\n";
+    std::wcout << L"  Field filters match field names or field type names case-insensitively.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  " << name << L" nt!_EPROCESS\n";
+    std::wcout << L"  " << name << L" nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks\n";
+    std::wcout << L"  " << name << L" nt!*\n";
+}
+
+static void PrintDisassemblyHelp()
+{
+    std::wcout << L"disassembly commands:\n";
+    std::wcout << L"  u [address|symbol] [instruction-count]\n";
+    std::wcout << L"  uf <address|symbol> [max-instructions]\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  u disassembles forward and remembers the next address.\n";
+    std::wcout << L"  uf uses native byte reads when the driver is open, then follows local branch targets.\n";
+    std::wcout << L"  u defaults to 8 instructions and caps explicit counts at 256.\n";
+    std::wcout << L"  uf defaults to 512 instructions and caps explicit counts at 4096.\n";
+}
+
+static void PrintDisplayHelp(const std::wstring& command)
+{
+    std::wcout << L"display memory commands:\n";
+    std::wcout << L"  " << command << L" [/process <process-id>] <address|symbol> [count]\n";
+    std::wcout << L"\n";
+    std::wcout << L"families:\n";
+    std::wcout << L"  d/db/da/dc/dd/df/dp/dq/du/dw/dyb/dyd\n";
+    std::wcout << L"  dda/ddp/ddu/dpa/dpp/dpu/dqa/dqp/dqu\n";
+    std::wcout << L"  dds/dps/dqs\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /process <process-id>  read in a process page-table context\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  count is element count for unit dumps and character count for string dumps.\n";
+    std::wcout << L"  unreadable bytes are shown as ?? when sparse reads can continue.\n";
+    std::wcout << L"  dds/dps/dqs annotate values with nearest loaded symbols.\n";
+}
+
+static void PrintEnterHelp(const std::wstring& command)
+{
+    std::wcout << L"enter memory commands:\n";
+    std::wcout << L"  " << command << L" [/process <process-id>] <address|symbol> <value...>\n";
+    std::wcout << L"  " << command << L" [/process <process-id>] <address|symbol>\n";
+    std::wcout << L"\n";
+    std::wcout << L"families:\n";
+    std::wcout << L"  e/eb/ew/ed/ef/ep/eq write integer values\n";
+    std::wcout << L"  ea/eu write strings\n";
+    std::wcout << L"  eza/ezu write zero-terminated strings\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Address-only form prompts for replacement bytes. Kernel virtual writes use System(pid 4) context by default.\n";
+    std::wcout << L"  /process <process-id> writes through that process page table for this command only.\n";
+    std::wcout << L"  Read-only leaf PTEs are temporarily marked writable, flushed, written, and restored.\n";
+    std::wcout << L"  Integer values are little-endian and clipped to the command width.\n";
+}
+
+static void PrintPhysicalDisplayHelp(const std::wstring& command)
+{
+    std::wcout << L"physical display commands:\n";
+    std::wcout << L"  " << command << L" <physical-address> [count]\n";
+    std::wcout << L"\n";
+    std::wcout << L"families:\n";
+    std::wcout << L"  phys/pdb display bytes\n";
+    std::wcout << L"  pdw/pdd/pdq display words, dwords, or qwords\n";
+    std::wcout << L"  !db/!dw/!dd/!dq display physical bytes, words, dwords, or qwords\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  count is element count; phys, pdb, and !db default to byte dumps.\n";
+    std::wcout << L"  Unreadable physical bytes are shown as ?? when sparse reads can continue.\n";
+}
+
+static void PrintPhysicalEnterHelp(const std::wstring& command)
+{
+    std::wcout << L"physical enter commands:\n";
+    std::wcout << L"  " << command << L" <physical-address> [value...]\n";
+    std::wcout << L"  " << command << L" <physical-address>\n";
+    std::wcout << L"\n";
+    std::wcout << L"families:\n";
+    std::wcout << L"  peb/pew/ped/peq write bytes, words, dwords, or qwords\n";
+    std::wcout << L"  !eb/!ew/!ed/!eq write physical bytes, words, dwords, or qwords\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Address-only form prompts with the current physical value, like WinDbg eb-style editing.\n";
+    std::wcout << L"  Physical writes bypass process page-table context and use the physical address directly.\n";
+    std::wcout << L"  Integer values are little-endian and clipped to the command width.\n";
+}
+
+static void PrintSearchHelp()
+{
+    std::wcout << L"search command:\n";
+    std::wcout << L"  s [-b|-w|-d|-q] <address> <length> <value...>\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  -b   byte pattern\n";
+    std::wcout << L"  -w   word pattern\n";
+    std::wcout << L"  -d   dword pattern\n";
+    std::wcout << L"  -q   qword pattern\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  length is bytes; value tokens are encoded using the selected pattern width.\n";
+    std::wcout << L"  -b is the default when no width option is supplied.\n";
+}
+
+static void PrintCompareHelp()
+{
+    std::wcout << L"compare command:\n";
+    std::wcout << L"  c <address1> <address2> <length>\n";
+}
+
+static void PrintFillHelp()
+{
+    std::wcout << L"fill command:\n";
+    std::wcout << L"  f <address> <length> <byte-pattern...>\n";
+    std::wcout << L"  fp <address> <length> <pointer-pattern...>\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  length is bytes; the pattern repeats until the target range is filled.\n";
+}
+
+static void PrintMoveHelp()
+{
+    std::wcout << L"move command:\n";
+    std::wcout << L"  m <source> <destination> <length>\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  length is bytes; the command reads the source range first, then writes destination.\n";
+}
+
+static void PrintSetFieldHelp()
+{
+    std::wcout << L"setfield command:\n";
+    std::wcout << L"  setfield <type> <address|symbol> <field> <value>\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Resolves the field offset from symbols and writes the scalar value at address + offset.\n";
+    std::wcout << L"  Use dt <type> <address> <field> first to confirm field layout and current value.\n";
+}
+
+static void PrintNumberBaseHelp()
+{
+    std::wcout << L"n command:\n";
+    std::wcout << L"  n [10|16]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  10   use decimal input base for unprefixed numeric values\n";
+    std::wcout << L"  16   use hexadecimal input base for unprefixed numeric values\n";
+}
+
+static void PrintQuietHelp()
+{
+    std::wcout << L"sq command:\n";
+    std::wcout << L"  sq [true|false]\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Toggles quiet-mode state used by native output paths that honor it.\n";
+}
+
+static void PrintSymbolHelp(const std::wstring& command)
+{
+    std::wcout << L"symbol command:\n";
+    if (command == L".sympath" || command == L"sympath")
+    {
+        std::wcout << L"  .sympath [path]\n";
+        std::wcout << L"  sympath [path]\n";
+        std::wcout << L"  Show or replace the current symbol path.\n";
+    }
+    else if (command == L".sympath+")
+    {
+        std::wcout << L"  .sympath+ <path>\n";
+        std::wcout << L"  Append to the current symbol path.\n";
+    }
+    else if (command == L".reload" || command == L"reload" || command == L"ld")
+    {
+        std::wcout << L"  .reload\n";
+        std::wcout << L"  reload\n";
+        std::wcout << L"  ld\n";
+        std::wcout << L"  Reload kernel module information and symbols.\n";
+    }
+    else if (command == L"lm" || command == L"modules")
+    {
+        std::wcout << L"  lm [filter]\n";
+        std::wcout << L"  modules [filter]\n";
+        std::wcout << L"  List loaded kernel modules; filter matches image names case-insensitively.\n";
+    }
+    else if (command == L"x")
+    {
+        std::wcout << L"  x <module!mask>\n";
+        std::wcout << L"  Enumerate symbols matching a DbgHelp-style wildcard mask.\n";
+    }
+    else
+    {
+        std::wcout << L"  ln <symbol|address>\n";
+        std::wcout << L"  addr <symbol|address>\n";
+        std::wcout << L"  Resolve an expression and print the nearest loaded symbol.\n";
+    }
+}
+
+static void PrintSessionHelp(const std::wstring& command)
+{
+    std::wstring name = command;
+
+    if (name == L"||" || name == L"||s")
+    {
+        std::wcout << L"target command:\n";
+        std::wcout << L"  ||\n";
+        std::wcout << L"  ||s\n";
+        std::wcout << L"  Show local live-memory system target status.\n";
+    }
+    else if (name == L"|")
+    {
+        std::wcout << L"target command:\n";
+        std::wcout << L"  |\n";
+        std::wcout << L"  Show the current native process context summary.\n";
+    }
+    else if (name == L"q" || name == L"qq" || name == L"qd" || name == L"quit" || name == L"exit")
+    {
+        std::wcout << L"quit commands:\n";
+        std::wcout << L"  q | qq | qd | quit | exit\n";
+        std::wcout << L"  Close the device handle, stop/delete the main driver service, then exit.\n";
+    }
+    else if (name == L"unload")
+    {
+        std::wcout << L"unload command:\n";
+        std::wcout << L"  unload\n";
+        std::wcout << L"  Stop/delete the main driver service, then exit.\n";
+    }
+    else if (name == L"home" || name == L"dashboard")
+    {
+        std::wcout << L"dashboard commands:\n";
+        std::wcout << L"  home\n";
+        std::wcout << L"  dashboard\n";
+        std::wcout << L"  Redraw the startup dashboard.\n";
+    }
+    else if (name == L"drvstatus")
+    {
+        std::wcout << L"drvstatus command:\n";
+        std::wcout << L"  drvstatus\n";
+        std::wcout << L"  Show SCM state, active controller PID, handle count, and write mode.\n";
+    }
+    else if (name == L"version" || name == L"vertarget" || name == L"vercommand")
+    {
+        std::wcout << L"version commands:\n";
+        std::wcout << L"  version\n";
+        std::wcout << L"  vertarget\n";
+        std::wcout << L"  vercommand\n";
+        std::wcout << L"  Show tool, driver ABI, target Windows, or command identity information.\n";
+    }
+    else if (name == L"kd")
+    {
+        std::wcout << L"kd command:\n";
+        std::wcout << L"  kd <windbg-command>\n";
+        std::wcout << L"  Execute a raw DbgEng command independent of backend mode.\n";
+    }
+    else if (name == L"kddetach")
+    {
+        std::wcout << L"kddetach command:\n";
+        std::wcout << L"  kddetach\n";
+        std::wcout << L"  Shut down the current DbgEng backend instance.\n";
+    }
+}
+
+static void PrintQueryHelp()
+{
+    std::wcout << L"query command:\n";
+    std::wcout << L"  query <address|symbol> [length]\n";
+    std::wcout << L"  Ask the driver for a native virtual-address range summary.\n";
+    std::wcout << L"  length is bytes and defaults to one byte.\n";
+}
+
+static void PrintAiHelp()
+{
+    std::wcout << L"ai command:\n";
+    std::wcout << L"  ai <subcommand> [args...]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  status       show provider, model, credential, policy, and transcript state\n";
+    std::wcout << L"  providers    list supported providers\n";
+    std::wcout << L"  provider     select openai-codex-cli, openai-codex-subscription, deepseek, openrouter, or off\n";
+    std::wcout << L"  policy       set allow-remote, local-only, or status\n";
+    std::wcout << L"  model        set provider model name\n";
+    std::wcout << L"  base-url     set compatible API base URL\n";
+    std::wcout << L"  effort       set reasoning effort\n";
+    std::wcout << L"  auth         print provider authentication help\n";
+    std::wcout << L"  preview      print the composed request without sending it\n";
+    std::wcout << L"  ask          send an advisory prompt\n";
+    std::wcout << L"  plan         ask AI to produce executable command proposals\n";
+    std::wcout << L"  analyze      run evidence commands and ask AI to analyze output\n";
+    std::wcout << L"  explain      explain dt/dtx output\n";
+    std::wcout << L"  annotate     annotate u/uf disassembly output\n";
+    std::wcout << L"  diagnose     diagnose setup, symbol, backend, or command failures\n";
+    std::wcout << L"  playbook     create investigation playbooks\n";
+    std::wcout << L"  show         show the loaded AI plan\n";
+    std::wcout << L"  run          execute planned read-only commands\n";
+    std::wcout << L"  write        preview or confirm a planned write-like command\n";
+    std::wcout << L"  transcript   configure AI transcript logging\n";
+    std::wcout << L"  audit        configure write-audit logging\n";
+    std::wcout << L"  report       write a session report\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  ai provider openrouter\n";
+    std::wcout << L"  ai analyze callbacks all WdFilter.sys\n";
+    std::wcout << L"  ai annotate uf nt!PspCreateProcessNotifyRoutine 128\n";
+    std::wcout << L"  ai provider help\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  API-key providers load .env from the current directory, EXE directory, or repo root.\n";
+    std::wcout << L"  ai run executes read-only validated plan commands; write-like commands require ai write confirm.\n";
+}
+
+static bool PrintAiSubcommandHelp(const std::wstring& action)
+{
+    bool handled = true;
+    std::wstring name = ToLower(action);
+
+    if (name == L"status")
+    {
+        std::wcout << L"ai status:\n";
+        std::wcout << L"  ai status\n";
+        std::wcout << L"  Show current AI provider runtime settings.\n";
+    }
+    else if (name == L"providers")
+    {
+        std::wcout << L"ai providers:\n";
+        std::wcout << L"  ai providers\n";
+        std::wcout << L"  List provider names accepted by ai provider.\n";
+    }
+    else if (name == L"provider")
+    {
+        std::wcout << L"ai provider:\n";
+        std::wcout << L"  ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>\n";
+        std::wcout << L"  API-key providers read credentials from .env in the EXE/workspace search path.\n";
+        std::wcout << L"  DeepSeek uses DEEPSEEK_API_KEY; OpenRouter uses OPENROUTER_API_KEY.\n";
+    }
+    else if (name == L"policy")
+    {
+        std::wcout << L"ai policy:\n";
+        std::wcout << L"  ai policy <allow-remote|local-only|status>\n";
+        std::wcout << L"  local-only blocks remote API providers.\n";
+    }
+    else if (name == L"model")
+    {
+        std::wcout << L"ai model:\n";
+        std::wcout << L"  ai model <model>\n";
+        std::wcout << L"  Sets the provider model string without changing provider.\n";
+        std::wcout << L"  The accepted model names depend on the selected provider.\n";
+    }
+    else if (name == L"base-url")
+    {
+        std::wcout << L"ai base-url:\n";
+        std::wcout << L"  ai base-url <url>\n";
+        std::wcout << L"  Sets an OpenAI-compatible API base URL for providers that support it.\n";
+    }
+    else if (name == L"effort")
+    {
+        std::wcout << L"ai effort:\n";
+        std::wcout << L"  ai effort <minimal|low|medium|high|xhigh>\n";
+        std::wcout << L"  Sets reasoning effort for compatible providers.\n";
+    }
+    else if (name == L"auth")
+    {
+        std::wcout << L"ai auth:\n";
+        std::wcout << L"  ai auth\n";
+        std::wcout << L"  Prints provider login and .env credential guidance.\n";
+    }
+    else if (name == L"preview" || name == L"ask")
+    {
+        std::wcout << L"ai " << name << L":\n";
+        std::wcout << L"  ai preview <prompt>\n";
+        std::wcout << L"  ai ask <prompt>\n";
+        std::wcout << L"  preview prints the request locally; ask sends it to the selected provider.\n";
+        std::wcout << L"  If the prompt is literally help, use ai ask \"help\" or ai help ask to avoid ambiguity.\n";
+    }
+    else if (name == L"plan")
+    {
+        std::wcout << L"ai plan:\n";
+        std::wcout << L"  ai plan <prompt>\n";
+        std::wcout << L"  Builds a validated read/write command plan for later ai run or ai write.\n";
+    }
+    else if (name == L"analyze")
+    {
+        std::wcout << L"ai analyze:\n";
+        std::wcout << L"  ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]\n";
+        std::wcout << L"  ai analyze callbacks [scope] /module <module>\n";
+        std::wcout << L"  Runs the callback scan, captures output, and asks AI for an analysis report.\n";
+    }
+    else if (name == L"explain")
+    {
+        std::wcout << L"ai explain:\n";
+        std::wcout << L"  ai explain dt <dt-args...>\n";
+        std::wcout << L"  ai explain dtx <dtx-args...>\n";
+        std::wcout << L"  Runs dt/dtx and asks AI to explain fields and follow-ups.\n";
+    }
+    else if (name == L"annotate")
+    {
+        std::wcout << L"ai annotate:\n";
+        std::wcout << L"  ai annotate <u|uf> <address|symbol> [instruction-count]\n";
+        std::wcout << L"  Runs native disassembly and asks AI to annotate likely behavior.\n";
+    }
+    else if (name == L"diagnose")
+    {
+        std::wcout << L"ai diagnose:\n";
+        std::wcout << L"  ai diagnose <symbol/backend/type failure or operator note>\n";
+    }
+    else if (name == L"playbook")
+    {
+        std::wcout << L"ai playbook:\n";
+        std::wcout << L"  ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]\n";
+        std::wcout << L"  Generates investigation commands; run executes read-only plan items immediately.\n";
+    }
+    else if (name == L"show")
+    {
+        std::wcout << L"ai show:\n";
+        std::wcout << L"  ai show\n";
+        std::wcout << L"  Show the current parsed AI command plan.\n";
+    }
+    else if (name == L"run")
+    {
+        std::wcout << L"ai run:\n";
+        std::wcout << L"  ai run <index|all>\n";
+        std::wcout << L"  Execute planned commands that passed read-only validation.\n";
+        std::wcout << L"  Session mutation, unload, backend changes, and write-like commands are blocked.\n";
+    }
+    else if (name == L"write")
+    {
+        std::wcout << L"ai write:\n";
+        std::wcout << L"  ai write <index>\n";
+        std::wcout << L"  ai write <index> confirm\n";
+        std::wcout << L"  Preview backup/translation/verify commands before operator-confirmed writes.\n";
+    }
+    else if (name == L"transcript")
+    {
+        std::wcout << L"ai transcript:\n";
+        std::wcout << L"  ai transcript <path|off|status>\n";
+        std::wcout << L"  ai transcript max <bytes|off>\n";
+        std::wcout << L"  ai transcript redact <on|off>\n";
+    }
+    else if (name == L"audit")
+    {
+        std::wcout << L"ai audit:\n";
+        std::wcout << L"  ai audit <path|off|status>\n";
+        std::wcout << L"  Records write-like AI command decisions.\n";
+    }
+    else if (name == L"report")
+    {
+        std::wcout << L"ai report:\n";
+        std::wcout << L"  ai report <path>\n";
+        std::wcout << L"  Writes a human-readable AI session report.\n";
+    }
+    else
+    {
+        handled = false;
+    }
+
+    return handled;
+}
+
+static void PrintAiHelpFromArgs(const std::vector<std::wstring>& args, size_t first)
+{
+    size_t index = first;
+
+    if (index < args.size() && IsHelpToken(args[index]))
+    {
+        ++index;
+    }
+
+    if (index < args.size())
+    {
+        if (!PrintAiSubcommandHelp(args[index]))
+        {
+            std::wcerr << L"unknown ai help topic: " << args[index] << L"\n";
+            PrintAiHelp();
+        }
+    }
+    else
+    {
+        PrintAiHelp();
+    }
+}
+
+static bool IsAiPromptPayloadAction(const std::wstring& action)
+{
+    return action == L"ask" || action == L"preview" || action == L"plan" || action == L"diagnose";
+}
+
+static bool IsAiSubcommandHelpRequest(const std::vector<std::wstring>& args, const std::wstring& action)
+{
+    bool help = false;
+
+    do
+    {
+        if (args.size() < 3)
+        {
+            break;
+        }
+
+        if (IsAiPromptPayloadAction(action))
+        {
+            help = args.size() == 3 && IsHelpToken(args[2]);
+            break;
+        }
+
+        for (size_t index = 2; index < args.size(); ++index)
+        {
+            if (IsHelpToken(args[index]))
+            {
+                help = true;
+                break;
+            }
+        }
+    } while (false);
+
+    return help;
+}
+
+static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size_t commandIndex)
+{
+    bool handled = true;
+
+    do
+    {
+        if (commandIndex >= args.size())
+        {
+            handled = false;
+            break;
+        }
+
+        std::wstring command = CompletionCanonicalCommand(args[commandIndex]);
+        size_t detailIndex = commandIndex + 1;
+        if (detailIndex < args.size() && IsHelpToken(args[detailIndex]))
+        {
+            ++detailIndex;
+        }
+
+        if (command == L"help" || command == L"?")
+        {
+            PrintHelp(false);
+        }
+        else if (command == L"callbacks")
+        {
+            PrintCallbacksHelpFromArgs(args, detailIndex);
+        }
+        else if (command == L"ai")
+        {
+            PrintAiHelpFromArgs(args, detailIndex);
+        }
+        else if (command == L"backend")
+        {
+            PrintBackendHelp();
+        }
+        else if (command == L"kdinit")
+        {
+            PrintKdInitHelp();
+        }
+        else if (command == L"probe")
+        {
+            PrintProbeHelp();
+        }
+        else if (command == L"procctx")
+        {
+            PrintProcCtxHelp();
+        }
+        else if (command == L"write")
+        {
+            PrintWriteHelp();
+        }
+        else if (command == L"!dml_proc")
+        {
+            PrintDmlProcHelp();
+        }
+        else if (command == L"vtop")
+        {
+            PrintVtopHelp();
+        }
+        else if (command == L"dt" || command == L"dtx")
+        {
+            PrintDtHelp(command);
+        }
+        else if (command == L"u" || command == L"uf")
+        {
+            PrintDisassemblyHelp();
+        }
+        else if (IsDisplayCommand(command))
+        {
+            PrintDisplayHelp(command);
+        }
+        else if (IsEnterCommand(command))
+        {
+            PrintEnterHelp(command);
+        }
+        else if (IsPhysicalDisplayCommand(command))
+        {
+            PrintPhysicalDisplayHelp(command);
+        }
+        else if (IsPhysicalEnterCommand(command))
+        {
+            PrintPhysicalEnterHelp(command);
+        }
+        else if (command == L"s")
+        {
+            PrintSearchHelp();
+        }
+        else if (command == L"c")
+        {
+            PrintCompareHelp();
+        }
+        else if (command == L"f" || command == L"fp")
+        {
+            PrintFillHelp();
+        }
+        else if (command == L"m")
+        {
+            PrintMoveHelp();
+        }
+        else if (command == L"setfield")
+        {
+            PrintSetFieldHelp();
+        }
+        else if (command == L"n")
+        {
+            PrintNumberBaseHelp();
+        }
+        else if (command == L"sq")
+        {
+            PrintQuietHelp();
+        }
+        else if (command == L".sympath" || command == L"sympath" || command == L".sympath+" ||
+                 command == L".reload" || command == L"reload" || command == L"ld" ||
+                 command == L"lm" || command == L"modules" || command == L"x" ||
+                 command == L"ln" || command == L"addr")
+        {
+            PrintSymbolHelp(command);
+        }
+        else if (command == L"query")
+        {
+            PrintQueryHelp();
+        }
+        else if (command == L"home" || command == L"dashboard" || command == L"drvstatus" ||
+                 command == L"version" || command == L"vertarget" || command == L"vercommand" ||
+                 command == L"kd" || command == L"kddetach" || command == L"unload" ||
+                 command == L"||" || command == L"||s" || command == L"|" ||
+                 command == L"q" || command == L"qq" || command == L"qd" ||
+                 command == L"quit" || command == L"exit")
+        {
+            PrintSessionHelp(command);
+        }
+        else
+        {
+            handled = false;
+        }
+    } while (false);
+
+    return handled;
 }
 
 static bool ParseDecimalIndex(const std::wstring& value, size_t* output)
@@ -8267,6 +10190,12 @@ static std::wstring InferAiPlanBackend(const std::wstring& commandLine, const st
         }
 
         std::wstring command = NormalizeInputCommand(args[0]);
+        if (IsNativeBangCommand(command))
+        {
+            backend = L"native";
+            break;
+        }
+
         if (command == L"kd" || commandClass == L"dbgeng" || (!command.empty() && command[0] == L'!'))
         {
             backend = L"dbgeng";
@@ -8374,7 +10303,11 @@ static bool IsNativePhysicalReadCommand(const std::wstring& command)
         command == L"pdb" ||
         command == L"pdw" ||
         command == L"pdd" ||
-        command == L"pdq")
+        command == L"pdq" ||
+        command == L"!db" ||
+        command == L"!dw" ||
+        command == L"!dd" ||
+        command == L"!dq")
     {
         result = true;
     }
@@ -8425,6 +10358,18 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
 
         if (command == L"kd" || (!command.empty() && command[0] == L'!'))
         {
+            if (IsPhysicalDisplayCommand(command))
+            {
+                commandClass = L"physical-read";
+                break;
+            }
+
+            if (command == L"!dml_proc")
+            {
+                commandClass = L"process";
+                break;
+            }
+
             commandClass = L"dbgeng";
             break;
         }
@@ -8445,9 +10390,15 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
             break;
         }
 
-        if (command == L"callbacks" || command == L"kcallbacks" || command == L"cb")
+        if (command == L"callbacks")
         {
             commandClass = L"callbacks";
+            break;
+        }
+
+        if (command == L"!dml_proc")
+        {
+            commandClass = L"process";
             break;
         }
 
@@ -8688,6 +10639,94 @@ static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* r
     return ok;
 }
 
+static bool ValidateCallbackCommandArgumentShape(
+    const std::vector<std::wstring>& args,
+    std::wstring* reason)
+{
+    bool ok = false;
+
+    do
+    {
+        size_t index = 1;
+        bool hasModuleFilter = false;
+
+        if (args.size() <= index)
+        {
+            ok = true;
+            break;
+        }
+
+        if (IsCallbackScopeName(args[index]))
+        {
+            ++index;
+        }
+        else if (IsDeprecatedCallbackScopeAlias(args[index]) ||
+                 IsDeprecatedCallbackModuleOption(args[index]))
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"callback command uses a deprecated alias; use all, object, registry, process, thread, minifilter, and /module";
+            }
+            break;
+        }
+
+        while (index < args.size())
+        {
+            if (IsCallbackModuleOption(args[index]))
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"callback /module option requires a module name";
+                    }
+                    break;
+                }
+
+                if (hasModuleFilter)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"callback command has more than one module filter";
+                    }
+                    break;
+                }
+
+                hasModuleFilter = true;
+                index += 2;
+                continue;
+            }
+
+            if (IsDeprecatedCallbackScopeAlias(args[index]) ||
+                IsDeprecatedCallbackModuleOption(args[index]) ||
+                IsSwitchLikeToken(args[index]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"callback command uses an unsupported option or deprecated alias";
+                }
+                break;
+            }
+
+            if (hasModuleFilter)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"callback command has more than one module filter";
+                }
+                break;
+            }
+
+            hasModuleFilter = true;
+            ++index;
+        }
+
+        ok = index >= args.size();
+    } while (false);
+
+    return ok;
+}
+
 static bool ValidateAiPlanArgumentShape(
     const std::wstring& command,
     const std::vector<std::wstring>& args,
@@ -8745,7 +10784,77 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
-        else if (IsEnterCommand(command) || IsPhysicalEnterCommand(command))
+        else if (IsDisplayCommand(command))
+        {
+            if (args.size() >= 2)
+            {
+                if (IsDeprecatedProcessContextOption(args[1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"memory command uses deprecated /pid option; use /process";
+                    }
+                    break;
+                }
+
+                if (IsSwitchLikeToken(args[1]) && !IsProcessContextOption(args[1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"memory command uses an unsupported option";
+                    }
+                    break;
+                }
+
+                if (IsProcessContextOption(args[1]) && args.size() < 4)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"memory /process option requires process id and address";
+                    }
+                    break;
+                }
+            }
+        }
+        else if (IsEnterCommand(command))
+        {
+            if (args.size() < 3)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"write command requires target and at least one value";
+                }
+                break;
+            }
+
+            if (IsDeprecatedProcessContextOption(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"write command uses deprecated /pid option; use /process";
+                }
+                break;
+            }
+
+            if (IsSwitchLikeToken(args[1]) && !IsProcessContextOption(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"write command uses an unsupported option";
+                }
+                break;
+            }
+
+            if (IsProcessContextOption(args[1]) && args.size() < 5)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"write /process option requires process id, target, and value";
+                }
+                break;
+            }
+        }
+        else if (IsPhysicalEnterCommand(command))
         {
             if (args.size() < 3)
             {
@@ -8759,11 +10868,47 @@ static bool ValidateAiPlanArgumentShape(
         else if (command == L"vtop" && args.size() >= 2)
         {
             std::wstring option = ToLower(args[1]);
-            if ((option == L"/cr3" || option == L"/pid" || option == L"/process") && args.size() < 4)
+            if (IsDeprecatedProcessContextOption(option))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"vtop command uses deprecated /pid option; use /process";
+                }
+                break;
+            }
+
+            if (IsSwitchLikeToken(option) && option != L"/cr3" && !IsProcessContextOption(option))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"vtop command uses an unsupported option";
+                }
+                break;
+            }
+
+            if ((option == L"/cr3" || option == L"/process") && args.size() < 4)
             {
                 if (reason != nullptr)
                 {
                     *reason = L"vtop option requires context value and address";
+                }
+                break;
+            }
+        }
+        else if (command == L"callbacks")
+        {
+            if (!ValidateCallbackCommandArgumentShape(args, reason))
+            {
+                break;
+            }
+        }
+        else if (command == L"!dml_proc")
+        {
+            if (args.size() != 1)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!dml_proc does not accept arguments";
                 }
                 break;
             }
@@ -9027,7 +11172,7 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"]}\n";
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
-    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, vtop, pdb, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
     stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
@@ -9433,19 +11578,7 @@ static bool EstimatePhysicalEnterWriteSize(const std::vector<std::wstring>& comm
         }
 
         std::wstring command = NormalizeInputCommand(commandArgs[0]);
-        uint64_t width = 1;
-        if (command == L"pew")
-        {
-            width = 2;
-        }
-        else if (command == L"ped")
-        {
-            width = 4;
-        }
-        else if (command == L"peq")
-        {
-            width = 8;
-        }
+        uint64_t width = static_cast<uint64_t>(UnitWidthForPhysicalEnterCommand(command));
 
         uint64_t count = static_cast<uint64_t>(commandArgs.size() - 2);
         if (count <= (~0ull / width))
@@ -9501,7 +11634,7 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             EstimateEnterWriteSize(commandArgs, &byteCount);
 
             bool hasExplicitContext = addressIndex >= 3 && IsProcessContextOption(commandArgs[1]);
-            std::wstring contextPrefix = hasExplicitContext ? L"/pid " + commandArgs[2] + L" " : L"/pid 4 ";
+            std::wstring contextPrefix = hasExplicitContext ? L"/process " + commandArgs[2] + L" " : L"/process 4 ";
             plan.TargetKind = hasExplicitContext ? L"virtual-process" : L"virtual-kernel-system";
             plan.Target = resolved ? HexText(address) : commandArgs[addressIndex];
             plan.Target += hasExplicitContext ? L" pid=" + commandArgs[2] : L" pid=4(default)";
@@ -9816,7 +11949,7 @@ static void PopulateWriteRestoreCommand(
         std::wstring restorePrefix = physical ? L"peb" : L"eb";
         if (!physical && hasAddressContext)
         {
-            restorePrefix += L" /pid " + std::to_wstring(addressContext.ProcessId);
+            restorePrefix += L" /process " + std::to_wstring(addressContext.ProcessId);
         }
 
         plan->RestoreCommand = BuildByteRestoreCommand(restorePrefix, address, bytes);
@@ -10137,7 +12270,7 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
         {
             plan.Title = L"Object callback integrity review";
             plan.Summary = L"Enumerate object-manager callback lists discovered from object type objects.";
-            add(L"callbacks ob", L"enumerate object-manager filters by object type");
+            add(L"callbacks object", L"enumerate object-manager filters by object type");
             add(L"dt nt!_OBJECT_TYPE", L"show object type layout for offset verification");
         }
         else if (key == L"address")
@@ -10451,7 +12584,7 @@ static void HandleAiCommand(
 {
     do
     {
-        if (args.size() == 1 || args[1] == L"status")
+        if (args.size() == 1)
         {
             std::wcout << ai.StatusText();
             break;
@@ -10460,31 +12593,18 @@ static void HandleAiCommand(
         std::wstring action = ToLower(args[1]);
         if (action == L"help")
         {
-            std::wcout << L"ai commands:\n";
-            std::wcout << L"  ai status\n";
-            std::wcout << L"  ai providers\n";
-            std::wcout << L"  ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>\n";
-            std::wcout << L"  ai policy <allow-remote|local-only|status>\n";
-            std::wcout << L"  ai model <model>\n";
-            std::wcout << L"  ai baseurl <url>\n";
-            std::wcout << L"  ai effort <minimal|low|medium|high|xhigh>\n";
-            std::wcout << L"  ai auth\n";
-            std::wcout << L"  ai preview <prompt>\n";
-            std::wcout << L"  ai ask <prompt>\n";
-            std::wcout << L"  ai plan <prompt>\n";
-            std::wcout << L"  ai analyze callbacks [all|ob|registry|process|thread|minifilter] [module]\n";
-            std::wcout << L"  ai explain dt <dt-args...>\n";
-            std::wcout << L"  ai annotate <u|uf> <address|symbol> [count]\n";
-            std::wcout << L"  ai diagnose <prompt>\n";
-            std::wcout << L"  ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]\n";
-            std::wcout << L"  ai show\n";
-            std::wcout << L"  ai run <index|all>\n";
-            std::wcout << L"  ai write <index> [confirm]\n";
-            std::wcout << L"  ai transcript <path|off|status>\n";
-            std::wcout << L"  ai transcript max <bytes|off>\n";
-            std::wcout << L"  ai transcript redact <on|off>\n";
-            std::wcout << L"  ai audit <path|off|status>\n";
-            std::wcout << L"  ai report <path>\n";
+            PrintAiHelpFromArgs(args, 1);
+        }
+        else if (IsAiSubcommandHelpRequest(args, action))
+        {
+            if (!PrintAiSubcommandHelp(action))
+            {
+                PrintAiHelp();
+            }
+        }
+        else if (action == L"status")
+        {
+            std::wcout << ai.StatusText();
         }
         else if (action == L"providers")
         {
@@ -10535,11 +12655,11 @@ static void HandleAiCommand(
             ai.SetModel(JoinArgs(args, 2));
             std::wcout << ai.StatusText();
         }
-        else if (action == L"baseurl" || action == L"base-url")
+        else if (action == L"base-url")
         {
             if (args.size() < 3)
             {
-                std::wcerr << L"usage: ai baseurl <url>\n";
+                std::wcerr << L"usage: ai base-url <url>\n";
                 break;
             }
 
@@ -10713,7 +12833,7 @@ static void HandleAiCommand(
         {
             if (args.size() < 3 || ToLower(args[2]) != L"callbacks")
             {
-                std::wcerr << L"usage: ai analyze callbacks [all|ob|registry|process|thread|minifilter] [module]\n";
+                std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]\n";
                 break;
             }
 
@@ -10727,6 +12847,12 @@ static void HandleAiCommand(
                     scope = args[3];
                     index = 4;
                 }
+                else if (IsDeprecatedCallbackScopeAlias(args[3]) ||
+                         IsDeprecatedCallbackModuleOption(args[3]))
+                {
+                    std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]\n";
+                    break;
+                }
 
                 while (index < args.size())
                 {
@@ -10738,9 +12864,22 @@ static void HandleAiCommand(
                             break;
                         }
 
+                        if (!moduleFilter.empty())
+                        {
+                            std::wcerr << L"usage: ai analyze callbacks [scope] [module]\n";
+                            break;
+                        }
+
                         moduleFilter = args[index + 1];
                         index += 2;
                         continue;
+                    }
+
+                    if (IsDeprecatedCallbackModuleOption(args[index]) ||
+                        IsDeprecatedCallbackScopeAlias(args[index]))
+                    {
+                        std::wcerr << L"usage: ai analyze callbacks [scope] [module]\n";
+                        break;
                     }
 
                     if (moduleFilter.empty())
@@ -10958,17 +13097,36 @@ static bool HandleCommand(
 
         if (command == L"help")
         {
-            if (args.size() >= 2 &&
-                (ToLower(args[1]) == L"callbacks" ||
-                 ToLower(args[1]) == L"kcallbacks" ||
-                 ToLower(args[1]) == L"cb"))
+            if (args.size() >= 2 && ToLower(args[1]) == L"all")
             {
-                PrintCallbacksHelp();
+                PrintHelp(true);
+            }
+            else if (args.size() >= 2)
+            {
+                if (!PrintDetailedCommandHelp(args, 1))
+                {
+                    std::wstring topic = CompletionCanonicalCommand(args[1]);
+                    if (CommandRegistry::IsKnown(topic))
+                    {
+                        CommandRegistry::PrintCommandStatus(topic);
+                    }
+                    else
+                    {
+                        std::wcerr << L"unknown help topic: " << args[1] << L"\n";
+                        PrintHelp(false);
+                    }
+                }
             }
             else
             {
-                bool includeDbgEng = args.size() >= 2 && ToLower(args[1]) == L"all";
-                PrintHelp(includeDbgEng);
+                PrintHelp(false);
+            }
+        }
+        else if (args.size() >= 2 && IsHelpToken(args[1]))
+        {
+            if (!PrintDetailedCommandHelp(args, 0))
+            {
+                CommandRegistry::PrintCommandStatus(command);
             }
         }
         else if (command == L"home" || command == L"dashboard")
@@ -11012,7 +13170,7 @@ static bool HandleCommand(
         else if (command == L"kdinit")
         {
             state.DbgEngRemoteKernel = false;
-            if (args.size() >= 2 && (ToLower(args[1]) == L"/remote" || ToLower(args[1]) == L"remote"))
+            if (args.size() >= 2 && ToLower(args[1]) == L"/remote")
             {
                 if (args.size() < 3)
                 {
@@ -11023,13 +13181,14 @@ static bool HandleCommand(
                 state.DbgEngRemoteKernel = true;
                 state.DbgEngConnectOptions = JoinArgs(args, 2);
             }
-            else if (args.size() >= 2 && (ToLower(args[1]) == L"/local" || ToLower(args[1]) == L"local"))
+            else if (args.size() >= 2 && ToLower(args[1]) == L"/local")
             {
                 state.DbgEngConnectOptions = args.size() >= 3 ? JoinArgs(args, 2) : L"";
             }
             else if (args.size() >= 2)
             {
-                state.DbgEngConnectOptions = JoinArgs(args, 1);
+                std::wcerr << L"usage: kdinit [/local [connect-options]|/remote <connect-options>]\n";
+                break;
             }
             else
             {
@@ -11080,7 +13239,8 @@ static bool HandleCommand(
         }
         else if (command == L"ai")
         {
-            if (args.size() >= 2 && ToLower(args[1]) == L"run")
+            std::wstring aiAction = args.size() >= 2 ? ToLower(args[1]) : L"";
+            if (aiAction == L"run" && !IsAiSubcommandHelpRequest(args, aiAction))
             {
                 keepRunning = RunAiPlannedCommands(args, state, dbgeng, device, service, symbols, ai, aiState);
             }
@@ -11099,8 +13259,9 @@ static bool HandleCommand(
                  command != L"unload" && command != L"drvstatus" &&
                  command != L"probe" &&
                  command != L"procctx" &&
-                 command != L"callbacks" && command != L"kcallbacks" && command != L"cb" &&
-                 command != L"ai")
+                 command != L"callbacks" &&
+                 command != L"ai" &&
+                 !IsNativeBangCommand(command))
         {
             ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true);
         }
@@ -11281,6 +13442,10 @@ static bool HandleCommand(
         {
             HandleProcessContextCommand(args, state, device, symbols);
         }
+        else if (command == L"!dml_proc")
+        {
+            HandleDmlProcCommand(args, state, device, symbols);
+        }
         else if (IsPhysicalDisplayCommand(command))
         {
             HandlePhysicalDisplayCommand(args, state, device);
@@ -11293,7 +13458,7 @@ static bool HandleCommand(
         {
             HandleDtCommand(args, state, device, symbols);
         }
-        else if (command == L"callbacks" || command == L"kcallbacks" || command == L"cb")
+        else if (command == L"callbacks")
         {
             HandleCallbacksCommand(args, device, symbols);
         }
@@ -11413,7 +13578,13 @@ static bool HandleCommand(
             if (args.size() >= 2)
             {
                 std::wstring value = ToLower(args[1]);
-                state.Quiet = value == L"1" || value == L"on" || value == L"true";
+                if (value != L"true" && value != L"false")
+                {
+                    std::wcerr << L"usage: sq [true|false]\n";
+                    break;
+                }
+
+                state.Quiet = value == L"true";
             }
 
             std::wcout << L"quiet mode: " << (state.Quiet ? L"on" : L"off") << L"\n";
