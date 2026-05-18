@@ -77,13 +77,15 @@ cd .\x64\Release
 .\KnLiveDbg.exe
 ```
 
-The EXE expects `KnLiveDbg.sys` beside it. It resolves the absolute driver path, updates an existing service config when present, creates the service when missing, starts it, and waits for `SERVICE_RUNNING`. `quit` leaves the service loaded. Use `unload` to close the device handle, stop the driver, delete the service, and wait for deletion before exit. Use `drvstatus` to inspect SCM state plus the active single-controller owner/write-mode state. Use `probe load` when you want the optional positive-control driver loaded from the same output directory.
+The EXE expects `KnLiveDbg.sys` beside it. It resolves the absolute driver path, updates an existing service config when present, creates the service when missing, starts it, and waits for `SERVICE_RUNNING`. Startup, single-instance acquisition, install/update, driver load, device open, ABI verification, symbol initialization, probe load, and unload paths are printed as colored staged `[ .. ]`, `[ OK ]`, `[WARN]`, and `[FAIL]` rows. Only one `KnLiveDbg.exe` instance can run at a time; a second elevated process exits before touching SCM or the driver. On successful startup the console prints a colored welcome banner plus a dashboard with driver, write gate, backend, symbols, AI, probe, and quick-action hints before the `knkd>` prompt. `home` or `dashboard` redraws that screen. `q`, `quit`, `exit`, EOF, Ctrl+C, and `unload` close the device handle, stop the main driver, delete the service, and wait for deletion before exit. If the session loaded `KnLiveDbgProbe.sys` with `probe load`, that probe service is also stopped and deleted during process cleanup. Use `drvstatus` to inspect SCM state plus the active single-controller owner/write-mode state. Use `probe load` when you want the optional positive-control driver loaded from the same output directory.
 
 ## TUI Commands
 
 ```text
 help
 help all
+home
+dashboard
 backend [auto|native|dbgeng]
 kdinit [/local [connect-options]|/remote <connect-options>]
 kd <windbg-command>

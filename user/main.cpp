@@ -22,6 +22,20 @@
 #include <vector>
 
 static std::atomic_bool g_StopRequested = false;
+static HANDLE g_MainThreadHandle = nullptr;
+static HANDLE g_InstanceMutexHandle = nullptr;
+static bool g_InstanceMutexOwned = false;
+
+static constexpr WORD KNDBG_COLOR_TEXT = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+static constexpr WORD KNDBG_COLOR_DIM = FOREGROUND_BLUE | FOREGROUND_GREEN;
+static constexpr WORD KNDBG_COLOR_FRAME = FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+static constexpr WORD KNDBG_COLOR_TITLE = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+static constexpr WORD KNDBG_COLOR_ACCENT = FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+static constexpr WORD KNDBG_COLOR_STEP = FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+static constexpr WORD KNDBG_COLOR_OK = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+static constexpr WORD KNDBG_COLOR_WARN = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+static constexpr WORD KNDBG_COLOR_FAIL = FOREGROUND_RED | FOREGROUND_INTENSITY;
+static constexpr WORD KNDBG_COLOR_PROMPT = FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
 
 static std::wstring FormatWin32Error(const wchar_t* prefix, DWORD error)
 {
@@ -40,10 +54,62 @@ static std::wstring FormatWin32Error(const wchar_t* prefix, DWORD error)
     return stream.str();
 }
 
+class ScopedConsoleColor
+{
+public:
+    ScopedConsoleColor(HANDLE handle, WORD foreground) :
+        handle_(handle),
+        oldAttributes_(0),
+        active_(false)
+    {
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+
+        do
+        {
+            if (handle_ == nullptr || handle_ == INVALID_HANDLE_VALUE)
+            {
+                break;
+            }
+
+            if (!GetConsoleScreenBufferInfo(handle_, &info))
+            {
+                break;
+            }
+
+            oldAttributes_ = info.wAttributes;
+            WORD preserved = static_cast<WORD>(info.wAttributes & 0xfff0);
+            WORD attributes = static_cast<WORD>(preserved | foreground);
+            if (!SetConsoleTextAttribute(handle_, attributes))
+            {
+                break;
+            }
+
+            active_ = true;
+        } while (false);
+    }
+
+    ~ScopedConsoleColor()
+    {
+        if (active_)
+        {
+            SetConsoleTextAttribute(handle_, oldAttributes_);
+        }
+    }
+
+private:
+    HANDLE handle_;
+    WORD oldAttributes_;
+    bool active_;
+};
+
 struct DebuggerState
 {
     uint32_t NumberBase;
     bool Quiet;
+    bool MainDriverCleanupRequested;
+    bool MainDriverUnloaded;
+    bool ProbeDriverCleanupRequested;
+    bool ProbeDriverUnloaded;
     std::wstring LastCommand;
     std::wstring DbgEngConnectOptions;
     bool DbgEngRemoteKernel;
@@ -131,6 +197,10 @@ static BOOL WINAPI ConsoleHandler(DWORD controlType)
     case CTRL_BREAK_EVENT:
     case CTRL_CLOSE_EVENT:
         g_StopRequested = true;
+        if (g_MainThreadHandle != nullptr)
+        {
+            CancelSynchronousIo(g_MainThreadHandle);
+        }
         handled = TRUE;
         break;
     default:
@@ -426,6 +496,7 @@ static void PrintHelp(bool includeDbgEng)
 {
     std::wcout << L"KnLiveDbg WinDbg-compatible command surface\n";
     std::wcout << L"usage examples:\n";
+    std::wcout << L"  home\n";
     std::wcout << L"  .sympath SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols\n";
     std::wcout << L"  .reload\n";
     std::wcout << L"  lm nt\n";
@@ -2738,7 +2809,18 @@ static void PrintProbeInfo(const KNDBG_PROBE_INFO_RESPONSE& info)
                << L" 40" << std::dec << L"\n";
 }
 
-static void HandleProbeCommand(const std::vector<std::wstring>& args)
+static bool LoadDriverServiceWithUx(
+    DriverService& service,
+    const std::wstring& title,
+    const std::wstring& driverPath,
+    std::wstring* error);
+static bool UnloadDriverServiceWithUx(
+    DriverService& service,
+    const std::wstring& title,
+    DriverUnloadResult* unloadResult,
+    std::wstring* error);
+
+static void HandleProbeCommand(const std::vector<std::wstring>& args, DebuggerState& state)
 {
     std::wstring action = args.size() >= 2 ? ToLower(args[1]) : L"status";
     std::wstring error;
@@ -2749,14 +2831,13 @@ static void HandleProbeCommand(const std::vector<std::wstring>& args)
         if (action == L"load" || action == L"install" || action == L"start")
         {
             std::wstring driverPath = args.size() >= 3 ? JoinArgs(args, 2) : GetExecutableDirectory() + L"\\KnLiveDbgProbe.sys";
-            if (!probeService.EnsureLoaded(driverPath, &error))
+            state.ProbeDriverCleanupRequested = true;
+            state.ProbeDriverUnloaded = false;
+            if (!LoadDriverServiceWithUx(probeService, L"Probe driver load", driverPath, &error))
             {
-                std::wcerr << L"probe load failed: " << error << L"\n";
-                std::wcerr << L"expected probe path: " << driverPath << L"\n";
                 break;
             }
 
-            std::wcout << L"probe driver loaded: " << driverPath << L"\n";
             KNDBG_PROBE_INFO_RESPONSE info = {};
             if (QueryProbeInfo(&info, &error))
             {
@@ -2770,18 +2851,12 @@ static void HandleProbeCommand(const std::vector<std::wstring>& args)
         else if (action == L"unload" || action == L"remove" || action == L"stop")
         {
             DriverUnloadResult unloadResult = {};
-            if (!probeService.StopAndDelete(&unloadResult, &error))
+            if (!UnloadDriverServiceWithUx(probeService, L"Probe driver unload", &unloadResult, &error))
             {
-                std::wcerr << L"probe unload failed: " << error << L"\n";
                 break;
             }
 
-            std::wcout << L"probe service removed";
-            if (!unloadResult.FinalState.empty())
-            {
-                std::wcout << L": " << unloadResult.FinalState;
-            }
-            std::wcout << L"\n";
+            state.ProbeDriverUnloaded = true;
         }
         else if (action == L"status")
         {
@@ -2838,6 +2913,519 @@ static void HandleProbeCommand(const std::vector<std::wstring>& args)
             std::wcerr << L"usage: probe [status|load [sys-path]|info|reset|unload]\n";
         }
     } while (false);
+}
+
+static std::wstring TuiFitText(const std::wstring& value, size_t width)
+{
+    std::wstring result;
+
+    do
+    {
+        for (wchar_t ch : value)
+        {
+            if (ch == L'\r' || ch == L'\n' || ch == L'\t')
+            {
+                result += L' ';
+            }
+            else
+            {
+                result += ch;
+            }
+        }
+
+        if (result.size() > width)
+        {
+            if (width <= 3)
+            {
+                result.resize(width);
+            }
+            else
+            {
+                result.resize(width - 3);
+                result += L"...";
+            }
+            break;
+        }
+
+        while (result.size() < width)
+        {
+            result += L' ';
+        }
+    } while (false);
+
+    return result;
+}
+
+static void PrintTuiRule(WORD color = KNDBG_COLOR_FRAME)
+{
+    ScopedConsoleColor scopedColor(GetStdHandle(STD_OUTPUT_HANDLE), color);
+    std::wcout << L"+" << std::wstring(78, L'-') << L"+\n";
+}
+
+static void PrintTuiLine(const std::wstring& value, WORD color = KNDBG_COLOR_TEXT)
+{
+    ScopedConsoleColor scopedColor(GetStdHandle(STD_OUTPUT_HANDLE), color);
+    std::wcout << L"| " << TuiFitText(value, 76) << L" |\n";
+}
+
+static void PrintTuiBlank()
+{
+    PrintTuiLine(L"", KNDBG_COLOR_DIM);
+}
+
+static void PrintWelcomeBanner()
+{
+    PrintTuiRule(KNDBG_COLOR_ACCENT);
+    PrintTuiLine(L"##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##", KNDBG_COLOR_ACCENT);
+    PrintTuiLine(L"", KNDBG_COLOR_ACCENT);
+    PrintTuiLine(L"                    WELCOME TO KNLIVEDBG", KNDBG_COLOR_TITLE);
+    PrintTuiLine(L"              Live Kernel Debugger Console", KNDBG_COLOR_ACCENT);
+    PrintTuiLine(L"        Native memory IOCTLs + symbols + optional DbgEng", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"", KNDBG_COLOR_ACCENT);
+    PrintTuiLine(L"##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##", KNDBG_COLOR_ACCENT);
+    PrintTuiRule(KNDBG_COLOR_ACCENT);
+}
+
+static std::wstring DriverStatusSummary(const DriverStatus& status)
+{
+    std::wstring text;
+
+    do
+    {
+        if (!status.Installed)
+        {
+            text = L"not-installed";
+            break;
+        }
+
+        text = L"installed";
+        if (!status.StateText.empty())
+        {
+            text += L"/" + status.StateText;
+        }
+    } while (false);
+
+    return text;
+}
+
+static void PrintLifecycleHeader(const std::wstring& title, const std::wstring& detail)
+{
+    PrintTuiRule();
+    PrintTuiLine(title, KNDBG_COLOR_TITLE);
+    if (!detail.empty())
+    {
+        PrintTuiLine(detail, KNDBG_COLOR_DIM);
+    }
+    PrintTuiRule();
+}
+
+static void PrintLifecycleStep(const std::wstring& label, const std::wstring& detail)
+{
+    std::wstring line = L"[ .. ] " + label;
+
+    if (!detail.empty())
+    {
+        line += L": " + detail;
+    }
+
+    PrintTuiLine(line, KNDBG_COLOR_STEP);
+}
+
+static void PrintLifecycleOk(const std::wstring& label, const std::wstring& detail)
+{
+    std::wstring line = L"[ OK ] " + label;
+
+    if (!detail.empty())
+    {
+        line += L": " + detail;
+    }
+
+    PrintTuiLine(line, KNDBG_COLOR_OK);
+}
+
+static void PrintLifecycleWarn(const std::wstring& label, const std::wstring& detail)
+{
+    std::wstring line = L"[WARN] " + label;
+
+    if (!detail.empty())
+    {
+        line += L": " + detail;
+    }
+
+    PrintTuiLine(line, KNDBG_COLOR_WARN);
+}
+
+static void PrintLifecycleFail(const std::wstring& label, const std::wstring& detail)
+{
+    std::wstring line = L"[FAIL] " + label;
+
+    if (!detail.empty())
+    {
+        line += L": " + detail;
+    }
+
+    PrintTuiLine(line, KNDBG_COLOR_FAIL);
+}
+
+static bool LoadDriverServiceWithUx(
+    DriverService& service,
+    const std::wstring& title,
+    const std::wstring& driverPath,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        PrintLifecycleHeader(title, L"image: " + driverPath);
+
+        DriverStatus before = {};
+        PrintLifecycleStep(L"query service", L"SCM status");
+        if (!service.Query(&before, error))
+        {
+            PrintLifecycleFail(L"query service", error != nullptr ? *error : L"unknown error");
+            break;
+        }
+        PrintLifecycleOk(L"query service", DriverStatusSummary(before));
+
+        PrintLifecycleStep(L"install/update service", L"kernel driver demand-start entry");
+        if (!service.Install(driverPath, error))
+        {
+            PrintLifecycleFail(L"install/update service", error != nullptr ? *error : L"unknown error");
+            break;
+        }
+        PrintLifecycleOk(L"install/update service", L"configured");
+
+        PrintLifecycleStep(L"load driver", L"start service");
+        if (!service.Start(error))
+        {
+            PrintLifecycleFail(L"load driver", error != nullptr ? *error : L"unknown error");
+            break;
+        }
+        PrintLifecycleOk(L"load driver", L"running");
+
+        DriverStatus after = {};
+        PrintLifecycleStep(L"verify final state", L"SCM status");
+        if (!service.Query(&after, error))
+        {
+            PrintLifecycleFail(L"verify final state", error != nullptr ? *error : L"unknown error");
+            break;
+        }
+        PrintLifecycleOk(L"verify final state", DriverStatusSummary(after));
+        PrintTuiRule();
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool UnloadDriverServiceWithUx(
+    DriverService& service,
+    const std::wstring& title,
+    DriverUnloadResult* unloadResult,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        PrintLifecycleHeader(title, L"SCM stop/delete sequence");
+
+        DriverStatus before = {};
+        PrintLifecycleStep(L"query service", L"SCM status");
+        if (!service.Query(&before, error))
+        {
+            PrintLifecycleFail(L"query service", error != nullptr ? *error : L"unknown error");
+            break;
+        }
+        PrintLifecycleOk(L"query service", DriverStatusSummary(before));
+
+        if (!before.Installed)
+        {
+            PrintLifecycleOk(L"unload service", L"already absent");
+            PrintTuiRule();
+            if (unloadResult != nullptr)
+            {
+                *unloadResult = {};
+                unloadResult->Deleted = true;
+                unloadResult->FinalState = L"not-installed";
+            }
+            ok = true;
+            break;
+        }
+
+        PrintLifecycleStep(L"stop/delete service", L"release kernel driver image");
+        if (!service.StopAndDelete(unloadResult, error))
+        {
+            PrintLifecycleFail(L"stop/delete service", error != nullptr ? *error : L"unknown error");
+            break;
+        }
+
+        std::wstring finalState = unloadResult != nullptr ? unloadResult->FinalState : L"deleted";
+        PrintLifecycleOk(L"stop/delete service", finalState);
+        PrintTuiRule();
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool CleanupMainDriverOnExit(DebuggerState& state, DeviceClient& device, DriverService& service)
+{
+    bool ok = false;
+    std::wstring error;
+
+    do
+    {
+        if (!state.MainDriverCleanupRequested)
+        {
+            ok = true;
+            break;
+        }
+
+        if (state.MainDriverUnloaded)
+        {
+            ok = true;
+            break;
+        }
+
+        PrintLifecycleHeader(L"KnLiveDbg shutdown", L"automatic driver unload/remove");
+        PrintLifecycleStep(L"close device handle", L"release controller session");
+        if (device.IsOpen())
+        {
+            device.Close();
+            PrintLifecycleOk(L"close device handle", L"closed");
+        }
+        else
+        {
+            PrintLifecycleOk(L"close device handle", L"already closed");
+        }
+
+        DriverUnloadResult unloadResult = {};
+        if (!UnloadDriverServiceWithUx(service, L"Main driver automatic unload", &unloadResult, &error))
+        {
+            std::wcerr << L"automatic driver unload failed: " << error << L"\n";
+            break;
+        }
+
+        state.MainDriverUnloaded = true;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool CleanupProbeDriverOnExit(DebuggerState& state)
+{
+    bool ok = false;
+    std::wstring error;
+
+    do
+    {
+        if (!state.ProbeDriverCleanupRequested)
+        {
+            ok = true;
+            break;
+        }
+
+        if (state.ProbeDriverUnloaded)
+        {
+            ok = true;
+            break;
+        }
+
+        DriverService probeService(KNDBG_PROBE_SERVICE_NAME, KNDBG_PROBE_DISPLAY_NAME);
+        DriverUnloadResult unloadResult = {};
+        if (!UnloadDriverServiceWithUx(probeService, L"Probe driver automatic unload", &unloadResult, &error))
+        {
+            std::wcerr << L"automatic probe driver unload failed: " << error << L"\n";
+            break;
+        }
+
+        state.ProbeDriverUnloaded = true;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool AcquireSingleInstanceLock(std::wstring* error)
+{
+    bool ok = false;
+    constexpr const wchar_t* MutexName = L"Global\\KnLiveDbg.Exe.SingleInstance";
+
+    do
+    {
+        g_InstanceMutexHandle = CreateMutexW(nullptr, TRUE, MutexName);
+        if (g_InstanceMutexHandle == nullptr)
+        {
+            DWORD lastError = GetLastError();
+            if (lastError == ERROR_ACCESS_DENIED)
+            {
+                HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, MutexName);
+                if (existing != nullptr)
+                {
+                    CloseHandle(existing);
+                    if (error != nullptr)
+                    {
+                        *error = L"another KnLiveDbg.exe instance is already running";
+                    }
+                    break;
+                }
+            }
+
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"CreateMutexW single-instance gate failed", lastError);
+            }
+            break;
+        }
+
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            CloseHandle(g_InstanceMutexHandle);
+            g_InstanceMutexHandle = nullptr;
+            if (error != nullptr)
+            {
+                *error = L"another KnLiveDbg.exe instance is already running";
+            }
+            break;
+        }
+
+        g_InstanceMutexOwned = true;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void ReleaseSingleInstanceLock()
+{
+    if (g_InstanceMutexHandle != nullptr)
+    {
+        if (g_InstanceMutexOwned)
+        {
+            ReleaseMutex(g_InstanceMutexHandle);
+            g_InstanceMutexOwned = false;
+        }
+
+        CloseHandle(g_InstanceMutexHandle);
+        g_InstanceMutexHandle = nullptr;
+    }
+}
+
+static std::wstring BuildDriverPanelText(DriverService& service, DeviceClient& device)
+{
+    std::wstring text = L"Driver: device=open";
+    std::wstring error;
+
+    do
+    {
+        DriverStatus status = {};
+        if (service.Query(&status, &error))
+        {
+            text += L" service=";
+            text += (status.Installed ? std::wstring(L"installed") : std::wstring(L"not-installed"));
+            if (!status.StateText.empty())
+            {
+                text += L"/" + status.StateText;
+            }
+        }
+        else
+        {
+            text += L" service=query-failed";
+        }
+
+        DriverSessionStatus session = {};
+        if (device.IsOpen() && device.QuerySessionStatus(&session, &error))
+        {
+            text += L" write=";
+            text += ((session.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) != 0 ? std::wstring(L"on") : std::wstring(L"off"));
+            text += L" handles=" + std::to_wstring(session.OpenHandleCount);
+            text += L" owner-pid=" + std::to_wstring(session.OwnerPid);
+        }
+    } while (false);
+
+    return text;
+}
+
+static std::wstring BuildProbePanelText()
+{
+    std::wstring text = L"Probe: not-loaded";
+    std::wstring error;
+    DriverService probeService(KNDBG_PROBE_SERVICE_NAME, KNDBG_PROBE_DISPLAY_NAME);
+
+    do
+    {
+        DriverStatus status = {};
+        if (!probeService.Query(&status, &error))
+        {
+            text = L"Probe: query-failed";
+            break;
+        }
+
+        if (!status.Installed)
+        {
+            break;
+        }
+
+        text = L"Probe: " + status.StateText;
+        if (status.CurrentState == SERVICE_RUNNING)
+        {
+            KNDBG_PROBE_INFO_RESPONSE info = {};
+            if (QueryProbeInfo(&info, &error))
+            {
+                text += L" va=" + HexText(info.BufferVirtualAddress);
+                text += L" pa=" + HexText(info.BufferPhysicalAddress);
+            }
+        }
+    } while (false);
+
+    return text;
+}
+
+static void PrintStartupTui(
+    const DebuggerState& state,
+    DriverService& service,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const AiProviderRuntime& ai)
+{
+    const AiProviderSettings& aiSettings = ai.Settings();
+    std::wstring model = aiSettings.Model.empty() ? L"default" : aiSettings.Model;
+    std::wstring dotEnv = aiSettings.DotEnvPath.empty() ? L"none" : aiSettings.DotEnvPath;
+    std::wstring dbgengMode = state.DbgEngRemoteKernel ? L"remote-kernel" : L"local-kernel";
+
+    PrintWelcomeBanner();
+    PrintTuiLine(L"KnLiveDbg live kernel debugger console", KNDBG_COLOR_TITLE);
+    PrintTuiLine(L"WinDbg-style commands over native memory IOCTLs and optional DbgEng", KNDBG_COLOR_DIM);
+    PrintTuiRule();
+    PrintTuiLine(BuildDriverPanelText(service, device), KNDBG_COLOR_OK);
+    PrintTuiLine(L"Backend: " + std::wstring(BackendModeText(state.Backend)) + L" dbgeng=lazy kd-mode=" + dbgengMode + L" base=16", KNDBG_COLOR_ACCENT);
+    PrintTuiLine(L"Symbols: ready=" + std::wstring(symbols.IsReady() ? L"yes" : L"no") +
+                 L" modules=" + std::to_wstring(symbols.Modules().size()), symbols.IsReady() ? KNDBG_COLOR_OK : KNDBG_COLOR_WARN);
+    PrintTuiLine(L"AI: provider=" + ai.ProviderName() + L" model=" + model +
+                 L" policy=" + ai.RemotePolicyName() + L" credential=" + ai.CredentialStatus(), KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"Env: " + dotEnv, dotEnv == L"none" ? KNDBG_COLOR_DIM : KNDBG_COLOR_OK);
+    PrintTuiLine(BuildProbePanelText(), KNDBG_COLOR_TEXT);
+    PrintTuiRule();
+    PrintTuiLine(L"Quick actions", KNDBG_COLOR_TITLE);
+    PrintTuiLine(L"  help          show native command summary", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  help all      include DbgEng-routed WinDbg commands", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  drvstatus     inspect service/session/write gate state", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  probe load    load positive-control VA/PA test buffer", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  callbacks all enumerate callback and minifilter surfaces", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  ai status     inspect provider, model, policy, and credentials", KNDBG_COLOR_TEXT);
+    PrintTuiBlank();
+    PrintTuiLine(L"Examples", KNDBG_COLOR_TITLE);
+    PrintTuiLine(L"  lm nt                    x nt!*Process*", KNDBG_COLOR_DIM);
+    PrintTuiLine(L"  dt nt!_EPROCESS <addr>   dq nt!PsLoadedModuleList 8", KNDBG_COLOR_DIM);
+    PrintTuiLine(L"  vtop <addr>              pdb <physical-address> 80", KNDBG_COLOR_DIM);
+    PrintTuiLine(L"  u nt!KiSystemCall64 8    uf nt!KiSystemCall64", KNDBG_COLOR_DIM);
+    PrintTuiLine(L"  backend dbgeng           kd !process 0 0", KNDBG_COLOR_DIM);
+    PrintTuiRule();
+    PrintTuiLine(L"Type home to redraw this screen. Type q, quit, or exit to unload and leave.", KNDBG_COLOR_WARN);
+    PrintTuiRule();
 }
 
 static std::wstring ObjectOperationsText(uint32_t operations)
@@ -4729,7 +5317,8 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"backend" || command == L"kdinit" || command == L"kddetach" ||
             command == L"drvstatus" || command == L"unload" || command == L"q" ||
             command == L"qq" || command == L"qd" || command == L"quit" || command == L"exit" ||
-            command == L"version" || command == L"vertarget" || command == L"vercommand")
+            command == L"version" || command == L"vertarget" || command == L"vercommand" ||
+            command == L"home" || command == L"dashboard")
         {
             commandClass = L"session";
             break;
@@ -7091,6 +7680,10 @@ static bool HandleCommand(
             bool includeDbgEng = args.size() >= 2 && ToLower(args[1]) == L"all";
             PrintHelp(includeDbgEng);
         }
+        else if (command == L"home" || command == L"dashboard")
+        {
+            PrintStartupTui(state, service, device, symbols, ai);
+        }
         else if (command == L"backend")
         {
             if (args.size() >= 2)
@@ -7178,7 +7771,7 @@ static bool HandleCommand(
         }
         else if (command == L"probe")
         {
-            HandleProbeCommand(args);
+            HandleProbeCommand(args, state);
         }
         else if (command == L"kd")
         {
@@ -7563,19 +8156,17 @@ static bool HandleCommand(
         else if (command == L"unload")
         {
             DriverUnloadResult unloadResult = {};
+            PrintLifecycleHeader(L"Main driver unload", L"device: " KNDBG_USER_DEVICE_NAME);
+            PrintLifecycleStep(L"close device handle", L"release controller session");
             device.Close();
-            if (!service.StopAndDelete(&unloadResult, &error))
+            PrintLifecycleOk(L"close device handle", L"closed");
+            if (!UnloadDriverServiceWithUx(service, L"Main driver SCM unload", &unloadResult, &error))
             {
-                std::wcerr << L"unload failed: " << error << L"\n";
+                std::wcerr << L"unload failed\n";
             }
             else
             {
-                std::wcout << L"driver service removed";
-                if (!unloadResult.FinalState.empty())
-                {
-                    std::wcout << L": " << unloadResult.FinalState;
-                }
-                std::wcout << L"\n";
+                state.MainDriverUnloaded = true;
             }
             keepRunning = false;
         }
@@ -7672,30 +8263,66 @@ int wmain(int argc, wchar_t** argv)
     UNREFERENCED_PARAMETER(argv);
 
     int exitCode = 1;
+    DebuggerState state = {};
+    state.NumberBase = 16;
+    state.Quiet = false;
+    state.MainDriverCleanupRequested = false;
+    state.MainDriverUnloaded = false;
+    state.ProbeDriverCleanupRequested = false;
+    state.ProbeDriverUnloaded = false;
+    state.Backend = DebuggerState::BackendMode::Auto;
+
+    DriverService service;
+    DeviceClient device;
+    SymbolEngine symbols;
+    DbgEngBackend dbgeng;
+    AiProviderRuntime ai;
+    AiPlanState aiState = {};
+    std::wstring error;
 
     do
     {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &g_MainThreadHandle,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS);
         SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
+        PrintLifecycleHeader(L"KnLiveDbg launch", L"preflight checks");
+        PrintLifecycleStep(L"elevation", L"administrator token");
         if (!IsElevated())
         {
+            PrintLifecycleFail(L"elevation", L"administrator privileges are required");
             std::wcerr << L"KnLiveDbg must run elevated to install and load the driver.\n";
             break;
         }
+        PrintLifecycleOk(L"elevation", L"administrator");
+
+        PrintLifecycleStep(L"single instance", L"Global\\KnLiveDbg.Exe.SingleInstance");
+        if (!AcquireSingleInstanceLock(&error))
+        {
+            PrintLifecycleFail(L"single instance", error);
+            std::wcerr << error << L"\n";
+            break;
+        }
+        PrintLifecycleOk(L"single instance", L"acquired");
+
+        state.MainDriverCleanupRequested = true;
 
         std::wstring exeDir = GetExecutableDirectory();
         std::wstring driverPath = exeDir + L"\\KnLiveDbg.sys";
 
-        DriverService service;
-        std::wstring error;
-        if (!service.EnsureLoaded(driverPath, &error))
+        if (!LoadDriverServiceWithUx(service, L"Main driver startup", driverPath, &error))
         {
-            std::wcerr << L"driver load failed: " << error << L"\n";
-            std::wcerr << L"expected driver path: " << driverPath << L"\n";
+            std::wcerr << L"driver load failed\n";
             break;
         }
 
-        DeviceClient device;
+        PrintLifecycleStep(L"open device", KNDBG_USER_DEVICE_NAME);
         for (int attempt = 0; attempt < 50; ++attempt)
         {
             if (device.Open(&error))
@@ -7708,47 +8335,48 @@ int wmain(int argc, wchar_t** argv)
 
         if (!device.IsOpen())
         {
+            PrintLifecycleFail(L"open device", error);
             std::wcerr << L"device open failed: " << error << L"\n";
             break;
         }
+        PrintLifecycleOk(L"open device", L"ready");
 
+        PrintLifecycleStep(L"verify driver ABI", L"IOCTL_KNDBG_GET_VERSION");
         if (!device.QueryVersion(&error))
         {
+            PrintLifecycleFail(L"verify driver ABI", error);
             std::wcerr << L"driver ABI check failed: " << error << L"\n";
             break;
         }
+        PrintLifecycleOk(L"verify driver ABI", L"compatible");
 
-        SymbolEngine symbols;
+        PrintLifecycleStep(L"initialize symbols", L"DbgHelp/DIA");
         if (!symbols.Initialize(symbols.SymbolPath(), &error))
         {
+            PrintLifecycleWarn(L"initialize symbols", error);
             std::wcerr << L"symbol init warning: " << error << L"\n";
         }
         else if (!symbols.LoadKernelModules(&error))
         {
+            PrintLifecycleWarn(L"load kernel modules", error);
             std::wcerr << L"symbol reload warning: " << error << L"\n";
         }
-
-        DebuggerState state = {};
-        state.NumberBase = 16;
-        state.Quiet = false;
-        state.Backend = DebuggerState::BackendMode::Auto;
-
-        DbgEngBackend dbgeng;
-        AiProviderRuntime ai;
-        AiPlanState aiState = {};
-        std::wstring loadedDotEnv;
-        std::wstring dotEnvError;
-        ai.LoadDotEnvFiles(BuildDotEnvSearchPaths(exeDir), &loadedDotEnv, &dotEnvError);
-
-        std::wcout << L"KnLiveDbg ready. backend=auto. type help or help all\n";
-        if (!loadedDotEnv.empty())
+        else
         {
-            std::wcout << L"AI config: loaded " << loadedDotEnv << L"\n";
+            PrintLifecycleOk(L"initialize symbols", L"modules=" + std::to_wstring(symbols.Modules().size()));
         }
+
+        std::wstring dotEnvError;
+        ai.LoadDotEnvFiles(BuildDotEnvSearchPaths(exeDir), nullptr, &dotEnvError);
+
+        PrintStartupTui(state, service, device, symbols, ai);
 
         while (!g_StopRequested)
         {
-            std::wcout << L"knkd> ";
+            {
+                ScopedConsoleColor scopedColor(GetStdHandle(STD_OUTPUT_HANDLE), KNDBG_COLOR_PROMPT);
+                std::wcout << L"knkd> ";
+            }
             std::wstring line;
             if (!std::getline(std::wcin, line))
             {
@@ -7784,10 +8412,30 @@ int wmain(int argc, wchar_t** argv)
             }
         }
 
-        dbgeng.Shutdown();
-        device.Close();
         exitCode = 0;
     } while (false);
+
+    dbgeng.Shutdown();
+    bool cleanupOk = true;
+    if (!CleanupProbeDriverOnExit(state))
+    {
+        cleanupOk = false;
+    }
+    if (!CleanupMainDriverOnExit(state, device, service))
+    {
+        cleanupOk = false;
+    }
+    if (!cleanupOk)
+    {
+        exitCode = 1;
+    }
+
+    if (g_MainThreadHandle != nullptr)
+    {
+        CloseHandle(g_MainThreadHandle);
+        g_MainThreadHandle = nullptr;
+    }
+    ReleaseSingleInstanceLock();
 
     return exitCode;
 }

@@ -18,11 +18,17 @@ Kn Live Dbg follows a LiveKD-style split:
 
 2. User-mode TUI
    - Owns driver install/load/unload through SCM.
+   - Acquires a process-wide named mutex before touching SCM so only one `KnLiveDbg.exe` instance can run at a time.
+   - Displays colored staged lifecycle output for elevation checks, single-instance acquisition, SCM query/install/start, device open, ABI verification, symbol initialization, probe load, and service unload paths.
+   - Automatically closes the device handle, stops the main driver, and deletes the service on normal process exit, EOF, Ctrl+C, `q`, `quit`, `exit`, and `unload`.
+   - Tracks `probe load` within the session and automatically stops/deletes the probe service during process cleanup when the session loaded it.
+   - Prints a colored startup welcome banner and dashboard with driver, write gate, backend, symbol, AI, probe, and quick-action status before the interactive prompt.
    - Owns kernel module enumeration.
    - Owns symbol path, PDB loading, type lookup, and field offset resolution.
    - Uses DIA SDK as a fallback when `DbgHelp` cannot return complete UDT field metadata.
    - Owns PDB-driven callback list decoding for object, registry, process, and minifilter callbacks.
    - Presents Windbg-like commands.
+   - Redraws the dashboard with `home` or `dashboard`.
    - Optionally attaches a DbgEng local-kernel backend for commands that need debugger-engine semantics.
 
 This keeps the driver small and reduces the amount of complex parser/symbol code running in kernel mode.

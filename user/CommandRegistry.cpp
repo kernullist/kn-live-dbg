@@ -210,6 +210,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"write", L"write", L"memory", L"set native write gate", CommandSupport::Native),
         Make(L"setfield", L"setfield", L"type", L"write a structure field", CommandSupport::Native),
         Make(L"unload", L"unload", L"session", L"stop and delete service", CommandSupport::Native),
+        Make(L"home", L"home", L"session", L"redraw startup dashboard", CommandSupport::Native),
+        Make(L"dashboard", L"home", L"session", L"redraw startup dashboard", CommandSupport::Alias),
         Make(L"help", L"help", L"session", L"show help", CommandSupport::Native),
         Make(L"exit", L"q", L"session", L"quit", CommandSupport::Alias),
         Make(L"quit", L"q", L"session", L"quit", CommandSupport::Alias)

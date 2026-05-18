@@ -35,6 +35,7 @@ backend [auto|native|dbgeng]
 kdinit [/local [connect-options]|/remote <connect-options>]
 kd <windbg-command>
 kddetach
+home|dashboard
 probe [status|load [sys-path]|info|reset|unload]
 ai [status|providers|provider|policy|model|baseurl|effort|auth|preview|ask|plan|analyze|explain|annotate|diagnose|playbook|show|run|write|transcript|audit|report]
 ```
@@ -49,7 +50,7 @@ Backend mode differences:
 | `native` | Enabled. | Disabled except for explicitly wired commands that intentionally use DbgEng internally, such as `u` and `uf`. | Verifying driver-backed behavior without accidental raw WinDbg execution. |
 | `dbgeng` | Only session/TUI exceptions run before the raw DbgEng catch-all. | Enabled for most commands through `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
 
-The `dbgeng` catch-all intentionally excludes `q`, `qq`, `qd`, `quit`, `exit`, `unload`, `drvstatus`, `probe`, `procctx`, `callbacks`, `kcallbacks`, `cb`, and `ai` so shutdown, service control, status, probe control, native process context, callback scanning, and AI provider control stay under the TUI. The explicit `u`/`uf` handler also runs before that catch-all. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+The `dbgeng` catch-all intentionally excludes `q`, `qq`, `qd`, `quit`, `exit`, `unload`, `drvstatus`, `home`, `dashboard`, `probe`, `procctx`, `callbacks`, `kcallbacks`, `cb`, and `ai` so shutdown, service control, status/dashboard, probe control, native process context, callback scanning, and AI provider control stay under the TUI. The explicit `u`/`uf` handler also runs before that catch-all. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
 
 ## Native Commands
 
@@ -70,7 +71,7 @@ ai
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 c, f, fp, m, s
 n, sq
-version, vertarget, vercommand, drvstatus, probe
+version, vertarget, vercommand, drvstatus, home, dashboard, probe
 q, qq, qd
 ```
 
