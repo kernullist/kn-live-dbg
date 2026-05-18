@@ -9,6 +9,10 @@
       <UniqueIdentifier>{0D1908A8-074D-4280-A3FB-9410F2DD0764}</UniqueIdentifier>
       <Extensions>h;hpp;hxx</Extensions>
     </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{C7E3D44A-FBB4-4EB6-A3F5-F2BA8802D096}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Driver.cpp">
@@ -19,5 +23,13 @@
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\shared\KnLiveDbgVersion.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="KnLiveDbg.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

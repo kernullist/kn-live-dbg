@@ -61,14 +61,15 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 5. The walk supports 4 KB pages plus 2 MB and 1 GB large pages.
 6. The response reports CR3, VA, PA, page size, page offset, contiguous translated bytes, and the page-table entries that were used.
 7. `d*` and `e*` can use `/pid <pid>` or a stored `procctx` to translate user VAs page-by-page and then perform physical reads/writes.
-8. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
-9. `peb`, `pew`, `ped`, and `peq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; write mode starts enabled and can be disabled with `write off`.
+8. Virtual and physical display commands perform sparse reads for dump output. Readable bytes are printed normally, while unreadable bytes keep the requested layout and are shown as `??` or `0x????...` for wider units.
+9. `phys`, `pdb`, `pdw`, `pdd`, and `pdq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
+10. `peb`, `pew`, `ped`, and `peq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; write mode starts enabled and can be disabled with `write off`.
 
 ## Symbol Flow
 
 1. TUI calls `NtQuerySystemInformation(SystemModuleInformation)`.
 2. TUI translates `\SystemRoot\...` paths into local Windows paths.
-3. The build helper stages the pinned `vendor\debugging-tools\x64` Debugging Tools runtime DLLs beside the EXE so DbgHelp can load `symsrv.dll` and use the Microsoft symbol server instead of the limited System32 runtime. If the vendor runtime is incomplete, it falls back to the locally installed Windows Kits Debugging Tools copy.
+3. The build helper stages the pinned `vendor\debugging-tools\x64` Debugging Tools runtime DLLs beside the EXE so DbgHelp can load `symsrv.dll`, DbgEng can load `DbgModel.dll`, and both can use the Microsoft symbol server instead of the limited System32 runtime. If the vendor runtime is incomplete, it falls back to the locally installed Windows Kits Debugging Tools copy for missing debugger-runtime files.
 4. The sync script, build script, and EXE startup path create `symsrv.yes` when `symsrv.dll` is present but the consent marker is missing.
 5. Startup registers staged `msdia140.dll` with `DllRegisterServer` before symbol initialization so DIA fallback does not require a separate `regsvr32` step in normal elevated runs.
 6. Startup creates `<exe-dir>\symbols`, prepends the EXE directory and its non-cache subdirectories to the DbgHelp/DbgEng symbol path, then appends `SRV*<exe-dir>\symbols*https://msdl.microsoft.com/download/symbols` so downloaded PDBs are managed under the runnable EXE bundle.
@@ -83,7 +84,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 15. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA, or asks DIA to resolve the PDB from the module image plus symbol path, and recovers field names, offsets, lengths, bit positions, and type names. DIA activation first uses registered COM, then falls back to creating `IDiaDataSource` directly from the staged `msdia*.dll` through `DllGetClassObject` so COM registration failures are reported separately from PDB/type lookup failures.
 16. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
 17. `u` resolves an address or symbol with the native symbol engine, reads bounded code bytes through `IOCTL_KNDBG_READ_VIRTUAL`, and formats x64 instructions with the vendored Zydis decoder. This keeps local live-kernel disassembly independent from DbgEng memory callbacks, which can fail in local-kernel sessions. If the driver device is not open, `u` still falls back to the DbgEng disassembly path.
-18. `uf` is an explicit function-disassembly command that uses DbgEng function-boundary logic.
+18. `uf` resolves an address or symbol, reads a bounded code window through the driver, and uses the same Zydis decoder as `u` while stopping at common function terminal instructions. If the driver device is not open, it falls back to the DbgEng command path.
 19. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
 
 ## Callback Scanner Flow
@@ -105,7 +106,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 
 The DbgEng backend is intentionally isolated from the native memory backend. Native read/write operations still go through `KnLiveDbg.sys`, while DbgEng commands execute through the debugger engine.
 
-`u` and `uf` are deliberately wired as explicit commands instead of falling through the generic command router. `u` stays on the driver-backed memory path and uses Zydis for instruction decoding when the device is open; `uf` still relies on DbgEng for function-boundary semantics.
+`u` and `uf` are deliberately wired as explicit commands instead of falling through the generic command router. Both stay on the driver-backed memory path and use Zydis for instruction decoding when the device is open; DbgEng is only a fallback when the native device is unavailable.
 
 Backend routing is mode-dependent:
 
@@ -117,6 +118,16 @@ Backend routing is mode-dependent:
 Interactive command execution is wrapped by a delayed progress watchdog. If a dispatched command runs longer than about one second, the watchdog writes elapsed-time status rows directly to the console with `WriteConsoleW`, outside stdout/stderr transcript capture, and stops once the command returns.
 
 Human-readable native command output uses scoped console attributes for high-signal tokens such as callback kind tags, object types, modules, symbols, translated physical addresses, and type/field names. The color layer is applied only while writing to the console stream, so transcript capture and JSON evidence remain plain text.
+
+## Build and Release Flow
+
+1. `tools\build.ps1` is the authoritative scripted build path for versioned artifacts.
+2. It reads `.build\version-state.json`, falls back to the existing output PE version, and otherwise starts from `0.0.0`.
+3. The next build version increments the patch component by one; the first scripted build is therefore `0.0.1`.
+4. The script writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys` before the WDK TestSign step.
+5. After a successful build, the script verifies the stamped PE versions, verifies driver signatures, stages Debugging Tools runtime DLLs beside the EXE, and saves the new version state.
+6. `tools\release.ps1` runs the build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory.
+7. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, README/runtime manifest metadata, and `kn-live-dbg-version.json`.
 
 ## AI Provider Flow
 

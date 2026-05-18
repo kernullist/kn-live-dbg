@@ -9,6 +9,10 @@
       <UniqueIdentifier>{B67C3AA6-1746-4F2F-B94B-FE5C375EA7DB}</UniqueIdentifier>
       <Extensions>h;hpp;hxx</Extensions>
     </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{26F61EAC-D648-4E61-98F5-BA36AB4F767F}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ProbeDriver.cpp">
@@ -19,5 +23,13 @@
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\shared\KnLiveDbgVersion.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="KnLiveDbgProbe.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

@@ -1155,7 +1155,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  x nt!*Process*\n";
     std::wcout << L"  ln nt!PsLoadedModuleList\n";
     std::wcout << L"  u nt!KiSystemCall64 8\n";
-    std::wcout << L"  uf nt!KiSystemCall64\n";
+    std::wcout << L"  uf nt!KiSystemCall64 512\n";
     std::wcout << L"  dq nt!PsLoadedModuleList 8\n";
     std::wcout << L"  dt nt!_EPROCESS <address>\n";
     std::wcout << L"  callbacks all\n";
@@ -1442,9 +1442,77 @@ static uint64_t DecodeInteger(const uint8_t* bytes, size_t width)
     return value;
 }
 
-static void HexDump(uint64_t address, const std::vector<uint8_t>& bytes)
+struct MemoryReadView
 {
-    for (size_t offset = 0; offset < bytes.size(); offset += 16)
+    std::vector<uint8_t> Bytes;
+    std::vector<uint8_t> Valid;
+    bool AnyValid;
+};
+
+static MemoryReadView MakeKnownMemoryReadView(const std::vector<uint8_t>& bytes)
+{
+    MemoryReadView view = {};
+
+    view.Bytes = bytes;
+    view.Valid.assign(bytes.size(), 1);
+    view.AnyValid = !bytes.empty();
+
+    return view;
+}
+
+static bool MemoryByteIsKnown(const MemoryReadView& view, size_t offset)
+{
+    bool known = false;
+
+    if (offset < view.Bytes.size() && offset < view.Valid.size() && view.Valid[offset] != 0)
+    {
+        known = true;
+    }
+
+    return known;
+}
+
+static bool MemoryRangeIsKnown(const MemoryReadView& view, size_t offset, size_t width)
+{
+    bool known = false;
+
+    do
+    {
+        if (width == 0 || offset > view.Bytes.size() || width > view.Bytes.size() - offset)
+        {
+            break;
+        }
+
+        known = true;
+        for (size_t index = 0; index < width; ++index)
+        {
+            if (!MemoryByteIsKnown(view, offset + index))
+            {
+                known = false;
+                break;
+            }
+        }
+    } while (false);
+
+    return known;
+}
+
+static std::wstring UnknownHexText(size_t width, bool prefix)
+{
+    std::wstring result;
+
+    if (prefix)
+    {
+        result = L"0x";
+    }
+
+    result += std::wstring(width * 2, L'?');
+    return result;
+}
+
+static void HexDump(uint64_t address, const MemoryReadView& view)
+{
+    for (size_t offset = 0; offset < view.Bytes.size(); offset += 16)
     {
         PrintColoredText(HexTextWidth(address + offset, 16, false), KNDBG_COLOR_ACCENT);
         std::wcout << L"  ";
@@ -1452,9 +1520,16 @@ static void HexDump(uint64_t address, const std::vector<uint8_t>& bytes)
 
         for (size_t index = 0; index < 16; ++index)
         {
-            if (offset + index < bytes.size())
+            if (offset + index < view.Bytes.size())
             {
-                std::wcout << std::setw(2) << static_cast<unsigned>(bytes[offset + index]) << L" ";
+                if (MemoryByteIsKnown(view, offset + index))
+                {
+                    std::wcout << std::setw(2) << static_cast<unsigned>(view.Bytes[offset + index]) << L" ";
+                }
+                else
+                {
+                    std::wcout << L"?? ";
+                }
             }
             else
             {
@@ -1463,12 +1538,16 @@ static void HexDump(uint64_t address, const std::vector<uint8_t>& bytes)
         }
 
         std::wcout << L" ";
-        for (size_t index = 0; index < 16 && offset + index < bytes.size(); ++index)
+        for (size_t index = 0; index < 16 && offset + index < view.Bytes.size(); ++index)
         {
-            wchar_t ch = static_cast<wchar_t>(bytes[offset + index]);
-            if (ch < 32 || ch > 126)
+            wchar_t ch = L'?';
+            if (MemoryByteIsKnown(view, offset + index))
             {
-                ch = L'.';
+                ch = static_cast<wchar_t>(view.Bytes[offset + index]);
+                if (ch < 32 || ch > 126)
+                {
+                    ch = L'.';
+                }
             }
             std::wcout << ch;
         }
@@ -1477,13 +1556,21 @@ static void HexDump(uint64_t address, const std::vector<uint8_t>& bytes)
     }
 }
 
-static void UnitDump(uint64_t address, const std::vector<uint8_t>& bytes, size_t width, SymbolEngine* symbols)
+static void UnitDump(uint64_t address, const MemoryReadView& view, size_t width, SymbolEngine* symbols)
 {
-    for (size_t offset = 0; offset + width <= bytes.size(); offset += width)
+    for (size_t offset = 0; offset + width <= view.Bytes.size(); offset += width)
     {
-        uint64_t value = DecodeInteger(bytes.data() + offset, width);
         PrintColoredText(HexTextWidth(address + offset, 16, true), KNDBG_COLOR_ACCENT);
-        std::wcout << L": " << HexTextWidth(value, static_cast<int>(width * 2), true);
+        std::wcout << L": ";
+
+        if (!MemoryRangeIsKnown(view, offset, width))
+        {
+            std::wcout << UnknownHexText(width, true) << std::dec << L"\n";
+            continue;
+        }
+
+        uint64_t value = DecodeInteger(view.Bytes.data() + offset, width);
+        std::wcout << HexTextWidth(value, static_cast<int>(width * 2), true);
 
         if (symbols != nullptr)
         {
@@ -1505,13 +1592,20 @@ static void UnitDump(uint64_t address, const std::vector<uint8_t>& bytes, size_t
     }
 }
 
-static void PrintAsciiString(uint64_t address, const std::vector<uint8_t>& bytes)
+static void PrintAsciiString(uint64_t address, const MemoryReadView& view)
 {
     PrintColoredText(HexText(address), KNDBG_COLOR_ACCENT);
     std::wcout << L": ";
 
-    for (uint8_t ch : bytes)
+    for (size_t offset = 0; offset < view.Bytes.size(); ++offset)
     {
+        if (!MemoryByteIsKnown(view, offset))
+        {
+            std::wcout << L"?";
+            continue;
+        }
+
+        uint8_t ch = view.Bytes[offset];
         if (ch == 0)
         {
             break;
@@ -1530,15 +1624,26 @@ static void PrintAsciiString(uint64_t address, const std::vector<uint8_t>& bytes
     std::wcout << L"\n";
 }
 
-static void PrintUnicodeString(uint64_t address, const std::vector<uint8_t>& bytes)
+static void PrintAsciiString(uint64_t address, const std::vector<uint8_t>& bytes)
+{
+    PrintAsciiString(address, MakeKnownMemoryReadView(bytes));
+}
+
+static void PrintUnicodeString(uint64_t address, const MemoryReadView& view)
 {
     PrintColoredText(HexText(address), KNDBG_COLOR_ACCENT);
     std::wcout << L": ";
 
-    for (size_t offset = 0; offset + sizeof(wchar_t) <= bytes.size(); offset += sizeof(wchar_t))
+    for (size_t offset = 0; offset + sizeof(wchar_t) <= view.Bytes.size(); offset += sizeof(wchar_t))
     {
+        if (!MemoryRangeIsKnown(view, offset, sizeof(wchar_t)))
+        {
+            std::wcout << L"?";
+            continue;
+        }
+
         wchar_t ch = 0;
-        memcpy(&ch, bytes.data() + offset, sizeof(ch));
+        memcpy(&ch, view.Bytes.data() + offset, sizeof(ch));
         if (ch == 0)
         {
             break;
@@ -1555,6 +1660,11 @@ static void PrintUnicodeString(uint64_t address, const std::vector<uint8_t>& byt
     }
 
     std::wcout << L"\n";
+}
+
+static void PrintUnicodeString(uint64_t address, const std::vector<uint8_t>& bytes)
+{
+    PrintUnicodeString(address, MakeKnownMemoryReadView(bytes));
 }
 
 static size_t UnitWidthForDisplayCommand(const std::wstring& command)
@@ -2117,6 +2227,253 @@ static bool ReadMemoryWithProcessContext(
     std::vector<uint8_t>* bytes,
     std::wstring* error);
 
+static void MarkKnownBytes(MemoryReadView* view, size_t offset, const std::vector<uint8_t>& bytes, size_t maxLength)
+{
+    if (view == nullptr)
+    {
+        return;
+    }
+
+    size_t copyLength = std::min(bytes.size(), maxLength);
+    if (offset > view->Bytes.size())
+    {
+        return;
+    }
+
+    copyLength = std::min(copyLength, view->Bytes.size() - offset);
+    for (size_t index = 0; index < copyLength; ++index)
+    {
+        view->Bytes[offset + index] = bytes[index];
+        view->Valid[offset + index] = 1;
+        view->AnyValid = true;
+    }
+}
+
+static uint32_t PageBoundedReadChunk(uint64_t address, size_t offset, uint32_t length)
+{
+    uint32_t chunk = 0;
+
+    do
+    {
+        if (offset >= length)
+        {
+            break;
+        }
+
+        uint64_t current = address + offset;
+        size_t pageOffset = static_cast<size_t>(current & 0xfffull);
+        size_t pageLeft = 0x1000ull - pageOffset;
+        size_t remaining = static_cast<size_t>(length) - offset;
+        chunk = static_cast<uint32_t>(std::min(pageLeft, remaining));
+    } while (false);
+
+    return chunk;
+}
+
+static bool ReadSparseVirtualMemory(
+    DeviceClient& device,
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address,
+    uint32_t length,
+    MemoryReadView* view,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (view == nullptr || length == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid sparse read request";
+            }
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver device is not open";
+            }
+            break;
+        }
+
+        view->Bytes.assign(length, 0);
+        view->Valid.assign(length, 0);
+        view->AnyValid = false;
+
+        size_t offset = 0;
+        while (offset < length)
+        {
+            uint32_t chunk = PageBoundedReadChunk(address, offset, length);
+            if (chunk == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> chunkBytes;
+            std::wstring ignored;
+            if (ReadMemoryWithProcessContext(device, state, explicitContext, address + offset, chunk, &chunkBytes, &ignored))
+            {
+                MarkKnownBytes(view, offset, chunkBytes, chunk);
+                if (chunkBytes.size() >= chunk)
+                {
+                    offset += chunk;
+                }
+                else if (!chunkBytes.empty())
+                {
+                    offset += chunkBytes.size();
+                }
+                else
+                {
+                    offset += chunk;
+                }
+                continue;
+            }
+
+            std::vector<uint8_t> firstByte;
+            if (!ReadMemoryWithProcessContext(device, state, explicitContext, address + offset, 1, &firstByte, &ignored) ||
+                firstByte.size() != 1)
+            {
+                offset += chunk;
+                continue;
+            }
+
+            MarkKnownBytes(view, offset, firstByte, 1);
+            for (uint32_t lineOffset = 0; lineOffset < chunk; lineOffset += 16)
+            {
+                uint32_t lineLength = std::min<uint32_t>(16, chunk - lineOffset);
+                std::vector<uint8_t> lineBytes;
+                if (ReadMemoryWithProcessContext(device, state, explicitContext, address + offset + lineOffset, lineLength, &lineBytes, &ignored))
+                {
+                    MarkKnownBytes(view, offset + lineOffset, lineBytes, lineLength);
+                    continue;
+                }
+
+                for (uint32_t index = 0; index < lineLength; ++index)
+                {
+                    std::vector<uint8_t> byte;
+                    if (ReadMemoryWithProcessContext(device, state, explicitContext, address + offset + lineOffset + index, 1, &byte, &ignored) &&
+                        byte.size() == 1)
+                    {
+                        MarkKnownBytes(view, offset + lineOffset + index, byte, 1);
+                    }
+                }
+            }
+
+            offset += chunk;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ReadSparsePhysicalMemory(
+    DeviceClient& device,
+    uint64_t physicalAddress,
+    uint32_t length,
+    MemoryReadView* view,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (view == nullptr || length == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid sparse physical read request";
+            }
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver device is not open";
+            }
+            break;
+        }
+
+        view->Bytes.assign(length, 0);
+        view->Valid.assign(length, 0);
+        view->AnyValid = false;
+
+        size_t offset = 0;
+        while (offset < length)
+        {
+            uint32_t chunk = PageBoundedReadChunk(physicalAddress, offset, length);
+            if (chunk == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> chunkBytes;
+            std::wstring ignored;
+            if (device.ReadPhysical(physicalAddress + offset, chunk, &chunkBytes, &ignored))
+            {
+                MarkKnownBytes(view, offset, chunkBytes, chunk);
+                if (chunkBytes.size() >= chunk)
+                {
+                    offset += chunk;
+                }
+                else if (!chunkBytes.empty())
+                {
+                    offset += chunkBytes.size();
+                }
+                else
+                {
+                    offset += chunk;
+                }
+                continue;
+            }
+
+            std::vector<uint8_t> firstByte;
+            if (!device.ReadPhysical(physicalAddress + offset, 1, &firstByte, &ignored) ||
+                firstByte.size() != 1)
+            {
+                offset += chunk;
+                continue;
+            }
+
+            MarkKnownBytes(view, offset, firstByte, 1);
+            for (uint32_t lineOffset = 0; lineOffset < chunk; lineOffset += 16)
+            {
+                uint32_t lineLength = std::min<uint32_t>(16, chunk - lineOffset);
+                std::vector<uint8_t> lineBytes;
+                if (device.ReadPhysical(physicalAddress + offset + lineOffset, lineLength, &lineBytes, &ignored))
+                {
+                    MarkKnownBytes(view, offset + lineOffset, lineBytes, lineLength);
+                    continue;
+                }
+
+                for (uint32_t index = 0; index < lineLength; ++index)
+                {
+                    std::vector<uint8_t> byte;
+                    if (device.ReadPhysical(physicalAddress + offset + lineOffset + index, 1, &byte, &ignored) &&
+                        byte.size() == 1)
+                    {
+                        MarkKnownBytes(view, offset + lineOffset + index, byte, 1);
+                    }
+                }
+            }
+
+            offset += chunk;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static void HandleDisplayCommand(
     const std::vector<std::wstring>& args,
     const DebuggerState& state,
@@ -2205,9 +2562,9 @@ static void HandleDisplayCommand(
             break;
         }
 
-        std::vector<uint8_t> bytes;
+        MemoryReadView memory;
         const ProcessAddressContext* memoryContext = hasExplicitContext ? &explicitContext : nullptr;
-        if (!ReadMemoryWithProcessContext(device, state, memoryContext, address, byteCount, &bytes, &error))
+        if (!ReadSparseVirtualMemory(device, state, memoryContext, address, byteCount, &memory, &error))
         {
             std::wcerr << L"read failed: " << error << L"\n";
             break;
@@ -2215,27 +2572,34 @@ static void HandleDisplayCommand(
 
         if (command == L"d" || command == L"db" || command == L"dyb")
         {
-            HexDump(address, bytes);
+            HexDump(address, memory);
         }
         else if (command == L"da" || command == L"ds")
         {
-            PrintAsciiString(address, bytes);
+            PrintAsciiString(address, memory);
         }
         else if (command == L"du")
         {
-            PrintUnicodeString(address, bytes);
+            PrintUnicodeString(address, memory);
         }
         else if (command == L"dds" || command == L"dps" || command == L"dqs")
         {
-            UnitDump(address, bytes, unit, &symbols);
+            UnitDump(address, memory, unit, &symbols);
         }
         else if (command.size() == 3 && command[0] == L'd' &&
                  (command[2] == L'a' || command[2] == L'p' || command[2] == L'u'))
         {
-            for (size_t offset = 0; offset + unit <= bytes.size(); offset += unit)
+            for (size_t offset = 0; offset + unit <= memory.Bytes.size(); offset += unit)
             {
-                uint64_t pointer = DecodeInteger(bytes.data() + offset, unit);
-                std::wcout << L"0x" << std::hex << (address + offset) << L": 0x" << pointer << L" ";
+                std::wcout << L"0x" << std::hex << (address + offset) << L": ";
+                if (!MemoryRangeIsKnown(memory, offset, unit))
+                {
+                    std::wcout << UnknownHexText(unit, true) << L" <unreadable>\n";
+                    continue;
+                }
+
+                uint64_t pointer = DecodeInteger(memory.Bytes.data() + offset, unit);
+                std::wcout << L"0x" << pointer << L" ";
 
                 if (command[2] == L'a')
                 {
@@ -2279,7 +2643,7 @@ static void HandleDisplayCommand(
         }
         else
         {
-            UnitDump(address, bytes, unit, nullptr);
+            UnitDump(address, memory, unit, nullptr);
         }
     } while (false);
 }
@@ -2934,8 +3298,8 @@ static void HandlePhysicalDisplayCommand(
             break;
         }
 
-        std::vector<uint8_t> bytes;
-        if (!device.ReadPhysical(physicalAddress, byteCount, &bytes, &error))
+        MemoryReadView memory;
+        if (!ReadSparsePhysicalMemory(device, physicalAddress, byteCount, &memory, &error))
         {
             std::wcerr << L"physical read failed: " << error << L"\n";
             break;
@@ -2943,11 +3307,11 @@ static void HandlePhysicalDisplayCommand(
 
         if (command == L"phys" || command == L"pdb")
         {
-            HexDump(physicalAddress, bytes);
+            HexDump(physicalAddress, memory);
         }
         else
         {
-            UnitDump(physicalAddress, bytes, unit, nullptr);
+            UnitDump(physicalAddress, memory, unit, nullptr);
         }
     } while (false);
 }
@@ -4832,16 +5196,14 @@ static void HandleUnassembleCommand(
 
     do
     {
-        if (command == L"uf")
+        bool isFunction = command == L"uf";
+        if (isFunction)
         {
             if (args.size() < 2)
             {
-                std::wcerr << L"usage: uf <address|symbol>\n";
+                std::wcerr << L"usage: uf <address|symbol> [max-instructions]\n";
                 break;
             }
-
-            ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true);
-            break;
         }
 
         uint64_t address = 0;
@@ -4879,6 +5241,11 @@ static void HandleUnassembleCommand(
         }
 
         uint64_t count = 8;
+        if (isFunction)
+        {
+            count = 512;
+        }
+
         std::wstring countText;
         if (args.size() >= 3)
         {
@@ -4895,9 +5262,10 @@ static void HandleUnassembleCommand(
             break;
         }
 
-        if (count == 0 || count > 256)
+        uint64_t maxCount = isFunction ? 4096 : 256;
+        if (count == 0 || count > maxCount)
         {
-            std::wcerr << L"instruction count must be between 1 and 256\n";
+            std::wcerr << L"instruction count must be between 1 and " << maxCount << L"\n";
             break;
         }
 
@@ -4907,14 +5275,24 @@ static void HandleUnassembleCommand(
             std::vector<uint8_t> codeBytes;
             if (!ReadMemoryWithProcessContext(device, state, nullptr, address, bytesToRead, &codeBytes, &error))
             {
-                std::wcerr << L"u failed: driver code read failed: " << error << L"\n";
+                std::wcerr << command << L" failed: driver code read failed: " << error << L"\n";
                 break;
             }
 
             NativeDisassemblyResult nativeResult = {};
-            if (!DisassembleX64CodeBytes(address, codeBytes, static_cast<uint32_t>(count), &nativeResult, &error))
+            bool disassembled = false;
+            if (isFunction)
             {
-                std::wcerr << L"u failed: native disassembly failed: " << error << L"\n";
+                disassembled = DisassembleX64FunctionBytes(address, codeBytes, static_cast<uint32_t>(count), &nativeResult, &error);
+            }
+            else
+            {
+                disassembled = DisassembleX64CodeBytes(address, codeBytes, static_cast<uint32_t>(count), &nativeResult, &error);
+            }
+
+            if (!disassembled)
+            {
+                std::wcerr << command << L" failed: native disassembly failed: " << error << L"\n";
                 break;
             }
 
@@ -4926,6 +5304,12 @@ static void HandleUnassembleCommand(
 
             state.LastDisassemblyAddress = nativeResult.NextOffset;
             state.HasLastDisassemblyAddress = true;
+            break;
+        }
+
+        if (isFunction)
+        {
+            ExecuteDbgEngCommand(dbgeng, symbols, state, originalLine, true);
             break;
         }
 
