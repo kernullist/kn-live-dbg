@@ -1,6 +1,6 @@
-# Kn Live Dbg
+# Kn-Live-Dbg
 
-Kn Live Dbg is a Windows kernel live-debugging experiment shaped after the useful part of LiveKD: the kernel driver exposes narrow memory primitives, while the user-mode console owns service lifecycle, symbol loading, type interpretation, and operator UX.
+Kn-Live-Dbg is a Windows kernel live-debugging experiment shaped after the useful part of LiveKD: the kernel driver exposes narrow memory primitives, while the user-mode console owns service lifecycle, symbol loading, type interpretation, and operator UX.
 
 ## Scope and Signing Notice
 
@@ -106,7 +106,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands. Examples include `callbacks <Tab>` for callback scopes, `callbacks ob /m<Tab>` for the module option, `ai <Tab>` for AI actions, `ai analyze callbacks <Tab>` for callback scopes, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `ai <Tab>` for AI actions, `ai analyze callbacks <Tab>` for callback scopes, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Interactive output highlights high-signal categories and identifiers with console colors. Callback record tags such as `[ob]`, object type names, modules, symbols, translated physical addresses, module/symbol names, type names, field names, and dump line addresses are colored for scanning, while captured stdout/transcript text remains plain.
 
@@ -115,7 +115,12 @@ Interactive output highlights high-signal categories and identifiers with consol
 ```text
 help
 help all
+help <command>
+<command> help
+ai help <subcommand>
 help callbacks
+callbacks <scope> help
+ai <subcommand> help
 home
 dashboard
 backend [auto|native|dbgeng]
@@ -135,30 +140,33 @@ addr <symbol|address>
 query <address|symbol> [length]
 vtop <address|symbol> [length]
 vtop /cr3 <directory-table-base> <address|symbol> [length]
-vtop /pid <process-id> <address|symbol> [length]
+vtop /process <process-id> <address|symbol> [length]
 d, da, db, dc, dd, dD, df, dp, dq, du, dw, dW, dyb, dyd
-d* /pid <process-id> <address|symbol> [count]
+d* /process <process-id> <address|symbol> [count]
 dda, ddp, ddu, dpa, dpp, dpu, dqa, dqp, dqu
 dds, dps, dqs
 phys, pdb, pdw, pdd, pdq
-procctx [status|off|<process-id>]
+!db, !dw, !dd, !dq
+procctx [status|clear|<process-id>]
 u <address|symbol> [instruction-count]
 uf <address|symbol> [max-instructions]
 dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
-callbacks [all|ob|registry|process|thread|minifilter] [module]
+callbacks [all|object|registry|process|thread|minifilter] [module]
 callbacks [scope] /module <module>
-kcallbacks [all|ob|registry|process|thread|minifilter] [module]
-cb [all|ob|registry|process|thread|minifilter] [module]
+!dml_proc
 ai status
+ai providers
 ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
 ai policy <allow-remote|local-only|status>
 ai model <model>
+ai base-url <url>
+ai effort <minimal|low|medium|high|xhigh>
 ai auth
 ai preview <prompt>
 ai ask <prompt>
 ai plan <prompt>
-ai analyze callbacks [all|ob|registry|process|thread|minifilter] [module]
+ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]
 ai explain dt <dt-args...>
 ai annotate <u|uf> <address|symbol> [instruction-count]
 ai diagnose <prompt>
@@ -178,12 +186,24 @@ m <source> <destination> <length>
 write on|off
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 e* <address|symbol> [value...]          # defaults to System(pid 4) context
-e* /pid <process-id> <address|symbol> [value...]
+e* /process <process-id> <address|symbol> [value...]
 peb, pew, ped, peq
+!eb, !ew, !ed, !eq
+pe* <physical-address> [value...]
 setfield <type> <address|symbol> <field> <value>
 unload
 q, qq, qd, quit, exit
 ```
+
+Help syntax notes:
+
+- `help` shows native/TUI commands; `help all` also lists DbgEng-routed WinDbg commands.
+- `help <command>` and `<command> help` print detailed command-family syntax.
+- Count arguments are element counts for typed dumps, bytes for range lengths, and instruction counts for `u`/`uf`.
+- `nt!` is treated as the loaded kernel image for symbols and PDB type names.
+- `d*`, `e*`, and `vtop` support `/process <process-id>` for one command; `procctx <pid>` pins a default context.
+- Virtual `e*` writes default to System(pid 4) context for kernel addresses and temporarily restore read-only leaf PTE write bits after patching.
+- API-key AI providers load `.env` from the current directory, EXE directory, or repo root; `ai run` remains read-only and `ai write <index> confirm` is required for write-like plans.
 
 Example:
 
@@ -198,15 +218,19 @@ knkd> dq nt!PsLoadedModuleList 4
 knkd> vtop nt!PsLoadedModuleList
 knkd> procctx 1234
 knkd> db 0000012345678000 80
-knkd> db /pid 1234 0000012345678000 80
+knkd> db /process 1234 0000012345678000 80
 knkd> pdb <physical-address> 80
+knkd> !db <physical-address> 80
+knkd> !eb <physical-address>
+knkd> !eq <physical-address> <value>
 knkd> dt nt!_EPROCESS
 knkd> dt -r1 nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
 knkd> callbacks all
-knkd> callbacks ob
+knkd> callbacks object
 knkd> callbacks minifilter
 knkd> callbacks all WdFilter.sys
 knkd> callbacks /module WdFilter.sys
+knkd> !dml_proc
 knkd> ai provider openai-codex-cli
 knkd> ai preview explain the callback surfaces I pasted above
 knkd> ai plan inspect unknown object callbacks
@@ -237,13 +261,13 @@ ai providers
 ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
 ai policy <allow-remote|local-only|status>
 ai model <model>
-ai baseurl <url>
+ai base-url <url>
 ai effort <minimal|low|medium|high|xhigh>
 ai auth
 ai preview <prompt>
 ai ask <prompt>
 ai plan <prompt>
-ai analyze callbacks [all|ob|registry|process|thread|minifilter] [module]
+ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]
 ai explain dt <dt-args...>
 ai annotate <u|uf> <address|symbol> [instruction-count]
 ai diagnose <prompt>
@@ -308,7 +332,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -317,14 +341,14 @@ Examples:
 ```text
 knkd> kdinit
 knkd> kdinit /remote net:port=50000,key=1.2.3.4
-knkd> !process 0 0
+knkd> !dml_proc
 knkd> backend dbgeng
 knkd> k
 knkd> backend auto
 knkd> kddetach
 ```
 
-DbgEng uses `IDebugClient5::AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, ...)` for local mode and `DEBUG_ATTACH_KERNEL_CONNECTION` for `kdinit /remote <connection-options>`. Local mode still follows the limits of Windows local kernel debugging; not every KD command has the same behavior as a remote break-in session.
+DbgEng uses `IDebugClient5::AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, ...)` for local mode and `DEBUG_ATTACH_KERNEL_CONNECTION` for `kdinit /remote <connection-options>`. Local mode still follows the limits of Windows local kernel debugging; not every KD command has the same behavior as a remote break-in session. Use native `!dml_proc` when you need a process list without relying on DbgEng current process/thread state or extension exports.
 
 ## Native `dt`
 
@@ -355,18 +379,28 @@ Exact type layouts first try `SymGetTypeFromNameW`. If that lookup fails for an 
 
 When `DbgHelp` cannot return a usable UDT layout, the symbol engine tries a DIA SDK fallback against the loaded PDB path or resolves the PDB from the module image plus symbol path. DIA creation first uses registered COM and then falls back to direct `DllGetClassObject` activation from the staged `msdia*.dll`, which makes registration failures distinct from real type lookup failures. The fallback is especially useful for field offsets, bit positions, and private type metadata used by callback scanning and `dt`; recursive expansion still prefers the normal `DbgHelp` type-id path when it is available.
 
+## Native Process Listing
+
+`!dml_proc` is implemented natively so it works even when the optional DbgEng backend does not have a current process/thread or cannot load WinDbg extension exports:
+
+```text
+!dml_proc
+```
+
+The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.ActiveProcessLinks`, then walks the active process list from live kernel memory. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a ready-to-run `dt nt!_EPROCESS <address>` follow-up.
+
 ## Kernel Callback Scanner
 
 `callbacks` walks live kernel callback lists using kernel PDB type layouts and the native memory reader:
 
 ```text
 callbacks all
-callbacks ob
+callbacks object
 callbacks registry
 callbacks process
 callbacks thread
 callbacks minifilter
-callbacks ob WdFilter.sys
+callbacks object WdFilter.sys
 callbacks minifilter UnionFS
 ```
 
@@ -378,7 +412,7 @@ The scanner currently covers:
 4. Thread creation callbacks by enumerating and validating create-thread notify routine table candidates such as `PspCreateThreadNotifyRoutine`, then decoding callback routine blocks with the same stable x64 fallback.
 5. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
 
-Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `callbacks ob WdFilter.sys` or `callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
+Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `callbacks object WdFilter.sys` or `callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
 
 ## Virtual-To-Physical And Physical Memory
 
@@ -387,17 +421,21 @@ Native physical memory support is intentionally explicit:
 ```text
 vtop nt!PsLoadedModuleList
 vtop /cr3 <directory-table-base> <virtual-address> 100
-vtop /pid <process-id> <user-virtual-address> 100
+vtop /process <process-id> <user-virtual-address> 100
 procctx <process-id>
 db <user-virtual-address> 80
-db /pid <process-id> <user-virtual-address> 80
+db /process <process-id> <user-virtual-address> 80
 pdb <physical-address> 80
 pdq <physical-address> 10
+!db <physical-address> 80
+!dq <physical-address> 10
 write off
+!eb <physical-address>
 peq <physical-address> <qword-value>
+!eq <physical-address> <qword-value>
 ```
 
-`vtop` uses the current CR3 when no directory-table base is supplied. `vtop /pid` asks the driver to resolve the target EPROCESS, reads the DTB offsets from PDB type metadata, and walks that process address space. It prints whether the walk used PML4 or PML5, the physical address of each page-table entry that was read, and the leaf entry kind, physical address, and writable state. `procctx <pid>` stores the same process context for later user VA reads/writes. `d*` commands accept `/pid <pid>` for one-shot process-aware access, while native `e*` virtual writes default to the System process context (`pid 4`) and accept `/pid <pid>` when a process-specific user VA should be edited. If `e*` is invoked with only an address, the TUI enters a WinDbg-style one-line edit prompt that shows the current value, accepts replacement values, and cancels on an empty line, `.`, `q`, or `quit`. These paths translate each VA range before access. Reads use physical pages, translated user VA writes use physical writes through the selected process context, and kernel VA writes use the original virtual address after any required page-table write-enable step. When a translated leaf PTE/PDE/PDPTE is present but not writable, `e*` temporarily sets the write bit on that leaf entry, flushes the virtual address, performs the edit, restores the write bit to its original state, and flushes again. The driver walks x64 paging structures through physical reads, reports PML5E/PML4E/PDPTE/PDE/PTE entries when applicable, handles 4 KB, 2 MB, and 1 GB pages, and returns the number of contiguous bytes remaining in the translated page. Physical writes are routed through page-sized `MmMapIoSpaceEx` mappings with `MmGetVirtualForPhysical` fallback when Windows already has a direct mapping for the PFN. Write mode is enabled by default for each device handle; use `write off` when you want a read-only console session.
+`vtop` uses the current CR3 when no directory-table base is supplied. `vtop /process` asks the driver to resolve the target EPROCESS, reads the DTB offsets from PDB type metadata, and walks that process address space. It prints whether the walk used PML4 or PML5, the physical address of each page-table entry that was read, and the leaf entry kind, physical address, and writable state. `procctx <pid>` stores the same process context for later user VA reads/writes. `d*` commands accept `/process <pid>` for one-shot process-aware access, while native `e*` virtual writes default to the System process context (`pid 4`) and accept `/process <pid>` when a process-specific user VA should be edited. If `e*` is invoked with only an address, the TUI enters a WinDbg-style one-line edit prompt that shows the current value, accepts replacement values, and cancels on an empty line, `.`, `q`, or `quit`. These paths translate each VA range before access. Reads use physical pages, translated user VA writes use physical writes through the selected process context, and kernel VA writes use the original virtual address after any required page-table write-enable step. When a translated leaf PTE/PDE/PDPTE is present but not writable, `e*` temporarily sets the write bit on that leaf entry, flushes the virtual address, performs the edit, restores the write bit to its original state, and flushes again. The driver walks x64 paging structures through physical reads, reports PML5E/PML4E/PDPTE/PDE/PTE entries when applicable, handles 4 KB, 2 MB, and 1 GB pages, and returns the number of contiguous bytes remaining in the translated page. Physical reads are available through both native names (`phys`, `pdb`, `pdw`, `pdd`, `pdq`) and WinDbg-style extension names (`!db`, `!dw`, `!dd`, `!dq`). Physical writes are available through both native names (`peb`, `pew`, `ped`, `peq`) and WinDbg-style extension names (`!eb`, `!ew`, `!ed`, `!eq`), and are routed through page-sized `MmMapIoSpaceEx` mappings with `MmGetVirtualForPhysical` fallback when Windows already has a direct mapping for the PFN. Address-only physical enter commands prompt with the current physical value before writing, matching the native `eb` edit flow. Write mode is enabled by default for each device handle; use `write off` when you want a read-only console session.
 
 ## Positive-Control Probe
 

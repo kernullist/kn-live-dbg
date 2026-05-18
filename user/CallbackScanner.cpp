@@ -2949,22 +2949,17 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
 
         std::wstring normalized = ToLowerLocal(scope.empty() ? L"all" : scope);
         bool scanAll = normalized == L"all";
-        bool scanOb = scanAll || normalized == L"ob" || normalized == L"object" ||
-            normalized == L"objects" || normalized == L"object-manager";
-        bool scanRegistry = scanAll || normalized == L"reg" || normalized == L"registry";
-        bool scanProcess = scanAll || normalized == L"proc" || normalized == L"process" ||
-            normalized == L"processes" || normalized == L"ps";
-        bool scanThread = scanAll || normalized == L"thread" || normalized == L"threads" ||
-            normalized == L"thr" || normalized == L"th";
-        bool scanMini = scanAll || normalized == L"mini" || normalized == L"minifilter" ||
-            normalized == L"minifilters" || normalized == L"flt" || normalized == L"fltmgr" ||
-            normalized == L"filter" || normalized == L"filters";
+        bool scanOb = scanAll || normalized == L"object";
+        bool scanRegistry = scanAll || normalized == L"registry";
+        bool scanProcess = scanAll || normalized == L"process";
+        bool scanThread = scanAll || normalized == L"thread";
+        bool scanMini = scanAll || normalized == L"minifilter";
 
         if (!scanOb && !scanRegistry && !scanProcess && !scanThread && !scanMini)
         {
             if (error != nullptr)
             {
-                *error = L"usage: callbacks [all|ob|registry|process|thread|minifilter]";
+                *error = L"usage: callbacks [all|object|registry|process|thread|minifilter]";
             }
             break;
         }

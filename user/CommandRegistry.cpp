@@ -86,12 +86,20 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"pdw", L"pdw", L"memory", L"display physical words", CommandSupport::Native),
         Make(L"pdd", L"pdd", L"memory", L"display physical dwords", CommandSupport::Native),
         Make(L"pdq", L"pdq", L"memory", L"display physical qwords", CommandSupport::Native),
+        Make(L"!db", L"!db", L"memory", L"display physical bytes", CommandSupport::Native),
+        Make(L"!dw", L"!dw", L"memory", L"display physical words", CommandSupport::Native),
+        Make(L"!dd", L"!dd", L"memory", L"display physical dwords", CommandSupport::Native),
+        Make(L"!dq", L"!dq", L"memory", L"display physical qwords", CommandSupport::Native),
         Make(L"probe", L"probe", L"session", L"manage positive-control test driver", CommandSupport::Native),
         Make(L"procctx", L"procctx", L"memory", L"set process DTB context for vtop", CommandSupport::Native),
         Make(L"peb", L"peb", L"memory", L"enter physical byte values", CommandSupport::Native),
         Make(L"pew", L"pew", L"memory", L"enter physical word values", CommandSupport::Native),
         Make(L"ped", L"ped", L"memory", L"enter physical dword values", CommandSupport::Native),
         Make(L"peq", L"peq", L"memory", L"enter physical qword values", CommandSupport::Native),
+        Make(L"!eb", L"!eb", L"memory", L"enter physical byte values", CommandSupport::Native),
+        Make(L"!ew", L"!ew", L"memory", L"enter physical word values", CommandSupport::Native),
+        Make(L"!ed", L"!ed", L"memory", L"enter physical dword values", CommandSupport::Native),
+        Make(L"!eq", L"!eq", L"memory", L"enter physical qword values", CommandSupport::Native),
         Make(L"vtop", L"vtop", L"memory", L"translate virtual address to physical address", CommandSupport::Native),
         Make(L"dg", L"dg", L"selector", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"dl", L"dl", L"memory", kRequiresParser, CommandSupport::DbgEng),
@@ -99,9 +107,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"dS", L"dS", L"memory", L"display counted string as UTF-16", CommandSupport::Alias),
         Make(L"dt", L"dt", L"type", L"display type fields or enumerate type patterns", CommandSupport::Native),
         Make(L"dtx", L"dtx", L"type", L"display type fields through native type reader", CommandSupport::Alias),
-        Make(L"callbacks", L"callbacks", L"kernel", L"list callbacks: all|ob|registry|process|thread|minifilter [module]", CommandSupport::Native),
-        Make(L"kcallbacks", L"callbacks", L"kernel", L"alias for callbacks [scope] [module]", CommandSupport::Alias),
-        Make(L"cb", L"callbacks", L"kernel", L"alias for callbacks [scope] [module]", CommandSupport::Alias),
+        Make(L"callbacks", L"callbacks", L"kernel", L"list callbacks: all|object|registry|process|thread|minifilter [module]", CommandSupport::Native),
+        Make(L"!dml_proc", L"!dml_proc", L"kernel", L"list all processes from EPROCESS ActiveProcessLinks", CommandSupport::Native),
         Make(L"dv", L"dv", L"locals", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"dx", L"dx", L"data-model", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"e", L"e", L"memory", L"enter byte values", CommandSupport::Native),
@@ -293,6 +300,8 @@ bool CommandRegistry::IsKnown(const std::wstring& command)
 void CommandRegistry::PrintSummary(bool includeDbgEng)
 {
     std::wcout << L"registered commands:\n";
+    std::wcout << L"  states: native=KnLiveDbg implementation, alias=local alias, dbgeng=DbgEng-routed\n";
+    std::wcout << L"  detail: type help <command> or <command> help for command-family syntax\n";
 
     for (const CommandInfo& info : Commands())
     {

@@ -20,7 +20,7 @@ The first integration layer is implemented as a user-mode `ai` command and `AiPr
 2. `ai providers` lists the supported provider names.
 3. `ai provider <name>` switches between `openai-codex-cli`, `openai-codex-subscription`, `deepseek`, `openrouter`, and `off`.
 4. `ai policy <allow-remote|local-only|status>` controls whether HTTP-backed providers are allowed in the current session.
-5. `ai model <model>`, `ai baseurl <url>`, and `ai effort <effort>` update the in-memory provider settings for the current session.
+5. `ai model <model>`, `ai base-url <url>`, and `ai effort <effort>` update the in-memory provider settings for the current session.
 6. `ai auth` prints the supported `.env` keys, environment variables, and Codex auth file search paths.
 7. `ai preview <prompt>` prints the outbound provider plan without sending a request.
 8. `ai ask <prompt>` sends an advisory request. The assistant receives session context such as backend mode, number base, symbol path, loaded module count, and write-safety rules.
@@ -49,15 +49,17 @@ The runtime automatically loads the first `.env` file found in the current direc
 
 The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. AI callback analysis consumes normal `callbacks <scope> [module]` evidence. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
 
+Every AI subcommand has operator help through `ai <subcommand> help` and `ai help <subcommand>`, so provider setup, transcript/audit logging, playbooks, analysis, and write confirmation can be discovered without leaving the TUI.
+
 ## Candidate Features
 
 ### Natural-Language Command Planner
 
 Translate operator intent into concrete commands:
 
-- "Show object callbacks" -> `callbacks ob`
+- "Show object callbacks" -> `callbacks object`
 - "Dump this address as an EPROCESS" -> `dt nt!_EPROCESS <address>`
-- "Translate this virtual address and read the physical bytes" -> `vtop <address>` followed by `pdb <physical-address> <length>`
+- "Translate this virtual address and read the physical bytes" -> `vtop <address>` followed by `pdb <physical-address> <length>` or `!db <physical-address> <length>`
 - "Disassemble this callback routine" -> `u <address> <count>` or `uf <symbol>`
 
 Implementation notes:
@@ -69,7 +71,7 @@ Implementation notes:
 
 ### Callback Analysis Report
 
-Implemented entrypoint: `ai analyze callbacks [all|ob|registry|process|thread|minifilter] [module]`.
+Implemented entrypoint: `ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]`.
 
 The command post-processes `callbacks` output into an investigation report:
 
@@ -102,7 +104,7 @@ Because write mode is enabled by default per device handle, the AI path adds an 
 
 1. Before a write, read and display the current value.
 2. Show the exact target range, write width, interpreted type field when available, and whether the write crosses a page boundary.
-3. For native `e*` virtual writes, treat the default address-space context as System (`pid 4`) unless the command includes `/pid <process-id>`.
+3. For native `e*` virtual writes, treat the default address-space context as System (`pid 4`) unless the command includes `/process <process-id>`.
 4. For virtual writes, offer `vtop` context when useful, including the leaf entry physical address, writable state, and whether a temporary write-bit flip plus VA flush is expected. Kernel VA edits should be described as temporary write-enable plus original-VA write; translated user VA edits should be described as physical writes through the selected process context.
 5. For physical writes, warn when the target could be page tables, device memory, or firmware-owned memory.
 6. Generate backup and restore commands before applying the write.
