@@ -4,6 +4,7 @@
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
 #include "DriverService.h"
+#include "NativeDisassembler.h"
 #include "SymbolEngine.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
@@ -19,6 +20,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 static std::atomic_bool g_StopRequested = false;
@@ -51,6 +53,15 @@ static std::wstring FormatWin32Error(const wchar_t* prefix, DWORD error)
 
     std::wstringstream stream;
     stream << prefix << L": " << error << L" " << buffer;
+    return stream.str();
+}
+
+static std::wstring FormatHResultError(const wchar_t* prefix, HRESULT hr)
+{
+    std::wstringstream stream;
+
+    stream << prefix << L": 0x" << std::hex << std::setw(8) << std::setfill(L'0')
+           << static_cast<uint32_t>(hr) << std::dec;
     return stream.str();
 }
 
@@ -101,6 +112,20 @@ private:
     WORD oldAttributes_;
     bool active_;
 };
+
+static void PrintColoredText(const std::wstring& text, WORD color)
+{
+    ScopedConsoleColor scopedColor(GetStdHandle(STD_OUTPUT_HANDLE), color);
+    std::wcout << text;
+}
+
+static void PrintColoredText(const wchar_t* text, WORD color)
+{
+    if (text != nullptr)
+    {
+        PrintColoredText(std::wstring(text), color);
+    }
+}
 
 struct DebuggerState
 {
@@ -342,6 +367,249 @@ static std::wstring GetExecutableDirectory()
     return result;
 }
 
+static bool FileExists(const std::wstring& path)
+{
+    bool exists = false;
+
+    do
+    {
+        if (path.empty())
+        {
+            break;
+        }
+
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+        {
+            break;
+        }
+
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            break;
+        }
+
+        exists = true;
+    } while (false);
+
+    return exists;
+}
+
+static bool EnsureSymsrvConsentFile(const std::wstring& exeDir, std::wstring* status, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (status != nullptr)
+        {
+            status->clear();
+        }
+
+        if (exeDir.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"executable directory is empty";
+            }
+            break;
+        }
+
+        std::wstring symsrvPath = exeDir + L"\\symsrv.dll";
+        if (!FileExists(symsrvPath))
+        {
+            if (status != nullptr)
+            {
+                *status = L"symsrv.dll not staged";
+            }
+            ok = true;
+            break;
+        }
+
+        std::wstring consentPath = exeDir + L"\\symsrv.yes";
+        if (FileExists(consentPath))
+        {
+            if (status != nullptr)
+            {
+                *status = L"symsrv.yes present";
+            }
+            ok = true;
+            break;
+        }
+
+        HANDLE file = CreateFileW(
+            consentPath.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            DWORD lastError = GetLastError();
+            if (lastError == ERROR_FILE_EXISTS)
+            {
+                if (status != nullptr)
+                {
+                    *status = L"symsrv.yes present";
+                }
+                ok = true;
+                break;
+            }
+
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"CreateFileW symsrv.yes failed", lastError);
+            }
+            break;
+        }
+
+        BYTE marker = 0x20;
+        DWORD written = 0;
+        BOOL writeOk = WriteFile(file, &marker, sizeof(marker), &written, nullptr);
+        DWORD writeError = writeOk ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(file);
+
+        if (!writeOk || written != sizeof(marker))
+        {
+            DeleteFileW(consentPath.c_str());
+            if (error != nullptr)
+            {
+                *error = writeOk ? L"WriteFile symsrv.yes wrote an unexpected byte count" :
+                    FormatWin32Error(L"WriteFile symsrv.yes failed", writeError);
+            }
+            break;
+        }
+
+        if (status != nullptr)
+        {
+            *status = L"symsrv.yes created";
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+typedef HRESULT (STDAPICALLTYPE* DllRegisterServerPtr)();
+
+static bool RegisterDiaDll(const std::wstring& path, std::wstring* error)
+{
+    bool ok = false;
+    HMODULE module = nullptr;
+
+    do
+    {
+        module = LoadLibraryW(path.c_str());
+        if (module == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"LoadLibraryW DIA failed", GetLastError());
+            }
+            break;
+        }
+
+        FARPROC proc = GetProcAddress(module, "DllRegisterServer");
+        if (proc == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"GetProcAddress DllRegisterServer failed", GetLastError());
+            }
+            break;
+        }
+
+        auto registerServer = reinterpret_cast<DllRegisterServerPtr>(proc);
+        HRESULT hr = registerServer();
+        if (FAILED(hr))
+        {
+            if (error != nullptr)
+            {
+                *error = FormatHResultError(L"DllRegisterServer DIA failed", hr);
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    if (module != nullptr)
+    {
+        FreeLibrary(module);
+    }
+
+    return ok;
+}
+
+static bool EnsureDiaRegistration(const std::wstring& exeDir, std::wstring* status, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (status != nullptr)
+        {
+            status->clear();
+        }
+
+        if (exeDir.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"executable directory is empty";
+            }
+            break;
+        }
+
+        const std::wstring candidates[] =
+        {
+            exeDir + L"\\msdia140.dll",
+            exeDir + L"\\msdia150.dll"
+        };
+
+        std::wstring selected;
+        for (const std::wstring& candidate : candidates)
+        {
+            if (FileExists(candidate))
+            {
+                selected = candidate;
+                break;
+            }
+        }
+
+        if (selected.empty())
+        {
+            if (status != nullptr)
+            {
+                *status = L"msdia dll not staged";
+            }
+            ok = true;
+            break;
+        }
+
+        std::wstring localError;
+        if (!RegisterDiaDll(selected, &localError))
+        {
+            if (error != nullptr)
+            {
+                *error = selected + L": " + localError;
+            }
+            break;
+        }
+
+        if (status != nullptr)
+        {
+            size_t slash = selected.find_last_of(L"\\/");
+            *status = L"registered " + (slash == std::wstring::npos ? selected : selected.substr(slash + 1));
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static std::wstring GetCurrentDirectoryString()
 {
     std::wstring result;
@@ -456,6 +724,390 @@ static std::vector<std::wstring> BuildDotEnvSearchPaths(const std::wstring& exeD
     return paths;
 }
 
+typedef struct _SYMBOL_DIRECTORY_SCAN_ITEM
+{
+    std::wstring Path;
+    ULONG Depth;
+} SYMBOL_DIRECTORY_SCAN_ITEM;
+
+typedef struct _STARTUP_SYMBOL_PATH_INFO
+{
+    std::wstring Path;
+    std::wstring SymbolCachePath;
+    std::wstring SymbolCacheError;
+    size_t LocalDirectoryCount;
+    bool SymbolCacheReady;
+    bool Truncated;
+} STARTUP_SYMBOL_PATH_INFO;
+
+static const wchar_t* KNDBG_MICROSOFT_SYMBOL_SERVER = L"https://msdl.microsoft.com/download/symbols";
+
+static void AddUniqueSymbolPathEntry(std::vector<std::wstring>& entries, const std::wstring& entry)
+{
+    do
+    {
+        std::wstring trimmed = TrimWhitespace(entry);
+        if (trimmed.empty())
+        {
+            break;
+        }
+
+        std::wstring lowered = ToLower(trimmed);
+        for (const std::wstring& existing : entries)
+        {
+            if (ToLower(existing) == lowered)
+            {
+                return;
+            }
+        }
+
+        entries.push_back(trimmed);
+    } while (false);
+}
+
+static std::vector<std::wstring> SplitSymbolPathEntries(const std::wstring& symbolPath)
+{
+    std::vector<std::wstring> entries;
+    size_t first = 0;
+
+    while (first <= symbolPath.size())
+    {
+        size_t next = symbolPath.find(L';', first);
+        std::wstring entry = symbolPath.substr(
+            first,
+            next == std::wstring::npos ? std::wstring::npos : next - first);
+        AddUniqueSymbolPathEntry(entries, entry);
+
+        if (next == std::wstring::npos)
+        {
+            break;
+        }
+
+        first = next + 1;
+    }
+
+    return entries;
+}
+
+static std::wstring JoinSymbolPathEntries(const std::vector<std::wstring>& entries)
+{
+    std::wstring result;
+
+    for (const std::wstring& entry : entries)
+    {
+        if (entry.empty())
+        {
+            continue;
+        }
+
+        if (!result.empty())
+        {
+            result += L";";
+        }
+
+        result += entry;
+    }
+
+    return result;
+}
+
+static bool IsSkippableDirectoryName(const std::wstring& name)
+{
+    return name == L"." || name == L"..";
+}
+
+static std::wstring TrimTrailingSlashes(const std::wstring& value)
+{
+    std::wstring result = value;
+
+    while (!result.empty() && (result.back() == L'\\' || result.back() == L'/'))
+    {
+        result.pop_back();
+    }
+
+    return result;
+}
+
+static bool PathIsSameOrBelow(const std::wstring& path, const std::wstring& root)
+{
+    bool matches = false;
+
+    do
+    {
+        if (path.empty() || root.empty())
+        {
+            break;
+        }
+
+        std::wstring normalizedPath = ToLower(TrimTrailingSlashes(GetFullPathString(path)));
+        std::wstring normalizedRoot = ToLower(TrimTrailingSlashes(GetFullPathString(root)));
+        if (normalizedPath.empty() || normalizedRoot.empty())
+        {
+            break;
+        }
+
+        if (normalizedPath == normalizedRoot)
+        {
+            matches = true;
+            break;
+        }
+
+        if (normalizedPath.size() > normalizedRoot.size() &&
+            normalizedPath.rfind(normalizedRoot, 0) == 0 &&
+            (normalizedPath[normalizedRoot.size()] == L'\\' || normalizedPath[normalizedRoot.size()] == L'/'))
+        {
+            matches = true;
+            break;
+        }
+    } while (false);
+
+    return matches;
+}
+
+static bool EnsureDirectoryExists(const std::wstring& path, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (path.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"directory path is empty";
+            }
+            break;
+        }
+
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES)
+        {
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                ok = true;
+            }
+            else if (error != nullptr)
+            {
+                *error = L"path exists but is not a directory: " + path;
+            }
+            break;
+        }
+
+        if (!CreateDirectoryW(path.c_str(), nullptr))
+        {
+            DWORD lastError = GetLastError();
+            if (lastError == ERROR_ALREADY_EXISTS)
+            {
+                attributes = GetFileAttributesW(path.c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                {
+                    ok = true;
+                    break;
+                }
+            }
+
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"CreateDirectoryW failed", lastError);
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring BuildExeSymbolCachePath(const std::wstring& exeDir)
+{
+    std::wstring result;
+
+    do
+    {
+        if (exeDir.empty())
+        {
+            break;
+        }
+
+        result = GetFullPathString(exeDir + L"\\symbols");
+    } while (false);
+
+    return result;
+}
+
+static std::wstring BuildMicrosoftSymbolServerEntry(const std::wstring& cachePath)
+{
+    std::wstring entry;
+
+    do
+    {
+        if (cachePath.empty())
+        {
+            break;
+        }
+
+        entry = L"SRV*" + cachePath + L"*" + KNDBG_MICROSOFT_SYMBOL_SERVER;
+    } while (false);
+
+    return entry;
+}
+
+static bool IsMicrosoftSymbolServerEntry(const std::wstring& entry)
+{
+    return ToLower(entry).find(ToLower(KNDBG_MICROSOFT_SYMBOL_SERVER)) != std::wstring::npos;
+}
+
+static void AddExecutableSymbolDirectories(
+    std::vector<std::wstring>& entries,
+    const std::wstring& exeDir,
+    const std::wstring& excludedRoot,
+    size_t maxDirectories,
+    ULONG maxDepth,
+    size_t* localDirectoryCount,
+    bool* truncated)
+{
+    do
+    {
+        if (localDirectoryCount != nullptr)
+        {
+            *localDirectoryCount = 0;
+        }
+
+        if (truncated != nullptr)
+        {
+            *truncated = false;
+        }
+
+        if (exeDir.empty() || maxDirectories == 0)
+        {
+            break;
+        }
+
+        std::vector<SYMBOL_DIRECTORY_SCAN_ITEM> pending;
+        std::vector<std::wstring> localDirectories;
+
+        AddUniquePath(localDirectories, exeDir);
+
+        SYMBOL_DIRECTORY_SCAN_ITEM rootItem = {};
+        rootItem.Path = GetFullPathString(exeDir);
+        rootItem.Depth = 0;
+        pending.push_back(rootItem);
+
+        size_t scanIndex = 0;
+        while (scanIndex < pending.size())
+        {
+            SYMBOL_DIRECTORY_SCAN_ITEM item = pending[scanIndex];
+            ++scanIndex;
+
+            if (item.Depth >= maxDepth)
+            {
+                continue;
+            }
+
+            std::wstring search = item.Path + L"\\*";
+            WIN32_FIND_DATAW findData = {};
+            HANDLE find = FindFirstFileW(search.c_str(), &findData);
+            if (find == INVALID_HANDLE_VALUE)
+            {
+                continue;
+            }
+
+            do
+            {
+                std::wstring name = findData.cFileName;
+                if (IsSkippableDirectoryName(name))
+                {
+                    continue;
+                }
+
+                if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+                {
+                    continue;
+                }
+
+                if ((findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                {
+                    continue;
+                }
+
+                if (localDirectories.size() >= maxDirectories)
+                {
+                    if (truncated != nullptr)
+                    {
+                        *truncated = true;
+                    }
+                    break;
+                }
+
+                std::wstring child = item.Path + L"\\" + name;
+                if (PathIsSameOrBelow(child, excludedRoot))
+                {
+                    continue;
+                }
+
+                AddUniquePath(localDirectories, child);
+
+                SYMBOL_DIRECTORY_SCAN_ITEM childItem = {};
+                childItem.Path = GetFullPathString(child);
+                childItem.Depth = item.Depth + 1;
+                pending.push_back(childItem);
+            } while (FindNextFileW(find, &findData));
+
+            FindClose(find);
+
+            if (truncated != nullptr && *truncated)
+            {
+                break;
+            }
+        }
+
+        for (const std::wstring& directory : localDirectories)
+        {
+            AddUniqueSymbolPathEntry(entries, directory);
+        }
+
+        if (localDirectoryCount != nullptr)
+        {
+            *localDirectoryCount = localDirectories.size();
+        }
+    } while (false);
+}
+
+static STARTUP_SYMBOL_PATH_INFO BuildStartupSymbolPath(const std::wstring& baseSymbolPath, const std::wstring& exeDir)
+{
+    STARTUP_SYMBOL_PATH_INFO info = {};
+    std::vector<std::wstring> entries;
+
+    info.SymbolCachePath = BuildExeSymbolCachePath(exeDir);
+    if (!info.SymbolCachePath.empty())
+    {
+        info.SymbolCacheReady = EnsureDirectoryExists(info.SymbolCachePath, &info.SymbolCacheError);
+    }
+
+    AddExecutableSymbolDirectories(entries, exeDir, info.SymbolCachePath, 128, 6, &info.LocalDirectoryCount, &info.Truncated);
+
+    std::wstring microsoftSymbolServer = BuildMicrosoftSymbolServerEntry(info.SymbolCachePath);
+    if (!microsoftSymbolServer.empty())
+    {
+        AddUniqueSymbolPathEntry(entries, microsoftSymbolServer);
+    }
+
+    std::vector<std::wstring> baseEntries = SplitSymbolPathEntries(baseSymbolPath);
+    for (const std::wstring& entry : baseEntries)
+    {
+        if (IsMicrosoftSymbolServerEntry(entry))
+        {
+            continue;
+        }
+
+        AddUniqueSymbolPathEntry(entries, entry);
+    }
+
+    info.Path = JoinSymbolPathEntries(entries);
+    return info;
+}
+
 static std::vector<std::wstring> Split(const std::wstring& line)
 {
     std::vector<std::wstring> parts;
@@ -497,7 +1149,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"KnLiveDbg WinDbg-compatible command surface\n";
     std::wcout << L"usage examples:\n";
     std::wcout << L"  home\n";
-    std::wcout << L"  .sympath SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols\n";
+    std::wcout << L"  .sympath SRV*<exe-dir>\\symbols*https://msdl.microsoft.com/download/symbols\n";
     std::wcout << L"  .reload\n";
     std::wcout << L"  lm nt\n";
     std::wcout << L"  x nt!*Process*\n";
@@ -525,6 +1177,32 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  drvstatus\n";
     std::wcout << L"\n";
     CommandRegistry::PrintSummary(includeDbgEng);
+}
+
+static void PrintCallbacksHelp()
+{
+    std::wcout << L"callbacks command:\n";
+    std::wcout << L"  callbacks [all|ob|object|registry|reg|process|proc|ps|minifilter|mini|flt|fltmgr]\n";
+    std::wcout << L"  callbacks json [all|ob|registry|process|minifilter] [path|-]\n";
+    std::wcout << L"  callbacks [all|ob|registry|process|minifilter] json [path|-]\n";
+    std::wcout << L"  kcallbacks [scope]\n";
+    std::wcout << L"  cb [scope]\n";
+    std::wcout << L"\n";
+    std::wcout << L"scopes:\n";
+    std::wcout << L"  all          object-manager, registry, process, and minifilter callbacks\n";
+    std::wcout << L"  ob           object-manager filters from _OBJECT_TYPE.CallbackList\n";
+    std::wcout << L"  registry     registry callbacks from CmpCallbackListHead candidates\n";
+    std::wcout << L"  process      process creation callbacks from PspCreateProcessNotifyRoutine candidates\n";
+    std::wcout << L"  minifilter   minifilter filters and operation callbacks from fltmgr!FltGlobals\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  callbacks all\n";
+    std::wcout << L"  callbacks ob\n";
+    std::wcout << L"  callbacks registry\n";
+    std::wcout << L"  callbacks process\n";
+    std::wcout << L"  callbacks minifilter\n";
+    std::wcout << L"  callbacks json all .\\callbacks.json\n";
+    std::wcout << L"  callbacks minifilter json -\n";
 }
 
 static const wchar_t* BackendModeText(DebuggerState::BackendMode mode)
@@ -617,6 +1295,19 @@ static std::wstring HexText(uint64_t value)
     std::wstringstream stream;
 
     stream << L"0x" << std::hex << value << std::dec;
+    return stream.str();
+}
+
+static std::wstring HexTextWidth(uint64_t value, int width, bool prefix)
+{
+    std::wstringstream stream;
+
+    if (prefix)
+    {
+        stream << L"0x";
+    }
+
+    stream << std::hex << std::setw(width) << std::setfill(L'0') << value << std::dec;
     return stream.str();
 }
 
@@ -755,7 +1446,9 @@ static void HexDump(uint64_t address, const std::vector<uint8_t>& bytes)
 {
     for (size_t offset = 0; offset < bytes.size(); offset += 16)
     {
-        std::wcout << std::hex << std::setw(16) << std::setfill(L'0') << (address + offset) << L"  ";
+        PrintColoredText(HexTextWidth(address + offset, 16, false), KNDBG_COLOR_ACCENT);
+        std::wcout << L"  ";
+        std::wcout << std::hex << std::setfill(L'0');
 
         for (size_t index = 0; index < 16; ++index)
         {
@@ -780,7 +1473,7 @@ static void HexDump(uint64_t address, const std::vector<uint8_t>& bytes)
             std::wcout << ch;
         }
 
-        std::wcout << std::dec << L"\n";
+        std::wcout << std::setfill(L' ') << std::dec << L"\n";
     }
 }
 
@@ -789,8 +1482,8 @@ static void UnitDump(uint64_t address, const std::vector<uint8_t>& bytes, size_t
     for (size_t offset = 0; offset + width <= bytes.size(); offset += width)
     {
         uint64_t value = DecodeInteger(bytes.data() + offset, width);
-        std::wcout << L"0x" << std::hex << std::setw(16) << std::setfill(L'0') << (address + offset)
-                   << L": 0x" << std::setw(static_cast<int>(width * 2)) << value;
+        PrintColoredText(HexTextWidth(address + offset, 16, true), KNDBG_COLOR_ACCENT);
+        std::wcout << L": " << HexTextWidth(value, static_cast<int>(width * 2), true);
 
         if (symbols != nullptr)
         {
@@ -799,7 +1492,8 @@ static void UnitDump(uint64_t address, const std::vector<uint8_t>& bytes, size_t
             std::wstring ignored;
             if (symbols->FindNearestSymbol(value, &name, &displacement, &ignored))
             {
-                std::wcout << L"  " << name;
+                std::wcout << L"  ";
+                PrintColoredText(name, KNDBG_COLOR_TITLE);
                 if (displacement != 0)
                 {
                     std::wcout << L"+0x" << displacement;
@@ -813,7 +1507,8 @@ static void UnitDump(uint64_t address, const std::vector<uint8_t>& bytes, size_t
 
 static void PrintAsciiString(uint64_t address, const std::vector<uint8_t>& bytes)
 {
-    std::wcout << L"0x" << std::hex << address << L": " << std::dec;
+    PrintColoredText(HexText(address), KNDBG_COLOR_ACCENT);
+    std::wcout << L": ";
 
     for (uint8_t ch : bytes)
     {
@@ -837,7 +1532,8 @@ static void PrintAsciiString(uint64_t address, const std::vector<uint8_t>& bytes
 
 static void PrintUnicodeString(uint64_t address, const std::vector<uint8_t>& bytes)
 {
-    std::wcout << L"0x" << std::hex << address << L": " << std::dec;
+    PrintColoredText(HexText(address), KNDBG_COLOR_ACCENT);
+    std::wcout << L": ";
 
     for (size_t offset = 0; offset + sizeof(wchar_t) <= bytes.size(); offset += sizeof(wchar_t))
     {
@@ -1058,6 +1754,11 @@ static bool ContainsNoCase(const std::wstring& value, const std::wstring& needle
     return ToLower(value).find(ToLower(needle)) != std::wstring::npos;
 }
 
+static bool HasTypeWildcard(const std::wstring& value)
+{
+    return value.find(L'*') != std::wstring::npos || value.find(L'?') != std::wstring::npos;
+}
+
 static bool FieldMatchesFilters(const TypeFieldInfo& field, const std::vector<std::wstring>& filters)
 {
     bool matches = false;
@@ -1156,7 +1857,7 @@ static bool ParseDtRequest(
         {
             if (error != nullptr)
             {
-                *error = L"usage: dt [-rN] [-v] [-b] <module!type|type> [address|symbol] [field-filter...]";
+                *error = L"usage: dt [-rN] [-v] [-b] <module!type|type|module!type-pattern> [address|symbol] [field-filter...]";
             }
             break;
         }
@@ -1186,6 +1887,58 @@ static bool ParseDtRequest(
     } while (false);
 
     return ok;
+}
+
+static std::wstring FormatTypeMatchName(const TypeMatchInfo& match)
+{
+    std::wstring name = match.Name;
+
+    do
+    {
+        if (name.find(L'!') != std::wstring::npos || match.ModuleName.empty())
+        {
+            break;
+        }
+
+        name = match.ModuleName + L"!" + name;
+    } while (false);
+
+    return name;
+}
+
+static void PrintDtTypeMatches(const DtRequest& request, const std::vector<TypeMatchInfo>& matches, size_t limit)
+{
+    for (const TypeMatchInfo& match : matches)
+    {
+        if (request.Bare)
+        {
+            std::wcout << match.Name << L"\n";
+            continue;
+        }
+
+        PrintColoredText(FormatTypeMatchName(match), KNDBG_COLOR_TITLE);
+        std::wcout << L" size=0x" << std::hex << match.Size << std::dec;
+
+        if (request.Verbose)
+        {
+            std::wcout << L" moduleBase=0x" << std::hex << std::setw(16) << std::setfill(L'0') << match.ModuleBase
+                       << std::setfill(L' ') << L" typeId=" << std::dec << match.TypeId;
+        }
+
+        std::wcout << L"\n";
+    }
+
+    if (limit != 0 && matches.size() >= limit)
+    {
+        PrintColoredText(L"type matches shown", KNDBG_COLOR_WARN);
+        std::wcout << L"=" << matches.size() << L" limit=" << limit
+                   << L" (narrow the pattern for more)\n";
+    }
+    else
+    {
+        PrintColoredText(L"type matches", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << matches.size() << L"\n";
+    }
 }
 
 static void PrintFieldValue(DeviceClient& device, const TypeFieldInfo& field, uint64_t address)
@@ -1239,10 +1992,11 @@ static void DumpTypeLayout(
 {
     std::wstring indentText(indent, L' ');
 
-    std::wcout << indentText << layout.Name;
-    if (request.HasAddress)
-    {
-        std::wcout << L" @ 0x" << std::hex << address;
+        std::wcout << indentText;
+        PrintColoredText(layout.Name, KNDBG_COLOR_TITLE);
+        if (request.HasAddress)
+        {
+            std::wcout << L" @ 0x" << std::hex << address;
     }
     std::wcout << L" size=0x" << std::hex << layout.Size << std::dec << L"\n";
 
@@ -1253,8 +2007,12 @@ static void DumpTypeLayout(
             continue;
         }
 
-        std::wcout << indentText << L"   +0x" << std::hex << std::setw(3) << std::setfill(L'0') << field.Offset
-                   << std::setfill(L' ') << L" " << field.Name;
+        std::wstringstream offsetText;
+        offsetText << L"+0x" << std::hex << std::setw(3) << std::setfill(L'0') << field.Offset;
+        std::wcout << indentText << L"   ";
+        PrintColoredText(offsetText.str(), KNDBG_COLOR_ACCENT);
+        std::wcout << L" ";
+        PrintColoredText(field.Name, KNDBG_COLOR_TITLE);
 
         if (!request.Bare)
         {
@@ -1309,6 +2067,26 @@ static void HandleDtCommand(
         if (!ParseDtRequest(args, state, symbols, &request, &error))
         {
             std::wcerr << L"dt failed: " << error << L"\n";
+            break;
+        }
+
+        if (HasTypeWildcard(request.TypeName))
+        {
+            if (request.HasAddress || !request.FieldFilters.empty())
+            {
+                std::wcerr << L"dt failed: wildcard type patterns list matching types only; use an exact type name to dump fields or values\n";
+                break;
+            }
+
+            constexpr size_t typeMatchLimit = 512;
+            std::vector<TypeMatchInfo> matches;
+            if (!symbols.EnumerateTypes(request.TypeName, typeMatchLimit, &matches, &error))
+            {
+                std::wcerr << L"dt failed: " << error << L"\n";
+                break;
+            }
+
+            PrintDtTypeMatches(request, matches, typeMatchLimit);
             break;
         }
 
@@ -1677,12 +2455,17 @@ static uint64_t SelectProcessDirectoryTableBase(const ProcessAddressContext& con
 
 static void PrintProcessAddressContext(const ProcessAddressContext& context)
 {
-    std::wcout << L"pid=" << context.ProcessId
-               << L" eprocess=0x" << std::hex << std::setw(16) << std::setfill(L'0') << context.Eprocess
-               << L" dtb=0x" << std::setw(16) << context.DirectoryTableBase;
+    PrintColoredText(L"pid", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=" << context.ProcessId << L" ";
+    PrintColoredText(L"eprocess", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=" << HexTextWidth(context.Eprocess, 16, true) << L" ";
+    PrintColoredText(L"dtb", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=" << HexTextWidth(context.DirectoryTableBase, 16, true);
     if (context.UserDirectoryTableBase != 0)
     {
-        std::wcout << L" user-dtb=0x" << std::setw(16) << context.UserDirectoryTableBase;
+        std::wcout << L" ";
+        PrintColoredText(L"user-dtb", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(context.UserDirectoryTableBase, 16, true);
     }
     std::wcout << std::dec << L"\n";
 }
@@ -2019,25 +2802,38 @@ static void HandleTranslateVirtualCommand(
 
         if (hasProcessContext)
         {
-            std::wcout << L"process-context ";
+            PrintColoredText(L"process-context", KNDBG_COLOR_TITLE);
+            std::wcout << L" ";
             PrintProcessAddressContext(processContext);
         }
 
-        std::wcout << L"va=0x" << std::hex << std::setw(16) << std::setfill(L'0') << info.VirtualAddress
-                   << L" pa=0x" << std::setw(16) << info.PhysicalAddress
-                   << L" cr3=0x" << std::setw(16) << info.DirectoryTableBase << std::dec << L"\n";
-        std::wcout << L"page-size=0x" << std::hex << info.PageSize
-                   << L" page-offset=0x" << info.PageOffset
-                   << L" page-bytes=0x" << info.PageBytes
-                   << L" translated=0x" << info.TranslatedLength << std::dec << L"\n";
+        PrintColoredText(L"va", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(info.VirtualAddress, 16, true) << L" ";
+        PrintColoredText(L"pa", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << HexTextWidth(info.PhysicalAddress, 16, true) << L" ";
+        PrintColoredText(L"cr3", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(info.DirectoryTableBase, 16, true) << L"\n";
+        PrintColoredText(L"page-size", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexText(info.PageSize) << L" ";
+        PrintColoredText(L"page-offset", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexText(info.PageOffset) << L" ";
+        PrintColoredText(L"page-bytes", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexText(info.PageBytes) << L" ";
+        PrintColoredText(L"translated", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << HexText(info.TranslatedLength) << L"\n";
         if ((info.Flags & KNDBG_TRANSLATE_FLAG_LA57_ACTIVE) != 0)
         {
-            std::wcout << L"pml5e=0x" << std::hex << std::setw(16) << info.Pml5e << L"\n";
+            PrintColoredText(L"pml5e", KNDBG_COLOR_ACCENT);
+            std::wcout << L"=" << HexTextWidth(info.Pml5e, 16, true) << L"\n";
         }
-        std::wcout << L"pml4e=0x" << std::hex << std::setw(16) << info.Pml4e
-                   << L" pdpte=0x" << std::setw(16) << info.Pdpte
-                   << L" pde=0x" << std::setw(16) << info.Pde
-                   << L" pte=0x" << std::setw(16) << info.Pte << std::dec << L"\n";
+        PrintColoredText(L"pml4e", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(info.Pml4e, 16, true) << L" ";
+        PrintColoredText(L"pdpte", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(info.Pdpte, 16, true) << L" ";
+        PrintColoredText(L"pde", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(info.Pde, 16, true) << L" ";
+        PrintColoredText(L"pte", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << HexTextWidth(info.Pte, 16, true) << L"\n";
     } while (false);
 }
 
@@ -2055,12 +2851,14 @@ static void HandleProcessContextCommand(
         {
             if (state.HasProcessContext)
             {
-                std::wcout << L"process context: ";
+                PrintColoredText(L"process context", KNDBG_COLOR_TITLE);
+                std::wcout << L": ";
                 PrintProcessAddressContext(state.ProcessContext);
             }
             else
             {
-                std::wcout << L"process context: off\n";
+                PrintColoredText(L"process context", KNDBG_COLOR_TITLE);
+                std::wcout << L": off\n";
             }
             break;
         }
@@ -2070,7 +2868,8 @@ static void HandleProcessContextCommand(
         {
             state.HasProcessContext = false;
             state.ProcessContext = {};
-            std::wcout << L"process context: off\n";
+            PrintColoredText(L"process context", KNDBG_COLOR_TITLE);
+            std::wcout << L": off\n";
             break;
         }
 
@@ -2090,7 +2889,8 @@ static void HandleProcessContextCommand(
 
         state.ProcessContext = context;
         state.HasProcessContext = true;
-        std::wcout << L"process context: ";
+        PrintColoredText(L"process context", KNDBG_COLOR_TITLE);
+        std::wcout << L": ";
         PrintProcessAddressContext(state.ProcessContext);
     } while (false);
 }
@@ -2218,7 +3018,8 @@ static void HandlePhysicalEnterCommand(
 
         if (device.WritePhysical(physicalAddress, bytes, &error))
         {
-            std::wcout << L"wrote physical " << bytes.size() << L" bytes\n";
+            PrintColoredText(L"wrote physical", KNDBG_COLOR_OK);
+            std::wcout << L" " << bytes.size() << L" bytes\n";
         }
         else
         {
@@ -2338,7 +3139,8 @@ static void HandleEnterCommand(
         const ProcessAddressContext* memoryContext = hasExplicitContext ? &explicitContext : nullptr;
         if (WriteMemoryWithProcessContext(device, state, memoryContext, address, bytes, &error))
         {
-            std::wcout << L"wrote " << bytes.size() << L" bytes\n";
+            PrintColoredText(L"wrote", KNDBG_COLOR_OK);
+            std::wcout << L" " << bytes.size() << L" bytes\n";
         }
         else
         {
@@ -2391,14 +3193,16 @@ static void HandleCompare(const std::vector<std::wstring>& args, const DebuggerS
         {
             if (left[index] != right[index])
             {
-                std::wcout << L"0x" << std::hex << (address1 + index) << L" 0x"
-                           << static_cast<unsigned>(left[index]) << L" != 0x"
-                           << (address2 + index) << L" 0x" << static_cast<unsigned>(right[index]) << std::dec << L"\n";
+                PrintColoredText(HexText(address1 + index), KNDBG_COLOR_ACCENT);
+                std::wcout << L" 0x" << std::hex << static_cast<unsigned>(left[index]) << L" != ";
+                PrintColoredText(HexText(address2 + index), KNDBG_COLOR_ACCENT);
+                std::wcout << L" 0x" << static_cast<unsigned>(right[index]) << std::dec << L"\n";
                 ++mismatchCount;
             }
         }
 
-        std::wcout << L"mismatches=" << mismatchCount << L"\n";
+        PrintColoredText(L"mismatches", mismatchCount == 0 ? KNDBG_COLOR_OK : KNDBG_COLOR_WARN);
+        std::wcout << L"=" << mismatchCount << L"\n";
     } while (false);
 }
 
@@ -2473,7 +3277,8 @@ static void HandleFill(const std::vector<std::wstring>& args, const DebuggerStat
 
         if (device.WriteMemory(address, bytes, &error))
         {
-            std::wcout << L"filled " << bytes.size() << L" bytes\n";
+            PrintColoredText(L"filled", KNDBG_COLOR_OK);
+            std::wcout << L" " << bytes.size() << L" bytes\n";
         }
         else
         {
@@ -2520,7 +3325,8 @@ static void HandleMove(const std::vector<std::wstring>& args, const DebuggerStat
 
         if (device.WriteMemory(destination, bytes, &error))
         {
-            std::wcout << L"moved " << bytes.size() << L" bytes\n";
+            PrintColoredText(L"moved", KNDBG_COLOR_OK);
+            std::wcout << L" " << bytes.size() << L" bytes\n";
         }
         else
         {
@@ -2618,12 +3424,14 @@ static void HandleSearch(const std::vector<std::wstring>& args, const DebuggerSt
         {
             if (memcmp(bytes.data() + index, pattern.data(), pattern.size()) == 0)
             {
-                std::wcout << L"0x" << std::hex << (address + index) << std::dec << L"\n";
+                PrintColoredText(HexText(address + index), KNDBG_COLOR_ACCENT);
+                std::wcout << L"\n";
                 ++matches;
             }
         }
 
-        std::wcout << L"matches=" << matches << L"\n";
+        PrintColoredText(L"matches", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << matches << L"\n";
     } while (false);
 }
 
@@ -2631,10 +3439,12 @@ static void PrintVersion(DeviceClient& device)
 {
     std::wstring error;
 
-    std::wcout << L"KnLiveDbg version 0.4\n";
+    PrintColoredText(L"KnLiveDbg", KNDBG_COLOR_TITLE);
+    std::wcout << L" version 0.4\n";
     if (device.QueryVersion(&error))
     {
-        std::wcout << L"driver ABI ok\n";
+        PrintColoredText(L"driver ABI ok", KNDBG_COLOR_OK);
+        std::wcout << L"\n";
     }
     else
     {
@@ -2654,13 +3464,14 @@ static void PrintTarget()
     auto rtlGetVersion = ntdll != nullptr ? reinterpret_cast<RtlGetVersionPtr>(GetProcAddress(ntdll, "RtlGetVersion")) : nullptr;
     if (rtlGetVersion != nullptr && rtlGetVersion(&version) >= 0)
     {
-        std::wcout << L"local live kernel target: Windows "
-                   << version.dwMajorVersion << L"." << version.dwMinorVersion
+        PrintColoredText(L"local live kernel target", KNDBG_COLOR_TITLE);
+        std::wcout << L": Windows " << version.dwMajorVersion << L"." << version.dwMinorVersion
                    << L" build " << version.dwBuildNumber << L"\n";
     }
     else
     {
-        std::wcout << L"local live kernel target: current machine\n";
+        PrintColoredText(L"local live kernel target", KNDBG_COLOR_TITLE);
+        std::wcout << L": current machine\n";
     }
 }
 
@@ -2797,13 +3608,14 @@ static bool ResetProbePattern(std::wstring* error)
 
 static void PrintProbeInfo(const KNDBG_PROBE_INFO_RESPONSE& info)
 {
-    std::wcout << L"probe abi=" << info.AbiVersion
-               << L" length=0x" << std::hex << info.BufferLength
-               << L" seed=0x" << info.PatternSeed << std::dec << L"\n";
-    std::wcout << L"probe virtual=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-               << info.BufferVirtualAddress << L"\n";
-    std::wcout << L"probe physical=0x" << std::setw(16) << info.BufferPhysicalAddress
-               << std::setfill(L' ') << std::dec << L"\n";
+    PrintColoredText(L"probe", KNDBG_COLOR_TITLE);
+    std::wcout << L" abi=" << info.AbiVersion
+               << L" length=" << HexText(info.BufferLength)
+               << L" seed=" << HexText(info.PatternSeed) << L"\n";
+    PrintColoredText(L"probe virtual", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=" << HexTextWidth(info.BufferVirtualAddress, 16, true) << L"\n";
+    PrintColoredText(L"probe physical", KNDBG_COLOR_TITLE);
+    std::wcout << L"=" << HexTextWidth(info.BufferPhysicalAddress, 16, true) << L"\n";
     std::wcout << L"try: db 0x" << std::hex << info.BufferVirtualAddress
                << L" 40; pdb 0x" << info.BufferPhysicalAddress
                << L" 40" << std::dec << L"\n";
@@ -3066,6 +3878,196 @@ static void PrintLifecycleFail(const std::wstring& label, const std::wstring& de
 
     PrintTuiLine(line, KNDBG_COLOR_FAIL);
 }
+
+static bool IsConsoleOutputHandle(HANDLE handle)
+{
+    bool isConsole = false;
+
+    do
+    {
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
+        {
+            break;
+        }
+
+        DWORD mode = 0;
+        if (!GetConsoleMode(handle, &mode))
+        {
+            break;
+        }
+
+        isConsole = true;
+    } while (false);
+
+    return isConsole;
+}
+
+static void WriteConsoleTuiLineDirect(HANDLE handle, const std::wstring& value, WORD color)
+{
+    do
+    {
+        if (!IsConsoleOutputHandle(handle))
+        {
+            break;
+        }
+
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        WORD oldAttributes = 0;
+        bool hasOldAttributes = false;
+        if (GetConsoleScreenBufferInfo(handle, &info))
+        {
+            oldAttributes = info.wAttributes;
+            hasOldAttributes = true;
+            WORD preserved = static_cast<WORD>(info.wAttributes & 0xfff0);
+            SetConsoleTextAttribute(handle, static_cast<WORD>(preserved | color));
+        }
+
+        std::wstring line = L"| " + TuiFitText(value, 76) + L" |\n";
+        DWORD written = 0;
+        WriteConsoleW(handle, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr);
+
+        if (hasOldAttributes)
+        {
+            SetConsoleTextAttribute(handle, oldAttributes);
+        }
+    } while (false);
+}
+
+static std::wstring FormatElapsedSeconds(uint64_t milliseconds)
+{
+    std::wstring text;
+
+    do
+    {
+        uint64_t seconds = milliseconds / 1000;
+        uint64_t tenths = (milliseconds % 1000) / 100;
+
+        std::wstringstream stream;
+        stream << seconds << L"." << tenths << L"s";
+        text = stream.str();
+    } while (false);
+
+    return text;
+}
+
+static std::wstring ShortCommandText(const std::wstring& command)
+{
+    std::wstring result = TrimWhitespace(command);
+
+    do
+    {
+        if (result.empty())
+        {
+            result = L"<empty>";
+            break;
+        }
+
+        for (wchar_t& ch : result)
+        {
+            if (ch == L'\r' || ch == L'\n' || ch == L'\t')
+            {
+                ch = L' ';
+            }
+        }
+
+        if (result.size() > 48)
+        {
+            result.resize(45);
+            result += L"...";
+        }
+    } while (false);
+
+    return result;
+}
+
+class ScopedCommandProgress
+{
+public:
+    ScopedCommandProgress(const std::wstring& command, const std::wstring& origin, bool enabled) :
+        command_(ShortCommandText(command)),
+        origin_(origin.empty() ? L"command" : origin),
+        handle_(GetStdHandle(STD_OUTPUT_HANDLE)),
+        startTick_(GetTickCount64()),
+        stopRequested_(false),
+        completed_(false),
+        displayed_(false)
+    {
+        bool shouldStart = enabled && !command_.empty() && IsConsoleOutputHandle(handle_);
+        if (shouldStart)
+        {
+            try
+            {
+                worker_ = std::thread(&ScopedCommandProgress::WorkerMain, this);
+            }
+            catch (...)
+            {
+                // Progress is best-effort and must never block command execution.
+            }
+        }
+    }
+
+    ~ScopedCommandProgress()
+    {
+        Complete();
+    }
+
+    void Complete()
+    {
+        bool expected = false;
+        if (!completed_.compare_exchange_strong(expected, true))
+        {
+            return;
+        }
+
+        stopRequested_ = true;
+        if (worker_.joinable())
+        {
+            worker_.join();
+        }
+
+        if (displayed_.load())
+        {
+            uint64_t elapsed = GetTickCount64() - startTick_;
+            WriteConsoleTuiLineDirect(
+                handle_,
+                L"[ .. ] " + origin_ + L" finished: " + command_ + L" elapsed=" + FormatElapsedSeconds(elapsed),
+                KNDBG_COLOR_DIM);
+        }
+    }
+
+private:
+    void WorkerMain()
+    {
+        static constexpr uint64_t START_DELAY_MS = 1200;
+        static constexpr uint64_t UPDATE_INTERVAL_MS = 3000;
+        uint64_t nextUpdate = START_DELAY_MS;
+
+        while (!stopRequested_.load())
+        {
+            uint64_t elapsed = GetTickCount64() - startTick_;
+            if (elapsed >= nextUpdate)
+            {
+                displayed_ = true;
+                WriteConsoleTuiLineDirect(
+                    handle_,
+                    L"[ .. ] " + origin_ + L" still running: " + command_ + L" elapsed=" + FormatElapsedSeconds(elapsed),
+                    KNDBG_COLOR_STEP);
+                nextUpdate += UPDATE_INTERVAL_MS;
+            }
+
+            Sleep(100);
+        }
+    }
+
+    std::wstring command_;
+    std::wstring origin_;
+    HANDLE handle_;
+    uint64_t startTick_;
+    std::atomic_bool stopRequested_;
+    std::atomic_bool completed_;
+    std::atomic_bool displayed_;
+    std::thread worker_;
+};
 
 static bool LoadDriverServiceWithUx(
     DriverService& service,
@@ -3465,19 +4467,50 @@ static bool IsCallbackScopeName(const std::wstring& value)
     if (lowered == L"all" ||
         lowered == L"ob" ||
         lowered == L"object" ||
+        lowered == L"objects" ||
         lowered == L"object-manager" ||
         lowered == L"registry" ||
         lowered == L"reg" ||
         lowered == L"process" ||
+        lowered == L"processes" ||
+        lowered == L"proc" ||
         lowered == L"ps" ||
         lowered == L"minifilter" ||
+        lowered == L"minifilters" ||
+        lowered == L"mini" ||
         lowered == L"flt" ||
-        lowered == L"fltmgr")
+        lowered == L"fltmgr" ||
+        lowered == L"filter" ||
+        lowered == L"filters")
     {
         result = true;
     }
 
     return result;
+}
+
+static WORD CallbackKindColor(const std::wstring& kind)
+{
+    WORD color = KNDBG_COLOR_ACCENT;
+
+    if (kind == L"ob")
+    {
+        color = KNDBG_COLOR_TITLE;
+    }
+    else if (kind == L"minifilter")
+    {
+        color = KNDBG_COLOR_WARN;
+    }
+    else if (kind == L"registry")
+    {
+        color = KNDBG_COLOR_ACCENT;
+    }
+    else if (kind == L"process")
+    {
+        color = KNDBG_COLOR_OK;
+    }
+
+    return color;
 }
 
 static void PrintCallbackAddress(
@@ -3493,20 +4526,24 @@ static void PrintCallbackAddress(
             break;
         }
 
-        std::wcout << L"  " << label << L"=0x"
-                   << std::hex << std::setw(16) << std::setfill(L'0') << address << std::dec;
+        std::wcout << L"  ";
+        PrintColoredText(label, KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(address, 16, true);
         if (!moduleName.empty())
         {
-            std::wcout << L" module=" << moduleName;
+            std::wcout << L" module=";
+            PrintColoredText(moduleName, KNDBG_COLOR_OK);
         }
         else
         {
-            std::wcout << L" module=<non-image>";
+            std::wcout << L" module=";
+            PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
         }
 
         if (!symbolName.empty())
         {
-            std::wcout << L" symbol=" << symbolName;
+            std::wcout << L" symbol=";
+            PrintColoredText(symbolName, KNDBG_COLOR_TITLE);
         }
 
         std::wcout << L"\n";
@@ -3528,7 +4565,12 @@ static void HandleCallbacksCommand(
         if (args.size() >= 2)
         {
             std::wstring first = ToLower(args[1]);
-            if (first == L"json" || first == L"--json")
+            if (first == L"help" || first == L"?" || first == L"/?" || first == L"-?")
+            {
+                PrintCallbacksHelp();
+                break;
+            }
+            else if (first == L"json" || first == L"--json")
             {
                 jsonOutput = true;
                 if (args.size() >= 3)
@@ -3550,6 +4592,13 @@ static void HandleCallbacksCommand(
             else
             {
                 scope = args[1];
+                if (!IsCallbackScopeName(scope))
+                {
+                    std::wcerr << L"usage: callbacks [all|ob|registry|process|minifilter]\n";
+                    PrintCallbacksHelp();
+                    break;
+                }
+
                 if (args.size() >= 3)
                 {
                     std::wstring second = ToLower(args[2]);
@@ -3607,10 +4656,22 @@ static void HandleCallbacksCommand(
             break;
         }
 
-        std::wcout << L"callback records=" << result.Records.size() << L"\n";
+        PrintColoredText(L"callback records", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << result.Records.size() << L"\n";
         for (const KernelCallbackRecord& record : result.Records)
         {
-            std::wcout << L"[" << record.Kind << L"] " << record.Target;
+            PrintColoredText(L"[" + record.Kind + L"]", CallbackKindColor(record.Kind));
+            if (record.Kind == L"ob")
+            {
+                std::wcout << L" object=";
+                PrintColoredText(record.Target.empty() ? L"<unknown>" : record.Target, KNDBG_COLOR_TITLE);
+            }
+            else
+            {
+                std::wcout << L" ";
+                PrintColoredText(record.Target, CallbackKindColor(record.Kind));
+            }
+
             if (!record.Altitude.empty())
             {
                 std::wcout << L" altitude=\"" << record.Altitude << L"\"";
@@ -3618,7 +4679,8 @@ static void HandleCallbacksCommand(
 
             if (!record.CallbackName.empty())
             {
-                std::wcout << L" callback=" << record.CallbackName;
+                std::wcout << L" callback=";
+                PrintColoredText(record.CallbackName, KNDBG_COLOR_TITLE);
             }
 
             if (record.Kind == L"ob")
@@ -3646,8 +4708,9 @@ static void HandleCallbacksCommand(
 
             if (record.RootAddress != 0)
             {
-                std::wcout << L"  root=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.RootAddress << std::dec;
+                std::wcout << L"  ";
+                PrintColoredText(L"root", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=" << HexTextWidth(record.RootAddress, 16, true);
                 if (!record.RootSource.empty())
                 {
                     std::wcout << L" source=" << record.RootSource;
@@ -3657,12 +4720,12 @@ static void HandleCallbacksCommand(
 
             if (record.Filter != 0)
             {
-                std::wcout << L"  filter=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.Filter << std::dec;
+                std::wcout << L"  ";
+                PrintColoredText(L"filter", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=" << HexTextWidth(record.Filter, 16, true);
                 if (record.Frame != 0)
                 {
-                    std::wcout << L" frame=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                               << record.Frame << std::dec;
+                    std::wcout << L" frame=" << HexTextWidth(record.Frame, 16, true);
                 }
                 if (record.FrameId != 0xffffffffu)
                 {
@@ -3673,14 +4736,23 @@ static void HandleCallbacksCommand(
 
             if (record.DriverObject != 0)
             {
-                std::wcout << L"  driverObject=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.DriverObject << std::dec << L"\n";
+                std::wcout << L"  ";
+                PrintColoredText(L"driverObject", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=" << HexTextWidth(record.DriverObject, 16, true) << L"\n";
             }
 
             if (record.ObjectType != 0)
             {
-                std::wcout << L"  objectType=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.ObjectType << std::dec;
+                std::wcout << L"  ";
+                PrintColoredText(L"object", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=";
+                PrintColoredText(record.Target.empty() ? L"<unknown>" : record.Target, KNDBG_COLOR_TITLE);
+                if (record.ObjectTypeIndex != 0xffffffffu)
+                {
+                    std::wcout << L" typeIndex=0x" << std::hex << record.ObjectTypeIndex << std::dec;
+                }
+
+                std::wcout << L" objectType=" << HexTextWidth(record.ObjectType, 16, true);
                 if (!record.ObjectTypeSource.empty())
                 {
                     std::wcout << L" source=" << record.ObjectTypeSource;
@@ -3690,27 +4762,31 @@ static void HandleCallbacksCommand(
 
             if (record.ListEntry != 0)
             {
-                std::wcout << L"  list=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.ListEntry << std::dec << L"\n";
+                std::wcout << L"  ";
+                PrintColoredText(L"list", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=" << HexTextWidth(record.ListEntry, 16, true) << L"\n";
             }
 
             if (record.Entry != 0)
             {
-                std::wcout << L"  entry=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.Entry << std::dec << L"\n";
+                std::wcout << L"  ";
+                PrintColoredText(L"entry", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=" << HexTextWidth(record.Entry, 16, true) << L"\n";
             }
 
             if (record.CallbackBlock != 0)
             {
-                std::wcout << L"  block=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.CallbackBlock << L" raw=0x" << std::setw(16)
-                           << record.RawValue << std::dec << L"\n";
+                std::wcout << L"  ";
+                PrintColoredText(L"block", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=" << HexTextWidth(record.CallbackBlock, 16, true)
+                           << L" raw=" << HexTextWidth(record.RawValue, 16, true) << L"\n";
             }
 
             if (record.CallbackEntry != 0)
             {
-                std::wcout << L"  callbackEntry=0x" << std::hex << std::setw(16) << std::setfill(L'0')
-                           << record.CallbackEntry << std::dec << L"\n";
+                std::wcout << L"  ";
+                PrintColoredText(L"callbackEntry", KNDBG_COLOR_ACCENT);
+                std::wcout << L"=" << HexTextWidth(record.CallbackEntry, 16, true) << L"\n";
             }
 
             const wchar_t* primaryLabel = L"pre";
@@ -3735,7 +4811,9 @@ static void HandleCallbacksCommand(
 
             if (!record.Notes.empty())
             {
-                std::wcout << L"  notes=" << record.Notes << L"\n";
+                std::wcout << L"  ";
+                PrintColoredText(L"notes", KNDBG_COLOR_WARN);
+                std::wcout << L"=" << record.Notes << L"\n";
             }
         }
     } while (false);
@@ -3745,6 +4823,7 @@ static void HandleUnassembleCommand(
     const std::vector<std::wstring>& args,
     const std::wstring& originalLine,
     DebuggerState& state,
+    DeviceClient& device,
     DbgEngBackend& dbgeng,
     SymbolEngine& symbols)
 {
@@ -3800,7 +4879,17 @@ static void HandleUnassembleCommand(
         }
 
         uint64_t count = 8;
-        if (args.size() >= 3 && !ParseUnsigned(args[2], state.NumberBase, &count))
+        std::wstring countText;
+        if (args.size() >= 3)
+        {
+            countText = args[2];
+            if (countText.size() > 1 && (countText[0] == L'L' || countText[0] == L'l'))
+            {
+                countText = countText.substr(1);
+            }
+        }
+
+        if (args.size() >= 3 && !ParseUnsigned(countText, state.NumberBase, &count))
         {
             std::wcerr << L"invalid instruction count\n";
             break;
@@ -3809,6 +4898,34 @@ static void HandleUnassembleCommand(
         if (count == 0 || count > 256)
         {
             std::wcerr << L"instruction count must be between 1 and 256\n";
+            break;
+        }
+
+        if (device.IsOpen())
+        {
+            uint32_t bytesToRead = static_cast<uint32_t>(count * 16);
+            std::vector<uint8_t> codeBytes;
+            if (!ReadMemoryWithProcessContext(device, state, nullptr, address, bytesToRead, &codeBytes, &error))
+            {
+                std::wcerr << L"u failed: driver code read failed: " << error << L"\n";
+                break;
+            }
+
+            NativeDisassemblyResult nativeResult = {};
+            if (!DisassembleX64CodeBytes(address, codeBytes, static_cast<uint32_t>(count), &nativeResult, &error))
+            {
+                std::wcerr << L"u failed: native disassembly failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << nativeResult.Text;
+            if (!nativeResult.Text.empty() && nativeResult.Text.back() != L'\n')
+            {
+                std::wcout << L"\n";
+            }
+
+            state.LastDisassemblyAddress = nativeResult.NextOffset;
+            state.HasLastDisassemblyAddress = true;
             break;
         }
 
@@ -4122,6 +5239,8 @@ static std::wstring BuildCallbackScanJson(
         stream << L"    {\n";
         AppendJsonStringProperty(stream, L"      ", L"kind", record.Kind, true);
         AppendJsonStringProperty(stream, L"      ", L"target", record.Target, true);
+        AppendJsonStringProperty(stream, L"      ", L"object_type_name", record.Kind == L"ob" ? record.Target : L"", true);
+        AppendJsonNullableUint32Property(stream, L"      ", L"object_type_index", record.ObjectTypeIndex, 0xffffffffu, true);
         AppendJsonStringProperty(stream, L"      ", L"altitude", record.Altitude, true);
         AppendJsonStringProperty(stream, L"      ", L"callback_name", record.CallbackName, true);
         AppendJsonStringProperty(stream, L"      ", L"filter_name", record.FilterName, true);
@@ -7677,8 +8796,18 @@ static bool HandleCommand(
 
         if (command == L"help")
         {
-            bool includeDbgEng = args.size() >= 2 && ToLower(args[1]) == L"all";
-            PrintHelp(includeDbgEng);
+            if (args.size() >= 2 &&
+                (ToLower(args[1]) == L"callbacks" ||
+                 ToLower(args[1]) == L"kcallbacks" ||
+                 ToLower(args[1]) == L"cb"))
+            {
+                PrintCallbacksHelp();
+            }
+            else
+            {
+                bool includeDbgEng = args.size() >= 2 && ToLower(args[1]) == L"all";
+                PrintHelp(includeDbgEng);
+            }
         }
         else if (command == L"home" || command == L"dashboard")
         {
@@ -7785,7 +8914,7 @@ static bool HandleCommand(
         }
         else if (command == L"u" || command == L"uf")
         {
-            HandleUnassembleCommand(args, originalLine, state, dbgeng, symbols);
+            HandleUnassembleCommand(args, originalLine, state, device, dbgeng, symbols);
         }
         else if (command == L"ai")
         {
@@ -7818,7 +8947,8 @@ static bool HandleCommand(
             uint64_t value = 0;
             if (ParseAddressOrSymbol(symbols, state, args[1], &value, &error))
             {
-                std::wcout << L"Evaluate expression: 0x" << std::hex << value << L" = " << std::dec << value << L"\n";
+                PrintColoredText(L"Evaluate expression", KNDBG_COLOR_TITLE);
+                std::wcout << L": " << HexText(value) << L" = " << std::dec << value << L"\n";
             }
             else
             {
@@ -7836,7 +8966,8 @@ static bool HandleCommand(
                 }
             }
 
-            std::wcout << L"symbol path: " << symbols.SymbolPath() << L"\n";
+            PrintColoredText(L"symbol path", KNDBG_COLOR_TITLE);
+            std::wcout << L": " << symbols.SymbolPath() << L"\n";
         }
         else if (command == L".sympath+")
         {
@@ -7849,13 +8980,15 @@ static bool HandleCommand(
                 }
             }
 
-            std::wcout << L"symbol path: " << symbols.SymbolPath() << L"\n";
+            PrintColoredText(L"symbol path", KNDBG_COLOR_TITLE);
+            std::wcout << L": " << symbols.SymbolPath() << L"\n";
         }
         else if (command == L".reload" || command == L"reload" || command == L"ld")
         {
             if (symbols.LoadKernelModules(&error))
             {
-                std::wcout << L"loaded module list: " << symbols.Modules().size() << L"\n";
+                PrintColoredText(L"loaded module list", KNDBG_COLOR_TITLE);
+                std::wcout << L": " << symbols.Modules().size() << L"\n";
                 if (dbgeng.IsReady())
                 {
                     std::wstring output;
@@ -7887,9 +9020,10 @@ static bool HandleCommand(
                     continue;
                 }
 
-                std::wcout << L"0x" << std::hex << std::setw(16) << std::setfill(L'0') << module.Base
-                           << L" size=0x" << module.Size << L" " << module.ImageName
-                           << L" " << module.ImagePath << std::dec << L"\n";
+                PrintColoredText(HexTextWidth(module.Base, 16, true), KNDBG_COLOR_ACCENT);
+                std::wcout << L" size=" << HexText(module.Size) << L" ";
+                PrintColoredText(module.ImageName, KNDBG_COLOR_TITLE);
+                std::wcout << L" " << module.ImagePath << L"\n";
             }
         }
         else if (command == L"x" && args.size() >= 2)
@@ -7899,11 +9033,14 @@ static bool HandleCommand(
             {
                 for (const SymbolMatchInfo& match : matches)
                 {
-                    std::wcout << L"0x" << std::hex << std::setw(16) << std::setfill(L'0') << match.Address
-                               << L" " << match.Name << std::dec << L"\n";
+                    PrintColoredText(HexTextWidth(match.Address, 16, true), KNDBG_COLOR_ACCENT);
+                    std::wcout << L" ";
+                    PrintColoredText(match.Name, KNDBG_COLOR_TITLE);
+                    std::wcout << L"\n";
                 }
 
-                std::wcout << L"symbols=" << matches.size() << L"\n";
+                PrintColoredText(L"symbols", KNDBG_COLOR_TITLE);
+                std::wcout << L"=" << matches.size() << L"\n";
             }
             else
             {
@@ -7921,10 +9058,13 @@ static bool HandleCommand(
 
             std::wstring nearest;
             uint64_t displacement = 0;
-            std::wcout << args[1] << L" = 0x" << std::hex << address << std::dec << L"\n";
+            PrintColoredText(args[1], KNDBG_COLOR_TITLE);
+            std::wcout << L" = " << HexText(address) << L"\n";
             if (symbols.FindNearestSymbol(address, &nearest, &displacement, &error))
             {
-                std::wcout << L"nearest: " << nearest;
+                PrintColoredText(L"nearest", KNDBG_COLOR_ACCENT);
+                std::wcout << L": ";
+                PrintColoredText(nearest, KNDBG_COLOR_TITLE);
                 if (displacement != 0)
                 {
                     std::wcout << L"+0x" << std::hex << displacement << std::dec;
@@ -8002,7 +9142,10 @@ static bool HandleCommand(
 
             if (device.SetWriteMode(enabled, &error))
             {
-                std::wcout << L"write mode: " << (enabled ? L"on" : L"off") << L"\n";
+                PrintColoredText(L"write mode", KNDBG_COLOR_TITLE);
+                std::wcout << L": ";
+                PrintColoredText(enabled ? L"on" : L"off", enabled ? KNDBG_COLOR_OK : KNDBG_COLOR_WARN);
+                std::wcout << L"\n";
             }
             else
             {
@@ -8056,7 +9199,10 @@ static bool HandleCommand(
 
             if (device.WriteMemory(fieldAddress, bytes, &error))
             {
-                std::wcout << L"wrote field " << field.Name << L" at +0x" << std::hex << field.Offset << std::dec << L"\n";
+                PrintColoredText(L"wrote field", KNDBG_COLOR_OK);
+                std::wcout << L" ";
+                PrintColoredText(field.Name, KNDBG_COLOR_TITLE);
+                std::wcout << L" at +0x" << std::hex << field.Offset << std::dec << L"\n";
             }
             else
             {
@@ -8231,8 +9377,12 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
 
     do
     {
-        ScopedWideStreamCapture capture(&result.Output, &result.Error);
-        result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
+        ScopedCommandProgress progress(originalLine, origin, !args.empty());
+        {
+            ScopedWideStreamCapture capture(&result.Output, &result.Error);
+            result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
+        }
+        progress.Complete();
 
         WriteCommandTranscriptEvent(
             aiState,
@@ -8314,6 +9464,36 @@ int wmain(int argc, wchar_t** argv)
         state.MainDriverCleanupRequested = true;
 
         std::wstring exeDir = GetExecutableDirectory();
+        PrintLifecycleStep(L"symbol runtime consent", L"symsrv.yes");
+        std::wstring symsrvConsentStatus;
+        if (!EnsureSymsrvConsentFile(exeDir, &symsrvConsentStatus, &error))
+        {
+            PrintLifecycleWarn(L"symbol runtime consent", error);
+            std::wcerr << L"symsrv consent warning: " << error << L"\n";
+        }
+        else
+        {
+            PrintLifecycleOk(L"symbol runtime consent", symsrvConsentStatus);
+        }
+
+        PrintLifecycleStep(L"register DIA", L"msdia COM");
+        std::wstring diaStatus;
+        if (!EnsureDiaRegistration(exeDir, &diaStatus, &error))
+        {
+            PrintLifecycleWarn(L"register DIA", error);
+            std::wcerr << L"DIA registration warning: " << error << L"\n";
+        }
+        else
+        {
+            PrintLifecycleOk(L"register DIA", diaStatus);
+        }
+
+        STARTUP_SYMBOL_PATH_INFO startupSymbolPath = BuildStartupSymbolPath(symbols.SymbolPath(), exeDir);
+        if (!startupSymbolPath.Path.empty())
+        {
+            symbols.SetSymbolPath(startupSymbolPath.Path);
+        }
+
         std::wstring driverPath = exeDir + L"\\KnLiveDbg.sys";
 
         if (!LoadDriverServiceWithUx(service, L"Main driver startup", driverPath, &error))
@@ -8350,6 +9530,29 @@ int wmain(int argc, wchar_t** argv)
         }
         PrintLifecycleOk(L"verify driver ABI", L"compatible");
 
+        PrintLifecycleStep(L"symbol search path", L"EXE directory tree");
+        if (startupSymbolPath.Truncated)
+        {
+            PrintLifecycleWarn(L"symbol search path", L"local dirs=" + std::to_wstring(startupSymbolPath.LocalDirectoryCount) + L" truncated");
+        }
+        else
+        {
+            PrintLifecycleOk(L"symbol search path", L"local dirs=" + std::to_wstring(startupSymbolPath.LocalDirectoryCount));
+        }
+
+        PrintLifecycleStep(L"symbol cache", L"EXE symbols directory");
+        if (!startupSymbolPath.SymbolCacheReady)
+        {
+            std::wstring cacheWarning = startupSymbolPath.SymbolCacheError.empty() ?
+                L"not configured" : startupSymbolPath.SymbolCacheError;
+            PrintLifecycleWarn(L"symbol cache", cacheWarning);
+            std::wcerr << L"symbol cache warning: " << cacheWarning << L"\n";
+        }
+        else
+        {
+            PrintLifecycleOk(L"symbol cache", startupSymbolPath.SymbolCachePath);
+        }
+
         PrintLifecycleStep(L"initialize symbols", L"DbgHelp/DIA");
         if (!symbols.Initialize(symbols.SymbolPath(), &error))
         {
@@ -8364,6 +9567,19 @@ int wmain(int argc, wchar_t** argv)
         else
         {
             PrintLifecycleOk(L"initialize symbols", L"modules=" + std::to_wstring(symbols.Modules().size()));
+
+            PrintLifecycleStep(L"download kernel symbols", L"nt PDB");
+            size_t kernelSymbolCount = 0;
+            std::wstring preloadError;
+            if (symbols.PreloadKernelSymbols(&kernelSymbolCount, &preloadError))
+            {
+                PrintLifecycleOk(L"download kernel symbols", L"loaded=" + std::to_wstring(kernelSymbolCount));
+            }
+            else
+            {
+                PrintLifecycleWarn(L"download kernel symbols", preloadError);
+                std::wcerr << L"kernel symbol preload warning: " << preloadError << L"\n";
+            }
         }
 
         std::wstring dotEnvError;

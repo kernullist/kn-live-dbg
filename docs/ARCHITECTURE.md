@@ -68,18 +68,27 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 
 1. TUI calls `NtQuerySystemInformation(SystemModuleInformation)`.
 2. TUI translates `\SystemRoot\...` paths into local Windows paths.
-3. TUI calls `SymLoadModuleExW` for each loaded kernel image.
-4. `addr` uses `SymFromNameW`.
-5. `dt` uses `SymGetTypeFromNameW` and `SymGetTypeInfo`.
-6. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA and recovers field names, offsets, lengths, bit positions, and type names.
-7. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
-8. `u` resolves an address or symbol with the native symbol engine, then calls DbgEng `DisassembleWide` directly for bounded instruction output.
-9. `uf` is an explicit function-disassembly command that uses DbgEng function-boundary logic.
-10. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
+3. The build helper stages the pinned `vendor\debugging-tools\x64` Debugging Tools runtime DLLs beside the EXE so DbgHelp can load `symsrv.dll` and use the Microsoft symbol server instead of the limited System32 runtime. If the vendor runtime is incomplete, it falls back to the locally installed Windows Kits Debugging Tools copy.
+4. The sync script, build script, and EXE startup path create `symsrv.yes` when `symsrv.dll` is present but the consent marker is missing.
+5. Startup registers staged `msdia140.dll` with `DllRegisterServer` before symbol initialization so DIA fallback does not require a separate `regsvr32` step in normal elevated runs.
+6. Startup creates `<exe-dir>\symbols`, prepends the EXE directory and its non-cache subdirectories to the DbgHelp/DbgEng symbol path, then appends `SRV*<exe-dir>\symbols*https://msdl.microsoft.com/download/symbols` so downloaded PDBs are managed under the runnable EXE bundle.
+7. TUI calls `SymLoadModuleExW` for each loaded kernel image.
+8. Kernel images named `ntoskrnl.exe` or `ntkrnl*` are loaded into DbgHelp under the `nt` module alias.
+9. After driver load and ABI verification, startup forces the `nt` kernel image symbols to materialize, which downloads the PDB into the configured symbol cache when it is not already present.
+10. If forced symbol loading still leaves the module at `SymNone`, the warning includes the loaded `dbghelp.dll` path and `symsrv.dll` load state for runtime diagnosis.
+11. `addr` uses `SymFromNameW`.
+12. Exact `dt` layouts use `SymGetTypeFromNameW` and `SymGetTypeInfo`.
+13. If exact `SymGetTypeFromNameW` lookup fails, the symbol engine reuses `SymEnumTypesW` exact matching to recover module base plus type id before falling back to DIA; the match accepts module-qualified names, leaf type names, and leading-underscore variants.
+14. Wildcard `dt` patterns such as `dt nt!*` use `SymEnumTypesW` against matching loaded kernel modules, apply the `*`/`?` filter in user mode, fall back to DIA UDT enumeration when DbgHelp cannot enumerate the type stream, and print list-only type matches.
+15. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA, or asks DIA to resolve the PDB from the module image plus symbol path, and recovers field names, offsets, lengths, bit positions, and type names. DIA activation first uses registered COM, then falls back to creating `IDiaDataSource` directly from the staged `msdia*.dll` through `DllGetClassObject` so COM registration failures are reported separately from PDB/type lookup failures.
+16. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates function/context addresses with loaded module ownership.
+17. `u` resolves an address or symbol with the native symbol engine, reads bounded code bytes through `IOCTL_KNDBG_READ_VIRTUAL`, and formats x64 instructions with the vendored Zydis decoder. This keeps local live-kernel disassembly independent from DbgEng memory callbacks, which can fail in local-kernel sessions. If the driver device is not open, `u` still falls back to the DbgEng disassembly path.
+18. `uf` is an explicit function-disassembly command that uses DbgEng function-boundary logic.
+19. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
 
 ## Callback Scanner Flow
 
-1. Object callbacks: resolve `_OBJECT_TYPE.CallbackList`, discover object type objects from `ObTypeIndexTable`, read `_OBJECT_TYPE.Name`, then walk each callback list.
+1. Object callbacks: resolve `_OBJECT_TYPE.CallbackList`, discover object type objects from `ObTypeIndexTable`, read `_OBJECT_TYPE.Name` and table index, then walk each callback list. Human output and JSON carry the object type name/index alongside the `_OBJECT_TYPE` address. If the target nt PDB exposes `_OBJECT_TYPE` but omits the private callback item type, the scanner falls back to the guarded x64 object-callback item field layout, validates live list pointers, callback-entry pointers, operation masks, and callback routine pointers, and treats that as the normal public-symbol path unless validation fails.
 2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk `_CM_CALLBACK_CONTEXT_BLOCK` records.
 3. Process callbacks: enumerate `PspCreateProcessNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read `_EX_CALLBACK_ROUTINE_BLOCK` records.
 4. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
@@ -96,7 +105,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 
 The DbgEng backend is intentionally isolated from the native memory backend. Native read/write operations still go through `KnLiveDbg.sys`, while DbgEng commands execute through the debugger engine.
 
-`u` and `uf` are deliberately wired as explicit commands instead of falling through the generic command router. This keeps unassembly available even when the operator is otherwise using native command mode, while still relying on DbgEng for the instruction decoder and function-boundary semantics.
+`u` and `uf` are deliberately wired as explicit commands instead of falling through the generic command router. `u` stays on the driver-backed memory path and uses Zydis for instruction decoding when the device is open; `uf` still relies on DbgEng for function-boundary semantics.
 
 Backend routing is mode-dependent:
 
@@ -104,6 +113,10 @@ Backend routing is mode-dependent:
 2. `native` disables generic DbgEng fallback. Commands that require WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, or exception semantics are reported as DbgEng-only instead of being executed.
 3. `dbgeng` routes most non-session commands through `IDebugControl4::ExecuteWide`. The TUI still intercepts shutdown/service commands, backend management, native callback scanning, and explicit `u`/`uf`.
 4. `kd <command>` is a raw DbgEng escape hatch independent of the selected backend mode.
+
+Interactive command execution is wrapped by a delayed progress watchdog. If a dispatched command runs longer than about one second, the watchdog writes elapsed-time status rows directly to the console with `WriteConsoleW`, outside stdout/stderr transcript capture, and stops once the command returns.
+
+Human-readable native command output uses scoped console attributes for high-signal tokens such as callback kind tags, object types, modules, symbols, translated physical addresses, and type/field names. The color layer is applied only while writing to the console stream, so transcript capture and JSON evidence remain plain text.
 
 ## AI Provider Flow
 

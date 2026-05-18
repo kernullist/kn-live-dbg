@@ -53,6 +53,11 @@ typedef NTSTATUS (NTAPI* NtQuerySystemInformationPtr)(
     ULONG SystemInformationLength,
     PULONG ReturnLength);
 
+typedef HRESULT (STDAPICALLTYPE* DllGetClassObjectPtr)(REFCLSID classId, REFIID interfaceId, LPVOID* object);
+
+static HMODULE g_DiaLocalModule = nullptr;
+static std::wstring g_DiaLocalModulePath;
+
 static std::wstring DbgHelpErrorText(const wchar_t* prefix, DWORD error)
 {
     wchar_t buffer[512] = {};
@@ -68,6 +73,70 @@ static std::wstring DbgHelpErrorText(const wchar_t* prefix, DWORD error)
     std::wstringstream stream;
     stream << prefix << L": " << error << L" " << buffer;
     return stream.str();
+}
+
+static std::wstring LoadedModulePathText(const wchar_t* moduleName)
+{
+    std::wstring result = L"not-loaded";
+
+    do
+    {
+        if (moduleName == nullptr || moduleName[0] == L'\0')
+        {
+            break;
+        }
+
+        HMODULE module = GetModuleHandleW(moduleName);
+        if (module == nullptr)
+        {
+            break;
+        }
+
+        wchar_t path[MAX_PATH] = {};
+        DWORD length = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
+        if (length == 0)
+        {
+            result = L"loaded-path-unavailable";
+            break;
+        }
+
+        if (length >= static_cast<DWORD>(std::size(path)))
+        {
+            result = L"loaded-path-truncated";
+            break;
+        }
+
+        result = path;
+    } while (false);
+
+    return result;
+}
+
+static std::wstring GetExecutableDirectory()
+{
+    std::wstring result;
+
+    do
+    {
+        wchar_t path[MAX_PATH] = {};
+        DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
+        if (length == 0 || length >= static_cast<DWORD>(std::size(path)))
+        {
+            break;
+        }
+
+        result = path;
+        size_t slash = result.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+        {
+            result.clear();
+            break;
+        }
+
+        result.resize(slash);
+    } while (false);
+
+    return result;
 }
 
 static std::wstring AsWide(const char* value)
@@ -119,6 +188,85 @@ static std::wstring StripExtension(const std::wstring& value)
     return result;
 }
 
+static bool IsNtKernelImageName(const std::wstring& imageName)
+{
+    bool result = false;
+
+    do
+    {
+        std::wstring imageNoExtension = StripExtension(ToLowerString(imageName));
+        if (imageNoExtension == L"ntoskrnl" || imageNoExtension.rfind(L"ntkrnl", 0) == 0)
+        {
+            result = true;
+            break;
+        }
+    } while (false);
+
+    return result;
+}
+
+static std::wstring GetDbgHelpModuleName(const KernelModuleInfo& module)
+{
+    std::wstring name = module.ImageName;
+
+    do
+    {
+        if (IsNtKernelImageName(module.ImageName))
+        {
+            name = L"nt";
+            break;
+        }
+    } while (false);
+
+    return name;
+}
+
+static bool IsLoadedCodeViewSymbolType(SYM_TYPE type)
+{
+    return type == SymPdb || type == SymDia || type == SymCv;
+}
+
+static std::wstring SymbolTypeName(SYM_TYPE type)
+{
+    std::wstring name;
+
+    switch (type)
+    {
+    case SymNone:
+        name = L"SymNone";
+        break;
+    case SymCoff:
+        name = L"SymCoff";
+        break;
+    case SymCv:
+        name = L"SymCv";
+        break;
+    case SymPdb:
+        name = L"SymPdb";
+        break;
+    case SymExport:
+        name = L"SymExport";
+        break;
+    case SymDeferred:
+        name = L"SymDeferred";
+        break;
+    case SymSym:
+        name = L"SymSym";
+        break;
+    case SymDia:
+        name = L"SymDia";
+        break;
+    case SymVirtual:
+        name = L"SymVirtual";
+        break;
+    default:
+        name = L"SymUnknown";
+        break;
+    }
+
+    return name;
+}
+
 static bool ModuleNameMatches(const std::wstring& imageName, const std::wstring& filter)
 {
     bool matches = false;
@@ -136,6 +284,137 @@ static bool ModuleNameMatches(const std::wstring& imageName, const std::wstring&
         std::wstring normalizedFilter = StripExtension(ToLowerString(filter));
 
         if (image == normalizedFilter || imageNoExtension == normalizedFilter)
+        {
+            matches = true;
+            break;
+        }
+
+        if (normalizedFilter == L"nt" && IsNtKernelImageName(imageName))
+        {
+            matches = true;
+            break;
+        }
+    } while (false);
+
+    return matches;
+}
+
+static bool WildcardMatchNoCase(const std::wstring& value, const std::wstring& pattern)
+{
+    bool matches = false;
+
+    do
+    {
+        std::wstring text = ToLowerString(value);
+        std::wstring mask = ToLowerString(pattern.empty() ? L"*" : pattern);
+
+        size_t textIndex = 0;
+        size_t maskIndex = 0;
+        size_t starIndex = std::wstring::npos;
+        size_t starTextIndex = 0;
+
+        while (textIndex < text.size())
+        {
+            if (maskIndex < mask.size() && (mask[maskIndex] == L'?' || mask[maskIndex] == text[textIndex]))
+            {
+                ++textIndex;
+                ++maskIndex;
+            }
+            else if (maskIndex < mask.size() && mask[maskIndex] == L'*')
+            {
+                starIndex = maskIndex;
+                ++maskIndex;
+                starTextIndex = textIndex;
+            }
+            else if (starIndex != std::wstring::npos)
+            {
+                maskIndex = starIndex + 1;
+                ++starTextIndex;
+                textIndex = starTextIndex;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (textIndex != text.size())
+        {
+            break;
+        }
+
+        while (maskIndex < mask.size() && mask[maskIndex] == L'*')
+        {
+            ++maskIndex;
+        }
+
+        matches = maskIndex == mask.size();
+    } while (false);
+
+    return matches;
+}
+
+static std::wstring StripModuleQualifier(const std::wstring& value)
+{
+    std::wstring result = value;
+
+    do
+    {
+        size_t bang = result.find_last_of(L'!');
+        if (bang != std::wstring::npos)
+        {
+            result = result.substr(bang + 1);
+        }
+    } while (false);
+
+    return result;
+}
+
+static std::wstring StripLeadingUnderscores(const std::wstring& value)
+{
+    std::wstring result = value;
+
+    do
+    {
+        size_t index = 0;
+        while (index < result.size() && result[index] == L'_')
+        {
+            ++index;
+        }
+
+        if (index != 0)
+        {
+            result = result.substr(index);
+        }
+    } while (false);
+
+    return result;
+}
+
+static bool TypeNameMatchesNoCase(const std::wstring& value, const std::wstring& pattern)
+{
+    bool matches = false;
+
+    do
+    {
+        std::wstring effectivePattern = pattern.empty() ? L"*" : pattern;
+        if (WildcardMatchNoCase(value, effectivePattern))
+        {
+            matches = true;
+            break;
+        }
+
+        std::wstring valueLeaf = StripModuleQualifier(value);
+        std::wstring patternLeaf = StripModuleQualifier(effectivePattern);
+        if (WildcardMatchNoCase(valueLeaf, patternLeaf))
+        {
+            matches = true;
+            break;
+        }
+
+        std::wstring valueNoUnderscore = StripLeadingUnderscores(valueLeaf);
+        std::wstring patternNoUnderscore = StripLeadingUnderscores(patternLeaf);
+        if (WildcardMatchNoCase(valueNoUnderscore, patternNoUnderscore))
         {
             matches = true;
             break;
@@ -321,6 +600,193 @@ static std::wstring HResultText(const wchar_t* prefix, HRESULT hr)
     return stream.str();
 }
 
+static bool CreateDiaDataSourceFromModule(HMODULE module, IDiaDataSource** source, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (source == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid DIA data source output";
+            }
+            break;
+        }
+
+        *source = nullptr;
+
+        if (module == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid DIA module handle";
+            }
+            break;
+        }
+
+        FARPROC proc = GetProcAddress(module, "DllGetClassObject");
+        if (proc == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"GetProcAddress DllGetClassObject failed", GetLastError());
+            }
+            break;
+        }
+
+        auto getClassObject = reinterpret_cast<DllGetClassObjectPtr>(proc);
+        IClassFactory* factory = nullptr;
+        HRESULT hr = getClassObject(CLSID_DiaSource, IID_IClassFactory, reinterpret_cast<void**>(&factory));
+        if (FAILED(hr) || factory == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = HResultText(L"DllGetClassObject CLSID_DiaSource failed", hr);
+            }
+            ReleaseCom(factory);
+            break;
+        }
+
+        hr = factory->CreateInstance(nullptr, __uuidof(IDiaDataSource), reinterpret_cast<void**>(source));
+        ReleaseCom(factory);
+        if (FAILED(hr) || *source == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = HResultText(L"IClassFactory::CreateInstance IDiaDataSource failed", hr);
+            }
+            ReleaseCom(*source);
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool CreateDiaDataSource(IDiaDataSource** source, std::wstring* provider, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (source == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid DIA data source output";
+            }
+            break;
+        }
+
+        *source = nullptr;
+        if (provider != nullptr)
+        {
+            provider->clear();
+        }
+
+        HRESULT hr = CoCreateInstance(
+            CLSID_DiaSource,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            __uuidof(IDiaDataSource),
+            reinterpret_cast<void**>(source));
+        if (SUCCEEDED(hr) && *source != nullptr)
+        {
+            if (provider != nullptr)
+            {
+                *provider = L"registered COM";
+            }
+            ok = true;
+            break;
+        }
+
+        ReleaseCom(*source);
+        std::wstring coCreateError = HResultText(L"CoCreateInstance CLSID_DiaSource failed", hr);
+
+        if (g_DiaLocalModule != nullptr)
+        {
+            std::wstring localError;
+            if (CreateDiaDataSourceFromModule(g_DiaLocalModule, source, &localError))
+            {
+                if (provider != nullptr)
+                {
+                    *provider = L"local " + g_DiaLocalModulePath;
+                }
+                ok = true;
+                break;
+            }
+
+            if (error != nullptr)
+            {
+                *error = coCreateError + L"; local DIA fallback failed: " + localError;
+            }
+            break;
+        }
+
+        std::wstring exeDir = GetExecutableDirectory();
+        if (exeDir.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = coCreateError + L"; local DIA fallback failed: executable directory unavailable";
+            }
+            break;
+        }
+
+        const wchar_t* candidates[] =
+        {
+            L"msdia140.dll",
+            L"msdia150.dll"
+        };
+
+        std::wstring lastLocalError = L"no local msdia dll found";
+        for (const wchar_t* candidate : candidates)
+        {
+            std::wstring path = exeDir + L"\\" + candidate;
+            DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                continue;
+            }
+
+            HMODULE module = LoadLibraryW(path.c_str());
+            if (module == nullptr)
+            {
+                lastLocalError = path + L": " + DbgHelpErrorText(L"LoadLibraryW DIA failed", GetLastError());
+                continue;
+            }
+
+            std::wstring createError;
+            if (!CreateDiaDataSourceFromModule(module, source, &createError))
+            {
+                lastLocalError = path + L": " + createError;
+                FreeLibrary(module);
+                continue;
+            }
+
+            g_DiaLocalModule = module;
+            g_DiaLocalModulePath = path;
+            if (provider != nullptr)
+            {
+                *provider = L"local " + path;
+            }
+            ok = true;
+            break;
+        }
+
+        if (!ok && error != nullptr)
+        {
+            *error = coCreateError + L"; local DIA fallback failed: " + lastLocalError;
+        }
+    } while (false);
+
+    return ok;
+}
+
 static std::wstring BstrToWide(BSTR value)
 {
     std::wstring result;
@@ -463,10 +929,29 @@ static std::wstring GetLoadedPdbPath(HANDLE process, uint64_t moduleBase)
     return path;
 }
 
+typedef struct _KNDBG_FORCE_SYMBOL_LOAD_CONTEXT
+{
+    bool SeenSymbol;
+} KNDBG_FORCE_SYMBOL_LOAD_CONTEXT;
+
+static BOOL CALLBACK KnDbgForceSymbolLoadCallback(PSYMBOL_INFOW SymbolInfo, ULONG SymbolSize, PVOID UserContext)
+{
+    UNREFERENCED_PARAMETER(SymbolInfo);
+    UNREFERENCED_PARAMETER(SymbolSize);
+
+    auto context = reinterpret_cast<KNDBG_FORCE_SYMBOL_LOAD_CONTEXT*>(UserContext);
+    if (context != nullptr)
+    {
+        context->SeenSymbol = true;
+    }
+
+    return FALSE;
+}
+
 SymbolEngine::SymbolEngine() :
     process_(GetCurrentProcess()),
     ready_(false),
-    symbolPath_(L"SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols")
+    symbolPath_(L"SRV*https://msdl.microsoft.com/download/symbols")
 {
 }
 
@@ -668,6 +1153,230 @@ std::wstring SymbolEngine::ResolveModuleImagePath(const KernelModuleInfo& module
     return result;
 }
 
+bool SymbolEngine::EnsureModuleLoaded(const KernelModuleInfo& module, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (module.Base == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid module base";
+            }
+            break;
+        }
+
+        IMAGEHLP_MODULEW64 moduleInfo = {};
+        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
+        if (SymGetModuleInfoW64(process_, module.Base, &moduleInfo))
+        {
+            if (moduleInfo.SymType != SymNone)
+            {
+                ok = true;
+                break;
+            }
+
+            SymUnloadModule64(process_, module.Base);
+        }
+
+        std::wstring imagePath = ResolveModuleImagePath(module);
+        std::wstring moduleName = GetDbgHelpModuleName(module);
+
+        SetLastError(ERROR_SUCCESS);
+        DWORD64 loaded = SymLoadModuleExW(
+            process_,
+            nullptr,
+            imagePath.empty() ? nullptr : imagePath.c_str(),
+            moduleName.empty() ? nullptr : moduleName.c_str(),
+            module.Base,
+            module.Size,
+            nullptr,
+            0);
+
+        DWORD lastError = GetLastError();
+        if (loaded == 0 && lastError != ERROR_SUCCESS)
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymLoadModuleExW failed", lastError);
+            }
+            break;
+        }
+
+        moduleInfo = {};
+        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
+        if (!SymGetModuleInfoW64(process_, module.Base, &moduleInfo))
+        {
+            lastError = GetLastError();
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymGetModuleInfoW64 failed", lastError);
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!EnsureModuleLoaded(module, error))
+        {
+            break;
+        }
+
+        IMAGEHLP_MODULEW64 moduleInfo = {};
+        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
+        if (SymGetModuleInfoW64(process_, module.Base, &moduleInfo) &&
+            IsLoadedCodeViewSymbolType(moduleInfo.SymType))
+        {
+            ok = true;
+            break;
+        }
+
+        std::wstring reloadError;
+        if (ReloadModuleWithImmediateSymbols(module, &reloadError))
+        {
+            ok = true;
+            break;
+        }
+
+        KNDBG_FORCE_SYMBOL_LOAD_CONTEXT context = {};
+        SetLastError(ERROR_SUCCESS);
+        BOOL enumOk = SymEnumSymbolsW(process_, module.Base, L"*", KnDbgForceSymbolLoadCallback, &context);
+        DWORD lastError = GetLastError();
+
+        moduleInfo = {};
+        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
+        if (SymGetModuleInfoW64(process_, module.Base, &moduleInfo) &&
+            IsLoadedCodeViewSymbolType(moduleInfo.SymType))
+        {
+            ok = true;
+            break;
+        }
+
+        if (error != nullptr)
+        {
+            std::wstringstream stream;
+            stream << L"CodeView/PDB symbols were not loaded for " << GetDbgHelpModuleName(module)
+                   << L" symType=" << static_cast<int>(moduleInfo.SymType)
+                   << L" (" << SymbolTypeName(moduleInfo.SymType) << L")";
+            if (moduleInfo.LoadedPdbName[0] != L'\0')
+            {
+                stream << L" pdb=" << moduleInfo.LoadedPdbName;
+            }
+            if (!reloadError.empty())
+            {
+                stream << L"; reload=" << reloadError;
+            }
+            if (!enumOk && lastError != ERROR_SUCCESS)
+            {
+                stream << L"; " << DbgHelpErrorText(L"SymEnumSymbolsW force load failed", lastError);
+            }
+            stream << L"; dbghelp=" << LoadedModulePathText(L"dbghelp.dll")
+                   << L"; symsrv=" << LoadedModulePathText(L"symsrv.dll");
+            *error = stream.str();
+        }
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& module, std::wstring* error)
+{
+    bool ok = false;
+    DWORD originalOptions = SymGetOptions();
+    bool restoreOptions = false;
+
+    do
+    {
+        std::wstring imagePath = ResolveModuleImagePath(module);
+        if (imagePath.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Module image path is empty";
+            }
+            break;
+        }
+
+        DWORD immediateOptions = originalOptions & ~SYMOPT_DEFERRED_LOADS;
+        SymSetOptions(immediateOptions);
+        restoreOptions = true;
+
+        SymUnloadModule64(process_, module.Base);
+
+        std::wstring moduleName = GetDbgHelpModuleName(module);
+        SetLastError(ERROR_SUCCESS);
+        DWORD64 loaded = SymLoadModuleExW(
+            process_,
+            nullptr,
+            imagePath.c_str(),
+            moduleName.empty() ? nullptr : moduleName.c_str(),
+            module.Base,
+            module.Size,
+            nullptr,
+            0);
+
+        DWORD lastError = GetLastError();
+        if (loaded == 0 && lastError != ERROR_SUCCESS)
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymLoadModuleExW immediate failed", lastError);
+            }
+            break;
+        }
+
+        IMAGEHLP_MODULEW64 moduleInfo = {};
+        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
+        if (!SymGetModuleInfoW64(process_, module.Base, &moduleInfo))
+        {
+            lastError = GetLastError();
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"SymGetModuleInfoW64 immediate failed", lastError);
+            }
+            break;
+        }
+
+        if (!IsLoadedCodeViewSymbolType(moduleInfo.SymType))
+        {
+            if (error != nullptr)
+            {
+                std::wstringstream stream;
+                stream << L"immediate load symType=" << static_cast<int>(moduleInfo.SymType)
+                       << L" (" << SymbolTypeName(moduleInfo.SymType) << L")";
+                if (moduleInfo.LoadedPdbName[0] != L'\0')
+                {
+                    stream << L" pdb=" << moduleInfo.LoadedPdbName;
+                }
+                stream << L" image=" << imagePath;
+                *error = stream.str();
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    if (restoreOptions)
+    {
+        SymSetOptions(originalOptions);
+    }
+
+    return ok;
+}
+
 bool SymbolEngine::LoadKernelModules(std::wstring* error)
 {
     bool ok = false;
@@ -690,28 +1399,144 @@ bool SymbolEngine::LoadKernelModules(std::wstring* error)
 
         for (const KernelModuleInfo& module : modules)
         {
-            std::wstring imagePath = ResolveModuleImagePath(module);
-            DWORD64 loaded = SymLoadModuleExW(
-                process_,
-                nullptr,
-                imagePath.empty() ? nullptr : imagePath.c_str(),
-                module.ImageName.empty() ? nullptr : module.ImageName.c_str(),
-                module.Base,
-                module.Size,
-                nullptr,
-                0);
-
-            if (loaded == 0)
-            {
-                DWORD lastError = GetLastError();
-                if (lastError != ERROR_SUCCESS)
-                {
-                    continue;
-                }
-            }
+            EnsureModuleLoaded(module, nullptr);
         }
 
         modules_ = std::move(modules);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::PreloadKernelSymbols(size_t* loadedCount, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (loadedCount != nullptr)
+        {
+            *loadedCount = 0;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        if (modules_.empty())
+        {
+            if (!LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        bool sawKernelImage = false;
+        std::wstring lastError;
+        size_t localCount = 0;
+
+        for (const KernelModuleInfo& module : modules_)
+        {
+            if (!IsNtKernelImageName(module.ImageName))
+            {
+                continue;
+            }
+
+            sawKernelImage = true;
+            std::wstring localError;
+            if (!EnsureModuleSymbolsLoaded(module, &localError))
+            {
+                lastError = localError;
+                continue;
+            }
+
+            ++localCount;
+        }
+
+        if (!sawKernelImage)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Kernel image was not found in the loaded module list";
+            }
+            break;
+        }
+
+        if (localCount == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = lastError.empty() ? L"Kernel symbols were not loaded" : lastError;
+            }
+            break;
+        }
+
+        if (loadedCount != nullptr)
+        {
+            *loadedCount = localCount;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::LoadDiaDataForModule(const KernelModuleInfo& module, IDiaDataSource* source, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (source == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid DIA data source";
+            }
+            break;
+        }
+
+        std::wstring lastError;
+        std::wstring pdbPath = GetLoadedPdbPath(process_, module.Base);
+        if (!pdbPath.empty())
+        {
+            HRESULT hr = source->loadDataFromPdb(pdbPath.c_str());
+            if (SUCCEEDED(hr))
+            {
+                ok = true;
+                break;
+            }
+
+            lastError = HResultText(L"IDiaDataSource::loadDataFromPdb failed", hr);
+        }
+
+        std::wstring imagePath = ResolveModuleImagePath(module);
+        if (imagePath.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = lastError.empty() ? L"DIA loadDataForExe failed: no module image path" : lastError;
+            }
+            break;
+        }
+
+        HRESULT hr = source->loadDataForExe(imagePath.c_str(), symbolPath_.c_str(), nullptr);
+        if (FAILED(hr))
+        {
+            if (error != nullptr)
+            {
+                std::wstring exeError = HResultText(L"IDiaDataSource::loadDataForExe failed", hr);
+                *error = lastError.empty() ? exeError : lastError + L"; " + exeError;
+            }
+            break;
+        }
+
         ok = true;
     } while (false);
 
@@ -842,6 +1667,59 @@ static BOOL CALLBACK KnDbgEnumSymbolsCallback(PSYMBOL_INFOW SymbolInfo, ULONG Sy
     return keepGoing;
 }
 
+typedef struct _KNDBG_ENUM_TYPE_CONTEXT
+{
+    HANDLE Process;
+    std::vector<TypeMatchInfo>* Matches;
+    size_t Limit;
+    uint64_t ModuleBase;
+    std::wstring ModuleName;
+    std::wstring Mask;
+    bool StoppedAtLimit;
+} KNDBG_ENUM_TYPE_CONTEXT;
+
+static BOOL CALLBACK KnDbgEnumTypesCallback(PSYMBOL_INFOW SymbolInfo, ULONG SymbolSize, PVOID UserContext)
+{
+    BOOL keepGoing = TRUE;
+
+    do
+    {
+        auto context = reinterpret_cast<KNDBG_ENUM_TYPE_CONTEXT*>(UserContext);
+        if (context == nullptr || context->Matches == nullptr || SymbolInfo == nullptr)
+        {
+            keepGoing = FALSE;
+            break;
+        }
+
+        if (!TypeNameMatchesNoCase(SymbolInfo->Name, context->Mask))
+        {
+            break;
+        }
+
+        TypeMatchInfo match = {};
+        match.ModuleName = context->ModuleName;
+        match.Name = SymbolInfo->Name;
+        match.ModuleBase = SymbolInfo->ModBase != 0 ? SymbolInfo->ModBase : context->ModuleBase;
+        match.TypeId = SymbolInfo->TypeIndex;
+        match.Size = SymbolSize;
+
+        if (match.Size == 0 && context->Process != nullptr && match.ModuleBase != 0 && match.TypeId != 0)
+        {
+            SymGetTypeInfo(context->Process, match.ModuleBase, match.TypeId, TI_GET_LENGTH, &match.Size);
+        }
+
+        context->Matches->push_back(match);
+
+        if (context->Limit != 0 && context->Matches->size() >= context->Limit)
+        {
+            context->StoppedAtLimit = true;
+            keepGoing = FALSE;
+        }
+    } while (false);
+
+    return keepGoing;
+}
+
 bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std::vector<SymbolMatchInfo>* matches, std::wstring* error)
 {
     bool ok = false;
@@ -886,6 +1764,7 @@ bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std:
 
         bool foundThroughModule = false;
         DWORD lastError = ERROR_SUCCESS;
+        std::wstring lastDetail;
 
         if (moduleFilter.empty())
         {
@@ -905,6 +1784,13 @@ bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std:
             {
                 if (!ModuleNameMatches(module.ImageName, moduleFilter))
                 {
+                    continue;
+                }
+
+                std::wstring loadError;
+                if (!EnsureModuleLoaded(module, &loadError))
+                {
+                    lastDetail = loadError;
                     continue;
                 }
 
@@ -928,7 +1814,346 @@ bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std:
         {
             if (error != nullptr)
             {
-                *error = DbgHelpErrorText(L"SymEnumSymbolsW failed", lastError);
+                *error = lastDetail.empty() ? DbgHelpErrorText(L"SymEnumSymbolsW failed", lastError) : lastDetail;
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool SymbolEngine::EnumerateTypesWithDia(
+    const KernelModuleInfo& module,
+    const std::wstring& typeMask,
+    size_t limit,
+    std::vector<TypeMatchInfo>* matches,
+    bool* stoppedAtLimit,
+    std::wstring* error)
+{
+    bool ok = false;
+    bool coInitialized = false;
+
+    do
+    {
+        if (matches == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid DIA type match output";
+            }
+            break;
+        }
+
+        if (stoppedAtLimit != nullptr)
+        {
+            *stoppedAtLimit = false;
+        }
+
+        if (limit != 0 && matches->size() >= limit)
+        {
+            if (stoppedAtLimit != nullptr)
+            {
+                *stoppedAtLimit = true;
+            }
+            ok = true;
+            break;
+        }
+
+        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(coHr))
+        {
+            coInitialized = true;
+        }
+        else if (coHr != RPC_E_CHANGED_MODE)
+        {
+            if (error != nullptr)
+            {
+                *error = HResultText(L"CoInitializeEx failed", coHr);
+            }
+            break;
+        }
+
+        IDiaDataSource* source = nullptr;
+        IDiaSession* session = nullptr;
+        IDiaSymbol* global = nullptr;
+        IDiaEnumSymbols* udtEnum = nullptr;
+
+        std::wstring diaProvider;
+        std::wstring diaCreateError;
+        if (!CreateDiaDataSource(&source, &diaProvider, &diaCreateError))
+        {
+            if (error != nullptr)
+            {
+                *error = diaCreateError;
+            }
+            ReleaseCom(udtEnum);
+            ReleaseCom(global);
+            ReleaseCom(session);
+            ReleaseCom(source);
+            break;
+        }
+
+        std::wstring diaLoadError;
+        if (!LoadDiaDataForModule(module, source, &diaLoadError))
+        {
+            if (error != nullptr)
+            {
+                *error = diaLoadError;
+            }
+            ReleaseCom(udtEnum);
+            ReleaseCom(global);
+            ReleaseCom(session);
+            ReleaseCom(source);
+            break;
+        }
+
+        HRESULT hr = source->openSession(&session);
+        if (FAILED(hr))
+        {
+            if (error != nullptr)
+            {
+                *error = HResultText(L"IDiaDataSource::openSession failed", hr);
+            }
+            ReleaseCom(udtEnum);
+            ReleaseCom(global);
+            ReleaseCom(session);
+            ReleaseCom(source);
+            break;
+        }
+
+        session->put_loadAddress(module.Base);
+
+        hr = session->get_globalScope(&global);
+        if (FAILED(hr) || global == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = HResultText(L"IDiaSession::get_globalScope failed", hr);
+            }
+            ReleaseCom(udtEnum);
+            ReleaseCom(global);
+            ReleaseCom(session);
+            ReleaseCom(source);
+            break;
+        }
+
+        hr = global->findChildren(SymTagUDT, nullptr, nsNone, &udtEnum);
+        if (FAILED(hr) || udtEnum == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = HResultText(L"DIA findChildren UDT failed", hr);
+            }
+            ReleaseCom(udtEnum);
+            ReleaseCom(global);
+            ReleaseCom(session);
+            ReleaseCom(source);
+            break;
+        }
+
+        std::wstring moduleName = GetDbgHelpModuleName(module);
+        while (true)
+        {
+            IDiaSymbol* udt = nullptr;
+            ULONG fetched = 0;
+            hr = udtEnum->Next(1, &udt, &fetched);
+            if (hr != S_OK || fetched == 0 || udt == nullptr)
+            {
+                ReleaseCom(udt);
+                if (FAILED(hr))
+                {
+                    if (error != nullptr)
+                    {
+                        *error = HResultText(L"DIA type enumeration failed", hr);
+                    }
+                    break;
+                }
+
+                ok = true;
+                break;
+            }
+
+            std::wstring name = DiaSymbolName(udt);
+            if (!name.empty() && TypeNameMatchesNoCase(name, typeMask))
+            {
+                TypeMatchInfo match = {};
+                match.ModuleName = moduleName;
+                match.Name = name;
+                match.ModuleBase = module.Base;
+
+                DWORD symIndexId = 0;
+                if (SUCCEEDED(udt->get_symIndexId(&symIndexId)))
+                {
+                    match.TypeId = symIndexId;
+                }
+
+                ULONGLONG length = 0;
+                if (SUCCEEDED(udt->get_length(&length)))
+                {
+                    match.Size = length;
+                }
+
+                matches->push_back(match);
+
+                if (limit != 0 && matches->size() >= limit)
+                {
+                    if (stoppedAtLimit != nullptr)
+                    {
+                        *stoppedAtLimit = true;
+                    }
+                    ReleaseCom(udt);
+                    ok = true;
+                    break;
+                }
+            }
+
+            ReleaseCom(udt);
+        }
+
+        ReleaseCom(udtEnum);
+        ReleaseCom(global);
+        ReleaseCom(session);
+        ReleaseCom(source);
+    } while (false);
+
+    if (coInitialized)
+    {
+        CoUninitialize();
+    }
+
+    return ok;
+}
+
+bool SymbolEngine::EnumerateTypes(const std::wstring& mask, size_t limit, std::vector<TypeMatchInfo>* matches, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (matches == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid type match output";
+            }
+            break;
+        }
+
+        if (!ready_)
+        {
+            if (!Initialize(symbolPath_, error))
+            {
+                break;
+            }
+        }
+
+        if (modules_.empty())
+        {
+            if (!LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        std::wstring effectiveMask = mask.empty() ? L"*" : mask;
+        std::wstring moduleFilter;
+        std::wstring typeMask = effectiveMask;
+        size_t bang = effectiveMask.find(L'!');
+        if (bang != std::wstring::npos)
+        {
+            moduleFilter = effectiveMask.substr(0, bang);
+            typeMask = effectiveMask.substr(bang + 1);
+            if (typeMask.empty())
+            {
+                typeMask = L"*";
+            }
+        }
+
+        matches->clear();
+        KNDBG_ENUM_TYPE_CONTEXT context = {};
+        context.Process = process_;
+        context.Matches = matches;
+        context.Limit = limit;
+        context.Mask = typeMask;
+
+        bool foundThroughModule = false;
+        bool matchedModule = false;
+        DWORD lastError = ERROR_SUCCESS;
+        std::wstring lastDetail;
+
+        for (const KernelModuleInfo& module : modules_)
+        {
+            if (!ModuleNameMatches(module.ImageName, moduleFilter))
+            {
+                continue;
+            }
+
+            matchedModule = true;
+            std::wstring loadError;
+            if (!EnsureModuleLoaded(module, &loadError))
+            {
+                lastDetail = loadError;
+                continue;
+            }
+
+            std::wstring symbolLoadError;
+            if (!EnsureModuleSymbolsLoaded(module, &symbolLoadError) && !symbolLoadError.empty())
+            {
+                lastDetail = symbolLoadError;
+            }
+
+            context.ModuleBase = module.Base;
+            context.ModuleName = GetDbgHelpModuleName(module);
+            context.StoppedAtLimit = false;
+
+            if (SymEnumTypesW(process_, module.Base, KnDbgEnumTypesCallback, &context))
+            {
+                foundThroughModule = true;
+            }
+            else if (context.StoppedAtLimit)
+            {
+                foundThroughModule = true;
+            }
+            else
+            {
+                lastError = GetLastError();
+                std::wstring diaError;
+                bool diaStoppedAtLimit = false;
+                context.StoppedAtLimit = false;
+                if (EnumerateTypesWithDia(module, typeMask, limit, matches, &diaStoppedAtLimit, &diaError))
+                {
+                    foundThroughModule = true;
+                    context.StoppedAtLimit = diaStoppedAtLimit;
+                }
+                else if (!diaError.empty())
+                {
+                    lastDetail = diaError;
+                }
+            }
+
+            if (limit != 0 && matches->size() >= limit)
+            {
+                break;
+            }
+        }
+
+        if (!matchedModule)
+        {
+            if (error != nullptr)
+            {
+                *error = L"No loaded module matched type pattern module: " + moduleFilter;
+            }
+            break;
+        }
+
+        if (!foundThroughModule && matches->empty())
+        {
+            if (error != nullptr)
+            {
+                *error = lastDetail.empty() ? DbgHelpErrorText(L"SymEnumTypesW failed", lastError) : lastDetail;
             }
             break;
         }
@@ -1004,6 +2229,7 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
         }
 
         std::wstring lastError;
+        bool matchedModule = false;
 
         for (const KernelModuleInfo& module : modules_)
         {
@@ -1017,11 +2243,8 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
-            std::wstring pdbPath = GetLoadedPdbPath(process_, module.Base);
-            if (pdbPath.empty())
-            {
-                continue;
-            }
+            matchedModule = true;
+            EnsureModuleLoaded(module, nullptr);
 
             IDiaDataSource* source = nullptr;
             IDiaSession* session = nullptr;
@@ -1029,10 +2252,11 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
             IDiaEnumSymbols* udtEnum = nullptr;
             IDiaSymbol* udt = nullptr;
 
-            HRESULT hr = CoCreateInstance(CLSID_DiaSource, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), reinterpret_cast<void**>(&source));
-            if (FAILED(hr))
+            std::wstring diaProvider;
+            std::wstring diaCreateError;
+            if (!CreateDiaDataSource(&source, &diaProvider, &diaCreateError))
             {
-                lastError = HResultText(L"CoCreateInstance CLSID_DiaSource failed", hr);
+                lastError = diaCreateError;
                 ReleaseCom(udt);
                 ReleaseCom(udtEnum);
                 ReleaseCom(global);
@@ -1041,10 +2265,10 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
-            hr = source->loadDataFromPdb(pdbPath.c_str());
-            if (FAILED(hr))
+            std::wstring diaLoadError;
+            if (!LoadDiaDataForModule(module, source, &diaLoadError))
             {
-                lastError = HResultText(L"IDiaDataSource::loadDataFromPdb failed", hr);
+                lastError = diaLoadError;
                 ReleaseCom(udt);
                 ReleaseCom(udtEnum);
                 ReleaseCom(global);
@@ -1053,7 +2277,7 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
-            hr = source->openSession(&session);
+            HRESULT hr = source->openSession(&session);
             if (FAILED(hr))
             {
                 lastError = HResultText(L"IDiaDataSource::openSession failed", hr);
@@ -1079,7 +2303,7 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
-            hr = global->findChildren(SymTagUDT, lookupTypeName.c_str(), nsCaseInsensitive, &udtEnum);
+            hr = global->findChildren(SymTagUDT, nullptr, nsNone, &udtEnum);
             if (FAILED(hr) || udtEnum == nullptr)
             {
                 lastError = HResultText(L"DIA findChildren UDT failed", hr);
@@ -1091,11 +2315,37 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
-            ULONG fetched = 0;
-            hr = udtEnum->Next(1, &udt, &fetched);
-            if (FAILED(hr) || fetched != 1 || udt == nullptr)
+            while (true)
             {
+                ULONG fetched = 0;
+                hr = udtEnum->Next(1, &udt, &fetched);
+                if (hr != S_OK || fetched != 1 || udt == nullptr)
+                {
+                    ReleaseCom(udt);
+                    break;
+                }
+
+                std::wstring diaName = DiaSymbolName(udt);
+                if (TypeNameMatchesNoCase(diaName, lookupTypeName))
+                {
+                    break;
+                }
+
                 ReleaseCom(udt);
+            }
+
+            if (udt == nullptr)
+            {
+                std::wstringstream stream;
+                stream << L"DIA type not found: module=" << GetDbgHelpModuleName(module)
+                       << L" type=" << lookupTypeName;
+                std::wstring pdbPath = GetLoadedPdbPath(process_, module.Base);
+                if (!pdbPath.empty())
+                {
+                    stream << L" pdb=" << pdbPath;
+                }
+                stream << L" image=" << ResolveModuleImagePath(module);
+                lastError = stream.str();
                 ReleaseCom(udtEnum);
                 ReleaseCom(global);
                 ReleaseCom(session);
@@ -1103,6 +2353,7 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
+            ULONG fetched = 0;
             TypeLayoutInfo local = {};
             local.Name = typeName;
             local.ModuleBase = module.Base;
@@ -1221,7 +2472,24 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
 
         if (!ok && error != nullptr)
         {
-            *error = lastError.empty() ? L"DIA type lookup failed" : lastError;
+            if (!matchedModule)
+            {
+                std::wstringstream stream;
+                stream << L"DIA type lookup failed: no module matched";
+                if (!moduleFilter.empty())
+                {
+                    stream << L" filter=" << moduleFilter;
+                }
+                if (preferredModuleBase != 0)
+                {
+                    stream << L" base=0x" << std::hex << preferredModuleBase;
+                }
+                *error = stream.str();
+            }
+            else
+            {
+                *error = lastError.empty() ? L"DIA type lookup failed" : lastError;
+            }
         }
     } while (false);
 
@@ -1385,6 +2653,14 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
             }
         }
 
+        if (modules_.empty())
+        {
+            if (!LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
         ULONG typeId = 0;
         DWORD64 moduleBase = 0;
         std::vector<uint8_t> symbolBuffer(sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t));
@@ -1410,6 +2686,8 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
                     continue;
                 }
 
+                EnsureModuleSymbolsLoaded(module, nullptr);
+
                 RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
                 symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
                 symbol->MaxNameLen = MAX_SYM_NAME;
@@ -1423,11 +2701,29 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
             }
         }
 
+        if (typeId == 0)
+        {
+            std::vector<TypeMatchInfo> matches;
+            std::wstring enumError;
+            if (EnumerateTypes(typeName, 1, &matches, &enumError) && !matches.empty())
+            {
+                typeId = matches.front().TypeId;
+                moduleBase = matches.front().ModuleBase;
+            }
+        }
+
         if (typeId == 0 && !SymGetTypeFromNameW(process_, 0, typeName.c_str(), symbol))
         {
             bool found = false;
             for (const KernelModuleInfo& module : modules_)
             {
+                if (!moduleFilter.empty() && !ModuleNameMatches(module.ImageName, moduleFilter))
+                {
+                    continue;
+                }
+
+                EnsureModuleSymbolsLoaded(module, nullptr);
+
                 RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
                 symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
                 symbol->MaxNameLen = MAX_SYM_NAME;
@@ -1471,6 +2767,13 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
         {
             for (const KernelModuleInfo& module : modules_)
             {
+                if (!moduleFilter.empty() && !ModuleNameMatches(module.ImageName, moduleFilter))
+                {
+                    continue;
+                }
+
+                EnsureModuleSymbolsLoaded(module, nullptr);
+
                 RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
                 symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
                 symbol->MaxNameLen = MAX_SYM_NAME;
