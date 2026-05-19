@@ -4,9 +4,9 @@ Kn-Live-Dbg is a Windows kernel live-debugging experiment shaped after the usefu
 
 ## Demo
 
-<video src="demo/kn-live-dbg-demo.mp4" controls width="100%"></video>
+<video src="https://raw.githubusercontent.com/kernullist/kn-live-dbg/main/demo/kn-live-dbg-demo-readme.mp4" controls width="100%"></video>
 
-If the embedded video does not render, open [demo/kn-live-dbg-demo.mp4](demo/kn-live-dbg-demo.mp4).
+If the embedded video does not render, open the [README-sized demo](https://raw.githubusercontent.com/kernullist/kn-live-dbg/main/demo/kn-live-dbg-demo-readme.mp4) or the [full-resolution demo](demo/kn-live-dbg-demo.mp4).
 
 ## Scope and Signing Notice
 
@@ -40,7 +40,7 @@ kn-live-dbg/
 11. Implements native live-memory support for memory, symbol, module, type, compare, fill, move, search, and explicit disassembly commands.
 12. Routes stop-state, parser-heavy, extension, and meta commands through the DbgEng backend.
 13. Provides an optional DbgEng backend for raw WinDbg command execution against the local kernel target.
-14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process/thread creation callbacks, and minifilter callbacks with function/module/context annotations.
+14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process/thread/image-load callbacks, and minifilter callbacks with function/module/context annotations.
 15. Provides an initial AI assistant provider layer for advisory command planning and result interpretation through Codex CLI, ChatGPT/Codex OAuth, DeepSeek, and OpenRouter.
 16. Enforces a single-controller device owner and exposes owner/write-mode state through `drvstatus`.
 17. Resolves process DTBs from `_EPROCESS.Pcb.DirectoryTableBase` and optional `UserDirectoryTableBase` for process-aware `vtop`, `d*`, and `e*` commands; native `e*` writes default to the System process context (`pid 4`).
@@ -112,7 +112,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `ai <Tab>` for AI actions, `ai analyze callbacks <Tab>` for callback scopes, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `ai <Tab>` for AI actions, `ai analyze callbacks <Tab>` for callback scopes, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -160,7 +160,7 @@ u <address|symbol> [instruction-count]
 uf <address|symbol> [max-instructions]
 dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
-callbacks [all|object|registry|process|thread|minifilter] [module]
+callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 callbacks [scope] /module <module>
 !dml_proc [pid]
 ai status
@@ -174,7 +174,7 @@ ai auth
 ai preview <prompt>
 ai ask <prompt>
 ai plan <prompt>
-ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]
+ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 ai explain dt <dt-args...>
 ai annotate <u|uf> <address|symbol> [instruction-count]
 ai diagnose <prompt>
@@ -235,6 +235,7 @@ knkd> dt nt!_EPROCESS
 knkd> dt -r1 nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
 knkd> callbacks all
 knkd> callbacks object
+knkd> callbacks imageload
 knkd> callbacks minifilter
 knkd> callbacks all WdFilter.sys
 knkd> callbacks /module WdFilter.sys
@@ -276,7 +277,7 @@ ai auth
 ai preview <prompt>
 ai ask <prompt>
 ai plan <prompt>
-ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]
+ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 ai explain dt <dt-args...>
 ai annotate <u|uf> <address|symbol> [instruction-count]
 ai diagnose <prompt>
@@ -408,6 +409,7 @@ callbacks object
 callbacks registry
 callbacks process
 callbacks thread
+callbacks imageload
 callbacks minifilter
 callbacks object WdFilter.sys
 callbacks minifilter UnionFS
@@ -419,9 +421,10 @@ The scanner currently covers:
 2. Registry callbacks by enumerating and validating registry callback list-head candidates such as `CmpCallbackListHead`, then walking callback context entries with guarded x64 fallback layouts when public nt PDBs omit `_CM_CALLBACK_CONTEXT_BLOCK`.
 3. Process creation callbacks by enumerating and validating create-process notify routine table candidates such as `PspCreateProcessNotifyRoutine`, then decoding callback routine blocks with a stable x64 fallback when public nt PDBs omit `_EX_CALLBACK_ROUTINE_BLOCK`. Process notify metadata is decoded into `notifyType`, for example `0x2` becomes `PsSetCreateProcessNotifyRoutineEx`.
 4. Thread creation callbacks by enumerating and validating create-thread notify routine table candidates such as `PspCreateThreadNotifyRoutine`, then decoding callback routine blocks with the same stable x64 fallback.
-5. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
+5. Image load callbacks by enumerating and validating load-image notify routine table candidates such as `PspLoadImageNotifyRoutine`, then decoding callback routine blocks with the same stable x64 fallback.
+6. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
 
-Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `callbacks object WdFilter.sys` or `callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
+Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Image-load output uses `function` for the `PLOAD_IMAGE_NOTIFY_ROUTINE` owner and reports the decoded notify block plus raw encoded slot value. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `callbacks object WdFilter.sys` or `callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
 
 ## Virtual-To-Physical And Physical Memory
 

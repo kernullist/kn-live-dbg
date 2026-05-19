@@ -1915,6 +1915,10 @@ static bool ScanExCallbackTableRoot(
                 record.Notes = fallbackNote;
             }
             context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
+            if (context.IsKernelImagePointer(record.Context))
+            {
+                context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
+            }
             records.push_back(record);
         }
 
@@ -2953,13 +2957,14 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
         bool scanRegistry = scanAll || normalized == L"registry";
         bool scanProcess = scanAll || normalized == L"process";
         bool scanThread = scanAll || normalized == L"thread";
+        bool scanImageLoad = scanAll || normalized == L"imageload";
         bool scanMini = scanAll || normalized == L"minifilter";
 
-        if (!scanOb && !scanRegistry && !scanProcess && !scanThread && !scanMini)
+        if (!scanOb && !scanRegistry && !scanProcess && !scanThread && !scanImageLoad && !scanMini)
         {
             if (error != nullptr)
             {
-                *error = L"usage: callbacks [all|object|registry|process|thread|minifilter]";
+                *error = L"usage: callbacks [all|object|registry|process|thread|imageload|minifilter]";
             }
             break;
         }
@@ -3015,6 +3020,19 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
             else
             {
                 result->Warnings.push_back(L"thread: " + localError);
+            }
+        }
+
+        if (scanImageLoad)
+        {
+            localError.clear();
+            if (ScanImageLoadCallbacks(result, &localError))
+            {
+                anyScannerSucceeded = true;
+            }
+            else
+            {
+                result->Warnings.push_back(L"imageload: " + localError);
             }
         }
 
@@ -3189,6 +3207,91 @@ bool KernelCallbackScanner::ScanThreadCallbacks(KernelCallbackScanResult* result
                     L"thread",
                     L"create-thread",
                     L"x64 fallback thread callback block layout",
+                    allowEmpty,
+                    result,
+                    &recordCount,
+                    &localError))
+            {
+                any = true;
+                break;
+            }
+
+            warnings.push_back(root.Source + L": " + localError);
+        }
+
+        if (!any)
+        {
+            if (error != nullptr)
+            {
+                *error = JoinWarnings(warnings);
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool KernelCallbackScanner::ScanImageLoadCallbacks(KernelCallbackScanResult* result, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid image-load callback scan output";
+            }
+            break;
+        }
+
+        CallbackScanContext context(device_, symbols_);
+        ExCallbackBlockLayout layout = {};
+        if (!BuildExCallbackBlockLayout(context, &layout, error))
+        {
+            break;
+        }
+
+        std::vector<CallbackRoot> roots;
+        std::vector<std::wstring> warnings;
+        AddEnumeratedCallbackRoots(
+            context,
+            {
+                L"nt!PspLoadImageNotifyRoutine",
+                L"nt!*LoadImage*Notify*Routine*",
+                L"nt!Psp*Image*Notify*Routine*"
+            },
+            128,
+            &roots,
+            &warnings);
+        AddResolvedCallbackRoot(context, L"nt!PspLoadImageNotifyRoutine", &roots, &warnings);
+
+        if (roots.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = JoinWarnings(warnings);
+            }
+            break;
+        }
+
+        bool any = false;
+        for (const CallbackRoot& root : roots)
+        {
+            uint32_t recordCount = 0;
+            std::wstring localError;
+            bool allowEmpty = SourceMatchesSymbolName(root.Source, L"PspLoadImageNotifyRoutine");
+            if (ScanExCallbackTableRoot(
+                    context,
+                    root,
+                    layout,
+                    L"imageload",
+                    L"load-image",
+                    L"x64 fallback image-load callback block layout",
                     allowEmpty,
                     result,
                     &recordCount,

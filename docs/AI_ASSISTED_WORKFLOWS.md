@@ -71,11 +71,11 @@ Implementation notes:
 
 ### Callback Analysis Report
 
-Implemented entrypoint: `ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]`.
+Implemented entrypoint: `ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]`.
 
 The command post-processes `callbacks` output into an investigation report:
 
-1. Count object-manager, registry, process creation, thread creation, and minifilter callbacks.
+1. Count object-manager, registry, process creation, thread creation, image-load, and minifilter callbacks.
 2. Group records by owning module and callback surface.
 3. Flag callback addresses that do not resolve to a loaded module or nearest symbol.
 4. Flag addresses outside expected executable image ranges.
@@ -121,7 +121,7 @@ The command adds AI analysis on top of `u` and `uf` output:
 
 1. Summarize the likely purpose of a function.
 2. Identify direct and indirect call targets when symbols are available.
-3. Classify routines as object callback, registry callback, process callback, thread callback, minifilter operation callback, dispatch routine, or unknown.
+3. Classify routines as object callback, registry callback, process callback, thread callback, image-load callback, minifilter operation callback, dispatch routine, or unknown.
 4. Highlight suspicious patterns such as indirect calls through writable memory, global list mutation, callback registration, page table access, MSR access, or code patching.
 5. Suggest next commands such as `ln`, `x`, `dt`, `dq`, or `uf` on a discovered call target.
 
