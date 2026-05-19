@@ -1251,6 +1251,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  dq nt!PsLoadedModuleList 8\n";
     std::wcout << L"  dt nt!_EPROCESS <address>\n";
     std::wcout << L"  callbacks all\n";
+    std::wcout << L"  callbacks imageload\n";
     std::wcout << L"  callbacks all WdFilter.sys\n";
     std::wcout << L"  callbacks process WdFilter.sys\n";
     std::wcout << L"  procctx <pid>\n";
@@ -1285,16 +1286,17 @@ static void PrintHelp(bool includeDbgEng)
 static void PrintCallbacksHelp()
 {
     std::wcout << L"callbacks command:\n";
-    std::wcout << L"  callbacks [all|object|registry|process|thread|minifilter] [module]\n";
+    std::wcout << L"  callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
     std::wcout << L"  callbacks [scope] /module <module>\n";
     std::wcout << L"  callbacks <scope> help\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
-    std::wcout << L"  all          object-manager, registry, process, thread, and minifilter callbacks\n";
+    std::wcout << L"  all          object-manager, registry, process, thread, image-load, and minifilter callbacks\n";
     std::wcout << L"  object       object-manager filters from _OBJECT_TYPE.CallbackList\n";
     std::wcout << L"  registry     registry callbacks from CmpCallbackListHead candidates\n";
     std::wcout << L"  process      process creation callbacks from PspCreateProcessNotifyRoutine candidates\n";
     std::wcout << L"  thread       thread creation callbacks from PspCreateThreadNotifyRoutine candidates\n";
+    std::wcout << L"  imageload    image load callbacks from PspLoadImageNotifyRoutine candidates\n";
     std::wcout << L"  minifilter   minifilter filters and operation callbacks from fltmgr!FltGlobals\n";
     std::wcout << L"  module       case-insensitive module name or stem, for example WdFilter or wdfilter.sys\n";
     std::wcout << L"\n";
@@ -1309,6 +1311,7 @@ static void PrintCallbacksHelp()
     std::wcout << L"  callbacks registry\n";
     std::wcout << L"  callbacks process\n";
     std::wcout << L"  callbacks thread\n";
+    std::wcout << L"  callbacks imageload\n";
     std::wcout << L"  callbacks minifilter\n";
     std::wcout << L"  callbacks object WdFilter.sys\n";
     std::wcout << L"  callbacks minifilter UnionFS\n";
@@ -1385,6 +1388,20 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"important output:\n";
         std::wcout << L"  function is the create-thread notify routine.\n";
         std::wcout << L"  callbackContext is printed when the record layout exposes a context-like field.\n";
+    }
+    else if (scope == L"imageload")
+    {
+        std::wcout << L"callbacks imageload:\n";
+        std::wcout << L"  callbacks imageload [module]\n";
+        std::wcout << L"  callbacks imageload /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"what it scans:\n";
+        std::wcout << L"  Image load notification blocks from PspLoadImageNotifyRoutine candidates.\n";
+        std::wcout << L"\n";
+        std::wcout << L"important output:\n";
+        std::wcout << L"  function is the image load notify routine.\n";
+        std::wcout << L"  callbackContext is printed when the record layout exposes a context-like field.\n";
+        std::wcout << L"  root and block show the notify table slot and decoded callback block.\n";
     }
     else if (scope == L"minifilter")
     {
@@ -2344,6 +2361,7 @@ static void AddCallbackScopeCompletionCandidates(std::vector<std::wstring>* cand
         L"registry",
         L"process",
         L"thread",
+        L"imageload",
         L"minifilter",
         L"/module",
         L"help"
@@ -8411,7 +8429,7 @@ static void PrintStartupTui(
     PrintTuiLine(L"  help all      include DbgEng-routed WinDbg commands", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  drvstatus     inspect service/session/write gate state", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  probe load    load positive-control VA/PA test buffer", KNDBG_COLOR_TEXT);
-    PrintTuiLine(L"  callbacks all enumerate callback and minifilter surfaces", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  callbacks all enumerate callback surfaces including minifilters", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  ai status     inspect provider, model, policy, and credentials", KNDBG_COLOR_TEXT);
     PrintTuiBlank();
     PrintTuiLine(L"Examples", KNDBG_COLOR_TITLE);
@@ -8464,6 +8482,7 @@ static bool IsCallbackScopeName(const std::wstring& value)
         lowered == L"registry" ||
         lowered == L"process" ||
         lowered == L"thread" ||
+        lowered == L"imageload" ||
         lowered == L"minifilter")
     {
         result = true;
@@ -8487,6 +8506,10 @@ static bool IsDeprecatedCallbackScopeAlias(const std::wstring& value)
         lowered == L"threads" ||
         lowered == L"thr" ||
         lowered == L"th" ||
+        lowered == L"image" ||
+        lowered == L"loadimage" ||
+        lowered == L"load-image" ||
+        lowered == L"imgload" ||
         lowered == L"mini" ||
         lowered == L"minifilters" ||
         lowered == L"flt" ||
@@ -8677,6 +8700,10 @@ static WORD CallbackKindColor(const std::wstring& kind)
     {
         color = KNDBG_COLOR_OK;
     }
+    else if (kind == L"imageload")
+    {
+        color = KNDBG_COLOR_WARN;
+    }
 
     return color;
 }
@@ -8781,6 +8808,10 @@ static void PrintCallbackContext(const KernelCallbackRecord& record)
         {
             label = L"callbackContext";
         }
+        else if (record.Kind == L"imageload")
+        {
+            label = L"callbackContext";
+        }
 
         std::wstring symbolName;
         if (!record.ContextModule.empty())
@@ -8825,7 +8856,7 @@ static void HandleCallbacksCommand(
             else if (IsDeprecatedCallbackModuleOption(args[index]) ||
                      IsDeprecatedCallbackScopeAlias(args[index]))
             {
-                std::wcerr << L"usage: callbacks [all|object|registry|process|thread|minifilter] [module]\n";
+                std::wcerr << L"usage: callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
                 PrintCallbacksHelp();
                 break;
             }
@@ -9048,6 +9079,7 @@ static void HandleCallbacksCommand(
             const wchar_t* primaryLabel = L"pre";
             if (record.Kind == L"process" ||
                 record.Kind == L"thread" ||
+                record.Kind == L"imageload" ||
                 (record.Kind == L"minifilter" && record.PostFunction == 0))
             {
                 primaryLabel = L"function";
@@ -9796,7 +9828,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     else if (name == L"analyze")
     {
         std::wcout << L"ai analyze:\n";
-        std::wcout << L"  ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]\n";
+        std::wcout << L"  ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
         std::wcout << L"  ai analyze callbacks [scope] /module <module>\n";
         std::wcout << L"  Runs the callback scan, captures output, and asks AI for an analysis report.\n";
     }
@@ -11628,7 +11660,7 @@ static bool ValidateCallbackCommandArgumentShape(
         {
             if (reason != nullptr)
             {
-                *reason = L"callback command uses a deprecated alias; use all, object, registry, process, thread, minifilter, and /module";
+                *reason = L"callback command uses a deprecated alias; use all, object, registry, process, thread, imageload, minifilter, and /module";
             }
             break;
         }
@@ -13232,7 +13264,7 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
         {
             plan.Title = L"Callback surface audit";
             plan.Summary = L"Enumerate callback surfaces and module baseline for follow-up AI analysis.";
-            add(L"callbacks all", L"enumerate object, registry, process, thread, and minifilter callbacks");
+            add(L"callbacks all", L"enumerate object, registry, process, thread, image-load, and minifilter callbacks");
             add(L"lm", L"capture loaded module baseline");
         }
         else if (key == L"minifilter")
@@ -13809,7 +13841,7 @@ static void HandleAiCommand(
         {
             if (args.size() < 3 || ToLower(args[2]) != L"callbacks")
             {
-                std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]\n";
+                std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
                 break;
             }
 
@@ -13826,7 +13858,7 @@ static void HandleAiCommand(
                 else if (IsDeprecatedCallbackScopeAlias(args[3]) ||
                          IsDeprecatedCallbackModuleOption(args[3]))
                 {
-                    std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|minifilter] [module]\n";
+                    std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
                     break;
                 }
 
@@ -13885,7 +13917,7 @@ static void HandleAiCommand(
                 L"ai_analyze_callbacks",
                 evidenceCommand,
                 L"Analyze this KnLiveDbg kernel callback scan.",
-                L"Produce a callback analysis report from this KnLiveDbg callback scan output. Count records by surface, group by module, decode process notify metadata, call out non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes.",
+                L"Produce a callback analysis report from this KnLiveDbg callback scan output. Count records by surface, group by module, decode process notify metadata, call out image-load notify owners, non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes.",
                 state,
                 dbgeng,
                 device,
@@ -13929,7 +13961,7 @@ static void HandleAiCommand(
                 L"ai_annotate_disassembly",
                 commandLine,
                 L"Annotate this KnLiveDbg disassembly.",
-                L"Summarize likely routine purpose, call targets, direct and indirect call evidence, callback/dispatch/minifilter/process classification hints, suspicious code patterns, uncertainty, and next commands such as ln, x, dt, dq, or uf.",
+                L"Summarize likely routine purpose, call targets, direct and indirect call evidence, callback/dispatch/minifilter/process/thread/image-load classification hints, suspicious code patterns, uncertainty, and next commands such as ln, x, dt, dq, or uf.",
                 state,
                 dbgeng,
                 device,

@@ -26,7 +26,7 @@ Kn Live Dbg follows a LiveKD-style split:
    - Owns kernel module enumeration.
    - Owns symbol path, PDB loading, type lookup, and field offset resolution.
    - Uses DIA SDK as a fallback when `DbgHelp` cannot return complete UDT field metadata.
-   - Owns PDB-driven callback list decoding for object, registry, process, thread, and minifilter callbacks.
+   - Owns PDB-driven callback list decoding for object, registry, process, thread, image-load, and minifilter callbacks.
    - Presents Windbg-like commands.
    - Redraws the dashboard with `home` or `dashboard`.
    - Optionally attaches a DbgEng local-kernel backend for commands that need debugger-engine semantics.
@@ -92,7 +92,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 14. If exact `SymGetTypeFromNameW` lookup fails, the symbol engine reuses `SymEnumTypesW` exact matching to recover module base plus type id before falling back to DIA; the match accepts module-qualified names, leaf type names, and leading-underscore variants.
 15. Wildcard `dt` patterns such as `dt nt!*` use `SymEnumTypesW` against matching loaded kernel modules, apply the `*`/`?` filter in user mode, fall back to DIA UDT enumeration when DbgHelp cannot enumerate the type stream, and print list-only type matches.
 16. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA, or asks DIA to resolve the PDB from the module image plus symbol path, and recovers field names, offsets, lengths, bit positions, and type names. DIA activation first uses registered COM, then falls back to creating `IDiaDataSource` directly from the staged `msdia*.dll` through `DllGetClassObject` so COM registration failures are reported separately from PDB/type lookup failures.
-17. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process/thread callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates callback routine addresses plus image-backed context addresses with loaded module ownership.
+17. `callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process/thread/image-load callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates callback routine addresses plus image-backed context addresses with loaded module ownership.
 18. `u` resolves an address or symbol with the native symbol engine, reads bounded code bytes through `IOCTL_KNDBG_READ_VIRTUAL`, and formats x64 instructions with the vendored Zydis decoder. This keeps local live-kernel disassembly independent from DbgEng memory callbacks, which can fail in local-kernel sessions. If the driver device is not open, `u` still falls back to the DbgEng disassembly path.
 19. `uf` resolves an address or symbol, reads a bounded code window through the driver, and uses the same Zydis decoder as `u` while stopping at common function terminal instructions. If the driver device is not open, it falls back to the DbgEng command path.
 20. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
@@ -103,7 +103,8 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk callback context records. Public nt PDBs can omit `_CM_CALLBACK_CONTEXT_BLOCK`, so the scanner uses guarded x64 fallback layouts and accepts only records whose callback routine fields resolve inside loaded kernel images. Callback context values are module-annotated only when they also point into a loaded kernel image.
 3. Process callbacks: enumerate `PspCreateProcessNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks. Public nt PDBs can omit `_EX_CALLBACK_ROUTINE_BLOCK`, so the scanner uses the stable x64 function/context fallback layout for this block. The block context value is decoded as `notifyType` metadata and is not module-annotated.
 4. Thread callbacks: enumerate `PspCreateThreadNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
-5. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
+5. Image-load callbacks: enumerate `PspLoadImageNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
+6. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
 
 ## DbgEng Flow
 

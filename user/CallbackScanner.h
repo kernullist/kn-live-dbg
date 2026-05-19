@@ -62,6 +62,7 @@ public:
 private:
     bool ScanProcessCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanThreadCallbacks(KernelCallbackScanResult* result, std::wstring* error);
+    bool ScanImageLoadCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanRegistryCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanObjectCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanMinifilterCallbacks(KernelCallbackScanResult* result, std::wstring* error);
