@@ -2,6 +2,12 @@
 
 Kn-Live-Dbg is a Windows kernel live-debugging experiment shaped after the useful part of LiveKD: the kernel driver exposes narrow memory primitives, while the user-mode console owns service lifecycle, symbol loading, type interpretation, and operator UX.
 
+## Demo
+
+<video src="demo/kn-live-dbg-demo.mp4" controls width="100%"></video>
+
+If the embedded video does not render, open [demo/kn-live-dbg-demo.mp4](demo/kn-live-dbg-demo.mp4).
+
 ## Scope and Signing Notice
 
 This tool is built for defensive Windows security research, anti-cheat research, driver diagnostics, and controlled lab analysis. It is not designed to bypass Windows Code Integrity and does not include Code Integrity bypass functionality. To load the driver, use Windows test-signing mode with the test-signed build, or sign the driver with an appropriate production certificate such as an EV code-signing certificate for real deployment environments.
