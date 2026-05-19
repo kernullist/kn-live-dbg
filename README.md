@@ -4,9 +4,9 @@ Kn-Live-Dbg is a Windows kernel live-debugging experiment shaped after the usefu
 
 ## Demo
 
-<video src="https://raw.githubusercontent.com/kernullist/kn-live-dbg/main/demo/kn-live-dbg-demo-readme.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/f3542a85-c960-46f2-a151-fdd23a8294a6
 
-If the embedded video does not render, open the [README-sized demo](https://raw.githubusercontent.com/kernullist/kn-live-dbg/main/demo/kn-live-dbg-demo-readme.mp4) or the [full-resolution demo](demo/kn-live-dbg-demo.mp4).
+If the embedded video does not render, open the [README-sized demo](demo/kn-live-dbg-demo-readme.mp4) or the [full-resolution demo](demo/kn-live-dbg-demo.mp4).
 
 ## Scope and Signing Notice
 
