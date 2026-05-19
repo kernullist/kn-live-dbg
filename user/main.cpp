@@ -652,32 +652,6 @@ static bool EnsureDiaRegistration(const std::wstring& exeDir, std::wstring* stat
     return ok;
 }
 
-static std::wstring GetCurrentDirectoryString()
-{
-    std::wstring result;
-
-    do
-    {
-        DWORD required = GetCurrentDirectoryW(0, nullptr);
-        if (required == 0)
-        {
-            break;
-        }
-
-        std::wstring buffer(required, L'\0');
-        DWORD written = GetCurrentDirectoryW(required, &buffer[0]);
-        if (written == 0 || written >= required)
-        {
-            break;
-        }
-
-        buffer.resize(written);
-        result = buffer;
-    } while (false);
-
-    return result;
-}
-
 static std::wstring GetFullPathString(const std::wstring& path)
 {
     std::wstring result = path;
@@ -732,35 +706,13 @@ static void AddUniquePath(std::vector<std::wstring>& paths, const std::wstring& 
     } while (false);
 }
 
-static bool EndsWithNoCase(const std::wstring& value, const std::wstring& suffix)
-{
-    bool result = false;
-
-    if (value.size() >= suffix.size())
-    {
-        result = ToLower(value.substr(value.size() - suffix.size())) == ToLower(suffix);
-    }
-
-    return result;
-}
-
 static std::vector<std::wstring> BuildDotEnvSearchPaths(const std::wstring& exeDir)
 {
     std::vector<std::wstring> paths;
 
-    std::wstring cwd = GetCurrentDirectoryString();
-    if (!cwd.empty())
-    {
-        AddUniquePath(paths, cwd + L"\\.env");
-    }
-
     if (!exeDir.empty())
     {
         AddUniquePath(paths, exeDir + L"\\.env");
-        if (EndsWithNoCase(exeDir, L"\\x64\\Debug") || EndsWithNoCase(exeDir, L"\\x64\\Release"))
-        {
-            AddUniquePath(paths, exeDir + L"\\..\\..\\.env");
-        }
     }
 
     return paths;
@@ -1233,7 +1185,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help dt              type layout, wildcard, and field filters\n";
     std::wcout << L"  help e               virtual memory editing and /process behavior\n";
     std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
-    std::wcout << L"  ai help              AI provider, plan, run, write, and transcript commands\n";
+    std::wcout << L"  ai help              AI question, config, plan, explain, run, and write commands\n";
     std::wcout << L"\n";
     std::wcout << L"usage examples:\n";
     std::wcout << L"  help <command>\n";
@@ -1272,7 +1224,8 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  peq <physical-address> <value>\n";
     std::wcout << L"  !eb <physical-address>\n";
     std::wcout << L"  !eq <physical-address> <value>\n";
-    std::wcout << L"  ai ask explain this callback scan result\n";
+    std::wcout << L"  ai a.exe eprocess\n";
+    std::wcout << L"  ai explain callbacks all\n";
     std::wcout << L"  drvstatus\n";
     std::wcout << L"\n";
     CommandRegistry::PrintSummary(includeDbgEng);
@@ -2387,26 +2340,12 @@ static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidate
     {
         L"status",
         L"help",
-        L"providers",
-        L"provider",
-        L"policy",
-        L"model",
-        L"base-url",
-        L"effort",
-        L"auth",
-        L"preview",
-        L"ask",
+        L"config",
         L"plan",
         L"run",
         L"write",
-        L"analyze",
         L"explain",
-        L"annotate",
-        L"diagnose",
-        L"playbook",
         L"show",
-        L"transcript",
-        L"audit",
         L"report"
     };
 
@@ -2431,7 +2370,64 @@ static void AddAiCompletionCandidates(
         }
 
         std::wstring action = ToLower(argsBefore[1]);
-        if (action == L"provider")
+        if (action == L"config")
+        {
+            if (argsBefore.size() == 2)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"status",
+                    L"providers",
+                    L"provider",
+                    L"policy",
+                    L"model",
+                    L"base-url",
+                    L"effort",
+                    L"auth",
+                    L"test",
+                    L"help"
+                };
+
+                AddCompletionCandidates(candidates, values);
+            }
+            else if (ToLower(argsBefore[2]) == L"provider")
+            {
+                for (const std::wstring& provider : AiProviderRuntime::SupportedProviderNames())
+                {
+                    AddCompletionCandidate(candidates, provider.c_str());
+                }
+
+                AddCompletionCandidate(candidates, L"off");
+                AddCompletionCandidate(candidates, L"help");
+            }
+            else if (ToLower(argsBefore[2]) == L"policy")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"allow-remote",
+                    L"local-only",
+                    L"status",
+                    L"help"
+                };
+
+                AddCompletionCandidates(candidates, values);
+            }
+            else if (ToLower(argsBefore[2]) == L"effort")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"minimal",
+                    L"low",
+                    L"medium",
+                    L"high",
+                    L"xhigh",
+                    L"help"
+                };
+
+                AddCompletionCandidates(candidates, values);
+            }
+        }
+        else if (action == L"provider")
         {
             if (argsBefore.size() == 2)
             {
@@ -2519,14 +2515,33 @@ static void AddAiCompletionCandidates(
         }
         else if (action == L"explain")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() == 2)
             {
-                L"dt",
-                L"dtx",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"callbacks",
+                    L"dt",
+                    L"dtx",
+                    L"u",
+                    L"uf",
+                    L"lm",
+                    L"!dml_proc",
+                    L"help"
+                };
 
-            AddCompletionCandidates(candidates, values);
+                AddCompletionCandidates(candidates, values);
+            }
+            else if (ToLower(argsBefore[2]) == L"callbacks")
+            {
+                if (argsBefore.size() == 3)
+                {
+                    AddCallbackScopeCompletionCandidates(candidates);
+                }
+                else
+                {
+                    AddCallbackModuleOptionCompletionCandidates(candidates);
+                }
+            }
         }
         else if (action == L"annotate")
         {
@@ -5583,6 +5598,153 @@ static bool ParseDmlProcessPidFilter(const std::wstring& value, uint64_t* pid)
     return ok;
 }
 
+struct DmlProcessCollection
+{
+    std::vector<DmlProcessRecord> Records;
+    std::vector<std::wstring> Warnings;
+    size_t ScannedCount = 0;
+    bool Truncated = false;
+};
+
+static bool CollectDmlProcessRecords(
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    DmlProcessCollection* output,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (output == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid process collection output";
+            }
+            break;
+        }
+
+        *output = DmlProcessCollection{};
+
+        DmlProcessLayout layout = {};
+        if (!ResolveDmlProcessLayout(symbols, &layout, error))
+        {
+            break;
+        }
+
+        ProcessAddressContext systemContext = {};
+        if (!EnsureKernelProcessAddressContext(state, device, symbols, &systemContext, error))
+        {
+            break;
+        }
+
+        uint64_t systemListEntry = 0;
+        if (!TryAddOffset(systemContext.Eprocess, layout.ActiveProcessLinks.Offset, &systemListEntry))
+        {
+            if (error != nullptr)
+            {
+                *error = L"ActiveProcessLinks address overflow";
+            }
+            break;
+        }
+
+        uint64_t listHead = 0;
+        std::wstring ignored;
+        bool hasGlobalHead = symbols.ResolveSymbol(L"nt!PsActiveProcessHead", &listHead, &ignored);
+
+        uint64_t current = 0;
+        constexpr size_t maxProcessRecords = 4096;
+        std::vector<uint64_t> visited;
+
+        if (hasGlobalHead)
+        {
+            if (!ReadKernelPointer(device, listHead, &current, error))
+            {
+                break;
+            }
+
+            visited.push_back(listHead);
+        }
+        else
+        {
+            DmlProcessRecord systemRecord = {};
+            if (!ReadDmlProcessRecord(device, layout, systemContext.Eprocess, &systemRecord, error))
+            {
+                break;
+            }
+
+            output->Records.push_back(systemRecord);
+            current = systemRecord.Flink;
+            output->ScannedCount = 1;
+            listHead = systemListEntry;
+            visited.push_back(systemListEntry);
+        }
+
+        while (current != 0 && current != listHead && output->ScannedCount < maxProcessRecords)
+        {
+            if (DmlProcessAlreadyVisited(visited, current))
+            {
+                output->Warnings.push_back(L"loop detected at " + HexTextWidth(current, 16, true));
+                break;
+            }
+
+            visited.push_back(current);
+
+            uint64_t eprocess = 0;
+            if (!TrySubtractOffset(current, layout.ActiveProcessLinks.Offset, &eprocess))
+            {
+                output->Warnings.push_back(L"list entry underflow at " + HexTextWidth(current, 16, true));
+                break;
+            }
+
+            DmlProcessRecord record = {};
+            std::wstring readError;
+            if (ReadDmlProcessRecord(device, layout, eprocess, &record, &readError))
+            {
+                output->Records.push_back(record);
+                ++output->ScannedCount;
+                current = record.Flink;
+            }
+            else
+            {
+                if (!hasGlobalHead)
+                {
+                    uint64_t hiddenHeadFlink = 0;
+                    if (ReadKernelPointer(device, current, &hiddenHeadFlink, nullptr) &&
+                        IsLikelyKernelVirtualAddress(hiddenHeadFlink))
+                    {
+                        if (hiddenHeadFlink == systemListEntry)
+                        {
+                            break;
+                        }
+
+                        if (!DmlProcessAlreadyVisited(visited, hiddenHeadFlink))
+                        {
+                            current = hiddenHeadFlink;
+                            continue;
+                        }
+                    }
+                }
+
+                output->Warnings.push_back(
+                    L"failed to read EPROCESS " + HexTextWidth(eprocess, 16, true) + L": " + readError);
+                break;
+            }
+        }
+
+        if (output->ScannedCount >= maxProcessRecords)
+        {
+            output->Truncated = true;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static void HandleDmlProcCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -5612,126 +5774,30 @@ static void HandleDmlProcCommand(
             hasPidFilter = true;
         }
 
-        DmlProcessLayout layout = {};
-        if (!ResolveDmlProcessLayout(symbols, &layout, &error))
+        DmlProcessCollection collection = {};
+        if (!CollectDmlProcessRecords(state, device, symbols, &collection, &error))
         {
             std::wcerr << L"!dml_proc failed: " << error << L"\n";
             break;
         }
+
+        size_t count = 0;
 
         PrintColoredText(L"!dml_proc", KNDBG_COLOR_TITLE);
         std::wcout << L"\n";
         PrintDmlProcessHeader();
-
-        ProcessAddressContext systemContext = {};
-        if (!EnsureKernelProcessAddressContext(state, device, symbols, &systemContext, &error))
+        for (const DmlProcessRecord& record : collection.Records)
         {
-            std::wcerr << L"!dml_proc failed: " << error << L"\n";
-            break;
-        }
-
-        uint64_t systemListEntry = 0;
-        if (!TryAddOffset(systemContext.Eprocess, layout.ActiveProcessLinks.Offset, &systemListEntry))
-        {
-            std::wcerr << L"!dml_proc failed: ActiveProcessLinks address overflow\n";
-            break;
-        }
-
-        uint64_t listHead = 0;
-        std::wstring ignored;
-        bool hasGlobalHead = symbols.ResolveSymbol(L"nt!PsActiveProcessHead", &listHead, &ignored);
-
-        uint64_t current = 0;
-        size_t count = 0;
-        size_t scannedCount = 0;
-        constexpr size_t maxProcessRecords = 4096;
-        std::vector<uint64_t> visited;
-
-        if (hasGlobalHead)
-        {
-            if (!ReadKernelPointer(device, listHead, &current, &error))
+            if (DmlProcessMatchesFilter(record, hasPidFilter, pidFilter))
             {
-                std::wcerr << L"!dml_proc failed: " << error << L"\n";
-                break;
-            }
-
-            visited.push_back(listHead);
-        }
-        else
-        {
-            DmlProcessRecord systemRecord = {};
-            if (!ReadDmlProcessRecord(device, layout, systemContext.Eprocess, &systemRecord, &error))
-            {
-                std::wcerr << L"!dml_proc failed: " << error << L"\n";
-                break;
-            }
-
-            if (DmlProcessMatchesFilter(systemRecord, hasPidFilter, pidFilter))
-            {
-                PrintDmlProcessRecord(systemRecord);
+                PrintDmlProcessRecord(record);
                 ++count;
             }
-
-            current = systemRecord.Flink;
-            scannedCount = 1;
-            listHead = systemListEntry;
-            visited.push_back(systemListEntry);
         }
 
-        while (current != 0 && current != listHead && scannedCount < maxProcessRecords)
+        for (const std::wstring& warning : collection.Warnings)
         {
-            if (DmlProcessAlreadyVisited(visited, current))
-            {
-                std::wcerr << L"!dml_proc warning: loop detected at " << HexTextWidth(current, 16, true) << L"\n";
-                break;
-            }
-
-            visited.push_back(current);
-
-            uint64_t eprocess = 0;
-            if (!TrySubtractOffset(current, layout.ActiveProcessLinks.Offset, &eprocess))
-            {
-                std::wcerr << L"!dml_proc warning: list entry underflow at " << HexTextWidth(current, 16, true) << L"\n";
-                break;
-            }
-
-            DmlProcessRecord record = {};
-            if (ReadDmlProcessRecord(device, layout, eprocess, &record, &error))
-            {
-                if (DmlProcessMatchesFilter(record, hasPidFilter, pidFilter))
-                {
-                    PrintDmlProcessRecord(record);
-                    ++count;
-                }
-
-                ++scannedCount;
-                current = record.Flink;
-            }
-            else
-            {
-                if (!hasGlobalHead)
-                {
-                    uint64_t hiddenHeadFlink = 0;
-                    if (ReadKernelPointer(device, current, &hiddenHeadFlink, nullptr) &&
-                        IsLikelyKernelVirtualAddress(hiddenHeadFlink))
-                    {
-                        if (hiddenHeadFlink == systemListEntry)
-                        {
-                            break;
-                        }
-
-                        if (!DmlProcessAlreadyVisited(visited, hiddenHeadFlink))
-                        {
-                            current = hiddenHeadFlink;
-                            continue;
-                        }
-                    }
-                }
-
-                std::wcerr << L"!dml_proc warning: failed to read EPROCESS "
-                           << HexTextWidth(eprocess, 16, true) << L": " << error << L"\n";
-                break;
-            }
+            std::wcerr << L"!dml_proc warning: " << warning << L"\n";
         }
 
         PrintColoredText(L"process records", KNDBG_COLOR_TITLE);
@@ -5742,7 +5808,7 @@ static void HandleDmlProcCommand(
             PrintColoredText(L"pid", KNDBG_COLOR_ACCENT);
             std::wcout << L"=" << std::dec << pidFilter;
         }
-        if (scannedCount >= maxProcessRecords)
+        if (collection.Truncated)
         {
             std::wcout << L" truncated=yes";
         }
@@ -9719,41 +9785,34 @@ static void PrintQueryHelp()
 static void PrintAiHelp()
 {
     std::wcout << L"ai command:\n";
+    std::wcout << L"  ai <question>\n";
     std::wcout << L"  ai <subcommand> [args...]\n";
     std::wcout << L"\n";
-    std::wcout << L"subcommands:\n";
-    std::wcout << L"  status       show provider, model, credential, policy, and transcript state\n";
-    std::wcout << L"  providers    list supported providers\n";
-    std::wcout << L"  provider     select openai-codex-cli, openai-codex-subscription, deepseek, openrouter, or off\n";
-    std::wcout << L"  policy       set allow-remote, local-only, or status\n";
-    std::wcout << L"  model        set provider model name\n";
-    std::wcout << L"  base-url     set compatible API base URL\n";
-    std::wcout << L"  effort       set reasoning effort\n";
-    std::wcout << L"  auth         print provider authentication help\n";
-    std::wcout << L"  preview      print the composed request without sending it\n";
-    std::wcout << L"  ask          send an advisory prompt\n";
+    std::wcout << L"primary subcommands:\n";
+    std::wcout << L"  status       show provider, model, credential, and policy state\n";
+    std::wcout << L"  config       configure provider, policy, model, base URL, effort, or auth\n";
     std::wcout << L"  plan         ask AI to produce executable command proposals\n";
-    std::wcout << L"  analyze      run evidence commands and ask AI to analyze output\n";
-    std::wcout << L"  explain      explain dt/dtx output\n";
-    std::wcout << L"  annotate     annotate u/uf disassembly output\n";
-    std::wcout << L"  diagnose     diagnose setup, symbol, backend, or command failures\n";
-    std::wcout << L"  playbook     create investigation playbooks\n";
-    std::wcout << L"  show         show the loaded AI plan\n";
     std::wcout << L"  run          execute planned read-only commands\n";
     std::wcout << L"  write        preview or confirm a planned write-like command\n";
-    std::wcout << L"  transcript   configure AI transcript logging\n";
-    std::wcout << L"  audit        configure write-audit logging\n";
+    std::wcout << L"  explain      run a read-only command and ask AI to explain the output\n";
+    std::wcout << L"  show         show the loaded AI plan\n";
     std::wcout << L"  report       write a session report\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
-    std::wcout << L"  ai provider openrouter\n";
-    std::wcout << L"  ai analyze callbacks all WdFilter.sys\n";
-    std::wcout << L"  ai annotate uf nt!PspCreateProcessNotifyRoutine 128\n";
-    std::wcout << L"  ai provider help\n";
+    std::wcout << L"  ai a.exe pid\n";
+    std::wcout << L"  ai a.exe eprocess\n";
+    std::wcout << L"  ai WdFilter.sys object callbacks\n";
+    std::wcout << L"  ai pid 1234 dtb\n";
+    std::wcout << L"  ai explain callbacks all WdFilter.sys\n";
+    std::wcout << L"  ai explain uf nt!PspCreateProcessNotifyRoutine 128\n";
+    std::wcout << L"  ai config provider openrouter\n";
+    std::wcout << L"  ai config test\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  API-key providers load .env from the current directory, EXE directory, or repo root.\n";
+    std::wcout << L"  Free-form questions first go through an AI tool planner, then local read-only tools execute the plan.\n";
+    std::wcout << L"  API-key providers load .env only from the EXE directory.\n";
     std::wcout << L"  ai run executes read-only validated plan commands; write-like commands require ai write confirm.\n";
+    std::wcout << L"  Legacy detailed commands still work; use ai help <topic> when needed.\n";
 }
 
 static bool PrintAiSubcommandHelp(const std::wstring& action)
@@ -9767,6 +9826,20 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai status\n";
         std::wcout << L"  Show current AI provider runtime settings.\n";
     }
+    else if (name == L"config")
+    {
+        std::wcout << L"ai config:\n";
+        std::wcout << L"  ai config [status]\n";
+        std::wcout << L"  ai config providers\n";
+        std::wcout << L"  ai config provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>\n";
+        std::wcout << L"  ai config policy <allow-remote|local-only|status>\n";
+        std::wcout << L"  ai config model <model>\n";
+        std::wcout << L"  ai config base-url <url>\n";
+        std::wcout << L"  ai config effort <minimal|low|medium|high|xhigh>\n";
+        std::wcout << L"  ai config auth\n";
+        std::wcout << L"  ai config test [prompt]\n";
+        std::wcout << L"  Groups provider setup and connectivity checks under one visible subcommand.\n";
+    }
     else if (name == L"providers")
     {
         std::wcout << L"ai providers:\n";
@@ -9777,7 +9850,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     {
         std::wcout << L"ai provider:\n";
         std::wcout << L"  ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>\n";
-        std::wcout << L"  API-key providers read credentials from .env in the EXE/workspace search path.\n";
+        std::wcout << L"  API-key providers read credentials from .env beside KnLiveDbg.exe.\n";
         std::wcout << L"  DeepSeek uses DEEPSEEK_API_KEY; OpenRouter uses OPENROUTER_API_KEY.\n";
     }
     else if (name == L"policy")
@@ -9835,9 +9908,12 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     else if (name == L"explain")
     {
         std::wcout << L"ai explain:\n";
+        std::wcout << L"  ai explain <read-only-command...>\n";
+        std::wcout << L"  ai explain callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
         std::wcout << L"  ai explain dt <dt-args...>\n";
         std::wcout << L"  ai explain dtx <dtx-args...>\n";
-        std::wcout << L"  Runs dt/dtx and asks AI to explain fields and follow-ups.\n";
+        std::wcout << L"  ai explain <u|uf> <address|symbol> [instruction-count]\n";
+        std::wcout << L"  Runs a read-only evidence command and asks AI to explain fields, callbacks, or disassembly.\n";
     }
     else if (name == L"annotate")
     {
@@ -10994,6 +11070,62 @@ static bool ExtractJsonBoolValue(const std::wstring& json, const std::wstring& k
     return ok;
 }
 
+static bool ExtractJsonScalarValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
+{
+    bool ok = false;
+    std::wstring pattern = L"\"" + key + L"\"";
+    size_t pos = json.find(pattern);
+
+    do
+    {
+        if (value == nullptr)
+        {
+            break;
+        }
+
+        if (ExtractJsonStringValue(json, key, value))
+        {
+            ok = true;
+            break;
+        }
+
+        if (pos == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t colon = json.find(L':', pos + pattern.size());
+        if (colon == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t start = colon + 1;
+        while (start < json.size() && iswspace(json[start]) != 0)
+        {
+            ++start;
+        }
+
+        size_t end = start;
+        while (end < json.size() &&
+               json[end] != L',' &&
+               json[end] != L'}' &&
+               json[end] != L']' &&
+               iswspace(json[end]) == 0)
+        {
+            ++end;
+        }
+
+        if (end > start)
+        {
+            *value = TrimWhitespace(json.substr(start, end - start));
+            ok = !value->empty();
+        }
+    } while (false);
+
+    return ok;
+}
+
 static std::vector<std::wstring> ExtractJsonArrayObjects(const std::wstring& json, const std::wstring& key)
 {
     std::vector<std::wstring> objects;
@@ -11066,6 +11198,157 @@ static std::vector<std::wstring> ExtractJsonArrayObjects(const std::wstring& jso
     } while (false);
 
     return objects;
+}
+
+static bool ExtractJsonObjectValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
+{
+    bool ok = false;
+    std::wstring pattern = L"\"" + key + L"\"";
+    size_t pos = json.find(pattern);
+
+    do
+    {
+        if (value == nullptr || pos == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t colon = json.find(L':', pos + pattern.size());
+        if (colon == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t start = colon + 1;
+        while (start < json.size() && iswspace(json[start]) != 0)
+        {
+            ++start;
+        }
+
+        if (start >= json.size() || json[start] != L'{')
+        {
+            break;
+        }
+
+        bool inString = false;
+        bool escaped = false;
+        int depth = 0;
+        for (size_t index = start; index < json.size(); ++index)
+        {
+            wchar_t ch = json[index];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == L'\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == L'\"')
+                {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (ch == L'\"')
+            {
+                inString = true;
+            }
+            else if (ch == L'{')
+            {
+                ++depth;
+            }
+            else if (ch == L'}')
+            {
+                --depth;
+                if (depth == 0)
+                {
+                    *value = json.substr(start, index - start + 1);
+                    ok = true;
+                    break;
+                }
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
+static std::vector<std::wstring> ExtractJsonStringArrayValues(const std::wstring& json, const std::wstring& key)
+{
+    std::vector<std::wstring> values;
+    std::wstring pattern = L"\"" + key + L"\"";
+    size_t pos = json.find(pattern);
+
+    do
+    {
+        if (pos == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t bracket = json.find(L'[', pos + pattern.size());
+        if (bracket == std::wstring::npos)
+        {
+            break;
+        }
+
+        bool inString = false;
+        bool escaped = false;
+        int arrayDepth = 0;
+        for (size_t index = bracket; index < json.size(); ++index)
+        {
+            wchar_t ch = json[index];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == L'\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == L'\"')
+                {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (ch == L'[')
+            {
+                ++arrayDepth;
+                continue;
+            }
+
+            if (ch == L']')
+            {
+                --arrayDepth;
+                if (arrayDepth == 0)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            if (arrayDepth == 1 && ch == L'\"')
+            {
+                std::wstring value;
+                size_t next = index + 1;
+                if (ParseJsonStringAt(json, index, &value, &next))
+                {
+                    values.push_back(value);
+                    index = next - 1;
+                }
+            }
+        }
+    } while (false);
+
+    return values;
 }
 
 static bool IsShutdownOrUnloadCommand(const std::wstring& command)
@@ -13580,6 +13863,1884 @@ static void HandleAiPlannedWrite(
     } while (false);
 }
 
+struct AiProcessIntent
+{
+    bool IsProcessQuery = false;
+    bool WantsPid = false;
+    bool WantsEprocess = false;
+    bool WantsDtb = false;
+    bool WantsPeb = false;
+    bool WantsInfo = false;
+    bool HasPid = false;
+    uint64_t Pid = 0;
+    bool HasEprocess = false;
+    uint64_t Eprocess = 0;
+    std::wstring ImageName;
+};
+
+static bool IsAiQueryTokenBoundary(wchar_t ch)
+{
+    bool boundary = true;
+
+    if (std::iswalnum(ch) != 0 ||
+        ch == L'_' ||
+        ch == L'-' ||
+        ch == L'.' ||
+        ch == L'\\' ||
+        ch == L'/' ||
+        ch == L':')
+    {
+        boundary = false;
+    }
+
+    return boundary;
+}
+
+static std::wstring TrimAiQueryToken(const std::wstring& value)
+{
+    std::wstring result;
+
+    do
+    {
+        if (value.empty())
+        {
+            break;
+        }
+
+        size_t first = 0;
+        size_t last = value.size();
+
+        while (first < last && IsAiQueryTokenBoundary(value[first]))
+        {
+            ++first;
+        }
+
+        while (last > first && IsAiQueryTokenBoundary(value[last - 1]))
+        {
+            --last;
+        }
+
+        result = value.substr(first, last - first);
+    } while (false);
+
+    return result;
+}
+
+static bool ContainsAiQueryWord(const std::wstring& loweredValue, const std::wstring& loweredWord)
+{
+    bool found = false;
+
+    do
+    {
+        if (loweredValue.empty() || loweredWord.empty())
+        {
+            break;
+        }
+
+        size_t offset = 0;
+        while (offset < loweredValue.size())
+        {
+            size_t match = loweredValue.find(loweredWord, offset);
+            if (match == std::wstring::npos)
+            {
+                break;
+            }
+
+            size_t end = match + loweredWord.size();
+            bool leftBoundary = match == 0 || IsAiQueryTokenBoundary(loweredValue[match - 1]);
+            bool rightBoundary = end >= loweredValue.size() || IsAiQueryTokenBoundary(loweredValue[end]);
+            if (leftBoundary && rightBoundary)
+            {
+                found = true;
+                break;
+            }
+
+            offset = end;
+        }
+    } while (false);
+
+    return found;
+}
+
+static std::wstring LeafFileName(const std::wstring& value)
+{
+    std::wstring result = value;
+
+    size_t slash = result.find_last_of(L"\\/");
+    if (slash != std::wstring::npos && slash + 1 < result.size())
+    {
+        result = result.substr(slash + 1);
+    }
+
+    return result;
+}
+
+static std::wstring StripExeSuffix(const std::wstring& value)
+{
+    std::wstring result = value;
+    std::wstring lowered = ToLower(result);
+
+    if (lowered.size() > 4 && lowered.substr(lowered.size() - 4) == L".exe")
+    {
+        result = result.substr(0, result.size() - 4);
+    }
+
+    return result;
+}
+
+static std::wstring ExtractExeImageNameFromQuery(const std::wstring& query)
+{
+    std::wstring result;
+    std::wstring lowered = ToLower(query);
+    size_t exeIndex = lowered.find(L".exe");
+
+    do
+    {
+        if (exeIndex == std::wstring::npos)
+        {
+            break;
+        }
+
+        size_t first = exeIndex;
+        while (first > 0 && !IsAiQueryTokenBoundary(query[first - 1]))
+        {
+            --first;
+        }
+
+        size_t last = exeIndex + 4;
+        result = LeafFileName(query.substr(first, last - first));
+        result = TrimAiQueryToken(result);
+    } while (false);
+
+    return result;
+}
+
+static bool ProcessImageNameMatches(const std::wstring& recordName, const std::wstring& queryName)
+{
+    bool matched = false;
+
+    do
+    {
+        std::wstring record = ToLower(LeafFileName(TrimAiQueryToken(recordName)));
+        std::wstring query = ToLower(LeafFileName(TrimAiQueryToken(queryName)));
+        if (record.empty() || query.empty() || record == L"<unknown>")
+        {
+            break;
+        }
+
+        if (record == query)
+        {
+            matched = true;
+            break;
+        }
+
+        if (ToLower(StripExeSuffix(record)) == ToLower(StripExeSuffix(query)))
+        {
+            matched = true;
+            break;
+        }
+
+        if (record.size() >= 15 && query.rfind(record, 0) == 0)
+        {
+            matched = true;
+            break;
+        }
+    } while (false);
+
+    return matched;
+}
+
+static bool TryExtractPidFromAiQuery(const std::vector<std::wstring>& tokens, uint64_t* pid)
+{
+    bool found = false;
+
+    do
+    {
+        if (pid == nullptr)
+        {
+            break;
+        }
+
+        for (size_t index = 0; index < tokens.size(); ++index)
+        {
+            std::wstring token = ToLower(TrimAiQueryToken(tokens[index]));
+            if (token.empty())
+            {
+                continue;
+            }
+
+            std::wstring value;
+            if (token == L"pid" || token == L"processid" || token == L"process-id")
+            {
+                if (index + 1 < tokens.size())
+                {
+                    value = TrimAiQueryToken(tokens[index + 1]);
+                }
+            }
+            else if (token.rfind(L"pid=", 0) == 0)
+            {
+                value = token.substr(4);
+            }
+
+            uint64_t parsed = 0;
+            if (!value.empty() && ParseDmlProcessPidFilter(value, &parsed))
+            {
+                *pid = parsed;
+                found = true;
+                break;
+            }
+        }
+    } while (false);
+
+    return found;
+}
+
+static bool TryExtractEprocessFromAiQuery(
+    const std::vector<std::wstring>& tokens,
+    const DebuggerState& state,
+    uint64_t* eprocess)
+{
+    bool found = false;
+
+    do
+    {
+        if (eprocess == nullptr)
+        {
+            break;
+        }
+
+        for (size_t index = 0; index < tokens.size(); ++index)
+        {
+            std::wstring token = TrimAiQueryToken(tokens[index]);
+            std::wstring lowered = ToLower(token);
+            std::wstring value = token;
+
+            if (lowered == L"eprocess" || lowered == L"_eprocess")
+            {
+                if (index + 1 < tokens.size())
+                {
+                    value = TrimAiQueryToken(tokens[index + 1]);
+                }
+                else
+                {
+                    value.clear();
+                }
+            }
+            else if (lowered.rfind(L"eprocess=", 0) == 0)
+            {
+                value = token.substr(9);
+            }
+            else if (lowered.rfind(L"_eprocess=", 0) == 0)
+            {
+                value = token.substr(10);
+            }
+
+            uint64_t parsed = 0;
+            if (!value.empty() &&
+                ParseUnsigned(value, state.NumberBase, &parsed) &&
+                IsLikelyKernelVirtualAddress(parsed))
+            {
+                *eprocess = parsed;
+                found = true;
+                break;
+            }
+        }
+    } while (false);
+
+    return found;
+}
+
+static AiProcessIntent ParseAiProcessIntent(const std::wstring& query, const DebuggerState& state)
+{
+    AiProcessIntent intent = {};
+    std::wstring lowered = ToLower(query);
+    std::vector<std::wstring> tokens = Split(query);
+    bool hasProcessWord = ContainsAiQueryWord(lowered, L"process") ||
+        ContainsNoCase(lowered, L"\xD504\xB85C\xC138\xC2A4");
+
+    intent.ImageName = ExtractExeImageNameFromQuery(query);
+    intent.WantsPid = ContainsNoCase(lowered, L"pid") ||
+        ContainsNoCase(lowered, L"process id") ||
+        ContainsNoCase(lowered, L"process-id");
+    intent.WantsEprocess = ContainsNoCase(lowered, L"eprocess");
+    intent.WantsDtb = ContainsNoCase(lowered, L"dtb") ||
+        ContainsNoCase(lowered, L"dirbase") ||
+        ContainsNoCase(lowered, L"directorytablebase") ||
+        ContainsNoCase(lowered, L"cr3");
+    intent.WantsPeb = ContainsNoCase(lowered, L"peb");
+    intent.WantsInfo = ContainsNoCase(lowered, L"info") ||
+        ContainsNoCase(lowered, L"summary") ||
+        hasProcessWord;
+    intent.HasPid = TryExtractPidFromAiQuery(tokens, &intent.Pid);
+    intent.HasEprocess = TryExtractEprocessFromAiQuery(tokens, state, &intent.Eprocess);
+
+    if (!intent.ImageName.empty() ||
+        intent.HasPid ||
+        (intent.HasEprocess &&
+            (intent.WantsPid || intent.WantsEprocess || intent.WantsDtb || intent.WantsPeb || intent.WantsInfo)) ||
+        ((intent.WantsPid || intent.WantsEprocess || intent.WantsDtb || intent.WantsPeb) &&
+            hasProcessWord))
+    {
+        intent.IsProcessQuery = true;
+    }
+
+    if (intent.IsProcessQuery &&
+        !intent.WantsPid &&
+        !intent.WantsEprocess &&
+        !intent.WantsDtb &&
+        !intent.WantsPeb)
+    {
+        intent.WantsInfo = true;
+    }
+
+    return intent;
+}
+
+static bool AiProcessRecordMatchesIntent(const DmlProcessRecord& record, const AiProcessIntent& intent)
+{
+    bool matched = true;
+
+    do
+    {
+        if (!intent.ImageName.empty())
+        {
+            if (!ProcessImageNameMatches(record.ImageName, intent.ImageName))
+            {
+                matched = false;
+                break;
+            }
+        }
+
+        if (intent.HasPid)
+        {
+            if (record.ProcessId != intent.Pid)
+            {
+                matched = false;
+                break;
+            }
+        }
+
+        if (intent.HasEprocess)
+        {
+            if (record.Eprocess != intent.Eprocess)
+            {
+                matched = false;
+                break;
+            }
+        }
+    } while (false);
+
+    return matched;
+}
+
+static void PrintAiProcessAnswerLine(const DmlProcessRecord& record, const AiProcessIntent& intent)
+{
+    bool any = false;
+
+    if (intent.WantsPid || intent.WantsInfo)
+    {
+        std::wcout << L"pid=" << std::dec << record.ProcessId;
+        any = true;
+    }
+
+    if (intent.WantsEprocess || intent.WantsInfo)
+    {
+        std::wcout << (any ? L" " : L"");
+        std::wcout << L"eprocess=" << HexTextWidth(record.Eprocess, 16, true);
+        any = true;
+    }
+
+    if (intent.WantsDtb || intent.WantsInfo)
+    {
+        std::wcout << (any ? L" " : L"");
+        std::wcout << L"dirbase=" << HexTextWidth(record.DirectoryTableBase, 16, true);
+        if (record.UserDirectoryTableBase != 0)
+        {
+            std::wcout << L" userdirbase=" << HexTextWidth(record.UserDirectoryTableBase, 16, true);
+        }
+        any = true;
+    }
+
+    if (intent.WantsPeb || intent.WantsInfo)
+    {
+        std::wcout << (any ? L" " : L"");
+        if (record.HasPeb)
+        {
+            std::wcout << L"peb=" << HexTextWidth(record.Peb, 16, true);
+        }
+        else
+        {
+            std::wcout << L"peb=<unavailable>";
+        }
+        any = true;
+    }
+
+    if (!any)
+    {
+        std::wcout << L"pid=" << std::dec << record.ProcessId
+                   << L" eprocess=" << HexTextWidth(record.Eprocess, 16, true);
+    }
+
+    std::wcout << L"\n";
+}
+
+static void PrintAiProcessNextCommands(const DmlProcessRecord& record)
+{
+    std::wcout << L"next:\n";
+    std::wcout << L"  dt nt!_EPROCESS " << HexTextWidth(record.Eprocess, 16, true) << L"\n";
+    std::wcout << L"  procctx " << std::dec << record.ProcessId << L"\n";
+    std::wcout << L"  db /process " << std::dec << record.ProcessId << L" <user-va> 80\n";
+    std::wcout << L"  vtop /process " << std::dec << record.ProcessId << L" <user-va>\n";
+}
+
+static bool TryHandleAiProcessQuery(
+    const std::wstring& query,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    bool handled = false;
+
+    do
+    {
+        AiProcessIntent intent = ParseAiProcessIntent(query, state);
+        if (!intent.IsProcessQuery)
+        {
+            break;
+        }
+
+        handled = true;
+
+        DmlProcessCollection collection = {};
+        std::wstring error;
+        if (!CollectDmlProcessRecords(state, device, symbols, &collection, &error))
+        {
+            std::wcerr << L"ai local process query failed: " << error << L"\n";
+            break;
+        }
+
+        std::vector<DmlProcessRecord> matches;
+        for (const DmlProcessRecord& record : collection.Records)
+        {
+            if (AiProcessRecordMatchesIntent(record, intent))
+            {
+                matches.push_back(record);
+            }
+        }
+
+        PrintColoredText(L"ai local", KNDBG_COLOR_TITLE);
+        std::wcout << L": process query\n";
+
+        if (matches.empty())
+        {
+            std::wcout << L"matches=0";
+            if (!intent.ImageName.empty())
+            {
+                std::wcout << L" image=" << intent.ImageName;
+            }
+            if (intent.HasPid)
+            {
+                std::wcout << L" pid=" << std::dec << intent.Pid;
+            }
+            if (intent.HasEprocess)
+            {
+                std::wcout << L" eprocess=" << HexTextWidth(intent.Eprocess, 16, true);
+            }
+            std::wcout << L"\n";
+            std::wcout << L"next:\n";
+            std::wcout << L"  !dml_proc\n";
+            break;
+        }
+
+        PrintDmlProcessHeader();
+        for (const DmlProcessRecord& record : matches)
+        {
+            PrintDmlProcessRecord(record);
+        }
+
+        PrintColoredText(L"matches", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << matches.size();
+        if (collection.Truncated)
+        {
+            std::wcout << L" truncated=yes";
+        }
+        std::wcout << L"\n";
+
+        for (const std::wstring& warning : collection.Warnings)
+        {
+            std::wcerr << L"ai local warning: " << warning << L"\n";
+        }
+
+        if (matches.size() == 1)
+        {
+            PrintColoredText(L"answer", KNDBG_COLOR_TITLE);
+            std::wcout << L": ";
+            PrintAiProcessAnswerLine(matches[0], intent);
+            PrintAiProcessNextCommands(matches[0]);
+        }
+        else
+        {
+            std::wcout << L"answer: multiple matches; use pid or eprocess to narrow the query\n";
+        }
+    } while (false);
+
+    return handled;
+}
+
+static bool TryHandleAiLocalQuery(
+    const std::wstring& query,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    bool handled = false;
+
+    do
+    {
+        if (TryHandleAiProcessQuery(query, state, device, symbols))
+        {
+            handled = true;
+            break;
+        }
+    } while (false);
+
+    return handled;
+}
+
+enum class AiCapabilityQueryResult
+{
+    NotAttempted,
+    Handled,
+    Failed
+};
+
+struct AiCapabilityStep
+{
+    std::wstring Tool;
+    std::wstring ArgsJson;
+};
+
+struct AiCapabilityPlan
+{
+    std::wstring Schema;
+    std::wstring Summary;
+    std::wstring RawResponse;
+    std::vector<AiCapabilityStep> Steps;
+};
+
+struct AiCapabilityProcessFilter
+{
+    bool HasImage = false;
+    std::wstring Image;
+    bool HasPid = false;
+    uint64_t Pid = 0;
+    bool HasEprocess = false;
+    uint64_t Eprocess = 0;
+};
+
+struct AiCapabilityStepResult
+{
+    bool HasProcesses = false;
+    std::vector<DmlProcessRecord> Processes;
+};
+
+static bool TryParseAiCapabilitySourceIndex(const std::wstring& source, size_t* index)
+{
+    bool ok = false;
+
+    do
+    {
+        if (index == nullptr || source.size() < 2 || source[0] != L'$')
+        {
+            break;
+        }
+
+        uint64_t parsed = 0;
+        if (!ParseUnsigned(source.substr(1), 10, &parsed) ||
+            parsed > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        {
+            break;
+        }
+
+        *index = static_cast<size_t>(parsed);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring NormalizeAiCapabilityProcessField(const std::wstring& value)
+{
+    std::wstring field = ToLower(TrimWhitespace(value));
+
+    if (field == L"name" || field == L"image" || field == L"imagename" || field == L"image_name")
+    {
+        field = L"image";
+    }
+    else if (field == L"processid" || field == L"process_id")
+    {
+        field = L"pid";
+    }
+    else if (field == L"address" || field == L"_eprocess")
+    {
+        field = L"eprocess";
+    }
+    else if (field == L"directorytablebase" || field == L"directory_table_base" || field == L"dirbase" || field == L"cr3")
+    {
+        field = L"dtb";
+    }
+    else if (field == L"userdirectorytablebase" || field == L"user_directory_table_base" || field == L"userdirbase")
+    {
+        field = L"userdtb";
+    }
+    else if (field == L"parent" || field == L"parentpid" || field == L"ppid")
+    {
+        field = L"ppid";
+    }
+    else if (field == L"active_threads" || field == L"activethreads")
+    {
+        field = L"threads";
+    }
+
+    return field;
+}
+
+static bool IsSupportedAiCapabilityProcessField(const std::wstring& field)
+{
+    return field == L"all" ||
+        field == L"pid" ||
+        field == L"image" ||
+        field == L"eprocess" ||
+        field == L"dtb" ||
+        field == L"userdtb" ||
+        field == L"peb" ||
+        field == L"ppid" ||
+        field == L"threads";
+}
+
+static std::vector<std::wstring> NormalizeAiCapabilityProcessFields(
+    const std::vector<std::wstring>& rawFields,
+    std::wstring* error)
+{
+    std::vector<std::wstring> fields;
+
+    do
+    {
+        for (const std::wstring& rawField : rawFields)
+        {
+            std::wstring field = NormalizeAiCapabilityProcessField(rawField);
+            if (field.empty())
+            {
+                continue;
+            }
+
+            if (!IsSupportedAiCapabilityProcessField(field))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"unsupported process field: " + rawField;
+                }
+                fields.clear();
+                break;
+            }
+
+            if (field == L"all")
+            {
+                fields.clear();
+                break;
+            }
+
+            bool exists = false;
+            for (const std::wstring& existing : fields)
+            {
+                if (existing == field)
+                {
+                    exists = true;
+                    break;
+                }
+            }
+
+            if (!exists)
+            {
+                fields.push_back(field);
+            }
+        }
+    } while (false);
+
+    return fields;
+}
+
+static std::vector<std::wstring> DefaultAiCapabilityProcessFields()
+{
+    std::vector<std::wstring> fields;
+    fields.push_back(L"pid");
+    fields.push_back(L"image");
+    fields.push_back(L"eprocess");
+    fields.push_back(L"dtb");
+    fields.push_back(L"peb");
+    return fields;
+}
+
+static bool ParseAiCapabilityProcessFilter(
+    const std::wstring& argsJson,
+    const DebuggerState& state,
+    AiCapabilityProcessFilter* filter,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (filter == nullptr)
+        {
+            break;
+        }
+
+        *filter = AiCapabilityProcessFilter{};
+
+        std::wstring image;
+        if (!ExtractJsonStringValue(argsJson, L"image", &image))
+        {
+            ExtractJsonStringValue(argsJson, L"name", &image);
+        }
+        if (image.empty())
+        {
+            ExtractJsonStringValue(argsJson, L"process", &image);
+        }
+        if (!TrimWhitespace(image).empty())
+        {
+            filter->HasImage = true;
+            filter->Image = TrimWhitespace(image);
+        }
+
+        std::wstring pidText;
+        if (ExtractJsonScalarValue(argsJson, L"pid", &pidText) && !TrimWhitespace(pidText).empty())
+        {
+            uint64_t parsed = 0;
+            if (!ParseDmlProcessPidFilter(TrimWhitespace(pidText), &parsed))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid process pid: " + pidText;
+                }
+                break;
+            }
+
+            filter->HasPid = true;
+            filter->Pid = parsed;
+        }
+
+        std::wstring eprocessText;
+        if (ExtractJsonScalarValue(argsJson, L"eprocess", &eprocessText) && !TrimWhitespace(eprocessText).empty())
+        {
+            uint64_t parsed = 0;
+            if (!ParseUnsigned(TrimWhitespace(eprocessText), state.NumberBase, &parsed) ||
+                !IsLikelyKernelVirtualAddress(parsed))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid EPROCESS address: " + eprocessText;
+                }
+                break;
+            }
+
+            filter->HasEprocess = true;
+            filter->Eprocess = parsed;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool AiCapabilityRecordMatchesFilter(
+    const DmlProcessRecord& record,
+    const AiCapabilityProcessFilter& filter)
+{
+    bool matched = true;
+
+    do
+    {
+        if (filter.HasImage && !ProcessImageNameMatches(record.ImageName, filter.Image))
+        {
+            matched = false;
+            break;
+        }
+
+        if (filter.HasPid && record.ProcessId != filter.Pid)
+        {
+            matched = false;
+            break;
+        }
+
+        if (filter.HasEprocess && record.Eprocess != filter.Eprocess)
+        {
+            matched = false;
+            break;
+        }
+    } while (false);
+
+    return matched;
+}
+
+static bool HasAiCapabilityProcessFilterArg(const std::wstring& argsJson)
+{
+    bool hasFilter = false;
+    std::wstring value;
+
+    do
+    {
+        if (ExtractJsonStringValue(argsJson, L"image", &value) ||
+            ExtractJsonStringValue(argsJson, L"name", &value) ||
+            ExtractJsonStringValue(argsJson, L"process", &value) ||
+            ExtractJsonScalarValue(argsJson, L"pid", &value) ||
+            ExtractJsonScalarValue(argsJson, L"eprocess", &value))
+        {
+            hasFilter = true;
+            break;
+        }
+    } while (false);
+
+    return hasFilter;
+}
+
+static bool CollectAiCapabilityProcessMatches(
+    const std::wstring& argsJson,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::vector<DmlProcessRecord>* matches,
+    bool* truncated,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (matches == nullptr || truncated == nullptr)
+        {
+            break;
+        }
+
+        matches->clear();
+        *truncated = false;
+
+        AiCapabilityProcessFilter filter = {};
+        if (!ParseAiCapabilityProcessFilter(argsJson, state, &filter, error))
+        {
+            break;
+        }
+
+        DmlProcessCollection collection = {};
+        if (!CollectDmlProcessRecords(state, device, symbols, &collection, error))
+        {
+            break;
+        }
+
+        for (const DmlProcessRecord& record : collection.Records)
+        {
+            if (AiCapabilityRecordMatchesFilter(record, filter))
+            {
+                matches->push_back(record);
+            }
+        }
+
+        *truncated = collection.Truncated;
+        for (const std::wstring& warning : collection.Warnings)
+        {
+            std::wcerr << L"ai tool warning: " << warning << L"\n";
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ResolveAiCapabilityProcessInput(
+    const std::wstring& argsJson,
+    const std::vector<AiCapabilityStepResult>& results,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::vector<DmlProcessRecord>* records,
+    bool* truncated,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (records == nullptr || truncated == nullptr)
+        {
+            break;
+        }
+
+        records->clear();
+        *truncated = false;
+
+        std::wstring source;
+        ExtractJsonStringValue(argsJson, L"source", &source);
+        if (!TrimWhitespace(source).empty())
+        {
+            size_t sourceIndex = 0;
+            if (!TryParseAiCapabilitySourceIndex(TrimWhitespace(source), &sourceIndex) ||
+                sourceIndex >= results.size() ||
+                !results[sourceIndex].HasProcesses)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid process source reference: " + source;
+                }
+                break;
+            }
+
+            *records = results[sourceIndex].Processes;
+            ok = true;
+            break;
+        }
+
+        if (!results.empty() && results.back().HasProcesses)
+        {
+            if (!HasAiCapabilityProcessFilterArg(argsJson))
+            {
+                *records = results.back().Processes;
+                ok = true;
+                break;
+            }
+        }
+
+        ok = CollectAiCapabilityProcessMatches(argsJson, state, device, symbols, records, truncated, error);
+    } while (false);
+
+    return ok;
+}
+
+static void PrintAiCapabilityProcessValue(
+    const DmlProcessRecord& record,
+    const std::wstring& field,
+    bool* any)
+{
+    if (any != nullptr && *any)
+    {
+        std::wcout << L" ";
+    }
+
+    if (field == L"pid")
+    {
+        std::wcout << L"pid=" << std::dec << record.ProcessId;
+    }
+    else if (field == L"image")
+    {
+        std::wcout << L"image=" << record.ImageName;
+    }
+    else if (field == L"eprocess")
+    {
+        std::wcout << L"eprocess=" << HexTextWidth(record.Eprocess, 16, true);
+    }
+    else if (field == L"dtb")
+    {
+        std::wcout << L"dirbase=" << HexTextWidth(record.DirectoryTableBase, 16, true);
+    }
+    else if (field == L"userdtb")
+    {
+        std::wcout << L"userdirbase=" << HexTextWidth(record.UserDirectoryTableBase, 16, true);
+    }
+    else if (field == L"peb")
+    {
+        if (record.HasPeb)
+        {
+            std::wcout << L"peb=" << HexTextWidth(record.Peb, 16, true);
+        }
+        else
+        {
+            std::wcout << L"peb=<unavailable>";
+        }
+    }
+    else if (field == L"ppid")
+    {
+        if (record.HasParentProcessId)
+        {
+            std::wcout << L"ppid=" << std::dec << record.ParentProcessId;
+        }
+        else
+        {
+            std::wcout << L"ppid=<unavailable>";
+        }
+    }
+    else if (field == L"threads")
+    {
+        if (record.HasActiveThreads)
+        {
+            std::wcout << L"threads=" << std::dec << record.ActiveThreads;
+        }
+        else
+        {
+            std::wcout << L"threads=<unavailable>";
+        }
+    }
+
+    if (any != nullptr)
+    {
+        *any = true;
+    }
+}
+
+static void PrintAiCapabilityProcessDescriptions(
+    const std::vector<DmlProcessRecord>& records,
+    const std::vector<std::wstring>& rawFields)
+{
+    std::wstring error;
+    std::vector<std::wstring> fields = NormalizeAiCapabilityProcessFields(rawFields, &error);
+    if (!error.empty())
+    {
+        std::wcerr << L"ai tool warning: " << error << L"\n";
+        fields = DefaultAiCapabilityProcessFields();
+    }
+    else if (fields.empty())
+    {
+        fields = DefaultAiCapabilityProcessFields();
+    }
+
+    for (size_t index = 0; index < records.size(); ++index)
+    {
+        std::wcout << L"[" << index << L"] ";
+        bool any = false;
+        for (const std::wstring& field : fields)
+        {
+            PrintAiCapabilityProcessValue(records[index], field, &any);
+        }
+        std::wcout << L"\n";
+    }
+}
+
+static bool ParseAiCapabilityPlanResponse(
+    const std::wstring& responseText,
+    AiCapabilityPlan* plan,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (plan == nullptr)
+        {
+            break;
+        }
+
+        std::wstring json;
+        if (!ExtractBalancedJsonObject(responseText, &json))
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI tool planner did not return a JSON object";
+            }
+            break;
+        }
+
+        AiCapabilityPlan parsed = {};
+        parsed.RawResponse = responseText;
+        ExtractJsonStringValue(json, L"schema", &parsed.Schema);
+        ExtractJsonStringValue(json, L"summary", &parsed.Summary);
+        if (parsed.Schema != L"kn-live-dbg.ai-capability-plan.v1")
+        {
+            if (error != nullptr)
+            {
+                *error = L"unsupported AI capability schema: " + parsed.Schema;
+            }
+            break;
+        }
+
+        std::vector<std::wstring> stepObjects = ExtractJsonArrayObjects(json, L"steps");
+        if (stepObjects.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI capability plan did not contain steps";
+            }
+            break;
+        }
+
+        if (stepObjects.size() > 6)
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI capability plan has too many steps";
+            }
+            break;
+        }
+
+        for (const std::wstring& stepObject : stepObjects)
+        {
+            AiCapabilityStep step = {};
+            ExtractJsonStringValue(stepObject, L"tool", &step.Tool);
+            if (step.Tool.empty())
+            {
+                ExtractJsonStringValue(stepObject, L"capability", &step.Tool);
+            }
+            step.Tool = ToLower(TrimWhitespace(step.Tool));
+            ExtractJsonObjectValue(stepObject, L"args", &step.ArgsJson);
+            if (step.ArgsJson.empty())
+            {
+                step.ArgsJson = L"{}";
+            }
+
+            if (step.Tool != L"process.find" &&
+                step.Tool != L"process.describe" &&
+                step.Tool != L"type.describe" &&
+                step.Tool != L"callbacks.list" &&
+                step.Tool != L"assistant.answer")
+            {
+                if (error != nullptr)
+                {
+                    *error = L"unsupported AI capability tool: " + step.Tool;
+                }
+                parsed.Steps.clear();
+                break;
+            }
+
+            parsed.Steps.push_back(step);
+        }
+
+        if (parsed.Steps.empty())
+        {
+            break;
+        }
+
+        *plan = parsed;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
+{
+    std::wstringstream stream;
+
+    stream << L"You are the KnLiveDbg tool router. Choose local read-only tools for the operator request.\n";
+    stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
+    stream << L"Schema:\n";
+    stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|assistant.answer\",\"args\":{}}";
+    stream << L"]}\n";
+    stream << L"Available tools:\n";
+    stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
+    stream << L"- process.describe: print process fields. Args: source like \"$0\" or image/pid/eprocess, fields array. Supported fields: pid,image,eprocess,dtb,userdtb,peb,ppid,threads,all.\n";
+    stream << L"- type.describe: dump a structure with dt. Args: source like \"$0\" or address/eprocess, type string, fields array of type field names. For process source, use each record EPROCESS address.\n";
+    stream << L"- callbacks.list: list kernel callbacks. Args: scope string and optional module string. Supported scopes: all,object,registry,process,thread,imageload,minifilter.\n";
+    stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
+    stream << L"Rules:\n";
+    stream << L"- Use only these tools. Do not emit debugger commands.\n";
+    stream << L"- All scalar args must be JSON strings. Use fields as an array of strings.\n";
+    stream << L"- For image-name process questions, first use process.find with image, then describe or type.describe source \"$0\".\n";
+    stream << L"- For PID/EPROCESS/DTB/PEB answers, prefer process.describe.\n";
+    stream << L"- For full _EPROCESS layout at the found process, use type.describe with type \"nt!_EPROCESS\" and source \"$0\".\n";
+    stream << L"- For callback requests such as object callbacks for WdFilter.sys, use callbacks.list with scope \"object\" and module \"WdFilter.sys\".\n";
+    stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
+    stream << L"Operator request:\n";
+    stream << query << L"\n";
+
+    return stream.str();
+}
+
+static bool IsAiCapabilityAssistantAnswerPlan(const AiCapabilityPlan& plan)
+{
+    return plan.Steps.size() == 1 && plan.Steps[0].Tool == L"assistant.answer";
+}
+
+static bool ExecuteAiCapabilityProcessFind(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiCapabilityStepResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        bool truncated = false;
+        if (!CollectAiCapabilityProcessMatches(step.ArgsJson, state, device, symbols, &result->Processes, &truncated, error))
+        {
+            break;
+        }
+
+        result->HasProcesses = true;
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": process.find\n";
+        PrintDmlProcessHeader();
+        for (const DmlProcessRecord& record : result->Processes)
+        {
+            PrintDmlProcessRecord(record);
+        }
+
+        PrintColoredText(L"matches", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << result->Processes.size();
+        if (truncated)
+        {
+            std::wcout << L" truncated=yes";
+        }
+        std::wcout << L"\n";
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityProcessDescribe(
+    const AiCapabilityStep& step,
+    const std::vector<AiCapabilityStepResult>& results,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiCapabilityStepResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        bool truncated = false;
+        if (!ResolveAiCapabilityProcessInput(step.ArgsJson, results, state, device, symbols, &result->Processes, &truncated, error))
+        {
+            break;
+        }
+
+        result->HasProcesses = true;
+        std::vector<std::wstring> fields = ExtractJsonStringArrayValues(step.ArgsJson, L"fields");
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": process.describe\n";
+        PrintAiCapabilityProcessDescriptions(result->Processes, fields);
+        PrintColoredText(L"records", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << result->Processes.size();
+        if (truncated)
+        {
+            std::wcout << L" truncated=yes";
+        }
+        std::wcout << L"\n";
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityTypeDescribeForAddress(
+    const std::wstring& typeName,
+    const std::wstring& addressText,
+    const std::vector<std::wstring>& fields,
+    const DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    bool ok = false;
+
+    do
+    {
+        if (TrimWhitespace(typeName).empty() || TrimWhitespace(addressText).empty())
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"dt");
+        args.push_back(typeName);
+        args.push_back(addressText);
+        for (const std::wstring& field : fields)
+        {
+            if (!TrimWhitespace(field).empty() && ToLower(TrimWhitespace(field)) != L"all")
+            {
+                args.push_back(TrimWhitespace(field));
+            }
+        }
+
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleDtCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityTypeDescribe(
+    const AiCapabilityStep& step,
+    const std::vector<AiCapabilityStepResult>& results,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiCapabilityStepResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        std::wstring typeName;
+        ExtractJsonStringValue(step.ArgsJson, L"type", &typeName);
+        if (TrimWhitespace(typeName).empty())
+        {
+            typeName = L"nt!_EPROCESS";
+        }
+
+        std::vector<std::wstring> fields = ExtractJsonStringArrayValues(step.ArgsJson, L"fields");
+
+        std::wstring addressText;
+        if (!ExtractJsonScalarValue(step.ArgsJson, L"address", &addressText))
+        {
+            ExtractJsonScalarValue(step.ArgsJson, L"eprocess", &addressText);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": type.describe\n";
+
+        if (!TrimWhitespace(addressText).empty())
+        {
+            if (!ExecuteAiCapabilityTypeDescribeForAddress(typeName, TrimWhitespace(addressText), fields, state, device, symbols))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"type.describe requires a type and address";
+                }
+                break;
+            }
+
+            ok = true;
+            break;
+        }
+
+        std::vector<DmlProcessRecord> records;
+        bool truncated = false;
+        if (!ResolveAiCapabilityProcessInput(step.ArgsJson, results, state, device, symbols, &records, &truncated, error))
+        {
+            break;
+        }
+
+        result->HasProcesses = true;
+        result->Processes = records;
+        if (records.empty())
+        {
+            std::wcout << L"records=0\n";
+            ok = true;
+            break;
+        }
+
+        for (const DmlProcessRecord& record : records)
+        {
+            ExecuteAiCapabilityTypeDescribeForAddress(
+                typeName,
+                HexTextWidth(record.Eprocess, 16, true),
+                fields,
+                state,
+                device,
+                symbols);
+        }
+
+        if (truncated)
+        {
+            std::wcout << L"records truncated=yes\n";
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring NormalizeAiCapabilityCallbackScope(const std::wstring& value)
+{
+    std::wstring scope = ToLower(TrimWhitespace(value));
+
+    if (scope.empty())
+    {
+        scope = L"all";
+    }
+    else if (scope == L"ob" ||
+             scope == L"objects" ||
+             scope == L"object-manager" ||
+             scope == L"object callback" ||
+             scope == L"object callbacks" ||
+             scope == L"object-callback" ||
+             scope == L"object-callbacks" ||
+             scope == L"object_callbacks")
+    {
+        scope = L"object";
+    }
+    else if (scope == L"reg" ||
+             scope == L"registry callback" ||
+             scope == L"registry callbacks" ||
+             scope == L"registry-callback" ||
+             scope == L"registry-callbacks" ||
+             scope == L"registry_callbacks")
+    {
+        scope = L"registry";
+    }
+    else if (scope == L"proc" ||
+             scope == L"processes" ||
+             scope == L"process callback" ||
+             scope == L"process callbacks" ||
+             scope == L"process-callback" ||
+             scope == L"process-callbacks" ||
+             scope == L"process_callbacks")
+    {
+        scope = L"process";
+    }
+    else if (scope == L"threads" ||
+             scope == L"thread callback" ||
+             scope == L"thread callbacks" ||
+             scope == L"thread-callback" ||
+             scope == L"thread-callbacks" ||
+             scope == L"thread_callbacks")
+    {
+        scope = L"thread";
+    }
+    else if (scope == L"image" ||
+             scope == L"loadimage" ||
+             scope == L"load-image" ||
+             scope == L"imgload" ||
+             scope == L"image load" ||
+             scope == L"image-load callback" ||
+             scope == L"image-load callbacks" ||
+             scope == L"image-load" ||
+             scope == L"image load callback" ||
+             scope == L"image load callbacks" ||
+             scope == L"image_load")
+    {
+        scope = L"imageload";
+    }
+    else if (scope == L"mini" ||
+             scope == L"minifilters" ||
+             scope == L"flt" ||
+             scope == L"fltmgr" ||
+             scope == L"filter" ||
+             scope == L"filters" ||
+             scope == L"mini filter" ||
+             scope == L"mini filters" ||
+             scope == L"file system filter" ||
+             scope == L"file system filters")
+    {
+        scope = L"minifilter";
+    }
+
+    return scope;
+}
+
+static bool ExecuteAiCapabilityCallbacksList(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring scope;
+        ExtractJsonStringValue(step.ArgsJson, L"scope", &scope);
+        scope = NormalizeAiCapabilityCallbackScope(scope);
+        if (!IsCallbackScopeName(scope))
+        {
+            if (error != nullptr)
+            {
+                *error = L"unsupported callback scope: " + scope;
+            }
+            break;
+        }
+
+        std::wstring module;
+        if (!ExtractJsonStringValue(step.ArgsJson, L"module", &module))
+        {
+            ExtractJsonStringValue(step.ArgsJson, L"driver", &module);
+        }
+        module = TrimWhitespace(module);
+
+        std::wstring unsafeReason;
+        if (!module.empty() &&
+            (ContainsUnsafeAiCommandCharacters(module, &unsafeReason) ||
+             IsCallbackModuleOption(module) ||
+             IsHelpToken(module)))
+        {
+            if (error != nullptr)
+            {
+                *error = unsafeReason.empty() ? L"invalid callback module filter" : unsafeReason;
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"callbacks");
+        args.push_back(scope);
+        if (!module.empty())
+        {
+            args.push_back(module);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": callbacks.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleCallbacksCommand(args, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityPlan(
+    const AiCapabilityPlan& plan,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+    std::vector<AiCapabilityStepResult> results;
+
+    do
+    {
+        if (!plan.Summary.empty())
+        {
+            PrintColoredText(L"ai tools", KNDBG_COLOR_TITLE);
+            std::wcout << L": " << plan.Summary << L"\n";
+        }
+
+        for (const AiCapabilityStep& step : plan.Steps)
+        {
+            AiCapabilityStepResult result = {};
+            bool stepOk = false;
+
+            if (step.Tool == L"process.find")
+            {
+                stepOk = ExecuteAiCapabilityProcessFind(step, state, device, symbols, &result, error);
+            }
+            else if (step.Tool == L"process.describe")
+            {
+                stepOk = ExecuteAiCapabilityProcessDescribe(step, results, state, device, symbols, &result, error);
+            }
+            else if (step.Tool == L"type.describe")
+            {
+                stepOk = ExecuteAiCapabilityTypeDescribe(step, results, state, device, symbols, &result, error);
+            }
+            else if (step.Tool == L"callbacks.list")
+            {
+                stepOk = ExecuteAiCapabilityCallbacksList(step, device, symbols, error);
+            }
+            else if (step.Tool == L"assistant.answer")
+            {
+                if (error != nullptr)
+                {
+                    *error = L"assistant.answer cannot be mixed with local tool steps";
+                }
+            }
+
+            if (!stepOk)
+            {
+                break;
+            }
+
+            results.push_back(result);
+        }
+
+        ok = results.size() == plan.Steps.size();
+    } while (false);
+
+    return ok;
+}
+
+static AiCapabilityQueryResult TryHandleAiCapabilityQuery(
+    const std::wstring& query,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    AiCapabilityQueryResult result = AiCapabilityQueryResult::NotAttempted;
+
+    do
+    {
+        if (ToLower(ai.ProviderName()) == L"off")
+        {
+            break;
+        }
+
+        AiCompletionRequest request = {};
+        request.System = BuildAiSystemPrompt(state, symbols);
+        request.Prompt = BuildAiCapabilityPlannerPrompt(query);
+
+        std::wcout << L"ai tool planner: provider=" << ai.ProviderName()
+                   << L" model=" << ai.Settings().Model
+                   << L" credential=" << ai.CredentialStatus() << L"\n";
+
+        AiCompletionResponse response = {};
+        std::wstring error;
+        if (!ai.Complete(request, &response, &error))
+        {
+            std::wcerr << L"ai tool planner failed: " << error << L"\n";
+            WriteAiTranscriptEvent(aiState, L"ai_tool_plan_failed", error, L"");
+            result = AiCapabilityQueryResult::Failed;
+            break;
+        }
+
+        AiCapabilityPlan plan = {};
+        if (!ParseAiCapabilityPlanResponse(response.Text, &plan, &error))
+        {
+            std::wcerr << L"ai tool planner skipped: " << error << L"\n";
+            WriteAiTranscriptEvent(aiState, L"ai_tool_plan_parse_failed", error, L"");
+            result = AiCapabilityQueryResult::NotAttempted;
+            break;
+        }
+
+        if (IsAiCapabilityAssistantAnswerPlan(plan))
+        {
+            WriteAiTranscriptEvent(aiState, L"ai_tool_plan_skipped", L"assistant.answer", L"");
+            result = AiCapabilityQueryResult::NotAttempted;
+            break;
+        }
+
+        WriteAiTranscriptEvent(aiState, L"ai_tool_plan", L"capability plan accepted", L"");
+        if (!ExecuteAiCapabilityPlan(plan, state, device, symbols, &error))
+        {
+            std::wcerr << L"ai tool execution failed: " << error << L"\n";
+            WriteAiTranscriptEvent(aiState, L"ai_tool_execution_failed", error, L"");
+            result = AiCapabilityQueryResult::Failed;
+            break;
+        }
+
+        result = AiCapabilityQueryResult::Handled;
+    } while (false);
+
+    return result;
+}
+
+static void HandleAiConfigTestCommand(const std::vector<std::wstring>& args, AiProviderRuntime& ai)
+{
+    static const std::wstring expectedMarker = L"kn-live-dbg-ai-ok";
+
+    do
+    {
+        AiCompletionRequest request = {};
+        request.System = L"You are a KnLiveDbg AI provider connectivity smoke test. Return exactly this marker and no other text: " + expectedMarker;
+        if (args.size() >= 4)
+        {
+            request.Prompt = JoinArgs(args, 3);
+        }
+        else
+        {
+            request.Prompt = L"Return exactly: " + expectedMarker;
+        }
+
+        std::wcout << L"ai config test\n";
+        std::wcout << L"  provider: " << ai.ProviderName() << L"\n";
+        std::wcout << L"  model: " << (ai.Settings().Model.empty() ? L"(default)" : ai.Settings().Model) << L"\n";
+        std::wcout << L"  remote policy: " << ai.RemotePolicyName() << L"\n";
+        std::wcout << L"  credential: " << ai.CredentialStatus() << L"\n";
+        std::wcout << L"  sending smoke request...\n";
+
+        AiCompletionResponse response = {};
+        std::wstring error;
+        uint64_t startTick = GetTickCount64();
+        bool completed = ai.Complete(request, &response, &error);
+        uint64_t elapsed = GetTickCount64() - startTick;
+
+        if (!completed)
+        {
+            std::wcout << L"  transport: failed\n";
+            std::wcout << L"  elapsed: " << FormatElapsedSeconds(elapsed) << L"\n";
+            std::wcerr << L"ai config test failed: " << error << L"\n";
+            break;
+        }
+
+        bool markerOk = ContainsNoCase(response.Text, expectedMarker);
+        std::wcout << L"  transport: ok\n";
+        if (response.StatusCode != 0)
+        {
+            std::wcout << L"  http status: " << response.StatusCode << L"\n";
+        }
+        std::wcout << L"  elapsed: " << FormatElapsedSeconds(elapsed) << L"\n";
+        std::wcout << L"  response marker: " << (markerOk ? L"ok" : L"missing") << L"\n";
+
+        if (!markerOk)
+        {
+            std::wstring preview = TrimWhitespace(response.Text);
+            if (preview.size() > 300)
+            {
+                preview.resize(300);
+                preview += L"...";
+            }
+
+            std::wcout << L"  response preview: " << (preview.empty() ? L"(empty)" : preview) << L"\n";
+        }
+    } while (false);
+}
+
+static void HandleAiConfigCommand(
+    const std::vector<std::wstring>& args,
+    AiProviderRuntime& ai)
+{
+    do
+    {
+        if (args.size() < 3 || ToLower(args[2]) == L"status")
+        {
+            std::wcout << ai.StatusText();
+            break;
+        }
+
+        std::wstring setting = ToLower(args[2]);
+        if (setting == L"help")
+        {
+            PrintAiSubcommandHelp(L"config");
+        }
+        else if (setting == L"providers")
+        {
+            PrintAiProviders();
+        }
+        else if (setting == L"provider")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"usage: ai config provider <name>\n";
+                break;
+            }
+
+            std::wstring error;
+            if (!ai.SetProvider(args[3], &error))
+            {
+                std::wcerr << L"ai config provider failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << ai.StatusText();
+        }
+        else if (setting == L"policy")
+        {
+            if (args.size() < 4 || ToLower(args[3]) == L"status")
+            {
+                std::wcout << L"ai remote policy: " << ai.RemotePolicyName() << L"\n";
+                break;
+            }
+
+            std::wstring error;
+            if (!ai.SetRemotePolicy(args[3], &error))
+            {
+                std::wcerr << L"ai config policy failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << ai.StatusText();
+        }
+        else if (setting == L"model")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"usage: ai config model <model>\n";
+                break;
+            }
+
+            ai.SetModel(JoinArgs(args, 3));
+            std::wcout << ai.StatusText();
+        }
+        else if (setting == L"base-url")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"usage: ai config base-url <url>\n";
+                break;
+            }
+
+            ai.SetBaseUrl(JoinArgs(args, 3));
+            std::wcout << ai.StatusText();
+        }
+        else if (setting == L"effort")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"usage: ai config effort <minimal|low|medium|high|xhigh>\n";
+                break;
+            }
+
+            ai.SetReasoningEffort(args[3]);
+            std::wcout << ai.StatusText();
+        }
+        else if (setting == L"auth")
+        {
+            std::wcout << ai.AuthHelpText();
+        }
+        else if (setting == L"test")
+        {
+            HandleAiConfigTestCommand(args, ai);
+        }
+        else
+        {
+            std::wcerr << L"unknown ai config setting. type ai help config\n";
+        }
+    } while (false);
+}
+
+static void HandleAiFreeFormCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        std::wstring query = JoinArgs(args, 1);
+        if (TrimWhitespace(query).empty())
+        {
+            PrintAiHelp();
+            break;
+        }
+
+        AiCapabilityQueryResult capabilityResult = TryHandleAiCapabilityQuery(
+            query,
+            state,
+            device,
+            symbols,
+            ai,
+            aiState);
+        if (capabilityResult == AiCapabilityQueryResult::Handled)
+        {
+            break;
+        }
+
+        if (TryHandleAiLocalQuery(query, state, device, symbols))
+        {
+            break;
+        }
+
+        if (capabilityResult == AiCapabilityQueryResult::Failed)
+        {
+            break;
+        }
+
+        AiCompletionRequest request = {};
+        request.System = BuildAiSystemPrompt(state, symbols);
+        request.Prompt = query;
+        std::wcout << L"ai request: provider=" << ai.ProviderName()
+                   << L" model=" << ai.Settings().Model
+                   << L" credential=" << ai.CredentialStatus() << L"\n";
+        CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
+    } while (false);
+}
+
 static void HandleAiCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -13613,6 +15774,10 @@ static void HandleAiCommand(
         else if (action == L"status")
         {
             std::wcout << ai.StatusText();
+        }
+        else if (action == L"config")
+        {
+            HandleAiConfigCommand(args, ai);
         }
         else if (action == L"providers")
         {
@@ -13691,7 +15856,14 @@ static void HandleAiCommand(
         }
         else if (action == L"show")
         {
-            PrintAiPlan(aiState);
+            if (args.size() == 2)
+            {
+                PrintAiPlan(aiState);
+            }
+            else
+            {
+                HandleAiFreeFormCommand(args, state, device, symbols, ai, aiState);
+            }
         }
         else if (action == L"write")
         {
@@ -13928,18 +16100,42 @@ static void HandleAiCommand(
         }
         else if (action == L"explain")
         {
-            if (args.size() < 4 || (ToLower(args[2]) != L"dt" && ToLower(args[2]) != L"dtx"))
+            if (args.size() < 3)
             {
-                std::wcerr << L"usage: ai explain dt <dt-args...>\n";
+                std::wcerr << L"usage: ai explain <read-only-command...>\n";
                 break;
             }
 
+            std::wstring topic = ToLower(args[2]);
             std::wstring commandLine = JoinArgs(args, 2);
+            std::wstring eventName = L"ai_explain";
+            std::wstring title = L"Explain this KnLiveDbg command output.";
+            std::wstring instructions = L"Explain the important fields, anomalies, uncertainty, and concrete follow-up commands. Preserve raw addresses and values.";
+
+            if (topic == L"callbacks")
+            {
+                eventName = L"ai_explain_callbacks";
+                title = L"Analyze this KnLiveDbg kernel callback scan.";
+                instructions = L"Produce a callback analysis report from this KnLiveDbg callback scan output. Count records by surface, group by module, decode process notify metadata, call out image-load notify owners, non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes.";
+            }
+            else if (topic == L"dt" || topic == L"dtx")
+            {
+                eventName = L"ai_explain_dt";
+                title = L"Explain this KnLiveDbg dt/dtx structure output.";
+                instructions = L"Explain important fields, pointer and LIST_ENTRY follow-ups, suspicious null or out-of-module values, and exact commands to inspect referenced fields. Keep raw offsets and values auditable.";
+            }
+            else if (topic == L"u" || topic == L"uf")
+            {
+                eventName = L"ai_explain_disassembly";
+                title = L"Annotate this KnLiveDbg disassembly.";
+                instructions = L"Summarize likely routine purpose, call targets, direct and indirect call evidence, callback/dispatch/minifilter/process/thread/image-load classification hints, suspicious code patterns, uncertainty, and next commands such as ln, x, dt, dq, or uf.";
+            }
+
             HandleAiEvidenceAnalysis(
-                L"ai_explain_dt",
+                eventName,
                 commandLine,
-                L"Explain this KnLiveDbg dt/dtx structure output.",
-                L"Explain important fields, pointer and LIST_ENTRY follow-ups, suspicious null or out-of-module values, and exact commands to inspect referenced fields. Keep raw offsets and values auditable.",
+                title,
+                instructions,
                 state,
                 dbgeng,
                 device,
@@ -14075,7 +16271,7 @@ static void HandleAiCommand(
         }
         else
         {
-            std::wcerr << L"unknown ai command. type ai help\n";
+            HandleAiFreeFormCommand(args, state, device, symbols, ai, aiState);
         }
     } while (false);
 }
