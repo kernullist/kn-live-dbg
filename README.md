@@ -8,6 +8,12 @@ https://github.com/user-attachments/assets/f3542a85-c960-46f2-a151-fdd23a8294a6
 
 If the embedded video does not render, open the [README-sized demo](demo/kn-live-dbg-demo-readme.mp4) or the [full-resolution demo](demo/kn-live-dbg-demo.mp4).
 
+### AI Command Demo
+
+<video src="demo/kn-live-dbg-demo-ai.mp4" controls muted playsinline width="100%"></video>
+
+If the AI command demo does not render inline, open [demo/kn-live-dbg-demo-ai.mp4](demo/kn-live-dbg-demo-ai.mp4).
+
 ## Scope and Signing Notice
 
 This tool is built for defensive Windows security research, anti-cheat research, driver diagnostics, and controlled lab analysis. It is not designed to bypass Windows Code Integrity and does not include Code Integrity bypass functionality. To load the driver, use Windows test-signing mode with the test-signed build, or sign the driver with an appropriate production certificate such as an EV code-signing certificate for real deployment environments.
@@ -112,7 +118,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `ai <Tab>` for AI actions, `ai analyze callbacks <Tab>` for callback scopes, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `ai <Tab>` for primary AI actions, `ai explain callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -163,29 +169,14 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 callbacks [scope] /module <module>
 !dml_proc [pid]
+ai <question>
 ai status
-ai providers
-ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
-ai policy <allow-remote|local-only|status>
-ai model <model>
-ai base-url <url>
-ai effort <minimal|low|medium|high|xhigh>
-ai auth
-ai preview <prompt>
-ai ask <prompt>
+ai config [status|providers|provider|policy|model|base-url|effort|auth|test]
 ai plan <prompt>
-ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
-ai explain dt <dt-args...>
-ai annotate <u|uf> <address|symbol> [instruction-count]
-ai diagnose <prompt>
-ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]
+ai explain <read-only-command...>
 ai show
 ai run <index|all>
 ai write <index> [confirm]
-ai transcript <path|off|status>
-ai transcript max <bytes|off>
-ai transcript redact <on|off>
-ai audit <path|off|status>
 ai report <path>
 c <address1> <address2> <length>
 s [-b|-w|-d|-q] <address> <length> <value...>
@@ -211,7 +202,7 @@ Help syntax notes:
 - `nt!` is treated as the loaded kernel image for symbols and PDB type names.
 - `d*`, `e*`, and `vtop` support `/process <process-id>` for one command; `procctx <pid>` pins a default context.
 - Virtual `e*` writes default to System(pid 4) context for kernel addresses and temporarily restore read-only leaf PTE write bits after patching.
-- API-key AI providers load `.env` from the current directory, EXE directory, or repo root; `ai run` remains read-only and `ai write <index> confirm` is required for write-like plans.
+- API-key AI providers load `.env` only from the EXE directory; `ai run` remains read-only and `ai write <index> confirm` is required for write-like plans.
 
 Example:
 
@@ -241,15 +232,14 @@ knkd> callbacks all WdFilter.sys
 knkd> callbacks /module WdFilter.sys
 knkd> !dml_proc
 knkd> !dml_proc 4
-knkd> ai provider openai-codex-cli
-knkd> ai preview explain the callback surfaces I pasted above
+knkd> ai config provider openai-codex-cli
+knkd> ai config test
+knkd> ai a.exe eprocess
+knkd> ai pid 1234 dtb
+knkd> ai explain callbacks all WdFilter.sys
 knkd> ai plan inspect unknown object callbacks
 knkd> ai show
 knkd> ai run 1
-knkd> ai transcript .\kn-ai-session.jsonl
-knkd> ai transcript max 10485760
-knkd> ai transcript redact on
-knkd> ai audit .\kn-write-audit.jsonl
 knkd> ai report .\kn-ai-report.md
 knkd> probe load
 knkd> probe info
@@ -263,36 +253,42 @@ Memory display commands use sparse reads. If part of a requested virtual or phys
 
 ## AI Assistant Providers
 
-The `ai` command is an advisory provider bridge. It does not execute generated debugger commands automatically, and it does not hide write operations. Use it to ask for command plans, explain pasted command output, or draft investigation next steps.
+The `ai` command is an operator intent layer plus an advisory provider bridge. Free-form questions first go through an AI tool planner that can choose from a small local read-only capability catalog, then the C++ executor runs the chosen tools. If no local tool fits, the planner falls back to a normal advisory answer. It does not execute generated debugger commands automatically, and it does not hide write operations. Use it to answer small debugger questions, ask for command plans, explain command output, or draft investigation next steps.
 
 ```text
+ai <question>
 ai status
-ai providers
-ai provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
-ai policy <allow-remote|local-only|status>
-ai model <model>
-ai base-url <url>
-ai effort <minimal|low|medium|high|xhigh>
-ai auth
-ai preview <prompt>
-ai ask <prompt>
+ai config [status]
+ai config providers
+ai config provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
+ai config policy <allow-remote|local-only|status>
+ai config model <model>
+ai config base-url <url>
+ai config effort <minimal|low|medium|high|xhigh>
+ai config auth
+ai config test [prompt]
 ai plan <prompt>
-ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
-ai explain dt <dt-args...>
-ai annotate <u|uf> <address|symbol> [instruction-count]
-ai diagnose <prompt>
-ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]
+ai explain <read-only-command...>
 ai show
 ai run <index|all>
 ai write <index> [confirm]
-ai transcript <path|off|status>
-ai transcript max <bytes|off>
-ai transcript redact <on|off>
-ai audit <path|off|status>
 ai report <path>
 ```
 
-Provider configuration is loaded from `.env` first and can be overridden by real process environment variables. Kn Live Dbg checks the current directory, the executable directory, and the repository root when running from `x64\Debug` or `x64\Release`. Copy `.env.example` to `.env` and fill in only the provider you want to use:
+Examples:
+
+```text
+ai a.exe pid
+ai a.exe eprocess
+ai a.exe process eprocess info
+ai pid 1234 dtb
+ai WdFilter.sys object callbacks
+ai explain callbacks all WdFilter.sys
+ai explain dt nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
+ai explain uf nt!PspCreateProcessNotifyRoutine 128
+```
+
+Provider configuration is loaded from `.env` beside `KnLiveDbg.exe` and can be overridden by real process environment variables. Copy `.env.example` to the EXE directory as `.env` and fill in only the provider you want to use:
 
 ```text
 KNLIVEDBG_AI_PROVIDER=openrouter
@@ -321,9 +317,11 @@ Supported keys:
 8. If no Codex auth file is configured, Kn Live Dbg checks `%USERPROFILE%\.kernforge\codex_auth.json` and `%USERPROFILE%\.codex\auth.json`.
 9. `KNLIVEDBG_CODEX_CLI_PATH` overrides the `codex` executable used by `openai-codex-cli`.
 
-Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. `ai preview` shows provider, model, remote policy, credential source, and prompt size without sending a request.
+Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
 
-`ai plan <prompt>` asks the selected model to return a strict `kn-live-dbg.ai-plan.v2` command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose, risk, backend, and expected-output notes. Empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` run a read-only evidence command, preserve stdout/stderr, add a deterministic output summary, then ask the selected model for a callback report, structure interpretation, or disassembly annotation. Callback analysis uses normal `callbacks <scope> [module]` output as evidence. `ai diagnose` produces setup and symbol/backend remediation guidance from an operator note. `ai playbook` loads repeatable read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations; `dry-run` is the default, and `run` dispatches the plan through the same guarded executor as `ai run`.
+For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The first catalog includes `process.find`, `process.describe`, `type.describe`, and `callbacks.list`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback prompts such as `ai WdFilter.sys object callbacks` can become a validated `callbacks object WdFilter.sys` run through the native callback scanner. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
+
+`ai plan <prompt>` asks the selected model to return a strict `kn-live-dbg.ai-plan.v2` command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose, risk, backend, and expected-output notes. Empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. `ai explain <read-only-command...>` runs a read-only evidence command, preserves stdout/stderr, adds a deterministic output summary, then asks the selected model for analysis. It has tuned prompts for `callbacks`, `dt`/`dtx`, and `u`/`uf`, so the older `ai analyze callbacks` and `ai annotate` flows are now covered by the shorter explain form.
 
 `ai run <index|all>` executes only non-write, non-shutdown planned commands. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, `m`, and raw `kd` wrappers around write-like commands are blocked from `ai run`; `ai write <index>` prints a write preview with target class, byte count, backup/read-current command, restore-current command for small ranges, verification command, and safe read-only preflight output. `ai write <index> confirm` re-runs the backup read, dispatches the write-like command, re-runs the verification command, and prints a deterministic before/after stdout/stderr diff for the verification command. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode, command class, write-like classification, stdout/stderr character counts, deterministic output summary, raw stdout/stderr, and keep-running state. `ai transcript max <bytes>` rotates long transcript files, `ai transcript redact on` redacts long hex addresses and `sk-...` style tokens from captured stdout/stderr, and `ai audit <path>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher. `ai report <path>` exports a Markdown summary of the current AI session, transcript settings, write-audit path, and plan.
 

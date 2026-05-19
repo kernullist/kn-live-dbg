@@ -147,24 +147,26 @@ Human-readable native command output uses scoped console attributes for high-sig
 ## AI Provider Flow
 
 1. `AiProviderRuntime` lives entirely in user mode.
-2. Provider selection defaults to `.env` plus environment variables and can be changed for the current TUI session with `ai provider`, `ai policy`, `ai model`, `ai base-url`, and `ai effort`.
+2. Provider selection defaults to `.env` plus environment variables and can be changed for the current TUI session with `ai config provider`, `ai config policy`, `ai config model`, `ai config base-url`, and `ai config effort`.
 3. `openai-codex-cli` executes `codex exec` as an external process and captures stdout/stderr.
 4. `openai-codex-subscription` reads Codex OAuth credentials from environment variables or auth files and calls the Codex Responses endpoint.
 5. `deepseek` and `openrouter` use OpenAI-compatible chat-completions requests over WinHTTP.
-6. `.env` is searched in the current directory, executable directory, and repository root when running from `x64\Debug` or `x64\Release`; real environment variables override `.env` values.
+6. `.env` is loaded only from the executable directory; real environment variables override `.env` values.
 7. AI requests receive only curated session context and the operator prompt. The model cannot call memory IOCTLs or execute generated debugger commands directly.
-8. `KNLIVEDBG_AI_REMOTE_POLICY=local-only` or `ai policy local-only` blocks HTTP-backed providers (`openai-codex-subscription`, `deepseek`, and `openrouter`) for private sessions.
-9. `ai plan` requires a strict JSON command proposal object, parses it into in-memory plan state, and shows numbered commands with purpose and risk notes.
-10. `ai plan` validates each proposed command before storing it: empty commands, nested `ai`, shutdown/unload commands, bare `kd`, overlong commands, and unknown non-DbgEng commands are rejected. Write-like proposals are forced to require explicit confirmation.
-11. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
-12. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
-13. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model. Callback analysis uses `callbacks <scope> [module]` output.
-14. `ai diagnose` uses current session context plus an operator note to explain symbol, type-layout, DbgEng, or setup failures.
-15. `ai playbook` creates deterministic read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations. `run` still goes through the guarded `ai run` path.
-16. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands. The preflight path builds backup/read-current, small-range restore, translation, and verification commands for recognized write forms, then prints a deterministic before/after diff of verification stdout/stderr after the write.
-17. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
-18. `ai transcript max <bytes|off>` rotates long transcript files, and `ai transcript redact <on|off>` controls stdout/stderr redaction for long hex addresses and `sk-...` style tokens.
-19. `ai audit <path|off|status>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher.
+8. `ai <question>` uses a strict `kn-live-dbg.ai-capability-plan.v1` tool-router JSON schema. The provider chooses from local read-only tools such as `process.find`, `process.describe`, `type.describe`, `callbacks.list`, or `assistant.answer`; the C++ executor validates and runs the selected tools locally.
+9. `ai config test` performs a real provider/model round-trip with a small marker prompt and reports transport status, HTTP status when available, elapsed time, and marker match result.
+10. `KNLIVEDBG_AI_REMOTE_POLICY=local-only` or `ai config policy local-only` blocks HTTP-backed providers (`openai-codex-subscription`, `deepseek`, and `openrouter`) for private sessions.
+11. `ai plan` requires a strict JSON command proposal object, parses it into in-memory plan state, and shows numbered commands with purpose and risk notes.
+12. `ai plan` validates each proposed command before storing it: empty commands, nested `ai`, shutdown/unload commands, bare `kd`, overlong commands, and unknown non-DbgEng commands are rejected. Write-like proposals are forced to require explicit confirmation.
+13. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
+14. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
+15. `ai analyze callbacks`, `ai explain dt`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model. Callback analysis uses `callbacks <scope> [module]` output.
+16. `ai diagnose` uses current session context plus an operator note to explain symbol, type-layout, DbgEng, or setup failures.
+17. `ai playbook` creates deterministic read-only command plans for callback, minifilter, object-callback, address, and suspect-driver investigations. `run` still goes through the guarded `ai run` path.
+18. `ai write <index> confirm` is the explicit operator confirmation path for planned write-like commands. The preflight path builds backup/read-current, small-range restore, translation, and verification commands for recognized write forms, then prints a deterministic before/after diff of verification stdout/stderr after the write.
+19. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
+20. `ai transcript max <bytes|off>` rotates long transcript files, and `ai transcript redact <on|off>` controls stdout/stderr redaction for long hex addresses and `sk-...` style tokens.
+21. `ai audit <path|off|status>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher.
 20. Transcript command records include origin, backend mode, command class, write-like status, stdout/stderr character counts, deterministic output summaries, raw stdout/stderr, and keep-running state.
 21. `ai report` writes a Markdown report with session context, provider status, transcript settings, write-audit path, parsed plan, and raw AI plan response.
 22. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
@@ -181,7 +183,7 @@ Completed hardening items:
 4. Callback module filtering is implemented with `callbacks [scope] [module]`.
 5. Write verification before/after diff rendering is implemented for confirmed AI write commands.
 6. AI plan command schema validation is implemented before plan storage.
-7. Local-only AI provider policy is implemented with `ai policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`.
+7. Local-only AI provider policy is implemented with `ai config policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`.
 8. Single-controller ownership is implemented in the driver and reported by `drvstatus`.
 9. Process DTB resolution is implemented with PDB-resolved EPROCESS offsets and `procctx`/`vtop /process`; native `e*` writes use System (`pid 4`) as the default context.
 10. LA57 detection and PML5E reporting are implemented in the page-table walker.

@@ -1655,7 +1655,7 @@ bool AiProviderRuntime::SetRemotePolicy(const std::wstring& policy, std::wstring
         {
             if (error != nullptr)
             {
-                *error = L"usage: ai policy <allow-remote|local-only>";
+                *error = L"usage: ai config policy <allow-remote|local-only>";
             }
             break;
         }
@@ -1772,7 +1772,7 @@ std::wstring AiProviderRuntime::AuthHelpText() const
     std::wstringstream stream;
 
     stream << L"AI auth sources:\n";
-    stream << L"  .env file is loaded from current directory, executable directory, or x64 output parent\n";
+    stream << L"  .env file is loaded only from the executable directory\n";
     stream << L"  KNLIVEDBG_AI_PROVIDER=openai-codex-cli|openai-codex-subscription|deepseek|openrouter\n";
     stream << L"  KNLIVEDBG_AI_REMOTE_POLICY=allow-remote|local-only\n";
     stream << L"  KNLIVEDBG_AI_MODEL=<model>\n";
@@ -1850,7 +1850,7 @@ bool AiProviderRuntime::Complete(const AiCompletionRequest& request, AiCompletio
         default:
             if (error != nullptr)
             {
-                *error = L"AI provider is disabled; run ai provider <name> or set KNLIVEDBG_AI_PROVIDER";
+                *error = L"AI provider is disabled; run ai config provider <name> or set KNLIVEDBG_AI_PROVIDER";
             }
             break;
         }
