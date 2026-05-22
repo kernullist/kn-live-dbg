@@ -106,6 +106,27 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 5. Image-load callbacks: enumerate `PspLoadImageNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
 6. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
 
+## ETW Logger / NMI Callback Flow
+
+1. `!etw` and `!nmi` share the same KnLiveDbg.sys virtual-read primitive used by other native scanners and rely on the loaded kernel PDB for symbol and type information.
+2. `EtwScanner::Scan` resolves `nt!EtwpDebuggerData`, reads 64 `WMI_LOGGER_CONTEXT*` pointers from offset `0x10`, and for each non-null logger context reads `LoggerName` (UNICODE_STRING) and `GetCpuClock` (function pointer). PDB-resolved offsets are used when `nt!_WMI_LOGGER_CONTEXT.LoggerName` and `.GetCpuClock` are exposed; otherwise the fallback offsets `0x68` and `0x28` are used and a warning is emitted because those values drift across builds.
+3. Each `GetCpuClock` target is annotated with owning module (`KernelModuleInfo` lookup) and nearest symbol (`SymbolEngine::FindNearestSymbol`). Pointers that do not land inside any loaded kernel module are tagged `Suspicious=true` with a `Notes` string — the canonical InfinityHook indicator.
+4. `!etw logger <index|name>` reuses the same scan and applies a decimal index filter or a case-insensitive name substring filter in the user-mode pass.
+5. `NmiScanner::Scan` resolves `nt!KiNmiCallbackListHead` (or `nt!KiNmiCallbackList` as an alias), reads the head pointer, then walks the `KNMI_HANDLER_CALLBACK` singly-linked list. The node layout is fixed: `Next` at `0x00`, `Callback` at `0x08`, `Context` at `0x10`, `Handle` at `0x18`. Iteration is bounded to 256 nodes with a visited-node cycle guard.
+6. Each NMI callback is annotated with module + symbol and flagged suspicious if outside loaded kernel modules.
+7. Both scanners check kernel canonical form (`address >= 0xffff800000000000`) at every pointer dereference and tolerate `MmCopyMemory` short reads through the existing `device.ReadMemory` path.
+8. Signature-scan extraction of `KiNmiCallbackListHead` from a `KeRegisterNmiCallback` disassembly is documented as a follow-up milestone; this initial pass relies on PDB symbol resolution.
+
+## VBS / HVCI / Secure Kernel Flow
+
+1. `!vbs`, `!ci`, and `!securekernel` share the `VbsScanner` user-mode module that reads from live kernel memory through `KnLiveDbg.sys` and queries CPUID directly from the EXE process.
+2. CiOptions resolution walks `nt!g_CiOptions`, `ci!g_CiOptions`, and `nt!CiOptions` in order, reads a `UINT32`, and decodes the documented flag bits (`CODEINTEGRITY_OPTION_ENABLED` 0x01, `TESTSIGN` 0x02, `UMCI_ENABLED` 0x04, `UMCI_AUDITMODE_ENABLED` 0x08, `HVCI_ENFORCED` 0x20, `UMCI_EXCLUSIONPATHS_ENABLED` 0x40, `TEST_BUILD` 0x80, `PREPRODUCTION_BUILD` 0x100, `FLIGHT_BUILD` 0x200, `HVCI_STRICT_MODE` 0x400, `HVCI_DEBUG_MODE` 0x800).
+3. VBS activity is reported from `nt!HvlpVsmVtlCallVa` (with `nt!HvlpVtlCallVa` and `nt!HvlVtlCallVa` fallbacks); a non-zero kernel-canonical pointer means the VTL call code page is mapped. `nt!HvcallpVtlCallStub` is resolved as a secondary marker.
+4. The scanner scans `SymbolEngine::Modules()` for `securekernel.exe` and `skci.dll` to confirm Secure Kernel runtime presence.
+5. CPUID leaves `0x1` (hypervisor-present bit 31 of ECX), `0x40000000` (vendor signature + leaf base), and `0x40000006` (raw implementation hardware features when supported) are queried from user mode for hypervisor identification. MBEC enablement is intentionally not claimed because `IA32_VMX_PROCBASED_CTLS2` bit 22 requires kernel-only MSR access; the report treats HVCI enforcement as a proxy and annotates the limitation in the `[vbs.hypervisor]` block.
+6. Trustlet enumeration walks `nt!PsActiveProcessHead` through `_EPROCESS.ActiveProcessLinks` with a bounded visited set, reads `_EPROCESS.UniqueProcessId`, `ImageFileName`, and `_EPROCESS.SecureState` (or `_KPROCESS.SecureState` through the embedded `Pcb`) per record. Bit 0 (`SecureKernelInProcess`) marks IUM trustlets; when the field is absent, the scanner falls back to case-insensitive prefix matches against well-known trustlet image names (`lsaiso`, `bioiso`, `securesystem`, `kdcustomization`) which tolerate the 15-byte `ImageFileName` truncation.
+7. `!vbs` prints all five blocks (`[vbs.core]`, `[ci.options]`, `[vbs.hypervisor]`, `[securekernel.modules]`, `[securekernel.trustlets]`). `!ci [options|policy]` prints the CI options + hypervisor blocks plus an optional `[ci.policy]` summary that explicitly notes WDAC policy blob discovery is reserved for a later milestone. `!securekernel` prints the secure kernel module list plus trustlet list.
+
 ## ALPC Port Discovery Flow
 
 1. `!alpc` is implemented natively against live kernel memory through the existing `KnLiveDbg.sys` virtual-read path and PDB type metadata.
