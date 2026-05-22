@@ -67,6 +67,9 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "any suspicious ETW logger hooks?" -> `!etw loggers`
 - "InfinityHook check" or "ETW dispatch integrity" -> `!etw integrity`
 - "list NMI callbacks" or "check NMI handler chain" -> `!nmi callbacks`
+- "decode WNF state name 0x41c64e6da3bc0075" -> `!wnf decode 0x41c64e6da3bc0075`
+- "list live WNF instances" -> `!wnf instances`
+- "show WNF data for hash X" -> `!wnf data X`
 
 The model-backed planner remains available through `ai plan <prompt>` for multi-command investigations:
 

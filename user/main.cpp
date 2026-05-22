@@ -11,6 +11,7 @@
 #include "SymbolEngine.h"
 #include "VbsScanner.h"
 #include "WfpScanner.h"
+#include "WnfScanner.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 #include "../shared/KnLiveDbgProbeIoctl.h"
@@ -21,7 +22,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cwctype>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -137,6 +140,392 @@ static void PrintColoredText(const wchar_t* text, WORD color)
     if (text != nullptr)
     {
         PrintColoredText(std::wstring(text), color);
+    }
+}
+
+static std::wstring GetExecutableDirectory();
+
+// -------- Output logging: tee stdout to a file --------------------------
+//
+// "log enable" intercepts std::wcout by swapping in a wstreambuf that
+// forwards every wide character to both the original console buffer
+// and a UTF-8 log file. The mechanism preserves console coloring
+// because PrintColoredText only manipulates CONSOLE_SCREEN_BUFFER
+// attributes; the actual character stream still flows through
+// std::wcout. ANSI escape sequences are never produced, so the log
+// file is clean text.
+//
+// "log disable" restores the original wstreambuf and closes the file.
+// The wmain shutdown path also calls Disable() to flush and close
+// gracefully on quit/exit.
+// TeeStreambuf is permanently installed as std::wcout.rdbuf() at wmain
+// startup. Its file sink starts null; "log enable" attaches a file
+// sink at runtime and "log disable" detaches it. The buffer must stay
+// installed across ScopedWideStreamCapture lifetimes because the
+// capture's destructor restores whatever rdbuf was present when it
+// entered -- if that was the tee, the chain survives; if it was a
+// raw console buf, the tee falls out of the chain and the file sink
+// stops receiving anything after the first enable call.
+class TeeStreambuf : public std::wstreambuf
+{
+public:
+    explicit TeeStreambuf(std::wstreambuf* console) :
+        console_(console),
+        file_(nullptr)
+    {
+    }
+
+    void SetFile(std::ofstream* file)
+    {
+        std::lock_guard<std::mutex> guard(file_lock_);
+        file_ = file;
+    }
+
+    bool HasFile()
+    {
+        std::lock_guard<std::mutex> guard(file_lock_);
+        return file_ != nullptr;
+    }
+
+protected:
+    int_type overflow(int_type c) override
+    {
+        if (c == traits_type::eof())
+        {
+            return traits_type::not_eof(c);
+        }
+
+        wchar_t wc = static_cast<wchar_t>(c);
+
+        if (console_ != nullptr)
+        {
+            (void)console_->sputc(wc);
+        }
+
+        std::lock_guard<std::mutex> guard(file_lock_);
+        if (file_ != nullptr && file_->good())
+        {
+            char buf[8] = {};
+            int len = WideCharToMultiByte(
+                CP_UTF8, 0,
+                &wc, 1,
+                buf, static_cast<int>(sizeof(buf)),
+                nullptr, nullptr);
+            if (len > 0)
+            {
+                file_->write(buf, len);
+            }
+        }
+
+        return c;
+    }
+
+    std::streamsize xsputn(const wchar_t* text, std::streamsize count) override
+    {
+        if (text == nullptr || count <= 0)
+        {
+            return 0;
+        }
+
+        if (console_ != nullptr)
+        {
+            console_->sputn(text, count);
+        }
+
+        std::lock_guard<std::mutex> guard(file_lock_);
+        if (file_ != nullptr && file_->good())
+        {
+            // Convert the whole run to UTF-8 in one pass. Worst case
+            // every wchar produces up to 4 UTF-8 bytes (surrogate
+            // pairs would be 4 bytes each); we keep a stack buffer
+            // for short runs and fall back to dynamic allocation
+            // beyond that.
+            constexpr int kStackBytes = 1024;
+            char stackBuf[kStackBytes];
+            char* out = stackBuf;
+            std::vector<char> heap;
+            int needed = WideCharToMultiByte(
+                CP_UTF8, 0,
+                text, static_cast<int>(count),
+                nullptr, 0,
+                nullptr, nullptr);
+            if (needed > kStackBytes)
+            {
+                heap.resize(static_cast<size_t>(needed));
+                out = heap.data();
+            }
+            int written = WideCharToMultiByte(
+                CP_UTF8, 0,
+                text, static_cast<int>(count),
+                out, needed,
+                nullptr, nullptr);
+            if (written > 0)
+            {
+                file_->write(out, written);
+            }
+        }
+
+        return count;
+    }
+
+    int sync() override
+    {
+        int rc = 0;
+        if (console_ != nullptr && console_->pubsync() != 0)
+        {
+            rc = -1;
+        }
+        std::lock_guard<std::mutex> guard(file_lock_);
+        if (file_ != nullptr)
+        {
+            file_->flush();
+        }
+        return rc;
+    }
+
+private:
+    std::wstreambuf* console_;
+    std::ofstream*   file_;
+    std::mutex       file_lock_;
+};
+
+struct OutputLogState
+{
+    std::ofstream                 File;
+    std::unique_ptr<TeeStreambuf>  Tee;
+    std::wstreambuf*              OriginalCoutBuf = nullptr;
+    std::wstring                  Path;
+    bool                          TeeInstalled = false;
+    bool                          Active = false;
+    std::mutex                    Lock;
+};
+
+static OutputLogState g_OutputLog;
+
+// Install the permanent tee buffer in front of std::wcout. Called
+// once at wmain startup -- BEFORE any ScopedWideStreamCapture so
+// that captures see the tee as their bottom-of-chain rdbuf and
+// restore to the tee at destructor time.
+static void InstallOutputTee()
+{
+    std::lock_guard<std::mutex> guard(g_OutputLog.Lock);
+    if (g_OutputLog.TeeInstalled)
+    {
+        return;
+    }
+    g_OutputLog.OriginalCoutBuf = std::wcout.rdbuf();
+    g_OutputLog.Tee.reset(new TeeStreambuf(g_OutputLog.OriginalCoutBuf));
+    std::wcout.rdbuf(g_OutputLog.Tee.get());
+    g_OutputLog.TeeInstalled = true;
+}
+
+static void UninstallOutputTee()
+{
+    std::lock_guard<std::mutex> guard(g_OutputLog.Lock);
+    if (!g_OutputLog.TeeInstalled)
+    {
+        return;
+    }
+    std::wcout.flush();
+    std::wcout.rdbuf(g_OutputLog.OriginalCoutBuf);
+    g_OutputLog.OriginalCoutBuf = nullptr;
+    g_OutputLog.Tee.reset();
+    g_OutputLog.TeeInstalled = false;
+}
+
+static std::wstring BuildLogFileName()
+{
+    // KnLiveDbg-YYYYMMDD-HHMMSS.log -- collation-friendly and unique
+    // per second. The user can launch multiple sessions and they
+    // will not collide unless the same second is hit twice.
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+
+    std::wstringstream ss;
+    ss << L"KnLiveDbg-"
+       << std::setw(4) << std::setfill(L'0') << st.wYear
+       << std::setw(2) << std::setfill(L'0') << st.wMonth
+       << std::setw(2) << std::setfill(L'0') << st.wDay
+       << L"-"
+       << std::setw(2) << std::setfill(L'0') << st.wHour
+       << std::setw(2) << std::setfill(L'0') << st.wMinute
+       << std::setw(2) << std::setfill(L'0') << st.wSecond
+       << L".log";
+    return ss.str();
+}
+
+static bool EnableOutputLog(std::wstring* outPath, std::wstring* outError)
+{
+    // Tee install happens in wmain. Here we only open the file sink
+    // and attach it to the already-installed tee. That way no rdbuf
+    // swap happens inside ScopedWideStreamCapture and the chain
+    // survives across capture lifetimes.
+    if (!g_OutputLog.TeeInstalled)
+    {
+        if (outError != nullptr)
+        {
+            *outError = L"tee buffer not installed";
+        }
+        return false;
+    }
+
+    std::unique_lock<std::mutex> guard(g_OutputLog.Lock);
+
+    if (g_OutputLog.Active)
+    {
+        if (outPath != nullptr)
+        {
+            *outPath = g_OutputLog.Path;
+        }
+        if (outError != nullptr)
+        {
+            *outError = L"log already enabled";
+        }
+        return false;
+    }
+
+    std::wstring exeDir = GetExecutableDirectory();
+    if (exeDir.empty())
+    {
+        if (outError != nullptr)
+        {
+            *outError = L"failed to resolve executable directory";
+        }
+        return false;
+    }
+
+    std::wstring path = exeDir + L"\\" + BuildLogFileName();
+
+    std::string narrowPath;
+    {
+        int needed = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 0)
+        {
+            narrowPath.resize(static_cast<size_t>(needed - 1));
+            WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1,
+                                narrowPath.data(), needed, nullptr, nullptr);
+        }
+    }
+
+    g_OutputLog.File.open(narrowPath, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!g_OutputLog.File.is_open())
+    {
+        if (outError != nullptr)
+        {
+            *outError = L"failed to open log file";
+        }
+        return false;
+    }
+
+    const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+    g_OutputLog.File.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+
+    g_OutputLog.Path = path;
+    g_OutputLog.Active = true;
+
+    // Attach the file sink to the tee. SetFile takes its own internal
+    // lock; nothing in the tee path needs g_OutputLog.Lock.
+    TeeStreambuf* tee = g_OutputLog.Tee.get();
+    guard.unlock();
+    tee->SetFile(&g_OutputLog.File);
+
+    if (outPath != nullptr)
+    {
+        *outPath = path;
+    }
+    return true;
+}
+
+static bool DisableOutputLog(std::wstring* outPath)
+{
+    if (!g_OutputLog.TeeInstalled)
+    {
+        return false;
+    }
+
+    std::unique_lock<std::mutex> guard(g_OutputLog.Lock);
+
+    if (!g_OutputLog.Active)
+    {
+        return false;
+    }
+
+    // Detach the file sink before any flush/close so concurrent writes
+    // through the tee cannot race against the close.
+    TeeStreambuf* tee = g_OutputLog.Tee.get();
+    guard.unlock();
+    std::wcout.flush();
+    tee->SetFile(nullptr);
+
+    guard.lock();
+    g_OutputLog.File.flush();
+    g_OutputLog.File.close();
+
+    if (outPath != nullptr)
+    {
+        *outPath = g_OutputLog.Path;
+    }
+    g_OutputLog.Path.clear();
+    g_OutputLog.Active = false;
+    return true;
+}
+
+static void HandleLogCommand(const std::vector<std::wstring>& args)
+{
+    std::wstring sub = (args.size() > 1) ? args[1] : L"status";
+    std::transform(sub.begin(), sub.end(), sub.begin(),
+                   [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+
+    if (sub == L"enable" || sub == L"on" || sub == L"start")
+    {
+        std::wstring path;
+        std::wstring error;
+        if (EnableOutputLog(&path, &error))
+        {
+            std::wcout << L"log enabled: " << path << L"\n";
+        }
+        else
+        {
+            std::wcout << L"log enable failed: " << error;
+            if (!path.empty())
+            {
+                std::wcout << L" (current=" << path << L")";
+            }
+            std::wcout << L"\n";
+        }
+    }
+    else if (sub == L"disable" || sub == L"off" || sub == L"stop")
+    {
+        std::wstring path;
+        if (DisableOutputLog(&path))
+        {
+            std::wcout << L"log disabled: " << path << L"\n";
+        }
+        else
+        {
+            std::wcout << L"log disabled: (was not active)\n";
+        }
+    }
+    else if (sub == L"status" || sub == L"?" || sub == L"help")
+    {
+        std::lock_guard<std::mutex> guard(g_OutputLog.Lock);
+        if (g_OutputLog.Active)
+        {
+            std::wcout << L"log status: active path=" << g_OutputLog.Path << L"\n";
+        }
+        else
+        {
+            std::wcout << L"log status: inactive\n";
+        }
+        std::wcout << L"usage: log [enable|disable|status]\n";
+        std::wcout << L"  enable  start mirroring all console output to a new log file in the EXE directory\n";
+        std::wcout << L"  disable stop logging and close the current file\n";
+        std::wcout << L"  status  show current logging state (default)\n";
+    }
+    else
+    {
+        std::wcout << L"unknown log subcommand: " << sub << L"\n";
+        std::wcout << L"usage: log [enable|disable|status]\n";
     }
 }
 
@@ -1236,6 +1625,8 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  !securekernel\n";
     std::wcout << L"  !etw loggers\n";
     std::wcout << L"  !nmi callbacks\n";
+    std::wcout << L"  !wnf decode 0x41c64e6da3bc0075\n";
+    std::wcout << L"  !wnf instances\n";
     std::wcout << L"  write off\n";
     std::wcout << L"  ed <address> <value>\n";
     std::wcout << L"  peq <physical-address> <value>\n";
@@ -1556,7 +1947,8 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!ci" ||
         command == L"!securekernel" ||
         command == L"!etw" ||
-        command == L"!nmi")
+        command == L"!nmi" ||
+        command == L"!wnf")
     {
         result = true;
     }
@@ -2393,6 +2785,17 @@ static bool IsNmiScopeName(const std::wstring& value)
     return lowered == L"callbacks";
 }
 
+static bool IsWnfScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"decode" ||
+        lowered == L"instances" ||
+        lowered == L"instance" ||
+        lowered == L"data" ||
+        lowered == L"candidates" ||
+        lowered == L"lists";
+}
+
 static void AddCompletionCandidate(std::vector<std::wstring>* candidates, const wchar_t* value)
 {
     do
@@ -2967,6 +3370,19 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"callbacks");
                 }
+                else if (topic == L"!wnf")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"decode",
+                        L"instances",
+                        L"instance",
+                        L"data",
+                        L"candidates",
+                        L"lists"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
                 else
                 {
                     AddHelpCompletionCandidates(&candidates);
@@ -3051,6 +3467,37 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 static const wchar_t* values[] =
                 {
                     L"callbacks",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"!wnf")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"decode",
+                    L"instances",
+                    L"instance",
+                    L"data",
+                    L"candidates",
+                    L"lists",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"log")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"enable",
+                    L"disable",
+                    L"status",
                     L"help"
                 };
                 AddCompletionCandidates(&candidates, values);
@@ -11111,6 +11558,776 @@ static void HandleNmiCommand(
     } while (false);
 }
 
+static void PrintWnfHelp()
+{
+    std::wcout << L"!wnf command:\n";
+    std::wcout << L"  !wnf decode <state-name-hash>\n";
+    std::wcout << L"  !wnf instances\n";
+    std::wcout << L"  !wnf instance <state-name-hash>\n";
+    std::wcout << L"  !wnf data <state-name-hash>\n";
+    std::wcout << L"  !wnf candidates\n";
+    std::wcout << L"  !wnf lists\n";
+    std::wcout << L"\n";
+    std::wcout << L"scopes:\n";
+    std::wcout << L"  decode     XOR the 64-bit raw state name against 0x41C64E6DA3BC0074 and parse Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields\n";
+    std::wcout << L"  instances  walk the live WNF subscription AVL tree from nt!ExpWnfSiloState and decode every _WNF_NAME_INSTANCE found\n";
+    std::wcout << L"  instance   walk and filter by the supplied 64-bit hash, printing the matching instance only\n";
+    std::wcout << L"  data       walk to the matching instance and dump up to 256 bytes of its last-published WNF_STATE_DATA payload\n";
+    std::wcout << L"  candidates anchor-disassembly-only diagnostic: dump every silo-state candidate found in the WNF entry-point functions plus the first 256 bytes at each, with kernel-pointer and state-name-shaped slot counts. Use this to manually inspect the WNF data structure on builds where automatic AVL detection fails.\n";
+    std::wcout << L"  lists      scan every silo candidate for LIST_ENTRY-shaped doubly-linked-list heads (modern Windows replaces RTL_AVL_TABLE for WNF subscription tracking with LIST_ENTRYs). Walks each non-empty chain and dumps the first 0x80 bytes per entry plus any state-name-shaped 64-bit value found within.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  decode is standalone and always works on any build.\n";
+    std::wcout << L"  Live walking requires the kernel PDB to expose nt!ExpWnfSiloState (or alias) plus _WNF_NAME_INSTANCE.StateName field and an AVL-table field on _WNF_SUBSCRIPTION_TABLE/_WNF_SILODRIVERSTATE/_WNF_PROCESS_CONTEXT. When any of those is missing the scanner reports a clear error and the decode subcommand still works.\n";
+    std::wcout << L"  Hash arguments accept hex (0x...) or decimal forms.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !wnf decode 0x41c64e6da3bc0075\n";
+    std::wcout << L"  !wnf instances\n";
+    std::wcout << L"  !wnf instance 0x41c64e6da3bc0075\n";
+    std::wcout << L"  !wnf data 0x41c64e6da3bc0075\n";
+}
+
+static void PrintWnfDecodedHash(const WnfStateNameDecoded& decoded)
+{
+    PrintColoredText(L"[wnf.decode]", KNDBG_COLOR_TITLE);
+    std::wcout << L" raw=" << HexTextWidth(decoded.Raw, 16, true)
+               << L" decoded=" << HexTextWidth(decoded.Decoded, 16, true) << L"\n";
+    std::wcout << L"  ";
+    PrintColoredText(L"lifetime", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=";
+    PrintColoredText(decoded.LifetimeText, KNDBG_COLOR_OK);
+    std::wcout << L"(" << std::dec << decoded.Lifetime << L")";
+
+    std::wcout << L" ";
+    PrintColoredText(L"scope", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=";
+    PrintColoredText(decoded.DataScopeText, KNDBG_COLOR_OK);
+    std::wcout << L"(" << std::dec << decoded.DataScope << L")";
+
+    std::wcout << L" version=" << std::dec << decoded.Version
+               << L" permanent=" << (decoded.IsPermanent ? L"yes" : L"no") << L"\n";
+
+    std::wcout << L"  sequence=0x" << std::hex << decoded.Sequence << std::dec
+               << L" owner_tag=0x" << std::hex << decoded.OwnerTag << std::dec;
+    if (!decoded.OwnerTagText.empty())
+    {
+        std::wcout << L"(\"" << decoded.OwnerTagText << L"\")";
+    }
+    std::wcout << L"\n";
+}
+
+static void PrintWnfInstance(const WnfInstanceRecord& record, bool compactSubs = false)
+{
+    PrintColoredText(L"[wnf.instance]", KNDBG_COLOR_TITLE);
+    std::wcout << L" address=" << HexTextWidth(record.Address, 16, true);
+    std::wcout << L" state=" << HexTextWidth(record.StateName, 16, true);
+    std::wcout << L" lifetime=";
+    PrintColoredText(record.Decoded.LifetimeText, KNDBG_COLOR_OK);
+    std::wcout << L" scope=";
+    PrintColoredText(record.Decoded.DataScopeText, KNDBG_COLOR_OK);
+    if (!record.Decoded.OwnerTagText.empty())
+    {
+        std::wcout << L" owner=\"" << record.Decoded.OwnerTagText << L"\"";
+    }
+    if (record.HasOwningProcess)
+    {
+        std::wcout << L" owning=";
+        if (record.HasOwningPid)
+        {
+            std::wcout << L"pid=";
+            std::wstringstream pidStream;
+            pidStream << std::dec << record.OwningPid;
+            PrintColoredText(pidStream.str(), KNDBG_COLOR_OK);
+        }
+        if (record.HasOwningImageName)
+        {
+            std::wcout << L" image=\"";
+            PrintColoredText(record.OwningImageName, KNDBG_COLOR_OK);
+            std::wcout << L"\"";
+        }
+        if (!record.HasOwningPid && !record.HasOwningImageName)
+        {
+            std::wcout << HexTextWidth(record.OwningProcessAddress, 16, true);
+        }
+    }
+    std::wcout << L"\n";
+
+    if (record.HasChangeStamp || record.HasDataSize || record.HasLastDataBlock)
+    {
+        std::wcout << L"  ";
+        if (record.HasChangeStamp)
+        {
+            std::wcout << L"changeStamp=0x" << std::hex << record.ChangeStamp << std::dec << L" ";
+        }
+        if (record.HasDataSize)
+        {
+            std::wcout << L"dataSize=" << std::dec << record.DataSize << L" ";
+        }
+        if (record.HasLastDataBlock)
+        {
+            std::wcout << L"lastDataBlock=" << HexTextWidth(record.LastDataBlock, 16, true);
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!record.Subscribers.empty())
+    {
+        // Classify chained nodes by pool tag. Field evidence shows the
+        // +0x48 chain is heterogeneous -- only Ntfc/Wnf-tagged nodes
+        // are real WNF subscription records, while the rest are
+        // other kernel objects sharing the same process-scope chain.
+        // We count them separately and show a top-tag histogram so
+        // the operator can immediately see how the chain decomposes.
+        size_t trueSubs = 0;
+        size_t otherObjects = 0;
+        size_t unknownNodes = 0;
+        size_t resolvedSubs = 0;
+        std::map<std::wstring, size_t> tagHistogram;
+        for (const WnfSubscriberRecord& sub : record.Subscribers)
+        {
+            if (sub.HasOwnPoolTag)
+            {
+                tagHistogram[sub.OwnPoolTag]++;
+                if (sub.IsProcessCandidateTag)
+                {
+                    ++trueSubs;
+                }
+                else
+                {
+                    ++otherObjects;
+                }
+            }
+            else
+            {
+                ++unknownNodes;
+            }
+            if (sub.HasProcess || sub.HasPid || sub.HasImageName)
+            {
+                ++resolvedSubs;
+            }
+        }
+        std::wcout << L"  chained_nodes=" << std::dec << record.Subscribers.size()
+                   << L" subscribers=" << trueSubs
+                   << L" resolved=" << resolvedSubs
+                   << L" other_objects=" << otherObjects;
+        if (unknownNodes > 0)
+        {
+            std::wcout << L" unknown=" << unknownNodes;
+        }
+        if (!tagHistogram.empty())
+        {
+            std::vector<std::pair<std::wstring, size_t>> sortedTags(
+                tagHistogram.begin(), tagHistogram.end());
+            std::sort(sortedTags.begin(), sortedTags.end(),
+                      [](const std::pair<std::wstring, size_t>& a,
+                         const std::pair<std::wstring, size_t>& b)
+                      {
+                          if (a.second != b.second)
+                          {
+                              return a.second > b.second;
+                          }
+                          return a.first < b.first;
+                      });
+            constexpr size_t kMaxTags = 8;
+            const size_t shown = sortedTags.size() < kMaxTags
+                ? sortedTags.size()
+                : kMaxTags;
+            std::wcout << L" tags={";
+            for (size_t i = 0; i < shown; ++i)
+            {
+                if (i > 0)
+                {
+                    std::wcout << L" ";
+                }
+                std::wcout << sortedTags[i].first << L":" << sortedTags[i].second;
+            }
+            if (sortedTags.size() > shown)
+            {
+                std::wcout << L" +" << (sortedTags.size() - shown) << L"more";
+            }
+            std::wcout << L"}";
+        }
+        std::wcout << L"\n";
+
+        for (size_t i = 0; i < record.Subscribers.size(); ++i)
+        {
+            const WnfSubscriberRecord& sub = record.Subscribers[i];
+            const bool subResolved =
+                sub.HasProcess || sub.HasPid || sub.HasImageName;
+
+            // Listing path: hide every unresolved node entirely. The
+            // header stats already convey their existence; their per-
+            // node hex dump would otherwise flood the output. The
+            // single-entry views (Instance/Data) keep emitting every
+            // node so the operator can still RE the layout.
+            if (compactSubs && !subResolved)
+            {
+                continue;
+            }
+
+            PrintColoredText(L"  [wnf.sub]", KNDBG_COLOR_ACCENT);
+            std::wcout << L" #" << std::dec << i
+                       << L" node=" << HexTextWidth(sub.NodeAddress, 16, true)
+                       << L" chain=+0x" << std::hex << sub.ListHeadEntryOffset << std::dec;
+            if (sub.HasOwnPoolTag)
+            {
+                std::wcout << L" tag=\"" << sub.OwnPoolTag << L"\"";
+            }
+            if (sub.HasProcess)
+            {
+                std::wcout << L" process=" << HexTextWidth(sub.OwningProcessAddress, 16, true);
+            }
+            if (sub.HasPid)
+            {
+                std::wcout << L" pid=";
+                std::wstringstream pidStream;
+                pidStream << std::dec << sub.Pid;
+                PrintColoredText(pidStream.str(), KNDBG_COLOR_OK);
+            }
+            if (sub.HasImageName)
+            {
+                std::wcout << L" image=\"";
+                PrintColoredText(sub.ImageName, KNDBG_COLOR_OK);
+                std::wcout << L"\"";
+            }
+            const bool isUnresolved =
+                !sub.HasProcess && !sub.HasPid && !sub.HasImageName;
+            if (isUnresolved)
+            {
+                // Tag identifies the node's kernel object type. Three
+                // distinct categories drive how we annotate the line:
+                //   (a) known process-subscription tag (Ntfc/Wnf*) but
+                //       EPROCESS couldn't be located -> still a real
+                //       subscriber, the layout just needs more RE.
+                //   (b) known non-process tag (Sect/NtFs/Pnp*/AlRe/...) ->
+                //       not a subscriber at all; the +0x48 chain is
+                //       linking other process-scope objects through
+                //       the same list head.
+                //   (c) no pool tag recovered -> diagnostic case.
+                if (!sub.HasOwnPoolTag)
+                {
+                    std::wcout << L" (unknown)";
+                }
+                else if (sub.IsProcessCandidateTag)
+                {
+                    std::wcout << L" (subscriber: unresolved)";
+                }
+                else
+                {
+                    std::wcout << L" (other-object)";
+                }
+            }
+            std::wcout << L"\n";
+
+            // Emit a hex dump only when EPROCESS resolution failed AND
+            // the node either has no identifying pool tag or is a known
+            // process-subscription candidate tag whose layout still
+            // needs reverse engineering. Non-process objects (Sect,
+            // NtFs, Pnp*, AlRe, SeAt, etc.) are skipped to keep the
+            // listing path readable.
+            const bool wantDump =
+                isUnresolved && !sub.RawBytes.empty() &&
+                (!sub.HasOwnPoolTag || sub.IsProcessCandidateTag);
+
+            // For diagnostic visibility, also surface the prefix bytes
+            // (0x40 bytes immediately preceding the node) whenever we
+            // failed to recover an own pool tag. That tells the
+            // operator where the real POOL_HEADER actually sits, or
+            // confirms the node lives deeper inside a larger pooled
+            // object than the heuristic currently reaches.
+            const bool wantPrefixDump =
+                isUnresolved && !sub.HasOwnPoolTag && !sub.PrefixBytes.empty();
+            if (wantPrefixDump)
+            {
+                const size_t bytesPerLine = 16;
+                const size_t prefixBytes = sub.PrefixBytes.size();
+                for (size_t row = 0; row < prefixBytes; row += bytesPerLine)
+                {
+                    std::wcout << L"      pre-" << HexTextWidth(static_cast<uint64_t>(prefixBytes - row), 2, false)
+                               << L"  ";
+                    std::wstring asciiLine;
+                    for (size_t j = 0; j < bytesPerLine; ++j)
+                    {
+                        if (row + j >= prefixBytes)
+                        {
+                            std::wcout << L"   ";
+                            continue;
+                        }
+                        uint8_t byte = sub.PrefixBytes[row + j];
+                        std::wcout << std::hex << std::setw(2) << std::setfill(L'0')
+                                   << static_cast<uint32_t>(byte) << std::dec << L" ";
+                        if (byte >= 0x20 && byte < 0x7f)
+                        {
+                            asciiLine.push_back(static_cast<wchar_t>(byte));
+                        }
+                        else
+                        {
+                            asciiLine.push_back(L'.');
+                        }
+                    }
+                    std::wcout << L" " << asciiLine << L"\n";
+                }
+            }
+
+            if (wantDump)
+            {
+                const size_t bytesPerLine = 16;
+                const size_t dumpBytes = sub.RawBytes.size() < 0x80
+                    ? sub.RawBytes.size()
+                    : static_cast<size_t>(0x80);
+                for (size_t row = 0; row < dumpBytes; row += bytesPerLine)
+                {
+                    std::wcout << L"      ";
+                    std::wcout << HexTextWidth(static_cast<uint64_t>(row), 4, true) << L"  ";
+                    std::wstring asciiLine;
+                    for (size_t j = 0; j < bytesPerLine; ++j)
+                    {
+                        if (row + j >= dumpBytes)
+                        {
+                            std::wcout << L"   ";
+                            continue;
+                        }
+                        uint8_t byte = sub.RawBytes[row + j];
+                        std::wcout << std::hex << std::setw(2) << std::setfill(L'0')
+                                   << static_cast<uint32_t>(byte) << std::dec << L" ";
+                        if (byte >= 0x20 && byte < 0x7f)
+                        {
+                            asciiLine.push_back(static_cast<wchar_t>(byte));
+                        }
+                        else
+                        {
+                            asciiLine.push_back(L'.');
+                        }
+                    }
+                    std::wcout << L" " << asciiLine << L"\n";
+                }
+            }
+        }
+    }
+}
+
+static void PrintWnfListHead(const WnfListHeadFinding& finding)
+{
+    PrintColoredText(L"[wnf.list]", KNDBG_COLOR_TITLE);
+    std::wcout << L" silo=" << HexTextWidth(finding.SiloAddress, 16, true);
+    std::wcout << L" head=silo+0x" << std::hex << finding.HeadOffset << std::dec;
+    std::wcout << L"(" << HexTextWidth(finding.HeadAddress, 16, true) << L")";
+    std::wcout << L" flink=" << HexTextWidth(finding.Flink, 16, true);
+    std::wcout << L" blink=" << HexTextWidth(finding.Blink, 16, true);
+    std::wcout << L" empty=" << (finding.IsEmpty ? L"yes" : L"no");
+    std::wcout << L" entries=" << std::dec << finding.Entries.size() << L"\n";
+
+    for (size_t e = 0; e < finding.Entries.size(); ++e)
+    {
+        const WnfListEntryWalkRecord& rec = finding.Entries[e];
+        std::wcout << L"  ";
+        PrintColoredText(L"entry[", KNDBG_COLOR_ACCENT);
+        std::wcout << std::dec << e;
+        PrintColoredText(L"]", KNDBG_COLOR_ACCENT);
+        std::wcout << L" addr=" << HexTextWidth(rec.EntryAddress, 16, true);
+        if (rec.HasStateName)
+        {
+            std::wcout << L" stateName=";
+            PrintColoredText(HexTextWidth(rec.StateNameCandidate, 16, true), KNDBG_COLOR_OK);
+            std::wcout << L" @+0x" << std::hex << rec.StateNameOffsetWithinEntry << std::dec;
+            std::wcout << L" lifetime=" << rec.DecodedStateName.LifetimeText;
+            std::wcout << L" scope=" << rec.DecodedStateName.DataScopeText;
+        }
+        std::wcout << L"\n";
+
+        const size_t bytesPerLine = 16;
+        // Cap visible hex dump at 0x80 bytes per entry even though
+        // captured bytes may extend to 0x200 (for probe purposes).
+        // Otherwise !wnf lists output would balloon 4x.
+        const size_t displayBytes = rec.EntryBytes.size() < 0x80
+            ? rec.EntryBytes.size()
+            : static_cast<size_t>(0x80);
+        for (size_t i = 0; i < displayBytes; i += bytesPerLine)
+        {
+            std::wcout << L"    ";
+            std::wcout << HexTextWidth(static_cast<uint64_t>(i), 4, true) << L"  ";
+
+            std::wstring asciiLine;
+            for (size_t j = 0; j < bytesPerLine; ++j)
+            {
+                if (i + j >= displayBytes)
+                {
+                    std::wcout << L"   ";
+                    continue;
+                }
+                uint8_t byte = rec.EntryBytes[i + j];
+                std::wcout << std::hex << std::setw(2) << std::setfill(L'0')
+                           << static_cast<uint32_t>(byte) << std::dec << L" ";
+                if (byte >= 0x20 && byte < 0x7f)
+                {
+                    asciiLine.push_back(static_cast<wchar_t>(byte));
+                }
+                else
+                {
+                    asciiLine.push_back(L'.');
+                }
+            }
+            std::wcout << L" " << asciiLine << L"\n";
+        }
+
+        // Verification probe: scan the FULL captured window (up to 0x200
+        // bytes) for the 0x41C6XXXX_XXXXXXXX encoded WNF state name
+        // fingerprint at any byte alignment. If found, this proves the
+        // entry carries a full-form encoded state name and tells us
+        // exactly where to read it from.
+        for (size_t off = 0; off + sizeof(uint64_t) <= rec.EntryBytes.size(); ++off)
+        {
+            uint64_t value = 0;
+            memcpy(&value, rec.EntryBytes.data() + off, sizeof(uint64_t));
+            if ((value & 0xFFFF000000000000ull) != 0x41C6000000000000ull)
+            {
+                continue;
+            }
+            // Verify XOR-decode plausibility before claiming a match.
+            WnfStateNameDecoded d = DecodeWnfStateName(value);
+            if (d.Lifetime > 3 || d.DataScope > 5)
+            {
+                continue;
+            }
+            std::wcout << L"    ";
+            PrintColoredText(L"[probe]", KNDBG_COLOR_OK);
+            std::wcout << L" full-encoded @+0x" << std::hex << off
+                       << L"=" << HexTextWidth(value, 16, true)
+                       << L" lifetime=" << d.LifetimeText
+                       << L" scope=" << d.DataScopeText;
+            if (!d.OwnerTagText.empty())
+            {
+                std::wcout << L" owner=\"" << d.OwnerTagText << L"\"";
+            }
+            std::wcout << L"\n";
+        }
+    }
+}
+
+static void PrintWnfCandidateDump(const WnfSiloCandidateDump& dump)
+{
+    PrintColoredText(L"[wnf.candidate]", KNDBG_COLOR_TITLE);
+    std::wcout << L" silo=" << HexTextWidth(dump.SiloAddress, 16, true);
+    std::wcout << L" ptr=" << HexTextWidth(dump.PointerAddress, 16, true);
+    std::wcout << L" anchor=\"" << dump.AnchorSymbol << L"\"";
+    std::wcout << L"\n";
+
+    if (!dump.NearestSymbol.empty())
+    {
+        std::wcout << L"  symbol=" << dump.NearestSymbol;
+        if (!dump.NearestModule.empty())
+        {
+            std::wcout << L" module=" << dump.NearestModule;
+        }
+        std::wcout << L"\n";
+    }
+
+    std::wcout << L"  kernel_pointer_slots=" << std::dec << dump.KernelPointerSlots
+               << L" embedded_state_name_hits=" << dump.EmbeddedStateNameHits << L"\n";
+
+    if (dump.HeadBytes.empty())
+    {
+        std::wcout << L"  (head bytes unreadable)\n";
+        return;
+    }
+
+    const size_t bytesPerLine = 16;
+    for (size_t i = 0; i < dump.HeadBytes.size(); i += bytesPerLine)
+    {
+        std::wcout << L"  ";
+        std::wcout << HexTextWidth(static_cast<uint64_t>(i), 4, true) << L"  ";
+
+        std::wstring asciiLine;
+        for (size_t j = 0; j < bytesPerLine; ++j)
+        {
+            if (i + j >= dump.HeadBytes.size())
+            {
+                std::wcout << L"   ";
+                continue;
+            }
+            uint8_t byte = dump.HeadBytes[i + j];
+            std::wcout << std::hex << std::setw(2) << std::setfill(L'0')
+                       << static_cast<uint32_t>(byte) << std::dec << L" ";
+            if (byte >= 0x20 && byte < 0x7f)
+            {
+                asciiLine.push_back(static_cast<wchar_t>(byte));
+            }
+            else
+            {
+                asciiLine.push_back(L'.');
+            }
+        }
+
+        std::wcout << L" " << asciiLine << L"\n";
+    }
+}
+
+static void PrintWnfDataDump(const WnfDataDump& data)
+{
+    PrintColoredText(L"[wnf.data]", KNDBG_COLOR_TITLE);
+    std::wcout << L" state=" << HexTextWidth(data.StateName, 16, true)
+               << L" instance=" << HexTextWidth(data.InstanceAddress, 16, true)
+               << L" block=" << HexTextWidth(data.DataBlockAddress, 16, true)
+               << L" size=" << std::dec << data.DataSize << L"\n";
+
+    if (data.DataBytes.empty())
+    {
+        std::wcout << L"  (no bytes captured)\n";
+        return;
+    }
+
+    const size_t bytesPerLine = 16;
+    for (size_t i = 0; i < data.DataBytes.size(); i += bytesPerLine)
+    {
+        std::wcout << L"  ";
+        std::wcout << HexTextWidth(static_cast<uint64_t>(i), 4, true) << L"  ";
+
+        std::wstring asciiLine;
+        for (size_t j = 0; j < bytesPerLine; ++j)
+        {
+            if (i + j >= data.DataBytes.size())
+            {
+                std::wcout << L"   ";
+                continue;
+            }
+            uint8_t byte = data.DataBytes[i + j];
+            std::wcout << std::hex << std::setw(2) << std::setfill(L'0')
+                       << static_cast<uint32_t>(byte) << std::dec << L" ";
+            if (byte >= 0x20 && byte < 0x7f)
+            {
+                asciiLine.push_back(static_cast<wchar_t>(byte));
+            }
+            else
+            {
+                asciiLine.push_back(L'.');
+            }
+        }
+
+        std::wcout << L" " << asciiLine << L"\n";
+    }
+}
+
+static void HandleWnfCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintWnfHelp();
+            break;
+        }
+
+        WnfScanner::Options options = {};
+        options.Target = WnfScanner::Scope::Instances;
+
+        size_t index = 1;
+        if (index < args.size())
+        {
+            if (IsWnfScopeName(args[index]))
+            {
+                std::wstring scope = ToLower(args[index]);
+                if (scope == L"decode")
+                {
+                    options.Target = WnfScanner::Scope::Decode;
+                }
+                else if (scope == L"instances")
+                {
+                    options.Target = WnfScanner::Scope::Instances;
+                }
+                else if (scope == L"instance")
+                {
+                    options.Target = WnfScanner::Scope::Instance;
+                }
+                else if (scope == L"data")
+                {
+                    options.Target = WnfScanner::Scope::Data;
+                }
+                else if (scope == L"candidates")
+                {
+                    options.Target = WnfScanner::Scope::Candidates;
+                }
+                else if (scope == L"lists")
+                {
+                    options.Target = WnfScanner::Scope::Lists;
+                }
+                ++index;
+            }
+            else
+            {
+                std::wcerr << L"usage: !wnf [decode|instances|instance|data] [hash]\n";
+                PrintWnfHelp();
+                break;
+            }
+        }
+
+        bool needsHash = options.Target == WnfScanner::Scope::Decode ||
+            options.Target == WnfScanner::Scope::Instance ||
+            options.Target == WnfScanner::Scope::Data;
+
+        if (needsHash)
+        {
+            if (index >= args.size())
+            {
+                std::wcerr << L"!wnf " << args[1] << L" requires a 64-bit state-name hash\n";
+                break;
+            }
+
+            uint64_t parsed = 0;
+            if (!ParseUnsigned(args[index], state.NumberBase, &parsed))
+            {
+                std::wcerr << L"!wnf: failed to parse hash \"" << args[index] << L"\"\n";
+                break;
+            }
+            options.TargetHash = parsed;
+            options.HasTargetHash = true;
+            ++index;
+        }
+
+        if (index < args.size())
+        {
+            std::wcerr << L"!wnf: unexpected extra argument \"" << args[index] << L"\"\n";
+            break;
+        }
+
+        if (options.Target != WnfScanner::Scope::Decode)
+        {
+            if (!device.IsOpen())
+            {
+                std::wcerr << L"!wnf live walking requires the KnLiveDbg.sys driver device to be open\n";
+                break;
+            }
+
+            if (symbols.Modules().empty())
+            {
+                std::wstring loadError;
+                if (!symbols.LoadKernelModules(&loadError))
+                {
+                    std::wcerr << L"!wnf failed: " << loadError << L"\n";
+                    break;
+                }
+            }
+        }
+
+        WnfScanner scanner(device, symbols);
+        WnfScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!wnf failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!wnf warning: " << warning << L"\n";
+            }
+            if (options.Target != WnfScanner::Scope::Decode)
+            {
+                std::wcerr << L"!wnf diagnostics: silo_candidates_collected=" << std::dec
+                           << result.SiloCandidatesCollected
+                           << L" silo_candidates_after_filter=" << result.SiloCandidatesAfterFilter
+                           << L" total_avl_tables_observed=" << result.TotalAvlTablesObserved
+                           << L" wnf_related_avls_observed=" << result.WnfRelatedAvlsObserved << L"\n";
+                for (const std::wstring& diag : result.Diagnostics)
+                {
+                    std::wcerr << L"!wnf diag: " << diag << L"\n";
+                }
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!wnf warning: " << warning << L"\n";
+        }
+        if (options.Target != WnfScanner::Scope::Decode &&
+            (result.Diagnostics.size() > 0 || result.WnfRelatedAvlsObserved == 0))
+        {
+            std::wcout << L"!wnf diagnostics: silo_candidates_collected=" << std::dec
+                       << result.SiloCandidatesCollected
+                       << L" silo_candidates_after_filter=" << result.SiloCandidatesAfterFilter
+                       << L" total_avl_tables_observed=" << result.TotalAvlTablesObserved
+                       << L" wnf_related_avls_observed=" << result.WnfRelatedAvlsObserved << L"\n";
+            for (const std::wstring& diag : result.Diagnostics)
+            {
+                std::wcout << L"!wnf diag: " << diag << L"\n";
+            }
+        }
+
+        if (options.Target == WnfScanner::Scope::Decode)
+        {
+            PrintWnfDecodedHash(result.DecodedHash);
+            break;
+        }
+
+        if (options.Target == WnfScanner::Scope::Candidates)
+        {
+            PrintColoredText(L"wnf candidates", KNDBG_COLOR_TITLE);
+            std::wcout << L"=" << result.Candidates.size() << L"\n";
+            for (const WnfSiloCandidateDump& dump : result.Candidates)
+            {
+                PrintWnfCandidateDump(dump);
+            }
+            break;
+        }
+
+        if (options.Target == WnfScanner::Scope::Lists)
+        {
+            PrintColoredText(L"wnf list heads", KNDBG_COLOR_TITLE);
+            std::wcout << L"=" << result.ListHeads.size();
+            uint32_t totalEntries = 0;
+            uint32_t nonEmpty = 0;
+            uint32_t withStateName = 0;
+            for (const WnfListHeadFinding& f : result.ListHeads)
+            {
+                totalEntries += static_cast<uint32_t>(f.Entries.size());
+                if (!f.IsEmpty) ++nonEmpty;
+                for (const WnfListEntryWalkRecord& e : f.Entries)
+                {
+                    if (e.HasStateName) ++withStateName;
+                }
+            }
+            std::wcout << L" non_empty=" << std::dec << nonEmpty
+                       << L" total_entries=" << totalEntries
+                       << L" entries_with_state_name=" << withStateName << L"\n";
+
+            for (const WnfListHeadFinding& f : result.ListHeads)
+            {
+                PrintWnfListHead(f);
+            }
+            break;
+        }
+
+        PrintColoredText(L"wnf walk", KNDBG_COLOR_TITLE);
+        std::wcout << L" silo_symbol=" << result.SiloStateSymbol
+                   << L" silo=" << HexTextWidth(result.SiloStateAddress, 16, true)
+                   << L" table_type=" << result.TableTypeName
+                   << L"::" << result.TableFieldName
+                   << L" table=" << HexTextWidth(result.TableAddress, 16, true)
+                   << L" nodes_visited=" << std::dec << result.NodesVisited
+                   << L" instances=" << result.Instances.size() << L"\n";
+
+        // In the listing path (Scope::Instances) we hide non-subscription
+        // chained objects -- their pool tag is shown in the per-entry
+        // tag histogram and their hex dump would otherwise flood the
+        // listing. Single-entry views (Instance / Data) still emit all
+        // nodes so the operator can RE the full layout when needed.
+        const bool compactSubs =
+            (options.Target == WnfScanner::Scope::Instances);
+        for (const WnfInstanceRecord& record : result.Instances)
+        {
+            PrintWnfInstance(record, compactSubs);
+        }
+
+        if (options.Target == WnfScanner::Scope::Data && result.Data.InstanceResolved)
+        {
+            PrintWnfDataDump(result.Data);
+        }
+    } while (false);
+}
+
 static void HandleUnassembleCommand(
     const std::vector<std::wstring>& args,
     const std::wstring& originalLine,
@@ -12049,6 +13266,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"!nmi")
         {
             PrintNmiHelp();
+        }
+        else if (command == L"!wnf")
+        {
+            PrintWnfHelp();
         }
         else if (command == L"vtop")
         {
@@ -13636,6 +14857,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!wnf")
+            {
+                commandClass = L"wnf";
+                break;
+            }
+
             commandClass = L"dbgeng";
             break;
         }
@@ -13695,6 +14922,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"!nmi")
         {
             commandClass = L"nmi";
+            break;
+        }
+
+        if (command == L"!wnf")
+        {
+            commandClass = L"wnf";
             break;
         }
 
@@ -14359,6 +15592,56 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
+        else if (command == L"!wnf")
+        {
+            size_t i = 1;
+            if (i < args.size())
+            {
+                if (!IsWnfScopeName(args[i]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!wnf scope must be decode, instances, instance, or data";
+                    }
+                    break;
+                }
+                std::wstring scope = ToLower(args[i]);
+                ++i;
+                bool needsHash = (scope == L"decode" || scope == L"instance" || scope == L"data");
+                if (scope == L"candidates" || scope == L"lists")
+                {
+                    // candidates/lists take no extra args
+                    if (i < args.size())
+                    {
+                        if (reason != nullptr)
+                        {
+                            *reason = L"!wnf " + scope + L" takes no extra arguments";
+                        }
+                        break;
+                    }
+                }
+                if (needsHash)
+                {
+                    if (i >= args.size())
+                    {
+                        if (reason != nullptr)
+                        {
+                            *reason = L"!wnf " + scope + L" requires a hash argument";
+                        }
+                        break;
+                    }
+                    ++i;
+                }
+                if (i < args.size())
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!wnf takes no extra arguments after the hash";
+                    }
+                    break;
+                }
+            }
+        }
         else if (command == L"!alpc")
         {
             size_t index = 1;
@@ -14677,7 +15960,7 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"]}\n";
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
-    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, !wnf, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
     stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
@@ -19089,6 +20372,14 @@ static bool HandleCommand(
         {
             HandleNmiCommand(args, device, symbols);
         }
+        else if (command == L"!wnf")
+        {
+            HandleWnfCommand(args, state, device, symbols);
+        }
+        else if (command == L"log")
+        {
+            HandleLogCommand(args);
+        }
         else if (IsPhysicalDisplayCommand(command))
         {
             HandlePhysicalDisplayCommand(args, state, device);
@@ -19392,6 +20683,14 @@ int wmain(int argc, wchar_t** argv)
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
 
+    // Permanently install the tee buffer in front of std::wcout. Must
+    // happen before any ScopedWideStreamCapture (i.e. before any
+    // command is dispatched) so that "log enable" only needs to
+    // attach a file sink at runtime, not swap rdbufs from inside a
+    // capture's chain (which would silently drop the tee on the next
+    // capture's destructor).
+    InstallOutputTee();
+
     int exitCode = 1;
     DebuggerState state = {};
     state.NumberBase = 16;
@@ -19629,6 +20928,9 @@ int wmain(int argc, wchar_t** argv)
         g_MainThreadHandle = nullptr;
     }
     ReleaseSingleInstanceLock();
+
+    DisableOutputLog(nullptr);
+    UninstallOutputTee();
 
     return exitCode;
 }
