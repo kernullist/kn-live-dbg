@@ -235,33 +235,48 @@ protected:
         std::lock_guard<std::mutex> guard(file_lock_);
         if (file_ != nullptr && file_->good())
         {
-            // Convert the whole run to UTF-8 in one pass. Worst case
-            // every wchar produces up to 4 UTF-8 bytes (surrogate
-            // pairs would be 4 bytes each); we keep a stack buffer
-            // for short runs and fall back to dynamic allocation
-            // beyond that.
-            constexpr int kStackBytes = 1024;
-            char stackBuf[kStackBytes];
-            char* out = stackBuf;
-            std::vector<char> heap;
-            int needed = WideCharToMultiByte(
-                CP_UTF8, 0,
-                text, static_cast<int>(count),
-                nullptr, 0,
-                nullptr, nullptr);
-            if (needed > kStackBytes)
+            // WideCharToMultiByte takes int; cap chunk size to INT_MAX
+            // so a hypothetical INT_MAX+ streamsize cannot wrap into a
+            // negative cchWideChar. In practice wcout never delivers a
+            // run that large, but the cast is otherwise undefined.
+            const std::streamsize kIntMax = std::numeric_limits<int>::max();
+            std::streamsize remaining = count;
+            const wchar_t* cursor = text;
+            while (remaining > 0 && file_->good())
             {
-                heap.resize(static_cast<size_t>(needed));
-                out = heap.data();
-            }
-            int written = WideCharToMultiByte(
-                CP_UTF8, 0,
-                text, static_cast<int>(count),
-                out, needed,
-                nullptr, nullptr);
-            if (written > 0)
-            {
-                file_->write(out, written);
+                const int chunk = static_cast<int>(
+                    remaining < kIntMax ? remaining : kIntMax);
+
+                constexpr int kStackBytes = 1024;
+                char stackBuf[kStackBytes];
+                char* out = stackBuf;
+                std::vector<char> heap;
+                int needed = WideCharToMultiByte(
+                    CP_UTF8, 0,
+                    cursor, chunk,
+                    nullptr, 0,
+                    nullptr, nullptr);
+                if (needed <= 0)
+                {
+                    break;
+                }
+                if (needed > kStackBytes)
+                {
+                    heap.resize(static_cast<size_t>(needed));
+                    out = heap.data();
+                }
+                int written = WideCharToMultiByte(
+                    CP_UTF8, 0,
+                    cursor, chunk,
+                    out, needed,
+                    nullptr, nullptr);
+                if (written > 0)
+                {
+                    file_->write(out, written);
+                }
+
+                cursor += chunk;
+                remaining -= chunk;
             }
         }
 
