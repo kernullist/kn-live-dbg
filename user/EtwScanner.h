@@ -12,11 +12,17 @@ struct EtwLoggerRecord
     uint32_t Slot = 0;
     uint64_t ContextAddress = 0;
     std::wstring Name;
-    uint64_t GetCpuClock = 0;
+    uint64_t GetCpuClockRaw = 0;
+    uint32_t GetCpuClockMode = 0xffffffffu;
+    std::wstring GetCpuClockModeText;
+    uint64_t GetCpuClockCallback = 0;
     std::wstring GetCpuClockModule;
     std::wstring GetCpuClockSymbol;
+    std::wstring GetCpuClockCallbackSource;
     std::wstring Notes;
-    bool HasGetCpuClock = false;
+    bool HasGetCpuClockRaw = false;
+    bool HasGetCpuClockMode = false;
+    bool HasGetCpuClockCallback = false;
     bool Suspicious = false;
 };
 
@@ -24,10 +30,15 @@ struct EtwScanResult
 {
     std::vector<EtwLoggerRecord> Loggers;
     std::vector<std::wstring>    Warnings;
+    std::wstring LoggerArraySource;
     uint64_t DebuggerDataAddress = 0;
+    uint64_t SiloStateAddress = 0;
+    uint64_t LoggerArrayBase = 0;
     uint32_t SlotCount = 0;
+    uint32_t NonCanonicalSlotCount = 0;
     bool     DebuggerDataResolved = false;
     bool     LayoutFromPdb = false;
+    bool     UsedSiloPath = false;
     uint64_t LoggerNameOffset = 0;
     uint64_t GetCpuClockOffset = 0;
 };
