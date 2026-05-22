@@ -22,6 +22,9 @@
     <ClCompile Include="AiProvider.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AlpcScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="CallbackScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -46,12 +49,18 @@
     <ClCompile Include="SymbolEngine.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="WfpScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\third_party\zydis\amalgamated\Zydis.c">
       <Filter>Third Party</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AiProvider.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AlpcScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CallbackScanner.h">
@@ -73,6 +82,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="SymbolEngine.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WfpScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h">
