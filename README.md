@@ -182,7 +182,7 @@ callbacks [scope] /module <module>
 !vbs
 !ci [options|policy]
 !securekernel
-!etw [loggers|logger <index|name>]
+!etw [loggers|logger <index|name>|integrity]
 !nmi [callbacks]
 ai <question>
 ai status
@@ -261,6 +261,7 @@ knkd> !ci policy
 knkd> !securekernel
 knkd> !etw loggers
 knkd> !etw logger "Circular Kernel Context Logger"
+knkd> !etw integrity
 knkd> !nmi callbacks
 knkd> ai config provider openai-codex-cli
 knkd> ai config test
@@ -558,12 +559,29 @@ WDAC policy blob extraction is intentionally deferred; the doc-listed `CI!g_CiPo
 !nmi callbacks
 ```
 
-ETW logger flow:
+ETW logger flow (`!etw loggers` / `!etw logger`):
 
 1. `nt!EtwpDebuggerData` is resolved through the loaded kernel PDB, and 64 `WMI_LOGGER_CONTEXT*` pointers are read from offset `0x10`.
 2. For each non-null logger context, `_WMI_LOGGER_CONTEXT.LoggerName` (UNICODE_STRING) and `_WMI_LOGGER_CONTEXT.GetCpuClock` (function pointer) are read using PDB-resolved field offsets when the type is exposed, or fallback offsets `0x68` (LoggerName) and `0x28` (GetCpuClock) otherwise. A warning is emitted when the fallback path is taken because those offsets drift across builds.
 3. Each `GetCpuClock` target is annotated with its owning module and nearest symbol. Pointers that do not land inside any loaded kernel module are flagged with `[SUSPICIOUS]`, which is the canonical InfinityHook indicator (`GetCpuClock` rewritten to point at attacker-controlled code outside `nt`/`hal`).
 4. `!etw logger <index>` accepts a decimal slot index (0..63); `!etw logger <name-substring>` filters by case-insensitive substring on the logger name.
+
+ETW integrity flow (`!etw integrity`):
+
+1. The scanner resolves a fixed list of canonical kernel dispatch targets grouped into four categories:
+   - **Core ETW dispatch**: `EtwpReserveTraceBuffer`, `EtwpReserveTraceBufferAtomic`, `EtwpLogKernelEvent`, `EtwpReleaseTraceBuffer`, `EtwpFinalizeTraceBuffer`, `EtwpCommitTraceBuffer`, `EtwSendTraceBuffer`, `EtwpEventDispatcher` (primary modern InfinityHook surface)
+   - **Classic cycle-count surface**: `EtwpGetCycleCount`, `EtwpReceiveCycleCount` (older InfinityHook variants)
+   - **PMC / HAL**: `HalpCollectPmcCounters`, `HalCollectPmcCounters`, `HalpProcessorPerfCounter`, `HalpInterruptHandle`
+   - **Timing sources**: `KeQueryPerformanceCounter`, `KeQuerySystemTimePrecise`, `KeQueryInterruptTimePrecise`, `KeQueryUnbiasedInterruptTimePrecise`, `RtlGetSystemTimePrecise`, `HalpTimerQueryHostPerformanceCounter`
+   - **Syscall path**: `KiSystemCall64`, `KiSystemCall64Shadow`, `KiSystemServiceUser` (broader rootkit surface that responds to the same prologue-tampering checks)
+
+   Targets not present in the loaded PDB are reported as `status=unresolved` and skipped without failing the whole scan; this lets a single command sweep multiple build variants.
+2. For each resolved target the scanner reads 0x100 bytes through `KnLiveDbg.sys` and decodes up to 16 instructions with the vendored Zydis decoder. The first 24 bytes are surfaced as `head=` hex for triage.
+3. Five integrity checks run against the decoded prologue: (a) first-instruction unconditional `jmp` (classic trampoline), (b) first-instruction `int3`/`ud2` (debug-trap replacement), (c) `mov reg, imm64; jmp reg` indirect trampoline, (d) `push imm; ret` 32-bit-target trampoline, (e) any unconditional `call`/`jmp` in the first 16 instructions whose target lies in kernel canonical space but outside any loaded kernel module.
+4. Each finding records the instruction index, offset, mnemonic, resolved target with module/symbol annotation, and a human-readable reason. The record status is `clean`, `SUSPICIOUS`, `unresolved`, `read-failed`, or `decode-failed`.
+5. A single summary line reports the target count, clean / suspicious / unresolved totals before the per-target detail lines.
+
+InfinityHook on modern Windows no longer lands on `WMI_LOGGER_CONTEXT.GetCpuClock` directly (that field carries a UINT32 mode tag dispatched by a switch statement in the kernel); the hook surface moved to the ETW/PMC dispatch functions themselves. `!etw integrity` covers that updated surface by reading those functions' actual instructions instead of relying on a single field value.
 
 NMI callback flow:
 
