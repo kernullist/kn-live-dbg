@@ -1572,15 +1572,21 @@ namespace
                 uint64_t ptr = 0;
                 memcpy(&ptr, nodeBytes.data() + off, sizeof(uint64_t));
 
-                // Reject EPROCESS candidates that sit suspiciously
-                // close to the node itself. Real EPROCESS objects live
-                // in their own pool chunks; if the "candidate" is
-                // within 0x200 bytes of the node it is almost certainly
-                // another field of the same record or an adjacent
-                // allocation, not a process object. This catches
-                // shape-only false positives like
-                //   node=0xffffd387e7bac8e0 process=0xffffd387e7bac890
-                // observed in field testing.
+                // Pre-filter cheaply before paying for ResolveEprocess.
+                // Non-canonical pointers (null, small ints, user-space)
+                // can never be _EPROCESS and would just be rejected
+                // inside ResolveEprocess. Also reject candidates that
+                // sit within 0x200 bytes of the node itself: real
+                // EPROCESS objects live in their own pool chunks, so a
+                // candidate this close is almost certainly another
+                // field of the same record or an adjacent allocation
+                // (catches shape-only false positives like
+                //  node=0xffffd387e7bac8e0 process=0xffffd387e7bac890
+                //  observed in field testing).
+                if (!IsKernelAddress(ptr))
+                {
+                    continue;
+                }
                 uint64_t distance = (ptr > current) ? (ptr - current) : (current - ptr);
                 if (distance < 0x200)
                 {
@@ -1712,10 +1718,12 @@ namespace
 
             // Self-sentinel (empty list) -- skip but still confirms this
             // slot IS a list head, so skip the next 8-byte slot too
-            // (the Blink half).
+            // (the Blink half). The loop already advances by
+            // sizeof(uint64_t); we add another 8 here so the next
+            // iteration lands one full LIST_ENTRY past the head.
             if (flink == headAbs && blink == headAbs)
             {
-                ++off;  // skip blink half too (loop increments by sizeof too)
+                off += sizeof(uint64_t);
                 continue;
             }
 
@@ -1753,8 +1761,11 @@ namespace
                                        entryAddress, off, flink, out);
 
             // Skip the blink half so we don't re-detect the same head
-            // from the +0x08 offset on the next iteration.
-            ++off;
+            // from the +0x08 offset on the next iteration. The for-loop
+            // already advances by sizeof(uint64_t); add another 8 here
+            // so the next iteration lands one full LIST_ENTRY past the
+            // head we just walked.
+            off += sizeof(uint64_t);
         }
     }
 
