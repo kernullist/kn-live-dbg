@@ -61,6 +61,11 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "wfp filters ALE_AUTH_CONNECT_V4" -> `wfp.list` with `scope=filters` and `layer=ALE_AUTH_CONNECT_V4`
 - "named alpc ports" -> `alpc.list` with `scope=ports`
 - "alpc connections owned by lsass" -> `alpc.list` with `scope=connections` and `name=lsass`
+- "is HVCI on?" or "VBS status" -> bare `!vbs` (planner can dispatch it directly as a read-only command)
+- "decode CiOptions" -> `!ci options`
+- "list IUM trustlets" -> `!securekernel`
+- "any suspicious ETW logger hooks?" or "InfinityHook check" -> `!etw loggers`
+- "list NMI callbacks" or "check NMI handler chain" -> `!nmi callbacks`
 
 The model-backed planner remains available through `ai plan <prompt>` for multi-command investigations:
 
