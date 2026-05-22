@@ -10661,11 +10661,29 @@ static void PrintEtwLoggerRecord(const EtwLoggerRecord& record)
     }
     std::wcout << L"\n";
 
-    if (record.HasGetCpuClock)
+    if (record.HasGetCpuClockRaw)
     {
         std::wcout << L"  ";
         PrintColoredText(L"getCpuClock", KNDBG_COLOR_ACCENT);
-        std::wcout << L"=" << HexTextWidth(record.GetCpuClock, 16, true);
+        std::wcout << L"=" << HexTextWidth(record.GetCpuClockRaw, 16, true);
+        if (record.HasGetCpuClockMode)
+        {
+            std::wcout << L" mode=";
+            PrintColoredText(record.GetCpuClockModeText, KNDBG_COLOR_OK);
+            std::wcout << L"(" << std::dec << record.GetCpuClockMode << L")";
+        }
+        std::wcout << L"\n";
+    }
+
+    if (record.HasGetCpuClockCallback)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"callback", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(record.GetCpuClockCallback, 16, true);
+        if (!record.GetCpuClockCallbackSource.empty())
+        {
+            std::wcout << L" source=" << record.GetCpuClockCallbackSource;
+        }
         if (!record.GetCpuClockModule.empty())
         {
             std::wcout << L" module=";
@@ -10830,9 +10848,19 @@ static void HandleEtwCommand(
         PrintColoredText(L"etw loggers", KNDBG_COLOR_TITLE);
         std::wcout << L"=" << result.Loggers.size();
         std::wcout << L" debuggerData=" << HexTextWidth(result.DebuggerDataAddress, 16, true);
+        std::wcout << L" arraySource=" << result.LoggerArraySource;
+        if (result.UsedSiloPath)
+        {
+            std::wcout << L" silo=" << HexTextWidth(result.SiloStateAddress, 16, true);
+        }
+        std::wcout << L" arrayBase=" << HexTextWidth(result.LoggerArrayBase, 16, true);
         std::wcout << L" layoutFromPdb=" << (result.LayoutFromPdb ? L"yes" : L"no");
         std::wcout << L" nameOffset=0x" << std::hex << result.LoggerNameOffset << std::dec;
         std::wcout << L" getCpuClockOffset=0x" << std::hex << result.GetCpuClockOffset << std::dec;
+        if (result.NonCanonicalSlotCount > 0)
+        {
+            std::wcout << L" skippedSlots=" << std::dec << result.NonCanonicalSlotCount;
+        }
         std::wcout << L"\n";
 
         for (const EtwLoggerRecord& record : result.Loggers)
