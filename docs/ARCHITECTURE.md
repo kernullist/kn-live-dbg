@@ -106,6 +106,28 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 5. Image-load callbacks: enumerate `PspLoadImageNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
 6. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
 
+## ALPC Port Discovery Flow
+
+1. `!alpc` is implemented natively against live kernel memory through the existing `KnLiveDbg.sys` virtual-read path and PDB type metadata.
+2. `AlpcScanner::Scan` resolves `nt!ObTypeIndexTable`, enumerates `_OBJECT_TYPE` slots, and locates the `ALPC Port` and `Directory` type entries by reading each type's `_OBJECT_TYPE.Name` (or `TypeName`) `UNICODE_STRING`.
+3. `nt!ObHeaderCookie` is resolved when present; if it cannot be found, the scanner records a warning and falls back to raw `_OBJECT_HEADER.TypeIndex` comparisons for pre-cookie kernels.
+4. `nt!ObpRootDirectoryObject` is read to get the root `_OBJECT_DIRECTORY`. The scanner recurses through `_OBJECT_DIRECTORY.HashBuckets[]` (bucket count derived from the PDB-resolved array length) following each `_OBJECT_DIRECTORY_ENTRY.ChainLink` and descending into directory-typed children with bounded depth and a visited-directory cycle guard.
+5. Each candidate object body has its `_OBJECT_HEADER` computed by subtracting `_OBJECT_HEADER.Body` offset, its `TypeIndex` decoded with the per-object XOR (`raw ^ cookie ^ ((header_addr >> 8) & 0xff)`), and matched against the `ALPC Port` type index.
+6. For each port the scanner reads `_ALPC_PORT.OwnerProcess`, `ConnectionPort`, `CommunicationInfo`, and Flags. `_ALPC_COMMUNICATION_INFO.ConnectionPort`, `ServerCommunicationPort`, and `ClientCommunicationPort` are followed to surface paired server/client ports that are not themselves named in the directory tree.
+7. Queue depths are computed by bounded `_LIST_ENTRY` walks on `MainQueue`, `PendingQueue`, `LargeMessageQueue`, `CanceledQueue`, and `WaitQueue`. `_KQUEUE` fields (typically `WaitQueue`) are detected by PDB type name and the list head is adjusted past the dispatcher header before walking.
+8. Owner annotations resolve `_EPROCESS.UniqueProcessId` and `ImageFileName` for each port whose `OwnerProcess` lies in the kernel canonical range.
+9. `!alpc ports`, `!alpc connections`, `!alpc port <addr>`, and `!alpc queues <addr>` reuse the same scanner with different scope/filter combinations. `connections` groups records by `ConnectionPort` to render server/client family graphs; `queues` populates queue counts for a single explicit port address.
+10. The `alpc.list` AI capability tool routes back through `HandleAlpcCommand` with scope and optional name/pid arguments validated against the same shape rules used for plan commands.
+
+## Windows Filtering Platform Flow
+
+1. `!wfp` is implemented natively in user mode against the Base Filtering Engine (BFE) through `fwpuclnt.dll`; the kernel driver is not involved and the BFE service must be running.
+2. `WfpScanner::Scan` opens an engine handle with `FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr, nullptr, &engine)`, then builds in-memory provider, layer, and sublayer indexes by enumerating `FWPM_PROVIDER0`, `FWPM_LAYER0`, and `FWPM_SUBLAYER0` through the standard `FwpmXxxCreateEnumHandle0` / `FwpmXxxEnum0` / `FwpmXxxDestroyEnumHandle0` cycle. Each page-sized batch is freed with `FwpmFreeMemory0` before the next page.
+3. The five subcommands `!wfp providers`, `!wfp sublayers`, `!wfp callouts`, `!wfp filters`, and `!wfp layers` reuse those indexes to resolve owning provider names, applicable layer names, and sublayer names, then format each record under `[wfp.provider]`, `[wfp.sublayer]`, `[wfp.callout]`, `[wfp.filter]`, and `[wfp.layer]` headings with key GUIDs, decoded flag mnemonics, and action/weight metadata.
+4. Module ownership for callouts comes from `FWPM_CALLOUT0.providerKey` resolved against the provider index and printed as the provider display name plus `serviceName`. Kernel-mode callout function pointers are intentionally not surfaced because user-mode `FWPM_CALLOUT0` does not expose them; documented kernel-side walking is reserved for a later milestone.
+5. `!wfp callouts /module <name|GUID>` filters by provider service name (case-insensitive substring), provider display name, or `providerKey` GUID. `!wfp filters /layer <name|GUID>` filters by layer display-name substring or `layerKey` GUID, and `/provider` applies the same provider matching as `/module` for filters.
+6. The `wfp.list` AI capability tool routes back through `HandleWfpCommand` with scope and optional module/layer arguments validated against the same shape rules used for plan commands.
+
 ## DbgEng Flow
 
 1. `kdinit` or `backend dbgeng` initializes `DbgEngBackend`.
@@ -153,7 +175,7 @@ Human-readable native command output uses scoped console attributes for high-sig
 5. `deepseek` and `openrouter` use OpenAI-compatible chat-completions requests over WinHTTP.
 6. `.env` is loaded only from the executable directory; real environment variables override `.env` values.
 7. AI requests receive only curated session context and the operator prompt. The model cannot call memory IOCTLs or execute generated debugger commands directly.
-8. `ai <question>` uses a strict `kn-live-dbg.ai-capability-plan.v1` tool-router JSON schema. The provider chooses from local read-only tools such as `process.find`, `process.describe`, `type.describe`, `callbacks.list`, or `assistant.answer`; the C++ executor validates and runs the selected tools locally.
+8. `ai <question>` uses a strict `kn-live-dbg.ai-capability-plan.v1` tool-router JSON schema. The provider chooses from local read-only tools such as `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, or `assistant.answer`; the C++ executor validates and runs the selected tools locally.
 9. `ai config test` performs a real provider/model round-trip with a small marker prompt and reports transport status, HTTP status when available, elapsed time, and marker match result.
 10. `KNLIVEDBG_AI_REMOTE_POLICY=local-only` or `ai config policy local-only` blocks HTTP-backed providers (`openai-codex-subscription`, `deepseek`, and `openrouter`) for private sessions.
 11. `ai plan` requires a strict JSON command proposal object, parses it into in-memory plan state, and shows numbered commands with purpose and risk notes.

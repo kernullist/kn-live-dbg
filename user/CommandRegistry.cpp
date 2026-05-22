@@ -109,6 +109,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"dtx", L"dtx", L"type", L"display type fields through native type reader", CommandSupport::Alias),
         Make(L"callbacks", L"callbacks", L"kernel", L"list callbacks: all|object|registry|process|thread|imageload|minifilter [module]", CommandSupport::Native),
         Make(L"!dml_proc", L"!dml_proc [pid]", L"kernel", L"list processes from EPROCESS ActiveProcessLinks, optionally filtered by PID", CommandSupport::Native),
+        Make(L"!wfp", L"!wfp [providers|sublayers|callouts|filters|layers]", L"kernel", L"enumerate Windows Filtering Platform objects via fwpuclnt.dll", CommandSupport::Native),
+        Make(L"!alpc", L"!alpc [ports|port|connections|queues]", L"kernel", L"enumerate ALPC ports, connection pairings, and queue depths from kernel memory", CommandSupport::Native),
         Make(L"dv", L"dv", L"locals", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"dx", L"dx", L"data-model", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"e", L"e", L"memory", L"enter byte values", CommandSupport::Native),

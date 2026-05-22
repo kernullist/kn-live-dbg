@@ -16,7 +16,7 @@ This document captures implementation ideas for adding AI assistance to Kn Live 
 
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory, but the visible surface is now smaller:
 
-1. `ai <question>` is the default operator entrypoint. It asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. The initial catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, and `assistant.answer`.
+1. `ai <question>` is the default operator entrypoint. It asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. The initial catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, and `assistant.answer`.
 2. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
 3. `ai config ...` groups provider setup and smoke checks under one visible subcommand. It supports `status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`.
 4. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
@@ -57,6 +57,10 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "pid 1234 peb" -> `_EPROCESS.Peb` when the field is available
 - "a.exe process eprocess info" -> `process.find` followed by `process.describe` or `type.describe`
 - "WdFilter.sys object callbacks" -> `callbacks.list` with `scope=object` and `module=WdFilter.sys`
+- "tcpip wfp callouts" -> `wfp.list` with `scope=callouts` and `module=tcpip`
+- "wfp filters ALE_AUTH_CONNECT_V4" -> `wfp.list` with `scope=filters` and `layer=ALE_AUTH_CONNECT_V4`
+- "named alpc ports" -> `alpc.list` with `scope=ports`
+- "alpc connections owned by lsass" -> `alpc.list` with `scope=connections` and `name=lsass`
 
 The model-backed planner remains available through `ai plan <prompt>` for multi-command investigations:
 
