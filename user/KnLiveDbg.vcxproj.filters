@@ -61,6 +61,9 @@
     <ClCompile Include="WfpScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="WnfScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\third_party\zydis\amalgamated\Zydis.c">
       <Filter>Third Party</Filter>
     </ClCompile>
@@ -103,6 +106,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WfpScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WnfScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h">
