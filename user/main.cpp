@@ -2384,7 +2384,7 @@ static bool IsCiScopeName(const std::wstring& value)
 static bool IsEtwScopeName(const std::wstring& value)
 {
     std::wstring lowered = ToLower(value);
-    return lowered == L"loggers" || lowered == L"logger";
+    return lowered == L"loggers" || lowered == L"logger" || lowered == L"integrity";
 }
 
 static bool IsNmiScopeName(const std::wstring& value)
@@ -2958,7 +2958,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     static const wchar_t* values[] =
                     {
                         L"loggers",
-                        L"logger"
+                        L"logger",
+                        L"integrity"
                     };
                     AddCompletionCandidates(&candidates, values);
                 }
@@ -3037,6 +3038,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     L"loggers",
                     L"logger",
+                    L"integrity",
                     L"help"
                 };
                 AddCompletionCandidates(&candidates, values);
@@ -10618,15 +10620,17 @@ static void PrintEtwHelp()
     std::wcout << L"!etw command:\n";
     std::wcout << L"  !etw loggers\n";
     std::wcout << L"  !etw logger <index|name-substring>\n";
+    std::wcout << L"  !etw integrity\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
-    std::wcout << L"  loggers  list every populated WMI_LOGGER_CONTEXT slot under nt!EtwpDebuggerData with name and GetCpuClock annotation\n";
-    std::wcout << L"  logger   filter by slot index (decimal) or case-insensitive name substring\n";
+    std::wcout << L"  loggers    list every populated WMI_LOGGER_CONTEXT slot under nt!EtwpDebuggerData with name and GetCpuClock annotation\n";
+    std::wcout << L"  logger     filter by slot index (decimal) or case-insensitive name substring\n";
+    std::wcout << L"  integrity  decode the first instructions of canonical ETW/PMC dispatch functions and report trampoline / cross-module branch findings (modern InfinityHook variants)\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Resolves nt!EtwpDebuggerData, reads 64 logger pointers from offset 0x10, then resolves LoggerName and GetCpuClock through _WMI_LOGGER_CONTEXT PDB fields when exposed.\n";
-    std::wcout << L"  When the PDB does not expose those fields the scanner falls back to documented offsets 0x68 (LoggerName) and 0x28 (GetCpuClock); a warning is emitted because those offsets drift across builds.\n";
-    std::wcout << L"  GetCpuClock pointers that do not land inside a loaded kernel module are flagged as suspicious (InfinityHook-style indicator).\n";
+    std::wcout << L"  Resolves nt!EtwpDebuggerData, walks the silo state when present, then resolves LoggerName and GetCpuClock through _WMI_LOGGER_CONTEXT PDB fields with documented fallbacks.\n";
+    std::wcout << L"  In modern Windows GetCpuClock is a UINT32 mode tag dispatched internally; mode=Custom on Circular Kernel Context Logger is normal, not a hook indicator.\n";
+    std::wcout << L"  !etw integrity disassembles each target's first 16 instructions and flags first-instruction jmp/int3/ud2, mov-imm64+jmp-reg trampolines, push-imm+ret trampolines, and cross-module branches whose targets lie outside any loaded kernel module.\n";
 }
 
 static void PrintNmiHelp()
@@ -10743,6 +10747,104 @@ static void PrintNmiCallbackRecord(const NmiCallbackRecord& record)
     }
 }
 
+static void PrintEtwIntegrityRecord(const EtwIntegrityRecord& record)
+{
+    PrintColoredText(L"[etw.integrity]", KNDBG_COLOR_TITLE);
+    std::wcout << L" target=";
+    PrintColoredText(record.Symbol, KNDBG_COLOR_OK);
+
+    const wchar_t* statusText = L"clean";
+    WORD statusColor = KNDBG_COLOR_OK;
+    if (!record.SymbolResolved)
+    {
+        statusText = L"unresolved";
+        statusColor = KNDBG_COLOR_WARN;
+    }
+    else if (!record.BytesRead)
+    {
+        statusText = L"read-failed";
+        statusColor = KNDBG_COLOR_WARN;
+    }
+    else if (!record.DecodeOk)
+    {
+        statusText = L"decode-failed";
+        statusColor = KNDBG_COLOR_WARN;
+    }
+    else if (!record.Findings.empty())
+    {
+        statusText = L"SUSPICIOUS";
+        statusColor = KNDBG_COLOR_FAIL;
+    }
+
+    std::wcout << L" status=";
+    PrintColoredText(statusText, statusColor);
+    std::wcout << L"\n";
+
+    if (!record.Description.empty())
+    {
+        std::wcout << L"  description=" << record.Description << L"\n";
+    }
+
+    if (record.SymbolResolved)
+    {
+        std::wcout << L"  address=" << HexTextWidth(record.Address, 16, true);
+        if (!record.OwningModule.empty())
+        {
+            std::wcout << L" module=";
+            PrintColoredText(record.OwningModule, KNDBG_COLOR_OK);
+        }
+        std::wcout << L"\n";
+
+        if (!record.HeadBytesHex.empty())
+        {
+            std::wcout << L"  head=" << record.HeadBytesHex << L"\n";
+        }
+
+        if (record.InstructionsAnalyzed > 0)
+        {
+            std::wcout << L"  instructions_analyzed=" << std::dec << record.InstructionsAnalyzed
+                       << L" findings=" << record.Findings.size() << L"\n";
+        }
+
+        for (size_t i = 0; i < record.Findings.size(); ++i)
+        {
+            const EtwIntegrityFinding& finding = record.Findings[i];
+            std::wcout << L"  ";
+            PrintColoredText(L"finding[", KNDBG_COLOR_WARN);
+            std::wcout << std::dec << i;
+            PrintColoredText(L"]", KNDBG_COLOR_WARN);
+            std::wcout << L" mnemonic=" << finding.Mnemonic
+                       << L" instr_index=" << finding.InstructionIndex
+                       << L" offset=0x" << std::hex << finding.InstructionOffset << std::dec
+                       << L"\n    reason=" << finding.Reason << L"\n";
+            if (finding.HasTarget)
+            {
+                std::wcout << L"    target=" << HexTextWidth(finding.Target, 16, true);
+                if (!finding.TargetModule.empty())
+                {
+                    std::wcout << L" module=";
+                    PrintColoredText(finding.TargetModule, KNDBG_COLOR_OK);
+                }
+                else
+                {
+                    std::wcout << L" module=";
+                    PrintColoredText(L"<outside-loaded-modules>", KNDBG_COLOR_FAIL);
+                }
+                if (!finding.TargetSymbol.empty())
+                {
+                    std::wcout << L" symbol=";
+                    PrintColoredText(finding.TargetSymbol, KNDBG_COLOR_OK);
+                }
+                std::wcout << L"\n";
+            }
+        }
+    }
+    else
+    {
+        std::wcout << L"  note: symbol not present in current kernel PDB; skipping\n";
+    }
+}
+
 static void HandleEtwCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
@@ -10779,11 +10881,15 @@ static void HandleEtwCommand(
                 {
                     options.Target = EtwScanner::Scope::Logger;
                 }
+                else if (scope == L"integrity")
+                {
+                    options.Target = EtwScanner::Scope::Integrity;
+                }
                 ++index;
             }
             else
             {
-                std::wcerr << L"usage: !etw [loggers|logger <index|name>]\n";
+                std::wcerr << L"usage: !etw [loggers|logger <index|name>|integrity]\n";
                 PrintEtwHelp();
                 break;
             }
@@ -10828,6 +10934,60 @@ static void HandleEtwCommand(
         }
 
         EtwScanner scanner(device, symbols);
+
+        if (options.Target == EtwScanner::Scope::Integrity)
+        {
+            EtwIntegrityResult integrityResult = {};
+            std::wstring integrityError;
+            if (!scanner.ScanIntegrity(&integrityResult, &integrityError))
+            {
+                std::wcerr << L"!etw integrity failed: " << integrityError << L"\n";
+                for (const std::wstring& warning : integrityResult.Warnings)
+                {
+                    std::wcerr << L"!etw warning: " << warning << L"\n";
+                }
+                break;
+            }
+
+            for (const std::wstring& warning : integrityResult.Warnings)
+            {
+                std::wcerr << L"!etw warning: " << warning << L"\n";
+            }
+
+            size_t suspiciousCount = 0;
+            size_t unresolvedCount = 0;
+            size_t cleanCount = 0;
+            for (const EtwIntegrityRecord& record : integrityResult.Records)
+            {
+                if (!record.SymbolResolved)
+                {
+                    ++unresolvedCount;
+                }
+                else if (!record.Findings.empty())
+                {
+                    ++suspiciousCount;
+                }
+                else if (record.BytesRead && record.DecodeOk)
+                {
+                    ++cleanCount;
+                }
+            }
+
+            PrintColoredText(L"etw integrity", KNDBG_COLOR_TITLE);
+            std::wcout << L" targets=" << std::dec << integrityResult.Records.size()
+                       << L" clean=" << cleanCount
+                       << L" suspicious=";
+            PrintColoredText(std::to_wstring(suspiciousCount),
+                             suspiciousCount == 0 ? KNDBG_COLOR_OK : KNDBG_COLOR_FAIL);
+            std::wcout << L" unresolved=" << unresolvedCount << L"\n";
+
+            for (const EtwIntegrityRecord& record : integrityResult.Records)
+            {
+                PrintEtwIntegrityRecord(record);
+            }
+            break;
+        }
+
         EtwScanResult result = {};
         std::wstring error;
         if (!scanner.Scan(options, &result, &error))
@@ -14164,6 +14324,17 @@ static bool ValidateAiPlanArgumentShape(
                     if (reason != nullptr)
                     {
                         *reason = L"!etw logger requires exactly one index-or-name argument";
+                    }
+                    break;
+                }
+            }
+            else if (args.size() >= 2 && ToLower(args[1]) == L"integrity")
+            {
+                if (args.size() > 2)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!etw integrity takes no extra arguments";
                     }
                     break;
                 }
