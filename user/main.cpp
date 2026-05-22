@@ -5,8 +5,11 @@
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
 #include "DriverService.h"
+#include "EtwScanner.h"
 #include "NativeDisassembler.h"
+#include "NmiScanner.h"
 #include "SymbolEngine.h"
+#include "VbsScanner.h"
 #include "WfpScanner.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
@@ -1228,6 +1231,11 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  !alpc ports\n";
     std::wcout << L"  !alpc connections\n";
     std::wcout << L"  !alpc queues <port-address>\n";
+    std::wcout << L"  !vbs\n";
+    std::wcout << L"  !ci options\n";
+    std::wcout << L"  !securekernel\n";
+    std::wcout << L"  !etw loggers\n";
+    std::wcout << L"  !nmi callbacks\n";
     std::wcout << L"  write off\n";
     std::wcout << L"  ed <address> <value>\n";
     std::wcout << L"  peq <physical-address> <value>\n";
@@ -1543,7 +1551,12 @@ static bool IsNativeBangCommand(const std::wstring& command)
     if (IsNativePhysicalBangCommand(command) ||
         command == L"!dml_proc" ||
         command == L"!wfp" ||
-        command == L"!alpc")
+        command == L"!alpc" ||
+        command == L"!vbs" ||
+        command == L"!ci" ||
+        command == L"!securekernel" ||
+        command == L"!etw" ||
+        command == L"!nmi")
     {
         result = true;
     }
@@ -2362,6 +2375,24 @@ static bool ResolveAlpcScope(const std::wstring& value, AlpcScanner::Scope* scop
     return ok;
 }
 
+static bool IsCiScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"options" || lowered == L"policy";
+}
+
+static bool IsEtwScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"loggers" || lowered == L"logger";
+}
+
+static bool IsNmiScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"callbacks";
+}
+
 static void AddCompletionCandidate(std::vector<std::wstring>* candidates, const wchar_t* value)
 {
     do
@@ -2828,6 +2859,11 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             break;
         }
 
+        if (IsHelpToken(argsBefore.back()))
+        {
+            break;
+        }
+
         std::wstring command = CompletionCanonicalCommand(argsBefore[0]);
         if (command == L"help" || command == L"?")
         {
@@ -2908,6 +2944,28 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddAlpcScopeCompletionCandidates(&candidates);
                 }
+                else if (topic == L"!ci")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"options",
+                        L"policy"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!etw")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"loggers",
+                        L"logger"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!nmi")
+                {
+                    AddCompletionCandidate(&candidates, L"callbacks");
+                }
                 else
                 {
                     AddHelpCompletionCandidates(&candidates);
@@ -2951,90 +3009,156 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 AddAlpcOptionCompletionCandidates(&candidates, scope);
             }
         }
+        else if (command == L"!ci")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"options",
+                    L"policy",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"!vbs" || command == L"!securekernel")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                AddCompletionCandidate(&candidates, L"help");
+            }
+        }
+        else if (command == L"!etw")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"loggers",
+                    L"logger",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"!nmi")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"callbacks",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
         else if (command == L"ai")
         {
             AddAiCompletionCandidates(argsBefore, &candidates);
         }
         else if (command == L"backend")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() <= 1)
             {
-                L"auto",
-                L"native",
-                L"dbgeng",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"auto",
+                    L"native",
+                    L"dbgeng",
+                    L"help"
+                };
 
-            AddCompletionCandidates(&candidates, values);
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"kdinit")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() <= 1)
             {
-                L"/local",
-                L"/remote",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"/local",
+                    L"/remote",
+                    L"help"
+                };
 
-            AddCompletionCandidates(&candidates, values);
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"probe")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() <= 1)
             {
-                L"status",
-                L"load",
-                L"info",
-                L"reset",
-                L"unload",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"status",
+                    L"load",
+                    L"info",
+                    L"reset",
+                    L"unload",
+                    L"help"
+                };
 
-            AddCompletionCandidates(&candidates, values);
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"procctx")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() <= 1)
             {
-                L"status",
-                L"clear",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"status",
+                    L"clear",
+                    L"help"
+                };
 
-            AddCompletionCandidates(&candidates, values);
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"write")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() <= 1)
             {
-                L"on",
-                L"off",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"on",
+                    L"off",
+                    L"help"
+                };
 
-            AddCompletionCandidates(&candidates, values);
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"sq")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() <= 1)
             {
-                L"true",
-                L"false",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"true",
+                    L"false",
+                    L"help"
+                };
 
-            AddCompletionCandidates(&candidates, values);
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"n")
         {
-            static const wchar_t* values[] =
+            if (argsBefore.size() <= 1)
             {
-                L"10",
-                L"16",
-                L"help"
-            };
+                static const wchar_t* values[] =
+                {
+                    L"10",
+                    L"16",
+                    L"help"
+                };
 
-            AddCompletionCandidates(&candidates, values);
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"vtop")
         {
@@ -10063,6 +10187,742 @@ static void HandleAlpcCommand(
     } while (false);
 }
 
+static void PrintVbsHelp()
+{
+    std::wcout << L"!vbs command:\n";
+    std::wcout << L"  !vbs\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Comprehensive VBS/HVCI/MBEC/Secure Kernel/trustlet status report.\n";
+    std::wcout << L"  Sources: nt!g_CiOptions, nt!HvlpVsmVtlCallVa, CPUID(0x40000000/0x40000006),\n";
+    std::wcout << L"  PsLoadedModuleList (securekernel.exe/skci.dll), and PsActiveProcessHead walk.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  CiOptions resolves through nt!g_CiOptions, ci!g_CiOptions, or nt!CiOptions in that order.\n";
+    std::wcout << L"  Trustlet detection requires _EPROCESS/_KPROCESS.SecureState exposure in the loaded kernel PDB.\n";
+    std::wcout << L"  When SecureState is unavailable, well-known trustlet image names (lsaiso.exe, bioiso.exe, securesystem.exe, kdcustomization.exe) are still listed as candidates.\n";
+}
+
+static void PrintCiHelp()
+{
+    std::wcout << L"!ci command:\n";
+    std::wcout << L"  !ci\n";
+    std::wcout << L"  !ci options\n";
+    std::wcout << L"  !ci policy\n";
+    std::wcout << L"\n";
+    std::wcout << L"scopes:\n";
+    std::wcout << L"  options   decode CiOptions bits (CODEINTEGRITY_OPTION_ENABLED, TESTSIGN, UMCI_ENABLED, HVCI_ENFORCED, etc.)\n";
+    std::wcout << L"  policy    summarize Code Integrity policy state (CiOptions plus best-effort policy hints)\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  WDAC policy hash extraction depends on private CI internals and is reported as a follow-up source for now.\n";
+}
+
+static void PrintSecureKernelHelp()
+{
+    std::wcout << L"!securekernel command:\n";
+    std::wcout << L"  !securekernel\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Secure Kernel and skci.dll module presence plus an IUM trustlet list walked from PsActiveProcessHead.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Trustlet detection prefers _EPROCESS.SecureState then _KPROCESS.SecureState bit 0 (SecureKernelInProcess).\n";
+    std::wcout << L"  Without that field, fallback heuristics use well-known trustlet image names.\n";
+}
+
+static const wchar_t* FormatBoolText(bool value)
+{
+    return value ? L"yes" : L"no";
+}
+
+static WORD FormatBoolColor(bool value)
+{
+    return value ? KNDBG_COLOR_OK : KNDBG_COLOR_WARN;
+}
+
+static std::wstring FormatCiOptionsFlagText(const VbsCiOptionsInfo& info)
+{
+    std::wstring acc;
+    auto append = [&](const wchar_t* token)
+    {
+        if (!acc.empty())
+        {
+            acc.append(L"|");
+        }
+        acc.append(token);
+    };
+
+    if (info.CodeIntegrityEnabled) append(L"CODEINTEGRITY_OPTION_ENABLED");
+    if (info.TestSign)             append(L"TESTSIGN");
+    if (info.UmciEnabled)          append(L"UMCI_ENABLED");
+    if (info.UmciAuditMode)        append(L"UMCI_AUDITMODE_ENABLED");
+    if (info.HvciEnforced)         append(L"HVCI_ENFORCED");
+    if (info.UmciExclusionPaths)   append(L"UMCI_EXCLUSIONPATHS_ENABLED");
+    if (info.TestBuild)            append(L"TEST_BUILD");
+    if (info.PreproductionBuild)   append(L"PREPRODUCTION_BUILD");
+    if (info.FlightBuild)          append(L"FLIGHT_BUILD");
+    if (info.HvciStrictMode)       append(L"HVCI_STRICT_MODE");
+    if (info.HvciDebugMode)        append(L"HVCI_DEBUG_MODE");
+
+    return acc;
+}
+
+static void PrintCiOptionsBlock(const VbsCiOptionsInfo& info)
+{
+    PrintColoredText(L"[ci.options]", KNDBG_COLOR_TITLE);
+    if (!info.Resolved)
+    {
+        std::wcout << L" status=unresolved\n";
+        return;
+    }
+
+    std::wcout << L" source=" << info.SymbolSource;
+    std::wcout << L" raw=0x" << std::hex << info.Raw << std::dec << L"\n";
+
+    std::wstring flagsText = FormatCiOptionsFlagText(info);
+    std::wcout << L"  flags=";
+    if (flagsText.empty())
+    {
+        PrintColoredText(L"<none>", KNDBG_COLOR_DIM);
+    }
+    else
+    {
+        PrintColoredText(flagsText, KNDBG_COLOR_OK);
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  ci=" << FormatBoolText(info.CodeIntegrityEnabled)
+               << L" testsign=" << FormatBoolText(info.TestSign)
+               << L" umci=" << FormatBoolText(info.UmciEnabled)
+               << L" hvci=" << FormatBoolText(info.HvciEnforced)
+               << L" hvci_strict=" << FormatBoolText(info.HvciStrictMode)
+               << L" hvci_debug=" << FormatBoolText(info.HvciDebugMode) << L"\n";
+}
+
+static void PrintHypervisorBlock(const VbsHypervisorInfo& info)
+{
+    PrintColoredText(L"[vbs.hypervisor]", KNDBG_COLOR_TITLE);
+    std::wcout << L" present=";
+    PrintColoredText(FormatBoolText(info.HypervisorPresent), FormatBoolColor(info.HypervisorPresent));
+    if (!info.VendorSignature.empty())
+    {
+        std::wcout << L" vendor=\"" << info.VendorSignature << L"\"";
+    }
+    if (info.HvLeafBase != 0)
+    {
+        std::wcout << L" leaf_base=0x" << std::hex << info.HvLeafBase << std::dec;
+    }
+    if (info.HvFeaturesValid)
+    {
+        std::wcout << L" hv_hw_features=0x" << std::hex << info.HvHardwareFeatures << std::dec;
+    }
+    std::wcout << L"\n";
+    std::wcout << L"  note: MBEC enablement requires IA32_VMX_PROCBASED_CTLS2 bit 22 (MSR read, kernel-only); inferred from HVCI enforcement instead.\n";
+}
+
+static void PrintVbsCoreBlock(const VbsScanResult& result)
+{
+    PrintColoredText(L"[vbs.core]", KNDBG_COLOR_TITLE);
+    std::wcout << L" vbs_active=";
+    PrintColoredText(FormatBoolText(result.VbsActive), FormatBoolColor(result.VbsActive));
+    std::wcout << L" hvci_enforced=";
+    PrintColoredText(FormatBoolText(result.CiOptions.HvciEnforced), FormatBoolColor(result.CiOptions.HvciEnforced));
+    std::wcout << L" sk_loaded=";
+    PrintColoredText(FormatBoolText(result.SecureKernelLoaded), FormatBoolColor(result.SecureKernelLoaded));
+    std::wcout << L" skci=";
+    PrintColoredText(FormatBoolText(result.SkciLoaded), FormatBoolColor(result.SkciLoaded));
+    std::wcout << L"\n";
+
+    if (result.HvlpVsmVtlCallVaResolved)
+    {
+        std::wcout << L"  " << result.HvlpVsmVtlCallVaSymbol << L"=" << HexTextWidth(result.HvlpVsmVtlCallVa, 16, true) << L"\n";
+    }
+
+    if (result.HvcallStubResolved)
+    {
+        std::wcout << L"  " << result.HvcallStubSymbol << L"=" << HexTextWidth(result.HvcallStubAddress, 16, true) << L"\n";
+    }
+}
+
+static void PrintSecureKernelModules(const VbsScanResult& result)
+{
+    if (result.SecureKernelModules.empty())
+    {
+        PrintColoredText(L"[securekernel.modules]", KNDBG_COLOR_TITLE);
+        std::wcout << L" count=0\n";
+        return;
+    }
+
+    PrintColoredText(L"[securekernel.modules]", KNDBG_COLOR_TITLE);
+    std::wcout << L" count=" << result.SecureKernelModules.size() << L"\n";
+    for (const VbsModuleHit& module : result.SecureKernelModules)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(module.ImageName, KNDBG_COLOR_OK);
+        std::wcout << L" base=" << HexTextWidth(module.Base, 16, true)
+                   << L" size=0x" << std::hex << module.Size << std::dec << L"\n";
+    }
+}
+
+static void PrintTrustletList(const VbsScanResult& result)
+{
+    PrintColoredText(L"[securekernel.trustlets]", KNDBG_COLOR_TITLE);
+    std::wcout << L" count=" << result.Trustlets.size() << L"\n";
+    for (const VbsTrustletInfo& t : result.Trustlets)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(HexTextWidth(t.Eprocess, 16, true), KNDBG_COLOR_ACCENT);
+        std::wcout << L" pid=" << std::dec << t.ProcessId;
+        if (!t.ImageName.empty())
+        {
+            std::wcout << L" image=\"";
+            PrintColoredText(t.ImageName, KNDBG_COLOR_OK);
+            std::wcout << L"\"";
+        }
+        if (t.HasSecureState)
+        {
+            std::wcout << L" secure_state=0x" << std::hex << t.SecureState << std::dec
+                       << L" sk_in_process=" << FormatBoolText(t.SecureKernelInProcess);
+        }
+        else
+        {
+            std::wcout << L" secure_state=unknown";
+        }
+        std::wcout << L"\n";
+    }
+}
+
+static void EmitVbsWarnings(const VbsScanResult& result)
+{
+    for (const std::wstring& warning : result.Warnings)
+    {
+        std::wcerr << L"!vbs warning: " << warning << L"\n";
+    }
+}
+
+static bool PrepareVbsScan(
+    VbsScanner::Options options,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    VbsScanResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            if (!symbols.LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        VbsScanner scanner(device, symbols);
+        if (!scanner.Scan(options, result, error))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void HandleVbsCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (args.size() >= 2 && HasHelpToken(args, 1))
+        {
+            PrintVbsHelp();
+            break;
+        }
+
+        if (args.size() >= 2)
+        {
+            std::wcerr << L"usage: !vbs\n";
+            PrintVbsHelp();
+            break;
+        }
+
+        VbsScanner::Options options = {};
+        options.Target = VbsScanner::Scope::Vbs;
+
+        VbsScanResult result = {};
+        std::wstring error;
+        if (!PrepareVbsScan(options, device, symbols, &result, &error))
+        {
+            std::wcerr << L"!vbs failed: " << error << L"\n";
+            EmitVbsWarnings(result);
+            break;
+        }
+
+        EmitVbsWarnings(result);
+
+        PrintVbsCoreBlock(result);
+        PrintCiOptionsBlock(result.CiOptions);
+        PrintHypervisorBlock(result.Hypervisor);
+        PrintSecureKernelModules(result);
+        PrintTrustletList(result);
+    } while (false);
+}
+
+static void PrintCiPolicyBlock(const VbsScanResult& result)
+{
+    PrintColoredText(L"[ci.policy]", KNDBG_COLOR_TITLE);
+    std::wcout << L" status=";
+    if (result.CiOptions.Resolved && result.CiOptions.UmciEnabled)
+    {
+        PrintColoredText(L"UMCI-enforced", KNDBG_COLOR_OK);
+    }
+    else if (result.CiOptions.Resolved)
+    {
+        PrintColoredText(L"UMCI-disabled", KNDBG_COLOR_WARN);
+    }
+    else
+    {
+        PrintColoredText(L"unknown", KNDBG_COLOR_WARN);
+    }
+    if (result.CiOptions.Resolved)
+    {
+        std::wcout << L" testsign=" << FormatBoolText(result.CiOptions.TestSign)
+                   << L" audit=" << FormatBoolText(result.CiOptions.UmciAuditMode)
+                   << L" exclusion_paths=" << FormatBoolText(result.CiOptions.UmciExclusionPaths)
+                   << L" hvci=" << FormatBoolText(result.CiOptions.HvciEnforced)
+                   << L" hvci_strict=" << FormatBoolText(result.CiOptions.HvciStrictMode);
+    }
+    std::wcout << L"\n";
+    std::wcout << L"  note: WDAC policy blob discovery requires private CI internals and is reserved for a follow-up milestone.\n";
+}
+
+static void HandleCiCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (args.size() >= 2 && HasHelpToken(args, 1))
+        {
+            PrintCiHelp();
+            break;
+        }
+
+        bool printOptions = true;
+        bool printPolicy = true;
+        if (args.size() >= 2)
+        {
+            if (!IsCiScopeName(args[1]))
+            {
+                std::wcerr << L"usage: !ci [options|policy]\n";
+                PrintCiHelp();
+                break;
+            }
+            std::wstring scope = ToLower(args[1]);
+            if (scope == L"options")
+            {
+                printOptions = true;
+                printPolicy = false;
+            }
+            else if (scope == L"policy")
+            {
+                printOptions = true;
+                printPolicy = true;
+            }
+        }
+
+        VbsScanner::Options options = {};
+        options.Target = VbsScanner::Scope::Ci;
+
+        VbsScanResult result = {};
+        std::wstring error;
+        if (!PrepareVbsScan(options, device, symbols, &result, &error))
+        {
+            std::wcerr << L"!ci failed: " << error << L"\n";
+            EmitVbsWarnings(result);
+            break;
+        }
+
+        EmitVbsWarnings(result);
+
+        if (printOptions)
+        {
+            PrintCiOptionsBlock(result.CiOptions);
+            PrintHypervisorBlock(result.Hypervisor);
+        }
+
+        if (printPolicy)
+        {
+            PrintCiPolicyBlock(result);
+        }
+    } while (false);
+}
+
+static void HandleSecureKernelCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (args.size() >= 2 && HasHelpToken(args, 1))
+        {
+            PrintSecureKernelHelp();
+            break;
+        }
+
+        if (args.size() >= 2)
+        {
+            std::wcerr << L"usage: !securekernel\n";
+            PrintSecureKernelHelp();
+            break;
+        }
+
+        VbsScanner::Options options = {};
+        options.Target = VbsScanner::Scope::SecureKernel;
+
+        VbsScanResult result = {};
+        std::wstring error;
+        if (!PrepareVbsScan(options, device, symbols, &result, &error))
+        {
+            std::wcerr << L"!securekernel failed: " << error << L"\n";
+            EmitVbsWarnings(result);
+            break;
+        }
+
+        EmitVbsWarnings(result);
+
+        PrintSecureKernelModules(result);
+        PrintTrustletList(result);
+    } while (false);
+}
+
+static void PrintEtwHelp()
+{
+    std::wcout << L"!etw command:\n";
+    std::wcout << L"  !etw loggers\n";
+    std::wcout << L"  !etw logger <index|name-substring>\n";
+    std::wcout << L"\n";
+    std::wcout << L"scopes:\n";
+    std::wcout << L"  loggers  list every populated WMI_LOGGER_CONTEXT slot under nt!EtwpDebuggerData with name and GetCpuClock annotation\n";
+    std::wcout << L"  logger   filter by slot index (decimal) or case-insensitive name substring\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Resolves nt!EtwpDebuggerData, reads 64 logger pointers from offset 0x10, then resolves LoggerName and GetCpuClock through _WMI_LOGGER_CONTEXT PDB fields when exposed.\n";
+    std::wcout << L"  When the PDB does not expose those fields the scanner falls back to documented offsets 0x68 (LoggerName) and 0x28 (GetCpuClock); a warning is emitted because those offsets drift across builds.\n";
+    std::wcout << L"  GetCpuClock pointers that do not land inside a loaded kernel module are flagged as suspicious (InfinityHook-style indicator).\n";
+}
+
+static void PrintNmiHelp()
+{
+    std::wcout << L"!nmi command:\n";
+    std::wcout << L"  !nmi\n";
+    std::wcout << L"  !nmi callbacks\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Singly-linked list of KNMI_HANDLER_CALLBACK nodes from nt!KiNmiCallbackListHead, with module/symbol annotation per callback.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Node layout is fixed: Next at 0x00, Callback at 0x08, Context at 0x10, Handle at 0x18.\n";
+    std::wcout << L"  Callback targets outside any loaded kernel module are flagged as suspicious; the walker bounds iteration and detects cycles.\n";
+}
+
+static void PrintEtwLoggerRecord(const EtwLoggerRecord& record)
+{
+    PrintColoredText(L"[etw.logger]", KNDBG_COLOR_TITLE);
+    std::wcout << L" slot=" << std::dec << record.Slot;
+    std::wcout << L" context=" << HexTextWidth(record.ContextAddress, 16, true);
+    if (!record.Name.empty())
+    {
+        std::wcout << L" name=\"";
+        PrintColoredText(record.Name, KNDBG_COLOR_OK);
+        std::wcout << L"\"";
+    }
+    if (record.Suspicious)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+    }
+    std::wcout << L"\n";
+
+    if (record.HasGetCpuClock)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"getCpuClock", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(record.GetCpuClock, 16, true);
+        if (!record.GetCpuClockModule.empty())
+        {
+            std::wcout << L" module=";
+            PrintColoredText(record.GetCpuClockModule, KNDBG_COLOR_OK);
+        }
+        if (!record.GetCpuClockSymbol.empty())
+        {
+            std::wcout << L" symbol=";
+            PrintColoredText(record.GetCpuClockSymbol, KNDBG_COLOR_OK);
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!record.Notes.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"notes", KNDBG_COLOR_WARN);
+        std::wcout << L"=" << record.Notes << L"\n";
+    }
+}
+
+static void PrintNmiCallbackRecord(const NmiCallbackRecord& record)
+{
+    PrintColoredText(L"[nmi.callback]", KNDBG_COLOR_TITLE);
+    std::wcout << L" slot=" << std::dec << record.Slot;
+    std::wcout << L" node=" << HexTextWidth(record.NodeAddress, 16, true);
+    if (record.Suspicious)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  ";
+    PrintColoredText(L"callback", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=" << HexTextWidth(record.Callback, 16, true);
+    if (!record.CallbackModule.empty())
+    {
+        std::wcout << L" module=";
+        PrintColoredText(record.CallbackModule, KNDBG_COLOR_OK);
+    }
+    if (!record.CallbackSymbol.empty())
+    {
+        std::wcout << L" symbol=";
+        PrintColoredText(record.CallbackSymbol, KNDBG_COLOR_OK);
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  context=" << HexTextWidth(record.Context, 16, true)
+               << L" handle=" << HexTextWidth(record.Handle, 16, true) << L"\n";
+
+    if (!record.Notes.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"notes", KNDBG_COLOR_WARN);
+        std::wcout << L"=" << record.Notes << L"\n";
+    }
+}
+
+static void HandleEtwCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!etw requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
+        {
+            PrintEtwHelp();
+            break;
+        }
+
+        EtwScanner::Options options = {};
+        options.Target = EtwScanner::Scope::Loggers;
+
+        size_t index = 1;
+        if (index < args.size())
+        {
+            if (IsEtwScopeName(args[index]))
+            {
+                std::wstring scope = ToLower(args[index]);
+                if (scope == L"loggers")
+                {
+                    options.Target = EtwScanner::Scope::Loggers;
+                }
+                else if (scope == L"logger")
+                {
+                    options.Target = EtwScanner::Scope::Logger;
+                }
+                ++index;
+            }
+            else
+            {
+                std::wcerr << L"usage: !etw [loggers|logger <index|name>]\n";
+                PrintEtwHelp();
+                break;
+            }
+        }
+
+        if (options.Target == EtwScanner::Scope::Logger)
+        {
+            if (index >= args.size())
+            {
+                std::wcerr << L"usage: !etw logger <index|name-substring>\n";
+                break;
+            }
+
+            std::wstring filterValue = args[index];
+            uint64_t parsedIndex = 0;
+            if (ParseUnsigned(filterValue, 10, &parsedIndex) && parsedIndex < 0x100ull)
+            {
+                options.HasIndexFilter = true;
+                options.IndexFilter = static_cast<uint32_t>(parsedIndex);
+            }
+            else
+            {
+                options.NameFilter = filterValue;
+            }
+            ++index;
+        }
+
+        if (index < args.size())
+        {
+            std::wcerr << L"!etw: unexpected extra argument \"" << args[index] << L"\"\n";
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!etw failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        EtwScanner scanner(device, symbols);
+        EtwScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!etw failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!etw warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!etw warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"etw loggers", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << result.Loggers.size();
+        std::wcout << L" debuggerData=" << HexTextWidth(result.DebuggerDataAddress, 16, true);
+        std::wcout << L" layoutFromPdb=" << (result.LayoutFromPdb ? L"yes" : L"no");
+        std::wcout << L" nameOffset=0x" << std::hex << result.LoggerNameOffset << std::dec;
+        std::wcout << L" getCpuClockOffset=0x" << std::hex << result.GetCpuClockOffset << std::dec;
+        std::wcout << L"\n";
+
+        for (const EtwLoggerRecord& record : result.Loggers)
+        {
+            PrintEtwLoggerRecord(record);
+        }
+    } while (false);
+}
+
+static void HandleNmiCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!nmi requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
+        {
+            PrintNmiHelp();
+            break;
+        }
+
+        size_t index = 1;
+        if (index < args.size())
+        {
+            if (!IsNmiScopeName(args[index]))
+            {
+                std::wcerr << L"usage: !nmi [callbacks]\n";
+                PrintNmiHelp();
+                break;
+            }
+            ++index;
+        }
+
+        if (index < args.size())
+        {
+            std::wcerr << L"!nmi: unexpected extra argument \"" << args[index] << L"\"\n";
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!nmi failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        NmiScanner scanner(device, symbols);
+        NmiScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!nmi failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!nmi warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!nmi warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"nmi callbacks", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << result.Callbacks.size();
+        if (result.ListHeadResolved)
+        {
+            std::wcout << L" listHead=" << result.ListHeadSymbol;
+            std::wcout << L"(" << HexTextWidth(result.ListHeadAddress, 16, true) << L")";
+        }
+        std::wcout << L"\n";
+
+        for (const NmiCallbackRecord& record : result.Callbacks)
+        {
+            PrintNmiCallbackRecord(record);
+        }
+    } while (false);
+}
+
 static void HandleUnassembleCommand(
     const std::vector<std::wstring>& args,
     const std::wstring& originalLine,
@@ -10981,6 +11841,26 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"!alpc")
         {
             PrintAlpcHelp();
+        }
+        else if (command == L"!vbs")
+        {
+            PrintVbsHelp();
+        }
+        else if (command == L"!ci")
+        {
+            PrintCiHelp();
+        }
+        else if (command == L"!securekernel")
+        {
+            PrintSecureKernelHelp();
+        }
+        else if (command == L"!etw")
+        {
+            PrintEtwHelp();
+        }
+        else if (command == L"!nmi")
+        {
+            PrintNmiHelp();
         }
         else if (command == L"vtop")
         {
@@ -12550,6 +13430,24 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!vbs" || command == L"!ci" || command == L"!securekernel")
+            {
+                commandClass = L"vbs";
+                break;
+            }
+
+            if (command == L"!etw")
+            {
+                commandClass = L"etw";
+                break;
+            }
+
+            if (command == L"!nmi")
+            {
+                commandClass = L"nmi";
+                break;
+            }
+
             commandClass = L"dbgeng";
             break;
         }
@@ -12591,6 +13489,24 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"!alpc")
         {
             commandClass = L"alpc";
+            break;
+        }
+
+        if (command == L"!vbs" || command == L"!ci" || command == L"!securekernel")
+        {
+            commandClass = L"vbs";
+            break;
+        }
+
+        if (command == L"!etw")
+        {
+            commandClass = L"etw";
+            break;
+        }
+
+        if (command == L"!nmi")
+        {
+            commandClass = L"nmi";
             break;
         }
 
@@ -13158,6 +14074,92 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
+        else if (command == L"!vbs" || command == L"!securekernel")
+        {
+            if (args.size() > 1)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = command + L" takes no arguments";
+                }
+                break;
+            }
+        }
+        else if (command == L"!ci")
+        {
+            if (args.size() > 2)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!ci accepts at most one subcommand (options|policy)";
+                }
+                break;
+            }
+            if (args.size() == 2 && !IsCiScopeName(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!ci scope must be options or policy";
+                }
+                break;
+            }
+        }
+        else if (command == L"!etw")
+        {
+            if (args.size() == 1)
+            {
+                // bare !etw defaults to loggers
+            }
+            else if (args.size() >= 2 && !IsEtwScopeName(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!etw scope must be loggers or logger";
+                }
+                break;
+            }
+            else if (args.size() >= 2 && ToLower(args[1]) == L"loggers")
+            {
+                if (args.size() > 2)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!etw loggers takes no extra arguments";
+                    }
+                    break;
+                }
+            }
+            else if (args.size() >= 2 && ToLower(args[1]) == L"logger")
+            {
+                if (args.size() != 3)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!etw logger requires exactly one index-or-name argument";
+                    }
+                    break;
+                }
+            }
+        }
+        else if (command == L"!nmi")
+        {
+            if (args.size() > 2)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!nmi accepts at most one subcommand (callbacks)";
+                }
+                break;
+            }
+            if (args.size() == 2 && !IsNmiScopeName(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!nmi scope must be callbacks";
+                }
+                break;
+            }
+        }
         else if (command == L"!alpc")
         {
             size_t index = 1;
@@ -13476,7 +14478,7 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"]}\n";
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
-    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !wfp, !alpc, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
     stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
@@ -17867,6 +18869,26 @@ static bool HandleCommand(
         else if (command == L"!alpc")
         {
             HandleAlpcCommand(args, state, device, symbols);
+        }
+        else if (command == L"!vbs")
+        {
+            HandleVbsCommand(args, device, symbols);
+        }
+        else if (command == L"!ci")
+        {
+            HandleCiCommand(args, device, symbols);
+        }
+        else if (command == L"!securekernel")
+        {
+            HandleSecureKernelCommand(args, device, symbols);
+        }
+        else if (command == L"!etw")
+        {
+            HandleEtwCommand(args, device, symbols);
+        }
+        else if (command == L"!nmi")
+        {
+            HandleNmiCommand(args, device, symbols);
         }
         else if (IsPhysicalDisplayCommand(command))
         {
