@@ -64,7 +64,8 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "is HVCI on?" or "VBS status" -> bare `!vbs` (planner can dispatch it directly as a read-only command)
 - "decode CiOptions" -> `!ci options`
 - "list IUM trustlets" -> `!securekernel`
-- "any suspicious ETW logger hooks?" or "InfinityHook check" -> `!etw loggers`
+- "any suspicious ETW logger hooks?" -> `!etw loggers`
+- "InfinityHook check" or "ETW dispatch integrity" -> `!etw integrity`
 - "list NMI callbacks" or "check NMI handler chain" -> `!nmi callbacks`
 
 The model-backed planner remains available through `ai plan <prompt>` for multi-command investigations:
