@@ -1,4 +1,5 @@
 #include "AiProvider.h"
+#include "AlpcScanner.h"
 #include "CallbackScanner.h"
 #include "CommandRegistry.h"
 #include "DbgEngBackend.h"
@@ -6,6 +7,7 @@
 #include "DriverService.h"
 #include "NativeDisassembler.h"
 #include "SymbolEngine.h"
+#include "WfpScanner.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 #include "../shared/KnLiveDbgProbeIoctl.h"
@@ -20,6 +22,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -1219,6 +1222,12 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  kdinit\n";
     std::wcout << L"  backend dbgeng\n";
     std::wcout << L"  !dml_proc [pid]\n";
+    std::wcout << L"  !wfp providers\n";
+    std::wcout << L"  !wfp callouts /module tcpip\n";
+    std::wcout << L"  !wfp filters /layer ALE_AUTH_CONNECT_V4\n";
+    std::wcout << L"  !alpc ports\n";
+    std::wcout << L"  !alpc connections\n";
+    std::wcout << L"  !alpc queues <port-address>\n";
     std::wcout << L"  write off\n";
     std::wcout << L"  ed <address> <value>\n";
     std::wcout << L"  peq <physical-address> <value>\n";
@@ -1532,7 +1541,9 @@ static bool IsNativeBangCommand(const std::wstring& command)
     bool result = false;
 
     if (IsNativePhysicalBangCommand(command) ||
-        command == L"!dml_proc")
+        command == L"!dml_proc" ||
+        command == L"!wfp" ||
+        command == L"!alpc")
     {
         result = true;
     }
@@ -2251,6 +2262,106 @@ static bool IsPhysicalEnterCommand(const std::wstring& command)
         command == L"!eq";
 }
 
+static bool IsWfpScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+
+    return lowered == L"providers" ||
+        lowered == L"sublayers" ||
+        lowered == L"callouts" ||
+        lowered == L"filters" ||
+        lowered == L"layers";
+}
+
+static bool IsWfpOption(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+
+    return lowered == L"/module" ||
+        lowered == L"/layer" ||
+        lowered == L"/provider";
+}
+
+static bool ResolveWfpScope(const std::wstring& value, WfpScanner::Scope* scope)
+{
+    bool ok = true;
+    std::wstring lowered = ToLower(value);
+
+    if (lowered == L"providers")
+    {
+        *scope = WfpScanner::Scope::Providers;
+    }
+    else if (lowered == L"sublayers")
+    {
+        *scope = WfpScanner::Scope::SubLayers;
+    }
+    else if (lowered == L"callouts")
+    {
+        *scope = WfpScanner::Scope::Callouts;
+    }
+    else if (lowered == L"filters")
+    {
+        *scope = WfpScanner::Scope::Filters;
+    }
+    else if (lowered == L"layers")
+    {
+        *scope = WfpScanner::Scope::Layers;
+    }
+    else
+    {
+        ok = false;
+    }
+
+    return ok;
+}
+
+static bool IsAlpcScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+
+    return lowered == L"ports" ||
+        lowered == L"port" ||
+        lowered == L"connections" ||
+        lowered == L"queues";
+}
+
+static bool IsAlpcOption(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+
+    return lowered == L"/name" ||
+        lowered == L"/pid";
+}
+
+static bool ResolveAlpcScope(const std::wstring& value, AlpcScanner::Scope* scope)
+{
+    bool ok = true;
+    std::wstring lowered = ToLower(value);
+
+    if (lowered == L"ports")
+    {
+        *scope = AlpcScanner::Scope::Ports;
+    }
+    else if (lowered == L"port")
+    {
+        *scope = AlpcScanner::Scope::Port;
+    }
+    else if (lowered == L"connections")
+    {
+        *scope = AlpcScanner::Scope::Connections;
+    }
+    else if (lowered == L"queues")
+    {
+        *scope = AlpcScanner::Scope::Queues;
+    }
+    else
+    {
+        ok = false;
+    }
+
+    return ok;
+}
+
 static void AddCompletionCandidate(std::vector<std::wstring>* candidates, const wchar_t* value)
 {
     do
@@ -2332,6 +2443,61 @@ static void AddCallbackModuleOptionCompletionCandidates(std::vector<std::wstring
     };
 
     AddCompletionCandidates(candidates, values);
+}
+
+static void AddWfpScopeCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"providers",
+        L"sublayers",
+        L"callouts",
+        L"filters",
+        L"layers",
+        L"help"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
+static void AddWfpOptionCompletionCandidates(std::vector<std::wstring>* candidates, WfpScanner::Scope scope)
+{
+    if (scope == WfpScanner::Scope::Callouts)
+    {
+        AddCompletionCandidate(candidates, L"/module");
+    }
+    else if (scope == WfpScanner::Scope::Filters)
+    {
+        AddCompletionCandidate(candidates, L"/layer");
+        AddCompletionCandidate(candidates, L"/provider");
+    }
+
+    AddCompletionCandidate(candidates, L"help");
+}
+
+static void AddAlpcScopeCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"ports",
+        L"port",
+        L"connections",
+        L"queues",
+        L"help"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
+static void AddAlpcOptionCompletionCandidates(std::vector<std::wstring>* candidates, AlpcScanner::Scope scope)
+{
+    if (scope == AlpcScanner::Scope::Ports || scope == AlpcScanner::Scope::Connections)
+    {
+        AddCompletionCandidate(candidates, L"/name");
+        AddCompletionCandidate(candidates, L"/pid");
+    }
+
+    AddCompletionCandidate(candidates, L"help");
 }
 
 static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidates)
@@ -2734,6 +2900,14 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
 
                     AddCompletionCandidates(&candidates, values);
                 }
+                else if (topic == L"!wfp")
+                {
+                    AddWfpScopeCompletionCandidates(&candidates);
+                }
+                else if (topic == L"!alpc")
+                {
+                    AddAlpcScopeCompletionCandidates(&candidates);
+                }
                 else
                 {
                     AddHelpCompletionCandidates(&candidates);
@@ -2749,6 +2923,32 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             else
             {
                 AddCallbackModuleOptionCompletionCandidates(&candidates);
+            }
+        }
+        else if (command == L"!wfp")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                AddWfpScopeCompletionCandidates(&candidates);
+            }
+            else
+            {
+                WfpScanner::Scope scope = WfpScanner::Scope::Callouts;
+                ResolveWfpScope(argsBefore[1], &scope);
+                AddWfpOptionCompletionCandidates(&candidates, scope);
+            }
+        }
+        else if (command == L"!alpc")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                AddAlpcScopeCompletionCandidates(&candidates);
+            }
+            else
+            {
+                AlpcScanner::Scope scope = AlpcScanner::Scope::Ports;
+                ResolveAlpcScope(argsBefore[1], &scope);
+                AddAlpcOptionCompletionCandidates(&candidates, scope);
             }
         }
         else if (command == L"ai")
@@ -9181,6 +9381,688 @@ static void HandleCallbacksCommand(
     } while (false);
 }
 
+static void PrintWfpHelp()
+{
+    std::wcout << L"!wfp command:\n";
+    std::wcout << L"  !wfp providers\n";
+    std::wcout << L"  !wfp sublayers\n";
+    std::wcout << L"  !wfp callouts [/module <name|GUID>]\n";
+    std::wcout << L"  !wfp filters [/layer <name|GUID>] [/provider <name|GUID>]\n";
+    std::wcout << L"  !wfp layers\n";
+    std::wcout << L"\n";
+    std::wcout << L"scopes:\n";
+    std::wcout << L"  providers  registered WFP providers (driver service identities)\n";
+    std::wcout << L"  sublayers  configured WFP sublayers and weights\n";
+    std::wcout << L"  callouts   registered WFP callouts with applicable layer and owning provider\n";
+    std::wcout << L"  filters    installed WFP filters with layer, sublayer, provider, action, and weight\n";
+    std::wcout << L"  layers     active WFP management layers with kernel/builtin/buffered flags\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /module <name|GUID>    callouts only; match owning provider service name, display name, or providerKey GUID\n";
+    std::wcout << L"  /layer <name|GUID>     filters only; match layer display name (substring) or layerKey GUID\n";
+    std::wcout << L"  /provider <name|GUID>  filters only; match provider service name, display name, or providerKey GUID\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Uses the user-mode Base Filtering Engine (BFE) through fwpuclnt.dll; requires the BFE service running.\n";
+    std::wcout << L"  Module ownership for callouts comes from the providerKey -> provider serviceName mapping.\n";
+    std::wcout << L"  Kernel-mode callout function pointers are not exposed through fwpuclnt and are intentionally omitted.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !wfp providers\n";
+    std::wcout << L"  !wfp callouts\n";
+    std::wcout << L"  !wfp callouts /module tcpip\n";
+    std::wcout << L"  !wfp filters /layer ALE_AUTH_CONNECT_V4\n";
+    std::wcout << L"  !wfp filters /provider WdFilter\n";
+    std::wcout << L"  !wfp layers\n";
+}
+
+static void PrintWfpRecord(const WfpRecord& record)
+{
+    PrintColoredText(L"[" + record.Kind + L"]", KNDBG_COLOR_TITLE);
+
+    if (record.Kind == L"wfp.filter")
+    {
+        std::wcout << L" id=" << record.Id;
+    }
+    else if (record.Kind == L"wfp.callout" && record.HasCalloutId)
+    {
+        std::wcout << L" calloutId=" << record.CalloutId;
+    }
+    else if (record.Kind == L"wfp.layer" && record.HasLayerId)
+    {
+        std::wcout << L" layerId=" << record.LayerId;
+    }
+
+    std::wcout << L" name=\"" << record.Name << L"\"";
+    std::wcout << L" key=";
+    PrintColoredText(record.Key, KNDBG_COLOR_ACCENT);
+
+    if (record.Kind == L"wfp.filter")
+    {
+        std::wcout << L" action=";
+        PrintColoredText(record.ActionText, KNDBG_COLOR_OK);
+        std::wcout << L"(0x" << std::hex << record.Action << L")" << std::dec;
+        if (!record.ActionKey.empty())
+        {
+            std::wcout << L" calloutKey=" << record.ActionKey;
+        }
+        std::wcout << L" weight=" << record.WeightText;
+        std::wcout << L" conditions=" << record.NumConditions;
+    }
+
+    if (record.Kind == L"wfp.sublayer" && record.HasSubLayerWeight)
+    {
+        std::wcout << L" weight=0x" << std::hex << record.SubLayerWeight << std::dec;
+    }
+
+    std::wcout << L" flags=0x" << std::hex << record.Flags << std::dec;
+    if (!record.FlagsText.empty())
+    {
+        std::wcout << L"(" << record.FlagsText << L")";
+    }
+
+    std::wcout << L"\n";
+
+    if ((record.Kind == L"wfp.filter" || record.Kind == L"wfp.callout") && !record.LayerKey.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"layer", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=";
+        if (!record.LayerName.empty())
+        {
+            PrintColoredText(record.LayerName, KNDBG_COLOR_OK);
+            std::wcout << L" ";
+        }
+        std::wcout << record.LayerKey;
+        if (record.HasLayerId)
+        {
+            std::wcout << L" layerId=" << record.LayerId;
+        }
+        std::wcout << L"\n";
+    }
+
+    if (record.Kind == L"wfp.filter" && !record.SubLayerKey.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"sublayer", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=";
+        if (!record.SubLayerName.empty())
+        {
+            PrintColoredText(record.SubLayerName, KNDBG_COLOR_OK);
+            std::wcout << L" ";
+        }
+        std::wcout << record.SubLayerKey << L"\n";
+    }
+
+    if (record.HasProvider && !record.ProviderKey.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"provider", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=";
+        if (!record.ProviderName.empty())
+        {
+            PrintColoredText(record.ProviderName, KNDBG_COLOR_OK);
+            std::wcout << L" ";
+        }
+        std::wcout << record.ProviderKey;
+        if (!record.ProviderService.empty())
+        {
+            std::wcout << L" service=\"" << record.ProviderService << L"\"";
+        }
+        std::wcout << L"\n";
+    }
+    else if (record.Kind == L"wfp.provider" && !record.ProviderService.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"service", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=\"" << record.ProviderService << L"\"\n";
+    }
+
+    if (!record.Description.empty())
+    {
+        std::wcout << L"  description=\"" << record.Description << L"\"\n";
+    }
+
+    if (!record.Notes.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"notes", KNDBG_COLOR_WARN);
+        std::wcout << L"=" << record.Notes << L"\n";
+    }
+}
+
+static void HandleWfpCommand(const std::vector<std::wstring>& args)
+{
+    do
+    {
+        WfpScanner::Options options = {};
+        options.Target = WfpScanner::Scope::Callouts;
+
+        size_t index = 1;
+        if (index < args.size())
+        {
+            if (HasHelpToken(args, 1))
+            {
+                PrintWfpHelp();
+                break;
+            }
+
+            if (IsWfpScopeName(args[index]))
+            {
+                ResolveWfpScope(args[index], &options.Target);
+                ++index;
+            }
+            else if (!IsWfpOption(args[index]))
+            {
+                std::wcerr << L"usage: !wfp [providers|sublayers|callouts|filters|layers] [/module|/layer|/provider <value>]\n";
+                PrintWfpHelp();
+                break;
+            }
+        }
+
+        bool optionError = false;
+        while (index < args.size())
+        {
+            if (IsHelpToken(args[index]))
+            {
+                PrintWfpHelp();
+                optionError = true;
+                break;
+            }
+
+            if (!IsWfpOption(args[index]))
+            {
+                std::wcerr << L"usage: !wfp [scope] [/module|/layer|/provider <value>]\n";
+                optionError = true;
+                break;
+            }
+
+            if (index + 1 >= args.size())
+            {
+                std::wcerr << L"usage: !wfp [scope] " << args[index] << L" <value>\n";
+                optionError = true;
+                break;
+            }
+
+            std::wstring optionName = ToLower(args[index]);
+            std::wstring optionValue = args[index + 1];
+            index += 2;
+
+            if (optionName == L"/module")
+            {
+                if (options.Target != WfpScanner::Scope::Callouts)
+                {
+                    std::wcerr << L"!wfp /module only applies to the callouts scope\n";
+                    optionError = true;
+                    break;
+                }
+                options.ModuleFilter = optionValue;
+            }
+            else if (optionName == L"/layer")
+            {
+                if (options.Target != WfpScanner::Scope::Filters)
+                {
+                    std::wcerr << L"!wfp /layer only applies to the filters scope\n";
+                    optionError = true;
+                    break;
+                }
+                options.LayerFilter = optionValue;
+            }
+            else if (optionName == L"/provider")
+            {
+                if (options.Target != WfpScanner::Scope::Filters)
+                {
+                    std::wcerr << L"!wfp /provider only applies to the filters scope\n";
+                    optionError = true;
+                    break;
+                }
+                options.ProviderFilter = optionValue;
+            }
+        }
+
+        if (optionError)
+        {
+            break;
+        }
+
+        WfpScanner scanner;
+        WfpScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!wfp scan failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!wfp warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!wfp warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"wfp records", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << result.Records.size();
+        std::wcout << L" scope=";
+        PrintColoredText(result.Scope, KNDBG_COLOR_OK);
+        if (!options.ModuleFilter.empty())
+        {
+            std::wcout << L" module=";
+            PrintColoredText(options.ModuleFilter, KNDBG_COLOR_OK);
+        }
+        if (!options.LayerFilter.empty())
+        {
+            std::wcout << L" layer=";
+            PrintColoredText(options.LayerFilter, KNDBG_COLOR_OK);
+        }
+        if (!options.ProviderFilter.empty())
+        {
+            std::wcout << L" provider=";
+            PrintColoredText(options.ProviderFilter, KNDBG_COLOR_OK);
+        }
+        std::wcout << L"\n";
+
+        for (const WfpRecord& record : result.Records)
+        {
+            PrintWfpRecord(record);
+        }
+    } while (false);
+}
+
+static void PrintAlpcHelp()
+{
+    std::wcout << L"!alpc command:\n";
+    std::wcout << L"  !alpc ports [/name <pattern>] [/pid <pid>]\n";
+    std::wcout << L"  !alpc port <address>\n";
+    std::wcout << L"  !alpc connections [/pid <pid>] [/name <pattern>]\n";
+    std::wcout << L"  !alpc queues <address>\n";
+    std::wcout << L"\n";
+    std::wcout << L"scopes:\n";
+    std::wcout << L"  ports        list ALPC ports discovered via Object Manager directory walk\n";
+    std::wcout << L"  port         show a single port at an explicit address\n";
+    std::wcout << L"  connections  group ports by ConnectionPort to render client/server pairings\n";
+    std::wcout << L"  queues       count MainQueue, PendingQueue, LargeMessageQueue, CanceledQueue, and WaitQueue entries for one port\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /name <pattern>  case-insensitive substring filter on port name or directory path\n";
+    std::wcout << L"  /pid <pid>       decimal owning-process PID filter (resolved through _ALPC_PORT.OwnerProcess)\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Discovery walks the Object Manager namespace from nt!ObpRootDirectoryObject and follows _ALPC_PORT.CommunicationInfo links to surface paired server/client ports.\n";
+    std::wcout << L"  Anonymous client ports that are never reachable from a named server port are not enumerated; handle-table walking is intentionally not yet implemented.\n";
+    std::wcout << L"  Queue counts are bounded list-entry walks and depend on PDB exposure of MainQueue/PendingQueue/LargeMessageQueue/CanceledQueue/WaitQueue.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !alpc ports\n";
+    std::wcout << L"  !alpc ports /name OLE\n";
+    std::wcout << L"  !alpc ports /pid 1234\n";
+    std::wcout << L"  !alpc port ffff8a8400000000\n";
+    std::wcout << L"  !alpc connections\n";
+    std::wcout << L"  !alpc queues ffff8a8400000000\n";
+}
+
+static void PrintAlpcPortHeader(const AlpcPortRecord& record)
+{
+    PrintColoredText(L"[alpc.port]", KNDBG_COLOR_TITLE);
+    std::wcout << L" address=";
+    PrintColoredText(HexTextWidth(record.Address, 16, true), KNDBG_COLOR_ACCENT);
+
+    if (!record.Name.empty())
+    {
+        std::wcout << L" name=\"";
+        PrintColoredText(record.Name, KNDBG_COLOR_OK);
+        std::wcout << L"\"";
+    }
+
+    if (record.IsConnectionPort)
+    {
+        std::wcout << L" role=connection";
+    }
+    else if (record.IsServerCommunicationPort)
+    {
+        std::wcout << L" role=server";
+    }
+    else if (record.IsClientCommunicationPort)
+    {
+        std::wcout << L" role=client";
+    }
+    else if (record.IsNamedDirectoryPort)
+    {
+        std::wcout << L" role=named";
+    }
+
+    std::wcout << L"\n";
+}
+
+static void PrintAlpcPortRecord(const AlpcPortRecord& record)
+{
+    PrintAlpcPortHeader(record);
+
+    if (!record.DirectoryPath.empty())
+    {
+        std::wcout << L"  path=" << record.DirectoryPath << L"\n";
+    }
+
+    if (record.HasOwnerProcess)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"owner", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(record.OwnerProcess, 16, true);
+        if (record.OwnerProcessId != 0)
+        {
+            std::wcout << L" pid=" << std::dec << record.OwnerProcessId;
+        }
+        if (!record.OwnerImageName.empty())
+        {
+            std::wcout << L" image=\"" << record.OwnerImageName << L"\"";
+        }
+        std::wcout << L"\n";
+    }
+
+    if (record.HasConnectionPort)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"connectionPort", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(record.ConnectionPort, 16, true) << L"\n";
+    }
+
+    if (record.HasCommunicationInfo)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"communicationInfo", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=" << HexTextWidth(record.CommunicationInfo, 16, true);
+        if (record.ServerCommunicationPort != 0)
+        {
+            std::wcout << L" server=" << HexTextWidth(record.ServerCommunicationPort, 16, true);
+        }
+        if (record.ClientCommunicationPort != 0)
+        {
+            std::wcout << L" client=" << HexTextWidth(record.ClientCommunicationPort, 16, true);
+        }
+        std::wcout << L"\n";
+    }
+
+    if (record.HasQueueData)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"queues", KNDBG_COLOR_ACCENT);
+        std::wcout << L" main=" << std::dec << record.MainQueueLength
+                   << L" pending=" << record.PendingQueueLength
+                   << L" large=" << record.LargeMessageQueueLength
+                   << L" canceled=" << record.CanceledQueueLength
+                   << L" wait=" << record.WaitQueueLength << L"\n";
+    }
+
+    if (record.Flags != 0)
+    {
+        std::wcout << L"  flags=0x" << std::hex << record.Flags << std::dec << L"\n";
+    }
+
+    if (!record.Notes.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"notes", KNDBG_COLOR_WARN);
+        std::wcout << L"=" << record.Notes << L"\n";
+    }
+}
+
+static void PrintAlpcConnectionGroups(const std::vector<AlpcPortRecord>& records)
+{
+    std::map<uint64_t, std::vector<const AlpcPortRecord*>> byConnection;
+    std::vector<const AlpcPortRecord*> orphans;
+
+    for (const AlpcPortRecord& record : records)
+    {
+        if (record.HasConnectionPort)
+        {
+            byConnection[record.ConnectionPort].push_back(&record);
+        }
+        else
+        {
+            orphans.push_back(&record);
+        }
+    }
+
+    PrintColoredText(L"alpc connection families", KNDBG_COLOR_TITLE);
+    std::wcout << L"=" << byConnection.size() << L" orphans=" << orphans.size() << L"\n";
+
+    for (const auto& group : byConnection)
+    {
+        std::wcout << L"\n";
+        PrintColoredText(L"connection=", KNDBG_COLOR_ACCENT);
+        std::wcout << HexTextWidth(group.first, 16, true) << L" members=" << group.second.size() << L"\n";
+
+        for (const AlpcPortRecord* port : group.second)
+        {
+            std::wcout << L"  ";
+            PrintColoredText(HexTextWidth(port->Address, 16, true), KNDBG_COLOR_ACCENT);
+
+            if (port->IsConnectionPort)
+            {
+                std::wcout << L" [connection]";
+            }
+            else if (port->IsServerCommunicationPort)
+            {
+                std::wcout << L" [server]";
+            }
+            else if (port->IsClientCommunicationPort)
+            {
+                std::wcout << L" [client]";
+            }
+
+            if (port->HasOwnerProcess)
+            {
+                std::wcout << L" pid=" << std::dec << port->OwnerProcessId;
+                if (!port->OwnerImageName.empty())
+                {
+                    std::wcout << L" image=\"" << port->OwnerImageName << L"\"";
+                }
+            }
+
+            if (!port->Name.empty())
+            {
+                std::wcout << L" name=\"" << port->Name << L"\"";
+            }
+
+            std::wcout << L"\n";
+        }
+    }
+
+    if (!orphans.empty())
+    {
+        std::wcout << L"\n";
+        PrintColoredText(L"unpaired ports", KNDBG_COLOR_WARN);
+        std::wcout << L"=" << orphans.size() << L"\n";
+        for (const AlpcPortRecord* port : orphans)
+        {
+            std::wcout << L"  " << HexTextWidth(port->Address, 16, true);
+            if (!port->Name.empty())
+            {
+                std::wcout << L" name=\"" << port->Name << L"\"";
+            }
+            std::wcout << L"\n";
+        }
+    }
+}
+
+static void HandleAlpcCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!alpc requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        AlpcScanner::Options options = {};
+        options.Target = AlpcScanner::Scope::Ports;
+
+        size_t index = 1;
+        if (index < args.size())
+        {
+            if (HasHelpToken(args, 1))
+            {
+                PrintAlpcHelp();
+                break;
+            }
+
+            if (IsAlpcScopeName(args[index]))
+            {
+                ResolveAlpcScope(args[index], &options.Target);
+                ++index;
+            }
+            else if (!IsAlpcOption(args[index]))
+            {
+                std::wcerr << L"usage: !alpc [ports|port|connections|queues] [options]\n";
+                PrintAlpcHelp();
+                break;
+            }
+        }
+
+        if (options.Target == AlpcScanner::Scope::Port || options.Target == AlpcScanner::Scope::Queues)
+        {
+            if (index >= args.size())
+            {
+                std::wcerr << L"usage: !alpc " << (options.Target == AlpcScanner::Scope::Port ? L"port" : L"queues") << L" <address>\n";
+                break;
+            }
+
+            uint64_t address = 0;
+            std::wstring parseError;
+            if (!ParseAddressOrSymbol(symbols, state, args[index], &address, &parseError))
+            {
+                std::wcerr << L"!alpc address parse failed: " << parseError << L"\n";
+                break;
+            }
+
+            options.Address = address;
+            options.HasAddress = true;
+            ++index;
+        }
+
+        bool optionError = false;
+        while (index < args.size())
+        {
+            if (IsHelpToken(args[index]))
+            {
+                PrintAlpcHelp();
+                optionError = true;
+                break;
+            }
+
+            if (!IsAlpcOption(args[index]))
+            {
+                std::wcerr << L"usage: !alpc [scope] [/name <pattern>] [/pid <pid>]\n";
+                optionError = true;
+                break;
+            }
+
+            if (index + 1 >= args.size())
+            {
+                std::wcerr << L"usage: !alpc [scope] " << args[index] << L" <value>\n";
+                optionError = true;
+                break;
+            }
+
+            std::wstring optionName = ToLower(args[index]);
+            std::wstring optionValue = args[index + 1];
+            index += 2;
+
+            if (optionName == L"/name")
+            {
+                if (options.Target == AlpcScanner::Scope::Queues)
+                {
+                    std::wcerr << L"!alpc /name does not apply to the queues scope\n";
+                    optionError = true;
+                    break;
+                }
+                options.NameFilter = optionValue;
+            }
+            else if (optionName == L"/pid")
+            {
+                uint64_t pid = 0;
+                if (!ParseUnsigned(optionValue, 10, &pid))
+                {
+                    std::wcerr << L"!alpc /pid expects a decimal process id\n";
+                    optionError = true;
+                    break;
+                }
+
+                options.PidFilter = pid;
+                options.HasPidFilter = true;
+            }
+        }
+
+        if (optionError)
+        {
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!alpc scan failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        AlpcScanner scanner(device, symbols);
+        AlpcScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!alpc scan failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!alpc warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!alpc warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"alpc records", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << result.Records.size();
+        if (result.TypeIndexResolved)
+        {
+            std::wcout << L" typeIndex=0x" << std::hex << static_cast<uint32_t>(result.AlpcPortTypeIndex) << std::dec;
+            std::wcout << L" objectType=" << HexTextWidth(result.AlpcPortTypeAddress, 16, true);
+        }
+        if (!options.NameFilter.empty())
+        {
+            std::wcout << L" name=\"" << options.NameFilter << L"\"";
+        }
+        if (options.HasPidFilter)
+        {
+            std::wcout << L" pid=" << std::dec << options.PidFilter;
+        }
+        std::wcout << L"\n";
+
+        if (options.Target == AlpcScanner::Scope::Connections)
+        {
+            PrintAlpcConnectionGroups(result.Records);
+            break;
+        }
+
+        for (const AlpcPortRecord& record : result.Records)
+        {
+            PrintAlpcPortRecord(record);
+        }
+    } while (false);
+}
+
 static void HandleUnassembleCommand(
     const std::vector<std::wstring>& args,
     const std::wstring& originalLine,
@@ -10091,6 +10973,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"!dml_proc")
         {
             PrintDmlProcHelp();
+        }
+        else if (command == L"!wfp")
+        {
+            PrintWfpHelp();
+        }
+        else if (command == L"!alpc")
+        {
+            PrintAlpcHelp();
         }
         else if (command == L"vtop")
         {
@@ -11648,6 +12538,18 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!wfp")
+            {
+                commandClass = L"wfp";
+                break;
+            }
+
+            if (command == L"!alpc")
+            {
+                commandClass = L"alpc";
+                break;
+            }
+
             commandClass = L"dbgeng";
             break;
         }
@@ -11677,6 +12579,18 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"!dml_proc")
         {
             commandClass = L"process";
+            break;
+        }
+
+        if (command == L"!wfp")
+        {
+            commandClass = L"wfp";
+            break;
+        }
+
+        if (command == L"!alpc")
+        {
+            commandClass = L"alpc";
             break;
         }
 
@@ -12204,6 +13118,105 @@ static bool ValidateAiPlanArgumentShape(
                 }
             }
         }
+        else if (command == L"!wfp")
+        {
+            size_t index = 1;
+            if (index < args.size())
+            {
+                if (!IsWfpScopeName(args[index]) && !IsWfpOption(args[index]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!wfp scope must be providers, sublayers, callouts, filters, or layers";
+                    }
+                    break;
+                }
+
+                if (IsWfpScopeName(args[index]))
+                {
+                    ++index;
+                }
+            }
+
+            bool optionShapeOk = true;
+            while (index < args.size())
+            {
+                if (!IsWfpOption(args[index]) || index + 1 >= args.size())
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!wfp option requires /module|/layer|/provider followed by a value";
+                    }
+                    optionShapeOk = false;
+                    break;
+                }
+                index += 2;
+            }
+
+            if (!optionShapeOk)
+            {
+                break;
+            }
+        }
+        else if (command == L"!alpc")
+        {
+            size_t index = 1;
+            bool requiresAddress = false;
+            if (index < args.size())
+            {
+                if (!IsAlpcScopeName(args[index]) && !IsAlpcOption(args[index]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!alpc scope must be ports, port, connections, or queues";
+                    }
+                    break;
+                }
+
+                if (IsAlpcScopeName(args[index]))
+                {
+                    std::wstring lowered = ToLower(args[index]);
+                    if (lowered == L"port" || lowered == L"queues")
+                    {
+                        requiresAddress = true;
+                    }
+                    ++index;
+                }
+            }
+
+            if (requiresAddress)
+            {
+                if (index >= args.size() || IsAlpcOption(args[index]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!alpc port|queues requires an address argument";
+                    }
+                    break;
+                }
+                ++index;
+            }
+
+            bool optionShapeOk = true;
+            while (index < args.size())
+            {
+                if (!IsAlpcOption(args[index]) || index + 1 >= args.size())
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!alpc option requires /name|/pid followed by a value";
+                    }
+                    optionShapeOk = false;
+                    break;
+                }
+                index += 2;
+            }
+
+            if (!optionShapeOk)
+            {
+                break;
+            }
+        }
 
         ok = true;
     } while (false);
@@ -12463,7 +13476,7 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"]}\n";
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
-    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !wfp, !alpc, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
     stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
@@ -14990,6 +16003,8 @@ static bool ParseAiCapabilityPlanResponse(
                 step.Tool != L"process.describe" &&
                 step.Tool != L"type.describe" &&
                 step.Tool != L"callbacks.list" &&
+                step.Tool != L"wfp.list" &&
+                step.Tool != L"alpc.list" &&
                 step.Tool != L"assistant.answer")
             {
                 if (error != nullptr)
@@ -15023,13 +16038,15 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
     stream << L"- process.describe: print process fields. Args: source like \"$0\" or image/pid/eprocess, fields array. Supported fields: pid,image,eprocess,dtb,userdtb,peb,ppid,threads,all.\n";
     stream << L"- type.describe: dump a structure with dt. Args: source like \"$0\" or address/eprocess, type string, fields array of type field names. For process source, use each record EPROCESS address.\n";
     stream << L"- callbacks.list: list kernel callbacks. Args: scope string and optional module string. Supported scopes: all,object,registry,process,thread,imageload,minifilter.\n";
+    stream << L"- wfp.list: list Windows Filtering Platform objects via fwpuclnt.dll. Args: scope (providers,sublayers,callouts,filters,layers; defaults to callouts), optional module (callouts/filters provider name or GUID), optional layer (filters only).\n";
+    stream << L"- alpc.list: list ALPC ports discovered via Object Manager directory walk and CommunicationInfo links. Args: scope (ports,connections; defaults to ports), optional name substring, optional pid filter as decimal string.\n";
     stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
     stream << L"Rules:\n";
     stream << L"- Use only these tools. Do not emit debugger commands.\n";
@@ -15038,6 +16055,8 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For PID/EPROCESS/DTB/PEB answers, prefer process.describe.\n";
     stream << L"- For full _EPROCESS layout at the found process, use type.describe with type \"nt!_EPROCESS\" and source \"$0\".\n";
     stream << L"- For callback requests such as object callbacks for WdFilter.sys, use callbacks.list with scope \"object\" and module \"WdFilter.sys\".\n";
+    stream << L"- For WFP questions such as callouts owned by tcpip or filters in the ALE auth connect layer, use wfp.list with the appropriate scope and module/layer.\n";
+    stream << L"- For ALPC questions such as listing named ports or pairing csrss/lsass connections, use alpc.list with scope ports or connections and optional name/pid filters.\n";
     stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
     stream << L"Operator request:\n";
     stream << query << L"\n";
@@ -15341,6 +16360,189 @@ static std::wstring NormalizeAiCapabilityCallbackScope(const std::wstring& value
     return scope;
 }
 
+static bool ExecuteAiCapabilityAlpcList(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring scope;
+        ExtractJsonStringValue(step.ArgsJson, L"scope", &scope);
+        scope = ToLower(TrimWhitespace(scope));
+        if (scope.empty())
+        {
+            scope = L"ports";
+        }
+
+        if (scope != L"ports" && scope != L"connections")
+        {
+            if (error != nullptr)
+            {
+                *error = L"alpc.list scope must be ports or connections";
+            }
+            break;
+        }
+
+        std::wstring name;
+        ExtractJsonStringValue(step.ArgsJson, L"name", &name);
+        name = TrimWhitespace(name);
+
+        std::wstring pidText;
+        ExtractJsonStringValue(step.ArgsJson, L"pid", &pidText);
+        pidText = TrimWhitespace(pidText);
+
+        std::wstring unsafeReason;
+        if (!name.empty() && (ContainsUnsafeAiCommandCharacters(name, &unsafeReason) || IsHelpToken(name)))
+        {
+            if (error != nullptr)
+            {
+                *error = unsafeReason.empty() ? L"invalid alpc name filter" : unsafeReason;
+            }
+            break;
+        }
+
+        unsafeReason.clear();
+        if (!pidText.empty() && (ContainsUnsafeAiCommandCharacters(pidText, &unsafeReason) || IsHelpToken(pidText)))
+        {
+            if (error != nullptr)
+            {
+                *error = unsafeReason.empty() ? L"invalid alpc pid filter" : unsafeReason;
+            }
+            break;
+        }
+
+        if (!pidText.empty())
+        {
+            uint64_t pid = 0;
+            if (!ParseUnsigned(pidText, 10, &pid))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"alpc.list pid must be a decimal process id";
+                }
+                break;
+            }
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!alpc");
+        args.push_back(scope);
+        if (!name.empty())
+        {
+            args.push_back(L"/name");
+            args.push_back(name);
+        }
+        if (!pidText.empty())
+        {
+            args.push_back(L"/pid");
+            args.push_back(pidText);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": alpc.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleAlpcCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityWfpList(
+    const AiCapabilityStep& step,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring scope;
+        ExtractJsonStringValue(step.ArgsJson, L"scope", &scope);
+        scope = ToLower(TrimWhitespace(scope));
+        if (scope.empty())
+        {
+            scope = L"callouts";
+        }
+
+        WfpScanner::Scope target = WfpScanner::Scope::Callouts;
+        if (!ResolveWfpScope(scope, &target))
+        {
+            if (error != nullptr)
+            {
+                *error = L"unsupported wfp scope: " + scope;
+            }
+            break;
+        }
+
+        std::wstring module;
+        if (!ExtractJsonStringValue(step.ArgsJson, L"module", &module))
+        {
+            ExtractJsonStringValue(step.ArgsJson, L"provider", &module);
+        }
+        module = TrimWhitespace(module);
+
+        std::wstring layer;
+        ExtractJsonStringValue(step.ArgsJson, L"layer", &layer);
+        layer = TrimWhitespace(layer);
+
+        std::wstring unsafeReason;
+        if (!module.empty() && (ContainsUnsafeAiCommandCharacters(module, &unsafeReason) || IsHelpToken(module)))
+        {
+            if (error != nullptr)
+            {
+                *error = unsafeReason.empty() ? L"invalid wfp module filter" : unsafeReason;
+            }
+            break;
+        }
+
+        unsafeReason.clear();
+        if (!layer.empty() && (ContainsUnsafeAiCommandCharacters(layer, &unsafeReason) || IsHelpToken(layer)))
+        {
+            if (error != nullptr)
+            {
+                *error = unsafeReason.empty() ? L"invalid wfp layer filter" : unsafeReason;
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!wfp");
+        args.push_back(scope);
+        if (!module.empty())
+        {
+            if (target == WfpScanner::Scope::Callouts)
+            {
+                args.push_back(L"/module");
+                args.push_back(module);
+            }
+            else if (target == WfpScanner::Scope::Filters)
+            {
+                args.push_back(L"/provider");
+                args.push_back(module);
+            }
+        }
+
+        if (!layer.empty() && target == WfpScanner::Scope::Filters)
+        {
+            args.push_back(L"/layer");
+            args.push_back(layer);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": wfp.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleWfpCommand(args);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ExecuteAiCapabilityCallbacksList(
     const AiCapabilityStep& step,
     DeviceClient& device,
@@ -15439,6 +16641,14 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"callbacks.list")
             {
                 stepOk = ExecuteAiCapabilityCallbacksList(step, device, symbols, error);
+            }
+            else if (step.Tool == L"wfp.list")
+            {
+                stepOk = ExecuteAiCapabilityWfpList(step, error);
+            }
+            else if (step.Tool == L"alpc.list")
+            {
+                stepOk = ExecuteAiCapabilityAlpcList(step, state, device, symbols, error);
             }
             else if (step.Tool == L"assistant.answer")
             {
@@ -16649,6 +17859,14 @@ static bool HandleCommand(
         else if (command == L"!dml_proc")
         {
             HandleDmlProcCommand(args, state, device, symbols);
+        }
+        else if (command == L"!wfp")
+        {
+            HandleWfpCommand(args);
+        }
+        else if (command == L"!alpc")
+        {
+            HandleAlpcCommand(args, state, device, symbols);
         }
         else if (IsPhysicalDisplayCommand(command))
         {

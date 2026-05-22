@@ -54,6 +54,8 @@ kn-live-dbg/
 19. Supports DbgEng local-kernel and remote-kernel attach modes through `kdinit /local` and `kdinit /remote`.
 20. Falls back to DIA SDK type parsing when `DbgHelp` cannot provide enough UDT/field metadata.
 21. Builds and manages `KnLiveDbgProbe.sys`, a positive-control test driver with known virtual and physical buffer addresses.
+22. Enumerates Windows Filtering Platform providers, sublayers, callouts, filters, and layers natively through the user-mode Base Filtering Engine (`fwpuclnt.dll`) with `!wfp`, including layer/provider/sublayer name resolution and decoded action/flag mnemonics.
+23. Enumerates ALPC ports natively from live kernel memory with `!alpc`, recursively walking the Object Manager namespace from `nt!ObpRootDirectoryObject`, following `_ALPC_PORT.CommunicationInfo` to discover paired server/client ports, counting queue depths from `MainQueue`/`PendingQueue`/`LargeMessageQueue`/`CanceledQueue`/`WaitQueue`, and grouping records by `ConnectionPort` into client/server families.
 
 ## Design Notes
 
@@ -169,6 +171,12 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 callbacks [scope] /module <module>
 !dml_proc [pid]
+!wfp [providers|sublayers|callouts|filters|layers]
+!wfp callouts /module <name|GUID>
+!wfp filters /layer <name|GUID> /provider <name|GUID>
+!alpc [ports|port|connections|queues] [/name <pattern>] [/pid <pid>]
+!alpc port <address>
+!alpc queues <address>
 ai <question>
 ai status
 ai config [status|providers|provider|policy|model|base-url|effort|auth|test]
@@ -232,6 +240,14 @@ knkd> callbacks all WdFilter.sys
 knkd> callbacks /module WdFilter.sys
 knkd> !dml_proc
 knkd> !dml_proc 4
+knkd> !wfp providers
+knkd> !wfp callouts /module tcpip
+knkd> !wfp filters /layer ALE_AUTH_CONNECT_V4
+knkd> !wfp layers
+knkd> !alpc ports
+knkd> !alpc connections
+knkd> !alpc ports /name OLE
+knkd> !alpc queues ffff8a8400000000
 knkd> ai config provider openai-codex-cli
 knkd> ai config test
 knkd> ai a.exe eprocess
@@ -319,7 +335,7 @@ Supported keys:
 
 Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
 
-For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The first catalog includes `process.find`, `process.describe`, `type.describe`, and `callbacks.list`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback prompts such as `ai WdFilter.sys object callbacks` can become a validated `callbacks object WdFilter.sys` run through the native callback scanner. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
+For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The first catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, and `alpc.list`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback prompts such as `ai WdFilter.sys object callbacks` can become a validated `callbacks object WdFilter.sys` run through the native callback scanner, and prompts such as `ai tcpip wfp callouts`, `ai wfp filters ALE_AUTH_CONNECT_V4`, `ai alpc named ports`, or `ai alpc lsass connections` route through `!wfp` or `!alpc` with the matching scope, filters, and pid arguments. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
 
 `ai plan <prompt>` asks the selected model to return a strict `kn-live-dbg.ai-plan.v2` command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose, risk, backend, and expected-output notes. Empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. `ai explain <read-only-command...>` runs a read-only evidence command, preserves stdout/stderr, adds a deterministic output summary, then asks the selected model for analysis. It has tuned prompts for `callbacks`, `dt`/`dtx`, and `u`/`uf`, so the older `ai analyze callbacks` and `ai annotate` flows are now covered by the shorter explain form.
 
@@ -340,7 +356,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!wfp`, `!alpc`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -424,6 +440,69 @@ The scanner currently covers:
 
 Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Image-load output uses `function` for the `PLOAD_IMAGE_NOTIFY_ROUTINE` owner and reports the decoded notify block plus raw encoded slot value. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `callbacks object WdFilter.sys` or `callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
 
+## Windows Filtering Platform
+
+`!wfp` enumerates Windows Filtering Platform objects natively through the user-mode Base Filtering Engine (`fwpuclnt.dll`) and does not require the kernel driver to be open:
+
+```text
+!wfp providers
+!wfp sublayers
+!wfp callouts
+!wfp callouts /module tcpip
+!wfp filters
+!wfp filters /layer ALE_AUTH_CONNECT_V4
+!wfp filters /provider WdFilter
+!wfp layers
+```
+
+The scanner opens an engine handle with `FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr, nullptr, &engine)`, builds in-memory provider, layer, and sublayer indexes from `FwpmProviderEnum0`, `FwpmLayerEnum0`, and `FwpmSubLayerEnum0`, then enumerates the requested scope through the matching `FwpmXxxCreateEnumHandle0` / `FwpmXxxEnum0` / `FwpmXxxDestroyEnumHandle0` cycle. Each page-sized batch is freed with `FwpmFreeMemory0` before the next page.
+
+Output kinds and decoded fields:
+
+1. `[wfp.provider]` shows provider key GUID, display name, decoded persistent/disabled flag mnemonics, optional service name, and optional description.
+2. `[wfp.sublayer]` shows sublayer key GUID, display name, 16-bit weight, owning provider name plus service name when set, and persistent flag mnemonics.
+3. `[wfp.callout]` shows callout key GUID, display name, runtime `calloutId`, applicable layer name and GUID, owning provider, and decoded persistent/usesProviderContext/registered flag mnemonics.
+4. `[wfp.filter]` shows runtime `filterId`, filter key GUID, action type (`Block`, `Permit`, `CalloutTerminating`, `CalloutInspection`, `CalloutUnknown`, `Continue`, `None`, `NoneNoMatch`, `BitmaskPermit`, `BitmaskBlock`) with optional `calloutKey`, weight rendered from the underlying `FWP_VALUE0`, condition count, layer, sublayer, owning provider, and decoded filter flag mnemonics.
+5. `[wfp.layer]` shows layer key GUID, layer name, 16-bit `layerId`, and decoded `kernel|builtin|classifyMostly|buffered` flag mnemonics.
+
+`!wfp callouts /module <name|GUID>` filters callouts by the owning provider's service name (case-insensitive substring), display name, or `providerKey` GUID. `!wfp filters /layer <name|GUID>` filters filters by layer display-name substring or `layerKey` GUID, and `/provider` applies the same provider matching as `/module` for filters.
+
+The user-mode `FWPM_CALLOUT0` shape intentionally does not include kernel-mode callout function pointers, so `!wfp` resolves callout ownership through `providerKey` → provider `serviceName` rather than by matching function pointers against loaded module ranges. Documented kernel-side walking of `netio.sys` internal tables is reserved for a later milestone; the user-mode path requires only that the Base Filtering Engine (`BFE`) service is running.
+
+`wfp.list` is also wired as a local AI capability tool. `ai <question>` planning can choose it with optional `scope` and `module`/`layer` arguments, and the executor runs it through the same shape validation used for plan commands.
+
+## ALPC Port Enumeration
+
+`!alpc` walks live kernel memory through `KnLiveDbg.sys` and PDB type metadata to enumerate ALPC ports, render server/client connection families, and count queue depths:
+
+```text
+!alpc ports
+!alpc ports /name OLE
+!alpc ports /pid 1234
+!alpc port ffff8a8400000000
+!alpc connections
+!alpc queues ffff8a8400000000
+```
+
+Discovery flow:
+
+1. `nt!ObTypeIndexTable` is enumerated to find the `ALPC Port` and `Directory` `_OBJECT_TYPE` instances and their type indices.
+2. `nt!ObHeaderCookie` is resolved when present; on builds without it the scanner records a warning and falls back to raw `_OBJECT_HEADER.TypeIndex` comparisons.
+3. `nt!ObpRootDirectoryObject` is read, then the scanner recurses through `_OBJECT_DIRECTORY.HashBuckets[]` with bounded depth and a visited-directory cycle guard, decoding each entry's `_OBJECT_HEADER.TypeIndex` with the per-object XOR formula (`raw ^ cookie ^ ((header_addr >> 8) & 0xff)`).
+4. For each `ALPC Port` body the scanner reads `OwnerProcess`, `ConnectionPort`, `CommunicationInfo`, and `Flags` from PDB-resolved offsets, then follows `_ALPC_COMMUNICATION_INFO.ConnectionPort`, `ServerCommunicationPort`, and `ClientCommunicationPort` to surface paired server/client ports that are not themselves named in the directory tree.
+5. Owner annotations resolve `_EPROCESS.UniqueProcessId` and `ImageFileName` for each port whose `OwnerProcess` lies in the kernel canonical range.
+
+Subcommand behavior:
+
+1. `!alpc ports` lists every discovered port with role tag (`connection`/`server`/`client`/`named`), name, owning process, `ConnectionPort`, and `CommunicationInfo` linkage. `/name <pattern>` filters by case-insensitive substring on port name or full directory path, and `/pid <pid>` filters by decimal owning-process PID.
+2. `!alpc port <address>` prints the single port whose address matches and includes queue depths.
+3. `!alpc connections` groups all discovered ports by `ConnectionPort` to render server/client family graphs, with an explicit `unpaired ports` section for ports that have no `ConnectionPort` set.
+4. `!alpc queues <address>` performs bounded `_LIST_ENTRY` walks on `MainQueue`, `PendingQueue`, `LargeMessageQueue`, `CanceledQueue`, and `WaitQueue`. `_KQUEUE` fields (typically `WaitQueue`) are detected by PDB type name and the dispatcher header is skipped before list walking.
+
+The scanner only enumerates ports reachable through the Object Manager directory tree and through `CommunicationInfo` chains hanging off those named ports. Anonymous client ports that never receive a connection through a named server port are intentionally not enumerated; documented handle-table walking is reserved for a later milestone.
+
+`alpc.list` is also wired as a local AI capability tool. `ai <question>` planning can choose it with optional `scope` (`ports` or `connections`), `name` substring, and `pid` decimal arguments, and the executor runs it through the same shape validation used for plan commands.
+
 ## Virtual-To-Physical And Physical Memory
 
 Native physical memory support is intentionally explicit:
@@ -475,3 +554,5 @@ The buffer pattern is `(index * 13 + 0x5a) & 0xff`. `probe info` prints both the
 8. Do not hard-code kernel structure offsets for production use; resolve them from symbols at runtime.
 9. Live loading requires test-signing or another valid code integrity path.
 10. Native mode intentionally differs from full WinDbg for commands that stop or control the target. Use `backend dbgeng` for DbgEng-backed command execution, and still expect local-kernel debugging limitations.
+11. `!wfp` requires a healthy Base Filtering Engine (`BFE`) service for the user-mode `FwpmEngineOpen0` path; it does not enumerate WFP state from a hung BFE or a dead system, and it does not surface kernel-mode callout function pointers because the user-mode `FWPM_CALLOUT0` shape does not expose them.
+12. `!alpc` enumerates only ports reachable through the Object Manager namespace and through `_ALPC_PORT.CommunicationInfo` linkage; anonymous client ports that never reach a named server port are not enumerated, and queue counts depend on PDB exposure of the per-port `MainQueue`/`PendingQueue`/`LargeMessageQueue`/`CanceledQueue`/`WaitQueue` fields. PDB drift in `_ALPC_PORT` may produce a warning and reduce the field set rather than aborting the scan.

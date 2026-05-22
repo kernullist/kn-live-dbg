@@ -96,6 +96,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AiProvider.cpp" />
+    <ClCompile Include="AlpcScanner.cpp" />
     <ClCompile Include="CallbackScanner.cpp" />
     <ClCompile Include="CommandRegistry.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
@@ -104,6 +105,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
+    <ClCompile Include="WfpScanner.cpp" />
     <ClCompile Include="..\third_party\zydis\amalgamated\Zydis.c">
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
@@ -113,6 +115,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AiProvider.h" />
+    <ClInclude Include="AlpcScanner.h" />
     <ClInclude Include="CallbackScanner.h" />
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="DbgEngBackend.h" />
@@ -120,6 +123,7 @@
     <ClInclude Include="DriverService.h" />
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="SymbolEngine.h" />
+    <ClInclude Include="WfpScanner.h" />
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgVersion.h" />
