@@ -102,9 +102,12 @@
     <ClCompile Include="DbgEngBackend.cpp" />
     <ClCompile Include="DeviceClient.cpp" />
     <ClCompile Include="DriverService.cpp" />
+    <ClCompile Include="EtwScanner.cpp" />
+    <ClCompile Include="NmiScanner.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
+    <ClCompile Include="VbsScanner.cpp" />
     <ClCompile Include="WfpScanner.cpp" />
     <ClCompile Include="..\third_party\zydis\amalgamated\Zydis.c">
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
@@ -121,8 +124,11 @@
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />
     <ClInclude Include="DriverService.h" />
+    <ClInclude Include="EtwScanner.h" />
     <ClInclude Include="NativeDisassembler.h" />
+    <ClInclude Include="NmiScanner.h" />
     <ClInclude Include="SymbolEngine.h" />
+    <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="WfpScanner.h" />
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h" />

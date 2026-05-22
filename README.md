@@ -56,6 +56,8 @@ kn-live-dbg/
 21. Builds and manages `KnLiveDbgProbe.sys`, a positive-control test driver with known virtual and physical buffer addresses.
 22. Enumerates Windows Filtering Platform providers, sublayers, callouts, filters, and layers natively through the user-mode Base Filtering Engine (`fwpuclnt.dll`) with `!wfp`, including layer/provider/sublayer name resolution and decoded action/flag mnemonics.
 23. Enumerates ALPC ports natively from live kernel memory with `!alpc`, recursively walking the Object Manager namespace from `nt!ObpRootDirectoryObject`, following `_ALPC_PORT.CommunicationInfo` to discover paired server/client ports, counting queue depths from `MainQueue`/`PendingQueue`/`LargeMessageQueue`/`CanceledQueue`/`WaitQueue`, and grouping records by `ConnectionPort` into client/server families.
+24. Reports VBS, HVCI, Secure Kernel, and IUM trustlet status with `!vbs`, `!ci`, and `!securekernel` — decoding `nt!g_CiOptions` flag bits, reading `nt!HvlpVsmVtlCallVa` for VBS active state, scanning `PsLoadedModuleList` for `securekernel.exe`/`skci.dll`, querying CPUID leaves `0x40000000`/`0x40000006` for hypervisor identification, and walking `PsActiveProcessHead` with `_KPROCESS.SecureState` (or known trustlet image-name prefixes when the field is unavailable) for the trustlet list.
+25. Detects InfinityHook-style ETW logger tampering with `!etw` and walks the registered NMI handler chain with `!nmi` — reading `nt!EtwpDebuggerData`'s 64 `WMI_LOGGER_CONTEXT*` slots for logger name and GetCpuClock annotation, walking `nt!KiNmiCallbackListHead` through the `KNMI_HANDLER_CALLBACK` singly-linked list, and flagging any callback or GetCpuClock target outside the loaded kernel modules.
 
 ## Design Notes
 
@@ -177,6 +179,11 @@ callbacks [scope] /module <module>
 !alpc [ports|port|connections|queues] [/name <pattern>] [/pid <pid>]
 !alpc port <address>
 !alpc queues <address>
+!vbs
+!ci [options|policy]
+!securekernel
+!etw [loggers|logger <index|name>]
+!nmi [callbacks]
 ai <question>
 ai status
 ai config [status|providers|provider|policy|model|base-url|effort|auth|test]
@@ -248,6 +255,13 @@ knkd> !alpc ports
 knkd> !alpc connections
 knkd> !alpc ports /name OLE
 knkd> !alpc queues ffff8a8400000000
+knkd> !vbs
+knkd> !ci options
+knkd> !ci policy
+knkd> !securekernel
+knkd> !etw loggers
+knkd> !etw logger "Circular Kernel Context Logger"
+knkd> !nmi callbacks
 knkd> ai config provider openai-codex-cli
 knkd> ai config test
 knkd> ai a.exe eprocess
@@ -335,7 +349,7 @@ Supported keys:
 
 Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
 
-For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The first catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, and `alpc.list`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback prompts such as `ai WdFilter.sys object callbacks` can become a validated `callbacks object WdFilter.sys` run through the native callback scanner, and prompts such as `ai tcpip wfp callouts`, `ai wfp filters ALE_AUTH_CONNECT_V4`, `ai alpc named ports`, or `ai alpc lsass connections` route through `!wfp` or `!alpc` with the matching scope, filters, and pid arguments. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
+For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The first catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, and `alpc.list`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback prompts such as `ai WdFilter.sys object callbacks` can become a validated `callbacks object WdFilter.sys` run through the native callback scanner, and prompts such as `ai tcpip wfp callouts`, `ai wfp filters ALE_AUTH_CONNECT_V4`, `ai alpc named ports`, or `ai alpc lsass connections` route through `!wfp` or `!alpc` with the matching scope, filters, and pid arguments. VBS/HVCI/CI/Secure Kernel questions such as `ai is HVCI on?`, `ai decode CiOptions`, or `ai list IUM trustlets` are routed through `ai plan` to the native `!vbs`, `!ci options`, and `!securekernel` commands. ETW/NMI questions such as `ai any suspicious ETW logger hooks?` or `ai list NMI callbacks` plan into `!etw loggers` and `!nmi callbacks`. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
 
 `ai plan <prompt>` asks the selected model to return a strict `kn-live-dbg.ai-plan.v2` command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose, risk, backend, and expected-output notes. Empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. `ai explain <read-only-command...>` runs a read-only evidence command, preserves stdout/stderr, adds a deterministic output summary, then asks the selected model for analysis. It has tuned prompts for `callbacks`, `dt`/`dtx`, and `u`/`uf`, so the older `ai analyze callbacks` and `ai annotate` flows are now covered by the shorter explain form.
 
@@ -356,7 +370,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!wfp`, `!alpc`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -503,6 +517,62 @@ The scanner only enumerates ports reachable through the Object Manager directory
 
 `alpc.list` is also wired as a local AI capability tool. `ai <question>` planning can choose it with optional `scope` (`ports` or `connections`), `name` substring, and `pid` decimal arguments, and the executor runs it through the same shape validation used for plan commands.
 
+## VBS / HVCI / Secure Kernel Status
+
+`!vbs`, `!ci`, and `!securekernel` reuse `KnLiveDbg.sys` virtual reads and PDB type metadata to report the state of Virtualization-Based Security, HVCI, the Secure Kernel, and Isolated User Mode (IUM) trustlets:
+
+```text
+!vbs
+!ci
+!ci options
+!ci policy
+!securekernel
+```
+
+Data sources:
+
+1. `nt!g_CiOptions` (or `ci!g_CiOptions`, or legacy `nt!CiOptions`) is read as a `UINT32` and decoded into `CODEINTEGRITY_OPTION_ENABLED`, `TESTSIGN`, `UMCI_ENABLED`, `UMCI_AUDITMODE_ENABLED`, `HVCI_ENFORCED`, `UMCI_EXCLUSIONPATHS_ENABLED`, `TEST_BUILD`, `PREPRODUCTION_BUILD`, `FLIGHT_BUILD`, `HVCI_STRICT_MODE`, and `HVCI_DEBUG_MODE`.
+2. `nt!HvlpVsmVtlCallVa` (or the equivalent build-specific alias) is read as a pointer; a non-zero kernel-canonical value indicates VBS is active and the VTL call code page is mapped.
+3. `nt!HvcallpVtlCallStub` (or the equivalent alias) is resolved as a secondary VBS marker.
+4. `PsLoadedModuleList` is scanned for `securekernel.exe` and `skci.dll` to confirm Secure Kernel runtime presence.
+5. User-mode `CPUID` is queried at leaf `0x40000000` (hypervisor vendor signature), and at leaf `0x40000006` when supported (raw implementation hardware features). MBEC enablement cannot be confirmed from user mode because it lives in `IA32_VMX_PROCBASED_CTLS2` bit 22; the report annotates that limitation and treats HVCI enforcement as a proxy.
+6. `PsActiveProcessHead` is walked through `_EPROCESS.ActiveProcessLinks`. For each process, `_EPROCESS.SecureState` (or `_KPROCESS.SecureState` when the field is exposed through the embedded `Pcb`) is read; bit 0 (`SecureKernelInProcess`) flags IUM trustlets. When that field is not present in the loaded PDB, the scanner falls back to well-known trustlet image-name prefixes (`lsaiso`, `bioiso`, `securesystem`, `kdcustomization`) which already handle `_EPROCESS.ImageFileName` being truncated to 15 bytes.
+
+Subcommand behavior:
+
+1. `!vbs` prints a `[vbs.core]` summary line, the `[ci.options]` block with raw value and decoded mnemonics, the `[vbs.hypervisor]` block with vendor signature and CPUID leaf info, the `[securekernel.modules]` list, and the `[securekernel.trustlets]` list.
+2. `!ci` (or `!ci options`) prints the `[ci.options]` and `[vbs.hypervisor]` blocks; `!ci policy` additionally prints a `[ci.policy]` summary noting that full WDAC policy blob discovery requires private CI internals.
+3. `!securekernel` prints the `[securekernel.modules]` and `[securekernel.trustlets]` lists.
+
+WDAC policy blob extraction is intentionally deferred; the doc-listed `CI!g_CiPolicies`/`CiValidateImageHeader` path requires private layouts that the scanner does not yet trust enough to commit to.
+
+## ETW Logger Hooks And NMI Callbacks
+
+`!etw` and `!nmi` provide self-check coverage for two surfaces commonly used by InfinityHook-style rootkits and NMI-based stack inspection drivers:
+
+```text
+!etw loggers
+!etw logger 0
+!etw logger "Circular Kernel Context Logger"
+!nmi
+!nmi callbacks
+```
+
+ETW logger flow:
+
+1. `nt!EtwpDebuggerData` is resolved through the loaded kernel PDB, and 64 `WMI_LOGGER_CONTEXT*` pointers are read from offset `0x10`.
+2. For each non-null logger context, `_WMI_LOGGER_CONTEXT.LoggerName` (UNICODE_STRING) and `_WMI_LOGGER_CONTEXT.GetCpuClock` (function pointer) are read using PDB-resolved field offsets when the type is exposed, or fallback offsets `0x68` (LoggerName) and `0x28` (GetCpuClock) otherwise. A warning is emitted when the fallback path is taken because those offsets drift across builds.
+3. Each `GetCpuClock` target is annotated with its owning module and nearest symbol. Pointers that do not land inside any loaded kernel module are flagged with `[SUSPICIOUS]`, which is the canonical InfinityHook indicator (`GetCpuClock` rewritten to point at attacker-controlled code outside `nt`/`hal`).
+4. `!etw logger <index>` accepts a decimal slot index (0..63); `!etw logger <name-substring>` filters by case-insensitive substring on the logger name.
+
+NMI callback flow:
+
+1. `nt!KiNmiCallbackListHead` (with `nt!KiNmiCallbackList` as a fallback alias) is resolved through the loaded kernel PDB and read as a `PKNMI_HANDLER_CALLBACK`.
+2. The singly-linked list is walked with bounded iteration and a visited-node cycle guard. Each `KNMI_HANDLER_CALLBACK` node has a fixed layout: `Next` at `0x00`, `Callback` at `0x08`, `Context` at `0x10`, `Handle` at `0x18`.
+3. Each `Callback` is annotated with owning module and nearest symbol; targets outside any loaded kernel module are flagged with `[SUSPICIOUS]`.
+
+Discovery is the entire point: any `!etw` GetCpuClock hit outside loaded modules, or any `!nmi` callback in an unfamiliar driver, is a follow-up lead for `u`/`uf` and `dt` triage.
+
 ## Virtual-To-Physical And Physical Memory
 
 Native physical memory support is intentionally explicit:
@@ -556,3 +626,5 @@ The buffer pattern is `(index * 13 + 0x5a) & 0xff`. `probe info` prints both the
 10. Native mode intentionally differs from full WinDbg for commands that stop or control the target. Use `backend dbgeng` for DbgEng-backed command execution, and still expect local-kernel debugging limitations.
 11. `!wfp` requires a healthy Base Filtering Engine (`BFE`) service for the user-mode `FwpmEngineOpen0` path; it does not enumerate WFP state from a hung BFE or a dead system, and it does not surface kernel-mode callout function pointers because the user-mode `FWPM_CALLOUT0` shape does not expose them.
 12. `!alpc` enumerates only ports reachable through the Object Manager namespace and through `_ALPC_PORT.CommunicationInfo` linkage; anonymous client ports that never reach a named server port are not enumerated, and queue counts depend on PDB exposure of the per-port `MainQueue`/`PendingQueue`/`LargeMessageQueue`/`CanceledQueue`/`WaitQueue` fields. PDB drift in `_ALPC_PORT` may produce a warning and reduce the field set rather than aborting the scan.
+13. `!vbs` / `!ci` / `!securekernel` rely on `nt!g_CiOptions`, `nt!HvlpVsmVtlCallVa`, and `_KPROCESS.SecureState`. The exact symbol names drift across Windows builds, the trustlet bit field is private PDB territory, and MBEC enablement requires kernel-only MSR reads. The report annotates each missing source as a warning and falls back to well-known trustlet image-name prefixes when the secure-state field cannot be resolved.
+14. `!etw` falls back to documented offsets `0x68` (LoggerName) and `0x28` (GetCpuClock) when `_WMI_LOGGER_CONTEXT` is not exposed in the loaded PDB. Those offsets drift between Windows builds; a warning is emitted on the fallback path. `!nmi` requires `nt!KiNmiCallbackListHead` (or `nt!KiNmiCallbackList`) to be resolvable from the PDB; if both fail, signature-based extraction from `KeRegisterNmiCallback` is not yet implemented and the scanner reports the resolution failure as an error.
