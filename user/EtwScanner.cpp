@@ -1,7 +1,10 @@
 #include "EtwScanner.h"
 
+#include <Zydis.h>
+
 #include <algorithm>
 #include <cwctype>
+#include <iomanip>
 #include <sstream>
 
 namespace
@@ -1065,6 +1068,441 @@ bool EtwScanner::Scan(const Options& options, EtwScanResult* result, std::wstrin
                 filtered.push_back(record);
             }
             result->Loggers = std::move(filtered);
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+namespace
+{
+    struct IntegrityTarget
+    {
+        const wchar_t* Symbol;
+        const wchar_t* Description;
+    };
+
+    static const IntegrityTarget kIntegrityTargets[] =
+    {
+        // Core ETW dispatch functions (primary InfinityHook surface)
+        {L"nt!EtwpReserveTraceBuffer",                L"primary ETW kernel buffer reservation"},
+        {L"nt!EtwpReserveTraceBufferAtomic",          L"atomic-variant ETW buffer reservation"},
+        {L"nt!EtwpLogKernelEvent",                    L"kernel event logger entry"},
+        {L"nt!EtwpReleaseTraceBuffer",                L"ETW trace buffer release"},
+        {L"nt!EtwpFinalizeTraceBuffer",               L"ETW trace buffer finalisation"},
+        {L"nt!EtwpCommitTraceBuffer",                 L"ETW trace buffer commit"},
+        {L"nt!EtwSendTraceBuffer",                    L"ETW send trace buffer (provider->logger)"},
+        {L"nt!EtwpEventDispatcher",                   L"ETW event dispatcher"},
+
+        // Classic InfinityHook cycle-count surface
+        {L"nt!EtwpGetCycleCount",                     L"cycle count provider (classic InfinityHook target)"},
+        {L"nt!EtwpReceiveCycleCount",                 L"cycle count receive path"},
+
+        // PMC interrupt / HAL surface
+        {L"nt!HalpCollectPmcCounters",                L"HAL PMC counter collection (PMC-hook target)"},
+        {L"nt!HalCollectPmcCounters",                 L"HAL PMC counter collection (newer alias)"},
+        {L"nt!HalpProcessorPerfCounter",              L"HAL processor performance counter"},
+        {L"nt!HalpInterruptHandle",                   L"HAL interrupt handler entry"},
+
+        // Timing source functions (alternate hook surfaces)
+        {L"nt!KeQueryPerformanceCounter",             L"performance counter query"},
+        {L"nt!KeQuerySystemTimePrecise",              L"precise system time query"},
+        {L"nt!KeQueryInterruptTimePrecise",           L"precise interrupt time query"},
+        {L"nt!KeQueryUnbiasedInterruptTimePrecise",   L"precise unbiased interrupt time query"},
+        {L"nt!RtlGetSystemTimePrecise",               L"RTL precise system time"},
+        {L"nt!HalpTimerQueryHostPerformanceCounter",  L"HPET host performance counter"},
+
+        // Syscall path (broad rootkit surface; integrity check applies same way)
+        {L"nt!KiSystemCall64",                        L"x64 SYSCALL entry (primary syscall hook surface)"},
+        {L"nt!KiSystemCall64Shadow",                  L"x64 SYSCALL entry with KVA shadow"},
+        {L"nt!KiSystemServiceUser",                   L"per-thread system service dispatcher"}
+    };
+
+    constexpr uint32_t kIntegrityBytesPerFunction = 0x100;
+    constexpr uint32_t kIntegrityMaxInstructions  = 16;
+
+    bool ExtractRelativeBranchTarget(const ZydisDisassembledInstruction& inst, uint64_t pc, uint64_t* target)
+    {
+        if (target == nullptr)
+        {
+            return false;
+        }
+
+        if (inst.info.operand_count < 1)
+        {
+            return false;
+        }
+
+        const ZydisDecodedOperand& op = inst.operands[0];
+        if (op.type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        {
+            return false;
+        }
+
+        if (op.imm.is_relative == 0)
+        {
+            return false;
+        }
+
+        int64_t signedImm = op.imm.is_signed
+            ? static_cast<int64_t>(op.imm.value.s)
+            : static_cast<int64_t>(op.imm.value.u);
+
+        *target = pc + inst.info.length + static_cast<uint64_t>(signedImm);
+        return true;
+    }
+
+    std::wstring FormatHexBytes(const uint8_t* data, size_t length)
+    {
+        std::wstringstream stream;
+        for (size_t i = 0; i < length; ++i)
+        {
+            if (i > 0)
+            {
+                stream << L" ";
+            }
+            stream << std::hex << std::setw(2) << std::setfill(L'0')
+                   << static_cast<uint32_t>(data[i]);
+        }
+        return stream.str();
+    }
+
+    std::wstring HexAddress(uint64_t address)
+    {
+        std::wstringstream stream;
+        stream << L"0x" << std::hex << std::setw(16) << std::setfill(L'0') << address << std::dec;
+        return stream.str();
+    }
+
+    std::wstring AsciiToWideZ(const char* text)
+    {
+        std::wstring result;
+        if (text == nullptr)
+        {
+            return result;
+        }
+        while (*text != 0)
+        {
+            unsigned char ch = static_cast<unsigned char>(*text);
+            if (ch >= 0x20 && ch < 0x7f)
+            {
+                result.push_back(static_cast<wchar_t>(ch));
+            }
+            else
+            {
+                result.push_back(L'?');
+            }
+            ++text;
+        }
+        return result;
+    }
+
+    const KernelModuleInfo* FindOwningModule(SymbolEngine& symbols, uint64_t address)
+    {
+        for (const KernelModuleInfo& module : symbols.Modules())
+        {
+            uint64_t end = module.Base + module.Size;
+            if (end < module.Base)
+            {
+                continue;
+            }
+            if (address >= module.Base && address < end)
+            {
+                return &module;
+            }
+        }
+        return nullptr;
+    }
+
+    void AnalyzeIntegrityFunction(
+        SymbolEngine& symbols,
+        uint64_t funcAddress,
+        const std::vector<uint8_t>& bytes,
+        EtwIntegrityRecord* record)
+    {
+        if (record == nullptr || bytes.empty())
+        {
+            return;
+        }
+
+        std::vector<ZydisDisassembledInstruction> decoded;
+        decoded.reserve(kIntegrityMaxInstructions);
+
+        size_t offset = 0;
+        uint64_t pc = funcAddress;
+        std::wstringstream summary;
+
+        for (uint32_t i = 0; i < kIntegrityMaxInstructions && offset < bytes.size(); ++i)
+        {
+            ZydisDisassembledInstruction inst = {};
+            ZyanStatus status = ZydisDisassembleIntel(
+                ZYDIS_MACHINE_MODE_LONG_64,
+                pc,
+                bytes.data() + offset,
+                bytes.size() - offset,
+                &inst);
+            if (!ZYAN_SUCCESS(status))
+            {
+                break;
+            }
+            if (inst.info.length == 0 || inst.info.length > 15 ||
+                offset + inst.info.length > bytes.size())
+            {
+                break;
+            }
+
+            summary << HexAddress(pc) << L"  "
+                    << std::left << std::setw(24) << std::setfill(L' ')
+                    << FormatHexBytes(bytes.data() + offset, inst.info.length)
+                    << L"  " << AsciiToWideZ(inst.text) << L"\n";
+
+            decoded.push_back(inst);
+            offset += inst.info.length;
+            pc += inst.info.length;
+
+            ZydisMnemonic m = inst.info.mnemonic;
+            if (m == ZYDIS_MNEMONIC_RET || m == ZYDIS_MNEMONIC_INT3 ||
+                m == ZYDIS_MNEMONIC_UD2 || m == ZYDIS_MNEMONIC_HLT)
+            {
+                break;
+            }
+        }
+
+        record->InstructionsAnalyzed = static_cast<uint32_t>(decoded.size());
+        record->DecodeOk = !decoded.empty();
+        record->DisassemblySummary = summary.str();
+
+        if (decoded.empty())
+        {
+            return;
+        }
+
+        auto AddTargetAnnotation = [&](uint64_t target, EtwIntegrityFinding* finding)
+        {
+            finding->HasTarget = true;
+            finding->Target = target;
+            const KernelModuleInfo* module = FindOwningModule(symbols, target);
+            if (module != nullptr)
+            {
+                finding->TargetModule = module->ImageName;
+                finding->TargetInLoadedModule = true;
+            }
+            std::wstring nearest;
+            uint64_t displacement = 0;
+            std::wstring ignored;
+            if (symbols.FindNearestSymbol(target, &nearest, &displacement, &ignored))
+            {
+                std::wstringstream sym;
+                sym << nearest;
+                if (displacement != 0)
+                {
+                    sym << L"+0x" << std::hex << displacement << std::dec;
+                }
+                finding->TargetSymbol = sym.str();
+            }
+        };
+
+        const ZydisDisassembledInstruction& first = decoded[0];
+        ZydisMnemonic firstMnemonic = first.info.mnemonic;
+
+        // Check 1: function head replaced with unconditional jump (classic trampoline)
+        if (firstMnemonic == ZYDIS_MNEMONIC_JMP)
+        {
+            EtwIntegrityFinding finding = {};
+            finding.InstructionIndex = 0;
+            finding.InstructionOffset = 0;
+            finding.Mnemonic = L"jmp";
+            finding.Reason = L"function head replaced with unconditional jump (trampoline pattern)";
+
+            uint64_t target = 0;
+            if (ExtractRelativeBranchTarget(first, funcAddress, &target))
+            {
+                AddTargetAnnotation(target, &finding);
+            }
+            else if (first.info.operand_count > 0)
+            {
+                if (first.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
+                {
+                    finding.Reason += L" (indirect jmp through memory)";
+                }
+                else if (first.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                {
+                    finding.Reason += L" (register-indirect jmp)";
+                }
+            }
+            record->Findings.push_back(std::move(finding));
+        }
+
+        // Check 2: function head replaced with debug-trap instruction
+        if (firstMnemonic == ZYDIS_MNEMONIC_INT3 || firstMnemonic == ZYDIS_MNEMONIC_UD2)
+        {
+            EtwIntegrityFinding finding = {};
+            finding.InstructionIndex = 0;
+            finding.InstructionOffset = 0;
+            finding.Mnemonic = firstMnemonic == ZYDIS_MNEMONIC_INT3 ? L"int3" : L"ud2";
+            finding.Reason = L"function head replaced with debug-trap instruction";
+            record->Findings.push_back(std::move(finding));
+        }
+
+        // Check 3: mov rax, imm64 + jmp rax indirect trampoline
+        if (decoded.size() >= 2)
+        {
+            const ZydisDisassembledInstruction& a = decoded[0];
+            const ZydisDisassembledInstruction& b = decoded[1];
+            bool movImm64 = a.info.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                            a.info.length == 10 &&
+                            a.info.operand_count >= 2 &&
+                            a.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            a.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+            bool jmpReg = b.info.mnemonic == ZYDIS_MNEMONIC_JMP &&
+                          b.info.operand_count >= 1 &&
+                          b.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER;
+            if (movImm64 && jmpReg &&
+                a.operands[0].reg.value == b.operands[0].reg.value)
+            {
+                EtwIntegrityFinding finding = {};
+                finding.InstructionIndex = 0;
+                finding.InstructionOffset = 0;
+                finding.Mnemonic = L"mov-imm64+jmp-reg";
+                finding.Reason = L"function head matches mov reg,imm64 + jmp reg indirect trampoline";
+                AddTargetAnnotation(a.operands[1].imm.value.u, &finding);
+                record->Findings.push_back(std::move(finding));
+            }
+        }
+
+        // Check 4: push imm32 + ret trampoline
+        if (decoded.size() >= 2)
+        {
+            const ZydisDisassembledInstruction& a = decoded[0];
+            const ZydisDisassembledInstruction& b = decoded[1];
+            bool pushImm = a.info.mnemonic == ZYDIS_MNEMONIC_PUSH &&
+                           a.info.operand_count >= 1 &&
+                           a.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+            bool retInst = b.info.mnemonic == ZYDIS_MNEMONIC_RET;
+            if (pushImm && retInst)
+            {
+                EtwIntegrityFinding finding = {};
+                finding.InstructionIndex = 0;
+                finding.InstructionOffset = 0;
+                finding.Mnemonic = L"push-imm+ret";
+                finding.Reason = L"function head matches push imm + ret trampoline (32-bit target)";
+                uint64_t target = a.operands[0].imm.is_signed
+                    ? static_cast<uint64_t>(static_cast<int64_t>(a.operands[0].imm.value.s))
+                    : a.operands[0].imm.value.u;
+                AddTargetAnnotation(target, &finding);
+                record->Findings.push_back(std::move(finding));
+            }
+        }
+
+        // Check 5: any unconditional branch (call/jmp) within first N instructions
+        // whose target is kernel-canonical but outside any loaded module.
+        size_t curOffset = 0;
+        uint64_t curPc = funcAddress;
+        for (size_t i = 0; i < decoded.size(); ++i)
+        {
+            const ZydisDisassembledInstruction& inst = decoded[i];
+            ZydisMnemonic mn = inst.info.mnemonic;
+            bool isCallOrJmp = (mn == ZYDIS_MNEMONIC_CALL || mn == ZYDIS_MNEMONIC_JMP);
+            if (isCallOrJmp)
+            {
+                uint64_t target = 0;
+                if (ExtractRelativeBranchTarget(inst, curPc, &target))
+                {
+                    if (target >= 0xffff800000000000ull)
+                    {
+                        const KernelModuleInfo* module = FindOwningModule(symbols, target);
+                        if (module == nullptr)
+                        {
+                            bool alreadyReported = (i == 0 && mn == ZYDIS_MNEMONIC_JMP);
+                            if (!alreadyReported)
+                            {
+                                EtwIntegrityFinding finding = {};
+                                finding.InstructionIndex = static_cast<uint32_t>(i);
+                                finding.InstructionOffset = static_cast<uint32_t>(curOffset);
+                                finding.Mnemonic = (mn == ZYDIS_MNEMONIC_CALL) ? L"call" : L"jmp";
+                                finding.Reason = L"branches to kernel address outside any loaded module";
+                                AddTargetAnnotation(target, &finding);
+                                record->Findings.push_back(std::move(finding));
+                            }
+                        }
+                    }
+                }
+            }
+
+            curOffset += inst.info.length;
+            curPc += inst.info.length;
+        }
+    }
+}
+
+bool EtwScanner::ScanIntegrity(EtwIntegrityResult* result, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid integrity result output";
+            }
+            break;
+        }
+
+        *result = EtwIntegrityResult{};
+
+        if (symbols_.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols_.LoadKernelModules(&loadError))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"kernel module list unavailable: " + loadError;
+                }
+                break;
+            }
+        }
+
+        for (const IntegrityTarget& target : kIntegrityTargets)
+        {
+            EtwIntegrityRecord record = {};
+            record.Symbol = target.Symbol;
+            record.Description = target.Description;
+
+            uint64_t address = 0;
+            std::wstring resolveError;
+            if (!symbols_.ResolveSymbol(target.Symbol, &address, &resolveError))
+            {
+                result->Records.push_back(std::move(record));
+                continue;
+            }
+
+            record.SymbolResolved = true;
+            record.Address = address;
+
+            const KernelModuleInfo* owning = FindOwningModule(symbols_, address);
+            if (owning != nullptr)
+            {
+                record.OwningModule = owning->ImageName;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!ReadKernelBytes(device_, address, kIntegrityBytesPerFunction, &bytes, nullptr))
+            {
+                result->Warnings.push_back(std::wstring(target.Symbol) + L": kernel code read failed");
+                result->Records.push_back(std::move(record));
+                continue;
+            }
+            record.BytesRead = true;
+            record.HeadBytesHex = FormatHexBytes(bytes.data(), std::min<size_t>(24, bytes.size()));
+
+            AnalyzeIntegrityFunction(symbols_, address, bytes, &record);
+
+            result->Records.push_back(std::move(record));
         }
 
         ok = true;

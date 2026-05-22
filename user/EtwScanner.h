@@ -43,13 +43,48 @@ struct EtwScanResult
     uint64_t GetCpuClockOffset = 0;
 };
 
+struct EtwIntegrityFinding
+{
+    uint32_t InstructionIndex = 0;
+    uint32_t InstructionOffset = 0;
+    std::wstring Mnemonic;
+    uint64_t Target = 0;
+    std::wstring TargetModule;
+    std::wstring TargetSymbol;
+    std::wstring Reason;
+    bool HasTarget = false;
+    bool TargetInLoadedModule = false;
+};
+
+struct EtwIntegrityRecord
+{
+    std::wstring Symbol;
+    std::wstring Description;
+    std::wstring OwningModule;
+    std::wstring HeadBytesHex;
+    std::wstring DisassemblySummary;
+    uint64_t Address = 0;
+    uint32_t InstructionsAnalyzed = 0;
+    std::vector<EtwIntegrityFinding> Findings;
+    bool SymbolResolved = false;
+    bool BytesRead = false;
+    bool DecodeOk = false;
+};
+
+struct EtwIntegrityResult
+{
+    std::vector<EtwIntegrityRecord> Records;
+    std::vector<std::wstring>       Warnings;
+};
+
 class EtwScanner
 {
 public:
     enum class Scope
     {
         Loggers,
-        Logger
+        Logger,
+        Integrity
     };
 
     struct Options
@@ -63,6 +98,7 @@ public:
     EtwScanner(DeviceClient& device, SymbolEngine& symbols);
 
     bool Scan(const Options& options, EtwScanResult* result, std::wstring* error);
+    bool ScanIntegrity(EtwIntegrityResult* result, std::wstring* error);
 
 private:
     DeviceClient& device_;
