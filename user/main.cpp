@@ -1,3 +1,4 @@
+#include "AddressInspector.h"
 #include "AiProvider.h"
 #include "AlpcScanner.h"
 #include "CallbackScanner.h"
@@ -6,8 +7,11 @@
 #include "DeviceClient.h"
 #include "DriverService.h"
 #include "EtwScanner.h"
+#include "MemoryDumper.h"
 #include "NativeDisassembler.h"
+#include "PoolPeHunter.h"
 #include "NmiScanner.h"
+#include "PoolScanner.h"
 #include "SymbolEngine.h"
 #include "VbsScanner.h"
 #include "WfpScanner.h"
@@ -1514,13 +1518,68 @@ static STARTUP_SYMBOL_PATH_INFO BuildStartupSymbolPath(const std::wstring& baseS
 
 static std::vector<std::wstring> Split(const std::wstring& line)
 {
+    // Whitespace-delimited tokenizer with double-quote support. We only
+    // recognise '"' as a quote character, matching CMD/PowerShell convention
+    // -- this keeps unquoted paths containing apostrophes (e.g. C:\Users\O'
+    // Brien\foo.bin) intact rather than swallowing everything from the
+    // apostrophe onward. Quotes can begin and end mid-token, so the input
+    // --path="C:\Program Files\foo" yields a single token
+    // --path=C:\Program Files\foo. A token may mix quoted and unquoted
+    // segments; the quoting only affects whether interior whitespace is
+    // preserved.
     std::vector<std::wstring> parts;
-    std::wistringstream stream(line);
-    std::wstring part;
+    const size_t length = line.size();
+    size_t i = 0;
 
-    while (stream >> part)
+    while (i < length)
     {
-        parts.push_back(part);
+        while (i < length && std::iswspace(line[i]) != 0)
+        {
+            ++i;
+        }
+
+        if (i >= length)
+        {
+            break;
+        }
+
+        std::wstring token;
+        bool tokenStarted = false;
+
+        while (i < length)
+        {
+            wchar_t ch = line[i];
+
+            if (std::iswspace(ch) != 0)
+            {
+                break;
+            }
+
+            if (ch == L'"')
+            {
+                ++i;
+                while (i < length && line[i] != L'"')
+                {
+                    token.push_back(line[i]);
+                    ++i;
+                }
+                if (i < length)
+                {
+                    ++i;
+                }
+                tokenStarted = true;
+                continue;
+            }
+
+            token.push_back(ch);
+            ++i;
+            tokenStarted = true;
+        }
+
+        if (tokenStarted)
+        {
+            parts.push_back(token);
+        }
     }
 
     return parts;
@@ -1963,7 +2022,9 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!securekernel" ||
         command == L"!etw" ||
         command == L"!nmi" ||
-        command == L"!wnf")
+        command == L"!pool" ||
+        command == L"!wnf" ||
+        command == L"!address")
     {
         result = true;
     }
@@ -2800,6 +2861,29 @@ static bool IsNmiScopeName(const std::wstring& value)
     return lowered == L"callbacks";
 }
 
+static bool IsPoolScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"big" ||
+        lowered == L"bigpool" ||
+        lowered == L"find" ||
+        lowered == L"summary";
+}
+
+static bool IsPoolOption(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"/tag" ||
+        lowered == L"/min" ||
+        lowered == L"/max" ||
+        lowered == L"/addr" ||
+        lowered == L"/limit" ||
+        lowered == L"/paged" ||
+        lowered == L"/nonpaged" ||
+        lowered == L"/any" ||
+        lowered == L"/annotate";
+}
+
 static bool IsWnfScopeName(const std::wstring& value)
 {
     std::wstring lowered = ToLower(value);
@@ -3385,6 +3469,36 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"callbacks");
                 }
+                else if (topic == L"!pool")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"big",
+                        L"find",
+                        L"summary"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"pool-scan-pe")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"/tag",
+                        L"/min",
+                        L"/max",
+                        L"/limit",
+                        L"/nonpaged",
+                        L"/paged",
+                        L"/any",
+                        L"/suspicious",
+                        L"/dump"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"dump-raw")
+                {
+                    AddCompletionCandidate(&candidates, L"/zerofill");
+                }
                 else if (topic == L"!wnf")
                 {
                     static const wchar_t* values[] =
@@ -3483,6 +3597,69 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     L"callbacks",
                     L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"pool-scan-pe")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/tag",
+                L"/min",
+                L"/max",
+                L"/limit",
+                L"/nonpaged",
+                L"/paged",
+                L"/any",
+                L"/suspicious",
+                L"/dump",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"dump-raw")
+        {
+            if (argsBefore.size() >= 4)
+            {
+                AddCompletionCandidate(&candidates, L"/zerofill");
+            }
+            AddCompletionCandidate(&candidates, L"help");
+        }
+        else if (command == L"dump-pe")
+        {
+            AddCompletionCandidate(&candidates, L"help");
+        }
+        else if (command == L"!address")
+        {
+            AddCompletionCandidate(&candidates, L"help");
+        }
+        else if (command == L"!pool")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"big",
+                    L"find",
+                    L"summary",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/tag",
+                    L"/min",
+                    L"/max",
+                    L"/addr",
+                    L"/limit",
+                    L"/nonpaged",
+                    L"/paged",
+                    L"/any",
+                    L"/annotate"
                 };
                 AddCompletionCandidates(&candidates, values);
             }
@@ -11573,6 +11750,1149 @@ static void HandleNmiCommand(
     } while (false);
 }
 
+static void PrintDumpRawHelp()
+{
+    std::wcout << L"dump-raw command:\n";
+    std::wcout << L"  dump-raw <address> <length> <path> [/zerofill]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Reads <length> bytes starting at <address> from kernel memory through the driver\n";
+    std::wcout << L"  IOCTL and writes them verbatim to <path>. The read is chunked into 256 KB IOCTL\n";
+    std::wcout << L"  calls; per-chunk failures abort the dump unless /zerofill is supplied, in which\n";
+    std::wcout << L"  case failed chunks are zero-filled and a per-chunk warning is recorded.\n";
+    std::wcout << L"\n";
+    std::wcout << L"arguments:\n";
+    std::wcout << L"  <address>   start virtual address (symbol or hex/decimal value).\n";
+    std::wcout << L"  <length>    number of bytes to read (hex or decimal). Capped at 1 GB.\n";
+    std::wcout << L"  <path>      output file path. Existing file is overwritten.\n";
+    std::wcout << L"  /zerofill   continue on read failure and zero-fill the failed chunk.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Requires the KnLiveDbg.sys driver device to be open. Wrap paths that contain\n";
+    std::wcout << L"  whitespace in double quotes (\"C:\\Program Files\\foo.bin\"). Apostrophes in\n";
+    std::wcout << L"  unquoted paths are kept literal (matches CMD/PowerShell convention).\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  dump-raw nt!KiSystemServiceUser 0x200 .\\kiSystemServiceUser.bin\n";
+    std::wcout << L"  dump-raw 0xffffae8000123000 0x1000 .\\stack-page.bin\n";
+    std::wcout << L"  dump-raw nt 0x100000 \"C:\\Program Files\\Dumps\\ntoskrnl-1mb.bin\" /zerofill\n";
+}
+
+static void PrintDumpPeHelp()
+{
+    std::wcout << L"dump-pe command:\n";
+    std::wcout << L"  dump-pe <address> <path>\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Treats the memory region at <address> as an in-memory loaded PE image and rebuilds\n";
+    std::wcout << L"  the on-disk PE layout from the in-memory section table. The headers are copied\n";
+    std::wcout << L"  verbatim and each section's bytes are read from address+VirtualAddress and written\n";
+    std::wcout << L"  to file offset PointerToRawData (SizeOfRawData bytes), reversing the loader's RVA\n";
+    std::wcout << L"  expansion. Sections that fail to read (typically discarded INIT) are zero-filled\n";
+    std::wcout << L"  with a warning rather than aborting the dump.\n";
+    std::wcout << L"\n";
+    std::wcout << L"arguments:\n";
+    std::wcout << L"  <address>   PE base virtual address (symbol or hex/decimal value).\n";
+    std::wcout << L"  <path>      output file path. Existing file is overwritten.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Requires the KnLiveDbg.sys driver device to be open. PE32 (32-bit) and PE32+\n";
+    std::wcout << L"  (64-bit) are both supported.\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Header recovery: the scanner restores wiped 'MZ' / 'PE\\0\\0' signatures and\n";
+    std::wcout << L"  corrupted e_lfanew values when the surrounding FileHeader/OptionalHeader fields\n";
+    std::wcout << L"  are intact enough to identify the NT header position. This covers the common\n";
+    std::wcout << L"  malware/loader-stomp pattern of zeroing the magic bytes to evade signature\n";
+    std::wcout << L"  scanners while leaving the rest of the structure usable. Restored fields are\n";
+    std::wcout << L"  reported in the summary line under recovered=[MZ,e_lfanew,PE].\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Caveats: the dumped image reflects the in-memory state -- relocations are applied,\n";
+    std::wcout << L"  the IAT is resolved to live addresses, and any in-place patches by anti-malware or\n";
+    std::wcout << L"  PatchGuard appear in the output. Use this for IDA/Ghidra inspection of the running\n";
+    std::wcout << L"  image, not for repackaging.\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Paths with spaces are accepted when wrapped in double quotes\n";
+    std::wcout << L"  (\"C:\\Program Files\\Dumps\\foo.sys\"). Apostrophes in unquoted paths are\n";
+    std::wcout << L"  kept literal so names like O'Brien\\foo.sys do not need quoting.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  dump-pe nt .\\ntoskrnl-live.exe\n";
+    std::wcout << L"  dump-pe Wdf01000 .\\wdf01000-live.sys\n";
+    std::wcout << L"  dump-pe 0xfffff80300000000 \"C:\\Program Files\\Dumps\\unknown-driver.sys\"\n";
+}
+
+static void HandleDumpRawCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintDumpRawHelp();
+            break;
+        }
+
+        if (args.size() < 4)
+        {
+            std::wcerr << L"usage: dump-raw <address> <length> <path> [/zerofill]\n";
+            PrintDumpRawHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"dump-raw requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring error;
+        uint64_t address = 0;
+        if (!ParseAddressOrSymbol(symbols, state, args[1], &address, &error))
+        {
+            std::wcerr << L"dump-raw: failed to parse address \"" << args[1] << L"\": " << error << L"\n";
+            break;
+        }
+
+        uint64_t length = 0;
+        if (!ParseUnsigned(args[2], state.NumberBase, &length))
+        {
+            std::wcerr << L"dump-raw: failed to parse length \"" << args[2] << L"\"\n";
+            break;
+        }
+
+        if (length == 0)
+        {
+            std::wcerr << L"dump-raw: length must be > 0\n";
+            break;
+        }
+
+        std::wstring path = args[3];
+        bool zeroFill = false;
+        bool parseError = false;
+        for (size_t i = 4; i < args.size(); ++i)
+        {
+            std::wstring opt = ToLower(args[i]);
+            if (opt == L"/zerofill")
+            {
+                zeroFill = true;
+            }
+            else
+            {
+                std::wcerr << L"dump-raw: unrecognised argument \"" << args[i] << L"\"\n";
+                PrintDumpRawHelp();
+                parseError = true;
+                break;
+            }
+        }
+
+        if (parseError)
+        {
+            break;
+        }
+
+        DumpRawResult result = {};
+        std::wstring dumpError;
+        if (!DumpKernelRangeToFile(device, address, length, path, zeroFill, &result, &dumpError))
+        {
+            std::wcerr << L"dump-raw failed: " << dumpError << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"dump-raw warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"dump-raw warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"[dump-raw]", KNDBG_COLOR_TITLE);
+        std::wcout << L" address=" << HexTextWidth(result.StartAddress, 16, true)
+                   << L" length=0x" << std::hex << result.Length << std::dec
+                   << L" wrote=" << result.BytesWritten
+                   << L" chunks=" << result.ChunksRead;
+        if (result.ChunksFailed > 0)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"zero-filled=" + std::to_wstring(result.ChunksFailed), KNDBG_COLOR_WARN);
+        }
+        std::wcout << L" path=";
+        PrintColoredText(path, KNDBG_COLOR_OK);
+        std::wcout << L"\n";
+    } while (false);
+}
+
+static void PrintAddressHelp()
+{
+    std::wcout << L"!address command:\n";
+    std::wcout << L"  !address <va>\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Reports detailed properties of a virtual address: canonicality, kernel vs\n";
+    std::wcout << L"  user half, the page-table walk down to the leaf PTE (PML5/PML4/PDPTE/PDE/PTE\n";
+    std::wcout << L"  values plus their physical addresses), the resulting physical address, the\n";
+    std::wcout << L"  effective R/W/X/U permissions across every traversed level, and the owning\n";
+    std::wcout << L"  kernel module + nearest symbol when known.\n";
+    std::wcout << L"\n";
+    std::wcout << L"arguments:\n";
+    std::wcout << L"  <va>   virtual address (hex/decimal value, symbol like nt!Foo, or expression).\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  The page-table walk runs through the KnLiveDbg.sys TranslateVirtual IOCTL and\n";
+    std::wcout << L"  uses the live CR3. Effective writable = AND of bit-1 across walked levels;\n";
+    std::wcout << L"  effective executable = AND of (!NX) across walked levels.\n";
+    std::wcout << L"  LA57 (5-level) paging is auto-detected; the kernel/user split adjusts accordingly.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !address 0xfffff80237890000\n";
+    std::wcout << L"  !address nt!ExpWnfSiloState\n";
+    std::wcout << L"  !address WdFilter+0x1234\n";
+}
+
+static void PrintAddressInspection(const AddressInspectResult& r)
+{
+    PrintColoredText(L"[address]", KNDBG_COLOR_TITLE);
+    std::wcout << L" " << HexTextWidth(r.VirtualAddress, 16, true) << L"\n";
+
+    std::wcout << L"  canonical=";
+    PrintColoredText(r.IsCanonical ? L"yes" : L"no",
+                     r.IsCanonical ? KNDBG_COLOR_OK : KNDBG_COLOR_FAIL);
+    if (r.IsCanonical)
+    {
+        std::wcout << L" class=";
+        if (r.IsZeroPage)
+        {
+            PrintColoredText(L"zero-page", KNDBG_COLOR_WARN);
+        }
+        else if (r.IsKernelSpace)
+        {
+            PrintColoredText(L"kernel", KNDBG_COLOR_OK);
+        }
+        else if (r.IsUserSpace)
+        {
+            PrintColoredText(L"user", KNDBG_COLOR_ACCENT);
+        }
+        else
+        {
+            PrintColoredText(L"unknown", KNDBG_COLOR_DIM);
+        }
+    }
+    if (r.La57Active)
+    {
+        std::wcout << L" paging=LA57";
+    }
+    std::wcout << L"\n";
+
+    if (r.HasModule)
+    {
+        PrintColoredText(L"  module", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=";
+        PrintColoredText(r.ModuleName, KNDBG_COLOR_TITLE);
+        std::wcout << L" base=" << HexTextWidth(r.ModuleBase, 16, true)
+                   << L" size=0x" << std::hex << r.ModuleSize << std::dec
+                   << L" offset=0x" << std::hex << r.OffsetInModule << std::dec << L"\n";
+        if (!r.ModulePath.empty())
+        {
+            std::wcout << L"  image=";
+            PrintColoredText(r.ModulePath, KNDBG_COLOR_DIM);
+            std::wcout << L"\n";
+        }
+    }
+
+    if (r.HasSymbol)
+    {
+        PrintColoredText(L"  symbol", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=";
+        PrintColoredText(r.SymbolName, KNDBG_COLOR_TITLE);
+        std::wcout << L"+0x" << std::hex << r.SymbolDisplacement << std::dec << L"\n";
+    }
+
+    if (r.TranslationAttempted)
+    {
+        if (r.TranslationSucceeded)
+        {
+            PrintColoredText(L"[address.translation]", KNDBG_COLOR_TITLE);
+            std::wcout << L" CR3=" << HexTextWidth(r.DirectoryTableBase, 16, true)
+                       << L" levels=" << std::dec << r.PagingLevels
+                       << L" pageSize=0x" << std::hex << r.PageSize << std::dec;
+            if (r.LargePage)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"LargePage", KNDBG_COLOR_WARN);
+            }
+            std::wcout << L"\n";
+
+            auto printLevel = [](const wchar_t* name, uint64_t addr, uint64_t value)
+            {
+                if (addr == 0 && value == 0)
+                {
+                    return;
+                }
+                std::wcout << L"  ";
+                PrintColoredText(name, KNDBG_COLOR_ACCENT);
+                std::wcout << L" @ " << HexTextWidth(addr, 16, true)
+                           << L" = " << HexTextWidth(value, 16, true);
+                std::wcout << L" (P=" << ((value & 1ULL) ? 1 : 0)
+                           << L" W=" << ((value & 2ULL) ? 1 : 0)
+                           << L" U=" << ((value & 4ULL) ? 1 : 0)
+                           << L" PS=" << ((value & 0x80ULL) ? 1 : 0)
+                           << L" NX=" << ((value & (1ULL << 63)) ? 1 : 0)
+                           << L")\n";
+            };
+
+            if (r.La57Active)
+            {
+                printLevel(L"PML5E", r.Pml5eAddress, r.Pml5e);
+            }
+            printLevel(L"PML4E", r.Pml4eAddress, r.Pml4e);
+            printLevel(L"PDPTE", r.PdpteAddress, r.Pdpte);
+            printLevel(L"PDE  ", r.PdeAddress, r.Pde);
+            printLevel(L"PTE  ", r.PteAddress, r.Pte);
+
+            std::wcout << L"  effective: ";
+            std::wcout << L"present=";
+            PrintColoredText(r.EffectivePresent ? L"yes" : L"no",
+                             r.EffectivePresent ? KNDBG_COLOR_OK : KNDBG_COLOR_FAIL);
+            std::wcout << L" R=" << (r.EffectivePresent ? L"1" : L"0");
+            std::wcout << L" W=";
+            PrintColoredText(r.EffectiveWritable ? L"1" : L"0",
+                             r.EffectiveWritable ? KNDBG_COLOR_WARN : KNDBG_COLOR_DIM);
+            std::wcout << L" X=";
+            PrintColoredText(r.EffectiveExecutable ? L"1" : L"0",
+                             r.EffectiveExecutable ? KNDBG_COLOR_FAIL : KNDBG_COLOR_DIM);
+            std::wcout << L" U=";
+            PrintColoredText(r.EffectiveUserAccessible ? L"1" : L"0",
+                             r.EffectiveUserAccessible ? KNDBG_COLOR_WARN : KNDBG_COLOR_DIM);
+            if (r.EffectiveWritable && r.EffectiveExecutable && r.EffectivePresent)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[W+X]", KNDBG_COLOR_FAIL);
+            }
+            std::wcout << L"\n";
+
+            PrintColoredText(L"[address.physical]", KNDBG_COLOR_TITLE);
+            std::wcout << L" PA=" << HexTextWidth(r.PhysicalAddress, 16, true)
+                       << L" offset=0x" << std::hex << r.PageOffset
+                       << L" pageBytes=0x" << r.PageBytes << std::dec << L"\n";
+        }
+        else
+        {
+            PrintColoredText(L"[address.translation]", KNDBG_COLOR_TITLE);
+            std::wcout << L" ";
+            PrintColoredText(L"failed", KNDBG_COLOR_FAIL);
+            std::wcout << L": " << r.TranslationError << L"\n";
+        }
+    }
+}
+
+static void HandleAddressCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintAddressHelp();
+            break;
+        }
+
+        if (args.size() < 2)
+        {
+            std::wcerr << L"usage: !address <va>\n";
+            PrintAddressHelp();
+            break;
+        }
+
+        if (args.size() > 2)
+        {
+            std::wcerr << L"!address: unexpected extra argument \"" << args[2] << L"\"\n";
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!address requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring parseError;
+        uint64_t address = 0;
+        if (!ParseAddressOrSymbol(symbols, state, args[1], &address, &parseError))
+        {
+            std::wcerr << L"!address: failed to parse \"" << args[1] << L"\": " << parseError << L"\n";
+            break;
+        }
+
+        AddressInspectResult result;
+        std::wstring inspectError;
+        if (!InspectAddress(device, symbols, address, &result, &inspectError))
+        {
+            std::wcerr << L"!address failed: " << inspectError << L"\n";
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!address warning: " << warning << L"\n";
+        }
+
+        PrintAddressInspection(result);
+    } while (false);
+}
+
+static void PrintPoolScanPeHelp()
+{
+    std::wcout << L"pool-scan-pe command:\n";
+    std::wcout << L"  pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]\n";
+    std::wcout << L"               [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Enumerates big pool allocations via NtQuerySystemInformation\n";
+    std::wcout << L"  (SystemBigPoolInformation=0x42) and runs the same PE header detection used\n";
+    std::wcout << L"  by dump-pe on each entry's first 4 KB. The detector accepts both intact and\n";
+    std::wcout << L"  signature-wiped PE headers, so reflectively-loaded modules, unpacker stages,\n";
+    std::wcout << L"  and stomped driver replacements that zero MZ/PE to evade scanners are still\n";
+    std::wcout << L"  surfaced. Each hit prints the pool tag, address/size, suspicion markers\n";
+    std::wcout << L"  (which signatures were stripped), and PE metadata.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /tag <ABCD>        only scan entries with the given 4-char pool tag.\n";
+    std::wcout << L"  /min <bytes>       only scan entries >= <bytes> (default 0x1000).\n";
+    std::wcout << L"  /max <bytes>       only scan entries <= <bytes>.\n";
+    std::wcout << L"  /limit <n>         stop after <n> hits.\n";
+    std::wcout << L"  /nonpaged          NonPaged entries only (default).\n";
+    std::wcout << L"  /paged             Paged entries only.\n";
+    std::wcout << L"  /any               include both Paged and NonPaged.\n";
+    std::wcout << L"  /suspicious        only report hits whose MZ/PE/e_lfanew were wiped.\n";
+    std::wcout << L"  /dump <directory>  also dump each detected PE to a file via dump-pe logic;\n";
+    std::wcout << L"                     filename pattern is poolpe_<tag>_<address>.bin. The\n";
+    std::wcout << L"                     directory is created if missing.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Requires SeDebugPrivilege and the KnLiveDbg.sys driver to be open. Per-entry\n";
+    std::wcout << L"  reads use the driver's MmCopyMemory + MDL probe-and-lock fallback, so\n";
+    std::wcout << L"  paged-out big pool allocations are recovered automatically.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  pool-scan-pe\n";
+    std::wcout << L"  pool-scan-pe /suspicious\n";
+    std::wcout << L"  pool-scan-pe /tag Cdat /dump .\\poolpe-hits\n";
+    std::wcout << L"  pool-scan-pe /min 0x4000 /suspicious /dump .\\poolpe-hits\n";
+}
+
+static void PrintPoolPeHit(const PoolPeHit& hit)
+{
+    bool wiped = hit.Probe.MzWiped || hit.Probe.PeSignatureWiped || hit.Probe.ELfanewMismatch;
+    PrintColoredText(wiped ? L"[pool-pe.suspect]" : L"[pool-pe.hit]",
+                     wiped ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+
+    std::wcout << L" address=" << HexTextWidth(hit.Address, 16, true);
+
+    std::wstringstream sizeText;
+    sizeText << L"0x" << std::hex << hit.SizeInBytes;
+    std::wcout << L" size=";
+    PrintColoredText(sizeText.str(), KNDBG_COLOR_ACCENT);
+
+    std::wcout << L" tag=";
+    PrintColoredText(hit.TagText, KNDBG_COLOR_OK);
+
+    std::wcout << L" ";
+    PrintColoredText(hit.NonPaged ? L"NonPaged" : L"Paged",
+                     hit.NonPaged ? KNDBG_COLOR_OK : KNDBG_COLOR_DIM);
+
+    std::wcout << L" nt=0x" << std::hex << hit.Probe.NtOffset
+               << L" bits=" << std::dec << (hit.Probe.Is64Bit ? L"64" : L"32")
+               << L" machine=0x" << std::hex << hit.Probe.Machine
+               << L" sections=" << std::dec << hit.Probe.NumberOfSections
+               << L" sizeOfImage=0x" << std::hex << hit.Probe.SizeOfImage
+               << L" imageBase=0x" << hit.Probe.ImageBase
+               << std::dec;
+
+    if (wiped)
+    {
+        std::wcout << L" ";
+        std::wstring tag = L"WIPED=[";
+        bool first = true;
+        if (hit.Probe.MzWiped)
+        {
+            tag += L"MZ";
+            first = false;
+        }
+        if (hit.Probe.ELfanewMismatch)
+        {
+            if (!first) tag += L",";
+            tag += L"e_lfanew";
+            first = false;
+        }
+        if (hit.Probe.PeSignatureWiped)
+        {
+            if (!first) tag += L",";
+            tag += L"PE";
+        }
+        tag += L"]";
+        PrintColoredText(tag, KNDBG_COLOR_FAIL);
+    }
+
+    if (hit.DumpSucceeded)
+    {
+        std::wcout << L" dump=";
+        PrintColoredText(hit.DumpedPath, KNDBG_COLOR_OK);
+    }
+
+    std::wcout << L"\n";
+}
+
+static void HandlePoolScanPeCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    (void)symbols;
+
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintPoolScanPeHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"pool-scan-pe requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        PoolPeHunter::Options options = {};
+        options.Paged = PoolPeHunter::PagedFilter::NonPagedOnly;
+        options.HasMinSize = true;
+        options.MinSize = 0x1000;
+
+        bool parseError = false;
+        size_t i = 1;
+        while (i < args.size())
+        {
+            std::wstring opt = ToLower(args[i]);
+
+            if (opt == L"/nonpaged")
+            {
+                options.Paged = PoolPeHunter::PagedFilter::NonPagedOnly;
+                ++i;
+                continue;
+            }
+            if (opt == L"/paged")
+            {
+                options.Paged = PoolPeHunter::PagedFilter::PagedOnly;
+                ++i;
+                continue;
+            }
+            if (opt == L"/any")
+            {
+                options.Paged = PoolPeHunter::PagedFilter::Any;
+                ++i;
+                continue;
+            }
+            if (opt == L"/suspicious")
+            {
+                options.OnlySuspicious = true;
+                ++i;
+                continue;
+            }
+
+            if (opt == L"/tag")
+            {
+                if (i + 1 >= args.size())
+                {
+                    std::wcerr << L"pool-scan-pe: /tag requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                uint32_t tag = 0;
+                if (!ParsePoolTagText(args[i + 1], &tag))
+                {
+                    std::wcerr << L"pool-scan-pe: invalid tag \"" << args[i + 1] << L"\"\n";
+                    parseError = true;
+                    break;
+                }
+                options.HasTagFilter = true;
+                options.TagFilter = tag;
+                options.TagFilterText = args[i + 1];
+                i += 2;
+                continue;
+            }
+
+            if (opt == L"/min" || opt == L"/max" || opt == L"/limit")
+            {
+                if (i + 1 >= args.size())
+                {
+                    std::wcerr << L"pool-scan-pe: " << opt << L" requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                uint64_t value = 0;
+                if (!ParseUnsigned(args[i + 1], state.NumberBase, &value))
+                {
+                    std::wcerr << L"pool-scan-pe: failed to parse \"" << args[i + 1] << L"\" for " << opt << L"\n";
+                    parseError = true;
+                    break;
+                }
+                if (opt == L"/min")
+                {
+                    options.HasMinSize = true;
+                    options.MinSize = value;
+                }
+                else if (opt == L"/max")
+                {
+                    options.HasMaxSize = true;
+                    options.MaxSize = value;
+                }
+                else
+                {
+                    if (value > 0xFFFFFFFFull) value = 0xFFFFFFFFull;
+                    options.LimitHits = static_cast<uint32_t>(value);
+                }
+                i += 2;
+                continue;
+            }
+
+            if (opt == L"/dump")
+            {
+                if (i + 1 >= args.size())
+                {
+                    std::wcerr << L"pool-scan-pe: /dump requires a directory\n";
+                    parseError = true;
+                    break;
+                }
+                options.DumpEnabled = true;
+                options.DumpDirectory = args[i + 1];
+                i += 2;
+                continue;
+            }
+
+            std::wcerr << L"pool-scan-pe: unrecognised argument \"" << args[i] << L"\"\n";
+            PrintPoolScanPeHelp();
+            parseError = true;
+            break;
+        }
+
+        if (parseError)
+        {
+            break;
+        }
+
+        PoolPeHunter hunter(device);
+        PoolPeHunterResult result = {};
+        std::wstring error;
+        if (!hunter.Scan(options, &result, &error))
+        {
+            std::wcerr << L"pool-scan-pe failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"pool-scan-pe warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"pool-scan-pe warning: " << warning << L"\n";
+        }
+        for (const std::wstring& diag : result.Diagnostics)
+        {
+            std::wcout << L"pool-scan-pe diag: " << diag << L"\n";
+        }
+
+        for (const PoolPeHit& hit : result.Hits)
+        {
+            PrintPoolPeHit(hit);
+        }
+
+        PrintColoredText(L"[pool-pe.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" total=" << std::dec << result.TotalEntries
+                   << L" nonpaged=" << result.NonPagedCount
+                   << L" paged=" << result.PagedCount
+                   << L" scanned=" << result.Scanned
+                   << L" readFail=" << result.ReadFailures
+                   << L" hits=" << result.Hits.size()
+                   << L" suspicious=" << result.SuspiciousWipes;
+        if (!result.PrivilegeEnabled)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"(no SeDebugPrivilege)", KNDBG_COLOR_WARN);
+        }
+        std::wcout << L"\n";
+    } while (false);
+}
+
+static void HandleDumpPeCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintDumpPeHelp();
+            break;
+        }
+
+        if (args.size() < 3)
+        {
+            std::wcerr << L"usage: dump-pe <address> <path>\n";
+            PrintDumpPeHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"dump-pe requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring error;
+        uint64_t address = 0;
+        if (!ParseAddressOrSymbol(symbols, state, args[1], &address, &error))
+        {
+            std::wcerr << L"dump-pe: failed to parse address \"" << args[1] << L"\": " << error << L"\n";
+            break;
+        }
+
+        std::wstring path = args[2];
+        if (args.size() > 3)
+        {
+            std::wcerr << L"dump-pe: unexpected extra argument \"" << args[3] << L"\"\n";
+            PrintDumpPeHelp();
+            break;
+        }
+
+        DumpPeResult result = {};
+        std::wstring dumpError;
+        if (!DumpKernelPeToFile(device, address, path, &result, &dumpError))
+        {
+            std::wcerr << L"dump-pe failed: " << dumpError << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"dump-pe warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"dump-pe warning: " << warning << L"\n";
+        }
+
+        for (const DumpedSectionRecord& section : result.Sections)
+        {
+            PrintColoredText(L"[dump-pe.section]", KNDBG_COLOR_TITLE);
+            std::wcout << L" name=";
+            PrintColoredText(section.Name.empty() ? L"<unnamed>" : section.Name, KNDBG_COLOR_ACCENT);
+            std::wcout << L" rva=0x" << std::hex << section.VirtualAddress
+                       << L" vsize=0x" << section.VirtualSize
+                       << L" raw=0x" << section.SizeOfRawData
+                       << L" file=0x" << section.PointerToRawData
+                       << std::dec;
+
+            // Decode notable Characteristics flags. DISCARDABLE in particular
+            // tells the operator the loader is expected to tear down the
+            // section after load (e.g. INIT, .reloc), so a zero-fill outcome
+            // is the documented behaviour rather than a bug.
+            const uint32_t kImgScnMemDiscardable = 0x02000000;
+            const uint32_t kImgScnMemExecute    = 0x20000000;
+            const uint32_t kImgScnMemRead       = 0x40000000;
+            const uint32_t kImgScnMemWrite      = 0x80000000;
+            const uint32_t kImgScnMemNotPaged   = 0x08000000;
+
+            std::wstring chars;
+            if (section.Characteristics & kImgScnMemRead)        chars += L"R";
+            if (section.Characteristics & kImgScnMemWrite)       chars += L"W";
+            if (section.Characteristics & kImgScnMemExecute)     chars += L"X";
+            if (section.Characteristics & kImgScnMemNotPaged)    chars += L"+NP";
+            if (section.Characteristics & kImgScnMemDiscardable) chars += L"+DISCARD";
+            if (!chars.empty())
+            {
+                std::wcout << L" chars=";
+                PrintColoredText(chars,
+                    (section.Characteristics & kImgScnMemDiscardable) ? KNDBG_COLOR_DIM : KNDBG_COLOR_ACCENT);
+            }
+
+            if (section.ZeroFilled)
+            {
+                std::wcout << L" ";
+                if (section.Characteristics & kImgScnMemDiscardable)
+                {
+                    PrintColoredText(L"[ZERO-FILLED (discardable)]", KNDBG_COLOR_DIM);
+                }
+                else
+                {
+                    PrintColoredText(L"[ZERO-FILLED]", KNDBG_COLOR_WARN);
+                }
+            }
+            else if (section.ReadSucceeded)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"OK", KNDBG_COLOR_OK);
+            }
+            std::wcout << L"\n";
+        }
+
+        PrintColoredText(L"[dump-pe]", KNDBG_COLOR_TITLE);
+        std::wcout << L" address=" << HexTextWidth(result.StartAddress, 16, true)
+                   << L" bits=" << (result.Is64Bit ? L"64" : L"32")
+                   << L" machine=0x" << std::hex << result.Machine << std::dec
+                   << L" sections=" << result.NumberOfSections
+                   << L" headers=0x" << std::hex << result.SizeOfHeaders
+                   << L" imageBase=0x" << result.ImageBase
+                   << L" sizeOfImage=0x" << result.SizeOfImage
+                   << L" output=0x" << result.TotalFileSize << std::dec;
+
+        if (result.RestoredDosMagic || result.RestoredPeSignature || result.RestoredELfanew)
+        {
+            std::wcout << L" ";
+            std::wstring restored = L"recovered=[";
+            bool first = true;
+            if (result.RestoredDosMagic)
+            {
+                restored += L"MZ";
+                first = false;
+            }
+            if (result.RestoredELfanew)
+            {
+                if (!first)
+                {
+                    restored += L",";
+                }
+                restored += L"e_lfanew";
+                first = false;
+            }
+            if (result.RestoredPeSignature)
+            {
+                if (!first)
+                {
+                    restored += L",";
+                }
+                restored += L"PE";
+            }
+            restored += L"]";
+            PrintColoredText(restored, KNDBG_COLOR_WARN);
+        }
+
+        std::wcout << L" path=";
+        PrintColoredText(path, KNDBG_COLOR_OK);
+        std::wcout << L"\n";
+    } while (false);
+}
+
+static void PrintPoolHelp()
+{
+    std::wcout << L"!pool command:\n";
+    std::wcout << L"  !pool big [options]\n";
+    std::wcout << L"  !pool find /tag <TAG> [options]\n";
+    std::wcout << L"  !pool summary\n";
+    std::wcout << L"\n";
+    std::wcout << L"scopes:\n";
+    std::wcout << L"  big      enumerate big pool allocations via NtQuerySystemInformation(SystemBigPoolInformation=0x42).\n";
+    std::wcout << L"           Returns allocations >= one page tracked by nt!PoolBigPageTable. Useful for hunting kernel\n";
+    std::wcout << L"           cheat allocations, BYOVD payloads, and unusual large NonPaged ranges.\n";
+    std::wcout << L"  find     same data as 'big' but requires at least one filter (/tag, /addr, /min, or /max) and is geared\n";
+    std::wcout << L"           toward targeted searches.\n";
+    std::wcout << L"  summary  print only the per-build totals and skip the per-entry listing.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /tag <ABCD>     filter by 4-char ASCII tag (e.g. Wmem, MmCa, Cdat). Up to 4 characters; pad with spaces.\n";
+    std::wcout << L"  /min <bytes>    keep only entries whose SizeInBytes >= <bytes> (hex or decimal).\n";
+    std::wcout << L"  /max <bytes>    keep only entries whose SizeInBytes <= <bytes>.\n";
+    std::wcout << L"  /addr <va>      keep only the entry containing <va>.\n";
+    std::wcout << L"  /limit <n>      stop after printing <n> entries (default unlimited).\n";
+    std::wcout << L"  /nonpaged       only include NonPaged entries (default).\n";
+    std::wcout << L"  /paged          only include Paged entries.\n";
+    std::wcout << L"  /any            include both Paged and NonPaged.\n";
+    std::wcout << L"  /annotate       walk PTE for each kept NonPaged entry to mark R/W/X and large-page state.\n";
+    std::wcout << L"                  Slower (issues one QueryAddress+TranslateVirtual IOCTL per entry).\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Requires SeDebugPrivilege; run elevated. The scanner attempts to enable it automatically.\n";
+    std::wcout << L"  Only big pool (>= 0x1000 bytes) is tracked by nt!PoolBigPageTable. Use !pool find /tag <TAG> to scan\n";
+    std::wcout << L"  for known suspicious tags; combine with /annotate to spot W+X allocations (executable NonPaged pool).\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !pool big\n";
+    std::wcout << L"  !pool big /tag Cdat /annotate\n";
+    std::wcout << L"  !pool find /min 0x10000 /annotate\n";
+    std::wcout << L"  !pool find /addr 0xffffae8000123000\n";
+    std::wcout << L"  !pool summary\n";
+}
+
+static void PrintBigPoolRecord(const BigPoolEntryRecord& entry, bool annotateRequested)
+{
+    PrintColoredText(L"[pool.big]", KNDBG_COLOR_TITLE);
+    std::wcout << L" address=" << HexTextWidth(entry.VirtualAddress, 16, true);
+
+    std::wcout << L" size=";
+    std::wstringstream sizeText;
+    sizeText << L"0x" << std::hex << entry.SizeInBytes;
+    PrintColoredText(sizeText.str(), KNDBG_COLOR_ACCENT);
+    std::wcout << L" (" << std::dec << entry.SizeInBytes << L")";
+
+    std::wcout << L" tag=";
+    PrintColoredText(entry.TagText, KNDBG_COLOR_OK);
+
+    std::wcout << L" ";
+    PrintColoredText(entry.NonPaged ? L"NonPaged" : L"Paged",
+                     entry.NonPaged ? KNDBG_COLOR_OK : KNDBG_COLOR_DIM);
+
+    if (annotateRequested)
+    {
+        if (entry.AttributesQueried)
+        {
+            std::wcout << L" R=";
+            PrintColoredText(entry.IsReadable ? L"1" : L"0",
+                             entry.IsReadable ? KNDBG_COLOR_OK : KNDBG_COLOR_DIM);
+            std::wcout << L" W=";
+            PrintColoredText(entry.IsWritable ? L"1" : L"0",
+                             entry.IsWritable ? KNDBG_COLOR_WARN : KNDBG_COLOR_DIM);
+            std::wcout << L" X=";
+            PrintColoredText(entry.IsExecutable ? L"1" : L"0",
+                             entry.IsExecutable ? KNDBG_COLOR_FAIL : KNDBG_COLOR_DIM);
+            if (entry.IsLargePage)
+            {
+                std::wcout << L" LargePage";
+            }
+            if (entry.IsWritable && entry.IsExecutable)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[W+X]", KNDBG_COLOR_FAIL);
+            }
+        }
+        else
+        {
+            std::wcout << L" attr=unavailable";
+        }
+    }
+
+    std::wcout << L"\n";
+}
+
+static void HandlePoolCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintPoolHelp();
+            break;
+        }
+
+        PoolScanner::Options options = {};
+        options.Target = PoolScanner::Scope::Big;
+        options.Paged = PoolScanner::PagedFilter::NonPagedOnly;
+        bool summaryOnly = false;
+
+        size_t index = 1;
+        if (index < args.size() && IsPoolScopeName(args[index]))
+        {
+            std::wstring scope = ToLower(args[index]);
+            if (scope == L"big" || scope == L"bigpool")
+            {
+                options.Target = PoolScanner::Scope::Big;
+            }
+            else if (scope == L"find")
+            {
+                options.Target = PoolScanner::Scope::Find;
+            }
+            else if (scope == L"summary")
+            {
+                summaryOnly = true;
+            }
+            ++index;
+        }
+
+        bool parseError = false;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+
+            if (opt == L"/nonpaged")
+            {
+                options.Paged = PoolScanner::PagedFilter::NonPagedOnly;
+                ++index;
+                continue;
+            }
+            if (opt == L"/paged")
+            {
+                options.Paged = PoolScanner::PagedFilter::PagedOnly;
+                ++index;
+                continue;
+            }
+            if (opt == L"/any")
+            {
+                options.Paged = PoolScanner::PagedFilter::Any;
+                ++index;
+                continue;
+            }
+            if (opt == L"/annotate")
+            {
+                options.AnnotateAttributes = true;
+                ++index;
+                continue;
+            }
+
+            if (opt == L"/tag")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!pool: /tag requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                uint32_t tag = 0;
+                if (!ParsePoolTagText(args[index + 1], &tag))
+                {
+                    std::wcerr << L"!pool: invalid tag \"" << args[index + 1] << L"\"\n";
+                    parseError = true;
+                    break;
+                }
+                options.HasTagFilter = true;
+                options.TagFilter = tag;
+                options.TagFilterText = args[index + 1];
+                index += 2;
+                continue;
+            }
+
+            if (opt == L"/min" || opt == L"/max" || opt == L"/addr" || opt == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!pool: " << opt << L" requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                uint64_t value = 0;
+                if (!ParseUnsigned(args[index + 1], state.NumberBase, &value))
+                {
+                    std::wcerr << L"!pool: failed to parse \"" << args[index + 1] << L"\" for " << opt << L"\n";
+                    parseError = true;
+                    break;
+                }
+                if (opt == L"/min")
+                {
+                    options.HasMinSize = true;
+                    options.MinSize = value;
+                }
+                else if (opt == L"/max")
+                {
+                    options.HasMaxSize = true;
+                    options.MaxSize = value;
+                }
+                else if (opt == L"/addr")
+                {
+                    options.HasAddressFilter = true;
+                    options.AddressFilter = value;
+                }
+                else
+                {
+                    if (value > 0xFFFFFFFFull)
+                    {
+                        value = 0xFFFFFFFFull;
+                    }
+                    options.LimitEntries = static_cast<uint32_t>(value);
+                }
+                index += 2;
+                continue;
+            }
+
+            std::wcerr << L"!pool: unrecognised argument \"" << args[index] << L"\"\n";
+            PrintPoolHelp();
+            parseError = true;
+            break;
+        }
+
+        if (parseError)
+        {
+            break;
+        }
+
+        if (options.Target == PoolScanner::Scope::Find &&
+            !options.HasTagFilter && !options.HasAddressFilter &&
+            !options.HasMinSize && !options.HasMaxSize)
+        {
+            std::wcerr << L"!pool find requires at least one of /tag, /addr, /min, or /max\n";
+            PrintPoolHelp();
+            break;
+        }
+
+        if (options.AnnotateAttributes && !device.IsOpen())
+        {
+            std::wcerr << L"!pool /annotate requires the KnLiveDbg.sys driver device to be open; continuing without attributes\n";
+            options.AnnotateAttributes = false;
+        }
+
+        PoolScanner scanner(device, symbols);
+        PoolScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!pool failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!pool warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!pool warning: " << warning << L"\n";
+        }
+        for (const std::wstring& diag : result.Diagnostics)
+        {
+            std::wcout << L"!pool diag: " << diag << L"\n";
+        }
+
+        if (!summaryOnly)
+        {
+            for (const BigPoolEntryRecord& entry : result.Entries)
+            {
+                PrintBigPoolRecord(entry, options.AnnotateAttributes);
+            }
+        }
+
+        PrintColoredText(L"[pool.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" total=" << std::dec << result.TotalEntries
+                   << L" nonpaged=" << result.NonPagedCount
+                   << L" paged=" << result.PagedCount
+                   << L" matching=" << result.MatchingCount;
+        if (result.QueryBufferBytes != 0)
+        {
+            std::wcout << L" buffer=0x" << std::hex << result.QueryBufferBytes << std::dec;
+        }
+        if (result.QueryRetries != 0)
+        {
+            std::wcout << L" retries=" << result.QueryRetries;
+        }
+        if (!result.PrivilegeEnabled)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"(no SeDebugPrivilege)", KNDBG_COLOR_WARN);
+        }
+        std::wcout << L"\n";
+    } while (false);
+}
+
 static void PrintWnfHelp()
 {
     std::wcout << L"!wnf command:\n";
@@ -13282,6 +14602,26 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintNmiHelp();
         }
+        else if (command == L"!pool")
+        {
+            PrintPoolHelp();
+        }
+        else if (command == L"dump-raw")
+        {
+            PrintDumpRawHelp();
+        }
+        else if (command == L"dump-pe")
+        {
+            PrintDumpPeHelp();
+        }
+        else if (command == L"pool-scan-pe")
+        {
+            PrintPoolScanPeHelp();
+        }
+        else if (command == L"!address")
+        {
+            PrintAddressHelp();
+        }
         else if (command == L"!wnf")
         {
             PrintWnfHelp();
@@ -14872,6 +16212,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!pool")
+            {
+                commandClass = L"pool";
+                break;
+            }
+
             if (command == L"!wnf")
             {
                 commandClass = L"wnf";
@@ -14937,6 +16283,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"!nmi")
         {
             commandClass = L"nmi";
+            break;
+        }
+
+        if (command == L"!pool")
+        {
+            commandClass = L"pool";
             break;
         }
 
@@ -15605,6 +16957,26 @@ static bool ValidateAiPlanArgumentShape(
                     *reason = L"!nmi scope must be callbacks";
                 }
                 break;
+            }
+        }
+        else if (command == L"!pool")
+        {
+            size_t i = 1;
+            if (i < args.size() && IsPoolScopeName(args[i]))
+            {
+                ++i;
+            }
+            while (i < args.size())
+            {
+                if (!IsPoolOption(args[i]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!pool argument must be a scope name or /option";
+                    }
+                    break;
+                }
+                ++i;
             }
         }
         else if (command == L"!wnf")
@@ -20386,6 +21758,26 @@ static bool HandleCommand(
         else if (command == L"!nmi")
         {
             HandleNmiCommand(args, device, symbols);
+        }
+        else if (command == L"!pool")
+        {
+            HandlePoolCommand(args, state, device, symbols);
+        }
+        else if (command == L"dump-raw")
+        {
+            HandleDumpRawCommand(args, state, device, symbols);
+        }
+        else if (command == L"dump-pe")
+        {
+            HandleDumpPeCommand(args, state, device, symbols);
+        }
+        else if (command == L"pool-scan-pe")
+        {
+            HandlePoolScanPeCommand(args, state, device, symbols);
+        }
+        else if (command == L"!address")
+        {
+            HandleAddressCommand(args, state, device, symbols);
         }
         else if (command == L"!wnf")
         {

@@ -43,7 +43,19 @@
     <ClCompile Include="EtwScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AddressInspector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="NmiScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MemoryDumper.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PoolPeHunter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PoolScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="main.cpp">
@@ -93,7 +105,19 @@
     <ClInclude Include="EtwScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="AddressInspector.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="NmiScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MemoryDumper.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PoolPeHunter.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PoolScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="NativeDisassembler.h">
