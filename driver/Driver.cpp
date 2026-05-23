@@ -114,6 +114,112 @@ static bool KnDbgRangeOverflows(ULONGLONG Address, SIZE_T Length)
     return overflows;
 }
 
+// MDL-based read used as a fallback when MmCopyMemory(MM_COPY_MEMORY_VIRTUAL)
+// returns STATUS_INVALID_ADDRESS. MmCopyMemory only reads currently-resident
+// pages; for paged-out kernel memory (typical for rarely-touched sections like
+// .rsrc/GFIDS in third-party drivers and some .reloc pages) we need
+// MmProbeAndLockPages to force a page-in. Pages that are truly torn down
+// (e.g. discardable INIT after DriverEntry) still raise an exception here, so
+// the caller continues to receive STATUS_INVALID_ADDRESS for those and the
+// user-mode dump-pe path zero-fills the affected range.
+static NTSTATUS KnDbgReadVirtualAddressViaMdl(PVOID Address, PVOID Output, SIZE_T Length, PSIZE_T BytesCopied)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    PMDL mdl = nullptr;
+    BOOLEAN locked = FALSE;
+
+    do
+    {
+        if (BytesCopied != nullptr)
+        {
+            *BytesCopied = 0;
+        }
+
+        if (KeGetCurrentIrql() > APC_LEVEL)
+        {
+            status = STATUS_INVALID_DEVICE_STATE;
+            break;
+        }
+
+        // MmProbeAndLockPages(KernelMode, ...) treats Address as kernel-space.
+        // If a user-mode VA slips through here it could bugcheck the box (the
+        // probe would access user-mode page tables under the system DTB). We
+        // are a kernel-debug helper and only read kernel ranges, so refuse
+        // anything below MmSystemRangeStart up front.
+        if (Address < MmSystemRangeStart)
+        {
+            status = STATUS_INVALID_ADDRESS;
+            break;
+        }
+
+        // Defensive cap on the cast to ULONG. KNDBG_MAX_TRANSFER_SIZE is the
+        // upstream guard at 1 MB, so this is theoretical, but the explicit
+        // cast above would silently truncate if anyone ever raises that gate
+        // past 4 GB and the resulting RtlCopyMemory would read past the end
+        // of the locked range.
+        if (Length > MAXULONG)
+        {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+
+        mdl = IoAllocateMdl(Address, static_cast<ULONG>(Length), FALSE, FALSE, NULL);
+        if (mdl == nullptr)
+        {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+
+        __try
+        {
+            MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+            locked = TRUE;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            status = GetExceptionCode();
+            if (NT_SUCCESS(status))
+            {
+                status = STATUS_INVALID_ADDRESS;
+            }
+            break;
+        }
+
+        // After probing-and-locking, the pages are guaranteed resident and the
+        // original kernel VA can be read directly without aliasing through
+        // MmGetSystemAddressForMdlSafe. Wrap in __try for the rare case where
+        // the underlying mapping changes mid-copy (e.g. a concurrent unload).
+        __try
+        {
+            RtlCopyMemory(Output, Address, Length);
+            if (BytesCopied != nullptr)
+            {
+                *BytesCopied = Length;
+            }
+            status = STATUS_SUCCESS;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            status = GetExceptionCode();
+            if (NT_SUCCESS(status))
+            {
+                status = STATUS_INVALID_ADDRESS;
+            }
+        }
+    } while (false);
+
+    if (locked)
+    {
+        MmUnlockPages(mdl);
+    }
+    if (mdl != nullptr)
+    {
+        IoFreeMdl(mdl);
+    }
+
+    return status;
+}
+
 static NTSTATUS KnDbgReadVirtualAddress(ULONGLONG Address, PVOID Output, SIZE_T Length, PSIZE_T BytesCopied)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -138,11 +244,46 @@ static NTSTATUS KnDbgReadVirtualAddress(ULONGLONG Address, PVOID Output, SIZE_T 
             break;
         }
 
+        PVOID sourceVa = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(Address));
+
         MM_COPY_ADDRESS source = {};
-        source.VirtualAddress = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(Address));
+        source.VirtualAddress = sourceVa;
 
         *BytesCopied = 0;
         status = MmCopyMemory(Output, source, Length, MM_COPY_MEMORY_VIRTUAL, BytesCopied);
+
+        // MmCopyMemory(MM_COPY_MEMORY_VIRTUAL) refuses to page-in: pageable
+        // kernel memory that has been trimmed from the working set fails
+        // without attempting a page fault. The exact failure status varies
+        // across Windows builds (STATUS_INVALID_ADDRESS on most, but other
+        // codes have been observed for HVCI-protected or paged-out ranges),
+        // so we fall back on any non-success status. The MDL probe-and-lock
+        // path pulls the data back into physical memory before reading.
+        // Pages that are genuinely torn down (truly discarded sections,
+        // freed allocations, kernel CFG protected ranges) still fail through
+        // SEH inside the MDL helper, and the original failure status is
+        // preserved.
+        if (!NT_SUCCESS(status))
+        {
+            NTSTATUS savedStatus = status;
+            // Preserve any partial bytes MmCopyMemory copied before failing
+            // so we can hand them back on full fallback failure. The MDL
+            // helper zeroes *BytesCopied at entry, so without this snapshot
+            // we would drop partial successes.
+            SIZE_T savedBytesCopied = *BytesCopied;
+            SIZE_T mdlCopied = 0;
+            NTSTATUS mdlStatus = KnDbgReadVirtualAddressViaMdl(sourceVa, Output, Length, &mdlCopied);
+            if (NT_SUCCESS(mdlStatus))
+            {
+                *BytesCopied = mdlCopied;
+                status = mdlStatus;
+            }
+            else
+            {
+                *BytesCopied = savedBytesCopied;
+                status = savedStatus;
+            }
+        }
     } while (false);
 
     return status;
