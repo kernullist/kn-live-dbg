@@ -58,7 +58,11 @@ kn-live-dbg/
 23. Enumerates ALPC ports natively from live kernel memory with `!alpc`, recursively walking the Object Manager namespace from `nt!ObpRootDirectoryObject`, following `_ALPC_PORT.CommunicationInfo` to discover paired server/client ports, counting queue depths from `MainQueue`/`PendingQueue`/`LargeMessageQueue`/`CanceledQueue`/`WaitQueue`, and grouping records by `ConnectionPort` into client/server families.
 24. Reports VBS, HVCI, Secure Kernel, and IUM trustlet status with `!vbs`, `!ci`, and `!securekernel` — decoding `nt!g_CiOptions` flag bits, reading `nt!HvlpVsmVtlCallVa` for VBS active state, scanning `PsLoadedModuleList` for `securekernel.exe`/`skci.dll`, querying CPUID leaves `0x40000000`/`0x40000006` for hypervisor identification, and walking `PsActiveProcessHead` with `_KPROCESS.SecureState` (or known trustlet image-name prefixes when the field is unavailable) for the trustlet list.
 25. Detects InfinityHook-style ETW logger tampering with `!etw` and walks the registered NMI handler chain with `!nmi` — reading `nt!EtwpDebuggerData`'s 64 `WMI_LOGGER_CONTEXT*` slots for logger name and GetCpuClock annotation, walking `nt!KiNmiCallbackListHead` through the `KNMI_HANDLER_CALLBACK` singly-linked list, and flagging any callback or GetCpuClock target outside the loaded kernel modules.
-26. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
+26. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
+27. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
+28. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
+29. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
+30. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
 
 ## Design Notes
 
@@ -185,7 +189,12 @@ callbacks [scope] /module <module>
 !securekernel
 !etw [loggers|logger <index|name>|integrity]
 !nmi [callbacks]
-!wnf [decode <hash>|instances|instance <hash>|data <hash>]
+!pool [big|find|summary] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate]
+dump-raw <address> <length> <path> [/zerofill]
+dump-pe <address> <path>
+pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
+!address <va>
+!wnf [decode <hash>|instances|instance <hash>|data <hash>|candidates|lists]
 ai <question>
 ai status
 ai config [status|providers|provider|policy|model|base-url|effort|auth|test]
@@ -265,6 +274,17 @@ knkd> !etw loggers
 knkd> !etw logger "Circular Kernel Context Logger"
 knkd> !etw integrity
 knkd> !nmi callbacks
+knkd> !pool big /annotate
+knkd> !pool find /tag Wmem /annotate
+knkd> !pool find /min 0x10000 /annotate
+knkd> !pool summary
+knkd> dump-raw nt!KiSystemServiceUser 0x200 .\kiSystemServiceUser.bin
+knkd> dump-pe nt .\ntoskrnl-live.exe
+knkd> dump-pe Wdf01000 .\wdf01000-live.sys
+knkd> pool-scan-pe
+knkd> pool-scan-pe /suspicious /dump .\poolpe-hits
+knkd> !address nt!ExpWnfSiloState
+knkd> !address 0xffffe78fcd778000
 knkd> !wnf decode 0x41c64e6da3bc0075
 knkd> !wnf instances
 knkd> !wnf instance 0xfffff80300000000
@@ -377,7 +397,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!wnf`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!pool`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -630,7 +650,30 @@ Diagnostic subcommands for builds where automatic detection picks the wrong chai
 
 When neither walking mode produces records the scanner emits a precise error naming the missing piece and reminds the operator that the `decode` subcommand still works as a complete standalone tool.
 
-## Virtual-To-Physical And Physical Memory
+## Big Pool Tracking
+
+`!pool` snapshots `nt!PoolBigPageTable` -- the kernel's per-build tracking table for big pool (>= one page) allocations -- and surfaces tag, size, paged/non-paged class, virtual address range, and, on request, the effective R/W/X attributes derived from a live page-table walk:
+
+```text
+!pool big                              list every NonPaged big pool entry
+!pool big /tag Wmem /annotate          filter by tag and walk PTE for each entry
+!pool find /min 0x10000 /annotate      hunt large NonPaged allocations
+!pool find /addr 0xffffae8000123000    locate the entry containing a VA
+!pool summary                          totals only (no per-entry listing)
+```
+
+How it works:
+
+1. The scanner enables `SeDebugPrivilege` on the current token, resolves `ntdll!NtQuerySystemInformation`, and issues a buffer-growing `SystemBigPoolInformation` (class 0x42) query that doubles from 64 KB up to a 64 MB ceiling with at most 16 retries. The kernel returns a snapshot of `_SYSTEM_BIGPOOL_INFORMATION` whose entries pack the virtual address with the `NonPaged` flag in the low bit and report a 4-byte ASCII tag plus byte size.
+2. Per-entry filters apply in order: paged class (`/nonpaged` default, `/paged`, or `/any`), 4-character tag (`/tag <ABCD>` with case-sensitive matching; partial tags zero-pad the upper bytes to mirror `ExAllocatePoolWithTag('SG')` literal encoding), size band (`/min`/`/max`), containing address (`/addr`), and finally `/limit <n>` truncates the printed list while still counting all matches.
+3. `/annotate` issues one `IOCTL_KNDBG_TRANSLATE_VIRTUAL` per kept entry. The driver walks PML5/PML4/PDPTE/PDE/PTE (auto-detecting LA57 via CR4 and reporting the level count) and the scanner ANDs the Writable bit and ORs the NX bit across every traversed level so that effective W/X is correct even when a parent table clears W or sets NX. Large-page short-circuit (`PS=1` at PDPTE or PDE) is honored; the output flags `LargePage` and any combined `[W+X]` non-paged page in red as a BYOVD/staging signal.
+4. `!pool summary` prints the totals -- raw `TotalEntries`, `NonPagedCount`, `PagedCount`, kept `MatchingCount`, buffer size finally accepted by the kernel, retry count, and a `(no SeDebugPrivilege)` warning when elevation failed -- without the per-entry listing.
+
+Requirements and caveats:
+
+- The host must be elevated. `NtQuerySystemInformation(SystemBigPoolInformation)` returns `STATUS_ACCESS_DENIED` without `SeDebugPrivilege`; the error path reports the NTSTATUS verbatim.
+- Only big pool (>= one page) is tracked by `nt!PoolBigPageTable`. Smaller allocations served from per-CPU lookasides and the segment heap are not visible to this command.
+- `/annotate` requires the `KnLiveDbg.sys` device to be open. The TUI auto-disables the flag with a warning when the device is not available.
 
 Native physical memory support is intentionally explicit:
 
@@ -652,6 +695,102 @@ peq <physical-address> <qword-value>
 ```
 
 `vtop` uses the current CR3 when no directory-table base is supplied. `vtop /process` asks the driver to resolve the target EPROCESS, reads the DTB offsets from PDB type metadata, and walks that process address space. It prints whether the walk used PML4 or PML5, the physical address of each page-table entry that was read, and the leaf entry kind, physical address, and writable state. `procctx <pid>` stores the same process context for later user VA reads/writes. `d*` commands accept `/process <pid>` for one-shot process-aware access, while native `e*` virtual writes default to the System process context (`pid 4`) and accept `/process <pid>` when a process-specific user VA should be edited. If `e*` is invoked with only an address, the TUI enters a WinDbg-style one-line edit prompt that shows the current value, accepts replacement values, and cancels on an empty line, `.`, `q`, or `quit`. These paths translate each VA range before access. Reads use physical pages, translated user VA writes use physical writes through the selected process context, and kernel VA writes use the original virtual address after any required page-table write-enable step. When a translated leaf PTE/PDE/PDPTE is present but not writable, `e*` temporarily sets the write bit on that leaf entry, flushes the virtual address, performs the edit, restores the write bit to its original state, and flushes again. The driver walks x64 paging structures through physical reads, reports PML5E/PML4E/PDPTE/PDE/PTE entries when applicable, handles 4 KB, 2 MB, and 1 GB pages, and returns the number of contiguous bytes remaining in the translated page. Physical reads are available through both native names (`phys`, `pdb`, `pdw`, `pdd`, `pdq`) and WinDbg-style extension names (`!db`, `!dw`, `!dd`, `!dq`). Physical writes are available through both native names (`peb`, `pew`, `ped`, `peq`) and WinDbg-style extension names (`!eb`, `!ew`, `!ed`, `!eq`), and are routed through page-sized `MmMapIoSpaceEx` mappings with `MmGetVirtualForPhysical` fallback when Windows already has a direct mapping for the PFN. Address-only physical enter commands prompt with the current physical value before writing, matching the native `eb` edit flow. Write mode is enabled by default for each device handle; use `write off` when you want a read-only console session.
+
+## Memory Dumps
+
+Two file-emitting commands turn live kernel memory into on-disk artefacts for offline triage in IDA, Ghidra, or hex editors:
+
+```text
+dump-raw <address> <length> <path> [/zerofill]
+dump-pe <address> <path>
+```
+
+`dump-raw` reads `<length>` bytes starting at `<address>` and writes them verbatim. The read is chunked into 256 KB IOCTL calls (matching the driver's read window). The default behaviour aborts on the first per-chunk failure and reports the failing VA; pass `/zerofill` to fall back to zero-filling the failed chunk and continuing -- useful when sweeping ranges that straddle unmapped or paged-out pages. The total request is capped at 1 GB as a sanity guard.
+
+`dump-pe` rebuilds an on-disk PE image from a kernel-loaded module. It:
+
+1. Reads the first 4 KB at `<address>` and validates `IMAGE_DOS_HEADER.e_magic == 'MZ'`, follows `e_lfanew` to `IMAGE_NT_HEADERS`, and validates the `'PE\0\0'` signature. Both PE32 and PE32+ are supported; the scanner extracts `SizeOfHeaders`, `NumberOfSections`, `SizeOfImage`, `ImageBase`, and `Machine` from whichever optional header is present.
+2. Re-reads the headers buffer if `SizeOfHeaders > 4 KB` (rare but possible on builds with hefty `IMAGE_DATA_DIRECTORY` payloads), then locates the `IMAGE_SECTION_HEADER[]` table and computes the output file size as `max(SizeOfHeaders, max_over_sections(PointerToRawData + SizeOfRawData))`.
+3. Copies the in-memory headers verbatim to the output (preserving any loader patches), then for each section reads `SizeOfRawData` bytes from `<address> + VirtualAddress` and writes them at file offset `PointerToRawData`, reversing the loader's RVA-to-disk-offset expansion.
+4. Sections whose reads fail (typically discarded `INIT` sections in KMDF drivers; sometimes paged-out `.pdata`/`.rdata`) are zero-filled and surfaced as `[ZERO-FILLED]` per-section warnings, so the final file remains a structurally-valid PE that IDA/Ghidra can still load.
+
+**Header recovery**: malware modules (and some kernel-mode loaders) zero out the `MZ` and/or `PE\0\0` signatures, and sometimes the `e_lfanew` pointer too, to evade naive memory scanners. `dump-pe` recovers from this when the rest of the `IMAGE_FILE_HEADER` / `IMAGE_OPTIONAL_HEADER` is intact:
+
+1. **MZ wiped**: if `e_lfanew` still points to a plausible NT header (Machine != 0, NumberOfSections in 1..96, OptionalHeader.Magic == `0x10b`/`0x20b`, SizeOfOptionalHeader matches the Magic), the scanner restores `IMAGE_DOS_SIGNATURE` at offset 0.
+2. **PE\\0\\0 wiped**: if `e_lfanew` is correct but the 4-byte signature there is zero (or anything other than `0x00004550`), the scanner accepts the location if the trailing FileHeader/OptionalHeader still looks like a real PE and writes back the canonical `'PE\0\0'`.
+3. **e_lfanew corrupted**: the scanner sweeps 4-byte-aligned offsets from `0x40` up to `0x1000`, looking for a region that passes the FileHeader+Magic plausibility test, then rewrites `e_lfanew` to point at the discovered offset (along with restoring `MZ` and `PE\0\0` if also wiped).
+4. **DOS header partially or fully wiped, NT headers intact**: handled as a superset of cases 1+3.
+
+Whatever was repaired is surfaced both as per-restore lines in `dump-pe warning:` and as a coloured `recovered=[MZ,e_lfanew,PE]` tag in the final summary line. If the NT headers themselves are also gone (no plausible FileHeader+Magic anywhere in the first 4 KB), the scanner reports `could not locate IMAGE_NT_HEADERS even after attempting signature recovery` rather than guessing.
+
+```text
+dump-raw nt!KiSystemServiceUser 0x200 .\kiSystemServiceUser.bin
+dump-raw 0xffffae8000123000 0x10000 .\pool-region.bin /zerofill
+dump-pe nt .\ntoskrnl-live.exe
+dump-pe Wdf01000 .\wdf01000-live.sys
+```
+
+Caveats:
+
+- The dumped PE reflects the live image state: relocations are applied (so RVAs in the file body point at `ImageBase + RVA` rather than zero-relative), the IAT slots hold resolved function pointers (not import descriptor RVAs), and any in-place patches by anti-malware, HVCI, or PatchGuard appear in the output. Use this for analysing the running image, not for repackaging an installable binary.
+- Paths that contain whitespace are accepted when wrapped in double quotes -- `dump-pe nt "C:\Program Files\Dumps\ntoskrnl-live.exe"` works the same as `dump-pe nt .\ntoskrnl-live.exe`. The argument tokenizer recognises `"..."` as a literal region and supports mixed quoted/unquoted concatenation within a single token. Apostrophes are kept literal in unquoted paths (matching CMD/PowerShell convention) so names like `O'Brien\foo.sys` need no quoting.
+- Both commands require the `KnLiveDbg.sys` driver device to be open. Symbol-based addresses (e.g., `nt`, `Wdf01000`, `nt!ExpWnfSiloState`) are resolved through the same symbol path as the rest of the TUI.
+
+## Address Inspection
+
+`!address <va>` is the WinDbg-style introspection for a single virtual address. It answers "what is this pointer, and what can be done to it" in one go:
+
+```text
+!address <va>
+```
+
+Output breakdown:
+
+1. `[address]` -- canonicality (bits above 47 / 56 must all match), kernel vs user half, `[zero-page]` flag for the first 4 KB, `paging=LA57` when 5-level paging is active.
+2. `[address.module]` (when the address falls inside a loaded kernel module range) -- image name, base, size, offset within the module, full image path.
+3. `[address.symbol]` (when DbgHelp/DIA can resolve a nearest symbol) -- symbol name plus byte displacement.
+4. `[address.translation]` -- live CR3, number of paging levels walked, page size, and per-level PML5E/PML4E/PDPTE/PDE/PTE values along with their physical addresses. Each entry is annotated `(P=W=U=PS=NX=)` so the operator can see exactly where access is gated.
+5. `effective:` -- aggregated permissions across every walked level: present = AND of bit 0, writable = AND of bit 1, executable = AND of `(!NX)`, user-accessible = AND of bit 2. A `[W+X]` red tag fires when the page is both writable and executable in the effective state.
+6. `[address.physical]` -- resulting physical address, byte offset inside the page, and the byte count guaranteed contiguous by the driver translation pass.
+
+Examples:
+
+```text
+knkd> !address nt!ExpWnfSiloState
+knkd> !address 0xffffe78fcd778000
+knkd> !address WdFilter+0x1234
+```
+
+Symbolic forms (`nt!XXX`, `module+0xNN`, hex/decimal values, address expressions) are accepted through the same parser used elsewhere in the TUI. Non-canonical inputs short-circuit before TranslateVirtual and report a warning instead of issuing an IOCTL that would fail deterministically.
+
+## Big Pool PE Hunting
+
+`pool-scan-pe` combines the big pool enumerator with the `dump-pe` plausibility-gated PE header detector to surface hidden / reflectively-loaded modules camped in `nt!PoolBigPageTable` allocations. The detector accepts both intact and signature-wiped PE headers, so the common malware pattern of zeroing `MZ` / `PE\0\0` / `e_lfanew` to evade scanners no longer hides the payload.
+
+```text
+pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]
+             [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
+```
+
+How it works:
+
+1. Same enumeration path as `!pool`: enable `SeDebugPrivilege`, call `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, then iterate big pool entries after applying the paged-class, tag, and size filters.
+2. For each kept entry, read the first 4 KB through the driver `ReadMemory` IOCTL (which now includes the MDL probe-and-lock fallback for paged-out pages) and run `ProbeForPeHeader`. The probe tries `e_lfanew` first; on miss it sweeps 4-byte-aligned offsets `0x40..0x1000` looking for a plausible `IMAGE_NT_HEADERS` (Machine != 0, NumberOfSections in `1..96`, SizeOfOptionalHeader `0xF0`/`0xE0`, OptionalHeader.Magic `0x10b`/`0x20b`, SizeOfHeaders in `(0, 0x10000]`, SizeOfImage in `(SizeOfHeaders, 256 MB)`).
+3. Each hit is annotated with whether `MZ`, `PE\0\0`, and/or `e_lfanew` were wiped. Hits with any wipe are highlighted in red with a `WIPED=[MZ,e_lfanew,PE]` tag and also counted against `suspicious` in the summary line; intact-header PE images print in the regular `[pool-pe.hit]` form for completeness.
+4. With `/dump <directory>`, each hit is written to disk through `DumpKernelPeToFile`, which performs the same signature-recovery and section walking as the standalone `dump-pe` command. The output filename pattern is `poolpe_<tag>_<address>.bin`; the directory is created if missing.
+
+```text
+[pool-pe.hit]     address=0xffffae8000123000 size=0x10000 tag=Wmem NonPaged nt=0x100 bits=64 machine=0x8664 sections=5 sizeOfImage=0xa000 imageBase=0x...
+[pool-pe.suspect] address=0xffffae8000777000 size=0x18000 tag=Cdat NonPaged nt=0x108 bits=64 machine=0x8664 sections=6 sizeOfImage=0x14000 imageBase=0x0 WIPED=[MZ,e_lfanew,PE]
+[pool-pe.summary] total=18324 nonpaged=5012 paged=13312 scanned=4988 readFail=4 hits=2 suspicious=1
+```
+
+Notes:
+
+- The probe runs on the first 4 KB only -- enough to cover DOS header + NT header + section table for virtually every PE. Allocations smaller than `sizeof(IMAGE_DOS_HEADER)` are skipped.
+- `/suspicious` collapses output to the wiped-header hits, which are the high-signal cases for malware hunting.
+- `/dump` failures (e.g. truly torn-down sections inside the payload) leave a partial PE in the output file with `[ZERO-FILLED]` sections, mirroring `dump-pe` behaviour. The hit still appears in the scan output regardless.
+- Default size floor is `0x1000` (one page) since PE images take at least one page. Override with `/min`/`/max` when chasing exotic layouts.
 
 ## Positive-Control Probe
 

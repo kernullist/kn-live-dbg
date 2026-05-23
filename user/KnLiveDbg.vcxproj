@@ -95,6 +95,7 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="AddressInspector.cpp" />
     <ClCompile Include="AiProvider.cpp" />
     <ClCompile Include="AlpcScanner.cpp" />
     <ClCompile Include="CallbackScanner.cpp" />
@@ -104,6 +105,9 @@
     <ClCompile Include="DriverService.cpp" />
     <ClCompile Include="EtwScanner.cpp" />
     <ClCompile Include="NmiScanner.cpp" />
+    <ClCompile Include="MemoryDumper.cpp" />
+    <ClCompile Include="PoolPeHunter.cpp" />
+    <ClCompile Include="PoolScanner.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
@@ -118,6 +122,7 @@
     <ResourceCompile Include="KnLiveDbg.rc" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AddressInspector.h" />
     <ClInclude Include="AiProvider.h" />
     <ClInclude Include="AlpcScanner.h" />
     <ClInclude Include="CallbackScanner.h" />
@@ -128,6 +133,9 @@
     <ClInclude Include="EtwScanner.h" />
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="NmiScanner.h" />
+    <ClInclude Include="MemoryDumper.h" />
+    <ClInclude Include="PoolPeHunter.h" />
+    <ClInclude Include="PoolScanner.h" />
     <ClInclude Include="SymbolEngine.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="WfpScanner.h" />
