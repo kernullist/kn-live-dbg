@@ -55,6 +55,9 @@
     <ClCompile Include="PoolPeHunter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ThreatIntelSubscriber.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PoolScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -115,6 +118,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PoolPeHunter.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ThreatIntelSubscriber.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PoolScanner.h">

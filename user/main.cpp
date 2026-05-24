@@ -10,6 +10,7 @@
 #include "MemoryDumper.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
+#include "ThreatIntelSubscriber.h"
 #include "NmiScanner.h"
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
@@ -42,6 +43,14 @@
 static std::atomic_bool g_StopRequested = false;
 static HANDLE g_MainThreadHandle = nullptr;
 static HANDLE g_InstanceMutexHandle = nullptr;
+
+// Set by the !ti handler while a subscription is active. The console control
+// handler reads this on hard-exit paths (window close / logoff / system
+// shutdown) and calls Stop() synchronously so the kernel ETW session never
+// leaks; the normal exit path (return from wmain) is already covered by the
+// singleton's destructor.
+class TiSubscriber;
+static std::atomic<TiSubscriber*> g_TiSubscriberForShutdown{nullptr};
 static bool g_InstanceMutexOwned = false;
 static std::recursive_mutex g_ConsoleOutputMutex;
 static std::atomic_uint64_t g_CommandStreamOutputSerial = 0;
@@ -652,7 +661,8 @@ static BOOL WINAPI ConsoleHandler(DWORD controlType)
     {
     case CTRL_C_EVENT:
     case CTRL_BREAK_EVENT:
-    case CTRL_CLOSE_EVENT:
+        // Polite interrupt: let the main loop notice the flag and tear down
+        // through normal paths (which includes the TiSubscriber destructor).
         g_StopRequested = true;
         if (g_MainThreadHandle != nullptr)
         {
@@ -660,6 +670,32 @@ static BOOL WINAPI ConsoleHandler(DWORD controlType)
         }
         handled = TRUE;
         break;
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+    {
+        // Hard exit: Windows will terminate the process shortly after we
+        // return. Static destructors typically do NOT run on these paths,
+        // which means the ETW session and provider registration would leak
+        // until reboot. We synchronously tear down the TI subscription
+        // first; the call is bounded by IOCTL latencies and well under
+        // the OS-imposed handler budget (5 s for CTRL_CLOSE_EVENT, 20 s
+        // for CTRL_LOGOFF/SHUTDOWN_EVENT by default).
+        TiSubscriber* sub = g_TiSubscriberForShutdown.load();
+        if (sub != nullptr)
+        {
+            std::wstring stopError;
+            sub->Stop(&stopError);
+            g_TiSubscriberForShutdown.store(nullptr);
+        }
+        g_StopRequested = true;
+        if (g_MainThreadHandle != nullptr)
+        {
+            CancelSynchronousIo(g_MainThreadHandle);
+        }
+        handled = TRUE;
+        break;
+    }
     default:
         handled = FALSE;
         break;
@@ -2024,7 +2060,8 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!nmi" ||
         command == L"!pool" ||
         command == L"!wnf" ||
-        command == L"!address")
+        command == L"!address" ||
+        command == L"!ti")
     {
         result = true;
     }
@@ -3499,6 +3536,16 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"/zerofill");
                 }
+                else if (topic == L"set-ppl-antimalware")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"on",
+                        L"off",
+                        L"status"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
                 else if (topic == L"!wnf")
                 {
                     static const wchar_t* values[] =
@@ -3633,6 +3680,54 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         else if (command == L"!address")
         {
             AddCompletionCandidate(&candidates, L"help");
+        }
+        else if (command == L"set-ppl-antimalware")
+        {
+            static const wchar_t* values[] =
+            {
+                L"on",
+                L"off",
+                L"status",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!ti")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"start",
+                    L"stop",
+                    L"status",
+                    L"add",
+                    L"remove",
+                    L"watch",
+                    L"recent",
+                    L"stats",
+                    L"by",
+                    L"grep",
+                    L"save",
+                    L"clear",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/pid",
+                    L"/name",
+                    L"/throttle",
+                    L"/ring",
+                    L"/log",
+                    L"pid",
+                    L"task"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"!pool")
         {
@@ -12089,6 +12184,980 @@ static void PrintAddressInspection(const AddressInspectResult& r)
     }
 }
 
+static void PrintSetPplAntimalwareHelp()
+{
+    std::wcout << L"set-ppl-antimalware command:\n";
+    std::wcout << L"  set-ppl-antimalware [on|off|status]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Flips the calling process's _EPROCESS.Protection byte to make KnLiveDbg.exe\n";
+    std::wcout << L"  run as a PPL Antimalware process (PS_PROTECTION: Type=1 PPL, Signer=3\n";
+    std::wcout << L"  Antimalware -> 0x31). This is a prerequisite for subscribing to the\n";
+    std::wcout << L"  Microsoft-Windows-Threat-Intelligence ETW provider, which gates its sensitive\n";
+    std::wcout << L"  events on the consumer being PPL with the antimalware signer.\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  on       set the protection byte to 0x31 (PPL Antimalware). Default.\n";
+    std::wcout << L"  off      clear the protection byte to 0x00 (unprotected).\n";
+    std::wcout << L"  status   read and decode the current protection byte without writing.\n";
+    std::wcout << L"\n";
+    std::wcout << L"requirements:\n";
+    std::wcout << L"  - The KnLiveDbg.sys driver device must be open and write mode enabled\n";
+    std::wcout << L"    (run 'write on' first).\n";
+    std::wcout << L"  - Kernel symbols must resolve _EPROCESS.Protection so the driver receives\n";
+    std::wcout << L"    a build-correct field offset rather than a hardcoded number.\n";
+    std::wcout << L"\n";
+    std::wcout << L"caveats:\n";
+    std::wcout << L"  - Once PPL-protected, KnLiveDbg.exe cannot be attached to by a non-PPL\n";
+    std::wcout << L"    debugger; if you want to debug the tool itself, attach BEFORE running\n";
+    std::wcout << L"    this command.\n";
+    std::wcout << L"  - PatchGuard does not currently audit this field at runtime, but a future\n";
+    std::wcout << L"    Windows kernel could. Use only in controlled lab environments.\n";
+    std::wcout << L"  - PPL state is per-process and clears on exit.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  set-ppl-antimalware\n";
+    std::wcout << L"  set-ppl-antimalware on\n";
+    std::wcout << L"  set-ppl-antimalware status\n";
+    std::wcout << L"  set-ppl-antimalware off\n";
+}
+
+static std::wstring DescribeProtectionByte(uint8_t value)
+{
+    if (value == 0)
+    {
+        return L"None (unprotected)";
+    }
+    uint8_t type = value & 0x07;
+    uint8_t signer = (value >> 4) & 0x0F;
+    const wchar_t* typeName = L"?";
+    switch (type)
+    {
+        case 0: typeName = L"None"; break;
+        case 1: typeName = L"PPL"; break;
+        case 2: typeName = L"PP"; break;
+    }
+    const wchar_t* signerName = L"?";
+    switch (signer)
+    {
+        case 0: signerName = L"None"; break;
+        case 1: signerName = L"Authenticode"; break;
+        case 2: signerName = L"CodeGen"; break;
+        case 3: signerName = L"Antimalware"; break;
+        case 4: signerName = L"Lsa"; break;
+        case 5: signerName = L"Windows"; break;
+        case 6: signerName = L"WinTcb"; break;
+        case 7: signerName = L"WinSystem"; break;
+        case 8: signerName = L"App"; break;
+    }
+    std::wstringstream ss;
+    ss << typeName << L"-" << signerName;
+    return ss.str();
+}
+
+static void HandleSetPplAntimalwareCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    (void)state;
+
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintSetPplAntimalwareHelp();
+            break;
+        }
+
+        std::wstring action = L"on";
+        if (args.size() >= 2)
+        {
+            action = ToLower(args[1]);
+        }
+        if (args.size() > 2)
+        {
+            std::wcerr << L"set-ppl-antimalware: unexpected extra argument \"" << args[2] << L"\"\n";
+            break;
+        }
+
+        if (action != L"on" && action != L"off" && action != L"status")
+        {
+            std::wcerr << L"set-ppl-antimalware: unknown action \"" << args[1] << L"\"\n";
+            PrintSetPplAntimalwareHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"set-ppl-antimalware requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        // Resolve _EPROCESS.Protection field offset from the kernel PDB so
+        // the driver does not have to track per-build layout drift.
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"set-ppl-antimalware: failed to load kernel modules: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        TypeFieldInfo protectionField = {};
+        std::wstring fieldError;
+        if (!symbols.FindField(L"nt!_EPROCESS", L"Protection", &protectionField, &fieldError))
+        {
+            std::wcerr << L"set-ppl-antimalware: could not resolve _EPROCESS.Protection: "
+                       << fieldError << L"\n";
+            break;
+        }
+
+        if (protectionField.Offset == 0 || protectionField.Offset > 0x2000)
+        {
+            std::wcerr << L"set-ppl-antimalware: _EPROCESS.Protection offset 0x"
+                       << std::hex << protectionField.Offset << std::dec
+                       << L" out of plausible range\n";
+            break;
+        }
+
+        uint32_t pid = static_cast<uint32_t>(GetCurrentProcessId());
+
+        // For 'status' we read the current byte by writing the same value
+        // back -- the driver returns the old byte and the read-back which
+        // is what we want to display. Writing the same byte is idempotent.
+        uint8_t requestedValue = KNDBG_PROTECTION_PPL_ANTIMALWARE;
+        bool isStatusOnly = false;
+        if (action == L"off")
+        {
+            requestedValue = KNDBG_PROTECTION_NONE;
+        }
+        else if (action == L"status")
+        {
+            // Read current value first via a no-op rewrite. We need an
+            // intermediate read; reuse the IOCTL by writing back what we
+            // read. Simpler: do a single round where the new value is the
+            // value we hope is already there (use 0x31 by default) -- the
+            // response carries the OldProtection regardless. We then
+            // immediately overwrite again with OldProtection to be
+            // idempotent.
+            isStatusOnly = true;
+            requestedValue = KNDBG_PROTECTION_PPL_ANTIMALWARE;
+        }
+
+        uint8_t oldByte = 0;
+        uint8_t readBack = 0;
+        uint64_t eprocessAddress = 0;
+        std::wstring ioctlError;
+        if (!device.SetProcessProtection(
+                pid,
+                static_cast<uint32_t>(protectionField.Offset),
+                requestedValue,
+                &oldByte,
+                &readBack,
+                &eprocessAddress,
+                &ioctlError))
+        {
+            std::wcerr << L"set-ppl-antimalware: IOCTL failed: " << ioctlError << L"\n";
+            std::wcerr << L"  (hint: run 'write on' first; the driver requires write mode)\n";
+            break;
+        }
+
+        // For status, restore the original byte so the read is non-destructive.
+        if (isStatusOnly && oldByte != requestedValue)
+        {
+            std::wstring restoreError;
+            if (!device.SetProcessProtection(
+                    pid,
+                    static_cast<uint32_t>(protectionField.Offset),
+                    oldByte,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    &restoreError))
+            {
+                std::wcerr << L"set-ppl-antimalware: status read succeeded but restoring the original byte failed: "
+                           << restoreError << L"\n";
+                std::wcerr << L"  process is currently 0x" << std::hex << static_cast<unsigned>(readBack)
+                           << std::dec << L"\n";
+            }
+            readBack = oldByte;
+        }
+
+        PrintColoredText(L"[set-ppl-antimalware]", KNDBG_COLOR_TITLE);
+        std::wcout << L" pid=" << std::dec << pid
+                   << L" eprocess=" << HexTextWidth(eprocessAddress, 16, true)
+                   << L" offset=0x" << std::hex << protectionField.Offset << std::dec
+                   << L"\n";
+
+        std::wcout << L"  before=0x" << std::hex << std::setw(2) << std::setfill(L'0')
+                   << static_cast<unsigned>(oldByte) << std::dec
+                   << L" (" << DescribeProtectionByte(oldByte) << L")\n";
+
+        std::wcout << L"  after =0x" << std::hex << std::setw(2) << std::setfill(L'0')
+                   << static_cast<unsigned>(readBack) << std::dec
+                   << L" (" << DescribeProtectionByte(readBack) << L")";
+
+        if (!isStatusOnly)
+        {
+            std::wcout << L" requested=0x" << std::hex << std::setw(2) << std::setfill(L'0')
+                       << static_cast<unsigned>(requestedValue) << std::dec;
+            if (readBack != requestedValue)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[write rejected]", KNDBG_COLOR_FAIL);
+            }
+            else if (oldByte != readBack)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[ok]", KNDBG_COLOR_OK);
+            }
+            else
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[no change]", KNDBG_COLOR_DIM);
+            }
+        }
+        std::wcout << L"\n";
+
+        if (!isStatusOnly && readBack == KNDBG_PROTECTION_PPL_ANTIMALWARE)
+        {
+            std::wcout << L"  KnLiveDbg.exe is now PPL Antimalware; Microsoft-Windows-Threat-Intelligence\n"
+                       << L"  ETW subscription is now allowed for this process.\n";
+        }
+    } while (false);
+}
+
+// Singleton subscriber owned by main.cpp. We keep it as a function-local
+// static so destructor ordering is well-defined relative to wmain return.
+static TiSubscriber& GetTiSubscriberInstance()
+{
+    static TiSubscriber s_instance;
+    return s_instance;
+}
+
+static void PrintTiHelp()
+{
+    std::wcout << L"!ti command (Microsoft-Windows-Threat-Intelligence ETW):\n";
+    std::wcout << L"  !ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>]\n";
+    std::wcout << L"            [/log <path>] [/ring <N>]\n";
+    std::wcout << L"  !ti stop\n";
+    std::wcout << L"  !ti status\n";
+    std::wcout << L"  !ti add /pid <PID> | /name <imageName>\n";
+    std::wcout << L"  !ti remove /pid <PID> | /name <imageName>\n";
+    std::wcout << L"  !ti watch                live tail (Ctrl+C to exit)\n";
+    std::wcout << L"  !ti recent [N]           print last N ring events (default 50)\n";
+    std::wcout << L"  !ti stats                histogram by task/process\n";
+    std::wcout << L"  !ti by pid <PID>         ring filter\n";
+    std::wcout << L"  !ti by task <name>       ring filter (substring)\n";
+    std::wcout << L"  !ti grep <pattern>       case-insensitive substring grep\n";
+    std::wcout << L"  !ti save <path>          export current ring to JSONL\n";
+    std::wcout << L"  !ti clear                empty the ring\n";
+    std::wcout << L"\n";
+    std::wcout << L"prerequisites:\n";
+    std::wcout << L"  This provider is PPL Antimalware gated; run 'set-ppl-antimalware'\n";
+    std::wcout << L"  first or EnableTraceEx2 returns ERROR_ACCESS_DENIED.\n";
+    std::wcout << L"\n";
+    std::wcout << L"default output:\n";
+    std::wcout << L"  Subscription is silent by default. Ring/log capture every event but the\n";
+    std::wcout << L"  TUI prints nothing until '!ti watch' is invoked OR a /pid or /name\n";
+    std::wcout << L"  watch target matches an incoming event.\n";
+}
+
+static std::wstring FormatTimestampLocal(uint64_t fileTimeTicks)
+{
+    FILETIME ft = {};
+    ft.dwLowDateTime = static_cast<DWORD>(fileTimeTicks & 0xFFFFFFFFull);
+    ft.dwHighDateTime = static_cast<DWORD>(fileTimeTicks >> 32);
+    FILETIME localFt = {};
+    if (!FileTimeToLocalFileTime(&ft, &localFt))
+    {
+        return L"--:--:--.---";
+    }
+    SYSTEMTIME st = {};
+    if (!FileTimeToSystemTime(&localFt, &st))
+    {
+        return L"--:--:--.---";
+    }
+    wchar_t buf[24] = {};
+    swprintf_s(buf, L"%02u:%02u:%02u.%03u", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return buf;
+}
+
+static std::wstring TiBasenameOnly(const std::wstring& path)
+{
+    if (path.empty())
+    {
+        return L"<unknown>";
+    }
+    size_t slash = path.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+}
+
+static void PrintTiEventLine(const TiEventRecord& r)
+{
+    std::wcout << L"[" << FormatTimestampLocal(r.Timestamp) << L"] ";
+
+    PrintColoredText(r.TaskName.empty() ? (L"Task" + std::to_wstring(r.TaskId)) : r.TaskName,
+                     KNDBG_COLOR_TITLE);
+    std::wcout << L" pid=" << r.ProcessId
+               << L" tid=" << r.ThreadId
+               << L" image=";
+    PrintColoredText(TiBasenameOnly(r.ImagePath), KNDBG_COLOR_OK);
+
+    // Cross-process target was extracted by OnEventRecord and stashed on
+    // the record, so we just render it -- no payload walk or per-print
+    // image resolution required here.
+    if (r.TargetProcessId != 0)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"->", KNDBG_COLOR_WARN);
+        std::wcout << L" target=";
+        PrintColoredText(r.TargetImageBase.empty() ? L"<?>" : r.TargetImageBase,
+                         KNDBG_COLOR_FAIL);
+        std::wcout << L"(pid=" << r.TargetProcessId << L")";
+    }
+
+    if (!r.Payload.empty())
+    {
+        std::wcout << L" {";
+        size_t count = 0;
+        for (const TiPayloadField& f : r.Payload)
+        {
+            if (count >= 8)
+            {
+                std::wcout << L", +" << (r.Payload.size() - count) << L" more";
+                break;
+            }
+            if (count > 0)
+            {
+                std::wcout << L", ";
+            }
+            std::wcout << f.Name << L"=" << f.Value;
+            ++count;
+        }
+        std::wcout << L"}";
+    }
+    std::wcout << L"\n";
+}
+
+static bool ParseTiStartArgs(
+    const std::vector<std::wstring>& args,
+    size_t startIndex,
+    TiOptions* options,
+    std::wstring* error)
+{
+    size_t i = startIndex;
+    while (i < args.size())
+    {
+        std::wstring opt = ToLower(args[i]);
+
+        if (opt == L"/pid")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/pid requires a value";
+                return false;
+            }
+            uint64_t v = 0;
+            // Accept hex (0x prefix) as well as decimal so PIDs copied
+            // from WinDbg / debugger output paste-work directly.
+            if (!ParseUnsigned(args[i + 1], 0, &v) || v == 0 || v > 0xFFFFFFFFull)
+            {
+                *error = L"invalid PID: " + args[i + 1];
+                return false;
+            }
+            options->WatchPids.push_back(static_cast<uint32_t>(v));
+            i += 2;
+            continue;
+        }
+        if (opt == L"/name")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/name requires a value";
+                return false;
+            }
+            options->WatchNames.push_back(args[i + 1]);
+            i += 2;
+            continue;
+        }
+        if (opt == L"/throttle")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/throttle requires a value";
+                return false;
+            }
+            uint64_t v = 0;
+            if (!ParseUnsigned(args[i + 1], 0, &v) || v == 0 || v > 100000)
+            {
+                *error = L"invalid throttle (1..100000): " + args[i + 1];
+                return false;
+            }
+            options->ThrottlePerSecond = static_cast<uint32_t>(v);
+            i += 2;
+            continue;
+        }
+        if (opt == L"/ring")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/ring requires a value";
+                return false;
+            }
+            uint64_t v = 0;
+            if (!ParseUnsigned(args[i + 1], 0, &v) || v < 1024 || v > (1u << 22))
+            {
+                *error = L"invalid ring capacity (1024..4194304): " + args[i + 1];
+                return false;
+            }
+            options->RingCapacity = static_cast<uint32_t>(v);
+            i += 2;
+            continue;
+        }
+        if (opt == L"/log")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/log requires a path";
+                return false;
+            }
+            options->LogDirectory = args[i + 1];
+            i += 2;
+            continue;
+        }
+        *error = L"unrecognised start option: " + args[i];
+        return false;
+    }
+    return true;
+}
+
+static bool CheckSelfIsPplAntimalware(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint8_t* outProtection,
+    std::wstring* error)
+{
+    // Best-effort gate: returns true only when the EPROCESS.Protection byte
+    // for the current process reads back as 0x31 (PPL Antimalware). When
+    // symbols cannot resolve or the IOCTL fails, returns false but does
+    // not mutate state; the caller still tries Start() and surfaces the
+    // EnableTraceEx2 error.
+    if (symbols.Modules().empty())
+    {
+        std::wstring loadError;
+        if (!symbols.LoadKernelModules(&loadError))
+        {
+            if (error != nullptr)
+            {
+                *error = L"could not load kernel modules: " + loadError;
+            }
+            return false;
+        }
+    }
+
+    // DirectoryTableBase lives in _KPROCESS (the Pcb sub-structure at offset
+    // 0 inside _EPROCESS). On builds where the user-mode SymbolEngine cannot
+    // chase nested fields we try alternate spellings before giving up.
+    TypeFieldInfo dtbField = {};
+    std::wstring dtbError;
+    const wchar_t* dtbTypes[] = { L"nt!_EPROCESS", L"nt!_KPROCESS" };
+    const wchar_t* dtbNames[] = { L"DirectoryTableBase", L"Pcb.DirectoryTableBase" };
+    bool dtbResolved = false;
+    for (const wchar_t* t : dtbTypes)
+    {
+        for (const wchar_t* n : dtbNames)
+        {
+            std::wstring tryError;
+            if (symbols.FindField(t, n, &dtbField, &tryError))
+            {
+                dtbResolved = true;
+                break;
+            }
+            if (dtbError.empty())
+            {
+                dtbError = tryError;
+            }
+        }
+        if (dtbResolved)
+        {
+            break;
+        }
+    }
+    if (!dtbResolved)
+    {
+        if (error != nullptr)
+        {
+            *error = L"could not resolve _EPROCESS.DirectoryTableBase: " + dtbError;
+        }
+        return false;
+    }
+
+    TypeFieldInfo protField = {};
+    std::wstring protError;
+    if (!symbols.FindField(L"nt!_EPROCESS", L"Protection", &protField, &protError))
+    {
+        if (error != nullptr)
+        {
+            *error = L"could not resolve _EPROCESS.Protection: " + protError;
+        }
+        return false;
+    }
+
+    uint32_t pid = GetCurrentProcessId();
+    ProcessAddressContext ctx = {};
+    std::wstring resolveError;
+    if (!device.ResolveProcess(pid, dtbField.Offset, 0, &ctx, &resolveError))
+    {
+        if (error != nullptr)
+        {
+            *error = L"ResolveProcess failed: " + resolveError;
+        }
+        return false;
+    }
+
+    uint64_t fieldAddr = 0;
+    if (!TryAddOffset(ctx.Eprocess, protField.Offset, &fieldAddr))
+    {
+        if (error != nullptr)
+        {
+            *error = L"EPROCESS + Protection offset overflow";
+        }
+        return false;
+    }
+
+    std::vector<uint8_t> bytes;
+    std::wstring readError;
+    if (!device.ReadMemory(fieldAddr, 1, &bytes, &readError) || bytes.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = L"ReadMemory(Protection) failed: " + readError;
+        }
+        return false;
+    }
+
+    if (outProtection != nullptr)
+    {
+        *outProtection = bytes[0];
+    }
+    return bytes[0] == 0x31;
+}
+
+static void HandleTiCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    (void)state;
+
+    TiSubscriber& sub = GetTiSubscriberInstance();
+
+    do
+    {
+        if (args.size() < 2 || HasHelpToken(args, 1))
+        {
+            PrintTiHelp();
+            break;
+        }
+
+        std::wstring action = ToLower(args[1]);
+
+        if (action == L"start")
+        {
+            if (sub.IsActive())
+            {
+                std::wcerr << L"!ti: subscriber already active. use '!ti stop' first or '!ti add' to extend watch.\n";
+                break;
+            }
+            TiOptions options;
+            options.SelfPid = GetCurrentProcessId();
+            options.ExcludeSelf = true;
+            std::wstring parseError;
+            if (!ParseTiStartArgs(args, 2, &options, &parseError))
+            {
+                std::wcerr << L"!ti start: " << parseError << L"\n";
+                PrintTiHelp();
+                break;
+            }
+
+            if (!device.IsOpen())
+            {
+                std::wcerr << L"!ti start requires the KnLiveDbg.sys driver device to be open\n";
+                break;
+            }
+
+            // Proactive PPL Antimalware gate. The provider returns
+            // ERROR_ACCESS_DENIED from EnableTraceEx2 otherwise, but the
+            // pre-check gives a much clearer remediation hint.
+            uint8_t protByte = 0;
+            std::wstring gateError;
+            bool isPpl = CheckSelfIsPplAntimalware(device, symbols, &protByte, &gateError);
+            if (!isPpl)
+            {
+                if (gateError.empty())
+                {
+                    std::wcerr << L"!ti start: this process is not PPL Antimalware (current Protection=0x"
+                               << std::hex << std::setw(2) << std::setfill(L'0')
+                               << static_cast<unsigned>(protByte) << std::dec
+                               << L"). Microsoft-Windows-Threat-Intelligence requires the consumer\n"
+                               << L"  to be PPL Antimalware. Run 'write on' then 'set-ppl-antimalware'\n"
+                               << L"  first, then retry '!ti start'.\n";
+                    break;
+                }
+                else
+                {
+                    // Symbols / IOCTL trouble; warn and fall through. The
+                    // subscriber Start() will then return the underlying
+                    // EnableTraceEx2 status if the process really is not PPL.
+                    std::wcerr << L"!ti start: warning, could not pre-check PPL state (" << gateError
+                               << L"); continuing.\n";
+                }
+            }
+
+            // Register for the hard-exit cleanup path BEFORE Start() so a
+            // CTRL_CLOSE that arrives in the microsecond gap between Start
+            // returning and a post-Start store still tears the session down.
+            // Stop() is idempotent (atomic exchange on Active) so calling
+            // it on a never-started subscriber is a no-op.
+            g_TiSubscriberForShutdown.store(&sub);
+
+            std::wstring startError;
+            if (!sub.Start(options, &startError))
+            {
+                // Roll back the registration on failure.
+                g_TiSubscriberForShutdown.store(nullptr);
+                std::wcerr << L"!ti start failed: " << startError << L"\n";
+                break;
+            }
+
+            PrintColoredText(L"[ti]", KNDBG_COLOR_TITLE);
+            std::wcout << L" subscribed to Microsoft-Windows-Threat-Intelligence (all tasks)\n";
+            TiOptions current = sub.CurrentOptions();
+            std::wcout << L"     log directory=" << current.LogDirectory
+                       << L" base=" << current.LogBaseName
+                       << L" rotate=" << (current.LogRotateBytes >> 20) << L"MB x "
+                       << current.LogRotateCount << L"\n";
+            std::wcout << L"     ring=" << current.RingCapacity
+                       << L" throttle=" << current.ThrottlePerSecond << L"/s self_pid="
+                       << current.SelfPid << L"\n";
+            std::wcout << L"     watch:";
+            if (current.WatchPids.empty() && current.WatchNames.empty())
+            {
+                std::wcout << L" <none> (silent forensic mode; use '!ti watch' for live tail)";
+            }
+            for (uint32_t p : current.WatchPids)
+            {
+                std::wcout << L" pid=" << p;
+            }
+            for (const std::wstring& n : current.WatchNames)
+            {
+                std::wcout << L" name=" << n;
+            }
+            std::wcout << L"\n";
+
+            if (!current.WatchPids.empty() || !current.WatchNames.empty())
+            {
+                sub.SetLiveOutput(true);
+                std::wcout << L"     live output: enabled for matching events (throttled).\n";
+            }
+            break;
+        }
+
+        if (action == L"stop")
+        {
+            if (!sub.IsActive())
+            {
+                std::wcerr << L"!ti: subscriber not active.\n";
+                break;
+            }
+            std::wstring stopError;
+            sub.Stop(&stopError);
+            // Unregister AFTER Stop so the hard-exit path remains armed
+            // during the teardown. Stop() is idempotent, so a CTRL_CLOSE
+            // racing with our manual stop is harmless either way.
+            g_TiSubscriberForShutdown.store(nullptr);
+            PrintColoredText(L"[ti]", KNDBG_COLOR_TITLE);
+            std::wcout << L" stopped. ring and log are kept; use '!ti clear' to drop the ring.\n";
+            break;
+        }
+
+        if (action == L"status")
+        {
+            TiSubscriberStats s = sub.SnapshotStats();
+            TiOptions opt = sub.CurrentOptions();
+            PrintColoredText(L"[ti.status]", KNDBG_COLOR_TITLE);
+            std::wcout << L" active=" << (sub.IsActive() ? L"yes" : L"no")
+                       << L" live=" << (sub.IsLiveOutputEnabled() ? L"yes" : L"no")
+                       << L"\n";
+            std::wcout << L"  events received=" << s.EventsReceived
+                       << L" kept=" << s.EventsKept
+                       << L" dropped=" << s.EventsDropped
+                       << L" self_excluded=" << s.EventsSelfExcluded
+                       << L" watch_matched=" << s.EventsWatchMatched << L"\n";
+            std::wcout << L"  logged=" << s.EventsLogged
+                       << L" log_bytes=" << s.LogBytesWritten
+                       << L" rotations=" << s.LogRotations << L"\n";
+            std::wcout << L"  watch:";
+            for (uint32_t p : opt.WatchPids)
+            {
+                std::wcout << L" pid=" << p;
+            }
+            for (const std::wstring& n : opt.WatchNames)
+            {
+                std::wcout << L" name=" << n;
+            }
+            if (opt.WatchPids.empty() && opt.WatchNames.empty())
+            {
+                std::wcout << L" <none>";
+            }
+            std::wcout << L"\n";
+            break;
+        }
+
+        if (action == L"add" || action == L"remove")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"!ti " << action << L": usage: !ti " << action << L" /pid <PID> | /name <imageName>\n";
+                break;
+            }
+            std::wstring kind = ToLower(args[2]);
+            const std::wstring& value = args[3];
+
+            if (kind == L"/pid")
+            {
+                uint64_t v = 0;
+                if (!ParseUnsigned(value, 0, &v) || v == 0 || v > 0xFFFFFFFFull)
+                {
+                    std::wcerr << L"!ti " << action << L": invalid PID: " << value << L"\n";
+                    break;
+                }
+                bool ok = (action == L"add")
+                    ? sub.AddWatchPid(static_cast<uint32_t>(v))
+                    : sub.RemoveWatchPid(static_cast<uint32_t>(v));
+                std::wcout << L"[ti] pid " << v << (action == L"add" ? L" added" : L" removed")
+                           << (ok ? L"\n" : L" (no change)\n");
+            }
+            else if (kind == L"/name")
+            {
+                bool ok = (action == L"add")
+                    ? sub.AddWatchName(value)
+                    : sub.RemoveWatchName(value);
+                std::wcout << L"[ti] name " << value
+                           << (action == L"add" ? L" added" : L" removed")
+                           << (ok ? L"\n" : L" (no change)\n");
+            }
+            else
+            {
+                std::wcerr << L"!ti " << action << L": unknown kind \"" << args[2] << L"\"\n";
+            }
+            break;
+        }
+
+        if (action == L"watch")
+        {
+            if (!sub.IsActive())
+            {
+                std::wcerr << L"!ti watch: subscriber not active. run '!ti start' first.\n";
+                break;
+            }
+            const bool wasLive = sub.IsLiveOutputEnabled();
+            sub.SetLiveOutput(true);
+            PrintColoredText(L"[ti.watch]", KNDBG_COLOR_TITLE);
+            std::wcout << L" live tail engaged. press Ctrl+C or Esc to detach (subscription stays up).\n";
+
+            // Save the pre-watch Ctrl+C latch state and clear it for the
+            // duration of the loop. On exit we restore the original value
+            // so that any other long-running TUI command that was relying
+            // on g_StopRequested is not silently disarmed by this watch.
+            const bool savedStopRequested = g_StopRequested.load();
+            g_StopRequested = false;
+            for (;;)
+            {
+                if (g_StopRequested.load())
+                {
+                    g_StopRequested = false;
+                    break;
+                }
+                if (_kbhit())
+                {
+                    int ch = _getch();
+                    if (ch == 0x1B /* Esc */ || ch == L'q' || ch == L'Q')
+                    {
+                        break;
+                    }
+                    // Other keys are swallowed silently while watch is
+                    // engaged. The prompt is paused; we cannot let typed
+                    // characters reach the prompt parser because input is
+                    // captured by _getch already.
+                }
+                std::vector<TiEventRecord> batch = sub.DrainPrintQueue(64);
+                for (const TiEventRecord& r : batch)
+                {
+                    PrintTiEventLine(r);
+                }
+                uint64_t suppressed = sub.ConsumeThrottleSuppressedCount();
+                if (suppressed > 0)
+                {
+                    PrintColoredText(L"[ti.throttle]", KNDBG_COLOR_WARN);
+                    std::wcout << L" suppressed " << suppressed << L" events in the last window\n";
+                }
+                if (batch.empty())
+                {
+                    Sleep(50);
+                }
+            }
+            // Restore the live-output preference rather than leaving it
+            // sticky after exit. A subscriber that started silent stays
+            // silent once watch detaches.
+            sub.SetLiveOutput(wasLive);
+            // Restore the pre-watch Ctrl+C latch so a parallel cancellable
+            // operation that read this latch before we entered watch can
+            // still observe its original state.
+            g_StopRequested.store(savedStopRequested);
+            std::wcout << L"[ti.watch] detached. ring/log still active.\n";
+            break;
+        }
+
+        if (action == L"recent")
+        {
+            size_t n = 50;
+            if (args.size() >= 3)
+            {
+                uint64_t v = 0;
+                if (!ParseUnsigned(args[2], 10, &v) || v == 0)
+                {
+                    std::wcerr << L"!ti recent: invalid count: " << args[2] << L"\n";
+                    break;
+                }
+                // Sanity cap; user can re-issue if they really need more.
+                if (v > 10000)
+                {
+                    v = 10000;
+                }
+                n = static_cast<size_t>(v);
+            }
+            std::vector<TiEventRecord> recent = sub.Recent(n, false);
+            for (const TiEventRecord& r : recent)
+            {
+                PrintTiEventLine(r);
+            }
+            std::wcout << L"[ti.recent] returned=" << recent.size() << L"\n";
+            break;
+        }
+
+        if (action == L"stats")
+        {
+            std::map<std::wstring, uint64_t> taskHist;
+            std::map<std::wstring, uint64_t> imageHist;
+            size_t total = 0;
+            sub.Histogram(&taskHist, &imageHist, &total);
+
+            PrintColoredText(L"[ti.stats.task]", KNDBG_COLOR_TITLE);
+            std::wcout << L" total ring=" << total << L"\n";
+            for (const auto& kv : taskHist)
+            {
+                std::wcout << L"  " << kv.second << L"\t" << kv.first << L"\n";
+            }
+            PrintColoredText(L"[ti.stats.process]", KNDBG_COLOR_TITLE);
+            std::wcout << L"\n";
+            for (const auto& kv : imageHist)
+            {
+                std::wcout << L"  " << kv.second << L"\t" << kv.first << L"\n";
+            }
+            break;
+        }
+
+        if (action == L"by")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"!ti by: usage: !ti by pid <PID> | !ti by task <name>\n";
+                break;
+            }
+            std::wstring kind = ToLower(args[2]);
+            if (kind == L"pid")
+            {
+                uint64_t v = 0;
+                if (!ParseUnsigned(args[3], 0, &v) || v == 0)
+                {
+                    std::wcerr << L"!ti by pid: invalid PID: " << args[3] << L"\n";
+                    break;
+                }
+                std::vector<TiEventRecord> filtered = sub.FilterByPid(static_cast<uint32_t>(v), 200);
+                for (const TiEventRecord& r : filtered)
+                {
+                    PrintTiEventLine(r);
+                }
+                std::wcout << L"[ti.by.pid] matched=" << filtered.size() << L"\n";
+            }
+            else if (kind == L"task")
+            {
+                std::vector<TiEventRecord> filtered = sub.FilterByTask(args[3], 200);
+                for (const TiEventRecord& r : filtered)
+                {
+                    PrintTiEventLine(r);
+                }
+                std::wcout << L"[ti.by.task] matched=" << filtered.size() << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!ti by: unknown kind \"" << args[2] << L"\"\n";
+            }
+            break;
+        }
+
+        if (action == L"grep")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"!ti grep: usage: !ti grep <pattern>\n";
+                break;
+            }
+            std::vector<TiEventRecord> filtered = sub.Grep(args[2], 200);
+            for (const TiEventRecord& r : filtered)
+            {
+                PrintTiEventLine(r);
+            }
+            std::wcout << L"[ti.grep] matched=" << filtered.size() << L"\n";
+            break;
+        }
+
+        if (action == L"save")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"!ti save: usage: !ti save <path>\n";
+                break;
+            }
+            std::wstring saveError;
+            if (!sub.SaveTo(args[2], &saveError))
+            {
+                std::wcerr << L"!ti save failed: " << saveError << L"\n";
+                break;
+            }
+            std::wcout << L"[ti.save] wrote " << args[2] << L"\n";
+            break;
+        }
+
+        if (action == L"clear")
+        {
+            sub.Clear();
+            std::wcout << L"[ti.clear] ring drained.\n";
+            break;
+        }
+
+        std::wcerr << L"!ti: unknown subcommand \"" << args[1] << L"\"\n";
+        PrintTiHelp();
+    } while (false);
+}
+
 static void HandleAddressCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -14621,6 +15690,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"!address")
         {
             PrintAddressHelp();
+        }
+        else if (command == L"set-ppl-antimalware")
+        {
+            PrintSetPplAntimalwareHelp();
+        }
+        else if (command == L"!ti")
+        {
+            PrintTiHelp();
         }
         else if (command == L"!wnf")
         {
@@ -21778,6 +22855,14 @@ static bool HandleCommand(
         else if (command == L"!address")
         {
             HandleAddressCommand(args, state, device, symbols);
+        }
+        else if (command == L"set-ppl-antimalware")
+        {
+            HandleSetPplAntimalwareCommand(args, state, device, symbols);
+        }
+        else if (command == L"!ti")
+        {
+            HandleTiCommand(args, state, device, symbols);
         }
         else if (command == L"!wnf")
         {

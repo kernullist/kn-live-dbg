@@ -78,6 +78,21 @@ public:
     bool ReadPhysical(uint64_t physicalAddress, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error);
     bool WritePhysical(uint64_t physicalAddress, const std::vector<uint8_t>& bytes, std::wstring* error);
 
+    // Writes a single byte to (EPROCESS + ProtectionFieldOffset) inside the
+    // target process. Returns the old/new/read-back bytes plus the resolved
+    // EPROCESS pointer so callers can verify the change took effect. The
+    // driver requires write mode to be enabled and the standard write
+    // acknowledge magic. Used to flip the calling process to PPL Antimalware
+    // for ETW Microsoft-Windows-Threat-Intelligence subscription.
+    bool SetProcessProtection(
+        uint32_t processId,
+        uint32_t protectionFieldOffset,
+        uint8_t  newProtection,
+        uint8_t* oldProtection,
+        uint8_t* readBackProtection,
+        uint64_t* eprocessAddress,
+        std::wstring* error);
+
 private:
     bool Ioctl(DWORD code, void* buffer, DWORD inLength, DWORD outLength, DWORD* returned, std::wstring* error);
 

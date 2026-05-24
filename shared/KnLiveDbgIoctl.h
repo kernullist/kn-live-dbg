@@ -10,7 +10,7 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SERVICE_NAME L"KnLiveDbg"
 #define KNDBG_DISPLAY_NAME L"Kn Live Debug Driver"
 
-#define KNDBG_ABI_VERSION 5u
+#define KNDBG_ABI_VERSION 6u
 #define KNDBG_MAX_TRANSFER_SIZE (1024u * 1024u)
 #define KNDBG_WRITE_ACK_MAGIC 0x4B4E444247574F4Full
 
@@ -84,6 +84,20 @@ typedef unsigned __int64 KNDBG_UINT64;
 
 #define IOCTL_KNDBG_FLUSH_VIRTUAL \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80B, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+
+#define IOCTL_KNDBG_SET_PROCESS_PROTECTION \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80C, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+
+// Known _EPROCESS.Protection byte values. The PS_PROTECTION struct packs
+// Signer (high nibble) over Audit (bit 3) over Type (bits 0..2).
+//   Type:   0 = None, 1 = ProtectedLight (PPL), 2 = Protected
+//   Signer: 3 = Antimalware, 4 = Lsa, 5 = Windows, 6 = WinTcb, 7 = WinSystem
+// PPL Antimalware: Signer=3, Audit=0, Type=1 -> (3<<4) | 1 = 0x31.
+#define KNDBG_PROTECTION_NONE              0x00
+#define KNDBG_PROTECTION_PPL_ANTIMALWARE   0x31
+#define KNDBG_PROTECTION_PPL_LSA           0x41
+#define KNDBG_PROTECTION_PPL_WINDOWS       0x51
+#define KNDBG_PROTECTION_PPL_WINTCB        0x61
 
 #pragma pack(push, 8)
 
@@ -242,5 +256,29 @@ typedef struct _KNDBG_FLUSH_VIRTUAL_REQUEST
     KNDBG_UINT32 Reserved;
     KNDBG_UINT64 Acknowledge;
 } KNDBG_FLUSH_VIRTUAL_REQUEST;
+
+typedef struct _KNDBG_SET_PROCESS_PROTECTION_REQUEST
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 Flags;
+    KNDBG_UINT32 ProcessId;
+    KNDBG_UINT32 ProtectionFieldOffset; // offset of PS_PROTECTION inside _EPROCESS (PDB-derived)
+    KNDBG_UINT8  NewProtection;         // raw PS_PROTECTION byte to install
+    KNDBG_UINT8  Reserved[3];
+    KNDBG_UINT64 Acknowledge;           // must equal KNDBG_WRITE_ACK_MAGIC
+} KNDBG_SET_PROCESS_PROTECTION_REQUEST;
+
+typedef struct _KNDBG_SET_PROCESS_PROTECTION_RESPONSE
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 Flags;
+    KNDBG_UINT32 ProcessId;
+    KNDBG_UINT32 ProtectionFieldOffset;
+    KNDBG_UINT8  OldProtection;
+    KNDBG_UINT8  NewProtection;
+    KNDBG_UINT8  ReadBackProtection;
+    KNDBG_UINT8  Reserved;
+    KNDBG_UINT64 EprocessAddress;
+} KNDBG_SET_PROCESS_PROTECTION_RESPONSE;
 
 #pragma pack(pop)
