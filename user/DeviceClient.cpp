@@ -550,6 +550,84 @@ bool DeviceClient::FlushVirtual(uint64_t virtualAddress, uint32_t length, std::w
     return ok;
 }
 
+bool DeviceClient::SetProcessProtection(
+    uint32_t processId,
+    uint32_t protectionFieldOffset,
+    uint8_t  newProtection,
+    uint8_t* oldProtection,
+    uint8_t* readBackProtection,
+    uint64_t* eprocessAddress,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (processId == 0 || protectionFieldOffset == 0 || protectionFieldOffset > 0x2000)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid SetProcessProtection request";
+            }
+            break;
+        }
+
+        union
+        {
+            KNDBG_SET_PROCESS_PROTECTION_REQUEST Request;
+            KNDBG_SET_PROCESS_PROTECTION_RESPONSE Response;
+            unsigned char Padding[
+                sizeof(KNDBG_SET_PROCESS_PROTECTION_REQUEST) >= sizeof(KNDBG_SET_PROCESS_PROTECTION_RESPONSE)
+                    ? sizeof(KNDBG_SET_PROCESS_PROTECTION_REQUEST)
+                    : sizeof(KNDBG_SET_PROCESS_PROTECTION_RESPONSE)];
+        } buffer = {};
+
+        buffer.Request.Size = sizeof(KNDBG_SET_PROCESS_PROTECTION_REQUEST);
+        buffer.Request.ProcessId = processId;
+        buffer.Request.ProtectionFieldOffset = protectionFieldOffset;
+        buffer.Request.NewProtection = newProtection;
+        buffer.Request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_SET_PROCESS_PROTECTION,
+                &buffer,
+                sizeof(KNDBG_SET_PROCESS_PROTECTION_REQUEST),
+                sizeof(KNDBG_SET_PROCESS_PROTECTION_RESPONSE),
+                &returned,
+                error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(KNDBG_SET_PROCESS_PROTECTION_RESPONSE))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short SetProcessProtection response";
+            }
+            break;
+        }
+
+        if (oldProtection != nullptr)
+        {
+            *oldProtection = buffer.Response.OldProtection;
+        }
+        if (readBackProtection != nullptr)
+        {
+            *readBackProtection = buffer.Response.ReadBackProtection;
+        }
+        if (eprocessAddress != nullptr)
+        {
+            *eprocessAddress = buffer.Response.EprocessAddress;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::ReadPhysical(uint64_t physicalAddress, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error)
 {
     bool ok = false;

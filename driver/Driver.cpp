@@ -1408,6 +1408,116 @@ static NTSTATUS KnDbgHandleFlushVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+// Patches the byte at <Eprocess + ProtectionFieldOffset>. The offset is
+// supplied by user mode after resolving _EPROCESS.Protection via PDB symbols,
+// so the driver does not have to track per-build layout drift. The caller
+// must hold the device session and pass the standard write acknowledge magic
+// just like the virtual/physical write paths.
+static NTSTATUS KnDbgHandleSetProcessProtection(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+    PEPROCESS process = nullptr;
+    BOOLEAN dereference = FALSE;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_SET_PROCESS_PROTECTION_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (outputLength < sizeof(KNDBG_SET_PROCESS_PROTECTION_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        KNDBG_SET_PROCESS_PROTECTION_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+
+        if (request.Acknowledge != KNDBG_WRITE_ACK_MAGIC)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        if (request.ProcessId == 0)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        // Plausibility bound on the field offset. _EPROCESS is well under
+        // 0x2000 bytes on every supported Windows build, so anything outside
+        // that range is a caller bug and must not turn into a wild write.
+        if (request.ProtectionFieldOffset == 0 || request.ProtectionFieldOffset > 0x2000)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        status = PsLookupProcessByProcessId(ULongToHandle(request.ProcessId), &process);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+        dereference = TRUE;
+
+        UCHAR oldByte = 0;
+        UCHAR readBack = 0;
+        __try
+        {
+            PUCHAR field = reinterpret_cast<PUCHAR>(process) + request.ProtectionFieldOffset;
+            oldByte = *field;
+            *field = request.NewProtection;
+            readBack = *field;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            status = GetExceptionCode();
+            if (NT_SUCCESS(status))
+            {
+                status = STATUS_ACCESS_VIOLATION;
+            }
+            break;
+        }
+
+        KNDBG_SET_PROCESS_PROTECTION_RESPONSE* response =
+            reinterpret_cast<KNDBG_SET_PROCESS_PROTECTION_RESPONSE*>(Buffer);
+        RtlZeroMemory(response, sizeof(*response));
+        response->Size = sizeof(*response);
+        response->Flags = 0;
+        response->ProcessId = request.ProcessId;
+        response->ProtectionFieldOffset = request.ProtectionFieldOffset;
+        response->OldProtection = oldByte;
+        response->NewProtection = request.NewProtection;
+        response->ReadBackProtection = readBack;
+        response->EprocessAddress = reinterpret_cast<KNDBG_UINT64>(process);
+
+        information = sizeof(*response);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    if (dereference && process != nullptr)
+    {
+        ObDereferenceObject(process);
+    }
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
@@ -1582,6 +1692,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_FLUSH_VIRTUAL:
         status = KnDbgHandleFlushVirtual(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_SET_PROCESS_PROTECTION:
+        status = KnDbgHandleSetProcessProtection(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

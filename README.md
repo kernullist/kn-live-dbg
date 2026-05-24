@@ -62,6 +62,8 @@ kn-live-dbg/
 27. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
 28. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
 29. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
+30. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
+31. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
 30. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
 
 ## Design Notes
@@ -194,6 +196,9 @@ dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
 pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
 !address <va>
+set-ppl-antimalware [on|off|status]
+!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]
+!ti stop | status | watch | recent [N] | stats | by pid <PID> | by task <name> | grep <pattern> | save <path> | clear | add /pid|/name <v> | remove /pid|/name <v>
 !wnf [decode <hash>|instances|instance <hash>|data <hash>|candidates|lists]
 ai <question>
 ai status
@@ -285,6 +290,12 @@ knkd> pool-scan-pe
 knkd> pool-scan-pe /suspicious /dump .\poolpe-hits
 knkd> !address nt!ExpWnfSiloState
 knkd> !address 0xffffe78fcd778000
+knkd> write on
+knkd> set-ppl-antimalware
+knkd> !ti start /name foo.exe /name bar.exe
+knkd> !ti watch
+knkd> !ti stats
+knkd> !ti save .\ti-snapshot.jsonl
 knkd> !wnf decode 0x41c64e6da3bc0075
 knkd> !wnf instances
 knkd> !wnf instance 0xfffff80300000000
@@ -791,6 +802,354 @@ Notes:
 - `/suspicious` collapses output to the wiped-header hits, which are the high-signal cases for malware hunting.
 - `/dump` failures (e.g. truly torn-down sections inside the payload) leave a partial PE in the output file with `[ZERO-FILLED]` sections, mirroring `dump-pe` behaviour. The hit still appears in the scan output regardless.
 - Default size floor is `0x1000` (one page) since PE images take at least one page. Override with `/min`/`/max` when chasing exotic layouts.
+
+## Threat-Intelligence ETW (`!ti`)
+
+`!ti` subscribes to **Microsoft-Windows-Threat-Intelligence** (provider GUID `f4e1897c-bb5d-5668-f1d8-040f4d8dd344`), the kernel-side ETW provider that EDRs use for sensitive events: `VirtualAlloc` with W+X, cross-process `WriteVirtualMemory`, `QueueUserAPC`, `SetThreadContext`, image-load triggers, driver-object operations, and similar. The provider gates its events on the consumer being a **PPL Antimalware** process, so the typical flow is:
+
+```text
+knkd> write on                           # arm driver write mode (acknowledge gate)
+knkd> set-ppl-antimalware                # flip self _EPROCESS.Protection to 0x31
+knkd> !ti start /name foo.exe            # subscribe; live output only for foo.exe
+knkd> !ti watch                          # live tail (Esc or Ctrl+C to detach)
+```
+
+Default behaviour is **silent forensic mode**: the in-memory ring (1M events, ~256 MB) and the JSONL log (`ti-events-<timestamp>-<ms>-<pid>.jsonl`, 100 MB rotation × 10) capture every received event, but nothing scrolls the TUI until either `/pid`/`/name` is supplied (which auto-promotes matching events to live output) or `!ti watch` is invoked. Note that `!ti watch` with **no** filter set turns into a firehose because the matcher treats "empty watch set" as "match everything" — add `/pid`/`/name` first on a busy system. Subscription is torn down automatically on hard exit (window close / logoff / system shutdown) via the console control handler, in addition to the normal dtor path on Ctrl+C and `exit`.
+
+Architecture:
+
+1. The subscriber creates an own ETW session via `StartTraceW` and enables the TI provider with `EnableTraceEx2(EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, 0xFFFFFFFFFFFFFFFF)` so every task ID surfaces.
+2. A worker thread runs `ProcessTrace` and receives events through `EventRecordCallback`. Per-PID image resolution is cached (16K-entry bounded) so the hot path does not churn `OpenProcess`/`QueryFullProcessImageNameW`.
+3. Each event is decoded via TDH (`TdhGetEventInformation` + `TdhGetProperty`) with array indexing and struct-property guarding. Properties TDH cannot decode fall back to a raw-hex prefix in the JSONL `raw` field.
+4. Events are pushed into the ring buffer (oldest-evicted-first when full) and written to the JSONL log. The log rotates by file size with index wrap and oldest-file deletion -- it never grows past `LogRotateBytes * LogRotateCount` on disk.
+5. Live output uses a separate bounded queue with a per-second throttle counter; over-throttle events are dropped from the live queue but still hit ring + log, and a `[ti.throttle] suppressed N events` line surfaces in `!ti watch`.
+
+Watch matching is lazy: image-name targets compare against the basename of `_EPROCESS.ImagePath`. Processes that did not exist at `!ti start` time are picked up as soon as their first event arrives; once matched, the PID is promoted into a fast O(1) set so subsequent events for the same process never re-scan the name list.
+
+JSONL line schema (one event per line):
+
+```json
+{
+  "ts": "2026-05-24T06:30:01.123Z",
+  "pid": 4567, "tid": 7890,
+  "image": "C:\\path\\to\\foo.exe",
+  "task_id": 1, "task": "AllocVM",
+  "opcode": 0, "level": 4, "keyword": "0x0",
+  "version": 0,
+  "payload": { "TargetProcessId": "1234", "BaseAddress": "0xffff...", "RegionSize": "4096", "ProtectionMask": "0x40" }
+}
+```
+
+Subcommand reference:
+
+- `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- begin subscription. Repeatable `/pid`/`/name`. Default throttle 50/s, ring 1M, log directory next to KnLiveDbg.exe.
+- `!ti stop` -- end subscription. Ring and log files are retained.
+- `!ti status` -- live counters: received / kept / dropped / self-excluded / watch-matched / logged / log-bytes / rotations.
+- `!ti add /pid <PID>` or `!ti add /name <imageName>` -- extend watch set without restarting subscription.
+- `!ti remove /pid <PID>` or `!ti remove /name <imageName>` -- drop watch target. Removing a name clears the promoted-PID set so it can be rebuilt lazily.
+- `!ti watch` -- interactive live tail. Throttled at the configured rate. Press Esc, `q`, or Ctrl+C to detach. Live-output preference is restored after exit so a subscriber that started silent goes back to silent.
+- `!ti recent [N]` -- print the last N events from the ring (default 50, capped at 10000).
+- `!ti stats` -- histogram by task name and by image basename, computed in place without copying the ring.
+- `!ti by pid <PID>` / `!ti by task <substr>` -- ring filter.
+- `!ti grep <pattern>` -- case-insensitive substring match across image / task / payload field values.
+- `!ti save <path>` -- export the current ring snapshot to JSONL. The snapshot is taken under the ring lock then the disk write happens unlocked so the ETW callback is not stalled.
+- `!ti clear` -- empty the ring (does not stop subscription or close the log).
+
+Notes:
+
+- The driver's MDL probe-and-lock fallback (introduced in v0.0.6) keeps Threat-Intelligence consumer reads from failing on paged-out kernel ranges that some payloads touch.
+- KnLiveDbg.exe's own events are excluded by default to prevent feedback loops. The exclusion is keyed on the current process ID at subscribe time.
+- The provider is verbose. On an active desktop, expect thousands of events per second. The ring + log capture everything; the TUI stays calm unless you opt in to live output.
+
+### Usage Recipes
+
+The full prerequisite chain runs the driver, makes the TUI a PPL Antimalware consumer, then subscribes to the provider:
+
+```text
+# from an elevated shell
+sc query KnLiveDbg       # confirm the driver is loaded
+KnLiveDbg.exe            # launches the TUI in this elevated shell
+
+knkd> write on           # arm driver write mode (required by set-ppl-antimalware)
+knkd> set-ppl-antimalware    # flip own _EPROCESS.Protection to 0x31
+knkd> !ti start          # subscribe (silent forensic mode by default)
+```
+
+After this, every event lands in the in-memory ring (1M events) and the JSONL log under the EXE directory. **Capture is automatic once `!ti start` succeeds** -- you do not need `!ti watch` to record events. Use the recipes below depending on whether you want to observe events live, or just collect them for post-hoc analysis.
+
+> **`!ti watch` is optional.** It is purely a real-time scroll of matching events to the TUI. The ring + log capture happens regardless. If you are setting up an unattended capture, or you intend to analyse the JSONL externally with jq/ripgrep, you never need to run watch.
+
+#### 1) Silent forensic mode -- "log everything, scroll nothing"
+
+```text
+knkd> !ti start
+[ti] subscribed to Microsoft-Windows-Threat-Intelligence (all tasks)
+     log directory=...  ring=1048576 throttle=50/s
+     watch: <none> (silent forensic mode; use '!ti watch' for live tail)
+
+# ... run workload, do other commands, etc ...
+
+knkd> !ti status
+knkd> !ti recent 100
+knkd> !ti stop
+```
+
+The TUI stays usable for other commands while the ring + log fill. Inspect the ring or the JSONL log offline.
+
+#### 2) Watch a known PID
+
+```text
+knkd> !ti start /pid 1234
+[ti] subscribed to Microsoft-Windows-Threat-Intelligence (all tasks)
+     watch: pid=1234
+     live output: enabled for matching events (throttled).
+
+# events from pid 1234 stream live; press Esc to leave watch mode
+```
+
+Hex PIDs also accepted: `!ti start /pid 0x4D2` (same as 1234).
+
+#### 3) Watch a name that has not started yet -- malware sandbox
+
+```text
+knkd> !ti start /name suspicious.exe
+[ti] ...
+     watch: name=suspicious.exe
+
+# launch the sample in another terminal
+> suspicious.exe
+
+# events appear the moment the sample's first ETW event arrives.
+# The match works because watch is lazy on the image basename, not the PID.
+```
+
+This is the typical sandbox flow: subscribe first, then detonate.
+
+#### 4) Watch by name AND PID -- multiple targets
+
+```text
+knkd> !ti start /pid 1234 /name foo.exe /name bar.exe
+```
+
+Repeatable `/pid` and `/name`. PID matches go through an O(1) set; name matches scan the (small) name list once, then the matched PID is auto-promoted into the same fast set for subsequent events.
+
+#### 5) Add or remove targets without restarting the subscription
+
+```text
+knkd> !ti start             # silent mode
+knkd> !ti add /pid 5678     # later, decide to track 5678 live
+knkd> !ti add /name dropper.exe
+knkd> !ti remove /pid 5678
+knkd> !ti remove /name dropper.exe
+```
+
+`add` automatically promotes events to the live queue (if live output is on). Removing a name clears the promoted-PID set so the lazy re-match rebuilds.
+
+#### 6) (Optional) live tail an existing subscription
+
+`!ti watch` is purely for real-time observation. It does not start or stop capture -- the ring and log are filling either way.
+
+```text
+knkd> !ti start             # silent, no targets, capture is already running
+# ... time passes, you want to look at activity ...
+knkd> !ti watch
+[ti.watch] live tail engaged. press Ctrl+C or Esc to detach (subscription stays up).
+[06:42:11.123] AllocVM      pid=4567 image=foo.exe {...}
+[06:42:11.456] WriteVM      pid=4567 image=foo.exe {...}
+...
+[ti.throttle] suppressed 87 events in the last window
+# press Esc -> live output preference restored to the pre-watch value
+knkd> !ti status
+```
+
+`!ti watch` temporarily enables live output for every event (subject to throttle), and `Esc`/`q`/`Ctrl+C` restores the previous live-output setting. Silent subscribers go back to silent after watch exits.
+
+If you never want live scroll, you never have to run `!ti watch`. Use `!ti recent`, `!ti by`, `!ti grep`, `!ti save`, or jq on the JSONL log instead.
+
+#### 7) Reduce noise or expand cap -- throttle adjustment
+
+```text
+knkd> !ti start /name chrome.exe /throttle 200      # 200 events/s cap for chrome
+knkd> !ti start /name chrome.exe /throttle 5        # very quiet, scannable by eye
+```
+
+The ring + log are unaffected; throttle only gates the live print queue.
+
+#### 8) Bigger ring for long-running captures
+
+```text
+knkd> !ti start /ring 0x400000   # 4M events (~1 GB RAM)
+```
+
+`/ring` accepts hex or decimal. Default 1M (~256 MB). Each ring event holds wide-string fields so memory cost scales with the average payload size.
+
+#### 9) Custom log directory
+
+```text
+knkd> !ti start /log "D:\hunts\session-001"
+```
+
+The directory is created on demand. Filenames are `ti-events-YYYYMMDD-HHMMSS-mmm-PID.jsonl` for the active file and `ti-events.<N>.jsonl` for rotated slots. Rotation wraps at 100 MB x 10 by default, deleting the oldest before overwriting.
+
+#### 10) Query the ring after the fact
+
+```text
+knkd> !ti stop                       # stop subscription, ring + log are preserved
+knkd> !ti recent 200                 # last 200 events, newest first
+knkd> !ti stats                      # histogram by task and by image basename
+knkd> !ti by pid 1234                # ring filter on a specific PID
+knkd> !ti by task AllocVM            # ring filter (substring) on task name
+knkd> !ti by task WriteVM            # cross-process write events
+knkd> !ti by task ProtectVM          # protection-change events
+knkd> !ti grep TargetProcessId       # case-insensitive grep across payload
+knkd> !ti grep 0x140000              # look for image-base loads
+```
+
+`recent` is capped at 10 000 to keep the TUI responsive. `by` / `grep` cap at 200 matches per call.
+
+#### 11) Export a snapshot to a separate file
+
+```text
+knkd> !ti save D:\hunts\session-001\snapshot.jsonl
+[ti.save] wrote D:\hunts\session-001\snapshot.jsonl
+```
+
+The snapshot uses the same JSONL schema as the rotated log. Useful for capturing the current state without waiting for log rotation. Ring lock is released before the disk write so the ETW callback is not stalled.
+
+#### 12) Clear the ring (start fresh without restarting subscription)
+
+```text
+knkd> !ti clear              # ring drained; log untouched
+```
+
+#### 13) Process injection hunt -- end-to-end
+
+`/name target.exe` catches **both** sides: events the target itself fires AND cross-process operations (`VirtualAllocEx`, `WriteProcessMemory`, `QueueUserAPC`, `SetThreadContext`, ...) fired BY a loader against the target. The matcher walks the payload for `TargetProcessId`-like fields, resolves the basename of the referenced PID through the same cache the callback uses, and matches against `/name`. So you see "loader -> target" injections without having to know the loader's name in advance.
+
+Two valid flows. Pick based on whether you want to watch events live or just collect a trace for offline analysis.
+
+**A. Offline / unattended capture (no watch):**
+
+```text
+knkd> write on
+knkd> set-ppl-antimalware
+knkd> !ti start /name target.exe          # capture begins; nothing scrolls
+
+# in another terminal, run the loader:
+> loader.exe target.exe
+
+# back in the TUI, query the ring at any point. Live tail not required.
+knkd> !ti status
+knkd> !ti by task WriteVM         # cross-process writes into target.exe
+knkd> !ti by task SetThreadContext
+knkd> !ti by task QueueUserApc
+knkd> !ti save .\injection-trace.jsonl
+knkd> !ti stop
+```
+
+**B. Interactive triage (live watch):**
+
+```text
+knkd> write on
+knkd> set-ppl-antimalware
+knkd> !ti start /name target.exe
+knkd> !ti watch                            # live tail; same ring + log fills
+
+# in another terminal, run the loader:
+> loader.exe target.exe
+
+# events scroll in the TUI as they fire. Press Esc to detach when done.
+knkd> !ti by task WriteVM
+knkd> !ti save .\injection-trace.jsonl
+knkd> !ti stop
+```
+
+Both flows produce the same `injection-trace.jsonl` and the same ring contents. The JSONL has one line per event, jq/ripgrep friendly:
+
+```bash
+# from PowerShell / cmd:
+type .\injection-trace.jsonl | findstr WriteVM
+# or with jq if installed:
+jq -c 'select(.task=="WriteVM") | {ts, pid, image, payload}' injection-trace.jsonl
+```
+
+#### 13.5) Game-cheat alloc into a victim -- cheatengine -> notepad
+
+The classic ETW demo: open notepad, attach Cheat Engine to it, perform `VirtualAllocEx(notepadPid, ..., PAGE_EXECUTE_READWRITE)`.
+
+```text
+knkd> write on
+knkd> set-ppl-antimalware
+knkd> !ti start /name notepad.exe
+knkd> !ti watch                # optional; events also flow to the ring and log
+
+# in a separate shell:
+> notepad.exe
+> cheatengine.exe -> attach to notepad -> allocate executable buffer
+
+# expected event in the live tail (line wrapped here for readability):
+[12:07:27.073] KERNEL_THREATINT_TASK_ALLOCVM
+  pid=4892 tid=2968 image=cheatengine.exe
+  -> target=notepad.exe(pid=8804)
+  {CallingProcessId=4892, ..., TargetProcessId=8804,
+   BaseAddress=0x..., RegionSize=4096, ProtectionMask=0x40, +5 more}
+```
+
+The header shows `image=cheatengine.exe -> target=notepad.exe(pid=8804)` because the matcher caught the target-side reference even though the ETW event itself fired from Cheat Engine's PID.
+
+#### 14) Cross-process W+X allocation hunt (no watch needed)
+
+```text
+knkd> !ti start                       # silent, full capture, no live scroll
+# ... run / wait for the suspicious workload ...
+knkd> !ti by task AllocVM             # all VirtualAlloc-class events
+knkd> !ti grep ProtectionMask=0x40    # PAGE_EXECUTE_READWRITE (RWX)
+knkd> !ti save .\wx-trace.jsonl
+```
+
+This recipe explicitly skips `!ti watch` -- the silent ring fills in the background while you keep the TUI free for `!pool` / `pool-scan-pe` to chase the resulting allocation in big pool.
+
+#### 15) Cleanup at session end
+
+```text
+knkd> !ti stop                  # end ETW subscription, keeps ring + log
+knkd> !ti save .\session.jsonl  # optional export
+knkd> !ti clear                 # optional drop the ring (frees ~256 MB)
+knkd> exit                      # destructor double-checks the session is torn down
+```
+
+`exit` (or process termination) also calls the subscriber destructor which invokes `Stop` if the session is still active, so a forgotten `!ti stop` is recovered automatically.
+
+#### Useful task names for `by task` filtering
+
+The provider exposes many task IDs; the most actionable for malware / cheat hunting are:
+
+| Task name (substring OK) | What it captures |
+|---|---|
+| `AllocVM` | `NtAllocateVirtualMemory` (incl. cross-process via `pid != self`) |
+| `ProtectVM` | `NtProtectVirtualMemory` (often the W+X pivot for shellcode) |
+| `MapView` | `NtMapViewOfSection` |
+| `WriteVM` | `NtWriteVirtualMemory` (classic cross-process injection) |
+| `ReadVM` | `NtReadVirtualMemory` |
+| `QueueUserApc` | Cross-thread / cross-process APC injection |
+| `SetThreadContext` | RIP redirection on a remote thread |
+| `Suspend` / `Resume` | Cross-process thread control |
+| `Driver` | Driver-object operations |
+| `LdrPreload` | LDR-data preload trigger |
+
+Combine with `!ti by task <name>` for filtered ring listings or `!ti grep <name>` for fuzzier searches.
+
+Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `QueueUserApc`, `SetThreadContext`, `Suspend`/`Resume`) carry a `TargetProcessId` payload field; `/name <victim>` matches them via the resolved target basename, so a loader injecting into `notepad.exe` is caught by `/name notepad.exe` even though the event fires from the loader's PID. The live-tail header surfaces this as `image=loader.exe -> target=notepad.exe(pid=...)`.
+
+#### Common gotchas
+
+- **Forgot `write on` before `set-ppl-antimalware`**: the driver IOCTL returns `STATUS_ACCESS_DENIED`. Fix: `write on` first.
+- **Forgot `set-ppl-antimalware` before `!ti start`**: the pre-check refuses with a clear hint pointing at `set-ppl-antimalware`. Fix: run it, retry.
+- **Tried to scroll the prompt while in `!ti watch`**: keystrokes are captured by the watch loop and swallowed. Press `Esc`/`q` first to detach.
+- **Same name run multiple times**: each launch gets a new PID, name match auto-promotes each one. Use `!ti by pid <PID>` to disambiguate after the fact.
+- **`/name not.exe` does not match `notepad.exe`**: name matching is exact basename, not substring. Use `!ti grep not` for substring search over the ring.
+- **`!ti watch` with no filter floods the TUI**: empty watch set means "match everything", so on a busy system the throttle (50/s by default) is constantly engaged and the `[ti.throttle] suppressed N events` banner dominates. Add `/pid` or `/name` filters before watching, or raise the throttle with `/throttle`.
+- **Forgot `!ti stop`?** The subscriber's destructor calls Stop on normal exit (`exit`, Ctrl+C), and the console control handler calls Stop on hard exit (window close, logoff, shutdown). A clean teardown happens in every path except `TerminateProcess`. After a TerminateProcess, recover with `logman stop KnLiveDbg-Ti -ets`.
 
 ## Positive-Control Probe
 
