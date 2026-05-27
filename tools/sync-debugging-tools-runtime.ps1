@@ -22,14 +22,103 @@ $runtimeFiles = @(
     "symsrv.yes"
 )
 
-$diaSearchDirs = @(
-    "C:\Program Files\Microsoft Visual Studio\2022\Professional\DIA SDK\bin\amd64",
-    "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\DIA SDK\bin\amd64",
-    "C:\Program Files\Microsoft Visual Studio\2022\Community\DIA SDK\bin\amd64",
-    "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\DIA SDK\bin\amd64",
-    "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\DIA SDK\bin\amd64",
-    "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\DIA SDK\bin\amd64"
-)
+function Get-VsWherePath
+{
+    $paths = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"),
+        (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
+    )
+
+    foreach ($path in $paths)
+    {
+        if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path $path))
+        {
+            return $path
+        }
+    }
+
+    return $null
+}
+
+function Get-VisualStudioInstallations
+{
+    $installations = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $vswhere = Get-VsWherePath
+
+    if (-not [string]::IsNullOrWhiteSpace($vswhere))
+    {
+        $json = & $vswhere -products * -sort -format json
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($json))
+        {
+            $instances = $json | ConvertFrom-Json
+            foreach ($instance in $instances)
+            {
+                $path = [string]$instance.installationPath
+                if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path $path))
+                {
+                    $resolved = (Resolve-Path $path).Path
+                    if ($seen.Add($resolved))
+                    {
+                        $installations.Add($resolved)
+                    }
+                }
+            }
+        }
+    }
+
+    $roots = @(
+        (Join-Path $env:ProgramFiles "Microsoft Visual Studio"),
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio")
+    )
+
+    foreach ($root in $roots)
+    {
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root))
+        {
+            continue
+        }
+
+        $paths = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object {
+                Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name
+            }
+
+        foreach ($path in $paths)
+        {
+            $resolved = (Resolve-Path $path.FullName).Path
+            if ($seen.Add($resolved))
+            {
+                $installations.Add($resolved)
+            }
+        }
+    }
+
+    return $installations
+}
+
+function Get-DiaSearchDirs
+{
+    $dirs = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($installation in (Get-VisualStudioInstallations))
+    {
+        $dir = Join-Path $installation "DIA SDK\bin\amd64"
+        if (Test-Path (Join-Path $dir "msdia140.dll"))
+        {
+            $resolved = (Resolve-Path $dir).Path
+            if ($seen.Add($resolved))
+            {
+                $dirs.Add($resolved)
+            }
+        }
+    }
+
+    return $dirs
+}
 
 function Get-VersionValue
 {
@@ -211,6 +300,7 @@ foreach ($name in $runtimeFiles)
 }
 
 $diaCandidates = @()
+$diaSearchDirs = Get-DiaSearchDirs
 foreach ($dir in $diaSearchDirs)
 {
     $path = Join-Path $dir "msdia140.dll"
@@ -234,7 +324,7 @@ if ($diaCandidates.Count -gt 0)
 }
 else
 {
-    Write-Warning "msdia140.dll was not found in known Visual Studio DIA SDK x64 paths"
+    Write-Warning "msdia140.dll was not found in installed Visual Studio DIA SDK x64 paths"
 }
 
 $destinationSymsrv = Join-Path $destinationDir "symsrv.dll"
