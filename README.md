@@ -76,9 +76,9 @@ kn-live-dbg/
 
 Requirements:
 
-1. Visual Studio 2022.
+1. Visual Studio 2022 with MSBuild, VC++ x64 tools, and the DIA SDK component.
 2. Windows Driver Kit 10.0.26100.0.
-3. x64 developer shell or normal PowerShell with MSBuild at the default VS Professional path.
+3. x64 developer shell or normal PowerShell. The build helper discovers MSBuild and DIA SDK paths from installed Visual Studio instances through `vswhere`.
 4. Vendored Zydis v4.1.1 amalgamated sources under `third_party\zydis\amalgamated` for native x64 disassembly.
 
 Build:
@@ -95,7 +95,7 @@ Refresh the pinned Debugging Tools runtime from the newest complete local x64 se
 
 The driver projects use WDK `TestSign` for Debug and Release x64 builds. The build helper verifies that both `KnLiveDbg.sys` and `KnLiveDbgProbe.sys` have Authenticode signers and prints signature status/thumbprints after MSBuild completes.
 Normal scripted builds reuse the current PE version from `.build\version-state.json` or the existing output file and do not increment it. Use `.\tools\build.ps1 -Configuration Release -BumpVersion` only when a new build version should be minted; with no previous state, the baseline is `0.0.0`, so the first bumped build stamps `0.0.1` into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys`. The generated resource header is written under `.build\generated`, while `shared\KnLiveDbgVersion.h` remains a `0.0.0` fallback for direct Visual Studio builds that do not run the helper script.
-The build helper also stages the pinned `vendor\debugging-tools\x64` runtime beside the EXE (`dbghelp.dll`, `dbgeng.dll`, `dbgcore.dll`, `DbgModel.dll`, `msdia140.dll`, `symsrv.dll`, `srcsrv.dll`, and `symsrv.yes`) so DbgHelp and DbgEng can use the Microsoft symbol server instead of falling back to the limited System32 runtime. If the vendor pair is missing, the script falls back to the locally installed Windows Kits Debugging Tools copy. If `symsrv.dll` is staged but `symsrv.yes` is missing, the sync script, build script, and EXE startup path create `symsrv.yes` before symbol loading. Startup creates `<exe-dir>\symbols` and uses it as the downstream symbol store, so downloaded PDBs stay with the runnable EXE bundle rather than going to `C:\Symbols`. When `msdia140.dll` is staged, startup registers it automatically with `DllRegisterServer` before symbol initialization. The symbol engine also has a no-reg fallback that loads the staged `msdia*.dll` directly and creates `IDiaDataSource` through `DllGetClassObject`, so type fallback can still work when COM registration is unavailable.
+The build helper also stages the pinned `vendor\debugging-tools\x64` runtime beside the EXE (`dbghelp.dll`, `dbgeng.dll`, `dbgcore.dll`, `DbgModel.dll`, `msdia140.dll`, `symsrv.dll`, `srcsrv.dll`, and `symsrv.yes`) so DbgHelp and DbgEng can use the Microsoft symbol server instead of falling back to the limited System32 runtime. If the vendor pair is missing, the script falls back to the locally installed Windows Kits Debugging Tools copy. DIA include/lib paths are passed to MSBuild from the discovered Visual Studio installation instead of relying on a fixed VS edition path. If `symsrv.dll` is staged but `symsrv.yes` is missing, the sync script, build script, and EXE startup path create `symsrv.yes` before symbol loading. Startup creates `<exe-dir>\symbols` and uses it as the downstream symbol store, so downloaded PDBs stay with the runnable EXE bundle rather than going to `C:\Symbols`. When `msdia140.dll` is staged, startup registers it automatically with `DllRegisterServer` before symbol initialization. The symbol engine also has a no-reg fallback that loads the staged `msdia*.dll` directly and creates `IDiaDataSource` through `DllGetClassObject`, so type fallback can still work when COM registration is unavailable.
 
 Create a release zip:
 

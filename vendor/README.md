@@ -14,7 +14,7 @@ Current runtime set:
 
 The pinned `dbghelp.dll` and `symsrv.dll` pair is intentionally kept together. Mixing a newer System32 `dbghelp.dll` with an older or missing `symsrv.dll` can leave kernel PDB downloads at `SymNone`.
 `symsrv.yes` is also pinned as the symbol-server consent marker. The sync script, build script, and EXE startup path create a one-byte marker when `symsrv.dll` exists but `symsrv.yes` is missing.
-`msdia140.dll` is pinned from the Visual Studio DIA SDK x64 folder. The EXE registers it automatically with `DllRegisterServer` before symbol initialization in normal elevated runs. The symbol engine also supports no-reg DIA activation by loading the staged DLL directly and creating `IDiaDataSource` through `DllGetClassObject`.
+`msdia140.dll` is pinned from the newest discovered Visual Studio DIA SDK x64 folder. The sync script discovers installed Visual Studio roots through `vswhere` and filesystem fallback instead of relying on a fixed VS edition path. The EXE registers it automatically with `DllRegisterServer` before symbol initialization in normal elevated runs. The symbol engine also supports no-reg DIA activation by loading the staged DLL directly and creating `IDiaDataSource` through `DllGetClassObject`.
 
 Refresh this folder with:
 

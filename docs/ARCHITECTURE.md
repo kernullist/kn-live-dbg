@@ -78,7 +78,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 
 1. TUI calls `NtQuerySystemInformation(SystemModuleInformation)`.
 2. TUI translates `\SystemRoot\...` paths into local Windows paths.
-3. The build helper stages the pinned `vendor\debugging-tools\x64` Debugging Tools runtime DLLs beside the EXE so DbgHelp can load `symsrv.dll`, DbgEng can load `DbgModel.dll`, and both can use the Microsoft symbol server instead of the limited System32 runtime. If the vendor runtime is incomplete, it falls back to the locally installed Windows Kits Debugging Tools copy for missing debugger-runtime files.
+3. The build helper stages the pinned `vendor\debugging-tools\x64` Debugging Tools runtime DLLs beside the EXE so DbgHelp can load `symsrv.dll`, DbgEng can load `DbgModel.dll`, and both can use the Microsoft symbol server instead of the limited System32 runtime. If the vendor runtime is incomplete, it falls back to the locally installed Windows Kits Debugging Tools copy for missing debugger-runtime files. MSBuild receives DIA SDK and Debugging Tools include/lib directories from discovered Visual Studio and Windows Kits installations rather than fixed edition-specific paths.
 4. The sync script, build script, and EXE startup path create `symsrv.yes` when `symsrv.dll` is present but the consent marker is missing.
 5. Startup registers staged `msdia140.dll` with `DllRegisterServer` before symbol initialization so DIA fallback does not require a separate `regsvr32` step in normal elevated runs.
 6. Startup creates `<exe-dir>\symbols`, prepends the EXE directory and its non-cache subdirectories to the DbgHelp/DbgEng symbol path, then appends `SRV*<exe-dir>\symbols*https://msdl.microsoft.com/download/symbols` so downloaded PDBs are managed under the runnable EXE bundle.
@@ -239,7 +239,7 @@ Human-readable native command output uses scoped console attributes for high-sig
 2. It reads `.build\version-state.json`, falls back to the existing output PE version, and otherwise starts from `0.0.0`.
 3. Normal builds do not increment the version; `-BumpVersion` increments the patch component by one and saves the new version state after a successful build.
 4. The first bumped build is therefore `0.0.1`.
-5. The script writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys` before the WDK TestSign step.
+5. The script discovers MSBuild and the DIA SDK from installed Visual Studio instances, writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys` before the WDK TestSign step.
 6. After a successful build, the script verifies the stamped PE versions, verifies driver signatures, and stages Debugging Tools runtime DLLs beside the EXE.
 7. `tools\release.ps1` runs a version-bumped build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory. `-NoVersionBump` keeps the current version for ad hoc packages.
 8. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, README/runtime manifest metadata, and `kn-live-dbg-version.json`.

@@ -8,17 +8,161 @@ $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $solution = Join-Path $repo "kn-live-dbg.sln"
-$msbuild = "C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe"
 $exePath = Join-Path $repo "x64\$Configuration\KnLiveDbg.exe"
 $sysPath = Join-Path $repo "x64\$Configuration\KnLiveDbg.sys"
 $probeSysPath = Join-Path $repo "x64\$Configuration\KnLiveDbgProbe.sys"
 $outputDir = Join-Path $repo "x64\$Configuration"
 $vendorDebuggersDir = Join-Path $repo "vendor\debugging-tools\x64"
-$debuggersDir = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64"
 $stateDir = Join-Path $repo ".build"
 $statePath = Join-Path $stateDir "version-state.json"
 $generatedDir = Join-Path $stateDir "generated"
 $versionHeaderPath = Join-Path $generatedDir "KnLiveDbgVersion.h"
+
+function Get-VsWherePath
+{
+    $paths = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"),
+        (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
+    )
+
+    foreach ($path in $paths)
+    {
+        if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path $path))
+        {
+            return $path
+        }
+    }
+
+    return $null
+}
+
+function Get-VisualStudioInstallations
+{
+    $installations = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $vswhere = Get-VsWherePath
+
+    if (-not [string]::IsNullOrWhiteSpace($vswhere))
+    {
+        $json = & $vswhere -products * -requires Microsoft.Component.MSBuild -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -sort -format json
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($json))
+        {
+            $instances = $json | ConvertFrom-Json
+            foreach ($instance in $instances)
+            {
+                $path = [string]$instance.installationPath
+                if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path $path))
+                {
+                    $resolved = (Resolve-Path $path).Path
+                    if ($seen.Add($resolved))
+                    {
+                        $installations.Add($resolved)
+                    }
+                }
+            }
+        }
+    }
+
+    $roots = @(
+        (Join-Path $env:ProgramFiles "Microsoft Visual Studio"),
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio")
+    )
+
+    foreach ($root in $roots)
+    {
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root))
+        {
+            continue
+        }
+
+        $paths = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object {
+                Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name
+            }
+
+        foreach ($path in $paths)
+        {
+            if (Test-Path (Join-Path $path.FullName "MSBuild"))
+            {
+                $resolved = (Resolve-Path $path.FullName).Path
+                if ($seen.Add($resolved))
+                {
+                    $installations.Add($resolved)
+                }
+            }
+        }
+    }
+
+    return $installations
+}
+
+function Find-MSBuild
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$VisualStudioInstallations
+    )
+
+    foreach ($installation in $VisualStudioInstallations)
+    {
+        $candidates = @(
+            (Join-Path $installation "MSBuild\Current\Bin\MSBuild.exe"),
+            (Join-Path $installation "MSBuild\15.0\Bin\MSBuild.exe")
+        )
+
+        foreach ($candidate in $candidates)
+        {
+            if (Test-Path $candidate)
+            {
+                return (Resolve-Path $candidate).Path
+            }
+        }
+    }
+
+    throw "MSBuild was not found in installed Visual Studio instances"
+}
+
+function Find-DiaSdk
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$VisualStudioInstallations
+    )
+
+    foreach ($installation in $VisualStudioInstallations)
+    {
+        $diaRoot = Join-Path $installation "DIA SDK"
+        $include = Join-Path $diaRoot "include\dia2.h"
+        $library = Join-Path $diaRoot "lib\amd64\diaguids.lib"
+        if ((Test-Path $include) -and (Test-Path $library))
+        {
+            return (Resolve-Path $diaRoot).Path
+        }
+    }
+
+    throw "DIA SDK was not found. Install the Visual Studio C++ DIA SDK component."
+}
+
+function Find-DebuggingToolsDir
+{
+    $roots = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Debuggers\x64"),
+        (Join-Path $env:ProgramFiles "Windows Kits\10\Debuggers\x64")
+    )
+
+    foreach ($root in $roots)
+    {
+        if ((Test-Path (Join-Path $root "dbghelp.dll")) -and
+            (Test-Path (Join-Path $root "symsrv.dll")))
+        {
+            return (Resolve-Path $root).Path
+        }
+    }
+
+    throw "Windows Kits Debugging Tools x64 runtime was not found"
+}
 
 function Parse-VersionParts
 {
@@ -270,10 +414,25 @@ function Copy-DebuggingToolsRuntime
     }
 }
 
-if (-not (Test-Path $msbuild))
+$visualStudioInstallations = Get-VisualStudioInstallations
+if ($visualStudioInstallations.Count -eq 0)
 {
-    throw "MSBuild was not found at $msbuild"
+    throw "No Visual Studio installation with MSBuild was found"
 }
+
+$msbuild = Find-MSBuild -VisualStudioInstallations $visualStudioInstallations
+$diaSdkDir = Find-DiaSdk -VisualStudioInstallations $visualStudioInstallations
+$debuggersDir = Find-DebuggingToolsDir
+$diaIncludeDir = Join-Path $diaSdkDir "include"
+$diaLibDir = Join-Path $diaSdkDir "lib\amd64"
+$debuggersIncludeDir = Split-Path -Parent $debuggersDir
+$debuggersIncludeDir = Join-Path $debuggersIncludeDir "inc"
+$debuggersLibDir = Split-Path -Parent $debuggersDir
+$debuggersLibDir = Join-Path $debuggersLibDir "lib\x64"
+
+Write-Host "MSBuild: $msbuild"
+Write-Host "DIA SDK: $diaSdkDir"
+Write-Host "Debugging Tools: $debuggersDir"
 
 $baselineVersion = Get-BaselineVersion
 $versionParts = Parse-VersionParts -VersionText $baselineVersion
@@ -292,7 +451,19 @@ else
     Write-Host "PE version: $buildVersion"
 }
 
-& $msbuild $solution /m /p:Configuration=$Configuration /p:Platform=x64 /v:minimal
+$msbuildArgs = @(
+    $solution,
+    "/m",
+    "/p:Configuration=$Configuration",
+    "/p:Platform=x64",
+    "/p:DiaSdkIncludeDir=$diaIncludeDir",
+    "/p:DiaSdkLibDir=$diaLibDir",
+    "/p:DebuggingToolsIncludeDir=$debuggersIncludeDir",
+    "/p:DebuggingToolsLibDir=$debuggersLibDir",
+    "/v:minimal"
+)
+
+& $msbuild @msbuildArgs
 
 if ($LASTEXITCODE -ne 0)
 {
