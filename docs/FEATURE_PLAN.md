@@ -112,14 +112,15 @@ Operational value:
 Add a read-only user-mode process memory triage layer.
 
 Status: implemented in `ProcessTriageScanner` with native `!vad`, native
-`!threads`, JSON output, command help/completion, and AI `vad.list` /
-`threads.list` routing. Remaining hardening should come from field testing
-across Windows builds and protected-process edge cases.
+`!threads`, JSON output, command help/completion, AI `vad.list` /
+`threads.list` routing, and `/hiddenpte` VAD DKOM detection for present user
+PTE ranges that no VAD covers. Remaining hardening should come from field
+testing across Windows builds and protected-process edge cases.
 
 Target shape:
 
 ```text
-!vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/limit <n>] [/json <path>]
+!vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 ```
 
@@ -135,8 +136,12 @@ VAD requirements:
    mappings, private regions whose first page looks like PE/MZ, and
    signature-wiped PE candidates.
 5. Reuse the existing PE header probe logic where practical.
-6. Print a compact table and a `[vad.summary]` counter line.
-7. Support stable JSON output for diffing.
+6. With `/hiddenpte`, walk the target process page tables from the resolved
+   DTB, subtract normalized VAD coverage plus known VAD-less OS shared
+   mappings, and report present user PTE ranges that survive as hidden memory
+   candidates.
+7. Print a compact table and `[vad.summary]` / `[vad.hiddenpte]` counter lines.
+8. Support stable JSON output for diffing.
 
 Thread/APC requirements:
 

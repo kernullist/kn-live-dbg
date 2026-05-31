@@ -1,5 +1,7 @@
 #include "MemoryDumper.h"
 
+#include "../shared/KnLiveDbgIoctl.h"
+
 #include <Windows.h>
 #include <fstream>
 #include <iomanip>
@@ -21,7 +23,12 @@ namespace
         std::vector<uint8_t>* out,
         std::wstring* error)
     {
-        return device.ReadMemory(address, length, out, error);
+        return device.ReadMemory(
+            address,
+            length,
+            out,
+            error,
+            KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK);
     }
 
     // Read [address, address+length) into out, chunked. Returns false on first
