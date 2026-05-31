@@ -3031,6 +3031,7 @@ static void AddVadOptionCompletionCandidates(std::vector<std::wstring>* candidat
         L"/private",
         L"/wx",
         L"/pe",
+        L"/hiddenpte",
         L"/limit",
         L"/json",
         L"help"
@@ -15830,7 +15831,7 @@ static void PrintDmlProcHelp()
 static void PrintVadHelp()
 {
     std::wcout << L"!vad command:\n";
-    std::wcout << L"  !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /summary   print only the summary and warnings\n";
@@ -15838,6 +15839,7 @@ static void PrintVadHelp()
     std::wcout << L"  /private   show private-memory VADs only\n";
     std::wcout << L"  /wx        show writable executable VADs only\n";
     std::wcout << L"  /pe        probe private VAD first pages and show PE-like candidates only\n";
+    std::wcout << L"  /hiddenpte walk process page tables and report present user PTE ranges not covered by any VAD\n";
     std::wcout << L"  /limit n   cap printed/JSON records while still walking the tree\n";
     std::wcout << L"  /json path write stable JSON output\n";
     std::wcout << L"\n";
@@ -17964,6 +17966,21 @@ static bool IsShutdownOrUnloadCommand(const std::wstring& command)
     return blocked;
 }
 
+static bool IsAiSessionMutationCommand(const std::wstring& command)
+{
+    bool blocked = false;
+
+    if (command == L"backend" ||
+        command == L"kdinit" ||
+        command == L"kddetach" ||
+        command == L"probe")
+    {
+        blocked = true;
+    }
+
+    return blocked;
+}
+
 static bool ContainsUnsafeAiCommandCharacters(const std::wstring& line, std::wstring* reason)
 {
     bool unsafe = false;
@@ -18521,20 +18538,18 @@ static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* r
             break;
         }
 
-        if (command == L"backend" || command == L"kdinit" || command == L"kddetach")
+        if (IsAiSessionMutationCommand(command))
         {
             if (reason != nullptr)
             {
-                *reason = L"backend/session mutation commands are not allowed in AI plans";
-            }
-            break;
-        }
-
-        if (command == L"probe")
-        {
-            if (reason != nullptr)
-            {
-                *reason = L"probe service control is not allowed in AI plans";
+                if (command == L"probe")
+                {
+                    *reason = L"probe service control is not allowed in AI plans";
+                }
+                else
+                {
+                    *reason = L"backend/session mutation commands are not allowed in AI plans";
+                }
             }
             break;
         }
@@ -18551,7 +18566,9 @@ static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* r
         if (command == L"kd" && args.size() >= 2)
         {
             std::wstring inner = NormalizeInputCommand(args[1]);
-            if (inner == L"ai" || IsShutdownOrUnloadCommand(inner))
+            if (inner == L"ai" ||
+                IsShutdownOrUnloadCommand(inner) ||
+                IsAiSessionMutationCommand(inner))
             {
                 if (reason != nullptr)
                 {
@@ -18704,6 +18721,175 @@ static bool ValidateCallbackCommandArgumentShape(
         }
 
         ok = index >= args.size();
+    } while (false);
+
+    return ok;
+}
+
+static bool ValidateVadCommandArgumentShape(
+    const std::vector<std::wstring>& args,
+    std::wstring* reason)
+{
+    bool ok = false;
+
+    do
+    {
+        if (args.size() < 2)
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"!vad requires a process target";
+            }
+            break;
+        }
+
+        if (IsSwitchLikeToken(args[1]))
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"!vad target must be a pid, image name, or eprocess address";
+            }
+            break;
+        }
+
+        if (args[1].find_first_of(L"<>|") != std::wstring::npos)
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"!vad target must be a concrete pid, image name, or eprocess address, not a placeholder";
+            }
+            break;
+        }
+
+        size_t index = 2;
+        bool shapeOk = true;
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/summary" ||
+                option == L"/exec" ||
+                option == L"/private" ||
+                option == L"/wx" ||
+                option == L"/pe" ||
+                option == L"/hiddenpte" ||
+                option == L"/hidden" ||
+                option == L"/dkom")
+            {
+                ++index;
+                continue;
+            }
+
+            if (option == L"/limit" || option == L"/json")
+            {
+                if (index + 1 >= args.size() || IsSwitchLikeToken(args[index + 1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!vad " + option + L" requires a value";
+                    }
+                    shapeOk = false;
+                    break;
+                }
+
+                index += 2;
+                continue;
+            }
+
+            if (reason != nullptr)
+            {
+                *reason = L"!vad supports /summary, /exec, /private, /wx, /pe, /hiddenpte, /limit, and /json options";
+            }
+            shapeOk = false;
+            break;
+        }
+
+        if (!shapeOk)
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ValidateThreadsCommandArgumentShape(
+    const std::vector<std::wstring>& args,
+    std::wstring* reason)
+{
+    bool ok = false;
+
+    do
+    {
+        if (args.size() < 2)
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"!threads requires a process target";
+            }
+            break;
+        }
+
+        if (IsSwitchLikeToken(args[1]))
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"!threads target must be a pid, image name, or eprocess address";
+            }
+            break;
+        }
+
+        if (args[1].find_first_of(L"<>|") != std::wstring::npos)
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"!threads target must be a concrete pid, image name, or eprocess address, not a placeholder";
+            }
+            break;
+        }
+
+        size_t index = 2;
+        bool shapeOk = true;
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/apc" || option == L"/stacks")
+            {
+                ++index;
+                continue;
+            }
+
+            if (option == L"/limit" || option == L"/json")
+            {
+                if (index + 1 >= args.size() || IsSwitchLikeToken(args[index + 1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!threads " + option + L" requires a value";
+                    }
+                    shapeOk = false;
+                    break;
+                }
+
+                index += 2;
+                continue;
+            }
+
+            if (reason != nullptr)
+            {
+                *reason = L"!threads supports /apc, /stacks, /limit, and /json options";
+            }
+            shapeOk = false;
+            break;
+        }
+
+        if (!shapeOk)
+        {
+            break;
+        }
+
+        ok = true;
     } while (false);
 
     return ok;
@@ -18908,6 +19094,20 @@ static bool ValidateAiPlanArgumentShape(
                 }
             }
         }
+        else if (command == L"!vad")
+        {
+            if (!ValidateVadCommandArgumentShape(args, reason))
+            {
+                break;
+            }
+        }
+        else if (command == L"!threads")
+        {
+            if (!ValidateThreadsCommandArgumentShape(args, reason))
+            {
+                break;
+            }
+        }
         else if (command == L"!wfp")
         {
             size_t index = 1;
@@ -18931,7 +19131,9 @@ static bool ValidateAiPlanArgumentShape(
             bool optionShapeOk = true;
             while (index < args.size())
             {
-                if (!IsWfpOption(args[index]) || index + 1 >= args.size())
+                if (!IsWfpOption(args[index]) ||
+                    index + 1 >= args.size() ||
+                    IsSwitchLikeToken(args[index + 1]))
                 {
                     if (reason != nullptr)
                     {
@@ -19075,7 +19277,7 @@ static bool ValidateAiPlanArgumentShape(
                 }
                 if (option == L"/limit" || option == L"/json")
                 {
-                    if (i + 1 >= args.size())
+                    if (i + 1 >= args.size() || IsSwitchLikeToken(args[i + 1]))
                     {
                         if (reason != nullptr)
                         {
@@ -19123,21 +19325,49 @@ static bool ValidateAiPlanArgumentShape(
         else if (command == L"!pool")
         {
             size_t i = 1;
+            bool shapeOk = true;
             if (i < args.size() && IsPoolScopeName(args[i]))
             {
                 ++i;
             }
             while (i < args.size())
             {
-                if (!IsPoolOption(args[i]))
+                std::wstring option = ToLower(args[i]);
+                if (!IsPoolOption(option))
                 {
                     if (reason != nullptr)
                     {
                         *reason = L"!pool argument must be a scope name or /option";
                     }
+                    shapeOk = false;
                     break;
                 }
+
+                if (option == L"/tag" ||
+                    option == L"/min" ||
+                    option == L"/max" ||
+                    option == L"/addr" ||
+                    option == L"/limit")
+                {
+                    if (i + 1 >= args.size() || IsSwitchLikeToken(args[i + 1]))
+                    {
+                        if (reason != nullptr)
+                        {
+                            *reason = L"!pool " + option + L" requires a value";
+                        }
+                        shapeOk = false;
+                        break;
+                    }
+
+                    i += 2;
+                    continue;
+                }
+
                 ++i;
+            }
+            if (!shapeOk)
+            {
+                break;
             }
         }
         else if (command == L"!wnf")
@@ -19170,7 +19400,7 @@ static bool ValidateAiPlanArgumentShape(
                 }
                 if (needsHash)
                 {
-                    if (i >= args.size())
+                    if (i >= args.size() || IsSwitchLikeToken(args[i]))
                     {
                         if (reason != nullptr)
                         {
@@ -19232,7 +19462,9 @@ static bool ValidateAiPlanArgumentShape(
             bool optionShapeOk = true;
             while (index < args.size())
             {
-                if (!IsAlpcOption(args[index]) || index + 1 >= args.size())
+                if (!IsAlpcOption(args[index]) ||
+                    index + 1 >= args.size() ||
+                    IsSwitchLikeToken(args[index + 1]))
                 {
                     if (reason != nullptr)
                     {
@@ -19274,6 +19506,12 @@ static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason
         }
 
         std::wstring command = NormalizeInputCommand(args[0]);
+        if (ContainsUnsafeAiCommandCharacters(line, reason))
+        {
+            blocked = true;
+            break;
+        }
+
         if (command == L"ai")
         {
             blocked = true;
@@ -19294,7 +19532,7 @@ static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason
             break;
         }
 
-        if (command == L"backend" || command == L"kdinit" || command == L"kddetach" || command == L"probe")
+        if (IsAiSessionMutationCommand(command))
         {
             blocked = true;
             if (reason != nullptr)
@@ -19307,7 +19545,9 @@ static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason
         if (command == L"kd" && args.size() >= 2)
         {
             std::wstring inner = NormalizeInputCommand(args[1]);
-            if (IsShutdownOrUnloadCommand(inner))
+            if (inner == L"ai" ||
+                IsShutdownOrUnloadCommand(inner) ||
+                IsAiSessionMutationCommand(inner))
             {
                 blocked = true;
                 if (reason != nullptr)
@@ -19508,7 +19748,8 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"]}\n";
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
-    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, !wnf, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !vad, !threads, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, !wnf, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- For VAD DKOM or hidden PTE checks, use !vad target /hiddenpte where target is a concrete PID, image name, or EPROCESS address. Add /summary or /limit <n> when the operator asks for concise output.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
     stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
@@ -20816,6 +21057,24 @@ static bool ShouldAutoPlanAiQuery(const std::wstring& query)
     return shouldPlan;
 }
 
+static bool IsAiCommandRecommendationQuery(const std::wstring& query)
+{
+    static const std::vector<std::wstring> commandPhrases =
+    {
+        L"list commands",
+        L"show commands",
+        L"what commands",
+        L"which commands",
+        L"commands to",
+        L"command to",
+        L"commands for",
+        L"recommend commands",
+        L"suggest commands"
+    };
+
+    return ContainsAnyNoCase(query, commandPhrases);
+}
+
 static void HandleAiPlanRequest(
     const std::wstring& prompt,
     const std::wstring& eventName,
@@ -21587,6 +21846,33 @@ static void PrintVadRecord(const ProcessVadRecord& record)
     std::wcout << L"\n";
 }
 
+static void PrintHiddenVadPteRecord(const ProcessHiddenVadPteRecord& record)
+{
+    WORD color = record.Executable ? KNDBG_COLOR_WARN : KNDBG_COLOR_ACCENT;
+
+    PrintColoredText(L"[hidden-pte] ", color);
+    std::wcout << HexTextWidth(record.StartAddress, 16, true)
+               << L"-" << HexTextWidth(record.EndAddress, 16, true)
+               << L" size=" << HexText(record.Size)
+               << L" pages=" << std::dec << record.PageCount
+               << L" page_size=" << HexText(record.PageSize)
+               << L" phys=" << HexTextWidth(record.PhysicalAddress, 16, true)
+               << L" leaf=" << HexTextWidth(record.LeafEntryAddress, 16, true)
+               << L" entry=" << HexTextWidth(record.LeafEntry, 16, true)
+               << L" user=" << (record.UserAccessible ? L"yes" : L"no")
+               << L" writable=" << (record.Writable ? L"yes" : L"no")
+               << L" exec=" << (record.Executable ? L"yes" : L"no");
+    if (record.LargePage)
+    {
+        std::wcout << L" large=yes";
+    }
+    if (!record.Notes.empty())
+    {
+        std::wcout << L" notes=" << record.Notes;
+    }
+    std::wcout << L"\n";
+}
+
 static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryOnly)
 {
     PrintColoredText(L"!vad", KNDBG_COLOR_TITLE);
@@ -21601,6 +21887,11 @@ static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryO
         {
             PrintVadRecord(record);
         }
+
+        for (const ProcessHiddenVadPteRecord& record : result.HiddenPteRecords)
+        {
+            PrintHiddenVadPteRecord(record);
+        }
     }
 
     PrintColoredText(L"[vad.summary]", KNDBG_COLOR_TITLE);
@@ -21614,6 +21905,21 @@ static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryO
                << L" suspicious=" << result.SuspiciousCount
                << L" truncated=" << (result.Truncated ? L"yes" : L"no")
                << L"\n";
+
+    if (result.HiddenPteScanEnabled)
+    {
+        PrintColoredText(L"[vad.hiddenpte]", KNDBG_COLOR_TITLE);
+        std::wcout << L" paging_levels=" << result.PagingLevels
+                   << L" pte_leafs=" << result.PteLeafMappings
+                   << L" hidden_ranges=" << result.HiddenPteRanges
+                   << L" hidden_bytes=" << HexText(result.HiddenPteBytes)
+                   << L" hidden_exec=" << result.HiddenPteExecutableCount
+                   << L" hidden_wx=" << result.HiddenPteWxCount
+                   << L" page_table_pages=" << result.PageTablePagesRead
+                   << L" read_failures=" << result.PageTableReadFailures
+                   << L" truncated=" << (result.HiddenPteTruncated ? L"yes" : L"no")
+                   << L"\n";
+    }
 }
 
 static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeStacks, bool includeApc)
@@ -21794,6 +22100,10 @@ static void HandleVadCommand(
             {
                 options.ProbePe = true;
                 options.PeOnly = true;
+            }
+            else if (option == L"/hiddenpte" || option == L"/hidden" || option == L"/dkom")
+            {
+                options.ScanHiddenPtes = true;
             }
             else if (option == L"/limit")
             {
@@ -22892,7 +23202,7 @@ static bool ValidateAiCapabilityToolArgKeys(
     }
     else if (tool == L"vad.list")
     {
-        allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"exec", L"private", L"wx", L"pe", L"summary", L"limit"};
+        allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"exec", L"private", L"wx", L"pe", L"hiddenpte", L"dkom", L"summary", L"limit"};
     }
     else if (tool == L"threads.list")
     {
@@ -23078,7 +23388,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- callbacks.list: list kernel callbacks. Args: scope string and optional module string. Supported scopes: all,object,registry,process,thread,imageload,minifilter.\n";
     stream << L"- wfp.list: list Windows Filtering Platform objects via fwpuclnt.dll. Args: scope (providers,sublayers,callouts,filters,layers; defaults to callouts), optional module (callouts/filters provider name or GUID), optional layer (filters only).\n";
     stream << L"- alpc.list: list ALPC ports discovered via Object Manager directory walk and CommunicationInfo links. Args: scope (ports,connections; defaults to ports), optional name substring, optional pid filter as decimal string.\n";
-    stream << L"- vad.list: list target process VADs. Args: image, pid, eprocess, or source; optional booleans exec, private, wx, pe, summary; optional limit string.\n";
+    stream << L"- vad.list: list target process VADs and optionally detect present PTE ranges missing from the VAD tree. Args: image, pid, eprocess, or source; optional booleans exec, private, wx, pe, hiddenpte, dkom, summary; optional limit string.\n";
     stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
     stream << L"- etw.integrity: check inline ETW GetCpuClock targets and suspicious callback redirects. Args: {}.\n";
     stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
@@ -23100,7 +23410,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For callback requests such as object callbacks for WdFilter.sys, use callbacks.list with scope \"object\" and module \"WdFilter.sys\".\n";
     stream << L"- For WFP questions such as callouts owned by tcpip or filters in the ALE auth connect layer, use wfp.list with the appropriate scope and module/layer.\n";
     stream << L"- For ALPC questions such as listing named ports or pairing csrss/lsass connections, use alpc.list with scope ports or connections and optional name/pid filters.\n";
-    stream << L"- For executable private memory, W+X, PE-like VADs, or process memory region triage, use vad.list directly.\n";
+    stream << L"- For executable private memory, W+X, PE-like VADs, process memory region triage, or VAD DKOM/hidden PTE checks, use vad.list directly. Use hiddenpte=true for VAD DKOM checks.\n";
     stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
     stream << L"- For inline ETW hook questions, use etw.integrity.\n";
     stream << L"- For NMI callback questions, use nmi.list.\n";
@@ -23220,33 +23530,74 @@ static bool ExecuteAiCapabilityProcessDescribe(
     return ok;
 }
 
+static bool ValidateAiCapabilityScalarText(
+    const std::wstring& value,
+    const std::wstring& label,
+    std::wstring* error);
+
 static bool ExecuteAiCapabilityTypeDescribeForAddress(
     const std::wstring& typeName,
     const std::wstring& addressText,
     const std::vector<std::wstring>& fields,
     const DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* error)
 {
     bool ok = false;
 
     do
     {
-        if (TrimWhitespace(typeName).empty() || TrimWhitespace(addressText).empty())
+        std::wstring trimmedType = TrimWhitespace(typeName);
+        std::wstring trimmedAddress = TrimWhitespace(addressText);
+        if (trimmedType.empty() || trimmedAddress.empty())
         {
+            break;
+        }
+
+        if (!ValidateAiCapabilityScalarText(trimmedType, L"type name", error) ||
+            !ValidateAiCapabilityScalarText(trimmedAddress, L"type address", error))
+        {
+            break;
+        }
+
+        if (IsSwitchLikeToken(trimmedType) || IsSwitchLikeToken(trimmedAddress))
+        {
+            if (error != nullptr)
+            {
+                *error = L"type.describe type and address cannot be option tokens";
+            }
             break;
         }
 
         std::vector<std::wstring> args;
         args.push_back(L"dt");
-        args.push_back(typeName);
-        args.push_back(addressText);
+        args.push_back(trimmedType);
+        args.push_back(trimmedAddress);
         for (const std::wstring& field : fields)
         {
-            if (!TrimWhitespace(field).empty() && ToLower(TrimWhitespace(field)) != L"all")
+            std::wstring trimmedField = TrimWhitespace(field);
+            if (trimmedField.empty() || ToLower(trimmedField) == L"all")
             {
-                args.push_back(TrimWhitespace(field));
+                continue;
             }
+
+            if (!ValidateAiCapabilityScalarText(trimmedField, L"type field", error) ||
+                IsSwitchLikeToken(trimmedField))
+            {
+                if (error != nullptr && error->empty())
+                {
+                    *error = L"type.describe field cannot be an option token";
+                }
+                break;
+            }
+
+            args.push_back(trimmedField);
+        }
+
+        if (error != nullptr && !error->empty())
+        {
+            break;
         }
 
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
@@ -23295,11 +23646,14 @@ static bool ExecuteAiCapabilityTypeDescribe(
 
         if (!TrimWhitespace(addressText).empty())
         {
-            if (!ExecuteAiCapabilityTypeDescribeForAddress(typeName, TrimWhitespace(addressText), fields, state, device, symbols))
+            if (!ExecuteAiCapabilityTypeDescribeForAddress(typeName, TrimWhitespace(addressText), fields, state, device, symbols, error))
             {
                 if (error != nullptr)
                 {
-                    *error = L"type.describe requires a type and address";
+                    if (error->empty())
+                    {
+                        *error = L"type.describe requires a type and address";
+                    }
                 }
                 break;
             }
@@ -23324,15 +23678,26 @@ static bool ExecuteAiCapabilityTypeDescribe(
             break;
         }
 
+        bool dumpOk = true;
         for (const DmlProcessRecord& record : records)
         {
-            ExecuteAiCapabilityTypeDescribeForAddress(
-                typeName,
-                HexTextWidth(record.Eprocess, 16, true),
-                fields,
-                state,
-                device,
-                symbols);
+            if (!ExecuteAiCapabilityTypeDescribeForAddress(
+                    typeName,
+                    HexTextWidth(record.Eprocess, 16, true),
+                    fields,
+                    state,
+                    device,
+                    symbols,
+                    error))
+            {
+                dumpOk = false;
+                break;
+            }
+        }
+
+        if (!dumpOk)
+        {
+            break;
         }
 
         if (truncated)
@@ -23913,11 +24278,15 @@ static bool ExecuteAiCapabilityVadList(
         bool privateOnly = false;
         bool wxOnly = false;
         bool peOnly = false;
+        bool hiddenPte = false;
+        bool dkom = false;
         bool summaryOnly = false;
         if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"exec", &execOnly, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"private", &privateOnly, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"wx", &wxOnly, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"pe", &peOnly, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"hiddenpte", &hiddenPte, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"dkom", &dkom, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"summary", &summaryOnly, error))
         {
             break;
@@ -23950,6 +24319,10 @@ static bool ExecuteAiCapabilityVadList(
             if (peOnly)
             {
                 args.push_back(L"/pe");
+            }
+            if (hiddenPte || dkom)
+            {
+                args.push_back(L"/hiddenpte");
             }
             if (!AppendAiCapabilityLimitOption(step.ArgsJson, state, &args, error))
             {
@@ -24763,6 +25136,14 @@ static bool ExecuteAiCapabilityDriverIntegrity(
         {
             break;
         }
+        if (!target.empty() && IsSwitchLikeToken(target))
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver target cannot be an option token";
+            }
+            break;
+        }
 
         std::vector<std::wstring> args;
         args.push_back(L"!driver");
@@ -25164,6 +25545,20 @@ static void HandleAiFreeFormCommand(
                 dbgeng,
                 device,
                 service,
+                symbols,
+                ai,
+                aiState);
+            break;
+        }
+
+        if (IsAiCommandRecommendationQuery(query))
+        {
+            std::wcout << L"ai auto: command recommendation request; building command plan\n";
+            HandleAiPlanRequest(
+                query,
+                L"ai_auto_plan",
+                L"ai auto-plan request",
+                state,
                 symbols,
                 ai,
                 aiState);

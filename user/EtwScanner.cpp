@@ -336,7 +336,7 @@ namespace
                 break;
             }
 
-            // Step 3: heuristic auto-detect — search offsets within EtwpDebuggerData
+            // Step 3: heuristic auto-detect - search offsets within EtwpDebuggerData
             // and within candidate silo pointers, score by valid logger contexts.
             CandidateScore best = {};
             uint64_t siloFromHeuristic = 0;

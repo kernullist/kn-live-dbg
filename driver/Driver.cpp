@@ -114,14 +114,13 @@ static bool KnDbgRangeOverflows(ULONGLONG Address, SIZE_T Length)
     return overflows;
 }
 
-// MDL-based read used as a fallback when MmCopyMemory(MM_COPY_MEMORY_VIRTUAL)
-// returns STATUS_INVALID_ADDRESS. MmCopyMemory only reads currently-resident
-// pages; for paged-out kernel memory (typical for rarely-touched sections like
-// .rsrc/GFIDS in third-party drivers and some .reloc pages) we need
-// MmProbeAndLockPages to force a page-in. Pages that are truly torn down
-// (e.g. discardable INIT after DriverEntry) still raise an exception here, so
-// the caller continues to receive STATUS_INVALID_ADDRESS for those and the
-// user-mode dump-pe path zero-fills the affected range.
+// MDL-based read used only when the caller explicitly allows the fallback.
+// MmCopyMemory only reads currently-resident pages; for paged-out kernel memory
+// (typical for rarely-touched sections like .rsrc/GFIDS in third-party drivers
+// and some .reloc pages) MmProbeAndLockPages can force a page-in. Pages that
+// are truly torn down (e.g. discardable INIT after DriverEntry) still raise an
+// exception here, so the caller continues to receive STATUS_INVALID_ADDRESS for
+// those and the user-mode dump-pe path zero-fills the affected range.
 static NTSTATUS KnDbgReadVirtualAddressViaMdl(PVOID Address, PVOID Output, SIZE_T Length, PSIZE_T BytesCopied)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -220,7 +219,7 @@ static NTSTATUS KnDbgReadVirtualAddressViaMdl(PVOID Address, PVOID Output, SIZE_
     return status;
 }
 
-static NTSTATUS KnDbgReadVirtualAddress(ULONGLONG Address, PVOID Output, SIZE_T Length, PSIZE_T BytesCopied)
+static NTSTATUS KnDbgReadVirtualAddress(ULONGLONG Address, PVOID Output, SIZE_T Length, ULONG Flags, PSIZE_T BytesCopied)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
@@ -252,18 +251,11 @@ static NTSTATUS KnDbgReadVirtualAddress(ULONGLONG Address, PVOID Output, SIZE_T 
         *BytesCopied = 0;
         status = MmCopyMemory(Output, source, Length, MM_COPY_MEMORY_VIRTUAL, BytesCopied);
 
-        // MmCopyMemory(MM_COPY_MEMORY_VIRTUAL) refuses to page-in: pageable
-        // kernel memory that has been trimmed from the working set fails
-        // without attempting a page fault. The exact failure status varies
-        // across Windows builds (STATUS_INVALID_ADDRESS on most, but other
-        // codes have been observed for HVCI-protected or paged-out ranges),
-        // so we fall back on any non-success status. The MDL probe-and-lock
-        // path pulls the data back into physical memory before reading.
-        // Pages that are genuinely torn down (truly discarded sections,
-        // freed allocations, kernel CFG protected ranges) still fail through
-        // SEH inside the MDL helper, and the original failure status is
-        // preserved.
-        if (!NT_SUCCESS(status))
+        // MDL fallback can page in valid pageable driver sections, but it is
+        // too aggressive for scanners that probe untrusted callback/list
+        // pointers. Keep it opt-in for explicit dump paths only.
+        if (!NT_SUCCESS(status) &&
+            ((Flags & KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) != 0))
         {
             NTSTATUS savedStatus = status;
             // Preserve any partial bytes MmCopyMemory copied before failing
@@ -1041,6 +1033,12 @@ static NTSTATUS KnDbgHandleReadVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID
             break;
         }
 
+        if ((request.Flags & ~KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) != 0)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
         ULONG requiredLength = FIELD_OFFSET(KNDBG_READ_REQUEST, Data) + request.Length;
         if (outputLength < requiredLength)
         {
@@ -1057,7 +1055,7 @@ static NTSTATUS KnDbgHandleReadVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID
         response->Flags = request.Flags;
 
         SIZE_T bytesCopied = 0;
-        status = KnDbgReadVirtualAddress(request.Address, response->Data, request.Length, &bytesCopied);
+        status = KnDbgReadVirtualAddress(request.Address, response->Data, request.Length, request.Flags, &bytesCopied);
         response->Length = static_cast<KNDBG_UINT32>(bytesCopied);
         information = FIELD_OFFSET(KNDBG_READ_REQUEST, Data) + bytesCopied;
         if (!NT_SUCCESS(status) && bytesCopied != 0)
@@ -1200,7 +1198,7 @@ static NTSTATUS KnDbgHandleQueryAddress(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
 
         UCHAR scratch = 0;
         SIZE_T copied = 0;
-        status = KnDbgReadVirtualAddress(request.Address, &scratch, sizeof(scratch), &copied);
+        status = KnDbgReadVirtualAddress(request.Address, &scratch, sizeof(scratch), 0, &copied);
         if (NT_SUCCESS(status) && copied == sizeof(scratch))
         {
             response->IsReadable = 1;

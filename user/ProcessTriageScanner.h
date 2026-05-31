@@ -60,6 +60,23 @@ struct ProcessVadRecord
     std::wstring Notes;
 };
 
+struct ProcessHiddenVadPteRecord
+{
+    uint64_t StartAddress = 0;
+    uint64_t EndAddress = 0;
+    uint64_t Size = 0;
+    uint64_t PageSize = 0;
+    uint64_t PageCount = 0;
+    uint64_t PhysicalAddress = 0;
+    uint64_t LeafEntryAddress = 0;
+    uint64_t LeafEntry = 0;
+    bool Writable = false;
+    bool Executable = false;
+    bool UserAccessible = false;
+    bool LargePage = false;
+    std::wstring Notes;
+};
+
 struct ProcessVadScanOptions
 {
     ProcessTriageTarget Target = {};
@@ -69,6 +86,7 @@ struct ProcessVadScanOptions
     bool WxOnly = false;
     bool PeOnly = false;
     bool ProbePe = false;
+    bool ScanHiddenPtes = false;
     uint32_t Limit = 0;
 };
 
@@ -76,6 +94,7 @@ struct ProcessVadScanResult
 {
     ProcessTriageTarget Target = {};
     std::vector<ProcessVadRecord> Records;
+    std::vector<ProcessHiddenVadPteRecord> HiddenPteRecords;
     std::vector<std::wstring> Warnings;
     uint64_t NodesVisited = 0;
     uint64_t TotalRecords = 0;
@@ -85,7 +104,17 @@ struct ProcessVadScanResult
     uint64_t WxCount = 0;
     uint64_t PeLikeCount = 0;
     uint64_t SuspiciousCount = 0;
+    uint64_t PteLeafMappings = 0;
+    uint64_t PageTablePagesRead = 0;
+    uint64_t PageTableReadFailures = 0;
+    uint64_t HiddenPteRanges = 0;
+    uint64_t HiddenPteBytes = 0;
+    uint64_t HiddenPteExecutableCount = 0;
+    uint64_t HiddenPteWxCount = 0;
+    uint32_t PagingLevels = 0;
     bool Truncated = false;
+    bool HiddenPteScanEnabled = false;
+    bool HiddenPteTruncated = false;
     std::wstring LayoutSource;
 };
 

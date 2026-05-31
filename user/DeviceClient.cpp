@@ -256,7 +256,12 @@ bool DeviceClient::SetWriteMode(bool enabled, std::wstring* error)
     return Ioctl(IOCTL_KNDBG_SET_WRITE_MODE, &request, sizeof(request), sizeof(request), &returned, error);
 }
 
-bool DeviceClient::ReadMemory(uint64_t address, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error)
+bool DeviceClient::ReadMemory(
+    uint64_t address,
+    uint32_t length,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error,
+    uint32_t flags)
 {
     bool ok = false;
 
@@ -277,6 +282,7 @@ bool DeviceClient::ReadMemory(uint64_t address, uint32_t length, std::vector<uin
         request->Size = FIELD_OFFSET(KNDBG_READ_REQUEST, Data);
         request->Address = address;
         request->Length = length;
+        request->Flags = flags;
 
         DWORD returned = 0;
         if (!Ioctl(IOCTL_KNDBG_READ_VIRTUAL, buffer.data(), FIELD_OFFSET(KNDBG_READ_REQUEST, Data), bufferLength, &returned, error))

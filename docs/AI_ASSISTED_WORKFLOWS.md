@@ -16,7 +16,7 @@ This document captures the implemented AI assistance surface in Kn Live Dbg plus
 
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory, but the visible surface is now smaller:
 
-1. `ai <question>` is the default operator entrypoint. It first recognizes exact read-only evidence commands such as `callbacks`, `dt`, `dtx`, `u`, `uf`, `!ci`, or `!vbs` and runs them through evidence analysis. Otherwise it asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. If no direct local tool fits but the request looks investigative, it automatically builds a validated command plan and leaves execution to `ai run`; conceptual `what`/`how`/`why` questions remain advisory instead of being forced into planning. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, `driver.integrity`, and `assistant.answer`.
+1. `ai <question>` is the default operator entrypoint. It first recognizes exact read-only evidence commands such as `callbacks`, `dt`, `dtx`, `u`, `uf`, `!ci`, or `!vbs` and runs them through evidence analysis. Requests that ask to list, show, recommend, or suggest commands are treated as planning requests before local capability execution. Otherwise it asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. If no direct local tool fits but the request looks investigative, it automatically builds a validated command plan and leaves execution to `ai run`; conceptual `what`/`how`/`why` questions remain advisory instead of being forced into planning. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, `driver.integrity`, and `assistant.answer`.
 2. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
 3. `ai config ...` groups provider setup and smoke checks under one visible subcommand. It supports `status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`.
 4. `ai plan <prompt>` remains an explicit override that asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
@@ -137,6 +137,7 @@ VAD and thread triage:
 ```text
 ai show executable private VADs for game.exe
 ai find W+X regions in pid 1234
+ai scan game.exe for VAD DKOM hidden PTE mappings
 ai show suspicious thread starts for game.exe
 ai check APC evidence for pid 1234
 ai list threads with start addresses outside loaded modules
@@ -207,6 +208,7 @@ The command now behaves like a small tool-using agent and intent router. The ope
 - "alpc connections owned by lsass" -> `alpc.list` with `scope=connections` and `name=lsass`
 - "show executable private VADs for game.exe" -> `vad.list` with `image=game.exe`, `exec=true`, and `private=true`
 - "find W+X regions in pid 1234" -> `vad.list` with `pid=1234` and `wx=true`
+- "scan game.exe for VAD DKOM hidden PTE mappings" -> `vad.list` with `image=game.exe` and `hiddenpte=true`
 - "show suspicious thread starts for game.exe" -> `threads.list` with `image=game.exe`
 - "check APC evidence for pid 1234" -> `threads.list` with `pid=1234` and `apc=true`
 - "any inline ETW hook?" or "ETW dispatch integrity" -> `etw.integrity`
