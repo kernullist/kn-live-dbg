@@ -110,6 +110,7 @@
     <ClCompile Include="DeviceClient.cpp" />
     <ClCompile Include="DriverService.cpp" />
     <ClCompile Include="EtwScanner.cpp" />
+    <ClCompile Include="IntegrityScanner.cpp" />
     <ClCompile Include="NmiScanner.cpp" />
     <ClCompile Include="MemoryDumper.cpp" />
     <ClCompile Include="PoolPeHunter.cpp" />
@@ -139,6 +140,7 @@
     <ClInclude Include="DeviceClient.h" />
     <ClInclude Include="DriverService.h" />
     <ClInclude Include="EtwScanner.h" />
+    <ClInclude Include="IntegrityScanner.h" />
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="NmiScanner.h" />
     <ClInclude Include="MemoryDumper.h" />

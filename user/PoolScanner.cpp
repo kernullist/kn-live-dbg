@@ -56,6 +56,24 @@ namespace
     } SYSTEM_BIGPOOL_INFORMATION_LOCAL, *PSYSTEM_BIGPOOL_INFORMATION_LOCAL;
 #pragma pack(pop)
 
+    bool TryAdd(uint64_t left, uint64_t right, uint64_t* result)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (result == nullptr || left > (~0ull - right))
+            {
+                break;
+            }
+
+            *result = left + right;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     bool EnableDebugPrivilege(std::wstring* warning)
     {
         bool result = false;
@@ -439,17 +457,15 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
             if (options.HasAddressFilter)
             {
                 uint64_t target = options.AddressFilter;
-                uint64_t entryEnd = static_cast<uint64_t>(address) + size;
+                uint64_t entryEnd = 0;
+                if (!TryAdd(static_cast<uint64_t>(address), size, &entryEnd))
+                {
+                    continue;
+                }
                 if (target < address || target >= entryEnd)
                 {
                     continue;
                 }
-            }
-
-            if (options.LimitEntries != 0 && result->Entries.size() >= options.LimitEntries)
-            {
-                result->Diagnostics.push_back(L"output limit reached (/limit); remaining entries elided");
-                break;
             }
 
             BigPoolEntryRecord rec;
@@ -538,6 +554,20 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
                     rec.IsWritable = present && writable;
                     rec.IsExecutable = present && executable;
                 }
+            }
+
+            if (options.WxOnly)
+            {
+                if (!rec.AttributesQueried || !rec.IsWritable || !rec.IsExecutable)
+                {
+                    continue;
+                }
+            }
+
+            if (options.LimitEntries != 0 && result->Entries.size() >= options.LimitEntries)
+            {
+                result->Diagnostics.push_back(L"output limit reached (/limit); remaining entries elided");
+                break;
             }
 
             result->Entries.push_back(std::move(rec));

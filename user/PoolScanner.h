@@ -70,6 +70,7 @@ public:
         bool         HasAddressFilter = false;
         uint64_t     AddressFilter = 0;
         bool         AnnotateAttributes = false;   // walk PTE / probe pages via DeviceClient
+        bool         WxOnly = false;               // requires AnnotateAttributes and keeps only effective W+X entries
         uint32_t     LimitEntries = 0;             // 0 = unlimited
     };
 
