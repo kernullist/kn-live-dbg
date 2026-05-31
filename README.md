@@ -71,6 +71,7 @@ kn-live-dbg/
 - `docs/ARCHITECTURE.md` describes the driver/user split and backend routing.
 - `docs/WINDBG_COMMAND_COVERAGE.md` tracks native and DbgEng-routed WinDbg command coverage.
 - `docs/AI_ASSISTED_WORKFLOWS.md` captures planned AI-assisted command planning, callback analysis, `dt` interpretation, disassembly annotation, write safety, playbooks, and session reporting.
+- `docs/FEATURE_PLAN.md` tracks proposed high-value feature work such as snapshots/diffs, driver-object integrity, VAD/thread triage, WNF stabilization, AI capability expansion, WFP kernel callout resolution, module integrity, and probe fixtures.
 
 ## Build
 
