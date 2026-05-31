@@ -16152,10 +16152,10 @@ static void PrintAiHelp()
     std::wcout << L"primary subcommands:\n";
     std::wcout << L"  status       show provider, model, credential, and policy state\n";
     std::wcout << L"  config       configure provider, policy, model, base URL, effort, or auth\n";
-    std::wcout << L"  plan         ask AI to produce executable command proposals\n";
+    std::wcout << L"  plan         explicitly ask AI to produce executable command proposals\n";
     std::wcout << L"  run          execute planned read-only commands\n";
     std::wcout << L"  write        preview or confirm a planned write-like command\n";
-    std::wcout << L"  explain      run a read-only command and ask AI to explain the output\n";
+    std::wcout << L"  explain      explicitly run a read-only command and ask AI to explain the output\n";
     std::wcout << L"  show         show the loaded AI plan\n";
     std::wcout << L"  report       write a session report\n";
     std::wcout << L"\n";
@@ -16164,13 +16164,17 @@ static void PrintAiHelp()
     std::wcout << L"  ai a.exe eprocess\n";
     std::wcout << L"  ai WdFilter.sys object callbacks\n";
     std::wcout << L"  ai pid 1234 dtb\n";
-    std::wcout << L"  ai explain callbacks all WdFilter.sys\n";
-    std::wcout << L"  ai explain uf nt!PspCreateProcessNotifyRoutine 128\n";
+    std::wcout << L"  ai callbacks all WdFilter.sys\n";
+    std::wcout << L"  ai uf nt!PspCreateProcessNotifyRoutine 128\n";
+    std::wcout << L"  ai check VBS status\n";
+    std::wcout << L"  ai !ci options\n";
     std::wcout << L"  ai config provider openrouter\n";
     std::wcout << L"  ai config test\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Free-form questions first go through an AI tool planner, then local read-only tools execute the plan.\n";
+    std::wcout << L"  Prefer ai <goal>. It auto-routes local tools, read-only evidence analysis, or command planning.\n";
+    std::wcout << L"  Exact read-only commands such as callbacks, dt, u, !ci, or !vbs are treated as evidence to explain.\n";
+    std::wcout << L"  ai plan and ai explain still work as explicit overrides when you want that mode.\n";
     std::wcout << L"  API-key providers load .env only from the EXE directory.\n";
     std::wcout << L"  ai run executes read-only validated plan commands; write-like commands require ai write confirm.\n";
     std::wcout << L"  Legacy detailed commands still work; use ai help <topic> when needed.\n";
@@ -20507,6 +20511,300 @@ static void HandleAiEvidenceAnalysis(
     } while (false);
 }
 
+struct AiEvidenceAnalysisMetadata
+{
+    std::wstring EventName;
+    std::wstring Title;
+    std::wstring Instructions;
+};
+
+static AiEvidenceAnalysisMetadata BuildAiEvidenceAnalysisMetadata(
+    const std::wstring& commandLine,
+    const std::wstring& defaultEventName)
+{
+    AiEvidenceAnalysisMetadata metadata = {};
+    metadata.EventName = defaultEventName;
+    metadata.Title = L"Explain this KnLiveDbg command output.";
+    metadata.Instructions = L"Explain the important fields, anomalies, uncertainty, and concrete follow-up commands. Preserve raw addresses and values.";
+
+    std::vector<std::wstring> commandArgs = Split(commandLine);
+    if (!commandArgs.empty())
+    {
+        std::wstring topic = ToLower(NormalizeInputCommand(commandArgs[0]));
+        if (topic == L"callbacks")
+        {
+            metadata.EventName = defaultEventName + L"_callbacks";
+            metadata.Title = L"Analyze this KnLiveDbg kernel callback scan.";
+            metadata.Instructions = L"Produce a callback analysis report from this KnLiveDbg callback scan output. Count records by surface, group by module, decode process notify metadata, call out image-load notify owners, non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes.";
+        }
+        if (topic == L"dt" || topic == L"dtx")
+        {
+            metadata.EventName = defaultEventName + L"_dt";
+            metadata.Title = L"Explain this KnLiveDbg dt/dtx structure output.";
+            metadata.Instructions = L"Explain important fields, pointer and LIST_ENTRY follow-ups, suspicious null or out-of-module values, and exact commands to inspect referenced fields. Keep raw offsets and values auditable.";
+        }
+
+        if (topic == L"u" || topic == L"uf")
+        {
+            metadata.EventName = defaultEventName + L"_disassembly";
+            metadata.Title = L"Annotate this KnLiveDbg disassembly.";
+            metadata.Instructions = L"Summarize likely routine purpose, call targets, direct and indirect call evidence, callback/dispatch/minifilter/process/thread/image-load classification hints, suspicious code patterns, uncertainty, and next commands such as ln, x, dt, dq, or uf.";
+        }
+    }
+
+    return metadata;
+}
+
+static bool IsAiEvidenceCommandName(const std::wstring& command)
+{
+    bool evidenceCommand = false;
+    std::wstring normalized = ToLower(NormalizeInputCommand(command));
+
+    do
+    {
+        if (normalized == L"callbacks" ||
+            normalized == L"dt" ||
+            normalized == L"dtx" ||
+            normalized == L"u" ||
+            normalized == L"uf" ||
+            normalized == L"ln" ||
+            normalized == L"lm" ||
+            normalized == L"x" ||
+            normalized == L"vtop" ||
+            normalized == L"!dml_proc" ||
+            normalized == L"!vad" ||
+            normalized == L"!threads" ||
+            normalized == L"!wfp" ||
+            normalized == L"!alpc" ||
+            normalized == L"!vbs" ||
+            normalized == L"!ci" ||
+            normalized == L"!securekernel" ||
+            normalized == L"!etw" ||
+            normalized == L"!nmi" ||
+            normalized == L"!module" ||
+            normalized == L"!driver" ||
+            normalized == L"!pool" ||
+            normalized == L"!address" ||
+            normalized == L"!wnf")
+        {
+            evidenceCommand = true;
+            break;
+        }
+    } while (false);
+
+    return evidenceCommand;
+}
+
+static bool IsAiEvidenceCommandLine(const std::wstring& commandLine)
+{
+    std::vector<std::wstring> args = Split(commandLine);
+    return !args.empty() && IsAiEvidenceCommandName(args[0]);
+}
+
+static bool TryBuildImplicitAiEvidenceCommand(const std::wstring& query, std::wstring* commandLine)
+{
+    bool built = false;
+
+    do
+    {
+        if (commandLine == nullptr)
+        {
+            break;
+        }
+
+        commandLine->clear();
+        std::vector<std::wstring> args = Split(query);
+        if (args.empty())
+        {
+            break;
+        }
+
+        std::wstring first = ToLower(args[0]);
+        if (first == L"explain" ||
+            first == L"analyze" ||
+            first == L"interpret" ||
+            first == L"annotate")
+        {
+            if (args.size() < 2)
+            {
+                break;
+            }
+
+            std::wstring candidate = JoinArgs(args, 1);
+            if (IsAiEvidenceCommandLine(candidate))
+            {
+                *commandLine = candidate;
+                built = true;
+            }
+            break;
+        }
+
+        if (IsAiEvidenceCommandLine(query))
+        {
+            *commandLine = query;
+            built = true;
+        }
+    } while (false);
+
+    return built;
+}
+
+static bool ContainsAnyNoCase(const std::wstring& text, const std::vector<std::wstring>& needles)
+{
+    bool found = false;
+    std::wstring lowered = ToLower(text);
+
+    for (const std::wstring& needle : needles)
+    {
+        if (!needle.empty() && lowered.find(needle) != std::wstring::npos)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    return found;
+}
+
+static bool StartsWithAnyNoCase(const std::wstring& text, const std::vector<std::wstring>& prefixes)
+{
+    bool found = false;
+    std::wstring lowered = TrimWhitespace(ToLower(text));
+
+    for (const std::wstring& prefix : prefixes)
+    {
+        if (prefix.empty())
+        {
+            continue;
+        }
+
+        if (lowered == prefix ||
+            (lowered.size() > prefix.size() &&
+             lowered.rfind(prefix + L" ", 0) == 0))
+        {
+            found = true;
+            break;
+        }
+    }
+
+    return found;
+}
+
+static bool ShouldAutoPlanAiQuery(const std::wstring& query)
+{
+    static const std::vector<std::wstring> conceptualPrefixes =
+    {
+        L"what is",
+        L"what are",
+        L"why",
+        L"how do",
+        L"how does",
+        L"how can",
+        L"explain",
+        L"describe"
+    };
+    static const std::vector<std::wstring> planActionSignals =
+    {
+        L"check",
+        L"show",
+        L"list",
+        L"inspect",
+        L"find",
+        L"dump",
+        L"translate",
+        L"decode",
+        L"disassemble",
+        L"enumerate",
+        L"scan",
+        L"triage",
+        L"audit",
+        L"verify",
+        L"status",
+        L"options",
+        L"integrity"
+    };
+    static const std::vector<std::wstring> planInvestigationPhrases =
+    {
+        L"vbs",
+        L"hvci",
+        L"cioptions",
+        L"ci options",
+        L"securekernel",
+        L"secure kernel",
+        L"trustlet",
+        L"kernel callback",
+        L"module integrity",
+        L"driver integrity",
+        L"pool scan",
+        L"pool tag",
+        L"address inspect",
+        L"symbol lookup"
+    };
+    bool shouldPlan = false;
+
+    do
+    {
+        if (StartsWithAnyNoCase(query, conceptualPrefixes))
+        {
+            break;
+        }
+
+        if (ContainsAnyNoCase(query, planActionSignals) ||
+            ContainsAnyNoCase(query, planInvestigationPhrases))
+        {
+            shouldPlan = true;
+            break;
+        }
+    } while (false);
+
+    return shouldPlan;
+}
+
+static void HandleAiPlanRequest(
+    const std::wstring& prompt,
+    const std::wstring& eventName,
+    const std::wstring& requestLabel,
+    DebuggerState& state,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        AiCompletionRequest request = {};
+        request.System = BuildAiSystemPrompt(state, symbols);
+        request.Prompt = BuildAiPlanPrompt(prompt);
+
+        std::wcout << requestLabel << L": provider=" << ai.ProviderName()
+                   << L" model=" << ai.Settings().Model
+                   << L" credential=" << ai.CredentialStatus() << L"\n";
+
+        AiCompletionResponse response = {};
+        std::wstring error;
+        if (!ai.Complete(request, &response, &error))
+        {
+            std::wcerr << L"ai plan failed: " << error << L"\n";
+            WriteAiTranscriptEvent(aiState, eventName + L"_failed", error, L"");
+            break;
+        }
+
+        AiPlanState parsed = {};
+        PreserveAiSessionSettings(parsed, aiState);
+        if (!ParseAiPlanResponse(response.Text, &parsed, &error))
+        {
+            aiState.RawResponse = response.Text;
+            std::wcerr << L"ai plan parse failed: " << error << L"\n";
+            std::wcerr << L"raw response:\n" << response.Text << L"\n";
+            WriteAiTranscriptEvent(aiState, eventName + L"_parse_failed", error, L"");
+            break;
+        }
+
+        aiState = parsed;
+        WriteAiTranscriptEvent(aiState, eventName, L"plan loaded", L"");
+        PrintAiPlan(aiState);
+    } while (false);
+}
+
 static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstring& argument, std::wstring* error)
 {
     AiPlanState plan = {};
@@ -24778,7 +25076,9 @@ static void HandleAiConfigCommand(
 static void HandleAiFreeFormCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
+    DbgEngBackend& dbgeng,
     DeviceClient& device,
+    DriverService& service,
     SymbolEngine& symbols,
     AiProviderRuntime& ai,
     AiPlanState& aiState)
@@ -24789,6 +25089,28 @@ static void HandleAiFreeFormCommand(
         if (TrimWhitespace(query).empty())
         {
             PrintAiHelp();
+            break;
+        }
+
+        std::wstring implicitEvidenceCommand;
+        if (TryBuildImplicitAiEvidenceCommand(query, &implicitEvidenceCommand))
+        {
+            AiEvidenceAnalysisMetadata metadata = BuildAiEvidenceAnalysisMetadata(
+                implicitEvidenceCommand,
+                L"ai_auto_explain");
+            std::wcout << L"ai auto: evidence analysis\n";
+            HandleAiEvidenceAnalysis(
+                metadata.EventName,
+                implicitEvidenceCommand,
+                metadata.Title,
+                metadata.Instructions,
+                state,
+                dbgeng,
+                device,
+                service,
+                symbols,
+                ai,
+                aiState);
             break;
         }
 
@@ -24811,6 +25133,20 @@ static void HandleAiFreeFormCommand(
 
         if (capabilityResult == AiCapabilityQueryResult::Failed)
         {
+            break;
+        }
+
+        if (ShouldAutoPlanAiQuery(query))
+        {
+            std::wcout << L"ai auto: no direct local tool matched; building command plan\n";
+            HandleAiPlanRequest(
+                query,
+                L"ai_auto_plan",
+                L"ai auto-plan request",
+                state,
+                symbols,
+                ai,
+                aiState);
             break;
         }
 
@@ -24945,7 +25281,7 @@ static void HandleAiCommand(
             }
             else
             {
-                HandleAiFreeFormCommand(args, state, device, symbols, ai, aiState);
+                HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
             }
         }
         else if (action == L"write")
@@ -25094,9 +25430,15 @@ static void HandleAiCommand(
         }
         else if (action == L"analyze")
         {
-            if (args.size() < 3 || ToLower(args[2]) != L"callbacks")
+            if (args.size() < 3)
             {
-                std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
+                std::wcerr << L"usage: ai analyze <read-only-command...>\n";
+                break;
+            }
+
+            if (ToLower(args[2]) != L"callbacks")
+            {
+                HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
                 break;
             }
 
@@ -25189,36 +25531,14 @@ static void HandleAiCommand(
                 break;
             }
 
-            std::wstring topic = ToLower(args[2]);
             std::wstring commandLine = JoinArgs(args, 2);
-            std::wstring eventName = L"ai_explain";
-            std::wstring title = L"Explain this KnLiveDbg command output.";
-            std::wstring instructions = L"Explain the important fields, anomalies, uncertainty, and concrete follow-up commands. Preserve raw addresses and values.";
-
-            if (topic == L"callbacks")
-            {
-                eventName = L"ai_explain_callbacks";
-                title = L"Analyze this KnLiveDbg kernel callback scan.";
-                instructions = L"Produce a callback analysis report from this KnLiveDbg callback scan output. Count records by surface, group by module, decode process notify metadata, call out image-load notify owners, non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes.";
-            }
-            else if (topic == L"dt" || topic == L"dtx")
-            {
-                eventName = L"ai_explain_dt";
-                title = L"Explain this KnLiveDbg dt/dtx structure output.";
-                instructions = L"Explain important fields, pointer and LIST_ENTRY follow-ups, suspicious null or out-of-module values, and exact commands to inspect referenced fields. Keep raw offsets and values auditable.";
-            }
-            else if (topic == L"u" || topic == L"uf")
-            {
-                eventName = L"ai_explain_disassembly";
-                title = L"Annotate this KnLiveDbg disassembly.";
-                instructions = L"Summarize likely routine purpose, call targets, direct and indirect call evidence, callback/dispatch/minifilter/process/thread/image-load classification hints, suspicious code patterns, uncertainty, and next commands such as ln, x, dt, dq, or uf.";
-            }
+            AiEvidenceAnalysisMetadata metadata = BuildAiEvidenceAnalysisMetadata(commandLine, L"ai_explain");
 
             HandleAiEvidenceAnalysis(
-                eventName,
+                metadata.EventName,
                 commandLine,
-                title,
-                instructions,
+                metadata.Title,
+                metadata.Instructions,
                 state,
                 dbgeng,
                 device,
@@ -25320,41 +25640,18 @@ static void HandleAiCommand(
                 break;
             }
 
-            AiCompletionRequest request = {};
-            request.System = BuildAiSystemPrompt(state, symbols);
-            request.Prompt = BuildAiPlanPrompt(JoinArgs(args, 2));
-
-            std::wcout << L"ai plan request: provider=" << ai.ProviderName()
-                       << L" model=" << ai.Settings().Model
-                       << L" credential=" << ai.CredentialStatus() << L"\n";
-
-            AiCompletionResponse response = {};
-            std::wstring error;
-            if (!ai.Complete(request, &response, &error))
-            {
-                std::wcerr << L"ai plan failed: " << error << L"\n";
-                WriteAiTranscriptEvent(aiState, L"ai_plan_failed", error, L"");
-                break;
-            }
-
-            AiPlanState parsed = {};
-            PreserveAiSessionSettings(parsed, aiState);
-            if (!ParseAiPlanResponse(response.Text, &parsed, &error))
-            {
-                aiState.RawResponse = response.Text;
-                std::wcerr << L"ai plan parse failed: " << error << L"\n";
-                std::wcerr << L"raw response:\n" << response.Text << L"\n";
-                WriteAiTranscriptEvent(aiState, L"ai_plan_parse_failed", error, L"");
-                break;
-            }
-
-            aiState = parsed;
-            WriteAiTranscriptEvent(aiState, L"ai_plan", L"plan loaded", L"");
-            PrintAiPlan(aiState);
+            HandleAiPlanRequest(
+                JoinArgs(args, 2),
+                L"ai_plan",
+                L"ai plan request",
+                state,
+                symbols,
+                ai,
+                aiState);
         }
         else
         {
-            HandleAiFreeFormCommand(args, state, device, symbols, ai, aiState);
+            HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
         }
     } while (false);
 }

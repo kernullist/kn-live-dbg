@@ -16,11 +16,11 @@ This document captures implementation ideas for adding AI assistance to Kn Live 
 
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory, but the visible surface is now smaller:
 
-1. `ai <question>` is the default operator entrypoint. It asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, `driver.integrity`, and `assistant.answer`.
+1. `ai <question>` is the default operator entrypoint. It first recognizes exact read-only evidence commands such as `callbacks`, `dt`, `dtx`, `u`, `uf`, `!ci`, or `!vbs` and runs them through evidence analysis. Otherwise it asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. If no direct local tool fits but the request looks investigative, it automatically builds a validated command plan and leaves execution to `ai run`; conceptual `what`/`how`/`why` questions remain advisory instead of being forced into planning. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, `driver.integrity`, and `assistant.answer`.
 2. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
 3. `ai config ...` groups provider setup and smoke checks under one visible subcommand. It supports `status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`.
-4. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
-5. `ai explain <read-only-command...>` runs a read-only evidence command, preserves raw output, then asks the model for interpretation and follow-up commands. It has tuned prompts for `callbacks`, `dt`/`dtx`, and `u`/`uf`.
+4. `ai plan <prompt>` remains an explicit override that asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
+5. `ai explain <read-only-command...>` remains an explicit override for evidence analysis. The same path is also reached implicitly when the operator types `ai callbacks ...`, `ai dt ...`, `ai uf ...`, `ai !ci options`, or another recognized read-only evidence command.
 6. `ai show` prints the most recent parsed or playbook command plan.
 7. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
 8. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
@@ -39,9 +39,153 @@ The runtime automatically loads `.env` only from the executable directory. Real 
 
 `ai config test [prompt]` is the provider round-trip smoke check. Without a custom prompt, it asks the selected provider/model to return `kn-live-dbg-ai-ok`, then prints the configured provider, model, remote policy, credential status, transport result, HTTP status when available, elapsed time, and marker match result.
 
-The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. AI callback analysis now fits under `ai explain callbacks`, while compatibility aliases still consume normal `callbacks <scope> [module]` evidence. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
+The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. AI callback analysis now fits under both `ai callbacks ...` and `ai explain callbacks ...`, while compatibility aliases still consume normal `callbacks <scope> [module]` evidence. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
 
 The main `ai help` output stays focused on the primary workflow. Detailed compatibility topics still have operator help through `ai <subcommand> help` and `ai help <subcommand>`.
+
+## Operator Command Examples
+
+Default rule: prefer `ai <goal>` during normal use. Exact read-only command lines after `ai` are treated as evidence to run and explain, investigative requests can become a validated plan, and conceptual `what`/`how`/`why` questions stay advisory.
+
+Provider and session setup:
+
+```text
+ai status
+ai config status
+ai config provider openrouter
+ai config model deepseek/deepseek-r1
+ai config policy local-only
+ai config test
+ai help
+```
+
+Process and `_EPROCESS` triage:
+
+```text
+ai a.exe pid
+ai a.exe eprocess
+ai a.exe process eprocess info
+ai pid 1234 dtb
+ai pid 1234 peb
+ai show parent process for pid 1234
+ai find process named game.exe
+ai describe eprocess 0xffffc10212345080
+```
+
+Structure, symbol, and disassembly evidence:
+
+```text
+ai dt nt!_EPROCESS 0xffffc10212345080
+ai dtx nt!_ETHREAD 0xffffc10222220000
+ai uf nt!PspCreateProcessNotifyRoutine 128
+ai u fffff80212345678 40
+ai ln fffff80212345678
+ai x nt!*CreateProcess*
+```
+
+Callback analysis:
+
+```text
+ai callbacks all WdFilter.sys
+ai callbacks object WdFilter.sys
+ai callbacks process
+ai callbacks imageload
+ai WdFilter.sys object callbacks
+ai show process creation callbacks
+ai find callbacks owned by unknown modules
+ai list minifilter callbacks
+```
+
+VBS, HVCI, CI, and Secure Kernel:
+
+```text
+ai check VBS status
+ai is HVCI on?
+ai !vbs
+ai !ci options
+ai decode CiOptions
+ai list IUM trustlets
+ai check secure kernel state
+ai !securekernel
+```
+
+Module and driver integrity:
+
+```text
+ai inspect module text integrity
+ai inspect module text integrity with headers and sections
+ai find W+X kernel modules
+ai summarize live module integrity mismatches
+ai check driver dispatch integrity
+ai inspect driver dispatch table for WdFilter.sys
+ai find dispatch handlers outside owning driver image
+```
+
+WFP and ALPC:
+
+```text
+ai tcpip wfp callouts
+ai wfp filters ALE_AUTH_CONNECT_V4
+ai list WFP callouts owned by non-Microsoft modules
+ai named alpc ports
+ai alpc connections owned by lsass
+ai inspect ALPC ports related to game.exe
+```
+
+VAD and thread triage:
+
+```text
+ai show executable private VADs for game.exe
+ai find W+X regions in pid 1234
+ai show suspicious thread starts for game.exe
+ai check APC evidence for pid 1234
+ai list threads with start addresses outside loaded modules
+```
+
+ETW, NMI, pool, WNF, and TI:
+
+```text
+ai any inline ETW hook?
+ai check ETW dispatch integrity
+ai list NMI callbacks
+ai check NMI handler chain
+ai show W+X pool allocations
+ai pool tag Wmem larger than 0x10000
+ai decode WNF state name 0x41c64e6da3bc0075
+ai list live WNF instances
+ai query recent TI WriteVM events
+```
+
+Requests that are good fits for automatic command planning:
+
+```text
+ai check VBS and CI configuration
+ai scan kernel modules for executable writable sections
+ai list commands to inspect suspicious driver callbacks
+ai triage this address fffff80212345678
+ai verify whether WdFilter.sys owns all its callbacks
+ai show a read-only investigation plan for suspicious pool allocations
+```
+
+Conceptual questions that should stay advisory:
+
+```text
+ai what is HVCI?
+ai how does CiOptions affect kernel code integrity?
+ai why are W+X kernel pages suspicious?
+ai explain why callback addresses outside modules matter
+```
+
+Explicit overrides for forcing a mode:
+
+```text
+ai explain callbacks all WdFilter.sys
+ai explain dt nt!_EPROCESS 0xffffc10212345080
+ai plan check VBS status and decode CI options
+ai run all
+ai show
+ai report .\reports\session-ai.md
+```
 
 ## Candidate Features
 
@@ -49,7 +193,7 @@ The main `ai help` output stays focused on the primary workflow. Detailed compat
 
 Implemented entrypoint: `ai <question>`.
 
-The command now behaves like a small tool-using agent. The model receives the operator request and the capability catalog, returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. The catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, dispatches callback/WFP/ALPC requests to native scanners, and routes VAD/thread triage through the read-only process scanner:
+The command now behaves like a small tool-using agent and intent router. The operator can usually type `ai <goal>` without deciding between `plan` and `explain`. Exact read-only commands are executed as evidence and explained; local capability matches run through the strict tool catalog; unsupported investigative requests fall through to a validated command plan. The model receives the operator request and the capability catalog, returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. The catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, dispatches callback/WFP/ALPC requests to native scanners, and routes VAD/thread triage through the read-only process scanner:
 
 - "a.exe pid" -> matching PID records from the live process list
 - "a.exe eprocess" -> matching `_EPROCESS` addresses
@@ -77,11 +221,15 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "find W+X kernel modules" -> `module.integrity` with `target=all`, `wx=true`, and `verbose=true`
 - "summarize live module integrity mismatches" -> `module.integrity` with `target=all`, `summary=true`, and `mismatch=true`
 - "check driver dispatch integrity" -> `driver.integrity` with `target=all`
-- "is HVCI on?" or "VBS status" -> use `ai plan` for read-only native commands such as `!vbs`
-- "decode CiOptions" -> use `ai plan` for `!ci options`
-- "list IUM trustlets" -> use `ai plan` for `!securekernel`
+- "is HVCI on?" or "VBS status" -> automatic command plan for read-only native commands such as `!vbs`
+- "decode CiOptions" -> exact evidence command with `ai !ci options` or automatic command plan from the natural-language request
+- "list IUM trustlets" -> automatic command plan for `!securekernel`
+- "callbacks all WdFilter.sys" -> implicit evidence analysis, equivalent to `ai explain callbacks all WdFilter.sys`
+- "dt nt!_EPROCESS <address>" -> implicit evidence analysis for structure output
+- "uf nt!PspCreateProcessNotifyRoutine 128" -> implicit evidence analysis for disassembly output
+- "what is HVCI?" -> advisory answer, not automatic command planning
 
-The model-backed planner remains available through `ai plan <prompt>` for multi-command investigations:
+The model-backed planner remains available through `ai plan <prompt>` when the operator wants to force plan creation:
 
 - "Show object callbacks" -> `callbacks object`
 - "Dump this address as an EPROCESS" -> `dt nt!_EPROCESS <address>`
@@ -96,7 +244,7 @@ Implementation notes:
 4. Capability executors reject unsafe characters, command chaining, help tokens, invalid booleans, invalid numeric arguments, write-like actions, raw `kd`, nested `ai`, session mutation, and unload/shutdown routes.
 5. Resolve symbols before proposing commands when the request contains a symbol-like token.
 6. Prefer `backend auto` unless the requested command clearly needs raw DbgEng parser semantics.
-7. Display a command preview and require confirmation before execution for `ai plan` command proposals.
+7. Display a command preview and require confirmation before execution for automatic or explicit command proposals.
 8. For ambiguous requests, use `assistant.answer` or propose two or three command plans with tradeoffs rather than guessing silently.
 
 ### Callback Analysis Report
