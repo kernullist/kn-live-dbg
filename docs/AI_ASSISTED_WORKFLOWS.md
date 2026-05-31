@@ -16,7 +16,7 @@ This document captures implementation ideas for adding AI assistance to Kn Live 
 
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory, but the visible surface is now smaller:
 
-1. `ai <question>` is the default operator entrypoint. It asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, and `assistant.answer`.
+1. `ai <question>` is the default operator entrypoint. It asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, `driver.integrity`, and `assistant.answer`.
 2. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
 3. `ai config ...` groups provider setup and smoke checks under one visible subcommand. It supports `status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`.
 4. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
@@ -65,15 +65,19 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "find W+X regions in pid 1234" -> `vad.list` with `pid=1234` and `wx=true`
 - "show suspicious thread starts for game.exe" -> `threads.list` with `image=game.exe`
 - "check APC evidence for pid 1234" -> `threads.list` with `pid=1234` and `apc=true`
-- "is HVCI on?" or "VBS status" -> bare `!vbs` (planner can dispatch it directly as a read-only command)
-- "decode CiOptions" -> `!ci options`
-- "list IUM trustlets" -> `!securekernel`
-- "any suspicious ETW logger hooks?" -> `!etw loggers`
-- "InfinityHook check" or "ETW dispatch integrity" -> `!etw integrity`
-- "list NMI callbacks" or "check NMI handler chain" -> `!nmi callbacks`
-- "decode WNF state name 0x41c64e6da3bc0075" -> `!wnf decode 0x41c64e6da3bc0075`
-- "list live WNF instances" -> `!wnf instances`
-- "show WNF data for hash X" -> `!wnf data X`
+- "any inline ETW hook?" or "ETW dispatch integrity" -> `etw.integrity`
+- "list NMI callbacks" or "check NMI handler chain" -> `nmi.list`
+- "show W+X pool allocations" -> `pool.find` with `wx=true`
+- "pool tag Wmem larger than 0x10000" -> `pool.find` with `tag=Wmem` and `min=0x10000`
+- "why is this address suspicious?" -> `address.inspect` with `address=<va-or-symbol>`
+- "decode WNF state name 0x41c64e6da3bc0075" -> `wnf.decode` with `hash=0x41c64e6da3bc0075`
+- "list live WNF instances" -> `wnf.list` with `scope=instances`
+- "recent TI WriteVM events" -> `ti.query` with `action=grep` and `pattern=WriteVM`
+- "inspect module text integrity" -> `module.integrity` with `target=all`
+- "check driver dispatch integrity" -> `driver.integrity` with `target=all`
+- "is HVCI on?" or "VBS status" -> use `ai plan` for read-only native commands such as `!vbs`
+- "decode CiOptions" -> use `ai plan` for `!ci options`
+- "list IUM trustlets" -> use `ai plan` for `!securekernel`
 
 The model-backed planner remains available through `ai plan <prompt>` for multi-command investigations:
 
@@ -86,10 +90,12 @@ Implementation notes:
 
 1. Keep the AI-facing catalog small and explicit; adding more tools should be easier than adding more natural-language keyword rules.
 2. Send only the request and catalog during tool selection. Live process records, kernel addresses, and structure dumps are produced by the local executor after validation.
-3. Resolve symbols before proposing commands when the request contains a symbol-like token.
-4. Prefer `backend auto` unless the requested command clearly needs raw DbgEng parser semantics.
-5. Display a command preview and require confirmation before execution for `ai plan` command proposals.
-6. For ambiguous requests, use `assistant.answer` or propose two or three command plans with tradeoffs rather than guessing silently.
+3. The capability parser rejects unknown tools, unknown top-level fields, unknown step fields, and unknown per-tool arg fields before any native handler is called.
+4. Capability executors reject unsafe characters, command chaining, help tokens, invalid booleans, invalid numeric arguments, write-like actions, raw `kd`, nested `ai`, session mutation, and unload/shutdown routes.
+5. Resolve symbols before proposing commands when the request contains a symbol-like token.
+6. Prefer `backend auto` unless the requested command clearly needs raw DbgEng parser semantics.
+7. Display a command preview and require confirmation before execution for `ai plan` command proposals.
+8. For ambiguous requests, use `assistant.answer` or propose two or three command plans with tradeoffs rather than guessing silently.
 
 ### Callback Analysis Report
 

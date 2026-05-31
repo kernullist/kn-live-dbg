@@ -7,6 +7,7 @@
 #include "DeviceClient.h"
 #include "DriverService.h"
 #include "EtwScanner.h"
+#include "IntegrityScanner.h"
 #include "MemoryDumper.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
@@ -2061,6 +2062,8 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!securekernel" ||
         command == L"!etw" ||
         command == L"!nmi" ||
+        command == L"!module" ||
+        command == L"!driver" ||
         command == L"!pool" ||
         command == L"!wnf" ||
         command == L"!address" ||
@@ -2921,7 +2924,8 @@ static bool IsPoolOption(const std::wstring& value)
         lowered == L"/paged" ||
         lowered == L"/nonpaged" ||
         lowered == L"/any" ||
-        lowered == L"/annotate";
+        lowered == L"/annotate" ||
+        lowered == L"/wx";
 }
 
 static bool IsWnfScopeName(const std::wstring& value)
@@ -3548,6 +3552,17 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"callbacks");
                 }
+                else if (topic == L"!module" || topic == L"!driver")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"integrity",
+                        L"all",
+                        L"/limit",
+                        L"/json"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
                 else if (topic == L"!pool")
                 {
                     static const wchar_t* values[] =
@@ -3698,6 +3713,18 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 AddCompletionCandidates(&candidates, values);
             }
         }
+        else if (command == L"!module" || command == L"!driver")
+        {
+            static const wchar_t* values[] =
+            {
+                L"integrity",
+                L"all",
+                L"/limit",
+                L"/json",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
+        }
         else if (command == L"pool-scan-pe")
         {
             static const wchar_t* values[] =
@@ -3804,7 +3831,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"/nonpaged",
                     L"/paged",
                     L"/any",
-                    L"/annotate"
+                    L"/annotate",
+                    L"/wx"
                 };
                 AddCompletionCandidates(&candidates, values);
             }
@@ -12234,6 +12262,454 @@ static void PrintAddressInspection(const AddressInspectResult& r)
     }
 }
 
+static void PrintModuleIntegrityHelp()
+{
+    std::wcout << L"!module command:\n";
+    std::wcout << L"  !module integrity [module|all] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Verifies loaded kernel module PE headers and executable sections from live\n";
+    std::wcout << L"  memory. The scanner flags invalid headers, SizeOfImage drift, section\n";
+    std::wcout << L"  characteristics that are W+X, and effective page permissions that are W+X.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  [module|all]  image/path substring filter. Defaults to all.\n";
+    std::wcout << L"  /limit <n>    stop after <n> matching modules.\n";
+    std::wcout << L"  /json <path>  write structured kn-live-dbg.module-integrity.v1 JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !module integrity ntoskrnl\n";
+    std::wcout << L"  !module integrity all /limit 20\n";
+    std::wcout << L"  !module integrity WdFilter /json .\\module-integrity.json\n";
+}
+
+static void PrintDriverIntegrityHelp()
+{
+    std::wcout << L"!driver command:\n";
+    std::wcout << L"  !driver integrity [driver|all] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Walks the Object Manager \\Driver directory, reads _DRIVER_OBJECT entries,\n";
+    std::wcout << L"  annotates MajorFunction dispatch pointers, and flags handlers outside loaded\n";
+    std::wcout << L"  modules or routed into another non-kernel module. ntoskrnl stubs are treated\n";
+    std::wcout << L"  as normal because unused dispatch slots commonly point to nt!IopInvalidDeviceRequest.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  [driver|all]  driver object name/path substring filter. Defaults to all.\n";
+    std::wcout << L"  /limit <n>    stop after <n> matching drivers.\n";
+    std::wcout << L"  /json <path>  write structured kn-live-dbg.driver-integrity.v1 JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !driver integrity WdFilter\n";
+    std::wcout << L"  !driver integrity all /limit 25\n";
+    std::wcout << L"  !driver integrity all /json .\\driver-integrity.json\n";
+}
+
+static bool ParseIntegrityLimitOption(
+    const std::wstring& value,
+    uint32_t numberBase,
+    uint32_t* limit,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (limit == nullptr)
+        {
+            break;
+        }
+
+        uint64_t parsed = 0;
+        if (!ParseUnsigned(value, numberBase, &parsed) || parsed > 0xffffffffull)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid limit: " + value;
+            }
+            break;
+        }
+
+        *limit = static_cast<uint32_t>(parsed);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void PrintModuleIntegrityRecord(const ModuleIntegrityRecord& record)
+{
+    PrintColoredText(
+        record.Suspicious ? L"[module.integrity.suspicious]" : L"[module.integrity]",
+        record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+    std::wcout << L" image=";
+    PrintColoredText(record.ImageName.empty() ? L"<unknown>" : record.ImageName, KNDBG_COLOR_OK);
+    std::wcout << L" base=" << HexTextWidth(record.Base, 16, true)
+               << L" size=0x" << std::hex << record.Size
+               << L" peSize=0x" << record.SizeOfImage << std::dec
+               << L" sections=" << record.NumberOfSections;
+    if (record.SizeMismatch)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[SIZE-MISMATCH]", KNDBG_COLOR_WARN);
+    }
+    if (!record.Notes.empty())
+    {
+        std::wcout << L" notes=" << record.Notes;
+    }
+    std::wcout << L"\n";
+
+    for (const ModuleIntegritySectionRecord& section : record.Sections)
+    {
+        if (!section.Suspicious)
+        {
+            continue;
+        }
+
+        std::wcout << L"  ";
+        PrintColoredText(L"[module.section]", KNDBG_COLOR_WARN);
+        std::wcout << L" name=";
+        PrintColoredText(section.Name.empty() ? L"<unnamed>" : section.Name, KNDBG_COLOR_ACCENT);
+        std::wcout << L" rva=" << HexTextWidth(section.VirtualAddress, 8, true)
+                   << L" vsize=0x" << std::hex << section.VirtualSize
+                   << L" raw=0x" << section.RawSize << std::dec
+                   << L" chars=" << (section.Executable ? L"X" : L"-")
+                   << (section.Writable ? L"W" : L"-");
+        if (section.PageAttributesQueried)
+        {
+            std::wcout << L" effective="
+                       << (section.EffectiveExecutable ? L"X" : L"-")
+                       << (section.EffectiveWritable ? L"W" : L"-");
+        }
+        if (!section.Notes.empty())
+        {
+            std::wcout << L" notes=" << section.Notes;
+        }
+        std::wcout << L"\n";
+    }
+}
+
+static void PrintDriverIntegrityRecord(const DriverIntegrityRecord& record, bool verboseDispatch)
+{
+    PrintColoredText(
+        record.Suspicious ? L"[driver.integrity.suspicious]" : L"[driver.integrity]",
+        record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+    std::wcout << L" name=";
+    PrintColoredText(record.Name.empty() ? L"<unnamed>" : record.Name, KNDBG_COLOR_OK);
+    std::wcout << L" object=" << HexTextWidth(record.DriverObject, 16, true)
+               << L" start=" << HexTextWidth(record.DriverStart, 16, true)
+               << L" size=0x" << std::hex << record.DriverSize << std::dec;
+    if (!record.OwningModule.empty())
+    {
+        std::wcout << L" owner=";
+        PrintColoredText(record.OwningModule, KNDBG_COLOR_TITLE);
+    }
+    if (!record.Notes.empty())
+    {
+        std::wcout << L" notes=" << record.Notes;
+    }
+    std::wcout << L"\n";
+
+    if (record.DriverUnload != 0 || record.FastIoDispatch != 0)
+    {
+        std::wcout << L"  unload=" << HexTextWidth(record.DriverUnload, 16, true)
+                   << L" fastIo=" << HexTextWidth(record.FastIoDispatch, 16, true)
+                   << L" device=" << HexTextWidth(record.DeviceObject, 16, true) << L"\n";
+    }
+
+    for (const DriverDispatchRecord& dispatch : record.Dispatch)
+    {
+        if (!verboseDispatch && !dispatch.Suspicious)
+        {
+            continue;
+        }
+
+        std::wcout << L"  ";
+        PrintColoredText(dispatch.Suspicious ? L"[dispatch.suspicious]" : L"[dispatch]",
+                         dispatch.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_DIM);
+        std::wcout << L" irp=" << dispatch.Index << L":" << dispatch.Name
+                   << L" function=" << HexTextWidth(dispatch.Function, 16, true);
+        if (!dispatch.ModuleName.empty())
+        {
+            std::wcout << L" module=";
+            PrintColoredText(dispatch.ModuleName, KNDBG_COLOR_OK);
+        }
+        else if (dispatch.Function != 0)
+        {
+            std::wcout << L" module=";
+            PrintColoredText(L"<outside-loaded-modules>", KNDBG_COLOR_FAIL);
+        }
+        if (!dispatch.SymbolName.empty())
+        {
+            std::wcout << L" symbol=";
+            PrintColoredText(dispatch.SymbolName, KNDBG_COLOR_TITLE);
+        }
+        if (!dispatch.Notes.empty())
+        {
+            std::wcout << L" notes=" << dispatch.Notes;
+        }
+        std::wcout << L"\n";
+    }
+}
+
+static void HandleModuleIntegrityCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintModuleIntegrityHelp();
+            break;
+        }
+
+        if (args.size() < 2 || ToLower(args[1]) != L"integrity")
+        {
+            std::wcerr << L"usage: !module integrity [module|all] [/limit <n>] [/json <path>]\n";
+            PrintModuleIntegrityHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!module integrity requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        ModuleIntegrityOptions options = {};
+        std::wstring jsonPath;
+        std::wstring error;
+        bool parseError = false;
+
+        size_t index = 2;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!module integrity: /limit requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                if (!ParseIntegrityLimitOption(args[index + 1], state.NumberBase, &options.Limit, &error))
+                {
+                    std::wcerr << L"!module integrity: " << error << L"\n";
+                    parseError = true;
+                    break;
+                }
+                index += 2;
+                continue;
+            }
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!module integrity: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"!module integrity: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            if (!options.ModuleFilter.empty())
+            {
+                std::wcerr << L"!module integrity: unexpected extra target \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            options.ModuleFilter = args[index];
+            ++index;
+        }
+
+        if (parseError)
+        {
+            break;
+        }
+
+        IntegrityScanner scanner(device, symbols);
+        ModuleIntegrityResult result = {};
+        if (!scanner.ScanModules(options, &result, &error))
+        {
+            std::wcerr << L"!module integrity failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!module integrity warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!module integrity warning: " << warning << L"\n";
+        }
+
+        if (!jsonPath.empty())
+        {
+            if (WriteUtf8TextFile(jsonPath, BuildModuleIntegrityJson(result), &error))
+            {
+                std::wcout << L"!module integrity json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!module integrity json failed: " << error << L"\n";
+            }
+        }
+
+        for (const ModuleIntegrityRecord& record : result.Records)
+        {
+            PrintModuleIntegrityRecord(record);
+        }
+
+        PrintColoredText(L"[module.integrity.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" scanned=" << std::dec << result.ModulesScanned
+                   << L" matching=" << result.MatchingModules
+                   << L" suspicious=" << result.SuspiciousModules
+                   << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
+    } while (false);
+}
+
+static void HandleDriverIntegrityCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintDriverIntegrityHelp();
+            break;
+        }
+
+        if (args.size() < 2 || ToLower(args[1]) != L"integrity")
+        {
+            std::wcerr << L"usage: !driver integrity [driver|all] [/limit <n>] [/json <path>]\n";
+            PrintDriverIntegrityHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!driver integrity requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        DriverIntegrityOptions options = {};
+        std::wstring jsonPath;
+        std::wstring error;
+        bool parseError = false;
+
+        size_t index = 2;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!driver integrity: /limit requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                if (!ParseIntegrityLimitOption(args[index + 1], state.NumberBase, &options.Limit, &error))
+                {
+                    std::wcerr << L"!driver integrity: " << error << L"\n";
+                    parseError = true;
+                    break;
+                }
+                index += 2;
+                continue;
+            }
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!driver integrity: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"!driver integrity: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            if (!options.DriverFilter.empty())
+            {
+                std::wcerr << L"!driver integrity: unexpected extra target \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            options.DriverFilter = args[index];
+            ++index;
+        }
+
+        if (parseError)
+        {
+            break;
+        }
+
+        IntegrityScanner scanner(device, symbols);
+        DriverIntegrityResult result = {};
+        if (!scanner.ScanDrivers(options, &result, &error))
+        {
+            std::wcerr << L"!driver integrity failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!driver integrity warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!driver integrity warning: " << warning << L"\n";
+        }
+
+        if (!jsonPath.empty())
+        {
+            if (WriteUtf8TextFile(jsonPath, BuildDriverIntegrityJson(result), &error))
+            {
+                std::wcout << L"!driver integrity json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!driver integrity json failed: " << error << L"\n";
+            }
+        }
+
+        std::wstring filter = ToLower(TrimWhitespace(options.DriverFilter));
+        bool verboseDispatch = !filter.empty() && filter != L"all";
+        for (const DriverIntegrityRecord& record : result.Records)
+        {
+            PrintDriverIntegrityRecord(record, verboseDispatch);
+        }
+
+        PrintColoredText(L"[driver.integrity.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" scanned=" << std::dec << result.DriversScanned
+                   << L" matching=" << result.MatchingDrivers
+                   << L" suspicious=" << result.SuspiciousDrivers
+                   << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
+    } while (false);
+}
+
 static void PrintSetPplAntimalwareHelp()
 {
     std::wcout << L"set-ppl-antimalware command:\n";
@@ -13738,6 +14214,7 @@ static void PrintPoolHelp()
     std::wcout << L"  /any            include both Paged and NonPaged.\n";
     std::wcout << L"  /annotate       walk PTE for each kept NonPaged entry to mark R/W/X and large-page state.\n";
     std::wcout << L"                  Slower (issues one QueryAddress+TranslateVirtual IOCTL per entry).\n";
+    std::wcout << L"  /wx             implies /annotate and keeps only effective W+X NonPaged entries.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Requires SeDebugPrivilege; run elevated. The scanner attempts to enable it automatically.\n";
@@ -13747,6 +14224,7 @@ static void PrintPoolHelp()
     std::wcout << L"examples:\n";
     std::wcout << L"  !pool big\n";
     std::wcout << L"  !pool big /tag Cdat /annotate\n";
+    std::wcout << L"  !pool find /wx /limit 20\n";
     std::wcout << L"  !pool find /min 0x10000 /annotate\n";
     std::wcout << L"  !pool find /addr 0xffffae8000123000\n";
     std::wcout << L"  !pool summary\n";
@@ -13869,6 +14347,13 @@ static void HandlePoolCommand(
                 ++index;
                 continue;
             }
+            if (opt == L"/wx")
+            {
+                options.WxOnly = true;
+                options.AnnotateAttributes = true;
+                ++index;
+                continue;
+            }
 
             if (opt == L"/tag")
             {
@@ -13947,15 +14432,21 @@ static void HandlePoolCommand(
 
         if (options.Target == PoolScanner::Scope::Find &&
             !options.HasTagFilter && !options.HasAddressFilter &&
-            !options.HasMinSize && !options.HasMaxSize)
+            !options.HasMinSize && !options.HasMaxSize &&
+            !options.WxOnly)
         {
-            std::wcerr << L"!pool find requires at least one of /tag, /addr, /min, or /max\n";
+            std::wcerr << L"!pool find requires at least one of /tag, /addr, /min, /max, or /wx\n";
             PrintPoolHelp();
             break;
         }
 
         if (options.AnnotateAttributes && !device.IsOpen())
         {
+            if (options.WxOnly)
+            {
+                std::wcerr << L"!pool /wx requires the KnLiveDbg.sys driver device to be open\n";
+                break;
+            }
             std::wcerr << L"!pool /annotate requires the KnLiveDbg.sys driver device to be open; continuing without attributes\n";
             options.AnnotateAttributes = false;
         }
@@ -15766,6 +16257,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintNmiHelp();
         }
+        else if (command == L"!module")
+        {
+            PrintModuleIntegrityHelp();
+        }
+        else if (command == L"!driver")
+        {
+            PrintDriverIntegrityHelp();
+        }
         else if (command == L"!pool")
         {
             PrintPoolHelp();
@@ -17057,6 +17556,123 @@ static std::vector<std::wstring> ExtractJsonStringArrayValues(const std::wstring
     return values;
 }
 
+static std::vector<std::wstring> ExtractJsonObjectKeys(const std::wstring& json)
+{
+    std::vector<std::wstring> keys;
+    int objectDepth = 0;
+    bool inString = false;
+    bool escaped = false;
+
+    for (size_t index = 0; index < json.size(); ++index)
+    {
+        wchar_t ch = json[index];
+        if (inString)
+        {
+            if (escaped)
+            {
+                escaped = false;
+            }
+            else if (ch == L'\\')
+            {
+                escaped = true;
+            }
+            else if (ch == L'\"')
+            {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (ch == L'\"')
+        {
+            if (objectDepth == 1)
+            {
+                std::wstring key;
+                size_t next = index + 1;
+                if (!ParseJsonStringAt(json, index, &key, &next))
+                {
+                    break;
+                }
+
+                size_t probe = next;
+                while (probe < json.size() && iswspace(json[probe]) != 0)
+                {
+                    ++probe;
+                }
+
+                if (probe < json.size() && json[probe] == L':')
+                {
+                    keys.push_back(ToLower(key));
+                }
+
+                index = next - 1;
+                continue;
+            }
+
+            inString = true;
+            continue;
+        }
+
+        if (ch == L'{')
+        {
+            ++objectDepth;
+            continue;
+        }
+        if (ch == L'}')
+        {
+            --objectDepth;
+            if (objectDepth < 0)
+            {
+                break;
+            }
+            continue;
+        }
+    }
+
+    return keys;
+}
+
+static bool JsonKeyAllowed(const std::wstring& key, const std::vector<std::wstring>& allowed)
+{
+    bool found = false;
+
+    for (const std::wstring& candidate : allowed)
+    {
+        if (key == candidate)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    return found;
+}
+
+static bool ValidateJsonObjectKeys(
+    const std::wstring& json,
+    const std::vector<std::wstring>& allowed,
+    const std::wstring& context,
+    std::wstring* error)
+{
+    bool ok = true;
+    std::vector<std::wstring> keys = ExtractJsonObjectKeys(json);
+
+    for (const std::wstring& key : keys)
+    {
+        if (!JsonKeyAllowed(key, allowed))
+        {
+            ok = false;
+            if (error != nullptr)
+            {
+                *error = context + L" contains unsupported field: " + key;
+            }
+            break;
+        }
+    }
+
+    return ok;
+}
+
 static bool IsShutdownOrUnloadCommand(const std::wstring& command)
 {
     bool blocked = false;
@@ -17390,6 +18006,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!module" || command == L"!driver")
+            {
+                commandClass = L"integrity";
+                break;
+            }
+
             if (command == L"!pool")
             {
                 commandClass = L"pool";
@@ -17467,6 +18089,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"!nmi")
         {
             commandClass = L"nmi";
+            break;
+        }
+
+        if (command == L"!module" || command == L"!driver")
+        {
+            commandClass = L"integrity";
             break;
         }
 
@@ -18140,6 +18768,63 @@ static bool ValidateAiPlanArgumentShape(
                 {
                     *reason = L"!nmi scope must be callbacks";
                 }
+                break;
+            }
+        }
+        else if (command == L"!module" || command == L"!driver")
+        {
+            if (args.size() < 2 || ToLower(args[1]) != L"integrity")
+            {
+                if (reason != nullptr)
+                {
+                    *reason = command + L" scope must be integrity";
+                }
+                break;
+            }
+
+            size_t i = 2;
+            bool hasTarget = false;
+            bool shapeOk = true;
+            while (i < args.size())
+            {
+                std::wstring option = ToLower(args[i]);
+                if (option == L"/limit" || option == L"/json")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        if (reason != nullptr)
+                        {
+                            *reason = command + L" " + option + L" requires a value";
+                        }
+                        shapeOk = false;
+                        break;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if (IsSwitchLikeToken(args[i]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = command + L" supports only /limit and /json options";
+                    }
+                    shapeOk = false;
+                    break;
+                }
+                if (hasTarget)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = command + L" integrity accepts only one target filter";
+                    }
+                    shapeOk = false;
+                    break;
+                }
+                hasTarget = true;
+                ++i;
+            }
+            if (!shapeOk)
+            {
                 break;
             }
         }
@@ -21559,6 +22244,114 @@ static void PrintAiCapabilityProcessDescriptions(
     }
 }
 
+static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
+{
+    bool supported = false;
+
+    if (tool == L"process.find" ||
+        tool == L"process.describe" ||
+        tool == L"type.describe" ||
+        tool == L"callbacks.list" ||
+        tool == L"wfp.list" ||
+        tool == L"alpc.list" ||
+        tool == L"vad.list" ||
+        tool == L"threads.list" ||
+        tool == L"etw.integrity" ||
+        tool == L"nmi.list" ||
+        tool == L"pool.find" ||
+        tool == L"address.inspect" ||
+        tool == L"wnf.decode" ||
+        tool == L"wnf.list" ||
+        tool == L"ti.query" ||
+        tool == L"module.integrity" ||
+        tool == L"driver.integrity" ||
+        tool == L"assistant.answer")
+    {
+        supported = true;
+    }
+
+    return supported;
+}
+
+static bool ValidateAiCapabilityToolArgKeys(
+    const std::wstring& tool,
+    const std::wstring& argsJson,
+    std::wstring* error)
+{
+    std::vector<std::wstring> allowed;
+
+    if (tool == L"process.find")
+    {
+        allowed = {L"image", L"name", L"process", L"pid", L"eprocess"};
+    }
+    else if (tool == L"process.describe")
+    {
+        allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"fields"};
+    }
+    else if (tool == L"type.describe")
+    {
+        allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"address", L"type", L"fields"};
+    }
+    else if (tool == L"callbacks.list")
+    {
+        allowed = {L"scope", L"module", L"driver"};
+    }
+    else if (tool == L"wfp.list")
+    {
+        allowed = {L"scope", L"module", L"provider", L"layer"};
+    }
+    else if (tool == L"alpc.list")
+    {
+        allowed = {L"scope", L"name", L"pid"};
+    }
+    else if (tool == L"vad.list")
+    {
+        allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"exec", L"private", L"wx", L"pe", L"summary", L"limit"};
+    }
+    else if (tool == L"threads.list")
+    {
+        allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"apc", L"stacks", L"limit"};
+    }
+    else if (tool == L"etw.integrity" || tool == L"assistant.answer")
+    {
+        allowed = {};
+    }
+    else if (tool == L"nmi.list")
+    {
+        allowed = {L"scope"};
+    }
+    else if (tool == L"pool.find")
+    {
+        allowed = {L"tag", L"min", L"max", L"addr", L"address", L"limit", L"paged", L"annotate", L"wx"};
+    }
+    else if (tool == L"address.inspect")
+    {
+        allowed = {L"address", L"va", L"symbol"};
+    }
+    else if (tool == L"wnf.decode")
+    {
+        allowed = {L"hash", L"state", L"state_name"};
+    }
+    else if (tool == L"wnf.list")
+    {
+        allowed = {L"scope"};
+    }
+    else if (tool == L"ti.query")
+    {
+        allowed = {L"action", L"count", L"pid", L"task", L"pattern"};
+    }
+    else if (tool == L"module.integrity")
+    {
+        allowed = {L"module", L"name", L"target", L"limit"};
+    }
+    else if (tool == L"driver.integrity")
+    {
+        allowed = {L"driver", L"name", L"target", L"limit"};
+    }
+
+    return ValidateJsonObjectKeys(argsJson, allowed, tool + L" args", error);
+}
+
 static bool ParseAiCapabilityPlanResponse(
     const std::wstring& responseText,
     AiCapabilityPlan* plan,
@@ -21585,6 +22378,11 @@ static bool ParseAiCapabilityPlanResponse(
 
         AiCapabilityPlan parsed = {};
         parsed.RawResponse = responseText;
+        if (!ValidateJsonObjectKeys(json, {L"schema", L"summary", L"steps"}, L"AI capability plan", error))
+        {
+            break;
+        }
+
         ExtractJsonStringValue(json, L"schema", &parsed.Schema);
         ExtractJsonStringValue(json, L"summary", &parsed.Summary);
         if (parsed.Schema != L"kn-live-dbg.ai-capability-plan.v1")
@@ -21618,32 +22416,46 @@ static bool ParseAiCapabilityPlanResponse(
         for (const std::wstring& stepObject : stepObjects)
         {
             AiCapabilityStep step = {};
+            std::vector<std::wstring> stepKeys = ExtractJsonObjectKeys(stepObject);
+            if (!ValidateJsonObjectKeys(stepObject, {L"tool", L"capability", L"args"}, L"AI capability step", error))
+            {
+                parsed.Steps.clear();
+                break;
+            }
+
             ExtractJsonStringValue(stepObject, L"tool", &step.Tool);
             if (step.Tool.empty())
             {
                 ExtractJsonStringValue(stepObject, L"capability", &step.Tool);
             }
             step.Tool = ToLower(TrimWhitespace(step.Tool));
-            ExtractJsonObjectValue(stepObject, L"args", &step.ArgsJson);
+            bool hasArgsField = JsonKeyAllowed(L"args", stepKeys);
+            if (!ExtractJsonObjectValue(stepObject, L"args", &step.ArgsJson) && hasArgsField)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"AI capability step args must be a JSON object";
+                }
+                parsed.Steps.clear();
+                break;
+            }
             if (step.ArgsJson.empty())
             {
                 step.ArgsJson = L"{}";
             }
 
-            if (step.Tool != L"process.find" &&
-                step.Tool != L"process.describe" &&
-                step.Tool != L"type.describe" &&
-                step.Tool != L"callbacks.list" &&
-                step.Tool != L"wfp.list" &&
-                step.Tool != L"alpc.list" &&
-                step.Tool != L"vad.list" &&
-                step.Tool != L"threads.list" &&
-                step.Tool != L"assistant.answer")
+            if (!IsSupportedAiCapabilityTool(step.Tool))
             {
                 if (error != nullptr)
                 {
                     *error = L"unsupported AI capability tool: " + step.Tool;
                 }
+                parsed.Steps.clear();
+                break;
+            }
+
+            if (!ValidateAiCapabilityToolArgKeys(step.Tool, step.ArgsJson, error))
+            {
                 parsed.Steps.clear();
                 break;
             }
@@ -21671,7 +22483,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -21682,10 +22494,20 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- alpc.list: list ALPC ports discovered via Object Manager directory walk and CommunicationInfo links. Args: scope (ports,connections; defaults to ports), optional name substring, optional pid filter as decimal string.\n";
     stream << L"- vad.list: list target process VADs. Args: image, pid, eprocess, or source; optional booleans exec, private, wx, pe, summary; optional limit string.\n";
     stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
+    stream << L"- etw.integrity: check inline ETW GetCpuClock targets and suspicious callback redirects. Args: {}.\n";
+    stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
+    stream << L"- pool.find: find big pool entries. Args: optional tag, min, max, addr/address, limit strings; optional paged string any|nonpaged|paged; optional booleans annotate, wx. Use wx=true for W+X pool.\n";
+    stream << L"- address.inspect: inspect one virtual address or symbol. Args: address, va, or symbol string.\n";
+    stream << L"- wnf.decode: decode one WNF state-name hash. Args: hash, state, or state_name string.\n";
+    stream << L"- wnf.list: list live WNF data. Args: optional scope string instances, candidates, or lists; defaults to instances.\n";
+    stream << L"- ti.query: query the Threat Intelligence ring. Args: action recent|stats|by|grep; optional count, pid, task, pattern strings.\n";
+    stream << L"- module.integrity: inspect loaded module headers and executable section permissions. Args: optional module/name/target string and optional limit string.\n";
+    stream << L"- driver.integrity: inspect DRIVER_OBJECT dispatch targets. Args: optional driver/name/target string and optional limit string.\n";
     stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
     stream << L"Rules:\n";
     stream << L"- Use only these tools. Do not emit debugger commands.\n";
-    stream << L"- All scalar args must be JSON strings. Use fields as an array of strings.\n";
+    stream << L"- All scalar args must be JSON strings. Use fields as an array of strings. Do not invent fields.\n";
+    stream << L"- Never emit raw kd commands, nested ai commands, writes, unload/shutdown, session mutation, command chaining, or multiline content.\n";
     stream << L"- For image-name process questions, first use process.find with image, then describe or type.describe source \"$0\".\n";
     stream << L"- For PID/EPROCESS/DTB/PEB answers, prefer process.describe.\n";
     stream << L"- For full _EPROCESS layout at the found process, use type.describe with type \"nt!_EPROCESS\" and source \"$0\".\n";
@@ -21694,7 +22516,25 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For ALPC questions such as listing named ports or pairing csrss/lsass connections, use alpc.list with scope ports or connections and optional name/pid filters.\n";
     stream << L"- For executable private memory, W+X, PE-like VADs, or process memory region triage, use vad.list directly.\n";
     stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
+    stream << L"- For inline ETW hook questions, use etw.integrity.\n";
+    stream << L"- For NMI callback questions, use nmi.list.\n";
+    stream << L"- For W+X pool or suspicious big pool allocation questions, use pool.find with wx=true or explicit filters.\n";
+    stream << L"- For address suspicion or page permission questions, use address.inspect.\n";
+    stream << L"- For WNF decode questions, use wnf.decode; for live WNF instance/list questions, use wnf.list.\n";
+    stream << L"- For recent Microsoft-Windows-Threat-Intelligence events, use ti.query with recent/stats/by/grep.\n";
+    stream << L"- For driver dispatch integrity questions, use driver.integrity.\n";
+    stream << L"- For module text or executable section integrity questions, use module.integrity.\n";
     stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
+    stream << L"Examples:\n";
+    stream << L"- \"any inline ETW hook?\" => etw.integrity {}\n";
+    stream << L"- \"list NMI callbacks\" => nmi.list {\"scope\":\"callbacks\"}\n";
+    stream << L"- \"show W+X pool allocations\" => pool.find {\"wx\":\"true\",\"limit\":\"50\"}\n";
+    stream << L"- \"why is this address suspicious?\" => address.inspect {\"address\":\"<address>\"}\n";
+    stream << L"- \"decode this WNF state name\" => wnf.decode {\"hash\":\"<hash>\"}\n";
+    stream << L"- \"show live WNF instances\" => wnf.list {\"scope\":\"instances\"}\n";
+    stream << L"- \"query recent TI WriteVM events\" => ti.query {\"action\":\"grep\",\"pattern\":\"WriteVM\"}\n";
+    stream << L"- \"check driver dispatch integrity\" => driver.integrity {\"target\":\"all\"}\n";
+    stream << L"- \"inspect module text integrity\" => module.integrity {\"target\":\"all\"}\n";
     stream << L"Operator request:\n";
     stream << query << L"\n";
 
@@ -22617,6 +23457,701 @@ static bool ExecuteAiCapabilityThreadsList(
     return ok;
 }
 
+static bool ExtractAiCapabilityScalarAlias(
+    const std::wstring& argsJson,
+    const std::vector<std::wstring>& keys,
+    std::wstring* value)
+{
+    bool found = false;
+
+    do
+    {
+        if (value == nullptr)
+        {
+            break;
+        }
+
+        value->clear();
+        for (const std::wstring& key : keys)
+        {
+            std::wstring candidate;
+            if (ExtractJsonScalarValue(argsJson, key, &candidate) && !TrimWhitespace(candidate).empty())
+            {
+                *value = TrimWhitespace(candidate);
+                found = true;
+                break;
+            }
+        }
+    } while (false);
+
+    return found;
+}
+
+static bool ValidateAiCapabilityScalarText(
+    const std::wstring& value,
+    const std::wstring& label,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring unsafeReason;
+        if (ContainsUnsafeAiCommandCharacters(value, &unsafeReason) || IsHelpToken(value))
+        {
+            if (error != nullptr)
+            {
+                *error = unsafeReason.empty() ? L"invalid " + label + L" argument" : unsafeReason;
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityEtwIntegrity(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"etw.integrity requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!etw");
+        args.push_back(L"integrity");
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": etw.integrity\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleEtwCommand(args, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityNmiList(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring scope;
+        ExtractJsonStringValue(step.ArgsJson, L"scope", &scope);
+        scope = ToLower(TrimWhitespace(scope));
+        if (scope.empty())
+        {
+            scope = L"callbacks";
+        }
+        if (scope != L"callbacks")
+        {
+            if (error != nullptr)
+            {
+                *error = L"nmi.list scope must be callbacks";
+            }
+            break;
+        }
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"nmi.list requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!nmi");
+        args.push_back(L"callbacks");
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": nmi.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleNmiCommand(args, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityPoolFind(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::vector<std::wstring> args;
+        args.push_back(L"!pool");
+        args.push_back(L"find");
+
+        bool hasFilter = false;
+        bool parseFailed = false;
+
+        std::wstring tag;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"tag"}, &tag))
+        {
+            if (!ValidateAiCapabilityScalarText(tag, L"pool tag", error))
+            {
+                break;
+            }
+            uint32_t tagValue = 0;
+            if (!ParsePoolTagText(tag, &tagValue))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"pool.find tag must be a 1..4 byte printable pool tag";
+                }
+                break;
+            }
+            args.push_back(L"/tag");
+            args.push_back(tag);
+            hasFilter = true;
+        }
+
+        const std::vector<std::pair<std::wstring, std::wstring>> numericOptions =
+        {
+            {L"min", L"/min"},
+            {L"max", L"/max"},
+            {L"addr", L"/addr"},
+            {L"address", L"/addr"}
+        };
+
+        bool hasAddress = false;
+        for (const std::pair<std::wstring, std::wstring>& item : numericOptions)
+        {
+            if (item.first == L"address" && hasAddress)
+            {
+                continue;
+            }
+
+            std::wstring value;
+            if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {item.first}, &value))
+            {
+                continue;
+            }
+            if (!ValidateAiCapabilityScalarText(value, item.first, error))
+            {
+                parseFailed = true;
+                break;
+            }
+            uint64_t parsed = 0;
+            if (!ParseUnsigned(value, state.NumberBase, &parsed))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"pool.find " + item.first + L" must be numeric";
+                }
+                parseFailed = true;
+                break;
+            }
+            args.push_back(item.second);
+            args.push_back(value);
+            hasFilter = true;
+            if (item.first == L"addr" || item.first == L"address")
+            {
+                hasAddress = true;
+            }
+        }
+
+        if (parseFailed)
+        {
+            break;
+        }
+
+        std::wstring paged;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"paged"}, &paged))
+        {
+            paged = ToLower(TrimWhitespace(paged));
+            if (paged == L"any" || paged == L"all")
+            {
+                args.push_back(L"/any");
+            }
+            else if (paged == L"paged" || paged == L"true")
+            {
+                args.push_back(L"/paged");
+            }
+            else if (paged == L"nonpaged" || paged == L"false")
+            {
+                args.push_back(L"/nonpaged");
+            }
+            else
+            {
+                if (error != nullptr)
+                {
+                    *error = L"pool.find paged must be any, paged, or nonpaged";
+                }
+                break;
+            }
+        }
+
+        bool annotate = false;
+        bool wx = false;
+        if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"annotate", &annotate, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"wx", &wx, error))
+        {
+            break;
+        }
+        if (wx)
+        {
+            if (!device.IsOpen())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"pool.find wx requires the KnLiveDbg.sys driver device to be open";
+                }
+                break;
+            }
+            args.push_back(L"/wx");
+            hasFilter = true;
+        }
+        else if (annotate)
+        {
+            if (!device.IsOpen())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"pool.find annotate requires the KnLiveDbg.sys driver device to be open";
+                }
+                break;
+            }
+            args.push_back(L"/annotate");
+        }
+
+        if (!AppendAiCapabilityLimitOption(step.ArgsJson, state, &args, error))
+        {
+            break;
+        }
+
+        if (!hasFilter)
+        {
+            if (error != nullptr)
+            {
+                *error = L"pool.find requires tag, addr, min, max, or wx";
+            }
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": pool.find\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandlePoolCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityAddressInspect(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"address.inspect requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &address))
+        {
+            if (error != nullptr)
+            {
+                *error = L"address.inspect requires address, va, or symbol";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"address", error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!address");
+        args.push_back(address);
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": address.inspect\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleAddressCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityWnfDecode(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring hash;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"hash", L"state", L"state_name"}, &hash))
+        {
+            if (error != nullptr)
+            {
+                *error = L"wnf.decode requires hash, state, or state_name";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(hash, L"wnf hash", error))
+        {
+            break;
+        }
+        uint64_t parsed = 0;
+        if (!ParseUnsigned(hash, state.NumberBase, &parsed))
+        {
+            if (error != nullptr)
+            {
+                *error = L"wnf.decode hash must be numeric";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!wnf");
+        args.push_back(L"decode");
+        args.push_back(hash);
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": wnf.decode\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleWnfCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityWnfList(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"wnf.list requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring scope;
+        ExtractJsonStringValue(step.ArgsJson, L"scope", &scope);
+        scope = ToLower(TrimWhitespace(scope));
+        if (scope.empty())
+        {
+            scope = L"instances";
+        }
+        if (scope != L"instances" && scope != L"candidates" && scope != L"lists")
+        {
+            if (error != nullptr)
+            {
+                *error = L"wnf.list scope must be instances, candidates, or lists";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!wnf");
+        args.push_back(scope);
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": wnf.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleWnfCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityTiQuery(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring action;
+        ExtractJsonStringValue(step.ArgsJson, L"action", &action);
+        action = ToLower(TrimWhitespace(action));
+
+        std::wstring pattern;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pattern"}, &pattern);
+        std::wstring pidText;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pid"}, &pidText);
+        std::wstring task;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"task"}, &task);
+        std::wstring count;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"count"}, &count);
+
+        if (action.empty())
+        {
+            if (!pattern.empty())
+            {
+                action = L"grep";
+            }
+            else if (!pidText.empty() || !task.empty())
+            {
+                action = L"by";
+            }
+            else
+            {
+                action = L"recent";
+            }
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!ti");
+
+        if (action == L"recent")
+        {
+            args.push_back(L"recent");
+            if (!count.empty())
+            {
+                uint64_t parsed = 0;
+                if (!ValidateAiCapabilityScalarText(count, L"ti count", error) ||
+                    !ParseUnsigned(count, 10, &parsed) ||
+                    parsed == 0)
+                {
+                    if (error != nullptr && error->empty())
+                    {
+                        *error = L"ti.query count must be a positive decimal number";
+                    }
+                    break;
+                }
+                args.push_back(count);
+            }
+        }
+        else if (action == L"stats")
+        {
+            args.push_back(L"stats");
+        }
+        else if (action == L"by")
+        {
+            args.push_back(L"by");
+            if (!pidText.empty())
+            {
+                uint64_t parsed = 0;
+                if (!ValidateAiCapabilityScalarText(pidText, L"ti pid", error) ||
+                    !ParseUnsigned(pidText, 0, &parsed) ||
+                    parsed == 0 ||
+                    parsed > 0xffffffffull)
+                {
+                    if (error != nullptr && error->empty())
+                    {
+                        *error = L"ti.query pid must be a valid process id";
+                    }
+                    break;
+                }
+                args.push_back(L"pid");
+                args.push_back(pidText);
+            }
+            else if (!task.empty())
+            {
+                if (!ValidateAiCapabilityScalarText(task, L"ti task", error))
+                {
+                    break;
+                }
+                args.push_back(L"task");
+                args.push_back(task);
+            }
+            else
+            {
+                if (error != nullptr)
+                {
+                    *error = L"ti.query action by requires pid or task";
+                }
+                break;
+            }
+        }
+        else if (action == L"grep")
+        {
+            if (pattern.empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"ti.query action grep requires pattern";
+                }
+                break;
+            }
+            if (!ValidateAiCapabilityScalarText(pattern, L"ti pattern", error))
+            {
+                break;
+            }
+            args.push_back(L"grep");
+            args.push_back(pattern);
+        }
+        else
+        {
+            if (error != nullptr)
+            {
+                *error = L"ti.query action must be recent, stats, by, or grep";
+            }
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": ti.query\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleTiCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityModuleIntegrity(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"module.integrity requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring target;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"module", L"name", L"target"}, &target);
+        if (!target.empty() && !ValidateAiCapabilityScalarText(target, L"module target", error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!module");
+        args.push_back(L"integrity");
+        if (!target.empty())
+        {
+            args.push_back(target);
+        }
+        if (!AppendAiCapabilityLimitOption(step.ArgsJson, state, &args, error))
+        {
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": module.integrity\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleModuleIntegrityCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityDriverIntegrity(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver.integrity requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring target;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"driver", L"name", L"target"}, &target);
+        if (!target.empty() && !ValidateAiCapabilityScalarText(target, L"driver target", error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!driver");
+        args.push_back(L"integrity");
+        if (!target.empty())
+        {
+            args.push_back(target);
+        }
+        if (!AppendAiCapabilityLimitOption(step.ArgsJson, state, &args, error))
+        {
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": driver.integrity\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleDriverIntegrityCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ExecuteAiCapabilityPlan(
     const AiCapabilityPlan& plan,
     DebuggerState& state,
@@ -22671,6 +24206,42 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"threads.list")
             {
                 stepOk = ExecuteAiCapabilityThreadsList(step, results, state, device, symbols, &result, error);
+            }
+            else if (step.Tool == L"etw.integrity")
+            {
+                stepOk = ExecuteAiCapabilityEtwIntegrity(step, device, symbols, error);
+            }
+            else if (step.Tool == L"nmi.list")
+            {
+                stepOk = ExecuteAiCapabilityNmiList(step, device, symbols, error);
+            }
+            else if (step.Tool == L"pool.find")
+            {
+                stepOk = ExecuteAiCapabilityPoolFind(step, state, device, symbols, error);
+            }
+            else if (step.Tool == L"address.inspect")
+            {
+                stepOk = ExecuteAiCapabilityAddressInspect(step, state, device, symbols, error);
+            }
+            else if (step.Tool == L"wnf.decode")
+            {
+                stepOk = ExecuteAiCapabilityWnfDecode(step, state, device, symbols, error);
+            }
+            else if (step.Tool == L"wnf.list")
+            {
+                stepOk = ExecuteAiCapabilityWnfList(step, state, device, symbols, error);
+            }
+            else if (step.Tool == L"ti.query")
+            {
+                stepOk = ExecuteAiCapabilityTiQuery(step, state, device, symbols, error);
+            }
+            else if (step.Tool == L"module.integrity")
+            {
+                stepOk = ExecuteAiCapabilityModuleIntegrity(step, state, device, symbols, error);
+            }
+            else if (step.Tool == L"driver.integrity")
+            {
+                stepOk = ExecuteAiCapabilityDriverIntegrity(step, state, device, symbols, error);
             }
             else if (step.Tool == L"assistant.answer")
             {
@@ -23917,6 +25488,14 @@ static bool HandleCommand(
         else if (command == L"!nmi")
         {
             HandleNmiCommand(args, device, symbols);
+        }
+        else if (command == L"!module")
+        {
+            HandleModuleIntegrityCommand(args, state, device, symbols);
+        }
+        else if (command == L"!driver")
+        {
+            HandleDriverIntegrityCommand(args, state, device, symbols);
         }
         else if (command == L"!pool")
         {

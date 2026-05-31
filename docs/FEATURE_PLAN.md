@@ -68,6 +68,11 @@ Operational value:
 
 Add native `!driver`, `!drvobj`, and `!devstack` commands.
 
+Status: initial dispatch-integrity slice is implemented as
+`!driver integrity [driver|all] [/limit <n>] [/json <path>]` and exposed to
+the AI router as `driver.integrity`. Remaining work is the richer `list`,
+`object`, `!drvobj`, and `!devstack` surface.
+
 Target shape:
 
 ```text
@@ -189,7 +194,12 @@ Operational value:
 Expose more existing native scanners through the strict read-only AI tool
 router.
 
-Candidate tools:
+Status: implemented. The strict `kn-live-dbg.ai-capability-plan.v1` router now
+accepts the expanded read-only catalog, rejects unknown tools and per-tool
+unknown args, and dispatches every selected tool through validated local native
+handlers instead of raw debugger command generation.
+
+Implemented tools:
 
 ```text
 etw.integrity
@@ -213,6 +223,7 @@ Implementation notes:
 3. Return local tool evidence first, then optionally ask the provider to
    explain the evidence.
 4. Prefer structured local execution over natural-language keyword rules.
+5. Use `assistant.answer` only when no local read-only tool fits.
 
 Operational value:
 
@@ -253,10 +264,16 @@ Operational value:
 
 Add a driver/module live-image integrity view.
 
+Status: initial live-memory slice is implemented as
+`!module integrity [module|all] [/limit <n>] [/json <path>]` and exposed to the
+AI router as `module.integrity`. It validates PE headers, section metadata, and
+effective executable-section page permissions. Disk/live hashing, IAT checks,
+and prologue-trampoline scanning remain future hardening.
+
 Target shape:
 
 ```text
-!module integrity [module|all] [/headers] [/sections] [/text] [/iat] [/json <path>]
+!module integrity [module|all] [/limit <n>] [/json <path>]
 ```
 
 Implementation notes:
