@@ -16,11 +16,34 @@ struct ModuleIntegritySectionRecord
     uint32_t Characteristics = 0;
     bool Executable = false;
     bool Writable = false;
+    bool Readable = false;
+    bool RangeValid = true;
+    bool OverlapsPrevious = false;
+    bool FirstPageQueried = false;
+    bool FirstPageQueryFailed = false;
+    bool FirstPageReadable = false;
+    bool FirstPageWritable = false;
+    bool FirstPageExecutable = false;
+    bool FirstPageLargePage = false;
+    uint32_t FirstPagePagingLevels = 0;
+    bool LastPageQueried = false;
+    bool LastPageQueryFailed = false;
+    bool LastPageReadable = false;
+    bool LastPageWritable = false;
+    bool LastPageExecutable = false;
+    bool LastPageLargePage = false;
+    uint32_t LastPagePagingLevels = 0;
     bool PageAttributesQueried = false;
+    bool PageAttributeQueryFailed = false;
+    bool EffectiveReadable = false;
     bool EffectiveWritable = false;
     bool EffectiveExecutable = false;
     bool Suspicious = false;
+    bool WxEvidence = false;
+    bool MismatchEvidence = false;
+    std::wstring PageAttributeError;
     std::wstring Notes;
+    std::vector<std::wstring> ReasonCodes;
 };
 
 struct ModuleIntegrityRecord
@@ -30,13 +53,27 @@ struct ModuleIntegrityRecord
     uint64_t Base = 0;
     uint32_t Size = 0;
     uint32_t SizeOfImage = 0;
+    uint32_t SizeOfHeaders = 0;
+    uint32_t SectionAlignment = 0;
+    uint32_t FileAlignment = 0;
+    uint32_t NumberOfRvaAndSizes = 0;
+    uint64_t PreferredImageBase = 0;
+    uint16_t Machine = 0;
+    uint16_t OptionalHeaderMagic = 0;
     uint16_t NumberOfSections = 0;
     bool HeaderRead = false;
     bool MzOk = false;
     bool PeOk = false;
+    bool OptionalHeaderOk = false;
+    bool SectionTableOk = false;
     bool SizeMismatch = false;
+    bool ImageBaseMismatch = false;
     bool Suspicious = false;
+    bool WxEvidence = false;
+    bool MismatchEvidence = false;
     std::wstring Notes;
+    std::vector<std::wstring> ReasonCodes;
+    std::vector<std::wstring> InfoCodes;
     std::vector<ModuleIntegritySectionRecord> Sections;
 };
 
@@ -44,6 +81,12 @@ struct ModuleIntegrityOptions
 {
     std::wstring ModuleFilter;
     uint32_t Limit = 0;
+    bool SummaryOnly = false;
+    bool Verbose = false;
+    bool IncludeHeaders = false;
+    bool IncludeSections = false;
+    bool WxOnly = false;
+    bool MismatchOnly = false;
 };
 
 struct ModuleIntegrityResult
@@ -52,7 +95,10 @@ struct ModuleIntegrityResult
     std::vector<std::wstring> Warnings;
     uint64_t ModulesScanned = 0;
     uint64_t MatchingModules = 0;
+    uint64_t ReportedModules = 0;
     uint64_t SuspiciousModules = 0;
+    uint64_t WxModules = 0;
+    uint64_t MismatchModules = 0;
     bool Truncated = false;
 };
 
