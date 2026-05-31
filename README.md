@@ -71,8 +71,8 @@ kn-live-dbg/
 
 - `docs/ARCHITECTURE.md` describes the driver/user split and backend routing.
 - `docs/WINDBG_COMMAND_COVERAGE.md` tracks native and DbgEng-routed WinDbg command coverage.
-- `docs/AI_ASSISTED_WORKFLOWS.md` captures planned AI-assisted command planning, callback analysis, `dt` interpretation, disassembly annotation, write safety, playbooks, and session reporting.
-- `docs/FEATURE_PLAN.md` tracks proposed high-value feature work such as snapshots/diffs, driver-object integrity, VAD/thread triage, WNF stabilization, AI capability expansion, WFP kernel callout resolution, module integrity, and probe fixtures.
+- `docs/AI_ASSISTED_WORKFLOWS.md` documents the implemented AI intent router, evidence analysis, command planning, write safety, playbooks, reporting, and operator examples.
+- `docs/FEATURE_PLAN.md` tracks completed feature slices and remaining high-value work such as snapshots/diffs, richer driver-object/device-stack inspection, WNF stabilization, WFP kernel callout resolution, and probe fixtures.
 
 ## Build
 
@@ -205,7 +205,7 @@ pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged
 set-ppl-antimalware [on|off|status]
 !ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]
 !ti stop | status | watch | recent [N] | stats | by pid <PID> | by task <name> | grep <pattern> | save <path> | clear | add /pid|/name <v> | remove /pid|/name <v>
-!wnf [decode <hash>|instances|instance <hash>|data <hash>|candidates|lists]
+!wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 ai <question>
 ai status
 ai config [status|providers|provider|policy|model|base-url|effort|auth|test]
@@ -665,8 +665,8 @@ Discovery is the entire point: any `!etw` GetCpuClock hit outside loaded modules
 ```text
 !wnf decode <state-name-hash>
 !wnf instances
-!wnf instance <state-name-hash>
-!wnf data <state-name-hash>
+!wnf instance <state-name-hash|entry-address>
+!wnf data <state-name-hash|entry-address>
 ```
 
 Decoder (`!wnf decode`):
@@ -680,7 +680,7 @@ Live walking (`!wnf instances` / `!wnf instance` / `!wnf data`):
 1. The scanner collects silo state candidates by trying the well-known globals `nt!ExpWnfSiloState`, `nt!ExpWnfState`, and `nt!ExpWnfProcess` first, then falling back to anchor-disassembly of `nt!NtQueryWnfStateData` and `nt!NtPublishWnfStateData` with two levels of indirect-call follow and dual interpretation (treat each RIP-relative reference as both a pointer dereference and an inline struct). The union of those candidates feeds both walking modes.
 2. **Modern Win11 fast path (LIST_ENTRY heuristic walker)** runs first: for each silo candidate the scanner enumerates `LIST_ENTRY`-shaped heads in the first 0x800 bytes, walks every non-empty chain (bounded at 0x80 entries per list, 0x80 bytes captured per entry), and ranks each list by the number of UNIQUE state-name-shaped 64-bit values it yields after per-entry probe of byte offsets `0x10`..`0x38`. Kernel-canonical pointers and pure-zero slots are rejected explicitly to avoid sentinel/object-pointer pollution. The single most-diverse list is treated as the authoritative `_WNF_NAME_INSTANCE` chain; runner-up lists are surfaced as diagnostics so an operator can spot when the top-1 selection was wrong.
 3. **Legacy `RTL_AVL_TABLE` path** is tried only when the LIST_ENTRY walker produces no records. The AVL table is located by trying `NameSet`/`NameSubscriptionTable`/`SubscriptionTable`/`NameInstanceTable`/`NameInstances` fields on `nt!_WNF_SUBSCRIPTION_TABLE`, `nt!_WNF_SILODRIVERSTATE`, and `nt!_WNF_PROCESS_CONTEXT` types from the loaded PDB. The walker performs iterative in-order traversal with bounded depth (64) and node count (16384). Each node's user data starts at offset `+0x20` (past `sizeof(_RTL_BALANCED_LINKS)`); the user data is a `_WNF_NAME_INSTANCE` whose `StateName`, `ChangeStamp`, `DataSize`, and `LastDataBlock` (or `StateData`/`DataBlock`) fields are read via PDB-resolved offsets.
-4. `instance <hash>` filters the walk to the single matching state name; `data <hash>` additionally follows `LastDataBlock` to the `WNF_STATE_DATA` descriptor and tries buffer offsets `0x10`/`0x18`/`0x20`/`0x00` to dump up to 256 bytes of the last-published payload as a classic hex+ASCII view. The data dump path currently only fires from the legacy AVL walker, since LIST_ENTRY mode does not yet resolve per-build `ChangeStamp`/`DataSize`/`LastDataBlock` offsets inside each `_WNF_NAME_INSTANCE`.
+4. `instance <hash|entry-address>` filters the walk to a matching state name or stable LIST_ENTRY-mode entry address. `data <hash|entry-address>` dumps up to 256 bytes of the last-published payload as a classic hex+ASCII view. The legacy AVL path follows PDB-resolved `LastDataBlock`/`StateData` fields, while the modern LIST_ENTRY path heuristically scans the first 0x200 bytes of the matched entry for a kernel-canonical pointer whose dereferenced header matches the documented `_WNF_DATA_BLOCK` shape (`DataSize`, `AllocatedSize`, `ChangeStamp`). If that heuristic fails, diagnostics print a per-pointer header census so the build-specific data slot can be inspected manually.
 5. Each surfaced entry annotates the **owning process** recovered from the stable EPROCESS pointer at `node-0x30` of every chained node (entry-level metadata, 100% recovery across entries that carry at least one chained node). Per-entry chain decomposition is printed as `chained_nodes=N subscribers=X resolved=Y other_objects=Z tags={Ntfc:N Wnf:N Sect:N ...}` so an operator immediately sees how many real subscribers exist versus backing kernel objects. The `subscribers` count counts only true subscription tags (`Ntfc` / `Wnf ` / `WnfN`); `resolved` counts how many of any node yielded `pid=N image="..."`. The listing path (`!wnf instances`) emits only resolved subscriber lines per entry; single-entry views (`!wnf instance`, `!wnf data`) still print every node with prefix and body hex dumps so a build's record layout can be characterized. EPROCESS resolution uses a two-path acceptance: classical `_DISPATCHER_HEADER.Type == 0x03` fast-path, or shape-only validation of PDB-resolved `_EPROCESS.UniqueProcessId` (4-aligned, `0 < pid <= 0x100000`) AND `ImageFileName` (`>= 3` printable-ASCII chars). Candidates within `0x200` bytes of the chained node are rejected as same-chunk noise.
 6. `log enable` / `log disable` mirrors the entire console session to a timestamped UTF-8 log file (`KnLiveDbg-YYYYMMDD-HHMMSS.log`) in the EXE directory. Useful for capturing voluminous `!wnf instances` output for offline analysis; console coloring is preserved live while the log file receives clean text.
 

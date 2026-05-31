@@ -1,6 +1,6 @@
 # AI-Assisted Workflows
 
-This document captures implementation ideas for adding AI assistance to Kn Live Dbg. The goal is not to turn the tool into an autonomous kernel editor. The useful direction is an operator assistant that explains live kernel state, proposes commands, highlights risk, and produces repeatable investigation records.
+This document captures the implemented AI assistance surface in Kn Live Dbg plus the remaining guardrails for future work. The goal is not to turn the tool into an autonomous kernel editor. The useful direction is an operator assistant that explains live kernel state, proposes commands, highlights risk, and produces repeatable investigation records.
 
 ## Design Principles
 
@@ -187,7 +187,7 @@ ai show
 ai report .\reports\session-ai.md
 ```
 
-## Candidate Features
+## Implemented AI Features
 
 ### Natural-Language Operator Entry
 
@@ -340,16 +340,17 @@ Each playbook has a dry-run mode that prints the planned command sequence before
 
 ### Session Report Generation
 
-Generate Markdown or JSONL reports from an operator session:
+Implemented entrypoint: `ai report <path>`.
 
-1. Commands executed, backend used, and timestamps.
-2. Driver load/unload and write mode transitions.
-3. Symbol path, module baseline, and Windows build information.
-4. Callback records and analysis annotations.
-5. Write operations with before/after evidence.
-6. Errors, partial reads, failed symbol lookups, and fallback paths.
+The report command generates a Markdown summary from the current AI session:
 
-The report format should be stable enough to compare sessions across Windows builds and machines.
+1. Session context, backend/provider state, and selected model.
+2. Transcript and write-audit paths when enabled.
+3. The current parsed command plan, including command purpose, risk, backend expectation, and expected output.
+4. The raw AI plan response when one exists.
+5. Operator follow-up context needed to reproduce the AI-assisted investigation.
+
+Command stdout/stderr evidence is captured in JSONL by `ai transcript <path>` rather than embedded wholesale in the Markdown report. Write operations are captured separately by `ai audit <path>` and summarized by the report through the configured audit path.
 
 ## Suggested Implementation Order
 

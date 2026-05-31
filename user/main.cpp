@@ -3115,12 +3115,61 @@ static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidate
         L"status",
         L"help",
         L"config",
+        L"providers",
+        L"provider",
+        L"policy",
+        L"model",
+        L"base-url",
+        L"effort",
+        L"auth",
+        L"preview",
+        L"ask",
         L"plan",
         L"run",
         L"write",
         L"explain",
+        L"analyze",
+        L"annotate",
+        L"diagnose",
+        L"playbook",
+        L"transcript",
+        L"audit",
         L"show",
         L"report"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
+static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"callbacks",
+        L"dt",
+        L"dtx",
+        L"u",
+        L"uf",
+        L"ln",
+        L"lm",
+        L"x",
+        L"vtop",
+        L"!dml_proc",
+        L"!vad",
+        L"!threads",
+        L"!wfp",
+        L"!alpc",
+        L"!vbs",
+        L"!ci",
+        L"!securekernel",
+        L"!etw",
+        L"!nmi",
+        L"!module",
+        L"!driver",
+        L"!pool",
+        L"!address",
+        L"!wnf",
+        L"help"
     };
 
     AddCompletionCandidates(candidates, values);
@@ -3267,13 +3316,7 @@ static void AddAiCompletionCandidates(
         {
             if (argsBefore.size() == 2)
             {
-                static const wchar_t* values[] =
-                {
-                    L"callbacks",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
+                AddAiEvidenceCommandCompletionCandidates(candidates);
             }
             else if (ToLower(argsBefore[2]) == L"callbacks")
             {
@@ -3291,19 +3334,7 @@ static void AddAiCompletionCandidates(
         {
             if (argsBefore.size() == 2)
             {
-                static const wchar_t* values[] =
-                {
-                    L"callbacks",
-                    L"dt",
-                    L"dtx",
-                    L"u",
-                    L"uf",
-                    L"lm",
-                    L"!dml_proc",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
+                AddAiEvidenceCommandCompletionCandidates(candidates);
             }
             else if (ToLower(argsBefore[2]) == L"callbacks")
             {
@@ -14740,23 +14771,23 @@ static void PrintWnfHelp()
     std::wcout << L"!wnf command:\n";
     std::wcout << L"  !wnf decode <state-name-hash>\n";
     std::wcout << L"  !wnf instances\n";
-    std::wcout << L"  !wnf instance <state-name-hash>\n";
-    std::wcout << L"  !wnf data <state-name-hash>\n";
+    std::wcout << L"  !wnf instance <state-name-hash|entry-address>\n";
+    std::wcout << L"  !wnf data <state-name-hash|entry-address>\n";
     std::wcout << L"  !wnf candidates\n";
     std::wcout << L"  !wnf lists\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
     std::wcout << L"  decode     XOR the 64-bit raw state name against 0x41C64E6DA3BC0074 and parse Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields\n";
-    std::wcout << L"  instances  walk the live WNF subscription AVL tree from nt!ExpWnfSiloState and decode every _WNF_NAME_INSTANCE found\n";
-    std::wcout << L"  instance   walk and filter by the supplied 64-bit hash, printing the matching instance only\n";
+    std::wcout << L"  instances  walk live WNF instances through the modern LIST_ENTRY heuristic first, then legacy RTL_AVL_TABLE fallback\n";
+    std::wcout << L"  instance   walk and filter by the supplied 64-bit state name or LIST_ENTRY-mode entry address\n";
     std::wcout << L"  data       walk to the matching instance and dump up to 256 bytes of its last-published WNF_STATE_DATA payload\n";
-    std::wcout << L"  candidates anchor-disassembly-only diagnostic: dump every silo-state candidate found in the WNF entry-point functions plus the first 256 bytes at each, with kernel-pointer and state-name-shaped slot counts. Use this to manually inspect the WNF data structure on builds where automatic AVL detection fails.\n";
+    std::wcout << L"  candidates anchor-disassembly diagnostic: dump every silo-state candidate found in the WNF entry-point functions plus the first 256 bytes at each, with kernel-pointer and state-name-shaped slot counts.\n";
     std::wcout << L"  lists      scan every silo candidate for LIST_ENTRY-shaped doubly-linked-list heads (modern Windows replaces RTL_AVL_TABLE for WNF subscription tracking with LIST_ENTRYs). Walks each non-empty chain and dumps the first 0x80 bytes per entry plus any state-name-shaped 64-bit value found within.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  decode is standalone and always works on any build.\n";
-    std::wcout << L"  Live walking requires the kernel PDB to expose nt!ExpWnfSiloState (or alias) plus _WNF_NAME_INSTANCE.StateName field and an AVL-table field on _WNF_SUBSCRIPTION_TABLE/_WNF_SILODRIVERSTATE/_WNF_PROCESS_CONTEXT. When any of those is missing the scanner reports a clear error and the decode subcommand still works.\n";
-    std::wcout << L"  Hash arguments accept hex (0x...) or decimal forms.\n";
+    std::wcout << L"  LIST_ENTRY mode accepts stable entry addresses from !wnf instances and probes matched entries for _WNF_DATA_BLOCK pointers. Legacy AVL mode uses PDB-resolved WNF fields when available.\n";
+    std::wcout << L"  Arguments accept hex (0x...) or decimal forms.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !wnf decode 0x41c64e6da3bc0075\n";
@@ -15336,7 +15367,7 @@ static void HandleWnfCommand(
             }
             else
             {
-                std::wcerr << L"usage: !wnf [decode|instances|instance|data] [hash]\n";
+                std::wcerr << L"usage: !wnf [decode|instances|instance|data|candidates|lists] [hash|entry-address]\n";
                 PrintWnfHelp();
                 break;
             }
@@ -15350,14 +15381,14 @@ static void HandleWnfCommand(
         {
             if (index >= args.size())
             {
-                std::wcerr << L"!wnf " << args[1] << L" requires a 64-bit state-name hash\n";
+                std::wcerr << L"!wnf " << args[1] << L" requires a 64-bit state-name hash or LIST_ENTRY-mode entry address\n";
                 break;
             }
 
             uint64_t parsed = 0;
             if (!ParseUnsigned(args[index], state.NumberBase, &parsed))
             {
-                std::wcerr << L"!wnf: failed to parse hash \"" << args[index] << L"\"\n";
+                std::wcerr << L"!wnf: failed to parse hash/address \"" << args[index] << L"\"\n";
                 break;
             }
             options.TargetHash = parsed;
@@ -16156,6 +16187,7 @@ static void PrintAiHelp()
     std::wcout << L"  run          execute planned read-only commands\n";
     std::wcout << L"  write        preview or confirm a planned write-like command\n";
     std::wcout << L"  explain      explicitly run a read-only command and ask AI to explain the output\n";
+    std::wcout << L"  analyze      explicitly run a read-only command and ask AI for an analysis report\n";
     std::wcout << L"  show         show the loaded AI plan\n";
     std::wcout << L"  report       write a session report\n";
     std::wcout << L"\n";
@@ -16168,6 +16200,8 @@ static void PrintAiHelp()
     std::wcout << L"  ai uf nt!PspCreateProcessNotifyRoutine 128\n";
     std::wcout << L"  ai check VBS status\n";
     std::wcout << L"  ai !ci options\n";
+    std::wcout << L"  ai explain !module integrity all /summary\n";
+    std::wcout << L"  ai analyze !wnf candidates\n";
     std::wcout << L"  ai config provider openrouter\n";
     std::wcout << L"  ai config test\n";
     std::wcout << L"\n";
@@ -16266,9 +16300,11 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     else if (name == L"analyze")
     {
         std::wcout << L"ai analyze:\n";
+        std::wcout << L"  ai analyze <read-only-command...>\n";
         std::wcout << L"  ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
         std::wcout << L"  ai analyze callbacks [scope] /module <module>\n";
-        std::wcout << L"  Runs the callback scan, captures output, and asks AI for an analysis report.\n";
+        std::wcout << L"  Runs a read-only evidence command and asks AI for an analysis report.\n";
+        std::wcout << L"  Callback analysis remains available for compatibility.\n";
     }
     else if (name == L"explain")
     {
@@ -16278,6 +16314,8 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai explain dt <dt-args...>\n";
         std::wcout << L"  ai explain dtx <dtx-args...>\n";
         std::wcout << L"  ai explain <u|uf> <address|symbol> [instruction-count]\n";
+        std::wcout << L"  ai explain !module integrity all /summary\n";
+        std::wcout << L"  ai explain !wnf data <state-name-hash|entry-address>\n";
         std::wcout << L"  Runs a read-only evidence command and asks AI to explain fields, callbacks, or disassembly.\n";
     }
     else if (name == L"annotate")
@@ -19024,6 +19062,17 @@ static bool ValidateAiPlanArgumentShape(
             while (i < args.size())
             {
                 std::wstring option = ToLower(args[i]);
+                if (command == L"!module" &&
+                    (option == L"/summary" ||
+                     option == L"/verbose" ||
+                     option == L"/headers" ||
+                     option == L"/sections" ||
+                     option == L"/wx" ||
+                     option == L"/mismatch"))
+                {
+                    ++i;
+                    continue;
+                }
                 if (option == L"/limit" || option == L"/json")
                 {
                     if (i + 1 >= args.size())
@@ -19042,7 +19091,14 @@ static bool ValidateAiPlanArgumentShape(
                 {
                     if (reason != nullptr)
                     {
-                        *reason = command + L" supports only /limit and /json options";
+                        if (command == L"!module")
+                        {
+                            *reason = command + L" supports /summary, /verbose, /headers, /sections, /wx, /mismatch, /limit, and /json options";
+                        }
+                        else
+                        {
+                            *reason = command + L" supports only /limit and /json options";
+                        }
                     }
                     shapeOk = false;
                     break;
@@ -19093,7 +19149,7 @@ static bool ValidateAiPlanArgumentShape(
                 {
                     if (reason != nullptr)
                     {
-                        *reason = L"!wnf scope must be decode, instances, instance, or data";
+                        *reason = L"!wnf scope must be decode, instances, instance, data, candidates, or lists";
                     }
                     break;
                 }
@@ -19118,7 +19174,7 @@ static bool ValidateAiPlanArgumentShape(
                     {
                         if (reason != nullptr)
                         {
-                            *reason = L"!wnf " + scope + L" requires a hash argument";
+                            *reason = L"!wnf " + scope + L" requires a hash/address argument";
                         }
                         break;
                     }
@@ -19128,7 +19184,7 @@ static bool ValidateAiPlanArgumentShape(
                 {
                     if (reason != nullptr)
                     {
-                        *reason = L"!wnf takes no extra arguments after the hash";
+                        *reason = L"!wnf takes no extra arguments after the hash/address";
                     }
                     break;
                 }

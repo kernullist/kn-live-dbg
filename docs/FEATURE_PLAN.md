@@ -1,20 +1,27 @@
 # Feature Plan
 
-This document tracks high-value feature candidates for Kn Live Dbg. The common
-direction is to keep the driver narrow, grow the user-mode investigation surface,
-and produce repeatable evidence that can be compared across runs, machines, and
-Windows builds.
+This document tracks high-value feature status for Kn Live Dbg: completed
+slices, partially implemented surfaces, and remaining candidates. The common
+direction is to keep the driver narrow, grow the user-mode investigation
+surface, and produce repeatable evidence that can be compared across runs,
+machines, and Windows builds.
 
-## Recommended Order
+## Current Roadmap
+
+Completed core slices:
+
+1. Native VAD and thread/APC triage.
+2. AI capability catalog expansion, including implicit `ai <goal>` routing.
+3. Module integrity scanning.
+4. Driver dispatch integrity.
+
+Remaining priority order:
 
 1. Session baseline snapshots and diffs.
-2. Driver object and device stack integrity.
-3. Native VAD and thread/APC triage.
-4. WNF stabilization.
-5. AI capability catalog expansion.
-6. WFP kernel callout resolver.
-7. Module integrity scanning.
-8. Positive-control probe expansion.
+2. Richer driver object, `!drvobj`, and device-stack inspection.
+3. WNF stabilization.
+4. WFP kernel callout resolver.
+5. Positive-control probe expansion.
 
 ## Cross-Cutting Rules
 
@@ -163,6 +170,13 @@ Operational value:
 
 Close the known WNF gaps in modern LIST_ENTRY mode.
 
+Status: partially implemented. Modern LIST_ENTRY walking runs before the legacy
+`RTL_AVL_TABLE` path, `!wnf instance` and `!wnf data` accept either state-name
+hashes or stable entry addresses, the walker annotates subscriber/backing-object
+chains, and `!wnf data` heuristically probes matched LIST_ENTRY-mode entries for
+`_WNF_DATA_BLOCK` pointers. Remaining work is to lock down the canonical state
+name slot and symbolic name lookup.
+
 Target shape:
 
 ```text
@@ -173,15 +187,13 @@ Target shape:
 
 Implementation notes:
 
-1. Officially accept stable entry addresses in `!wnf instance` and `!wnf data`,
-   not only state-name hashes.
-2. Reverse-engineer and lock down the canonical state-name slot for modern
+1. Reverse-engineer and lock down the canonical state-name slot for modern
    `_WNF_NAME_INSTANCE` layouts.
-3. Keep the current diagnostic probes until the fixed slot is validated across
+2. Keep the current diagnostic probes until the fixed slot is validated across
    multiple Windows builds.
-4. Add a static well-known WNF state-name table only after the canonical slot is
+3. Add a static well-known WNF state-name table only after the canonical slot is
    stable.
-5. Improve `_WNF_NAME_SUBSCRIPTION` resolution so more `Ntfc` / `Wnf ` /
+4. Improve `_WNF_NAME_SUBSCRIPTION` resolution so more `Ntfc` / `Wnf ` /
    `WnfN` nodes resolve to PID/image evidence.
 
 Operational value:
@@ -281,19 +293,24 @@ Target shape:
                   [/wx] [/mismatch] [/limit <n>] [/json <path>]
 ```
 
-Implementation notes:
+Implemented behavior:
 
-1. Reuse loaded module enumeration, `dump-pe` header parsing, `!address`, and
-   native disassembly helpers.
-2. Keep malformed modules as partial suspicious records with durable reason
+1. Reuses loaded module enumeration and live PE header/section parsing.
+2. Keeps malformed modules as partial suspicious records with durable reason
    codes instead of aborting the full scan.
-3. Compare live PE headers and section metadata against disk where the image
+3. Checks section header anomalies, module-list size drift, executable section
+   page translation, static W+X characteristics, and effective W+X page
+   permissions.
+4. Emits stable JSON and concise console modes for summary, verbose, headers,
+   sections, W+X-only, and mismatch-only review.
+
+Remaining hardening:
+
+1. Compare live PE headers and section metadata against disk where the image
    path is available.
-4. Hash executable sections from live memory in bounded chunks.
-5. Flag `.text` pages that are writable, section header anomalies, suspicious
-   prologue trampolines, IAT targets outside loaded modules, and live/disk
-   mismatches.
-6. Keep failures partial: missing disk file, paged-out sections, or read
+2. Hash executable sections from live memory in bounded chunks.
+3. Add suspicious prologue-trampoline and IAT target checks.
+4. Keep failures partial: missing disk file, paged-out sections, or read
    failures should warn without aborting the whole scan.
 
 Operational value:
