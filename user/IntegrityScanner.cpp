@@ -10,6 +10,7 @@
 #include <map>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 
 namespace
 {
@@ -110,6 +111,11 @@ namespace
         return ok;
     }
 
+    bool IsPowerOfTwo32(uint32_t value)
+    {
+        return value != 0 && (value & (value - 1)) == 0;
+    }
+
     uint64_t DecodeInteger(const uint8_t* bytes, size_t width)
     {
         uint64_t value = 0;
@@ -158,12 +164,101 @@ namespace
                 result += L"\\t";
                 break;
             default:
-                result.push_back(ch);
+                if (ch >= 0 && ch < 0x20)
+                {
+                    std::wstringstream stream;
+                    stream << L"\\u"
+                           << std::hex << std::setw(4) << std::setfill(L'0')
+                           << static_cast<unsigned int>(ch);
+                    result += stream.str();
+                }
+                else
+                {
+                    result.push_back(ch);
+                }
                 break;
             }
         }
 
         return result;
+    }
+
+    void AddUnique(std::vector<std::wstring>* values, const std::wstring& value)
+    {
+        do
+        {
+            if (values == nullptr || value.empty())
+            {
+                break;
+            }
+
+            if (std::find(values->begin(), values->end(), value) == values->end())
+            {
+                values->push_back(value);
+            }
+        } while (false);
+    }
+
+    void AppendNote(std::wstring* notes, const std::wstring& note)
+    {
+        do
+        {
+            if (notes == nullptr || note.empty())
+            {
+                break;
+            }
+
+            if (!notes->empty())
+            {
+                *notes += L"; ";
+            }
+            *notes += note;
+        } while (false);
+    }
+
+    void AddRecordReason(ModuleIntegrityRecord* record, const std::wstring& code, const std::wstring& note)
+    {
+        do
+        {
+            if (record == nullptr)
+            {
+                break;
+            }
+
+            record->Suspicious = true;
+            AddUnique(&record->ReasonCodes, code);
+            AppendNote(&record->Notes, note);
+        } while (false);
+    }
+
+    void AddRecordInfo(ModuleIntegrityRecord* record, const std::wstring& code, const std::wstring& note)
+    {
+        do
+        {
+            (void)note;
+
+            if (record == nullptr)
+            {
+                break;
+            }
+
+            AddUnique(&record->InfoCodes, code);
+        } while (false);
+    }
+
+    void AddSectionReason(ModuleIntegritySectionRecord* section, const std::wstring& code, const std::wstring& note)
+    {
+        do
+        {
+            if (section == nullptr)
+            {
+                break;
+            }
+
+            section->Suspicious = true;
+            AddUnique(&section->ReasonCodes, code);
+            AppendNote(&section->Notes, note);
+        } while (false);
     }
 
     std::wstring SectionName(const IMAGE_SECTION_HEADER& section)
@@ -344,8 +439,8 @@ namespace
 
         for (const KernelModuleInfo& module : modules)
         {
-            uint64_t end = module.Base + module.Size;
-            if (end < module.Base)
+            uint64_t end = 0;
+            if (!TryAdd(module.Base, module.Size, &end))
             {
                 continue;
             }
@@ -377,6 +472,18 @@ namespace
         } while (false);
 
         return matched;
+    }
+
+    uint64_t SectionVirtualSpan(const IMAGE_SECTION_HEADER& section)
+    {
+        uint64_t span = section.Misc.VirtualSize;
+
+        if (span == 0)
+        {
+            span = section.SizeOfRawData;
+        }
+
+        return span;
     }
 
     void AnnotatePointer(SymbolEngine& symbols, uint64_t address, std::wstring* moduleName, std::wstring* symbolName)
@@ -417,34 +524,48 @@ namespace
         } while (false);
     }
 
+    struct ModulePageAttributes
+    {
+        bool Queried = false;
+        bool Readable = false;
+        bool Writable = false;
+        bool Executable = false;
+        bool LargePage = false;
+        uint32_t PagingLevels = 0;
+        std::wstring Error;
+    };
+
     bool QueryEffectivePageAttributes(
         DeviceClient& device,
         uint64_t address,
         uint32_t length,
-        bool* writable,
-        bool* executable)
+        ModulePageAttributes* attributes)
     {
         bool ok = false;
 
         do
         {
-            if (writable == nullptr || executable == nullptr || address == 0)
+            if (attributes == nullptr || address == 0)
             {
                 break;
             }
 
+            *attributes = ModulePageAttributes{};
             PhysicalTranslationInfo translation = {};
-            std::wstring ignored;
             uint32_t queryLength = length == 0 ? 1 : length;
             if (queryLength > 0x1000)
             {
                 queryLength = 0x1000;
             }
 
-            if (!device.TranslateVirtual(0, address, queryLength, &translation, &ignored))
+            if (!device.TranslateVirtual(0, address, queryLength, &translation, &attributes->Error))
             {
                 break;
             }
+
+            attributes->Queried = true;
+            attributes->LargePage = (translation.Flags & KNDBG_TRANSLATE_FLAG_LARGE_PAGE) != 0;
+            attributes->PagingLevels = translation.PagingLevels;
 
             const bool la57 = (translation.Flags & KNDBG_TRANSLATE_FLAG_LA57_ACTIVE) != 0;
             const uint64_t levels[5] =
@@ -492,8 +613,9 @@ namespace
                 }
             }
 
-            *writable = present && canWrite;
-            *executable = present && canExecute;
+            attributes->Readable = present;
+            attributes->Writable = present && canWrite;
+            attributes->Executable = present && canExecute;
             ok = true;
         } while (false);
 
@@ -1329,12 +1451,6 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                 continue;
             }
 
-            if (options.Limit != 0 && result->Records.size() >= options.Limit)
-            {
-                result->Truncated = true;
-                break;
-            }
-
             ++result->MatchingModules;
             ModuleIntegrityRecord record = {};
             record.ImageName = module.ImageName;
@@ -1344,129 +1460,488 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
 
             std::vector<uint8_t> headerBytes;
             std::wstring readError;
-            if (!ReadKernelBytes(device_, module.Base, 0x1000, &headerBytes, &readError))
+            uint32_t readLength = 0x1000;
+            if (module.Size != 0 && module.Size < readLength)
             {
-                record.Notes = L"header read failed: " + readError;
-                record.Suspicious = true;
-                result->Records.push_back(record);
-                ++result->SuspiciousModules;
-                continue;
+                readLength = module.Size;
             }
-
-            record.HeaderRead = true;
-            const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(headerBytes.data());
-            record.MzOk = dos->e_magic == IMAGE_DOS_SIGNATURE;
-            if (!record.MzOk || dos->e_lfanew < 0 || static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > headerBytes.size())
+            if (!ReadKernelBytes(device_, module.Base, readLength, &headerBytes, &readError))
             {
-                record.Notes = L"invalid or unreadable PE DOS/NT header";
-                record.Suspicious = true;
-                result->Records.push_back(record);
-                ++result->SuspiciousModules;
-                continue;
+                AddRecordReason(&record, L"header_unreadable", L"header read failed: " + readError);
+                record.MismatchEvidence = true;
             }
-
-            const uint8_t* ntBytes = headerBytes.data() + dos->e_lfanew;
-            const IMAGE_NT_HEADERS64* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(ntBytes);
-            record.PeOk = nt64->Signature == IMAGE_NT_SIGNATURE;
-            if (!record.PeOk)
+            else if (headerBytes.size() < sizeof(IMAGE_DOS_HEADER))
             {
-                record.Notes = L"PE signature mismatch";
-                record.Suspicious = true;
-                result->Records.push_back(record);
-                ++result->SuspiciousModules;
-                continue;
-            }
-
-            record.NumberOfSections = nt64->FileHeader.NumberOfSections;
-            record.SizeOfImage = nt64->OptionalHeader.SizeOfImage;
-            if (record.SizeOfImage != 0 && module.Size != 0)
-            {
-                uint32_t delta = record.SizeOfImage > module.Size
-                    ? record.SizeOfImage - module.Size
-                    : module.Size - record.SizeOfImage;
-                if (delta > 0x1000)
-                {
-                    record.SizeMismatch = true;
-                    record.Notes = L"module list size differs from PE SizeOfImage";
-                }
-            }
-
-            size_t sectionTable = static_cast<size_t>(dos->e_lfanew) +
-                sizeof(uint32_t) +
-                sizeof(IMAGE_FILE_HEADER) +
-                nt64->FileHeader.SizeOfOptionalHeader;
-            size_t sectionBytes = static_cast<size_t>(record.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
-            if (record.NumberOfSections > 96 || sectionTable > headerBytes.size() || sectionBytes > headerBytes.size() - sectionTable)
-            {
-                record.Notes += record.Notes.empty() ? L"section table unavailable" : L"; section table unavailable";
+                record.HeaderRead = true;
+                AddRecordReason(&record, L"header_too_small", L"header read is smaller than IMAGE_DOS_HEADER");
+                record.MismatchEvidence = true;
             }
             else
             {
-                const IMAGE_SECTION_HEADER* sections =
-                    reinterpret_cast<const IMAGE_SECTION_HEADER*>(headerBytes.data() + sectionTable);
-                for (uint16_t i = 0; i < record.NumberOfSections; ++i)
+                record.HeaderRead = true;
+                const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(headerBytes.data());
+                record.MzOk = dos->e_magic == IMAGE_DOS_SIGNATURE;
+                if (!record.MzOk)
                 {
-                    ModuleIntegritySectionRecord section = {};
-                    section.Name = SectionName(sections[i]);
-                    section.VirtualAddress = sections[i].VirtualAddress;
-                    section.VirtualSize = sections[i].Misc.VirtualSize;
-                    section.RawSize = sections[i].SizeOfRawData;
-                    section.Characteristics = sections[i].Characteristics;
-                    section.Executable = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-                    section.Writable = (section.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
-
-                    if (section.Executable && section.Writable)
+                    AddRecordReason(&record, L"invalid_mz", L"MZ signature mismatch");
+                    record.MismatchEvidence = true;
+                }
+                else if (dos->e_lfanew < 0)
+                {
+                    AddRecordReason(&record, L"invalid_e_lfanew", L"negative e_lfanew");
+                    record.MismatchEvidence = true;
+                }
+                else
+                {
+                    uint64_t ntOffset = static_cast<uint64_t>(dos->e_lfanew);
+                    uint64_t fileHeaderOffset = 0;
+                    uint64_t optionalHeaderOffset = 0;
+                    if (!TryAdd(ntOffset, sizeof(uint32_t), &fileHeaderOffset) ||
+                        !TryAdd(fileHeaderOffset, sizeof(IMAGE_FILE_HEADER), &optionalHeaderOffset))
                     {
-                        section.Suspicious = true;
-                        section.Notes = L"section characteristics are W+X";
+                        AddRecordReason(&record, L"invalid_e_lfanew", L"NT header offset overflow");
+                        record.MismatchEvidence = true;
                     }
-
-                    if (section.Executable || EqualsNoCaseLocal(section.Name, L".text"))
+                    else if (optionalHeaderOffset > headerBytes.size() ||
+                             headerBytes.size() - static_cast<size_t>(ntOffset) < sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER))
                     {
-                        uint64_t sectionAddress = 0;
-                        bool writable = false;
-                        bool executable = false;
-                        if (!TryAdd(module.Base, section.VirtualAddress, &sectionAddress))
+                        AddRecordReason(&record, L"nt_header_outside_read", L"NT header outside readable header bytes");
+                        record.MismatchEvidence = true;
+                    }
+                    else
+                    {
+                        const uint8_t* ntBytes = headerBytes.data() + ntOffset;
+                        const uint32_t signature = *reinterpret_cast<const uint32_t*>(ntBytes);
+                        record.PeOk = signature == IMAGE_NT_SIGNATURE;
+                        if (!record.PeOk)
                         {
-                            section.Suspicious = true;
-                            section.Notes += section.Notes.empty() ? L"section RVA overflow" : L"; section RVA overflow";
+                            AddRecordReason(&record, L"invalid_pe_signature", L"PE signature mismatch");
+                            record.MismatchEvidence = true;
                         }
-                        else if (QueryEffectivePageAttributes(
-                                     device_,
-                                     sectionAddress,
-                                     section.VirtualSize == 0 ? 1 : section.VirtualSize,
-                                     &writable,
-                                     &executable))
+                        else
                         {
-                            section.PageAttributesQueried = true;
-                            section.EffectiveWritable = writable;
-                            section.EffectiveExecutable = executable;
-                            if (writable && executable)
+                            const IMAGE_FILE_HEADER* fileHeader =
+                                reinterpret_cast<const IMAGE_FILE_HEADER*>(headerBytes.data() + fileHeaderOffset);
+                            record.Machine = fileHeader->Machine;
+                            record.NumberOfSections = fileHeader->NumberOfSections;
+                            const uint16_t optionalHeaderSize = fileHeader->SizeOfOptionalHeader;
+
+                            if (record.Machine != IMAGE_FILE_MACHINE_AMD64)
                             {
-                                section.Suspicious = true;
-                                section.Notes += section.Notes.empty() ? L"page attributes are W+X" : L"; page attributes are W+X";
+                                AddRecordReason(&record, L"unexpected_machine", L"unexpected PE machine type");
+                                record.MismatchEvidence = true;
+                            }
+                            if (record.NumberOfSections == 0 || record.NumberOfSections > 96)
+                            {
+                                AddRecordReason(&record, L"suspicious_section_count", L"suspicious section count");
+                                record.MismatchEvidence = true;
+                            }
+                            if (optionalHeaderSize < sizeof(IMAGE_OPTIONAL_HEADER64))
+                            {
+                                AddRecordReason(&record, L"optional_header_too_small", L"optional header is smaller than IMAGE_OPTIONAL_HEADER64");
+                                record.MismatchEvidence = true;
+                            }
+
+                            uint64_t optionalEnd = 0;
+                            if (!TryAdd(optionalHeaderOffset, optionalHeaderSize, &optionalEnd) ||
+                                optionalEnd > headerBytes.size())
+                            {
+                                AddRecordReason(&record, L"optional_header_outside_read", L"optional header outside readable header bytes");
+                                record.MismatchEvidence = true;
+                            }
+                            else if (optionalHeaderSize >= sizeof(IMAGE_OPTIONAL_HEADER64))
+                            {
+                                const IMAGE_OPTIONAL_HEADER64* optional =
+                                    reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(headerBytes.data() + optionalHeaderOffset);
+                                record.OptionalHeaderMagic = optional->Magic;
+                                record.SizeOfImage = optional->SizeOfImage;
+                                record.SizeOfHeaders = optional->SizeOfHeaders;
+                                record.SectionAlignment = optional->SectionAlignment;
+                                record.FileAlignment = optional->FileAlignment;
+                                record.NumberOfRvaAndSizes = optional->NumberOfRvaAndSizes;
+                                record.PreferredImageBase = optional->ImageBase;
+                                record.OptionalHeaderOk = optional->Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+
+                                if (!record.OptionalHeaderOk)
+                                {
+                                    AddRecordReason(&record, L"unexpected_optional_header_magic", L"unexpected optional header magic");
+                                    record.MismatchEvidence = true;
+                                }
+                                if (record.SizeOfImage == 0)
+                                {
+                                    AddRecordReason(&record, L"zero_size_of_image", L"PE SizeOfImage is zero");
+                                    record.MismatchEvidence = true;
+                                }
+                                if (record.SizeOfHeaders == 0)
+                                {
+                                    AddRecordReason(&record, L"zero_size_of_headers", L"PE SizeOfHeaders is zero");
+                                    record.MismatchEvidence = true;
+                                }
+                                if (record.SizeOfImage != 0 && record.SizeOfHeaders > record.SizeOfImage)
+                                {
+                                    AddRecordReason(&record, L"headers_outside_image", L"SizeOfHeaders exceeds SizeOfImage");
+                                    record.MismatchEvidence = true;
+                                }
+                                if (record.SectionAlignment == 0)
+                                {
+                                    AddRecordReason(&record, L"zero_section_alignment", L"SectionAlignment is zero");
+                                    record.MismatchEvidence = true;
+                                }
+                                else if (!IsPowerOfTwo32(record.SectionAlignment))
+                                {
+                                    AddRecordReason(&record, L"invalid_section_alignment", L"SectionAlignment is not a power of two");
+                                    record.MismatchEvidence = true;
+                                }
+                                if (record.FileAlignment == 0)
+                                {
+                                    AddRecordReason(&record, L"zero_file_alignment", L"FileAlignment is zero");
+                                    record.MismatchEvidence = true;
+                                }
+                                else if (!IsPowerOfTwo32(record.FileAlignment) ||
+                                         record.FileAlignment < 0x200 ||
+                                         record.FileAlignment > 0x10000)
+                                {
+                                    AddRecordReason(&record, L"invalid_file_alignment", L"FileAlignment is outside the PE alignment range");
+                                    record.MismatchEvidence = true;
+                                }
+                                if (record.SectionAlignment != 0 &&
+                                    record.FileAlignment != 0 &&
+                                    record.SectionAlignment < record.FileAlignment)
+                                {
+                                    AddRecordReason(&record, L"section_alignment_lt_file_alignment", L"SectionAlignment is smaller than FileAlignment");
+                                    record.MismatchEvidence = true;
+                                }
+                                if (record.PreferredImageBase != 0 && record.PreferredImageBase != module.Base)
+                                {
+                                    record.ImageBaseMismatch = true;
+                                    AddRecordInfo(&record, L"image_base_relocated", L"preferred ImageBase differs from loaded base");
+                                }
+                                if (record.SizeOfImage != 0 && module.Size != 0)
+                                {
+                                    uint32_t delta = record.SizeOfImage > module.Size
+                                        ? record.SizeOfImage - module.Size
+                                        : module.Size - record.SizeOfImage;
+                                    if (delta > 0x1000)
+                                    {
+                                        record.SizeMismatch = true;
+                                        record.MismatchEvidence = true;
+                                        AddRecordReason(&record, L"size_of_image_mismatch", L"module list size differs from PE SizeOfImage");
+                                    }
+                                }
+
+                                const uint32_t directoryCount =
+                                    record.NumberOfRvaAndSizes < IMAGE_NUMBEROF_DIRECTORY_ENTRIES
+                                        ? record.NumberOfRvaAndSizes
+                                        : IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+                                for (uint32_t directoryIndex = 0; directoryIndex < directoryCount; ++directoryIndex)
+                                {
+                                    if (directoryIndex == IMAGE_DIRECTORY_ENTRY_SECURITY)
+                                    {
+                                        continue;
+                                    }
+
+                                    const IMAGE_DATA_DIRECTORY& directory = optional->DataDirectory[directoryIndex];
+                                    if (directory.Size != 0 && directory.VirtualAddress == 0)
+                                    {
+                                        AddRecordReason(&record, L"data_directory_zero_rva", L"non-empty data directory has zero RVA");
+                                        record.MismatchEvidence = true;
+                                        break;
+                                    }
+
+                                    if (directory.VirtualAddress == 0 || directory.Size == 0 || record.SizeOfImage == 0)
+                                    {
+                                        continue;
+                                    }
+
+                                    uint64_t directoryEnd = 0;
+                                    if (!TryAdd(directory.VirtualAddress, directory.Size, &directoryEnd) ||
+                                        directory.VirtualAddress >= record.SizeOfImage ||
+                                        directoryEnd > record.SizeOfImage)
+                                    {
+                                        AddRecordReason(&record, L"data_directory_outside_image", L"data directory extends outside SizeOfImage");
+                                        record.MismatchEvidence = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            uint64_t sectionTable = 0;
+                            uint64_t sectionBytes = 0;
+                            uint64_t sectionEnd = 0;
+                            if (TryAdd(optionalHeaderOffset, optionalHeaderSize, &sectionTable) &&
+                                TryAdd(static_cast<uint64_t>(record.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER), 0, &sectionBytes) &&
+                                TryAdd(sectionTable, sectionBytes, &sectionEnd))
+                            {
+                                uint64_t desiredRead = sectionEnd;
+                                if (record.SizeOfHeaders != 0 && record.SizeOfHeaders > desiredRead)
+                                {
+                                    desiredRead = record.SizeOfHeaders;
+                                }
+                                if (desiredRead > headerBytes.size() && desiredRead <= kMaxRawRead)
+                                {
+                                    if (module.Size != 0 && desiredRead > module.Size)
+                                    {
+                                        desiredRead = module.Size;
+                                    }
+                                    if (desiredRead > headerBytes.size() && desiredRead <= kMaxRawRead)
+                                    {
+                                        std::vector<uint8_t> largerHeader;
+                                        std::wstring largerReadError;
+                                        if (ReadKernelBytes(device_, module.Base, static_cast<uint32_t>(desiredRead), &largerHeader, &largerReadError))
+                                        {
+                                            headerBytes.swap(largerHeader);
+                                        }
+                                        else
+                                        {
+                                            result->Warnings.push_back(record.ImageName + L": extended header read failed: " + largerReadError);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (!TryAdd(optionalHeaderOffset, optionalHeaderSize, &sectionTable) ||
+                                !TryAdd(static_cast<uint64_t>(record.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER), 0, &sectionBytes) ||
+                                !TryAdd(sectionTable, sectionBytes, &sectionEnd) ||
+                                record.NumberOfSections == 0 ||
+                                record.NumberOfSections > 96 ||
+                                sectionEnd > headerBytes.size())
+                            {
+                                AddRecordReason(&record, L"section_table_unavailable", L"section table is outside readable header bytes");
+                                record.MismatchEvidence = true;
+                            }
+                            else
+                            {
+                                record.SectionTableOk = true;
+                                const IMAGE_SECTION_HEADER* sections =
+                                    reinterpret_cast<const IMAGE_SECTION_HEADER*>(headerBytes.data() + sectionTable);
+
+                                for (uint16_t i = 0; i < record.NumberOfSections; ++i)
+                                {
+                                    ModuleIntegritySectionRecord section = {};
+                                    section.Name = SectionName(sections[i]);
+                                    section.VirtualAddress = sections[i].VirtualAddress;
+                                    section.VirtualSize = sections[i].Misc.VirtualSize;
+                                    section.RawSize = sections[i].SizeOfRawData;
+                                    section.Characteristics = sections[i].Characteristics;
+                                    section.Executable = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+                                    section.Writable = (section.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+                                    section.Readable = (section.Characteristics & IMAGE_SCN_MEM_READ) != 0;
+
+                                    const uint64_t span = SectionVirtualSpan(sections[i]);
+                                    uint64_t sectionEndRva = 0;
+                                    if (span == 0 && section.Executable)
+                                    {
+                                        section.MismatchEvidence = true;
+                                        AddSectionReason(&section, L"zero_size_executable_section", L"executable section has zero virtual/raw size");
+                                    }
+                                    if (span != 0 &&
+                                        (!TryAdd(section.VirtualAddress, span, &sectionEndRva) ||
+                                         (record.SizeOfImage != 0 && sectionEndRva > record.SizeOfImage)))
+                                    {
+                                        section.RangeValid = false;
+                                        section.MismatchEvidence = true;
+                                        AddSectionReason(&section, L"section_range_outside_image", L"section virtual range is outside SizeOfImage");
+                                    }
+
+                                    if (section.Executable && section.Writable)
+                                    {
+                                        section.WxEvidence = true;
+                                        AddSectionReason(&section, L"static_wx_section", L"section characteristics are W+X");
+                                    }
+
+                                    if ((section.Executable || EqualsNoCaseLocal(section.Name, L".text")) &&
+                                        span != 0 &&
+                                        section.RangeValid)
+                                    {
+                                        uint64_t sectionAddress = 0;
+                                        if (!TryAdd(module.Base, section.VirtualAddress, &sectionAddress))
+                                        {
+                                            section.MismatchEvidence = true;
+                                            AddSectionReason(&section, L"section_rva_overflow", L"section RVA overflow");
+                                        }
+                                        else
+                                        {
+                                            ModulePageAttributes firstProbe = {};
+                                            if (QueryEffectivePageAttributes(device_, sectionAddress, 1, &firstProbe))
+                                            {
+                                                section.FirstPageQueried = true;
+                                                section.FirstPageReadable = firstProbe.Readable;
+                                                section.FirstPageWritable = firstProbe.Writable;
+                                                section.FirstPageExecutable = firstProbe.Executable;
+                                                section.FirstPageLargePage = firstProbe.LargePage;
+                                                section.FirstPagePagingLevels = firstProbe.PagingLevels;
+                                                section.PageAttributesQueried = true;
+                                                section.EffectiveReadable = section.EffectiveReadable || firstProbe.Readable;
+                                                section.EffectiveWritable = section.EffectiveWritable || firstProbe.Writable;
+                                                section.EffectiveExecutable = section.EffectiveExecutable || firstProbe.Executable;
+                                                if (firstProbe.Writable && firstProbe.Executable)
+                                                {
+                                                    section.WxEvidence = true;
+                                                    AddSectionReason(&section, L"effective_wx_page", L"first executable page is effective W+X");
+                                                }
+                                            }
+                                            else
+                                            {
+                                                section.FirstPageQueryFailed = true;
+                                                section.PageAttributeQueryFailed = true;
+                                                section.PageAttributeError = firstProbe.Error;
+                                                if (section.Executable)
+                                                {
+                                                    section.MismatchEvidence = true;
+                                                    AddSectionReason(&section, L"exec_first_page_query_failed", L"first executable page translation failed");
+                                                }
+                                            }
+
+                                            if (span > 0x1000)
+                                            {
+                                                uint64_t lastAddress = 0;
+                                                if (!TryAdd(sectionAddress, span - 1, &lastAddress))
+                                                {
+                                                    section.MismatchEvidence = true;
+                                                    AddSectionReason(&section, L"section_last_page_overflow", L"section last page address overflow");
+                                                }
+                                                else
+                                                {
+                                                    ModulePageAttributes lastProbe = {};
+                                                    if (QueryEffectivePageAttributes(device_, lastAddress, 1, &lastProbe))
+                                                    {
+                                                        section.LastPageQueried = true;
+                                                        section.LastPageReadable = lastProbe.Readable;
+                                                        section.LastPageWritable = lastProbe.Writable;
+                                                        section.LastPageExecutable = lastProbe.Executable;
+                                                        section.LastPageLargePage = lastProbe.LargePage;
+                                                        section.LastPagePagingLevels = lastProbe.PagingLevels;
+                                                        section.PageAttributesQueried = true;
+                                                        section.EffectiveReadable = section.EffectiveReadable || lastProbe.Readable;
+                                                        section.EffectiveWritable = section.EffectiveWritable || lastProbe.Writable;
+                                                        section.EffectiveExecutable = section.EffectiveExecutable || lastProbe.Executable;
+                                                        if (lastProbe.Writable && lastProbe.Executable)
+                                                        {
+                                                            section.WxEvidence = true;
+                                                            AddSectionReason(&section, L"effective_wx_page", L"last executable page is effective W+X");
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        section.LastPageQueryFailed = true;
+                                                        section.PageAttributeQueryFailed = true;
+                                                        if (section.PageAttributeError.empty())
+                                                        {
+                                                            section.PageAttributeError = lastProbe.Error;
+                                                        }
+                                                        if (section.Executable)
+                                                        {
+                                                            section.MismatchEvidence = true;
+                                                            AddSectionReason(&section, L"exec_last_page_query_failed", L"last executable page translation failed");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (section.Suspicious)
+                                    {
+                                        AddUnique(&record.ReasonCodes, L"section_anomaly");
+                                        record.Suspicious = true;
+                                    }
+                                    if (section.WxEvidence)
+                                    {
+                                        record.WxEvidence = true;
+                                    }
+                                    if (section.MismatchEvidence)
+                                    {
+                                        record.MismatchEvidence = true;
+                                    }
+                                    record.Sections.push_back(section);
+                                }
+
+                                std::vector<size_t> order;
+                                for (size_t sectionIndex = 0; sectionIndex < record.Sections.size(); ++sectionIndex)
+                                {
+                                    const uint64_t span = record.Sections[sectionIndex].VirtualSize != 0
+                                        ? record.Sections[sectionIndex].VirtualSize
+                                        : record.Sections[sectionIndex].RawSize;
+                                    if (span != 0 && record.Sections[sectionIndex].RangeValid)
+                                    {
+                                        order.push_back(sectionIndex);
+                                    }
+                                }
+                                std::sort(
+                                    order.begin(),
+                                    order.end(),
+                                    [&record](size_t left, size_t right)
+                                    {
+                                        return record.Sections[left].VirtualAddress < record.Sections[right].VirtualAddress;
+                                    });
+
+                                uint64_t previousEnd = 0;
+                                bool hasPrevious = false;
+                                for (size_t sectionIndex : order)
+                                {
+                                    const uint64_t span = record.Sections[sectionIndex].VirtualSize != 0
+                                        ? record.Sections[sectionIndex].VirtualSize
+                                        : record.Sections[sectionIndex].RawSize;
+                                    uint64_t currentEnd = 0;
+                                    if (!TryAdd(record.Sections[sectionIndex].VirtualAddress, span, &currentEnd))
+                                    {
+                                        continue;
+                                    }
+                                    if (hasPrevious && record.Sections[sectionIndex].VirtualAddress < previousEnd)
+                                    {
+                                        record.Sections[sectionIndex].OverlapsPrevious = true;
+                                        record.Sections[sectionIndex].MismatchEvidence = true;
+                                        AddSectionReason(&record.Sections[sectionIndex], L"overlapping_section_range", L"section virtual range overlaps a previous section");
+                                        record.Suspicious = true;
+                                        record.MismatchEvidence = true;
+                                        AddUnique(&record.ReasonCodes, L"section_anomaly");
+                                    }
+                                    if (!hasPrevious || currentEnd > previousEnd)
+                                    {
+                                        previousEnd = currentEnd;
+                                        hasPrevious = true;
+                                    }
+                                }
                             }
                         }
                     }
-
-                    if (section.Suspicious)
-                    {
-                        record.Suspicious = true;
-                    }
-                    record.Sections.push_back(section);
                 }
             }
 
-            if (record.SizeMismatch)
+            if (record.MismatchEvidence)
             {
-                record.Suspicious = true;
+                AddUnique(&record.ReasonCodes, L"module_mismatch");
             }
-
+            if (record.WxEvidence)
+            {
+                AddUnique(&record.ReasonCodes, L"module_wx");
+            }
             if (record.Suspicious)
             {
                 ++result->SuspiciousModules;
             }
-            result->Records.push_back(record);
+            if (record.WxEvidence)
+            {
+                ++result->WxModules;
+            }
+            if (record.MismatchEvidence)
+            {
+                ++result->MismatchModules;
+            }
+
+            const bool passesWx = !options.WxOnly || record.WxEvidence;
+            const bool passesMismatch = !options.MismatchOnly || record.MismatchEvidence;
+            if (passesWx && passesMismatch)
+            {
+                ++result->ReportedModules;
+                if (options.Limit != 0 && result->Records.size() >= options.Limit)
+                {
+                    result->Truncated = true;
+                    continue;
+                }
+
+                result->Records.push_back(record);
+            }
         }
 
         ok = true;
@@ -1652,22 +2127,65 @@ bool IntegrityScanner::ScanDrivers(const DriverIntegrityOptions& options, Driver
 std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
 {
     std::wstringstream json;
+    auto writeStringArray = [&json](const std::vector<std::wstring>& values)
+    {
+        json << L"[";
+        for (size_t index = 0; index < values.size(); ++index)
+        {
+            if (index != 0)
+            {
+                json << L",";
+            }
+            json << L"\"" << JsonEscape(values[index]) << L"\"";
+        }
+        json << L"]";
+    };
+
     json << L"{\n";
     json << L"  \"schema\":\"kn-live-dbg.module-integrity.v1\",\n";
     json << L"  \"summary\":{\"modules_scanned\":" << result.ModulesScanned
          << L",\"matching_modules\":" << result.MatchingModules
+         << L",\"reported_modules\":" << result.ReportedModules
          << L",\"suspicious_modules\":" << result.SuspiciousModules
+         << L",\"wx_modules\":" << result.WxModules
+         << L",\"mismatch_modules\":" << result.MismatchModules
          << L",\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},\n";
+    json << L"  \"warnings\":";
+    writeStringArray(result.Warnings);
+    json << L",\n";
     json << L"  \"records\":[\n";
     for (size_t i = 0; i < result.Records.size(); ++i)
     {
         const ModuleIntegrityRecord& record = result.Records[i];
         json << L"    {\"image\":\"" << JsonEscape(record.ImageName)
+             << L"\",\"path\":\"" << JsonEscape(record.ImagePath)
              << L"\",\"base\":\"" << Hex(record.Base, 16)
              << L"\",\"size\":" << record.Size
-             << L",\"size_of_image\":" << record.SizeOfImage
+             << L",\"header\":{\"read\":" << (record.HeaderRead ? L"true" : L"false")
+             << L",\"mz_ok\":" << (record.MzOk ? L"true" : L"false")
+             << L",\"pe_ok\":" << (record.PeOk ? L"true" : L"false")
+             << L",\"optional_header_ok\":" << (record.OptionalHeaderOk ? L"true" : L"false")
+             << L",\"section_table_ok\":" << (record.SectionTableOk ? L"true" : L"false")
+             << L",\"machine\":\"" << Hex(record.Machine, 4)
+             << L"\",\"optional_magic\":\"" << Hex(record.OptionalHeaderMagic, 4)
+             << L"\",\"preferred_image_base\":\"" << Hex(record.PreferredImageBase, 16)
+             << L"\",\"size_of_image\":" << record.SizeOfImage
+             << L",\"size_of_headers\":" << record.SizeOfHeaders
+             << L",\"section_alignment\":" << record.SectionAlignment
+             << L",\"file_alignment\":" << record.FileAlignment
+             << L",\"number_of_rva_and_sizes\":" << record.NumberOfRvaAndSizes
+             << L",\"number_of_sections\":" << record.NumberOfSections
+             << L"}"
+             << L",\"size_mismatch\":" << (record.SizeMismatch ? L"true" : L"false")
+             << L",\"image_base_relocated\":" << (record.ImageBaseMismatch ? L"true" : L"false")
              << L",\"suspicious\":" << (record.Suspicious ? L"true" : L"false")
-             << L",\"notes\":\"" << JsonEscape(record.Notes)
+             << L",\"wx_evidence\":" << (record.WxEvidence ? L"true" : L"false")
+             << L",\"mismatch_evidence\":" << (record.MismatchEvidence ? L"true" : L"false")
+             << L",\"reason_codes\":";
+        writeStringArray(record.ReasonCodes);
+        json << L",\"info_codes\":";
+        writeStringArray(record.InfoCodes);
+        json << L",\"notes\":\"" << JsonEscape(record.Notes)
              << L"\",\"sections\":[";
         for (size_t s = 0; s < record.Sections.size(); ++s)
         {
@@ -1677,13 +2195,41 @@ std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
                 json << L",";
             }
             json << L"{\"name\":\"" << JsonEscape(section.Name)
-                 << L"\",\"va\":\"" << Hex(section.VirtualAddress)
+                 << L"\",\"rva\":\"" << Hex(section.VirtualAddress)
+                 << L"\",\"virtual_size\":" << section.VirtualSize
+                 << L",\"raw_size\":" << section.RawSize
+                 << L",\"characteristics\":\"" << Hex(section.Characteristics, 8)
                  << L"\",\"executable\":" << (section.Executable ? L"true" : L"false")
                  << L",\"writable\":" << (section.Writable ? L"true" : L"false")
+                 << L",\"readable\":" << (section.Readable ? L"true" : L"false")
+                 << L",\"range_valid\":" << (section.RangeValid ? L"true" : L"false")
+                 << L",\"overlaps_previous\":" << (section.OverlapsPrevious ? L"true" : L"false")
                  << L",\"effective_writable\":" << (section.EffectiveWritable ? L"true" : L"false")
                  << L",\"effective_executable\":" << (section.EffectiveExecutable ? L"true" : L"false")
+                 << L",\"effective_readable\":" << (section.EffectiveReadable ? L"true" : L"false")
+                 << L",\"page_attributes_queried\":" << (section.PageAttributesQueried ? L"true" : L"false")
+                 << L",\"page_attribute_query_failed\":" << (section.PageAttributeQueryFailed ? L"true" : L"false")
+                 << L",\"first_page\":{\"queried\":" << (section.FirstPageQueried ? L"true" : L"false")
+                 << L",\"query_failed\":" << (section.FirstPageQueryFailed ? L"true" : L"false")
+                 << L",\"readable\":" << (section.FirstPageReadable ? L"true" : L"false")
+                 << L",\"writable\":" << (section.FirstPageWritable ? L"true" : L"false")
+                 << L",\"executable\":" << (section.FirstPageExecutable ? L"true" : L"false")
+                 << L",\"large_page\":" << (section.FirstPageLargePage ? L"true" : L"false")
+                 << L",\"paging_levels\":" << section.FirstPagePagingLevels << L"}"
+                 << L",\"last_page\":{\"queried\":" << (section.LastPageQueried ? L"true" : L"false")
+                 << L",\"query_failed\":" << (section.LastPageQueryFailed ? L"true" : L"false")
+                 << L",\"readable\":" << (section.LastPageReadable ? L"true" : L"false")
+                 << L",\"writable\":" << (section.LastPageWritable ? L"true" : L"false")
+                 << L",\"executable\":" << (section.LastPageExecutable ? L"true" : L"false")
+                 << L",\"large_page\":" << (section.LastPageLargePage ? L"true" : L"false")
+                 << L",\"paging_levels\":" << section.LastPagePagingLevels << L"}"
                  << L",\"suspicious\":" << (section.Suspicious ? L"true" : L"false")
-                 << L"}";
+                 << L",\"wx_evidence\":" << (section.WxEvidence ? L"true" : L"false")
+                 << L",\"mismatch_evidence\":" << (section.MismatchEvidence ? L"true" : L"false")
+                 << L",\"page_attribute_error\":\"" << JsonEscape(section.PageAttributeError)
+                 << L"\",\"reason_codes\":";
+            writeStringArray(section.ReasonCodes);
+            json << L",\"notes\":\"" << JsonEscape(section.Notes) << L"\"}";
         }
         json << L"]}";
         if (i + 1 != result.Records.size())

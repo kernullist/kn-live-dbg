@@ -73,7 +73,9 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "decode WNF state name 0x41c64e6da3bc0075" -> `wnf.decode` with `hash=0x41c64e6da3bc0075`
 - "list live WNF instances" -> `wnf.list` with `scope=instances`
 - "recent TI WriteVM events" -> `ti.query` with `action=grep` and `pattern=WriteVM`
-- "inspect module text integrity" -> `module.integrity` with `target=all`
+- "inspect module text integrity" -> `module.integrity` with `target=all`, `headers=true`, and `sections=true`
+- "find W+X kernel modules" -> `module.integrity` with `target=all`, `wx=true`, and `verbose=true`
+- "summarize live module integrity mismatches" -> `module.integrity` with `target=all`, `summary=true`, and `mismatch=true`
 - "check driver dispatch integrity" -> `driver.integrity` with `target=all`
 - "is HVCI on?" or "VBS status" -> use `ai plan` for read-only native commands such as `!vbs`
 - "decode CiOptions" -> use `ai plan` for `!ci options`

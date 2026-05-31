@@ -264,29 +264,36 @@ Operational value:
 
 Add a driver/module live-image integrity view.
 
-Status: initial live-memory slice is implemented as
-`!module integrity [module|all] [/limit <n>] [/json <path>]` and exposed to the
-AI router as `module.integrity`. It validates PE headers, section metadata, and
-effective executable-section page permissions. Disk/live hashing, IAT checks,
-and prologue-trampoline scanning remain future hardening.
+Status: live-memory PE/section integrity hardening is implemented as
+`!module integrity [module|all] [/summary] [/verbose] [/headers] [/sections]
+[/wx] [/mismatch] [/limit <n>] [/json <path>]` and exposed to the AI router as
+`module.integrity`. It validates PE headers, optional-header bounds,
+image/header sizes, alignments, data directories, section metadata, section
+ranges/overlaps, and executable-section page permissions. The current slice
+emits stable JSON with module/section reason codes plus summary, header,
+section, W+X, and mismatch views. Disk/live hashing, IAT checks, and
+prologue-trampoline scanning remain future hardening.
 
 Target shape:
 
 ```text
-!module integrity [module|all] [/limit <n>] [/json <path>]
+!module integrity [module|all] [/summary] [/verbose] [/headers] [/sections]
+                  [/wx] [/mismatch] [/limit <n>] [/json <path>]
 ```
 
 Implementation notes:
 
 1. Reuse loaded module enumeration, `dump-pe` header parsing, `!address`, and
    native disassembly helpers.
-2. Compare live PE headers and section metadata against disk where the image
+2. Keep malformed modules as partial suspicious records with durable reason
+   codes instead of aborting the full scan.
+3. Compare live PE headers and section metadata against disk where the image
    path is available.
-3. Hash executable sections from live memory in bounded chunks.
-4. Flag `.text` pages that are writable, section header anomalies, suspicious
+4. Hash executable sections from live memory in bounded chunks.
+5. Flag `.text` pages that are writable, section header anomalies, suspicious
    prologue trampolines, IAT targets outside loaded modules, and live/disk
    mismatches.
-5. Keep failures partial: missing disk file, paged-out sections, or read
+6. Keep failures partial: missing disk file, paged-out sections, or read
    failures should warn without aborting the whole scan.
 
 Operational value:

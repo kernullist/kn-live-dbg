@@ -3552,7 +3552,24 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"callbacks");
                 }
-                else if (topic == L"!module" || topic == L"!driver")
+                else if (topic == L"!module")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"integrity",
+                        L"all",
+                        L"/summary",
+                        L"/verbose",
+                        L"/headers",
+                        L"/sections",
+                        L"/wx",
+                        L"/mismatch",
+                        L"/limit",
+                        L"/json"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!driver")
                 {
                     static const wchar_t* values[] =
                     {
@@ -3713,7 +3730,25 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 AddCompletionCandidates(&candidates, values);
             }
         }
-        else if (command == L"!module" || command == L"!driver")
+        else if (command == L"!module")
+        {
+            static const wchar_t* values[] =
+            {
+                L"integrity",
+                L"all",
+                L"/summary",
+                L"/verbose",
+                L"/headers",
+                L"/sections",
+                L"/wx",
+                L"/mismatch",
+                L"/limit",
+                L"/json",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!driver")
         {
             static const wchar_t* values[] =
             {
@@ -12265,22 +12300,32 @@ static void PrintAddressInspection(const AddressInspectResult& r)
 static void PrintModuleIntegrityHelp()
 {
     std::wcout << L"!module command:\n";
-    std::wcout << L"  !module integrity [module|all] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections]\n";
+    std::wcout << L"                    [/wx] [/mismatch] [/limit <n>] [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Verifies loaded kernel module PE headers and executable sections from live\n";
-    std::wcout << L"  memory. The scanner flags invalid headers, SizeOfImage drift, section\n";
-    std::wcout << L"  characteristics that are W+X, and effective page permissions that are W+X.\n";
+    std::wcout << L"  memory. The scanner validates PE headers, section ranges, SizeOfImage drift,\n";
+    std::wcout << L"  static W+X flags, and effective page permissions from page-table walks.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  [module|all]  image/path substring filter. Defaults to all.\n";
-    std::wcout << L"  /limit <n>    stop after <n> matching modules.\n";
+    std::wcout << L"  /summary      print only aggregate findings and warnings.\n";
+    std::wcout << L"  /verbose      print all executable/.text sections, not only suspicious ones.\n";
+    std::wcout << L"  /headers      print detailed PE header evidence.\n";
+    std::wcout << L"  /sections     print all section-table records.\n";
+    std::wcout << L"  /wx           report only modules with W+X section/page evidence.\n";
+    std::wcout << L"  /mismatch     report only modules with header, size, or section anomalies.\n";
+    std::wcout << L"  /limit <n>    cap reported records while still scanning matching modules.\n";
     std::wcout << L"  /json <path>  write structured kn-live-dbg.module-integrity.v1 JSON.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
+    std::wcout << L"  !module integrity\n";
     std::wcout << L"  !module integrity ntoskrnl\n";
-    std::wcout << L"  !module integrity all /limit 20\n";
-    std::wcout << L"  !module integrity WdFilter /json .\\module-integrity.json\n";
+    std::wcout << L"  !module integrity ntoskrnl /verbose\n";
+    std::wcout << L"  !module integrity all /wx\n";
+    std::wcout << L"  !module integrity WdFilter /headers /sections\n";
+    std::wcout << L"  !module integrity all /json .\\module-integrity.json\n";
 }
 
 static void PrintDriverIntegrityHelp()
@@ -12337,7 +12382,98 @@ static bool ParseIntegrityLimitOption(
     return ok;
 }
 
-static void PrintModuleIntegrityRecord(const ModuleIntegrityRecord& record)
+static void PrintReasonCodes(const std::vector<std::wstring>& codes)
+{
+    if (codes.empty())
+    {
+        return;
+    }
+
+    std::wcout << L" reasons=";
+    for (size_t index = 0; index < codes.size(); ++index)
+    {
+        if (index != 0)
+        {
+            std::wcout << L",";
+        }
+        std::wcout << codes[index];
+    }
+}
+
+static bool ShouldPrintModuleIntegritySection(
+    const ModuleIntegritySectionRecord& section,
+    const ModuleIntegrityOptions& options)
+{
+    bool print = false;
+
+    do
+    {
+        if (options.IncludeSections)
+        {
+            print = true;
+            break;
+        }
+        if (options.WxOnly)
+        {
+            print = section.WxEvidence;
+            break;
+        }
+        if (options.MismatchOnly)
+        {
+            print = section.MismatchEvidence || section.Suspicious;
+            break;
+        }
+        if (options.Verbose)
+        {
+            print = section.Executable || ToLower(section.Name) == L".text" || section.Suspicious;
+            break;
+        }
+
+        print = section.Suspicious;
+    } while (false);
+
+    return print;
+}
+
+static void PrintPageProbeState(
+    const wchar_t* label,
+    bool queried,
+    bool failed,
+    bool readable,
+    bool writable,
+    bool executable,
+    bool largePage,
+    uint32_t pagingLevels)
+{
+    std::wcout << L" " << label << L"=";
+    if (queried)
+    {
+        std::wcout << (readable ? L"R" : L"-")
+                   << (writable ? L"W" : L"-")
+                   << (executable ? L"X" : L"-");
+        if (pagingLevels != 0 || largePage)
+        {
+            std::wcout << L"(levels=" << pagingLevels;
+            if (largePage)
+            {
+                std::wcout << L",large";
+            }
+            std::wcout << L")";
+        }
+    }
+    else if (failed)
+    {
+        PrintColoredText(L"query-failed", KNDBG_COLOR_WARN);
+    }
+    else
+    {
+        PrintColoredText(L"not-queried", KNDBG_COLOR_DIM);
+    }
+}
+
+static void PrintModuleIntegrityRecord(
+    const ModuleIntegrityRecord& record,
+    const ModuleIntegrityOptions& options)
 {
     PrintColoredText(
         record.Suspicious ? L"[module.integrity.suspicious]" : L"[module.integrity]",
@@ -12353,34 +12489,88 @@ static void PrintModuleIntegrityRecord(const ModuleIntegrityRecord& record)
         std::wcout << L" ";
         PrintColoredText(L"[SIZE-MISMATCH]", KNDBG_COLOR_WARN);
     }
+    if (record.WxEvidence)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[WX]", KNDBG_COLOR_FAIL);
+    }
+    if (record.MismatchEvidence)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[MISMATCH]", KNDBG_COLOR_WARN);
+    }
+    PrintReasonCodes(record.ReasonCodes);
     if (!record.Notes.empty())
     {
         std::wcout << L" notes=" << record.Notes;
     }
     std::wcout << L"\n";
 
+    if (options.IncludeHeaders)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"[module.header]", KNDBG_COLOR_DIM);
+        std::wcout << L" mz=" << (record.MzOk ? L"ok" : L"bad")
+                   << L" pe=" << (record.PeOk ? L"ok" : L"bad")
+                   << L" opt=" << (record.OptionalHeaderOk ? L"ok" : L"bad")
+                   << L" sectable=" << (record.SectionTableOk ? L"ok" : L"bad")
+                   << L" machine=" << HexTextWidth(record.Machine, 4, true)
+                   << L" magic=" << HexTextWidth(record.OptionalHeaderMagic, 4, true)
+                   << L" imageBase=" << HexTextWidth(record.PreferredImageBase, 16, true)
+                   << L" sizeHeaders=0x" << std::hex << record.SizeOfHeaders
+                   << L" sectionAlign=0x" << record.SectionAlignment
+                   << L" fileAlign=0x" << record.FileAlignment
+                   << std::dec << L"\n";
+    }
+
     for (const ModuleIntegritySectionRecord& section : record.Sections)
     {
-        if (!section.Suspicious)
+        if (!ShouldPrintModuleIntegritySection(section, options))
         {
             continue;
         }
 
         std::wcout << L"  ";
-        PrintColoredText(L"[module.section]", KNDBG_COLOR_WARN);
+        PrintColoredText(section.Suspicious ? L"[module.section.suspicious]" : L"[module.section]",
+                         section.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_DIM);
         std::wcout << L" name=";
         PrintColoredText(section.Name.empty() ? L"<unnamed>" : section.Name, KNDBG_COLOR_ACCENT);
         std::wcout << L" rva=" << HexTextWidth(section.VirtualAddress, 8, true)
                    << L" vsize=0x" << std::hex << section.VirtualSize
                    << L" raw=0x" << section.RawSize << std::dec
                    << L" chars=" << (section.Executable ? L"X" : L"-")
-                   << (section.Writable ? L"W" : L"-");
+                   << (section.Writable ? L"W" : L"-")
+                   << (section.Readable ? L"R" : L"-");
+        PrintPageProbeState(
+            L"first",
+            section.FirstPageQueried,
+            section.FirstPageQueryFailed,
+            section.FirstPageReadable,
+            section.FirstPageWritable,
+            section.FirstPageExecutable,
+            section.FirstPageLargePage,
+            section.FirstPagePagingLevels);
+        PrintPageProbeState(
+            L"last",
+            section.LastPageQueried,
+            section.LastPageQueryFailed,
+            section.LastPageReadable,
+            section.LastPageWritable,
+            section.LastPageExecutable,
+            section.LastPageLargePage,
+            section.LastPagePagingLevels);
         if (section.PageAttributesQueried)
         {
             std::wcout << L" effective="
-                       << (section.EffectiveExecutable ? L"X" : L"-")
-                       << (section.EffectiveWritable ? L"W" : L"-");
+                       << (section.EffectiveReadable ? L"R" : L"-")
+                       << (section.EffectiveWritable ? L"W" : L"-")
+                       << (section.EffectiveExecutable ? L"X" : L"-");
         }
+        if (!section.PageAttributeError.empty())
+        {
+            std::wcout << L" pageError=" << section.PageAttributeError;
+        }
+        PrintReasonCodes(section.ReasonCodes);
         if (!section.Notes.empty())
         {
             std::wcout << L" notes=" << section.Notes;
@@ -12468,7 +12658,7 @@ static void HandleModuleIntegrityCommand(
 
         if (args.size() < 2 || ToLower(args[1]) != L"integrity")
         {
-            std::wcerr << L"usage: !module integrity [module|all] [/limit <n>] [/json <path>]\n";
+            std::wcerr << L"usage: !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]\n";
             PrintModuleIntegrityHelp();
             break;
         }
@@ -12488,6 +12678,42 @@ static void HandleModuleIntegrityCommand(
         while (index < args.size())
         {
             std::wstring opt = ToLower(args[index]);
+            if (opt == L"/summary")
+            {
+                options.SummaryOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/verbose")
+            {
+                options.Verbose = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/headers")
+            {
+                options.IncludeHeaders = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/sections")
+            {
+                options.IncludeSections = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/wx")
+            {
+                options.WxOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/mismatch")
+            {
+                options.MismatchOnly = true;
+                ++index;
+                continue;
+            }
             if (opt == L"/limit")
             {
                 if (index + 1 >= args.size())
@@ -12567,15 +12793,21 @@ static void HandleModuleIntegrityCommand(
             }
         }
 
-        for (const ModuleIntegrityRecord& record : result.Records)
+        if (!options.SummaryOnly)
         {
-            PrintModuleIntegrityRecord(record);
+            for (const ModuleIntegrityRecord& record : result.Records)
+            {
+                PrintModuleIntegrityRecord(record, options);
+            }
         }
 
         PrintColoredText(L"[module.integrity.summary]", KNDBG_COLOR_TITLE);
         std::wcout << L" scanned=" << std::dec << result.ModulesScanned
                    << L" matching=" << result.MatchingModules
+                   << L" reported=" << result.ReportedModules
                    << L" suspicious=" << result.SuspiciousModules
+                   << L" wx=" << result.WxModules
+                   << L" mismatch=" << result.MismatchModules
                    << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
     } while (false);
 }
@@ -22342,7 +22574,7 @@ static bool ValidateAiCapabilityToolArgKeys(
     }
     else if (tool == L"module.integrity")
     {
-        allowed = {L"module", L"name", L"target", L"limit"};
+        allowed = {L"module", L"name", L"target", L"limit", L"summary", L"verbose", L"headers", L"sections", L"wx", L"mismatch"};
     }
     else if (tool == L"driver.integrity")
     {
@@ -22501,7 +22733,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- wnf.decode: decode one WNF state-name hash. Args: hash, state, or state_name string.\n";
     stream << L"- wnf.list: list live WNF data. Args: optional scope string instances, candidates, or lists; defaults to instances.\n";
     stream << L"- ti.query: query the Threat Intelligence ring. Args: action recent|stats|by|grep; optional count, pid, task, pattern strings.\n";
-    stream << L"- module.integrity: inspect loaded module headers and executable section permissions. Args: optional module/name/target string and optional limit string.\n";
+    stream << L"- module.integrity: inspect loaded module PE headers, sections, and runtime page permissions. Args: optional module/name/target string, optional limit string, optional booleans summary, verbose, headers, sections, wx, mismatch.\n";
     stream << L"- driver.integrity: inspect DRIVER_OBJECT dispatch targets. Args: optional driver/name/target string and optional limit string.\n";
     stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
     stream << L"Rules:\n";
@@ -22523,7 +22755,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For WNF decode questions, use wnf.decode; for live WNF instance/list questions, use wnf.list.\n";
     stream << L"- For recent Microsoft-Windows-Threat-Intelligence events, use ti.query with recent/stats/by/grep.\n";
     stream << L"- For driver dispatch integrity questions, use driver.integrity.\n";
-    stream << L"- For module text or executable section integrity questions, use module.integrity.\n";
+    stream << L"- For module text or executable section integrity questions, use module.integrity. Use wx=true for W+X-only module triage, headers=true for PE header evidence, and sections=true for full section-table evidence.\n";
     stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
     stream << L"Examples:\n";
     stream << L"- \"any inline ETW hook?\" => etw.integrity {}\n";
@@ -22534,7 +22766,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- \"show live WNF instances\" => wnf.list {\"scope\":\"instances\"}\n";
     stream << L"- \"query recent TI WriteVM events\" => ti.query {\"action\":\"grep\",\"pattern\":\"WriteVM\"}\n";
     stream << L"- \"check driver dispatch integrity\" => driver.integrity {\"target\":\"all\"}\n";
-    stream << L"- \"inspect module text integrity\" => module.integrity {\"target\":\"all\"}\n";
+    stream << L"- \"inspect module text integrity\" => module.integrity {\"target\":\"all\",\"headers\":\"true\",\"sections\":\"true\"}\n";
     stream << L"Operator request:\n";
     stream << query << L"\n";
 
@@ -24080,6 +24312,14 @@ static bool ExecuteAiCapabilityModuleIntegrity(
         {
             break;
         }
+        if (!target.empty() && IsSwitchLikeToken(target))
+        {
+            if (error != nullptr)
+            {
+                *error = L"module target cannot be an option token";
+            }
+            break;
+        }
 
         std::vector<std::wstring> args;
         args.push_back(L"!module");
@@ -24091,6 +24331,46 @@ static bool ExecuteAiCapabilityModuleIntegrity(
         if (!AppendAiCapabilityLimitOption(step.ArgsJson, state, &args, error))
         {
             break;
+        }
+
+        bool summaryOnly = false;
+        bool verbose = false;
+        bool headers = false;
+        bool sections = false;
+        bool wx = false;
+        bool mismatch = false;
+        if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"summary", &summaryOnly, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"verbose", &verbose, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"headers", &headers, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"sections", &sections, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"wx", &wx, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"mismatch", &mismatch, error))
+        {
+            break;
+        }
+        if (summaryOnly)
+        {
+            args.push_back(L"/summary");
+        }
+        if (verbose)
+        {
+            args.push_back(L"/verbose");
+        }
+        if (headers)
+        {
+            args.push_back(L"/headers");
+        }
+        if (sections)
+        {
+            args.push_back(L"/sections");
+        }
+        if (wx)
+        {
+            args.push_back(L"/wx");
+        }
+        if (mismatch)
+        {
+            args.push_back(L"/mismatch");
         }
 
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
