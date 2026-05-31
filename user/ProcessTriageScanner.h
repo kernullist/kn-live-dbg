@@ -1,0 +1,186 @@
+#pragma once
+
+#include "DeviceClient.h"
+#include "MemoryDumper.h"
+#include "SymbolEngine.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct ProcessTriageTarget
+{
+    uint32_t ProcessId = 0;
+    uint64_t Eprocess = 0;
+    uint64_t DirectoryTableBase = 0;
+    uint64_t UserDirectoryTableBase = 0;
+    uint64_t Peb = 0;
+    bool     HasPeb = false;
+    std::wstring ImageName;
+};
+
+struct ProcessUserModuleRange
+{
+    uint64_t Base = 0;
+    uint64_t Size = 0;
+    std::wstring ImageName;
+    std::wstring ImagePath;
+};
+
+struct ProcessVadRecord
+{
+    uint64_t VadAddress = 0;
+    uint64_t NodeAddress = 0;
+    uint64_t Left = 0;
+    uint64_t Right = 0;
+    uint64_t StartVpn = 0;
+    uint64_t EndVpn = 0;
+    uint64_t StartAddress = 0;
+    uint64_t EndAddress = 0;
+    uint64_t Size = 0;
+    uint64_t CommitCharge = 0;
+    uint32_t Protection = 0;
+    std::wstring ProtectionText;
+    bool HasProtection = false;
+    bool Executable = false;
+    bool Writable = false;
+    bool HasPrivateMemory = false;
+    bool PrivateMemory = false;
+    bool HasNoChange = false;
+    bool NoChange = false;
+    bool HasLargePage = false;
+    bool LargePage = false;
+    bool HasSubsection = false;
+    uint64_t Subsection = 0;
+    bool PeProbeAttempted = false;
+    bool PeHeaderFound = false;
+    bool PeHeaderSuspicious = false;
+    PeHeaderProbe PeProbe = {};
+    std::wstring Classification;
+    std::wstring Notes;
+};
+
+struct ProcessVadScanOptions
+{
+    ProcessTriageTarget Target = {};
+    bool SummaryOnly = false;
+    bool ExecOnly = false;
+    bool PrivateOnly = false;
+    bool WxOnly = false;
+    bool PeOnly = false;
+    bool ProbePe = false;
+    uint32_t Limit = 0;
+};
+
+struct ProcessVadScanResult
+{
+    ProcessTriageTarget Target = {};
+    std::vector<ProcessVadRecord> Records;
+    std::vector<std::wstring> Warnings;
+    uint64_t NodesVisited = 0;
+    uint64_t TotalRecords = 0;
+    uint64_t MatchingRecords = 0;
+    uint64_t ExecutableCount = 0;
+    uint64_t PrivateExecutableCount = 0;
+    uint64_t WxCount = 0;
+    uint64_t PeLikeCount = 0;
+    uint64_t SuspiciousCount = 0;
+    bool Truncated = false;
+    std::wstring LayoutSource;
+};
+
+struct ProcessApcEntryRecord
+{
+    uint64_t KapcAddress = 0;
+    uint64_t KernelRoutine = 0;
+    uint64_t RundownRoutine = 0;
+    uint64_t NormalRoutine = 0;
+    uint64_t NormalContext = 0;
+    uint64_t SystemArgument1 = 0;
+    uint64_t SystemArgument2 = 0;
+    std::wstring KernelRoutineModule;
+    std::wstring KernelRoutineSymbol;
+    std::wstring NormalRoutineModule;
+    std::wstring Notes;
+    bool HasKernelRoutine = false;
+    bool HasRundownRoutine = false;
+    bool HasNormalRoutine = false;
+    bool Suspicious = false;
+};
+
+struct ProcessApcQueueRecord
+{
+    std::wstring Name;
+    uint64_t HeadAddress = 0;
+    uint64_t Flink = 0;
+    uint64_t Blink = 0;
+    uint32_t EntriesScanned = 0;
+    bool Present = false;
+    bool NonEmpty = false;
+    bool Truncated = false;
+    std::vector<ProcessApcEntryRecord> Entries;
+};
+
+struct ProcessThreadRecord
+{
+    uint64_t Ethread = 0;
+    uint64_t ListEntry = 0;
+    uint64_t ThreadId = 0;
+    uint64_t StartAddress = 0;
+    uint64_t Win32StartAddress = 0;
+    uint64_t Teb = 0;
+    uint64_t StackBase = 0;
+    uint64_t StackLimit = 0;
+    std::wstring StartModule;
+    std::wstring StartSymbol;
+    std::wstring Win32StartModule;
+    std::wstring VadClassification;
+    std::wstring Notes;
+    bool HasThreadId = false;
+    bool HasStartAddress = false;
+    bool HasWin32StartAddress = false;
+    bool HasTeb = false;
+    bool HasStackBounds = false;
+    bool StartInUserModule = false;
+    bool StartInPrivateExecVad = false;
+    bool StartInWxVad = false;
+    bool SuspiciousStart = false;
+    std::vector<ProcessApcQueueRecord> ApcQueues;
+};
+
+struct ProcessThreadScanOptions
+{
+    ProcessTriageTarget Target = {};
+    bool IncludeApc = false;
+    bool IncludeStacks = false;
+    uint32_t Limit = 0;
+};
+
+struct ProcessThreadScanResult
+{
+    ProcessTriageTarget Target = {};
+    std::vector<ProcessThreadRecord> Records;
+    std::vector<std::wstring> Warnings;
+    uint64_t ThreadsVisited = 0;
+    uint64_t MatchingRecords = 0;
+    uint64_t SuspiciousStartCount = 0;
+    uint64_t ApcNonEmptyCount = 0;
+    bool Truncated = false;
+    std::wstring LayoutSource;
+};
+
+class ProcessTriageScanner
+{
+public:
+    ProcessTriageScanner(DeviceClient& device, SymbolEngine& symbols);
+
+    bool ScanVad(const ProcessVadScanOptions& options, ProcessVadScanResult* result, std::wstring* error);
+    bool ScanThreads(const ProcessThreadScanOptions& options, ProcessThreadScanResult* result, std::wstring* error);
+
+private:
+    DeviceClient& device_;
+    SymbolEngine& symbols_;
+};
+
+std::wstring BuildProcessVadJson(const ProcessVadScanResult& result);
+std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result);

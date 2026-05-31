@@ -10,6 +10,7 @@
 #include "MemoryDumper.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
+#include "ProcessTriageScanner.h"
 #include "ThreatIntelSubscriber.h"
 #include "NmiScanner.h"
 #include "PoolScanner.h"
@@ -2051,6 +2052,8 @@ static bool IsNativeBangCommand(const std::wstring& command)
 
     if (IsNativePhysicalBangCommand(command) ||
         command == L"!dml_proc" ||
+        command == L"!vad" ||
+        command == L"!threads" ||
         command == L"!wfp" ||
         command == L"!alpc" ||
         command == L"!vbs" ||
@@ -3015,6 +3018,37 @@ static void AddCallbackModuleOptionCompletionCandidates(std::vector<std::wstring
     AddCompletionCandidates(candidates, values);
 }
 
+static void AddVadOptionCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"/summary",
+        L"/exec",
+        L"/private",
+        L"/wx",
+        L"/pe",
+        L"/limit",
+        L"/json",
+        L"help"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
+static void AddThreadsOptionCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"/apc",
+        L"/stacks",
+        L"/limit",
+        L"/json",
+        L"help"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
 static void AddWfpScopeCompletionCandidates(std::vector<std::wstring>* candidates)
 {
     static const wchar_t* values[] =
@@ -3479,6 +3513,14 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddWfpScopeCompletionCandidates(&candidates);
                 }
+                else if (topic == L"!vad")
+                {
+                    AddVadOptionCompletionCandidates(&candidates);
+                }
+                else if (topic == L"!threads")
+                {
+                    AddThreadsOptionCompletionCandidates(&candidates);
+                }
                 else if (topic == L"!alpc")
                 {
                     AddAlpcScopeCompletionCandidates(&candidates);
@@ -3588,6 +3630,14 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 ResolveWfpScope(argsBefore[1], &scope);
                 AddWfpOptionCompletionCandidates(&candidates, scope);
             }
+        }
+        else if (command == L"!vad")
+        {
+            AddVadOptionCompletionCandidates(&candidates);
+        }
+        else if (command == L"!threads")
+        {
+            AddThreadsOptionCompletionCandidates(&candidates);
         }
         else if (command == L"!alpc")
         {
@@ -15023,6 +15073,43 @@ static void PrintDmlProcHelp()
     std::wcout << L"  Output includes EPROCESS, PID, parent PID, active thread count, DTB, and image name.\n";
 }
 
+static void PrintVadHelp()
+{
+    std::wcout << L"!vad command:\n";
+    std::wcout << L"  !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /summary   print only the summary and warnings\n";
+    std::wcout << L"  /exec      show executable VADs only\n";
+    std::wcout << L"  /private   show private-memory VADs only\n";
+    std::wcout << L"  /wx        show writable executable VADs only\n";
+    std::wcout << L"  /pe        probe private VAD first pages and show PE-like candidates only\n";
+    std::wcout << L"  /limit n   cap printed/JSON records while still walking the tree\n";
+    std::wcout << L"  /json path write stable JSON output\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  The target can be a decimal PID, image name, or kernel EPROCESS address.\n";
+    std::wcout << L"  Layouts are resolved from nt PDBs at runtime; drift or protected targets may produce partial warnings.\n";
+    std::wcout << L"  Flags are evidence for triage, not proof of malicious injection.\n";
+}
+
+static void PrintThreadsHelp()
+{
+    std::wcout << L"!threads command:\n";
+    std::wcout << L"  !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /apc      inspect ETHREAD APC queue fields when PDB layout is available\n";
+    std::wcout << L"  /stacks   include stack base/limit fields in the table\n";
+    std::wcout << L"  /limit n  cap printed/JSON records while still walking the thread list\n";
+    std::wcout << L"  /json path write stable JSON output\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  The target can be a decimal PID, image name, or kernel EPROCESS address.\n";
+    std::wcout << L"  User-module annotation uses the live process module snapshot when accessible.\n";
+    std::wcout << L"  APC output is conservative evidence; incomplete layouts are reported as warnings.\n";
+}
+
 static void PrintVtopHelp()
 {
     std::wcout << L"vtop command:\n";
@@ -15642,6 +15729,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"!dml_proc")
         {
             PrintDmlProcHelp();
+        }
+        else if (command == L"!vad")
+        {
+            PrintVadHelp();
+        }
+        else if (command == L"!threads")
+        {
+            PrintThreadsHelp();
         }
         else if (command == L"!wfp")
         {
@@ -17259,6 +17354,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!vad" || command == L"!threads")
+            {
+                commandClass = L"process-triage";
+                break;
+            }
+
             if (command == L"!wfp")
             {
                 commandClass = L"wfp";
@@ -17330,6 +17431,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"!dml_proc")
         {
             commandClass = L"process";
+            break;
+        }
+
+        if (command == L"!vad" || command == L"!threads")
+        {
+            commandClass = L"process-triage";
             break;
         }
 
@@ -20011,6 +20118,582 @@ static bool ProcessImageNameMatches(const std::wstring& recordName, const std::w
     return matched;
 }
 
+static ProcessTriageTarget ProcessTriageTargetFromDmlRecord(const DmlProcessRecord& record)
+{
+    ProcessTriageTarget target = {};
+    target.ProcessId = static_cast<uint32_t>(record.ProcessId);
+    target.Eprocess = record.Eprocess;
+    target.DirectoryTableBase = record.DirectoryTableBase;
+    target.UserDirectoryTableBase = record.UserDirectoryTableBase;
+    target.Peb = record.Peb;
+    target.HasPeb = record.HasPeb;
+    target.ImageName = record.ImageName;
+    return target;
+}
+
+static bool ResolveProcessTriageTarget(
+    const std::wstring& rawTarget,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    ProcessTriageTarget* target,
+    std::vector<std::wstring>* warnings,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (target == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid target output";
+            }
+            break;
+        }
+
+        *target = ProcessTriageTarget{};
+        std::wstring input = TrimWhitespace(rawTarget);
+        if (input.empty() || IsSwitchLikeToken(input))
+        {
+            if (error != nullptr)
+            {
+                *error = L"missing process target";
+            }
+            break;
+        }
+
+        bool wantPid = false;
+        bool wantEprocess = false;
+        uint64_t pid = 0;
+        uint64_t eprocess = 0;
+
+        if (ParseDmlProcessPidFilter(input, &pid))
+        {
+            wantPid = true;
+        }
+        else if (ParseUnsigned(input, state.NumberBase, &eprocess) && IsLikelyKernelVirtualAddress(eprocess))
+        {
+            wantEprocess = true;
+        }
+
+        DmlProcessCollection collection = {};
+        if (!CollectDmlProcessRecords(state, device, symbols, &collection, error))
+        {
+            break;
+        }
+
+        if (warnings != nullptr)
+        {
+            warnings->insert(warnings->end(), collection.Warnings.begin(), collection.Warnings.end());
+        }
+
+        std::vector<DmlProcessRecord> matches;
+        for (const DmlProcessRecord& record : collection.Records)
+        {
+            bool matched = false;
+
+            if (wantPid)
+            {
+                matched = record.ProcessId == pid;
+            }
+            else if (wantEprocess)
+            {
+                matched = record.Eprocess == eprocess;
+            }
+            else
+            {
+                matched = ProcessImageNameMatches(record.ImageName, input);
+            }
+
+            if (matched)
+            {
+                matches.push_back(record);
+            }
+        }
+
+        if (matches.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"no process matched target: " + input;
+            }
+            break;
+        }
+
+        if (!wantPid && !wantEprocess && matches.size() > 1)
+        {
+            if (error != nullptr)
+            {
+                std::wstringstream stream;
+                stream << L"multiple process matches for " << input << L"; use pid or eprocess:";
+                size_t count = 0;
+                for (const DmlProcessRecord& record : matches)
+                {
+                    if (count >= 6)
+                    {
+                        stream << L" ...";
+                        break;
+                    }
+                    stream << L" " << record.ImageName << L"(pid=" << std::dec << record.ProcessId
+                           << L",eprocess=" << HexTextWidth(record.Eprocess, 16, true) << L")";
+                    ++count;
+                }
+                *error = stream.str();
+            }
+            break;
+        }
+
+        *target = ProcessTriageTargetFromDmlRecord(matches[0]);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ParseProcessTriageLimit(const std::wstring& value, uint32_t numberBase, uint32_t* limit, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (limit == nullptr)
+        {
+            break;
+        }
+
+        uint64_t parsed = 0;
+        if (!ParseUnsigned(value, numberBase, &parsed) || parsed > 0xffffffffull)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid limit: " + value;
+            }
+            break;
+        }
+
+        *limit = static_cast<uint32_t>(parsed);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void PrintProcessTriageWarnings(const std::wstring& prefix, const std::vector<std::wstring>& warnings)
+{
+    for (const std::wstring& warning : warnings)
+    {
+        std::wcerr << prefix << L" warning: " << warning << L"\n";
+    }
+}
+
+static void PrintVadRecord(const ProcessVadRecord& record)
+{
+    WORD color = record.Executable && record.Writable ? KNDBG_COLOR_WARN : KNDBG_COLOR_ACCENT;
+
+    PrintColoredText(HexTextWidth(record.StartAddress, 16, true), color);
+    std::wcout << L"-" << HexTextWidth(record.EndAddress, 16, true);
+    std::wcout << L" size=" << HexText(record.Size);
+    std::wcout << L" vad=" << HexTextWidth(record.VadAddress, 16, true);
+    std::wcout << L" prot=" << (record.HasProtection ? record.ProtectionText : L"?");
+    if (record.HasPrivateMemory)
+    {
+        std::wcout << L" private=" << (record.PrivateMemory ? L"yes" : L"no");
+    }
+    if (record.PeProbeAttempted)
+    {
+        std::wcout << L" pe=" << (record.PeHeaderFound ? L"yes" : L"no");
+    }
+    if (!record.Classification.empty())
+    {
+        std::wcout << L" flags=" << record.Classification;
+    }
+    if (!record.Notes.empty())
+    {
+        std::wcout << L" notes=" << record.Notes;
+    }
+    std::wcout << L"\n";
+}
+
+static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryOnly)
+{
+    PrintColoredText(L"!vad", KNDBG_COLOR_TITLE);
+    std::wcout << L" pid=" << std::dec << result.Target.ProcessId
+               << L" image=" << result.Target.ImageName
+               << L" eprocess=" << HexTextWidth(result.Target.Eprocess, 16, true)
+               << L"\n";
+
+    if (!summaryOnly)
+    {
+        for (const ProcessVadRecord& record : result.Records)
+        {
+            PrintVadRecord(record);
+        }
+    }
+
+    PrintColoredText(L"[vad.summary]", KNDBG_COLOR_TITLE);
+    std::wcout << L" nodes=" << result.NodesVisited
+               << L" total=" << result.TotalRecords
+               << L" matching=" << result.MatchingRecords
+               << L" exec=" << result.ExecutableCount
+               << L" private_exec=" << result.PrivateExecutableCount
+               << L" wx=" << result.WxCount
+               << L" pe=" << result.PeLikeCount
+               << L" suspicious=" << result.SuspiciousCount
+               << L" truncated=" << (result.Truncated ? L"yes" : L"no")
+               << L"\n";
+}
+
+static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeStacks, bool includeApc)
+{
+    WORD color = record.SuspiciousStart ? KNDBG_COLOR_WARN : KNDBG_COLOR_ACCENT;
+
+    PrintColoredText(HexTextWidth(record.Ethread, 16, true), color);
+    std::wcout << L" tid=";
+    if (record.HasThreadId)
+    {
+        std::wcout << std::dec << record.ThreadId;
+    }
+    else
+    {
+        std::wcout << L"?";
+    }
+
+    std::wcout << L" start=";
+    if (record.HasStartAddress)
+    {
+        std::wcout << HexTextWidth(record.StartAddress, 16, true);
+    }
+    else
+    {
+        std::wcout << L"?";
+    }
+
+    std::wcout << L" win32=";
+    if (record.HasWin32StartAddress)
+    {
+        std::wcout << HexTextWidth(record.Win32StartAddress, 16, true);
+    }
+    else
+    {
+        std::wcout << L"?";
+    }
+
+    if (!record.StartModule.empty())
+    {
+        std::wcout << L" module=" << record.StartModule;
+    }
+    else if (!record.Win32StartModule.empty())
+    {
+        std::wcout << L" module=" << record.Win32StartModule;
+    }
+
+    if (!record.VadClassification.empty())
+    {
+        std::wcout << L" vad=" << record.VadClassification;
+    }
+
+    if (record.HasTeb)
+    {
+        std::wcout << L" teb=" << HexTextWidth(record.Teb, 16, true);
+    }
+
+    if (includeStacks && record.HasStackBounds)
+    {
+        std::wcout << L" stack=" << HexTextWidth(record.StackLimit, 16, true)
+                   << L"-" << HexTextWidth(record.StackBase, 16, true);
+    }
+
+    if (!record.Notes.empty())
+    {
+        std::wcout << L" notes=" << record.Notes;
+    }
+
+    std::wcout << L"\n";
+
+    if (includeApc)
+    {
+        for (const ProcessApcQueueRecord& queue : record.ApcQueues)
+        {
+            std::wcout << L"    apc[" << queue.Name << L"] head="
+                       << HexTextWidth(queue.HeadAddress, 16, true)
+                       << L" present=" << (queue.Present ? L"yes" : L"no")
+                       << L" nonempty=" << (queue.NonEmpty ? L"yes" : L"no")
+                       << L" scanned=" << queue.EntriesScanned;
+            if (queue.Truncated)
+            {
+                std::wcout << L" truncated=yes";
+            }
+            std::wcout << L"\n";
+
+            for (const ProcessApcEntryRecord& entry : queue.Entries)
+            {
+                std::wcout << L"        kapc=" << HexTextWidth(entry.KapcAddress, 16, true)
+                           << L" kernel=" << HexTextWidth(entry.KernelRoutine, 16, true)
+                           << L" normal=" << HexTextWidth(entry.NormalRoutine, 16, true)
+                           << L" suspicious=" << (entry.Suspicious ? L"yes" : L"no");
+                if (!entry.KernelRoutineModule.empty())
+                {
+                    std::wcout << L" kmod=" << entry.KernelRoutineModule;
+                }
+                if (!entry.NormalRoutineModule.empty())
+                {
+                    std::wcout << L" nmod=" << entry.NormalRoutineModule;
+                }
+                if (!entry.Notes.empty())
+                {
+                    std::wcout << L" notes=" << entry.Notes;
+                }
+                std::wcout << L"\n";
+            }
+        }
+    }
+}
+
+static void PrintThreadScanResult(const ProcessThreadScanResult& result, bool includeStacks, bool includeApc)
+{
+    PrintColoredText(L"!threads", KNDBG_COLOR_TITLE);
+    std::wcout << L" pid=" << std::dec << result.Target.ProcessId
+               << L" image=" << result.Target.ImageName
+               << L" eprocess=" << HexTextWidth(result.Target.Eprocess, 16, true)
+               << L"\n";
+
+    for (const ProcessThreadRecord& record : result.Records)
+    {
+        PrintThreadRecord(record, includeStacks, includeApc);
+    }
+
+    PrintColoredText(L"[threads.summary]", KNDBG_COLOR_TITLE);
+    std::wcout << L" visited=" << result.ThreadsVisited
+               << L" records=" << result.MatchingRecords
+               << L" suspicious_start=" << result.SuspiciousStartCount
+               << L" nonempty_apc_queues=" << result.ApcNonEmptyCount
+               << L" truncated=" << (result.Truncated ? L"yes" : L"no")
+               << L"\n";
+}
+
+static void HandleVadCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        if (args.size() < 2 || IsHelpToken(args[1]))
+        {
+            PrintVadHelp();
+            break;
+        }
+
+        ProcessVadScanOptions options = {};
+        std::vector<std::wstring> targetWarnings;
+        if (!ResolveProcessTriageTarget(args[1], state, device, symbols, &options.Target, &targetWarnings, &error))
+        {
+            std::wcerr << L"!vad failed: " << error << L"\n";
+            break;
+        }
+
+        std::wstring jsonPath;
+        bool parseOk = true;
+        for (size_t index = 2; index < args.size(); ++index)
+        {
+            std::wstring option = ToLower(args[index]);
+
+            if (option == L"/summary")
+            {
+                options.SummaryOnly = true;
+            }
+            else if (option == L"/exec")
+            {
+                options.ExecOnly = true;
+            }
+            else if (option == L"/private")
+            {
+                options.PrivateOnly = true;
+            }
+            else if (option == L"/wx")
+            {
+                options.WxOnly = true;
+            }
+            else if (option == L"/pe")
+            {
+                options.ProbePe = true;
+                options.PeOnly = true;
+            }
+            else if (option == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!vad failed: /limit requires a value\n";
+                    parseOk = false;
+                    break;
+                }
+                if (!ParseProcessTriageLimit(args[index + 1], state.NumberBase, &options.Limit, &error))
+                {
+                    std::wcerr << L"!vad failed: " << error << L"\n";
+                    parseOk = false;
+                    break;
+                }
+                ++index;
+            }
+            else if (option == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!vad failed: /json requires a path\n";
+                    parseOk = false;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                ++index;
+            }
+            else
+            {
+                std::wcerr << L"!vad failed: unknown option " << args[index] << L"\n";
+                parseOk = false;
+                break;
+            }
+        }
+
+        if (!parseOk)
+        {
+            break;
+        }
+
+        ProcessTriageScanner scanner(device, symbols);
+        ProcessVadScanResult result = {};
+        if (!scanner.ScanVad(options, &result, &error))
+        {
+            std::wcerr << L"!vad failed: " << error << L"\n";
+            break;
+        }
+
+        result.Warnings.insert(result.Warnings.begin(), targetWarnings.begin(), targetWarnings.end());
+        PrintVadScanResult(result, options.SummaryOnly);
+        PrintProcessTriageWarnings(L"!vad", result.Warnings);
+
+        if (!jsonPath.empty())
+        {
+            if (WriteUtf8TextFile(jsonPath, BuildProcessVadJson(result), &error))
+            {
+                std::wcout << L"json written: " << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!vad json failed: " << error << L"\n";
+            }
+        }
+    } while (false);
+}
+
+static void HandleThreadsCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        if (args.size() < 2 || IsHelpToken(args[1]))
+        {
+            PrintThreadsHelp();
+            break;
+        }
+
+        ProcessThreadScanOptions options = {};
+        std::vector<std::wstring> targetWarnings;
+        if (!ResolveProcessTriageTarget(args[1], state, device, symbols, &options.Target, &targetWarnings, &error))
+        {
+            std::wcerr << L"!threads failed: " << error << L"\n";
+            break;
+        }
+
+        std::wstring jsonPath;
+        bool parseOk = true;
+        for (size_t index = 2; index < args.size(); ++index)
+        {
+            std::wstring option = ToLower(args[index]);
+
+            if (option == L"/apc")
+            {
+                options.IncludeApc = true;
+            }
+            else if (option == L"/stacks")
+            {
+                options.IncludeStacks = true;
+            }
+            else if (option == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!threads failed: /limit requires a value\n";
+                    parseOk = false;
+                    break;
+                }
+                if (!ParseProcessTriageLimit(args[index + 1], state.NumberBase, &options.Limit, &error))
+                {
+                    std::wcerr << L"!threads failed: " << error << L"\n";
+                    parseOk = false;
+                    break;
+                }
+                ++index;
+            }
+            else if (option == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!threads failed: /json requires a path\n";
+                    parseOk = false;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                ++index;
+            }
+            else
+            {
+                std::wcerr << L"!threads failed: unknown option " << args[index] << L"\n";
+                parseOk = false;
+                break;
+            }
+        }
+
+        if (!parseOk)
+        {
+            break;
+        }
+
+        ProcessTriageScanner scanner(device, symbols);
+        ProcessThreadScanResult result = {};
+        if (!scanner.ScanThreads(options, &result, &error))
+        {
+            std::wcerr << L"!threads failed: " << error << L"\n";
+            break;
+        }
+
+        result.Warnings.insert(result.Warnings.begin(), targetWarnings.begin(), targetWarnings.end());
+        PrintThreadScanResult(result, options.IncludeStacks, options.IncludeApc);
+        PrintProcessTriageWarnings(L"!threads", result.Warnings);
+
+        if (!jsonPath.empty())
+        {
+            if (WriteUtf8TextFile(jsonPath, BuildProcessThreadsJson(result), &error))
+            {
+                std::wcout << L"json written: " << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!threads json failed: " << error << L"\n";
+            }
+        }
+    } while (false);
+}
+
 static bool TryExtractPidFromAiQuery(const std::vector<std::wstring>& tokens, uint64_t* pid)
 {
     bool found = false;
@@ -20953,6 +21636,8 @@ static bool ParseAiCapabilityPlanResponse(
                 step.Tool != L"callbacks.list" &&
                 step.Tool != L"wfp.list" &&
                 step.Tool != L"alpc.list" &&
+                step.Tool != L"vad.list" &&
+                step.Tool != L"threads.list" &&
                 step.Tool != L"assistant.answer")
             {
                 if (error != nullptr)
@@ -20986,7 +21671,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -20995,6 +21680,8 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- callbacks.list: list kernel callbacks. Args: scope string and optional module string. Supported scopes: all,object,registry,process,thread,imageload,minifilter.\n";
     stream << L"- wfp.list: list Windows Filtering Platform objects via fwpuclnt.dll. Args: scope (providers,sublayers,callouts,filters,layers; defaults to callouts), optional module (callouts/filters provider name or GUID), optional layer (filters only).\n";
     stream << L"- alpc.list: list ALPC ports discovered via Object Manager directory walk and CommunicationInfo links. Args: scope (ports,connections; defaults to ports), optional name substring, optional pid filter as decimal string.\n";
+    stream << L"- vad.list: list target process VADs. Args: image, pid, eprocess, or source; optional booleans exec, private, wx, pe, summary; optional limit string.\n";
+    stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
     stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
     stream << L"Rules:\n";
     stream << L"- Use only these tools. Do not emit debugger commands.\n";
@@ -21005,6 +21692,8 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For callback requests such as object callbacks for WdFilter.sys, use callbacks.list with scope \"object\" and module \"WdFilter.sys\".\n";
     stream << L"- For WFP questions such as callouts owned by tcpip or filters in the ALE auth connect layer, use wfp.list with the appropriate scope and module/layer.\n";
     stream << L"- For ALPC questions such as listing named ports or pairing csrss/lsass connections, use alpc.list with scope ports or connections and optional name/pid filters.\n";
+    stream << L"- For executable private memory, W+X, PE-like VADs, or process memory region triage, use vad.list directly.\n";
+    stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
     stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
     stream << L"Operator request:\n";
     stream << query << L"\n";
@@ -21551,6 +22240,383 @@ static bool ExecuteAiCapabilityCallbacksList(
     return ok;
 }
 
+static bool ExtractAiCapabilityBooleanArg(
+    const std::wstring& argsJson,
+    const std::wstring& key,
+    bool* value,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (value == nullptr)
+        {
+            break;
+        }
+
+        bool boolValue = false;
+        if (ExtractJsonBoolValue(argsJson, key, &boolValue))
+        {
+            *value = boolValue;
+            ok = true;
+            break;
+        }
+
+        std::wstring scalar;
+        if (!ExtractJsonScalarValue(argsJson, key, &scalar))
+        {
+            ok = true;
+            break;
+        }
+
+        std::wstring normalized = ToLower(TrimWhitespace(scalar));
+        if (normalized == L"true" || normalized == L"yes" || normalized == L"1" || normalized == L"on")
+        {
+            *value = true;
+            ok = true;
+            break;
+        }
+        if (normalized == L"false" || normalized == L"no" || normalized == L"0" || normalized == L"off")
+        {
+            *value = false;
+            ok = true;
+            break;
+        }
+
+        if (error != nullptr)
+        {
+            *error = L"invalid boolean argument " + key + L": " + scalar;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool ValidateAiCapabilityTriageStringArg(
+    const std::wstring& argsJson,
+    const std::wstring& key,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring value;
+        if (!ExtractJsonStringValue(argsJson, key, &value))
+        {
+            ok = true;
+            break;
+        }
+
+        value = TrimWhitespace(value);
+        if (value.empty())
+        {
+            ok = true;
+            break;
+        }
+
+        std::wstring unsafeReason;
+        if (ContainsUnsafeAiCommandCharacters(value, &unsafeReason) || IsHelpToken(value))
+        {
+            if (error != nullptr)
+            {
+                *error = unsafeReason.empty() ? L"invalid " + key + L" argument" : unsafeReason;
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ValidateAiCapabilityTriageArgs(const std::wstring& argsJson, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!ValidateAiCapabilityTriageStringArg(argsJson, L"image", error) ||
+            !ValidateAiCapabilityTriageStringArg(argsJson, L"name", error) ||
+            !ValidateAiCapabilityTriageStringArg(argsJson, L"process", error) ||
+            !ValidateAiCapabilityTriageStringArg(argsJson, L"source", error))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ResolveAiCapabilityTriageRecords(
+    const AiCapabilityStep& step,
+    const std::vector<AiCapabilityStepResult>& results,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::vector<DmlProcessRecord>* records,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (records == nullptr)
+        {
+            break;
+        }
+
+        if (!ValidateAiCapabilityTriageArgs(step.ArgsJson, error))
+        {
+            break;
+        }
+
+        std::wstring source;
+        ExtractJsonStringValue(step.ArgsJson, L"source", &source);
+        if (TrimWhitespace(source).empty() &&
+            !HasAiCapabilityProcessFilterArg(step.ArgsJson) &&
+            (results.empty() || !results.back().HasProcesses))
+        {
+            if (error != nullptr)
+            {
+                *error = step.Tool + L" requires image, pid, eprocess, or source";
+            }
+            break;
+        }
+
+        bool truncated = false;
+        if (!ResolveAiCapabilityProcessInput(step.ArgsJson, results, state, device, symbols, records, &truncated, error))
+        {
+            break;
+        }
+
+        if (records->empty())
+        {
+            if (error != nullptr)
+            {
+                *error = step.Tool + L" target did not match any process";
+            }
+            break;
+        }
+
+        if (records->size() > 8)
+        {
+            if (error != nullptr)
+            {
+                *error = step.Tool + L" matched too many processes; narrow by pid or eprocess";
+            }
+            break;
+        }
+
+        if (truncated)
+        {
+            std::wcerr << L"ai tool warning: process list was truncated\n";
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool AppendAiCapabilityLimitOption(
+    const std::wstring& argsJson,
+    const DebuggerState& state,
+    std::vector<std::wstring>* args,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (args == nullptr)
+        {
+            break;
+        }
+
+        std::wstring limitText;
+        if (!ExtractJsonScalarValue(argsJson, L"limit", &limitText) || TrimWhitespace(limitText).empty())
+        {
+            ok = true;
+            break;
+        }
+
+        uint32_t limit = 0;
+        if (!ParseProcessTriageLimit(TrimWhitespace(limitText), state.NumberBase, &limit, error))
+        {
+            break;
+        }
+
+        args->push_back(L"/limit");
+        args->push_back(std::to_wstring(limit));
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityVadList(
+    const AiCapabilityStep& step,
+    const std::vector<AiCapabilityStepResult>& results,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiCapabilityStepResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        std::vector<DmlProcessRecord> records;
+        if (!ResolveAiCapabilityTriageRecords(step, results, state, device, symbols, &records, error))
+        {
+            break;
+        }
+
+        bool execOnly = false;
+        bool privateOnly = false;
+        bool wxOnly = false;
+        bool peOnly = false;
+        bool summaryOnly = false;
+        if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"exec", &execOnly, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"private", &privateOnly, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"wx", &wxOnly, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"pe", &peOnly, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"summary", &summaryOnly, error))
+        {
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": vad.list\n";
+
+        for (const DmlProcessRecord& record : records)
+        {
+            std::vector<std::wstring> args;
+            args.push_back(L"!vad");
+            args.push_back(HexTextWidth(record.Eprocess, 16, true));
+            if (summaryOnly)
+            {
+                args.push_back(L"/summary");
+            }
+            if (execOnly)
+            {
+                args.push_back(L"/exec");
+            }
+            if (privateOnly)
+            {
+                args.push_back(L"/private");
+            }
+            if (wxOnly)
+            {
+                args.push_back(L"/wx");
+            }
+            if (peOnly)
+            {
+                args.push_back(L"/pe");
+            }
+            if (!AppendAiCapabilityLimitOption(step.ArgsJson, state, &args, error))
+            {
+                break;
+            }
+
+            std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+            HandleVadCommand(args, state, device, symbols);
+        }
+
+        if (error != nullptr && !error->empty())
+        {
+            break;
+        }
+
+        result->HasProcesses = true;
+        result->Processes = records;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityThreadsList(
+    const AiCapabilityStep& step,
+    const std::vector<AiCapabilityStepResult>& results,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiCapabilityStepResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        std::vector<DmlProcessRecord> records;
+        if (!ResolveAiCapabilityTriageRecords(step, results, state, device, symbols, &records, error))
+        {
+            break;
+        }
+
+        bool includeApc = false;
+        bool includeStacks = false;
+        if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"apc", &includeApc, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"stacks", &includeStacks, error))
+        {
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": threads.list\n";
+
+        for (const DmlProcessRecord& record : records)
+        {
+            std::vector<std::wstring> args;
+            args.push_back(L"!threads");
+            args.push_back(HexTextWidth(record.Eprocess, 16, true));
+            if (includeApc)
+            {
+                args.push_back(L"/apc");
+            }
+            if (includeStacks)
+            {
+                args.push_back(L"/stacks");
+            }
+            if (!AppendAiCapabilityLimitOption(step.ArgsJson, state, &args, error))
+            {
+                break;
+            }
+
+            std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+            HandleThreadsCommand(args, state, device, symbols);
+        }
+
+        if (error != nullptr && !error->empty())
+        {
+            break;
+        }
+
+        result->HasProcesses = true;
+        result->Processes = records;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ExecuteAiCapabilityPlan(
     const AiCapabilityPlan& plan,
     DebuggerState& state,
@@ -21597,6 +22663,14 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"alpc.list")
             {
                 stepOk = ExecuteAiCapabilityAlpcList(step, state, device, symbols, error);
+            }
+            else if (step.Tool == L"vad.list")
+            {
+                stepOk = ExecuteAiCapabilityVadList(step, results, state, device, symbols, &result, error);
+            }
+            else if (step.Tool == L"threads.list")
+            {
+                stepOk = ExecuteAiCapabilityThreadsList(step, results, state, device, symbols, &result, error);
             }
             else if (step.Tool == L"assistant.answer")
             {
@@ -22807,6 +23881,14 @@ static bool HandleCommand(
         else if (command == L"!dml_proc")
         {
             HandleDmlProcCommand(args, state, device, symbols);
+        }
+        else if (command == L"!vad")
+        {
+            HandleVadCommand(args, state, device, symbols);
+        }
+        else if (command == L"!threads")
+        {
+            HandleThreadsCommand(args, state, device, symbols);
         }
         else if (command == L"!wfp")
         {

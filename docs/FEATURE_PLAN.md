@@ -99,6 +99,11 @@ Operational value:
 
 Add a read-only user-mode process memory triage layer.
 
+Status: implemented in `ProcessTriageScanner` with native `!vad`, native
+`!threads`, JSON output, command help/completion, and AI `vad.list` /
+`threads.list` routing. Remaining hardening should come from field testing
+across Windows builds and protected-process edge cases.
+
 Target shape:
 
 ```text

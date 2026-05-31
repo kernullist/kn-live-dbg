@@ -74,6 +74,16 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 4. The walker prefers `nt!PsActiveProcessHead` as the list anchor. If that symbol is unavailable, it falls back to PID 4's `ActiveProcessLinks`, prints the System process first, then follows `Flink` with a guard for the hidden list head.
 5. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a `dt nt!_EPROCESS <address>` follow-up.
 
+## Process Memory Triage Flow
+
+1. `!vad` and `!threads` stay entirely in user mode on top of `DeviceClient`, `SymbolEngine`, the native process-list walker, and page-table translation. The driver remains a narrow read/translate primitive provider.
+2. Target resolution accepts decimal PID, image name, or EPROCESS. Image names are matched with the same basename/stem logic used by AI process resolution; ambiguous image matches require PID or EPROCESS.
+3. `ProcessTriageScanner` resolves `_EPROCESS.VadRoot`, `_RTL_AVL_TREE.Root`, `_RTL_BALANCED_NODE.Left/Right`, `_MMVAD_SHORT.VadNode`, VPN, protection, private-memory, commit, no-change, large-page, and subsection fields from the loaded nt PDB/DIA metadata. Missing optional fields become warnings or reduced annotations, not hard-coded offsets.
+4. VAD traversal is iterative, bounded, and cycle guarded. Each node is validated as kernel-canonical before dereference. `/pe` translates the target user VA through the target DTB and reads the first page physically, then reuses the PE header probe used by pool PE hunting to flag intact and signature-wiped PE candidates.
+5. `!threads` resolves `_EPROCESS.ThreadListHead` and `_ETHREAD.ThreadListEntry`, then optional thread ID, start, Win32StartAddress, TEB, and stack fields. User module ranges are collected with `CreateToolhelp32Snapshot` when possible and correlated with VAD classifications to flag starts outside modules, in private executable VADs, or in W+X VADs.
+6. `/apc` resolves `_ETHREAD.ApcState`, `_KAPC_STATE.ApcListHead`, and `_KAPC` routine fields when symbols expose them. The scanner reports queue/list evidence conservatively and emits layout warnings instead of claiming certainty when APC metadata is incomplete.
+7. Both commands print compact console rows plus stable JSON records and summary counters. The output is designed for diffing and for AI tool routing through `vad.list` and `threads.list`.
+
 ## Symbol Flow
 
 1. TUI calls `NtQuerySystemInformation(SystemModuleInformation)`.
