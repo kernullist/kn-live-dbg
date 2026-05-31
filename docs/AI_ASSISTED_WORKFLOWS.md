@@ -16,7 +16,7 @@ This document captures implementation ideas for adding AI assistance to Kn Live 
 
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory, but the visible surface is now smaller:
 
-1. `ai <question>` is the default operator entrypoint. It asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. The initial catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, and `assistant.answer`.
+1. `ai <question>` is the default operator entrypoint. It asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, and `assistant.answer`.
 2. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
 3. `ai config ...` groups provider setup and smoke checks under one visible subcommand. It supports `status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`.
 4. `ai plan <prompt>` asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
@@ -49,7 +49,7 @@ The main `ai help` output stays focused on the primary workflow. Detailed compat
 
 Implemented entrypoint: `ai <question>`.
 
-The command now behaves like a small tool-using agent. The model receives the operator request and the capability catalog, returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. The first catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, and callback listing by dispatching to the native `callbacks` scanner:
+The command now behaves like a small tool-using agent. The model receives the operator request and the capability catalog, returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. The catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, dispatches callback/WFP/ALPC requests to native scanners, and routes VAD/thread triage through the read-only process scanner:
 
 - "a.exe pid" -> matching PID records from the live process list
 - "a.exe eprocess" -> matching `_EPROCESS` addresses
@@ -61,6 +61,10 @@ The command now behaves like a small tool-using agent. The model receives the op
 - "wfp filters ALE_AUTH_CONNECT_V4" -> `wfp.list` with `scope=filters` and `layer=ALE_AUTH_CONNECT_V4`
 - "named alpc ports" -> `alpc.list` with `scope=ports`
 - "alpc connections owned by lsass" -> `alpc.list` with `scope=connections` and `name=lsass`
+- "show executable private VADs for game.exe" -> `vad.list` with `image=game.exe`, `exec=true`, and `private=true`
+- "find W+X regions in pid 1234" -> `vad.list` with `pid=1234` and `wx=true`
+- "show suspicious thread starts for game.exe" -> `threads.list` with `image=game.exe`
+- "check APC evidence for pid 1234" -> `threads.list` with `pid=1234` and `apc=true`
 - "is HVCI on?" or "VBS status" -> bare `!vbs` (planner can dispatch it directly as a read-only command)
 - "decode CiOptions" -> `!ci options`
 - "list IUM trustlets" -> `!securekernel`

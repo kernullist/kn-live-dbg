@@ -113,6 +113,7 @@
     <ClCompile Include="NmiScanner.cpp" />
     <ClCompile Include="MemoryDumper.cpp" />
     <ClCompile Include="PoolPeHunter.cpp" />
+    <ClCompile Include="ProcessTriageScanner.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
     <ClCompile Include="PoolScanner.cpp" />
     <ClCompile Include="main.cpp" />
@@ -142,6 +143,7 @@
     <ClInclude Include="NmiScanner.h" />
     <ClInclude Include="MemoryDumper.h" />
     <ClInclude Include="PoolPeHunter.h" />
+    <ClInclude Include="ProcessTriageScanner.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="PoolScanner.h" />
     <ClInclude Include="SymbolEngine.h" />

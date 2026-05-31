@@ -181,6 +181,8 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 callbacks [scope] /module <module>
 !dml_proc [pid]
+!vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/limit <n>] [/json <path>]
+!threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|filters|layers]
 !wfp callouts /module <name|GUID>
 !wfp filters /layer <name|GUID> /provider <name|GUID>
@@ -388,7 +390,7 @@ Supported keys:
 
 Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
 
-For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The first catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, and `alpc.list`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback prompts such as `ai WdFilter.sys object callbacks` can become a validated `callbacks object WdFilter.sys` run through the native callback scanner, and prompts such as `ai tcpip wfp callouts`, `ai wfp filters ALE_AUTH_CONNECT_V4`, `ai alpc named ports`, or `ai alpc lsass connections` route through `!wfp` or `!alpc` with the matching scope, filters, and pid arguments. VBS/HVCI/CI/Secure Kernel questions such as `ai is HVCI on?`, `ai decode CiOptions`, or `ai list IUM trustlets` are routed through `ai plan` to the native `!vbs`, `!ci options`, and `!securekernel` commands. ETW/NMI questions such as `ai any suspicious ETW logger hooks?` or `ai list NMI callbacks` plan into `!etw loggers` and `!nmi callbacks`. WNF questions such as `ai decode this WNF state name 0x41c64e6da3bc0075` or `ai list live WNF instances` route through `!wnf decode` and `!wnf instances`. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
+For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, and `threads.list`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback prompts such as `ai WdFilter.sys object callbacks` can become a validated `callbacks object WdFilter.sys` run through the native callback scanner, and prompts such as `ai tcpip wfp callouts`, `ai wfp filters ALE_AUTH_CONNECT_V4`, `ai alpc named ports`, or `ai alpc lsass connections` route through `!wfp` or `!alpc` with the matching scope, filters, and pid arguments. Process memory prompts such as `ai show executable private VADs for game.exe`, `ai find W+X regions in pid 1234`, `ai show suspicious thread starts for game.exe`, or `ai check APC evidence for pid 1234` route through `!vad` or `!threads` with strict target/filter validation. VBS/HVCI/CI/Secure Kernel questions such as `ai is HVCI on?`, `ai decode CiOptions`, or `ai list IUM trustlets` are routed through `ai plan` to the native `!vbs`, `!ci options`, and `!securekernel` commands. ETW/NMI questions such as `ai any suspicious ETW logger hooks?` or `ai list NMI callbacks` plan into `!etw loggers` and `!nmi callbacks`. WNF questions such as `ai decode this WNF state name 0x41c64e6da3bc0075` or `ai list live WNF instances` route through `!wnf decode` and `!wnf instances`. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
 
 `ai plan <prompt>` asks the selected model to return a strict `kn-live-dbg.ai-plan.v2` command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose, risk, backend, and expected-output notes. Empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. `ai explain <read-only-command...>` runs a read-only evidence command, preserves stdout/stderr, adds a deterministic output summary, then asks the selected model for analysis. It has tuned prompts for `callbacks`, `dt`/`dtx`, and `u`/`uf`, so the older `ai analyze callbacks` and `ai annotate` flows are now covered by the shorter explain form.
 
@@ -409,7 +411,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!pool`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!pool`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -465,6 +467,19 @@ When `DbgHelp` cannot return a usable UDT layout, the symbol engine tries a DIA 
 ```
 
 The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.ActiveProcessLinks`, then walks the active process list from live kernel memory. If a decimal PID argument is supplied, for example `!dml_proc 4`, only records whose process ID matches that value are printed. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a ready-to-run `dt nt!_EPROCESS <address>` follow-up.
+
+## Native VAD And Thread Triage
+
+`!vad` and `!threads` add read-only process memory triage without adding new kernel parsing logic:
+
+```text
+!vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/limit <n>] [/json <path>]
+!threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
+```
+
+Targets can be decimal PID, image name, or EPROCESS address. `!vad` resolves `_EPROCESS.VadRoot` through PDB/DIA type metadata, walks the balanced tree with bounded traversal and cycle detection, decodes VPN range, protection, private-memory, commit, large/no-change, subsection, and PE-like first-page evidence when available, then prints a compact table plus `[vad.summary]`. `/exec`, `/private`, `/wx`, and `/pe` narrow the output; `/pe` probes private VAD first pages with the same PE header detector used by pool PE hunting.
+
+`!threads` walks the process thread list, prints ETHREAD/TID/start/Win32StartAddress/TEB/module/VAD annotations, optionally includes stack bounds, and `/apc` surfaces conservative APC queue evidence when ETHREAD/KAPC layouts are available. Both commands support `/json <path>` with stable field names for diffing. Warnings are expected on PDB drift, protected process/module enumeration failures, partial reads, or APC layouts that cannot be interpreted confidently.
 
 ## Kernel Callback Scanner
 
