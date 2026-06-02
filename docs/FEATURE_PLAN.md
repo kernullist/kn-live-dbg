@@ -325,7 +325,50 @@ Operational value:
 2. Pair with `pool-scan-pe` for hidden images and `!driver integrity` for
    dispatch pointer checks.
 
-## 8. Positive-Control Probe Expansion
+## 8. BYOVD Intelligence Scanner
+
+Status: implemented as `byovd [scan|update|status]` and `!byovd`.
+`tools\update-byovd-intel.ps1` builds a local catalog from the Microsoft
+vulnerable driver blocklist plus LOLDrivers hash/YARA feeds. `scan` refreshes
+the catalog automatically when it is older than 24 hours, unless `/no-update`
+is supplied.
+
+Implemented behavior:
+
+1. Downloads and extracts the Microsoft blocklist ZIP/XML, normalizing exact
+   hash denies and file-name/version file-attribute rules.
+2. Downloads LOLDrivers vulnerable/malicious and LoadsDespiteHVCI hash feeds,
+   plus the strict vulnerable-driver and malicious-driver YARA rule files.
+3. Hashes loaded kernel module images on disk with MD5/SHA1/SHA256 and reports
+   exact catalog hits as `HIGH` confidence.
+4. Reads PE fixed file versions and reports Microsoft name/version blocklist
+   hits as `MEDIUM` confidence signer-unverified triage hints.
+5. Emits stable `kn-live-dbg.byovd-scan.v1` JSON and includes the updater
+   script in release packages.
+6. Runs downloaded LOLDrivers YARA rules over loaded driver images when
+   `/yara` is supplied. The scanner uses an external `yara64.exe` / `yara.exe`,
+   applies a per-driver per-rule timeout, and reports YARA rule hits as `HIGH`
+   confidence with `source=loldrivers_yara`. Release packages intentionally do
+   not include YARA binaries; operators provide them separately.
+7. Provides a benign no-op positive-control fixture driver named
+   `amdryzenmasterdriver.sys` with fixed PE version `1.0.0.0`. `byovd fixture
+   load` installs it through SCM so `byovd scan` can verify the Microsoft
+   file-name/version `MEDIUM` hit path without using a real vulnerable driver.
+   On systems where HVCI or the Windows vulnerable-driver blocklist blocks the
+   fixture at load time, the scanner is not expected to report it because it
+   never reaches the loaded module list.
+
+Remaining hardening:
+
+1. Validate WDAC signer/certificate constraints for Microsoft file-attribute
+   hits before raising them above triage confidence.
+2. Add YARA execution over dumped PE/pool artifacts, not only loaded module
+   backing files.
+3. Add catalog diff output for added/removed rules between updates.
+4. Add a test-only catalog overlay for benign `HIGH` exact-hash positive
+   controls.
+
+## 9. Positive-Control Probe Expansion
 
 Turn `KnLiveDbgProbe.sys` into a small scanner regression fixture.
 

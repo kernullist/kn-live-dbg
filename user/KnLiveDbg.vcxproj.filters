@@ -25,6 +25,9 @@
     <ClCompile Include="AlpcScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ByovdScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="CallbackScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -94,6 +97,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AlpcScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ByovdScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CallbackScanner.h">

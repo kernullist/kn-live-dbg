@@ -11,6 +11,7 @@ $solution = Join-Path $repo "kn-live-dbg.sln"
 $exePath = Join-Path $repo "x64\$Configuration\KnLiveDbg.exe"
 $sysPath = Join-Path $repo "x64\$Configuration\KnLiveDbg.sys"
 $probeSysPath = Join-Path $repo "x64\$Configuration\KnLiveDbgProbe.sys"
+$byovdFixtureSysPath = Join-Path $repo "x64\$Configuration\amdryzenmasterdriver.sys"
 $outputDir = Join-Path $repo "x64\$Configuration"
 $vendorDebuggersDir = Join-Path $repo "vendor\debugging-tools\x64"
 $stateDir = Join-Path $repo ".build"
@@ -357,6 +358,34 @@ function Assert-DriverSignature
     }
 }
 
+function Assert-ByovdFixtureMetadata
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path))
+    {
+        throw "BYOVD fixture driver output was not found: $Path"
+    }
+
+    $item = Get-Item -LiteralPath $Path
+    $fileVersion = [string]$item.VersionInfo.FileVersion
+    $originalName = [string]$item.VersionInfo.OriginalFilename
+    if ($fileVersion -ne "1.0.0.0" -and $fileVersion -ne "1.0.0")
+    {
+        throw "BYOVD fixture PE version mismatch for $Path. expected=1.0.0.0 actual=$fileVersion"
+    }
+
+    if ($originalName -ne "amdryzenmasterdriver.sys")
+    {
+        throw "BYOVD fixture original filename mismatch for $Path. actual=$originalName"
+    }
+
+    Write-Host "amdryzenmasterdriver.sys BYOVD fixture metadata: FileVersion=$fileVersion OriginalFilename=$originalName"
+}
+
 function Copy-DebuggingToolsRuntime
 {
     param(
@@ -473,9 +502,11 @@ if ($LASTEXITCODE -ne 0)
 Assert-PEVersion -Path $exePath -Parts $versionParts
 Assert-PEVersion -Path $sysPath -Parts $versionParts
 Assert-PEVersion -Path $probeSysPath -Parts $versionParts
+Assert-ByovdFixtureMetadata -Path $byovdFixtureSysPath
 
 Assert-DriverSignature -Path $sysPath
 Assert-DriverSignature -Path $probeSysPath
+Assert-DriverSignature -Path $byovdFixtureSysPath
 
 $runtimeSourceDir = $vendorDebuggersDir
 if (-not (Test-Path (Join-Path $runtimeSourceDir "dbghelp.dll")) -or
@@ -496,4 +527,5 @@ if ($BumpVersion)
 Write-Host "EXE: $exePath"
 Write-Host "SYS: $sysPath"
 Write-Host "PROBE SYS: $probeSysPath"
+Write-Host "BYOVD FIXTURE SYS: $byovdFixtureSysPath"
 Write-Host "Version state: $statePath"

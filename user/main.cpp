@@ -1,6 +1,7 @@
 #include "AddressInspector.h"
 #include "AiProvider.h"
 #include "AlpcScanner.h"
+#include "ByovdScanner.h"
 #include "CallbackScanner.h"
 #include "CommandRegistry.h"
 #include "DbgEngBackend.h"
@@ -567,6 +568,8 @@ struct DebuggerState
     bool MainDriverUnloaded;
     bool ProbeDriverCleanupRequested;
     bool ProbeDriverUnloaded;
+    bool ByovdFixtureCleanupRequested;
+    bool ByovdFixtureUnloaded;
     std::wstring LastCommand;
     std::vector<std::wstring> CommandHistory;
     std::wstring DbgEngConnectOptions;
@@ -586,6 +589,9 @@ struct DebuggerState
 };
 
 static constexpr uint32_t KNDBG_SYSTEM_PROCESS_ID = 4;
+static constexpr const wchar_t* KNDBG_BYOVD_FIXTURE_SERVICE_NAME = L"KnLiveDbgByovdFixture";
+static constexpr const wchar_t* KNDBG_BYOVD_FIXTURE_DISPLAY_NAME = L"KnLiveDbg BYOVD Positive-Control Fixture";
+static constexpr const wchar_t* KNDBG_BYOVD_FIXTURE_IMAGE_NAME = L"amdryzenmasterdriver.sys";
 static constexpr uint64_t KNDBG_X64_PTE_PRESENT = 0x1ull;
 static constexpr uint64_t KNDBG_X64_PTE_WRITE = 0x2ull;
 static constexpr uint64_t KNDBG_X64_PTE_LARGE_PAGE = 0x80ull;
@@ -2057,6 +2063,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!threads" ||
         command == L"!wfp" ||
         command == L"!alpc" ||
+        command == L"!byovd" ||
         command == L"!vbs" ||
         command == L"!ci" ||
         command == L"!securekernel" ||
@@ -3791,6 +3798,43 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"help"
             };
             AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"byovd" || command == L"!byovd")
+        {
+            if (argsBefore.size() >= 2 && ToLower(argsBefore[1]) == L"fixture")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"status",
+                    L"load",
+                    L"unload",
+                    L"path",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else
+            {
+                static const wchar_t* values[] =
+                {
+                    L"scan",
+                    L"update",
+                    L"status",
+                    L"fixture",
+                    L"/no-update",
+                L"/force-update",
+                L"/exact",
+                L"/yara",
+                L"/yara-path",
+                L"/yara-timeout",
+                L"/verbose",
+                L"/summary",
+                L"/limit",
+                    L"/json",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"pool-scan-pe")
         {
@@ -9535,6 +9579,40 @@ static bool CleanupProbeDriverOnExit(DebuggerState& state)
     return ok;
 }
 
+static bool CleanupByovdFixtureDriverOnExit(DebuggerState& state)
+{
+    bool ok = false;
+    std::wstring error;
+
+    do
+    {
+        if (!state.ByovdFixtureCleanupRequested)
+        {
+            ok = true;
+            break;
+        }
+
+        if (state.ByovdFixtureUnloaded)
+        {
+            ok = true;
+            break;
+        }
+
+        DriverService fixtureService(KNDBG_BYOVD_FIXTURE_SERVICE_NAME, KNDBG_BYOVD_FIXTURE_DISPLAY_NAME);
+        DriverUnloadResult unloadResult = {};
+        if (!UnloadDriverServiceWithUx(fixtureService, L"BYOVD fixture automatic unload", &unloadResult, &error))
+        {
+            std::wcerr << L"automatic BYOVD fixture unload failed: " << error << L"\n";
+            break;
+        }
+
+        state.ByovdFixtureUnloaded = true;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool AcquireSingleInstanceLock(std::wstring* error)
 {
     bool ok = false;
@@ -12412,6 +12490,574 @@ static bool ParseIntegrityLimitOption(
     } while (false);
 
     return ok;
+}
+
+static std::wstring GetDefaultByovdFixturePath()
+{
+    return GetExecutableDirectory() + L"\\" + KNDBG_BYOVD_FIXTURE_IMAGE_NAME;
+}
+
+static void PrintByovdHelp()
+{
+    std::wcout << L"byovd command:\n";
+    std::wcout << L"  byovd [scan] [/no-update] [/force-update] [/exact] [/yara]\n";
+    std::wcout << L"               [/yara-path <exe>] [/yara-timeout <seconds>]\n";
+    std::wcout << L"               [/verbose] [/summary]\n";
+    std::wcout << L"               [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  byovd update [/force]\n";
+    std::wcout << L"  byovd status\n";
+    std::wcout << L"  byovd fixture [status|load [sys-path]|unload|path]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Scans currently loaded kernel modules against a local BYOVD intelligence\n";
+    std::wcout << L"  catalog built from the Microsoft vulnerable driver blocklist and LOLDrivers\n";
+    std::wcout << L"  hash/YARA feeds. The scan updates the local catalog automatically when it is\n";
+    std::wcout << L"  missing or older than 24 hours, then hashes each module image on disk.\n";
+    std::wcout << L"\n";
+    std::wcout << L"match confidence:\n";
+    std::wcout << L"  HIGH    exact MD5/SHA1/SHA256 catalog match.\n";
+    std::wcout << L"  MEDIUM  Microsoft file-name and file-version blocklist hint. Signer checks\n";
+    std::wcout << L"          are not yet applied, so treat this as triage evidence.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /no-update     skip stale-catalog auto update for this scan.\n";
+    std::wcout << L"  /force-update  update before scanning even when the catalog is fresh.\n";
+    std::wcout << L"  /exact         suppress name/version hints; /yara still adds YARA hits.\n";
+    std::wcout << L"  /yara          run LOLDrivers YARA rules through external yara64.exe/yara.exe.\n";
+    std::wcout << L"                 YARA binaries are operator-supplied and not bundled.\n";
+    std::wcout << L"  /yara-path     use a specific YARA executable path.\n";
+    std::wcout << L"  /yara-timeout  per-driver per-rule timeout in seconds, default 30.\n";
+    std::wcout << L"  /verbose       also print clean modules and hash/read failures.\n";
+    std::wcout << L"  /summary       print only aggregate counts and warnings.\n";
+    std::wcout << L"  /limit <n>     cap printed records while still scanning all modules.\n";
+    std::wcout << L"  /json <path>   write structured kn-live-dbg.byovd-scan.v1 JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"fixture:\n";
+    std::wcout << L"  Loads a benign no-op driver named " << KNDBG_BYOVD_FIXTURE_IMAGE_NAME << L".\n";
+    std::wcout << L"  It is expected to trigger a Microsoft file-name/version MEDIUM hit only.\n";
+    std::wcout << L"  If Windows blocks the load, check HVCI, Secure Boot, test signing, and the\n";
+    std::wcout << L"  vulnerable-driver blocklist state before debugging the scanner.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  byovd\n";
+    std::wcout << L"  byovd scan /exact\n";
+    std::wcout << L"  byovd scan /yara\n";
+    std::wcout << L"  byovd scan /force-update /json .\\byovd-scan.json\n";
+    std::wcout << L"  byovd update\n";
+    std::wcout << L"  byovd status\n";
+    std::wcout << L"  byovd fixture load\n";
+    std::wcout << L"  byovd scan\n";
+    std::wcout << L"  byovd fixture unload\n";
+}
+
+static void PrintByovdFixtureStatus(const DriverStatus& status)
+{
+    std::wcout << L"byovd fixture service: " << (status.Installed ? L"installed" : L"not installed");
+    if (!status.StateText.empty())
+    {
+        std::wcout << L" state=" << status.StateText;
+    }
+    std::wcout << L"\n";
+    std::wcout << L"  defaultPath=" << GetDefaultByovdFixturePath() << L"\n";
+    std::wcout << L"  expectedHit=MEDIUM source=microsoft_blocklist name="
+               << KNDBG_BYOVD_FIXTURE_IMAGE_NAME << L" version=1.0.0.0\n";
+}
+
+static void HandleByovdFixtureCommand(
+    const std::vector<std::wstring>& args,
+    size_t index,
+    DebuggerState& state)
+{
+    std::wstring action = index < args.size() ? ToLower(args[index]) : L"status";
+    std::wstring error;
+    DriverService fixtureService(KNDBG_BYOVD_FIXTURE_SERVICE_NAME, KNDBG_BYOVD_FIXTURE_DISPLAY_NAME);
+    bool argumentError = false;
+
+    do
+    {
+        if (index < args.size() && HasHelpToken(args, index))
+        {
+            PrintByovdHelp();
+            break;
+        }
+
+        if (action == L"status" || action == L"path" || action == L"unload")
+        {
+            if (args.size() > index + 1)
+            {
+                std::wcerr << L"byovd fixture " << action
+                           << L": unexpected argument \"" << args[index + 1] << L"\"\n";
+                argumentError = true;
+                break;
+            }
+        }
+
+        if (action == L"status")
+        {
+            DriverStatus status = {};
+            if (!fixtureService.Query(&status, &error))
+            {
+                std::wcerr << L"byovd fixture status failed: " << error << L"\n";
+                break;
+            }
+
+            PrintByovdFixtureStatus(status);
+        }
+        else if (action == L"path")
+        {
+            std::wcout << GetDefaultByovdFixturePath() << L"\n";
+        }
+        else if (action == L"load")
+        {
+            std::wstring driverPath = (args.size() > index + 1)
+                ? JoinArgs(args, index + 1)
+                : GetDefaultByovdFixturePath();
+
+            state.ByovdFixtureCleanupRequested = true;
+            state.ByovdFixtureUnloaded = false;
+
+            if (!LoadDriverServiceWithUx(fixtureService, L"BYOVD fixture driver load", driverPath, &error))
+            {
+                std::wcerr << L"byovd fixture load failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << L"byovd fixture loaded: " << driverPath << L"\n";
+            std::wcout << L"run: byovd scan\n";
+        }
+        else if (action == L"unload")
+        {
+            DriverUnloadResult unloadResult = {};
+            if (!UnloadDriverServiceWithUx(fixtureService, L"BYOVD fixture driver unload", &unloadResult, &error))
+            {
+                std::wcerr << L"byovd fixture unload failed: " << error << L"\n";
+                break;
+            }
+
+            state.ByovdFixtureUnloaded = true;
+        }
+        else
+        {
+            std::wcerr << L"usage: byovd fixture [status|load [sys-path]|unload|path]\n";
+        }
+    } while (false);
+
+    if (argumentError)
+    {
+        std::wcerr << L"usage: byovd fixture [status|load [sys-path]|unload|path]\n";
+    }
+}
+
+static void PrintByovdStatus(const ByovdCatalogStatus& status)
+{
+    PrintColoredText(L"[byovd.status]", KNDBG_COLOR_TITLE);
+    std::wcout << L" catalog=" << (status.HasCatalog ? L"yes" : L"no")
+               << L" stale=" << (status.Stale ? L"yes" : L"no")
+               << L" ageSeconds=" << status.AgeSeconds
+               << L" entries=" << status.EntryCount << L"\n";
+
+    std::wcout << L"  data=" << status.DataDirectory << L"\n";
+    std::wcout << L"  catalog=" << status.CatalogPath << L"\n";
+    std::wcout << L"  manifest=" << status.ManifestPath << L"\n";
+    std::wcout << L"  yara=" << status.YaraDirectory
+               << L" rules=" << status.YaraRuleFileCount
+               << L" present=" << (status.HasYaraRules ? L"yes" : L"no") << L"\n";
+
+    if (!status.SourceCounts.empty())
+    {
+        std::wcout << L"  sources:";
+        for (const auto& item : status.SourceCounts)
+        {
+            std::wcout << L" " << item.first << L"=" << item.second;
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!status.MatchTypeCounts.empty())
+    {
+        std::wcout << L"  matchTypes:";
+        for (const auto& item : status.MatchTypeCounts)
+        {
+            std::wcout << L" " << item.first << L"=" << item.second;
+        }
+        std::wcout << L"\n";
+    }
+}
+
+static void PrintByovdMatch(const ByovdMatch& match)
+{
+    std::wcout << L"  ";
+    PrintColoredText(
+        L"[byovd.match]",
+        match.Confidence == L"HIGH" ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN);
+    std::wcout << L" confidence=";
+    PrintColoredText(
+        match.Confidence,
+        match.Confidence == L"HIGH" ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN);
+    std::wcout << L" source=" << match.Entry.Source
+               << L" category=" << match.Entry.Category
+               << L" type=" << match.Entry.MatchType;
+
+    if (!match.Entry.Value.empty())
+    {
+        std::wcout << L" value=" << match.Entry.Value;
+    }
+    if (!match.Entry.Name.empty())
+    {
+        std::wcout << L" name=" << match.Entry.Name;
+    }
+    if (!match.Entry.MinimumVersion.empty() || !match.Entry.MaximumVersion.empty())
+    {
+        std::wcout << L" versionRange=" << match.Entry.MinimumVersion
+                   << L".." << match.Entry.MaximumVersion;
+    }
+    if (!match.Reason.empty())
+    {
+        std::wcout << L" reason=\"" << match.Reason << L"\"";
+    }
+    if (!match.Entry.Description.empty())
+    {
+        std::wcout << L" desc=\"" << match.Entry.Description << L"\"";
+    }
+    std::wcout << L"\n";
+}
+
+static void PrintByovdRecord(const ByovdModuleRecord& record)
+{
+    bool suspicious = !record.Matches.empty();
+    bool high = false;
+    for (const ByovdMatch& match : record.Matches)
+    {
+        if (match.Confidence == L"HIGH")
+        {
+            high = true;
+            break;
+        }
+    }
+
+    PrintColoredText(
+        suspicious ? L"[byovd.hit]" : L"[byovd.clean]",
+        suspicious ? (high ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN) : KNDBG_COLOR_DIM);
+    std::wcout << L" image=";
+    PrintColoredText(record.ImageName.empty() ? L"<unknown>" : record.ImageName,
+                     suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_OK);
+    std::wcout << L" base=" << HexTextWidth(record.Base, 16, true)
+               << L" size=0x" << std::hex << record.Size << std::dec;
+
+    if (record.VersionRead)
+    {
+        std::wcout << L" version=" << record.FileVersion;
+    }
+    if (record.FileHashed)
+    {
+        std::wcout << L" sha256=" << record.Sha256;
+    }
+    if (!record.Error.empty())
+    {
+        std::wcout << L" error=\"" << record.Error << L"\"";
+    }
+    if (record.YaraScanned)
+    {
+        std::wcout << L" yara=yes";
+    }
+    if (record.YaraTimedOut)
+    {
+        std::wcout << L" yaraTimeout=yes";
+    }
+    if (!record.YaraError.empty())
+    {
+        std::wcout << L" yaraError=\"" << record.YaraError << L"\"";
+    }
+    std::wcout << L"\n";
+
+    if (!record.DiskPath.empty())
+    {
+        std::wcout << L"  path=" << record.DiskPath << L"\n";
+    }
+
+    for (const ByovdMatch& match : record.Matches)
+    {
+        PrintByovdMatch(match);
+    }
+}
+
+static void HandleByovdCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintByovdHelp();
+            break;
+        }
+
+        std::wstring action = L"scan";
+        size_t index = 1;
+        if (args.size() >= 2)
+        {
+            std::wstring maybeAction = ToLower(args[1]);
+            if (maybeAction == L"scan" || maybeAction == L"update" || maybeAction == L"status" || maybeAction == L"fixture")
+            {
+                action = maybeAction;
+                index = 2;
+            }
+        }
+
+        ByovdScanner scanner(symbols, GetExecutableDirectory());
+        std::wstring error;
+
+        if (action == L"status")
+        {
+            ByovdCatalogStatus status = {};
+            if (!scanner.QueryCatalogStatus(&status, &error))
+            {
+                std::wcerr << L"byovd status failed: " << error << L"\n";
+                break;
+            }
+
+            PrintByovdStatus(status);
+            break;
+        }
+
+        if (action == L"fixture")
+        {
+            HandleByovdFixtureCommand(args, index, state);
+            break;
+        }
+
+        if (action == L"update")
+        {
+            bool force = true;
+            bool helpRequested = false;
+            bool parseError = false;
+            while (index < args.size())
+            {
+                std::wstring opt = ToLower(args[index]);
+                if (opt == L"/force")
+                {
+                    force = true;
+                    ++index;
+                    continue;
+                }
+                if (opt == L"help")
+                {
+                    PrintByovdHelp();
+                    helpRequested = true;
+                    break;
+                }
+
+                std::wcerr << L"byovd update: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+
+            if (helpRequested || parseError)
+            {
+                break;
+            }
+
+            std::vector<std::wstring> messages;
+            if (!scanner.UpdateCatalog(force, &messages, &error))
+            {
+                std::wcerr << L"byovd update failed: " << error << L"\n";
+                break;
+            }
+
+            for (const std::wstring& message : messages)
+            {
+                PrintColoredText(L"[byovd.update]", KNDBG_COLOR_TITLE);
+                std::wcout << L" " << message << L"\n";
+            }
+            PrintColoredText(L"[byovd.update]", KNDBG_COLOR_OK);
+            std::wcout << L" complete\n";
+            break;
+        }
+
+        ByovdScanOptions options = {};
+        std::wstring jsonPath;
+        bool parseError = false;
+
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/no-update")
+            {
+                options.AutoUpdate = false;
+                ++index;
+                continue;
+            }
+            if (opt == L"/force-update")
+            {
+                options.ForceUpdate = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/exact")
+            {
+                options.ExactOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/yara")
+            {
+                options.EnableYara = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/yara-path")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"byovd scan: /yara-path requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                options.EnableYara = true;
+                options.YaraExecutable = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (opt == L"/yara-timeout")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"byovd scan: /yara-timeout requires seconds\n";
+                    parseError = true;
+                    break;
+                }
+
+                uint64_t timeoutSeconds = 0;
+                if (!ParseUnsigned(args[index + 1], 10, &timeoutSeconds) ||
+                    timeoutSeconds == 0 ||
+                    timeoutSeconds > 600)
+                {
+                    std::wcerr << L"byovd scan: invalid /yara-timeout, expected 1..600 seconds\n";
+                    parseError = true;
+                    break;
+                }
+
+                options.EnableYara = true;
+                options.YaraTimeoutSeconds = static_cast<uint32_t>(timeoutSeconds);
+                index += 2;
+                continue;
+            }
+            if (opt == L"/verbose")
+            {
+                options.Verbose = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/summary")
+            {
+                options.SummaryOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"byovd scan: /limit requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                if (!ParseIntegrityLimitOption(args[index + 1], state.NumberBase, &options.Limit, &error))
+                {
+                    std::wcerr << L"byovd scan: " << error << L"\n";
+                    parseError = true;
+                    break;
+                }
+                index += 2;
+                continue;
+            }
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"byovd scan: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"byovd scan: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+
+            std::wcerr << L"byovd scan: unexpected argument \"" << args[index] << L"\"\n";
+            parseError = true;
+            break;
+        }
+
+        if (parseError)
+        {
+            break;
+        }
+
+        ByovdScanResult result = {};
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"byovd scan failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"byovd warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& message : result.Messages)
+        {
+            PrintColoredText(L"[byovd.info]", KNDBG_COLOR_DIM);
+            std::wcout << L" " << message << L"\n";
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"byovd warning: " << warning << L"\n";
+        }
+
+        if (!jsonPath.empty())
+        {
+            if (WriteUtf8TextFile(jsonPath, BuildByovdScanJson(result), &error))
+            {
+                std::wcout << L"byovd json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"byovd json failed: " << error << L"\n";
+            }
+        }
+
+        if (!options.SummaryOnly)
+        {
+            for (const ByovdModuleRecord& record : result.Records)
+            {
+                PrintByovdRecord(record);
+            }
+        }
+
+        PrintColoredText(L"[byovd.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" scanned=" << result.ModulesScanned
+                   << L" hashed=" << result.FilesHashed
+                   << L" readFail=" << result.FileReadFailures
+                   << L" matched=" << result.MatchedModules
+                   << L" exact=" << result.ExactMatches
+                   << L" hints=" << result.HintMatches
+                   << L" yaraScans=" << result.YaraScans
+                   << L" yaraMatches=" << result.YaraMatches
+                   << L" yaraFailures=" << result.YaraFailures
+                   << L" yaraTimeouts=" << result.YaraTimeouts
+                   << L" updateAttempted=" << (result.CatalogUpdateAttempted ? L"yes" : L"no")
+                   << L" updated=" << (result.CatalogUpdated ? L"yes" : L"no")
+                   << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
+    } while (false);
 }
 
 static void PrintReasonCodes(const std::vector<std::wstring>& codes)
@@ -16512,6 +17158,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"!alpc")
         {
             PrintAlpcHelp();
+        }
+        else if (command == L"byovd" || command == L"!byovd")
+        {
+            PrintByovdHelp();
         }
         else if (command == L"!vbs")
         {
@@ -26525,6 +27175,10 @@ static bool HandleCommand(
         {
             HandleDriverIntegrityCommand(args, state, device, symbols);
         }
+        else if (command == L"byovd" || command == L"!byovd")
+        {
+            HandleByovdCommand(args, state, symbols);
+        }
         else if (command == L"!pool")
         {
             HandlePoolCommand(args, state, device, symbols);
@@ -26880,6 +27534,8 @@ int wmain(int argc, wchar_t** argv)
     state.MainDriverUnloaded = false;
     state.ProbeDriverCleanupRequested = false;
     state.ProbeDriverUnloaded = false;
+    state.ByovdFixtureCleanupRequested = false;
+    state.ByovdFixtureUnloaded = false;
     state.Backend = DebuggerState::BackendMode::Auto;
 
     DriverService service;
@@ -27090,6 +27746,10 @@ int wmain(int argc, wchar_t** argv)
 
     dbgeng.Shutdown();
     bool cleanupOk = true;
+    if (!CleanupByovdFixtureDriverOnExit(state))
+    {
+        cleanupOk = false;
+    }
     if (!CleanupProbeDriverOnExit(state))
     {
         cleanupOk = false;
