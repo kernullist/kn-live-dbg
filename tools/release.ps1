@@ -209,6 +209,7 @@ $requiredFiles = @(
     "KnLiveDbg.exe",
     "KnLiveDbg.sys",
     "KnLiveDbgProbe.sys",
+    "amdryzenmasterdriver.sys",
     "dbghelp.dll",
     "dbgeng.dll",
     "dbgcore.dll",
@@ -259,6 +260,21 @@ if (Test-Path $vendorManifest)
         name   = $manifestItem.Name
         size   = $manifestItem.Length
         sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifestDestination).Hash
+    }) | Out-Null
+}
+
+$byovdUpdateScript = Join-Path $repo "tools\update-byovd-intel.ps1"
+if (Test-Path $byovdUpdateScript)
+{
+    $toolsDestination = Join-Path $stagingDir "tools"
+    New-Item -ItemType Directory -Force -Path $toolsDestination | Out-Null
+    $scriptDestination = Join-Path $toolsDestination "update-byovd-intel.ps1"
+    Copy-Item -LiteralPath $byovdUpdateScript -Destination $scriptDestination -Force
+    $scriptItem = Get-Item -LiteralPath $scriptDestination
+    $entries.Add([pscustomobject]@{
+        name   = "tools/update-byovd-intel.ps1"
+        size   = $scriptItem.Length
+        sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $scriptDestination).Hash
     }) | Out-Null
 }
 

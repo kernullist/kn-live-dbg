@@ -70,7 +70,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -94,7 +94,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -104,6 +104,7 @@
     <ClCompile Include="AddressInspector.cpp" />
     <ClCompile Include="AiProvider.cpp" />
     <ClCompile Include="AlpcScanner.cpp" />
+    <ClCompile Include="ByovdScanner.cpp" />
     <ClCompile Include="CallbackScanner.cpp" />
     <ClCompile Include="CommandRegistry.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
@@ -134,6 +135,7 @@
     <ClInclude Include="AddressInspector.h" />
     <ClInclude Include="AiProvider.h" />
     <ClInclude Include="AlpcScanner.h" />
+    <ClInclude Include="ByovdScanner.h" />
     <ClInclude Include="CallbackScanner.h" />
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="DbgEngBackend.h" />

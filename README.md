@@ -59,13 +59,14 @@ kn-live-dbg/
 24. Reports VBS, HVCI, Secure Kernel, and IUM trustlet status with `!vbs`, `!ci`, and `!securekernel` — decoding `nt!g_CiOptions` flag bits, reading `nt!HvlpVsmVtlCallVa` for VBS active state, scanning `PsLoadedModuleList` for `securekernel.exe`/`skci.dll`, querying CPUID leaves `0x40000000`/`0x40000006` for hypervisor identification, and walking `PsActiveProcessHead` with `_KPROCESS.SecureState` (or known trustlet image-name prefixes when the field is unavailable) for the trustlet list.
 25. Detects InfinityHook-style ETW logger tampering with `!etw` and walks the registered NMI handler chain with `!nmi` — reading `nt!EtwpDebuggerData`'s 64 `WMI_LOGGER_CONTEXT*` slots for logger name and GetCpuClock annotation, walking `nt!KiNmiCallbackListHead` through the `KNMI_HANDLER_CALLBACK` singly-linked list, and flagging any callback or GetCpuClock target outside the loaded kernel modules.
 26. Checks live module and driver-object integrity with `!module integrity` and `!driver integrity` -- reading live PE headers/sections for loaded modules, validating PE/section invariants with reason codes, flagging static/effective W+X evidence or live SizeOfImage drift, walking `\Driver` objects through Object Manager metadata, and annotating `DRIVER_OBJECT.MajorFunction[]` dispatch targets with module/symbol ownership.
-27. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), W+X page attributes (`/wx`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
-28. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
-29. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
-30. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
-31. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
-32. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
-33. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
+27. Scans loaded kernel modules for BYOVD risk with `byovd` / `!byovd` -- maintaining a local catalog from the Microsoft vulnerable driver blocklist plus LOLDrivers hash/YARA feeds, auto-refreshing it when older than 24 hours, hashing loaded module images on disk, optionally running LOLDrivers YARA rules through an operator-supplied `yara64.exe` / `yara.exe`, and reporting exact hash/YARA matches as `HIGH` confidence plus Microsoft file-name/version blocklist hints as `MEDIUM` confidence. A benign no-op fixture driver (`amdryzenmasterdriver.sys`) can be loaded with `byovd fixture load` to exercise the Microsoft name/version positive-control path without shipping an actual vulnerable driver.
+28. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), W+X page attributes (`/wx`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
+29. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
+30. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
+31. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
+32. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
+33. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
+34. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
 
 ## Design Notes
 
@@ -105,7 +106,7 @@ Create a release zip:
 .\tools\release.ps1 -Configuration Release
 ```
 
-The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the vendored runtime manifest when present, and `kn-live-dbg-version.json`.
+The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, the BYOVD positive-control fixture driver, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the vendored runtime manifest when present, `tools\update-byovd-intel.ps1`, and `kn-live-dbg-version.json`. YARA binaries are intentionally not packaged.
 
 Expected outputs:
 
@@ -197,6 +198,9 @@ callbacks [scope] /module <module>
 !nmi [callbacks]
 !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]
 !driver integrity [driver|all] [/limit <n>] [/json <path>]
+byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
+!byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
+byovd fixture [status|load [sys-path]|unload|path]
 !pool [big|find|summary] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx]
 dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
@@ -827,6 +831,57 @@ knkd> !module integrity ntoskrnl /headers /sections
 knkd> !module integrity all /limit 20 /json .\module-integrity.json
 knkd> !driver integrity WdFilter
 knkd> !driver integrity all /json .\driver-integrity.json
+```
+
+## BYOVD Intelligence Scan
+
+`byovd` (also accepted as `!byovd`) scans the currently loaded kernel module list against a local BYOVD catalog. The catalog is generated by `tools\update-byovd-intel.ps1` from the Microsoft vulnerable driver blocklist ZIP/XML plus LOLDrivers hash and YARA feeds. `byovd scan` automatically refreshes the local catalog under `<exe-dir>\data\byovd` when it is missing or older than 24 hours; use `/no-update` to force offline/reproducible mode or `/force-update` to refresh before scanning.
+
+```text
+byovd [scan] [/no-update] [/force-update] [/exact] [/verbose] [/summary]
+             [/limit <n>] [/json <path>]
+!byovd [scan] [/no-update] [/force-update] [/exact] [/verbose] [/summary]
+              [/limit <n>] [/json <path>]
+byovd scan /yara [/yara-path <exe>] [/yara-timeout <seconds>]
+byovd update [/force]
+byovd status
+byovd fixture [status|load [sys-path]|unload|path]
+```
+
+The scanner hashes each loaded module image on disk with MD5/SHA1/SHA256. Exact hash matches against Microsoft or LOLDrivers entries are reported as `HIGH` confidence. Microsoft file-attribute rules are also matched by file name plus PE file version and reported as `MEDIUM` confidence because signer/certificate constraints are not yet enforced in this slice. `/exact` suppresses those name/version hints when the operator wants hash-only evidence.
+
+`/yara` additionally runs the downloaded LOLDrivers YARA files under `<exe-dir>\data\byovd\yara` against each loaded module image on disk. YARA execution uses an external `yara64.exe` / `yara.exe`, but release packages intentionally do not include YARA binaries. Install YARA separately, put it on `PATH`, or use `/yara-path <exe>` to pin a specific binary. KnLiveDbg also searches the EXE directory, `tools\`, development parent `tools\` directories, and the current working directory's `tools\` for operator-supplied binaries. `/yara-timeout <seconds>` caps each driver/rule invocation; the default is 30 seconds and accepted range is 1..600 seconds. YARA hits are emitted as `HIGH` confidence with `source=loldrivers_yara` and `match_type=yara`. JSON output uses `kn-live-dbg.byovd-scan.v1` and includes `summary.yara_*`, `yara.executable`, and `yara.rule_files`.
+`summary.yara_scans` counts attempted YARA process invocations, while `summary.yara_failures` and `summary.yara_timeouts` split out failed or timed-out attempts.
+
+`byovd fixture load` installs and starts the bundled no-op fixture driver `amdryzenmasterdriver.sys`. The driver creates no device, exposes no IOCTLs, and only sets `DriverUnload`; its file name and fixed PE version `1.0.0.0` are intentionally chosen to satisfy a Microsoft vulnerable-driver file-attribute rule so the scanner should report a `MEDIUM` signer-unverified hit. This fixture is for testing the name/version path only. `HIGH` exact-hash testing should use a test-only local catalog entry for a benign sample hash, not a real vulnerable driver binary.
+
+Positive-control flow:
+
+```text
+knkd> byovd update
+knkd> byovd fixture load
+knkd> byovd scan /no-update /verbose
+...
+[byovd.hit] image=amdryzenmasterdriver.sys ... version=1.0.0.0 ...
+  [byovd.match] confidence=MEDIUM source=microsoft_blocklist category=microsoft_file_attribute type=file_version name=amdryzenmasterdriver.sys versionRange=0.0.0.0..1.5.0.0
+knkd> byovd fixture unload
+```
+
+If the fixture fails to load before the scan, treat that as a platform policy result first: HVCI, Secure Boot, test-signing state, and the Windows vulnerable-driver blocklist can prevent a driver that intentionally matches a Microsoft blocklist rule from loading. In that case the scanner has no loaded module to report; use a test VM with the intended code-integrity policy, or validate the catalog/status path with `byovd status` and updater tests.
+
+Examples:
+
+```text
+knkd> byovd
+knkd> byovd scan /exact
+knkd> byovd scan /yara
+knkd> byovd scan /yara /yara-path C:\Tools\YARA\yara64.exe /yara-timeout 15
+knkd> byovd scan /force-update /json .\byovd-scan.json
+knkd> byovd update
+knkd> byovd status
+knkd> byovd fixture load
+knkd> byovd scan
+knkd> byovd fixture unload
 ```
 
 ## Big Pool PE Hunting
