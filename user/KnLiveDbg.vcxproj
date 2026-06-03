@@ -111,6 +111,7 @@
     <ClCompile Include="DeviceClient.cpp" />
     <ClCompile Include="DriverService.cpp" />
     <ClCompile Include="EtwScanner.cpp" />
+    <ClCompile Include="FirmwareTableScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
     <ClCompile Include="NmiScanner.cpp" />
     <ClCompile Include="MemoryDumper.cpp" />
@@ -142,6 +143,7 @@
     <ClInclude Include="DeviceClient.h" />
     <ClInclude Include="DriverService.h" />
     <ClInclude Include="EtwScanner.h" />
+    <ClInclude Include="FirmwareTableScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="NmiScanner.h" />
