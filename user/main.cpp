@@ -8,6 +8,7 @@
 #include "DeviceClient.h"
 #include "DriverService.h"
 #include "EtwScanner.h"
+#include "FirmwareTableScanner.h"
 #include "IntegrityScanner.h"
 #include "MemoryDumper.h"
 #include "NativeDisassembler.h"
@@ -1743,6 +1744,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  !securekernel\n";
     std::wcout << L"  !etw loggers\n";
     std::wcout << L"  !nmi callbacks\n";
+    std::wcout << L"  !fwtable providers\n";
     std::wcout << L"  !wnf decode 0x41c64e6da3bc0075\n";
     std::wcout << L"  !wnf instances\n";
     std::wcout << L"  write off\n";
@@ -2069,6 +2071,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!securekernel" ||
         command == L"!etw" ||
         command == L"!nmi" ||
+        command == L"!fwtable" ||
         command == L"!module" ||
         command == L"!driver" ||
         command == L"!pool" ||
@@ -2911,6 +2914,18 @@ static bool IsNmiScopeName(const std::wstring& value)
     return lowered == L"callbacks";
 }
 
+static bool IsFirmwareTableScopeName(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"providers" || lowered == L"provider";
+}
+
+static bool IsFirmwareTableOption(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"/module";
+}
+
 static bool IsPoolScopeName(const std::wstring& value)
 {
     std::wstring lowered = ToLower(value);
@@ -3116,6 +3131,75 @@ static void AddAlpcOptionCompletionCandidates(std::vector<std::wstring>* candida
     AddCompletionCandidate(candidates, L"help");
 }
 
+static void AddFirmwareTableCompletionCandidates(std::vector<std::wstring>* candidates, bool afterScope)
+{
+    if (!afterScope)
+    {
+        static const wchar_t* values[] =
+        {
+            L"providers",
+            L"provider",
+            L"help"
+        };
+
+        AddCompletionCandidates(candidates, values);
+    }
+    else
+    {
+        static const wchar_t* values[] =
+        {
+            L"/module",
+            L"help"
+        };
+
+        AddCompletionCandidates(candidates, values);
+    }
+}
+
+static void AddFirmwareTableCommandCompletionCandidates(
+    std::vector<std::wstring>* candidates,
+    const std::vector<std::wstring>& argsBefore)
+{
+    do
+    {
+        if (argsBefore.size() <= 1)
+        {
+            AddFirmwareTableCompletionCandidates(candidates, false);
+            break;
+        }
+
+        std::wstring scope = ToLower(argsBefore[1]);
+        if (scope == L"providers")
+        {
+            AddFirmwareTableCompletionCandidates(candidates, true);
+            break;
+        }
+
+        if (scope == L"provider")
+        {
+            if (argsBefore.size() <= 2)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"ACPI",
+                    L"FIRM",
+                    L"RSMB",
+                    L"help"
+                };
+
+                AddCompletionCandidates(candidates, values);
+            }
+            else
+            {
+                AddCompletionCandidate(candidates, L"help");
+            }
+            break;
+        }
+
+        AddFirmwareTableCompletionCandidates(candidates, false);
+    } while (false);
+}
+
 static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidates)
 {
     static const wchar_t* values[] =
@@ -3172,6 +3256,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!securekernel",
         L"!etw",
         L"!nmi",
+        L"!fwtable",
         L"!module",
         L"!driver",
         L"!pool",
@@ -3591,6 +3676,10 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"callbacks");
                 }
+                else if (topic == L"!fwtable")
+                {
+                    AddFirmwareTableCompletionCandidates(&candidates, false);
+                }
                 else if (topic == L"!module")
                 {
                     static const wchar_t* values[] =
@@ -3768,6 +3857,10 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 };
                 AddCompletionCandidates(&candidates, values);
             }
+        }
+        else if (command == L"!fwtable")
+        {
+            AddFirmwareTableCommandCompletionCandidates(&candidates, argsBefore);
         }
         else if (command == L"!module")
         {
@@ -12068,6 +12161,392 @@ static void HandleNmiCommand(
     } while (false);
 }
 
+static void PrintFirmwareTableHelp()
+{
+    std::wcout << L"!fwtable command:\n";
+    std::wcout << L"  !fwtable providers\n";
+    std::wcout << L"  !fwtable providers /module <name>\n";
+    std::wcout << L"  !fwtable provider <signature>\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Registered firmware table provider nodes from nt!ExpFirmwareTableProviderListHead with handler and DriverObject annotations.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Default enumeration is passive and never invokes firmware handlers.\n";
+    std::wcout << L"  ACPI, FIRM, and RSMB are treated as baseline providers; custom signatures are highlighted for triage.\n";
+    std::wcout << L"  Calling EnumSystemFirmwareTables or GetSystemFirmwareTable can execute a registered handler, so probing is not part of this passive scan.\n";
+}
+
+static bool ParseFirmwareProviderSignature(
+    const std::wstring& value,
+    uint32_t numberBase,
+    uint32_t* signature)
+{
+    bool ok = false;
+
+    do
+    {
+        if (signature == nullptr)
+        {
+            break;
+        }
+
+        std::wstring text = TrimWhitespace(value);
+        if (text.size() == 4 && text.find_first_not_of(L"0123456789abcdefABCDEFxX") != std::wstring::npos)
+        {
+            uint32_t parsed = 0;
+            for (wchar_t ch : text)
+            {
+                if (ch < 0x20 || ch > 0x7e)
+                {
+                    parsed = 0;
+                    break;
+                }
+                parsed = (parsed << 8) | static_cast<uint32_t>(static_cast<uint8_t>(ch));
+            }
+            if (parsed != 0)
+            {
+                *signature = parsed;
+                ok = true;
+                break;
+            }
+        }
+
+        if (text.size() == 4 && text.rfind(L"0x", 0) != 0 && text.rfind(L"0X", 0) != 0)
+        {
+            bool printable = true;
+            for (wchar_t ch : text)
+            {
+                if (ch < 0x20 || ch > 0x7e)
+                {
+                    printable = false;
+                    break;
+                }
+            }
+            if (printable && text.find_first_not_of(L"0123456789") != std::wstring::npos)
+            {
+                uint32_t parsed = 0;
+                for (wchar_t ch : text)
+                {
+                    parsed = (parsed << 8) | static_cast<uint32_t>(static_cast<uint8_t>(ch));
+                }
+                *signature = parsed;
+                ok = true;
+                break;
+            }
+        }
+
+        uint64_t numeric = 0;
+        if (ParseUnsigned(text, numberBase, &numeric) && numeric <= 0xffffffffull)
+        {
+            *signature = static_cast<uint32_t>(numeric);
+            ok = true;
+            break;
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool FirmwareProviderMatchesModuleFilter(
+    const FirmwareTableProviderRecord& record,
+    const std::wstring& moduleFilter)
+{
+    bool matched = false;
+
+    do
+    {
+        if (TrimWhitespace(moduleFilter).empty())
+        {
+            matched = true;
+            break;
+        }
+
+        if (CallbackModuleTextMatchesFilter(record.HandlerModule, moduleFilter) ||
+            CallbackModuleTextMatchesFilter(record.DriverModule, moduleFilter) ||
+            CallbackModuleTextMatchesFilter(record.DriverName, moduleFilter))
+        {
+            matched = true;
+            break;
+        }
+    } while (false);
+
+    return matched;
+}
+
+static void ApplyFirmwareTableFilters(
+    const std::wstring& moduleFilter,
+    bool hasProviderFilter,
+    uint32_t providerFilter,
+    FirmwareTableScanResult* result)
+{
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        if (TrimWhitespace(moduleFilter).empty() && !hasProviderFilter)
+        {
+            break;
+        }
+
+        std::vector<FirmwareTableProviderRecord> filtered;
+        filtered.reserve(result->Records.size());
+        for (const FirmwareTableProviderRecord& record : result->Records)
+        {
+            if (hasProviderFilter && record.ProviderSignature != providerFilter)
+            {
+                continue;
+            }
+            if (!FirmwareProviderMatchesModuleFilter(record, moduleFilter))
+            {
+                continue;
+            }
+            filtered.push_back(record);
+        }
+
+        result->Records.swap(filtered);
+    } while (false);
+}
+
+static void PrintFirmwareTableProviderRecord(const FirmwareTableProviderRecord& record)
+{
+    PrintColoredText(L"[fwtable.provider]", record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+    std::wcout << L" slot=" << std::dec << record.Slot;
+    std::wcout << L" sig=" << HexTextWidth(record.ProviderSignature, 8, true);
+    if (!record.ProviderText.empty())
+    {
+        std::wcout << L" fourcc=\"";
+        PrintColoredText(record.ProviderText, record.StandardProvider ? KNDBG_COLOR_OK : KNDBG_COLOR_WARN);
+        std::wcout << L"\"";
+    }
+    if (record.Suspicious)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  node=" << HexTextWidth(record.NodeAddress, 16, true)
+               << L" list=" << HexTextWidth(record.ListEntry, 16, true)
+               << L" flink=" << HexTextWidth(record.Flink, 16, true)
+               << L" blink=" << HexTextWidth(record.Blink, 16, true)
+               << L" register=" << std::dec << static_cast<uint32_t>(record.RegisterFlag) << L"\n";
+
+    std::wcout << L"  ";
+    PrintColoredText(L"handler", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=" << HexTextWidth(record.FirmwareTableHandler, 16, true);
+    if (!record.HandlerModule.empty())
+    {
+        std::wcout << L" module=";
+        PrintColoredText(record.HandlerModule, KNDBG_COLOR_OK);
+    }
+    else
+    {
+        std::wcout << L" module=";
+        PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+    }
+    if (!record.HandlerSymbol.empty())
+    {
+        std::wcout << L" symbol=";
+        PrintColoredText(record.HandlerSymbol, KNDBG_COLOR_TITLE);
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  ";
+    PrintColoredText(L"driverObject", KNDBG_COLOR_ACCENT);
+    std::wcout << L"=" << HexTextWidth(record.DriverObject, 16, true);
+    if (!record.DriverName.empty())
+    {
+        std::wcout << L" name=\"";
+        PrintColoredText(record.DriverName, KNDBG_COLOR_OK);
+        std::wcout << L"\"";
+    }
+    if (record.DriverStart != 0)
+    {
+        std::wcout << L" start=" << HexTextWidth(record.DriverStart, 16, true)
+                   << L" size=0x" << std::hex << record.DriverSize << std::dec;
+    }
+    if (!record.DriverModule.empty())
+    {
+        std::wcout << L" module=";
+        PrintColoredText(record.DriverModule, KNDBG_COLOR_OK);
+    }
+    std::wcout << L"\n";
+
+    if (!record.Notes.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"notes", KNDBG_COLOR_WARN);
+        std::wcout << L"=" << record.Notes << L"\n";
+    }
+}
+
+static void HandleFirmwareTableCommand(
+    const std::vector<std::wstring>& args,
+    const DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintFirmwareTableHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!fwtable requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring scope = L"providers";
+        std::wstring moduleFilter;
+        bool hasProviderFilter = false;
+        uint32_t providerFilter = 0;
+
+        size_t index = 1;
+        if (index < args.size())
+        {
+            std::wstring requested = ToLower(args[index]);
+            if (requested == L"providers")
+            {
+                ++index;
+            }
+            else if (requested == L"provider")
+            {
+                scope = L"provider";
+                ++index;
+                if (index >= args.size())
+                {
+                    std::wcerr << L"usage: !fwtable provider <signature>\n";
+                    break;
+                }
+                if (!ParseFirmwareProviderSignature(args[index], state.NumberBase, &providerFilter))
+                {
+                    std::wcerr << L"!fwtable: invalid provider signature \"" << args[index] << L"\"\n";
+                    break;
+                }
+                hasProviderFilter = true;
+                ++index;
+            }
+            else
+            {
+                std::wcerr << L"usage: !fwtable [providers|provider <signature>]\n";
+                std::wcerr << L"       !fwtable providers /module <name>\n";
+                PrintFirmwareTableHelp();
+                break;
+            }
+        }
+
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/module")
+            {
+                if (scope != L"providers")
+                {
+                    std::wcerr << L"!fwtable /module applies to providers scope\n";
+                    break;
+                }
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"usage: !fwtable providers /module <name>\n";
+                    break;
+                }
+                if (!moduleFilter.empty())
+                {
+                    std::wcerr << L"!fwtable accepts only one /module filter\n";
+                    break;
+                }
+                moduleFilter = args[index + 1];
+                index += 2;
+                continue;
+            }
+
+            std::wcerr << L"!fwtable: unexpected argument \"" << args[index] << L"\"\n";
+            break;
+        }
+
+        if (index < args.size())
+        {
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!fwtable failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        FirmwareTableScanner scanner(device, symbols);
+        FirmwareTableScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!fwtable failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!fwtable warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        ApplyFirmwareTableFilters(moduleFilter, hasProviderFilter, providerFilter, &result);
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!fwtable warning: " << warning << L"\n";
+        }
+
+        size_t suspiciousCount = 0;
+        for (const FirmwareTableProviderRecord& record : result.Records)
+        {
+            if (record.Suspicious)
+            {
+                ++suspiciousCount;
+            }
+        }
+
+        PrintColoredText(L"firmware table providers", KNDBG_COLOR_TITLE);
+        std::wcout << L"=" << std::dec << result.Records.size()
+                   << L" suspicious=";
+        PrintColoredText(std::to_wstring(suspiciousCount),
+                         suspiciousCount == 0 ? KNDBG_COLOR_OK : KNDBG_COLOR_FAIL);
+        std::wcout << L" listHead=" << result.ListHeadSymbol
+                   << L"(" << HexTextWidth(result.ListHeadAddress, 16, true) << L")";
+        std::wcout << L" layout=" << (result.UsedFallbackLayout ? L"fallback" : L"pdb");
+        if (result.ResourceAddress != 0)
+        {
+            std::wcout << L" resource=" << result.ResourceSymbol
+                       << L"(" << HexTextWidth(result.ResourceAddress, 16, true) << L")";
+        }
+        if (!moduleFilter.empty())
+        {
+            std::wcout << L" module=";
+            PrintColoredText(moduleFilter, KNDBG_COLOR_OK);
+        }
+        if (hasProviderFilter)
+        {
+            std::wcout << L" provider=" << HexTextWidth(providerFilter, 8, true);
+        }
+        std::wcout << L"\n";
+
+        for (const FirmwareTableProviderRecord& record : result.Records)
+        {
+            PrintFirmwareTableProviderRecord(record);
+        }
+    } while (false);
+}
+
 static void PrintDumpRawHelp()
 {
     std::wcout << L"dump-raw command:\n";
@@ -17183,6 +17662,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintNmiHelp();
         }
+        else if (command == L"!fwtable")
+        {
+            PrintFirmwareTableHelp();
+        }
         else if (command == L"!module")
         {
             PrintModuleIntegrityHelp();
@@ -18947,6 +19430,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!fwtable")
+            {
+                commandClass = L"firmware-table";
+                break;
+            }
+
             if (command == L"!module" || command == L"!driver")
             {
                 commandClass = L"integrity";
@@ -19030,6 +19519,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
         if (command == L"!nmi")
         {
             commandClass = L"nmi";
+            break;
+        }
+
+        if (command == L"!fwtable")
+        {
+            commandClass = L"firmware-table";
             break;
         }
 
@@ -19371,6 +19866,93 @@ static bool ValidateCallbackCommandArgumentShape(
         }
 
         ok = index >= args.size();
+    } while (false);
+
+    return ok;
+}
+
+static bool ValidateFirmwareTableCommandArgumentShape(
+    const std::vector<std::wstring>& args,
+    std::wstring* reason)
+{
+    bool ok = false;
+
+    do
+    {
+        size_t index = 1;
+        std::wstring scope = L"providers";
+
+        if (index < args.size())
+        {
+            if (!IsFirmwareTableScopeName(args[index]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!fwtable scope must be providers or provider";
+                }
+                break;
+            }
+
+            scope = ToLower(args[index]);
+            ++index;
+        }
+
+        if (scope == L"provider")
+        {
+            if (index >= args.size() || IsSwitchLikeToken(args[index]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!fwtable provider requires a signature";
+                }
+                break;
+            }
+            ++index;
+            if (index < args.size())
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!fwtable provider takes no arguments after the signature";
+                }
+                break;
+            }
+        }
+        else
+        {
+            bool hasModule = false;
+            while (index < args.size())
+            {
+                if (!IsFirmwareTableOption(args[index]) ||
+                    index + 1 >= args.size() ||
+                    IsSwitchLikeToken(args[index + 1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!fwtable providers supports only /module <name>";
+                    }
+                    break;
+                }
+
+                if (hasModule)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!fwtable providers accepts only one /module filter";
+                    }
+                    break;
+                }
+
+                hasModule = true;
+                index += 2;
+            }
+
+            if (index < args.size())
+            {
+                break;
+            }
+        }
+
+        ok = true;
     } while (false);
 
     return ok;
@@ -19897,6 +20479,13 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
+        else if (command == L"!fwtable")
+        {
+            if (!ValidateFirmwareTableCommandArgumentShape(args, reason))
+            {
+                break;
+            }
+        }
         else if (command == L"!module" || command == L"!driver")
         {
             if (args.size() < 2 || ToLower(args[1]) != L"integrity")
@@ -20398,7 +20987,7 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"]}\n";
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
-    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !vad, !threads, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, !wnf, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
+    stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !vad, !threads, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, !fwtable, !wnf, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
     stream << L"- For VAD DKOM or hidden PTE checks, use !vad target /hiddenpte where target is a concrete PID, image name, or EPROCESS address. Add /summary or /limit <n> when the operator asks for concise output.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
     stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
@@ -21528,6 +22117,7 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
             normalized == L"!securekernel" ||
             normalized == L"!etw" ||
             normalized == L"!nmi" ||
+            normalized == L"!fwtable" ||
             normalized == L"!module" ||
             normalized == L"!driver" ||
             normalized == L"!pool" ||
@@ -23804,6 +24394,8 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"threads.list" ||
         tool == L"etw.integrity" ||
         tool == L"nmi.list" ||
+        tool == L"fwtable.list" ||
+        tool == L"firmwaretable.list" ||
         tool == L"pool.find" ||
         tool == L"address.inspect" ||
         tool == L"wnf.decode" ||
@@ -23865,6 +24457,10 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"nmi.list")
     {
         allowed = {L"scope"};
+    }
+    else if (tool == L"fwtable.list" || tool == L"firmwaretable.list")
+    {
+        allowed = {L"scope", L"module", L"provider", L"signature"};
     }
     else if (tool == L"pool.find")
     {
@@ -24029,7 +24625,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -24042,6 +24638,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
     stream << L"- etw.integrity: check inline ETW GetCpuClock targets and suspicious callback redirects. Args: {}.\n";
     stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
+    stream << L"- fwtable.list: list registered firmware table providers from nt!ExpFirmwareTableProviderListHead without invoking handlers. Args: optional scope providers|provider, optional module string, optional provider/signature string.\n";
     stream << L"- pool.find: find big pool entries. Args: optional tag, min, max, addr/address, limit strings; optional paged string any|nonpaged|paged; optional booleans annotate, wx. Use wx=true for W+X pool.\n";
     stream << L"- address.inspect: inspect one virtual address or symbol. Args: address, va, or symbol string.\n";
     stream << L"- wnf.decode: decode one WNF state-name hash. Args: hash, state, or state_name string.\n";
@@ -24064,6 +24661,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
     stream << L"- For inline ETW hook questions, use etw.integrity.\n";
     stream << L"- For NMI callback questions, use nmi.list.\n";
+    stream << L"- For firmware table provider, SystemRegisterFirmwareTableInformationHandler, or firmware-table cheat-channel questions, use fwtable.list.\n";
     stream << L"- For W+X pool or suspicious big pool allocation questions, use pool.find with wx=true or explicit filters.\n";
     stream << L"- For address suspicion or page permission questions, use address.inspect.\n";
     stream << L"- For WNF decode questions, use wnf.decode; for live WNF instance/list questions, use wnf.list.\n";
@@ -24074,6 +24672,8 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Examples:\n";
     stream << L"- \"any inline ETW hook?\" => etw.integrity {}\n";
     stream << L"- \"list NMI callbacks\" => nmi.list {\"scope\":\"callbacks\"}\n";
+    stream << L"- \"list firmware table providers\" => fwtable.list {\"scope\":\"providers\"}\n";
+    stream << L"- \"show custom firmware handler ACPI\" => fwtable.list {\"scope\":\"provider\",\"provider\":\"ACPI\"}\n";
     stream << L"- \"show W+X pool allocations\" => pool.find {\"wx\":\"true\",\"limit\":\"50\"}\n";
     stream << L"- \"why is this address suspicious?\" => address.inspect {\"address\":\"<address>\"}\n";
     stream << L"- \"decode this WNF state name\" => wnf.decode {\"hash\":\"<hash>\"}\n";
@@ -25204,6 +25804,119 @@ static bool ExecuteAiCapabilityNmiList(
     return ok;
 }
 
+static bool ExecuteAiCapabilityFirmwareTableList(
+    const AiCapabilityStep& step,
+    const DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = step.Tool + L" requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring scope;
+        ExtractJsonStringValue(step.ArgsJson, L"scope", &scope);
+        scope = ToLower(TrimWhitespace(scope));
+        if (scope.empty())
+        {
+            scope = L"providers";
+        }
+        if (scope != L"providers" && scope != L"provider")
+        {
+            if (error != nullptr)
+            {
+                *error = step.Tool + L" scope must be providers or provider";
+            }
+            break;
+        }
+
+        std::wstring module;
+        ExtractJsonStringValue(step.ArgsJson, L"module", &module);
+        module = TrimWhitespace(module);
+        if (!module.empty() && !ValidateAiCapabilityScalarText(module, L"fwtable module", error))
+        {
+            break;
+        }
+        if (!module.empty() && IsSwitchLikeToken(module))
+        {
+            if (error != nullptr)
+            {
+                *error = L"fwtable module cannot be an option token";
+            }
+            break;
+        }
+
+        std::wstring provider;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"provider", L"signature"}, &provider))
+        {
+            provider.clear();
+        }
+        if (!provider.empty() && !ValidateAiCapabilityScalarText(provider, L"fwtable provider", error))
+        {
+            break;
+        }
+        if (!provider.empty() && IsSwitchLikeToken(provider))
+        {
+            if (error != nullptr)
+            {
+                *error = L"fwtable provider cannot be an option token";
+            }
+            break;
+        }
+        if (!provider.empty() && !module.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"fwtable module filter applies only to providers scope";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!fwtable");
+        if (scope == L"provider" || !provider.empty())
+        {
+            if (provider.empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = step.Tool + L" provider scope requires provider or signature";
+                }
+                break;
+            }
+            args.push_back(L"provider");
+            args.push_back(provider);
+        }
+        else
+        {
+            args.push_back(L"providers");
+            if (!module.empty())
+            {
+                args.push_back(L"/module");
+                args.push_back(module);
+            }
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": fwtable.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleFirmwareTableCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ExecuteAiCapabilityPoolFind(
     const AiCapabilityStep& step,
     DebuggerState& state,
@@ -25879,6 +26592,10 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"nmi.list")
             {
                 stepOk = ExecuteAiCapabilityNmiList(step, device, symbols, error);
+            }
+            else if (step.Tool == L"fwtable.list" || step.Tool == L"firmwaretable.list")
+            {
+                stepOk = ExecuteAiCapabilityFirmwareTableList(step, state, device, symbols, error);
             }
             else if (step.Tool == L"pool.find")
             {
@@ -27166,6 +27883,10 @@ static bool HandleCommand(
         else if (command == L"!nmi")
         {
             HandleNmiCommand(args, device, symbols);
+        }
+        else if (command == L"!fwtable")
+        {
+            HandleFirmwareTableCommand(args, state, device, symbols);
         }
         else if (command == L"!module")
         {
