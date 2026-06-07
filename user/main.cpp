@@ -13101,6 +13101,10 @@ static void PrintFirmwareTableProviderRecord(const FirmwareTableProviderRecord& 
     {
         std::wcout << L" module=";
         PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+        if (record.FirmwareTableHandler != 0)
+        {
+            std::wcout << L" moduleAddress=" << HexTextWidth(record.FirmwareTableHandler, 16, true);
+        }
     }
     if (!record.HandlerSymbol.empty())
     {
@@ -13118,6 +13122,10 @@ static void PrintFirmwareTableProviderRecord(const FirmwareTableProviderRecord& 
         PrintColoredText(record.DriverName, KNDBG_COLOR_OK);
         std::wcout << L"\"";
     }
+    else if (record.DriverObject != 0)
+    {
+        std::wcout << L" name=<unresolved> raw=" << HexTextWidth(record.DriverObject, 16, true);
+    }
     if (record.DriverStart != 0)
     {
         std::wcout << L" start=" << HexTextWidth(record.DriverStart, 16, true)
@@ -13127,6 +13135,12 @@ static void PrintFirmwareTableProviderRecord(const FirmwareTableProviderRecord& 
     {
         std::wcout << L" module=";
         PrintColoredText(record.DriverModule, KNDBG_COLOR_OK);
+    }
+    else if (record.DriverStart != 0)
+    {
+        std::wcout << L" module=";
+        PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+        std::wcout << L" moduleAddress=" << HexTextWidth(record.DriverStart, 16, true);
     }
     std::wcout << L"\n";
 
