@@ -10,6 +10,9 @@
 namespace
 {
     constexpr uint64_t kKernelSpaceMin       = 0xffff800000000000ull;
+    // Reject sign-extended small negatives such as ffffffff`fffe79e8.
+    // They pass a broad kernel-half test but are not useful ETW structure VAs.
+    constexpr uint64_t kKernelSpaceGuardMin  = 0xffffffff00000000ull;
     constexpr uint32_t kEtwLoggerSlotCount   = 64;
     constexpr uint64_t kLoggerArrayOffset    = 0x10;
     constexpr uint64_t kFallbackLoggerName   = 0x68;
@@ -19,7 +22,7 @@ namespace
 
     bool IsKernelAddress(uint64_t value)
     {
-        return value >= kKernelSpaceMin;
+        return value >= kKernelSpaceMin && value < kKernelSpaceGuardMin;
     }
 
     bool TryAdd(uint64_t left, uint64_t right, uint64_t* result)
@@ -65,7 +68,7 @@ namespace
                 break;
             }
 
-            if (!device.ReadMemory(address, length, bytes, error))
+            if (!device.ReadMemory(address, length, bytes, error, 0))
             {
                 break;
             }

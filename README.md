@@ -965,7 +965,7 @@ pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]
 How it works:
 
 1. Same enumeration path as `!pool`: enable `SeDebugPrivilege`, call `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, then iterate big pool entries after applying the paged-class, tag, and size filters.
-2. For each kept entry, read the first 4 KB through the driver `ReadMemory` IOCTL (which now includes the MDL probe-and-lock fallback for paged-out pages) and run `ProbeForPeHeader`. The probe tries `e_lfanew` first; on miss it sweeps 4-byte-aligned offsets `0x40..0x1000` looking for a plausible `IMAGE_NT_HEADERS` (Machine != 0, NumberOfSections in `1..96`, SizeOfOptionalHeader `0xF0`/`0xE0`, OptionalHeader.Magic `0x10b`/`0x20b`, SizeOfHeaders in `(0, 0x10000]`, SizeOfImage in `(SizeOfHeaders, 256 MB)`).
+2. For each kept entry, read the first 4 KB through the driver `ReadMemory` IOCTL on the safe `MmCopyMemory` path and run `ProbeForPeHeader`. The probe tries `e_lfanew` first; on miss it sweeps 4-byte-aligned offsets `0x40..0x1000` looking for a plausible `IMAGE_NT_HEADERS` (Machine != 0, NumberOfSections in `1..96`, SizeOfOptionalHeader `0xF0`/`0xE0`, OptionalHeader.Magic `0x10b`/`0x20b`, SizeOfHeaders in `(0, 0x10000]`, SizeOfImage in `(SizeOfHeaders, 256 MB)`).
 3. Each hit is annotated with whether `MZ`, `PE\0\0`, and/or `e_lfanew` were wiped. Hits with any wipe are highlighted in red with a `WIPED=[MZ,e_lfanew,PE]` tag and also counted against `suspicious` in the summary line; intact-header PE images print in the regular `[pool-pe.hit]` form for completeness.
 4. With `/dump <directory>`, each hit is written to disk through `DumpKernelPeToFile`, which performs the same signature-recovery and section walking as the standalone `dump-pe` command. The output filename pattern is `poolpe_<tag>_<address>.bin`; the directory is created if missing.
 
@@ -1036,7 +1036,7 @@ Subcommand reference:
 
 Notes:
 
-- The driver's MDL probe-and-lock fallback (introduced in v0.0.6) keeps Threat-Intelligence consumer reads from failing on paged-out kernel ranges that some payloads touch.
+- The driver's MDL probe-and-lock fallback (introduced in v0.0.6) is opt-in and now guarded by canonical-system-range plus resident-page preflight, so broad scanners do not page in arbitrary pointer candidates.
 - KnLiveDbg.exe's own events are excluded by default to prevent feedback loops. The exclusion is keyed on the current process ID at subscribe time.
 - The provider is verbose. On an active desktop, expect thousands of events per second. The ring + log capture everything; the TUI stays calm unless you opt in to live output.
 
