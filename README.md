@@ -108,7 +108,7 @@ Create a release zip:
 .\tools\release.ps1 -Configuration Release
 ```
 
-The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, the BYOVD positive-control fixture driver, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the vendored runtime manifest when present, `tools\update-byovd-intel.ps1`, and `kn-live-dbg-version.json`. YARA binaries are intentionally not packaged.
+The build helper copies `tools\update-byovd-intel.ps1` into `x64\<Configuration>\tools\` so direct build outputs can refresh the BYOVD catalog. The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, the BYOVD positive-control fixture driver, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the vendored runtime manifest when present, `tools\update-byovd-intel.ps1`, and `kn-live-dbg-version.json`. YARA binaries are intentionally not packaged.
 
 Expected outputs:
 
@@ -917,7 +917,7 @@ byovd status
 byovd fixture [status|load [sys-path]|unload|path]
 ```
 
-The scanner hashes each loaded module image on disk with MD5/SHA1/SHA256. Exact hash matches against Microsoft or LOLDrivers entries are reported as `HIGH` confidence. Microsoft file-attribute rules are also matched by file name plus PE file version and reported as `MEDIUM` confidence because signer/certificate constraints are not yet enforced in this slice. `/exact` suppresses those name/version hints when the operator wants hash-only evidence.
+The scanner hashes each loaded module image on disk with MD5/SHA1/SHA256. Exact hash matches against Microsoft or LOLDrivers entries are reported as `HIGH` confidence. Microsoft file-attribute rules are also matched by file name plus PE file version and reported as `MEDIUM` confidence. The scanner reads PE version-info vendor metadata and suppresses third-party file-attribute hints against Microsoft-owned OS binaries, but full WDAC signer/certificate constraints are not yet enforced in this slice. `/exact` suppresses those name/version hints when the operator wants hash-only evidence.
 
 `/yara` additionally runs the downloaded LOLDrivers YARA files under `<exe-dir>\data\byovd\yara` against each loaded module image on disk. YARA execution uses an external `yara64.exe` / `yara.exe`, but release packages intentionally do not include YARA binaries. Install YARA separately, put it on `PATH`, or use `/yara-path <exe>` to pin a specific binary. KnLiveDbg also searches the EXE directory, `tools\`, development parent `tools\` directories, and the current working directory's `tools\` for operator-supplied binaries. `/yara-timeout <seconds>` caps each driver/rule invocation; the default is 30 seconds and accepted range is 1..600 seconds. YARA hits are emitted as `HIGH` confidence with `source=loldrivers_yara` and `match_type=yara`. JSON output uses `kn-live-dbg.byovd-scan.v1` and includes `summary.yara_*`, `yara.executable`, and `yara.rule_files`.
 `summary.yara_scans` counts attempted YARA process invocations, while `summary.yara_failures` and `summary.yara_timeouts` split out failed or timed-out attempts.

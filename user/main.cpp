@@ -13719,8 +13719,9 @@ static void PrintByovdHelp()
     std::wcout << L"\n";
     std::wcout << L"match confidence:\n";
     std::wcout << L"  HIGH    exact MD5/SHA1/SHA256 catalog match.\n";
-    std::wcout << L"  MEDIUM  Microsoft file-name and file-version blocklist hint. Signer checks\n";
-    std::wcout << L"          are not yet applied, so treat this as triage evidence.\n";
+    std::wcout << L"  MEDIUM  Microsoft file-name and file-version blocklist hint. Microsoft OS\n";
+    std::wcout << L"          vendor metadata is used to suppress third-party name collisions,\n";
+    std::wcout << L"          but full WDAC signer checks are still triage-only.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /no-update     skip stale-catalog auto update for this scan.\n";
@@ -13950,6 +13951,10 @@ static void PrintByovdRecord(const ByovdModuleRecord& record)
     if (record.VersionRead)
     {
         std::wcout << L" version=" << record.FileVersion;
+        if (!record.FileCompanyName.empty())
+        {
+            std::wcout << L" company=\"" << record.FileCompanyName << L"\"";
+        }
     }
     if (record.FileHashed)
     {
