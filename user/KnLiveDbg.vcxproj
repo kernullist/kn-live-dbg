@@ -119,6 +119,11 @@
     <ClCompile Include="ProcessTriageScanner.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
     <ClCompile Include="PoolScanner.cpp" />
+    <ClCompile Include="SnapshotCollector.cpp" />
+    <ClCompile Include="SnapshotDiff.cpp" />
+    <ClCompile Include="SnapshotJson.cpp" />
+    <ClCompile Include="SnapshotModel.cpp" />
+    <ClCompile Include="SnapshotPrinter.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
@@ -152,6 +157,11 @@
     <ClInclude Include="ProcessTriageScanner.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="PoolScanner.h" />
+    <ClInclude Include="SnapshotCollector.h" />
+    <ClInclude Include="SnapshotDiff.h" />
+    <ClInclude Include="SnapshotJson.h" />
+    <ClInclude Include="SnapshotModel.h" />
+    <ClInclude Include="SnapshotPrinter.h" />
     <ClInclude Include="SymbolEngine.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="WfpScanner.h" />

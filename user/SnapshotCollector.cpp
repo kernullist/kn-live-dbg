@@ -1,0 +1,1100 @@
+#include "SnapshotCollector.h"
+
+#include "AlpcScanner.h"
+#include "ByovdScanner.h"
+#include "CallbackScanner.h"
+#include "EtwScanner.h"
+#include "FirmwareTableScanner.h"
+#include "IntegrityScanner.h"
+#include "NmiScanner.h"
+#include "PoolPeHunter.h"
+#include "PoolScanner.h"
+#include "ProcessTriageScanner.h"
+#include "VbsScanner.h"
+#include "WfpScanner.h"
+#include "WnfScanner.h"
+
+#include <Windows.h>
+
+#include <algorithm>
+#include <fstream>
+#include <set>
+#include <sstream>
+
+namespace
+{
+    constexpr uint64_t kLargePoolThreshold = 0x100000ull;
+
+    std::wstring BoolText(bool value)
+    {
+        return value ? L"true" : L"false";
+    }
+
+    std::wstring DecText(uint64_t value)
+    {
+        return std::to_wstring(value);
+    }
+
+    void AddWarning(SnapshotDocument* document, const std::wstring& domain, const std::wstring& warning)
+    {
+        if (document != nullptr && !domain.empty() && !warning.empty())
+        {
+            document->DomainWarnings[domain].push_back(warning);
+        }
+    }
+
+    void AddWarnings(SnapshotDocument* document, const std::wstring& domain, const std::vector<std::wstring>& warnings)
+    {
+        for (const std::wstring& warning : warnings)
+        {
+            AddWarning(document, domain, warning);
+        }
+    }
+
+    void AddRecord(SnapshotDocument* document, SnapshotRecord record)
+    {
+        if (document != nullptr && !record.Domain.empty() && !record.Identity.empty())
+        {
+            record.Risk = SnapshotRiskNormalize(record.Risk);
+            document->Records.push_back(std::move(record));
+        }
+    }
+
+    std::wstring ModuleIdentityForAddress(SymbolEngine& symbols, uint64_t address)
+    {
+        std::wstring identity = SnapshotHex(address, 16);
+
+        for (const KernelModuleInfo& module : symbols.Modules())
+        {
+            uint64_t start = module.Base;
+            uint64_t end = module.Base + module.Size;
+            if (address >= start && address < end)
+            {
+                std::wstringstream stream;
+                stream << SnapshotToLower(module.ImageName) << L"+"
+                       << SnapshotHex(address - module.Base, 0);
+                identity = stream.str();
+                break;
+            }
+        }
+
+        return identity;
+    }
+
+    std::wstring ModuleOffsetIdentity(SymbolEngine& symbols, const std::wstring& moduleName, uint64_t address)
+    {
+        std::wstring identity = SnapshotToLower(moduleName);
+        std::wstring loweredModuleName = SnapshotToLower(moduleName);
+
+        for (const KernelModuleInfo& module : symbols.Modules())
+        {
+            uint64_t start = module.Base;
+            uint64_t end = module.Base + module.Size;
+            if (SnapshotToLower(module.ImageName) == loweredModuleName &&
+                address >= start &&
+                address < end)
+            {
+                identity += L"+";
+                identity += SnapshotHex(address - module.Base, 0);
+                return identity;
+            }
+        }
+
+        std::wstring resolved = ModuleIdentityForAddress(symbols, address);
+        if (resolved != SnapshotHex(address, 16))
+        {
+            identity = resolved;
+        }
+        else
+        {
+            identity += L"+";
+            identity += SnapshotHex(address, 16);
+        }
+
+        return identity;
+    }
+
+    std::wstring SymbolOrAddressIdentity(
+        SymbolEngine& symbols,
+        const std::wstring& module,
+        const std::wstring& symbol,
+        uint64_t address)
+    {
+        std::wstring identity;
+
+        if (!module.empty())
+        {
+            identity = SnapshotToLower(module);
+            if (!symbol.empty())
+            {
+                identity += L"!";
+                identity += SnapshotToLower(symbol);
+            }
+            else if (address != 0)
+            {
+                identity = ModuleOffsetIdentity(symbols, module, address);
+            }
+        }
+        else if (address != 0)
+        {
+            identity = ModuleIdentityForAddress(symbols, address);
+        }
+        else
+        {
+            identity = L"null";
+        }
+
+        return identity;
+    }
+
+    std::wstring JoinTags(const std::vector<std::wstring>& tags)
+    {
+        std::wstring text;
+        for (size_t i = 0; i < tags.size(); ++i)
+        {
+            if (i != 0)
+            {
+                text += L",";
+            }
+            text += tags[i];
+        }
+        return text;
+    }
+
+    std::wstring FingerprintFileFnv64(const std::wstring& path)
+    {
+        std::wstring result;
+        HANDLE file = INVALID_HANDLE_VALUE;
+
+        do
+        {
+            if (path.empty())
+            {
+                break;
+            }
+
+            file = CreateFileW(
+                path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                break;
+            }
+
+            uint64_t hash = 14695981039346656037ull;
+            uint8_t buffer[32768] = {};
+            DWORD read = 0;
+            while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read != 0)
+            {
+                for (DWORD i = 0; i < read; ++i)
+                {
+                    hash ^= buffer[i];
+                    hash *= 1099511628211ull;
+                }
+            }
+
+            result = SnapshotHex(hash, 16);
+        } while (false);
+
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(file);
+        }
+
+        return result;
+    }
+
+    bool RecordHasHighByovdMatch(const ByovdModuleRecord& record)
+    {
+        bool high = false;
+        for (const ByovdMatch& match : record.Matches)
+        {
+            if (match.Confidence == L"HIGH")
+            {
+                high = true;
+                break;
+            }
+        }
+        return high;
+    }
+
+    std::wstring ByovdMatchSummary(const ByovdModuleRecord& record)
+    {
+        std::wstring summary;
+        for (size_t i = 0; i < record.Matches.size(); ++i)
+        {
+            if (i != 0)
+            {
+                summary += L";";
+            }
+            summary += record.Matches[i].Confidence;
+            summary += L":";
+            summary += record.Matches[i].Entry.Source;
+            summary += L":";
+            summary += record.Matches[i].Entry.MatchType;
+        }
+        return summary;
+    }
+
+    std::set<std::wstring> BuildBaselineProcessSet(const SnapshotDocument& baseline)
+    {
+        std::set<std::wstring> identities;
+        for (const SnapshotProcessRecord& process : baseline.Processes)
+        {
+            if (!process.Identity.empty())
+            {
+                identities.insert(process.Identity);
+            }
+        }
+        return identities;
+    }
+
+    ProcessTriageTarget BuildTriageTarget(const SnapshotProcessRecord& process)
+    {
+        ProcessTriageTarget target = {};
+        target.ProcessId = process.ProcessId;
+        target.Eprocess = process.Eprocess;
+        target.DirectoryTableBase = process.DirectoryTableBase;
+        target.UserDirectoryTableBase = process.UserDirectoryTableBase;
+        target.Peb = process.Peb;
+        target.HasPeb = process.HasPeb;
+        target.ImageName = process.ImageName;
+        return target;
+    }
+
+    void CaptureProcessInventory(const SnapshotCaptureOptions& options, SnapshotDocument* document)
+    {
+        if (document == nullptr)
+        {
+            return;
+        }
+
+        document->Processes = options.Processes;
+        for (SnapshotProcessRecord& process : document->Processes)
+        {
+            std::vector<std::wstring> warnings;
+            if (process.Identity.empty())
+            {
+                process.Identity = BuildSnapshotProcessIdentity(process, &warnings);
+            }
+            AddWarnings(document, L"process", warnings);
+
+            SnapshotRecord record;
+            record.Domain = L"process";
+            record.Identity = process.Identity;
+            record.Display = process.ImageName + L" pid=" + std::to_wstring(process.ProcessId);
+            record.Risk = L"info";
+            record.Tags = {L"process-inventory"};
+            record.Evidence[L"pid"] = DecText(process.ProcessId);
+            record.Evidence[L"image"] = process.ImageName;
+            record.Evidence[L"eprocess"] = SnapshotHex(process.Eprocess, 16);
+            record.Evidence[L"dtb"] = SnapshotHex(process.DirectoryTableBase, 16);
+            record.Evidence[L"user_dtb"] = SnapshotHex(process.UserDirectoryTableBase, 16);
+            record.Evidence[L"has_create_time"] = BoolText(process.HasCreateTime);
+            record.Evidence[L"create_time"] = SnapshotHex(process.CreateTime, 16);
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureModules(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        IntegrityScanner scanner(device, symbols);
+        ModuleIntegrityOptions options = {};
+        ModuleIntegrityResult result = {};
+        std::wstring error;
+
+        if (!scanner.ScanModules(options, &result, &error))
+        {
+            AddWarning(document, L"modules", error);
+            AddWarnings(document, L"modules", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"modules", result.Warnings);
+        for (const ModuleIntegrityRecord& module : result.Records)
+        {
+            SnapshotRecord record;
+            record.Domain = L"modules";
+            record.Identity = L"module:" + SnapshotToLower(module.ImageName);
+            record.Display = module.ImageName;
+            record.Risk = module.WxEvidence ? L"high" : (module.Suspicious ? L"medium" : L"low");
+            record.Tags = {L"module"};
+            if (module.Suspicious)
+            {
+                record.Tags.push_back(L"suspicious");
+            }
+            if (module.WxEvidence)
+            {
+                record.Tags.push_back(L"wx");
+            }
+            if (module.MismatchEvidence)
+            {
+                record.Tags.push_back(L"mismatch");
+            }
+            record.Evidence[L"image"] = module.ImageName;
+            record.Evidence[L"path"] = module.ImagePath;
+            record.Evidence[L"base"] = SnapshotHex(module.Base, 16);
+            record.Evidence[L"size"] = DecText(module.Size);
+            record.Evidence[L"sizeof_image"] = DecText(module.SizeOfImage);
+            record.Evidence[L"reason_codes"] = JoinTags(module.ReasonCodes);
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureDrivers(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        IntegrityScanner scanner(device, symbols);
+        DriverIntegrityOptions options = {};
+        DriverIntegrityResult result = {};
+        std::wstring error;
+
+        if (!scanner.ScanDrivers(options, &result, &error))
+        {
+            AddWarning(document, L"drivers", error);
+            AddWarnings(document, L"drivers", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"drivers", result.Warnings);
+        for (const DriverIntegrityRecord& driver : result.Records)
+        {
+            SnapshotRecord record;
+            record.Domain = L"drivers";
+            record.Identity = L"driver:" + SnapshotToLower(driver.Name);
+            record.Display = driver.Name;
+            record.Risk = driver.Suspicious ? L"high" : L"low";
+            record.Tags = {L"driver"};
+            if (driver.Suspicious)
+            {
+                record.Tags.push_back(L"suspicious");
+            }
+            record.Evidence[L"name"] = driver.Name;
+            record.Evidence[L"object"] = SnapshotHex(driver.DriverObject, 16);
+            record.Evidence[L"start"] = SnapshotHex(driver.DriverStart, 16);
+            record.Evidence[L"size"] = DecText(driver.DriverSize);
+            record.Evidence[L"owning_module"] = driver.OwningModule;
+            record.Evidence[L"suspicious_dispatch_count"] = DecText(driver.SuspiciousDispatchCount);
+            AddRecord(document, std::move(record));
+
+            for (const DriverDispatchRecord& dispatch : driver.Dispatch)
+            {
+                SnapshotRecord dispatchRecord;
+                dispatchRecord.Domain = L"drivers";
+                dispatchRecord.Identity = L"driver-dispatch:" + SnapshotToLower(driver.Name) +
+                    L":" + std::to_wstring(dispatch.Index);
+                dispatchRecord.Display = driver.Name + L" " + dispatch.Name;
+                dispatchRecord.Risk = dispatch.Suspicious ? L"high" : L"low";
+                dispatchRecord.Tags = {L"dispatch"};
+                if (dispatch.Suspicious)
+                {
+                    dispatchRecord.Tags.push_back(L"suspicious");
+                }
+                dispatchRecord.Evidence[L"driver"] = driver.Name;
+                dispatchRecord.Evidence[L"irp"] = DecText(dispatch.Index);
+                dispatchRecord.Evidence[L"name"] = dispatch.Name;
+                dispatchRecord.Evidence[L"function"] = SnapshotHex(dispatch.Function, 16);
+                dispatchRecord.Evidence[L"module"] = dispatch.ModuleName;
+                dispatchRecord.Evidence[L"symbol"] = dispatch.SymbolName;
+                dispatchRecord.Evidence[L"in_loaded_module"] = BoolText(dispatch.InLoadedModule);
+                dispatchRecord.Evidence[L"in_owning_image"] = BoolText(dispatch.InOwningImage);
+                AddRecord(document, std::move(dispatchRecord));
+            }
+        }
+    }
+
+    void CaptureCallbacks(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        KernelCallbackScanner scanner(device, symbols);
+        KernelCallbackScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(L"all", &result, &error))
+        {
+            AddWarning(document, L"callbacks", error);
+            AddWarnings(document, L"callbacks", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"callbacks", result.Warnings);
+        for (const KernelCallbackRecord& cb : result.Records)
+        {
+            std::wstring owner = SymbolOrAddressIdentity(symbols, cb.FunctionModule, cb.FunctionSymbol, cb.Function);
+
+            SnapshotRecord record;
+            record.Domain = L"callbacks";
+            record.Identity = L"callback:" + SnapshotToLower(cb.Kind) + L":" +
+                SnapshotToLower(cb.Target) + L":" + owner + L":" +
+                SnapshotHex(cb.Entry != 0 ? cb.Entry : cb.CallbackBlock, 16);
+            record.Display = cb.Kind + L" " + cb.Target + L" " + owner;
+            record.Risk = cb.FunctionModule.empty() ? L"high" : L"medium";
+            record.Tags = {L"callback"};
+            if (cb.FunctionModule.empty())
+            {
+                record.Tags.push_back(L"unknown-owner");
+            }
+            record.Evidence[L"kind"] = cb.Kind;
+            record.Evidence[L"target"] = cb.Target;
+            record.Evidence[L"function"] = SnapshotHex(cb.Function, 16);
+            record.Evidence[L"function_module"] = cb.FunctionModule;
+            record.Evidence[L"function_symbol"] = cb.FunctionSymbol;
+            record.Evidence[L"post_function"] = SnapshotHex(cb.PostFunction, 16);
+            record.Evidence[L"entry"] = SnapshotHex(cb.Entry, 16);
+            record.Evidence[L"callback_block"] = SnapshotHex(cb.CallbackBlock, 16);
+            record.Evidence[L"notes"] = cb.Notes;
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureEtw(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        EtwScanner scanner(device, symbols);
+        EtwScanner::Options options = {};
+        options.Target = EtwScanner::Scope::Loggers;
+        EtwScanResult result = {};
+        std::wstring error;
+
+        if (scanner.Scan(options, &result, &error))
+        {
+            AddWarnings(document, L"etw", result.Warnings);
+            for (const EtwLoggerRecord& logger : result.Loggers)
+            {
+                SnapshotRecord record;
+                record.Domain = L"etw";
+                record.Identity = L"etw-logger:" + std::to_wstring(logger.Slot) +
+                    L":" + SnapshotToLower(logger.Name);
+                record.Display = logger.Name.empty()
+                    ? (L"logger slot " + std::to_wstring(logger.Slot))
+                    : logger.Name;
+                record.Risk = logger.Suspicious ? L"high" : L"low";
+                record.Tags = {L"logger"};
+                if (logger.Suspicious)
+                {
+                    record.Tags.push_back(L"suspicious");
+                }
+                record.Evidence[L"slot"] = DecText(logger.Slot);
+                record.Evidence[L"context"] = SnapshotHex(logger.ContextAddress, 16);
+                record.Evidence[L"name"] = logger.Name;
+                record.Evidence[L"get_cpu_clock"] = SnapshotHex(logger.GetCpuClockCallback, 16);
+                record.Evidence[L"get_cpu_clock_module"] = logger.GetCpuClockModule;
+                record.Evidence[L"get_cpu_clock_symbol"] = logger.GetCpuClockSymbol;
+                record.Evidence[L"notes"] = logger.Notes;
+                AddRecord(document, std::move(record));
+            }
+        }
+        else
+        {
+            AddWarning(document, L"etw", error);
+            AddWarnings(document, L"etw", result.Warnings);
+        }
+
+        EtwIntegrityResult integrity = {};
+        if (scanner.ScanIntegrity(&integrity, &error))
+        {
+            AddWarnings(document, L"etw", integrity.Warnings);
+            for (const EtwIntegrityRecord& item : integrity.Records)
+            {
+                SnapshotRecord record;
+                record.Domain = L"etw";
+                record.Identity = L"etw-integrity:" + SnapshotToLower(item.Symbol);
+                record.Display = item.Symbol;
+                record.Risk = item.Findings.empty() ? L"low" : L"high";
+                record.Tags = {L"integrity"};
+                if (!item.Findings.empty())
+                {
+                    record.Tags.push_back(L"suspicious");
+                }
+                record.Evidence[L"symbol"] = item.Symbol;
+                record.Evidence[L"address"] = SnapshotHex(item.Address, 16);
+                record.Evidence[L"findings"] = DecText(item.Findings.size());
+                record.Evidence[L"head_bytes"] = item.HeadBytesHex;
+                AddRecord(document, std::move(record));
+            }
+        }
+        else
+        {
+            AddWarning(document, L"etw", error);
+            AddWarnings(document, L"etw", integrity.Warnings);
+        }
+    }
+
+    void CaptureNmi(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        NmiScanner scanner(device, symbols);
+        NmiScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(&result, &error))
+        {
+            AddWarning(document, L"nmi", error);
+            AddWarnings(document, L"nmi", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"nmi", result.Warnings);
+        for (const NmiCallbackRecord& nmi : result.Callbacks)
+        {
+            std::wstring owner = SymbolOrAddressIdentity(symbols, nmi.CallbackModule, nmi.CallbackSymbol, nmi.Callback);
+            SnapshotRecord record;
+            record.Domain = L"nmi";
+            record.Identity = L"nmi:" + owner + L":" + SnapshotHex(nmi.NodeAddress, 16);
+            record.Display = owner;
+            record.Risk = nmi.Suspicious ? L"high" : L"medium";
+            record.Tags = {L"nmi"};
+            if (nmi.Suspicious)
+            {
+                record.Tags.push_back(L"suspicious");
+            }
+            record.Evidence[L"slot"] = DecText(nmi.Slot);
+            record.Evidence[L"node"] = SnapshotHex(nmi.NodeAddress, 16);
+            record.Evidence[L"callback"] = SnapshotHex(nmi.Callback, 16);
+            record.Evidence[L"module"] = nmi.CallbackModule;
+            record.Evidence[L"symbol"] = nmi.CallbackSymbol;
+            record.Evidence[L"notes"] = nmi.Notes;
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureFirmwareTables(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        FirmwareTableScanner scanner(device, symbols);
+        FirmwareTableScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(&result, &error))
+        {
+            AddWarning(document, L"fwtable", error);
+            AddWarnings(document, L"fwtable", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"fwtable", result.Warnings);
+        for (const FirmwareTableProviderRecord& provider : result.Records)
+        {
+            SnapshotRecord record;
+            record.Domain = L"fwtable";
+            record.Identity = L"fwtable:" + provider.ProviderText + L":" +
+                SnapshotHex(provider.NodeAddress, 16);
+            record.Display = provider.ProviderText;
+            record.Risk = provider.Suspicious ? L"high" : L"low";
+            record.Tags = {L"fwtable"};
+            if (provider.Suspicious)
+            {
+                record.Tags.push_back(L"suspicious");
+            }
+            record.Evidence[L"provider"] = provider.ProviderText;
+            record.Evidence[L"signature"] = SnapshotHex(provider.ProviderSignature, 8);
+            record.Evidence[L"node"] = SnapshotHex(provider.NodeAddress, 16);
+            record.Evidence[L"handler"] = SnapshotHex(provider.FirmwareTableHandler, 16);
+            record.Evidence[L"handler_module"] = provider.HandlerModule;
+            record.Evidence[L"handler_symbol"] = provider.HandlerSymbol;
+            record.Evidence[L"driver"] = provider.DriverName;
+            record.Evidence[L"notes"] = provider.Notes;
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CapturePool(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        PoolScanner scanner(device, symbols);
+        PoolScanner::Options options = {};
+        options.Target = PoolScanner::Scope::Big;
+        options.Paged = PoolScanner::PagedFilter::NonPagedOnly;
+        options.AnnotateAttributes = true;
+        PoolScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"pool", error);
+            AddWarnings(document, L"pool", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"pool", result.Warnings);
+        for (const BigPoolEntryRecord& entry : result.Entries)
+        {
+            bool wx = entry.AttributesQueried && entry.IsWritable && entry.IsExecutable;
+            bool large = entry.SizeInBytes >= kLargePoolThreshold;
+            SnapshotRecord record;
+            record.Domain = L"pool";
+            record.Identity = L"pool:" + entry.TagText + L":" +
+                SnapshotHex(entry.VirtualAddress, 16) + L":" + DecText(entry.SizeInBytes);
+            record.Display = entry.TagText + L" " + SnapshotHex(entry.VirtualAddress, 16);
+            record.Risk = wx ? L"high" : (large ? L"medium" : L"low");
+            record.Volatile = true;
+            record.Tags = {L"pool"};
+            if (entry.NonPaged)
+            {
+                record.Tags.push_back(L"nonpaged");
+            }
+            if (wx)
+            {
+                record.Tags.push_back(L"wx");
+            }
+            if (large)
+            {
+                record.Tags.push_back(L"large");
+            }
+            record.Evidence[L"address"] = SnapshotHex(entry.VirtualAddress, 16);
+            record.Evidence[L"size"] = DecText(entry.SizeInBytes);
+            record.Evidence[L"tag"] = entry.TagText;
+            record.Evidence[L"nonpaged"] = BoolText(entry.NonPaged);
+            record.Evidence[L"attributes_queried"] = BoolText(entry.AttributesQueried);
+            record.Evidence[L"readable"] = BoolText(entry.IsReadable);
+            record.Evidence[L"writable"] = BoolText(entry.IsWritable);
+            record.Evidence[L"executable"] = BoolText(entry.IsExecutable);
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CapturePoolPe(DeviceClient& device, SnapshotDocument* document)
+    {
+        PoolPeHunter hunter(device);
+        PoolPeHunter::Options options = {};
+        options.Paged = PoolPeHunter::PagedFilter::NonPagedOnly;
+        options.HasMinSize = true;
+        options.MinSize = 0x1000;
+        PoolPeHunterResult result = {};
+        std::wstring error;
+
+        if (!hunter.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"pool", error);
+            AddWarnings(document, L"pool", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"pool", result.Warnings);
+        for (const PoolPeHit& hit : result.Hits)
+        {
+            bool wiped = hit.Probe.MzWiped || hit.Probe.PeSignatureWiped || hit.Probe.ELfanewMismatch;
+            SnapshotRecord record;
+            record.Domain = L"pool";
+            record.Identity = L"pool-pe:" + SnapshotHex(hit.Address, 16) + L":" +
+                DecText(hit.SizeInBytes);
+            record.Display = L"pool PE " + hit.TagText + L" " + SnapshotHex(hit.Address, 16);
+            record.Risk = wiped ? L"high" : L"medium";
+            record.Volatile = true;
+            record.Tags = {L"pool-pe"};
+            if (wiped)
+            {
+                record.Tags.push_back(L"pool-pe-suspect");
+            }
+            record.Evidence[L"address"] = SnapshotHex(hit.Address, 16);
+            record.Evidence[L"size"] = DecText(hit.SizeInBytes);
+            record.Evidence[L"tag"] = hit.TagText;
+            record.Evidence[L"nonpaged"] = BoolText(hit.NonPaged);
+            record.Evidence[L"mz_wiped"] = BoolText(hit.Probe.MzWiped);
+            record.Evidence[L"pe_wiped"] = BoolText(hit.Probe.PeSignatureWiped);
+            record.Evidence[L"elfanew_mismatch"] = BoolText(hit.Probe.ELfanewMismatch);
+            record.Evidence[L"size_of_image"] = DecText(hit.Probe.SizeOfImage);
+            record.Evidence[L"sections"] = DecText(hit.Probe.NumberOfSections);
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureWfpScope(WfpScanner& scanner, WfpScanner::Scope scope, const std::wstring& scopeName, SnapshotDocument* document)
+    {
+        WfpScanner::Options options = {};
+        options.Target = scope;
+        WfpScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"wfp", scopeName + L": " + error);
+            AddWarnings(document, L"wfp", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"wfp", result.Warnings);
+        for (const WfpRecord& item : result.Records)
+        {
+            std::wstring key = !item.Key.empty()
+                ? item.Key
+                : (item.HasId ? std::to_wstring(item.Id) : item.Name);
+            SnapshotRecord record;
+            record.Domain = L"wfp";
+            record.Identity = L"wfp:" + SnapshotToLower(scopeName) + L":" + SnapshotToLower(key);
+            record.Display = scopeName + L" " + item.Name;
+            record.Risk = (scope == WfpScanner::Scope::Callouts || scope == WfpScanner::Scope::Filters) ? L"medium" : L"low";
+            record.Tags = {L"wfp", scopeName};
+            record.Evidence[L"kind"] = item.Kind;
+            record.Evidence[L"name"] = item.Name;
+            record.Evidence[L"key"] = item.Key;
+            record.Evidence[L"id"] = DecText(item.Id);
+            record.Evidence[L"provider"] = item.ProviderName;
+            record.Evidence[L"provider_key"] = item.ProviderKey;
+            record.Evidence[L"layer"] = item.LayerName;
+            record.Evidence[L"layer_key"] = item.LayerKey;
+            record.Evidence[L"action"] = item.ActionText;
+            record.Evidence[L"notes"] = item.Notes;
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureWfp(SnapshotDocument* document)
+    {
+        WfpScanner scanner;
+        CaptureWfpScope(scanner, WfpScanner::Scope::Providers, L"providers", document);
+        CaptureWfpScope(scanner, WfpScanner::Scope::SubLayers, L"sublayers", document);
+        CaptureWfpScope(scanner, WfpScanner::Scope::Callouts, L"callouts", document);
+        CaptureWfpScope(scanner, WfpScanner::Scope::Filters, L"filters", document);
+        CaptureWfpScope(scanner, WfpScanner::Scope::Layers, L"layers", document);
+    }
+
+    void CaptureAlpc(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        AlpcScanner scanner(device, symbols);
+        AlpcScanner::Options options = {};
+        options.Target = AlpcScanner::Scope::Connections;
+        AlpcScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"alpc", error);
+            AddWarnings(document, L"alpc", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"alpc", result.Warnings);
+        for (const AlpcPortRecord& port : result.Records)
+        {
+            SnapshotRecord record;
+            record.Domain = L"alpc";
+            record.Identity = L"alpc:" + SnapshotHex(port.Address, 16);
+            record.Display = port.Name.empty() ? SnapshotHex(port.Address, 16) : port.Name;
+            record.Risk = port.IsNamedDirectoryPort ? L"medium" : L"low";
+            record.Volatile = true;
+            record.Tags = {L"alpc"};
+            if (port.IsConnectionPort)
+            {
+                record.Tags.push_back(L"connection-port");
+            }
+            record.Evidence[L"address"] = SnapshotHex(port.Address, 16);
+            record.Evidence[L"name"] = port.Name;
+            record.Evidence[L"directory"] = port.DirectoryPath;
+            record.Evidence[L"owner_pid"] = DecText(port.OwnerProcessId);
+            record.Evidence[L"owner_image"] = port.OwnerImageName;
+            record.Evidence[L"connection_port"] = SnapshotHex(port.ConnectionPort, 16);
+            record.Evidence[L"queues"] = DecText(
+                static_cast<uint64_t>(port.MainQueueLength) +
+                port.PendingQueueLength +
+                port.LargeMessageQueueLength +
+                port.CanceledQueueLength +
+                port.WaitQueueLength);
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureWnf(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        WnfScanner scanner(device, symbols);
+        WnfScanner::Options options = {};
+        options.Target = WnfScanner::Scope::Instances;
+        WnfScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"wnf", error);
+            AddWarnings(document, L"wnf", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"wnf", result.Warnings);
+        for (const WnfInstanceRecord& instance : result.Instances)
+        {
+            SnapshotRecord record;
+            record.Domain = L"wnf";
+            record.Identity = L"wnf:" + SnapshotHex(instance.Address, 16);
+            record.Display = SnapshotHex(instance.StateName, 16);
+            record.Risk = L"low";
+            record.Volatile = true;
+            record.Tags = {L"wnf"};
+            record.Evidence[L"address"] = SnapshotHex(instance.Address, 16);
+            record.Evidence[L"state"] = SnapshotHex(instance.StateName, 16);
+            record.Evidence[L"owner_pid"] = DecText(instance.OwningPid);
+            record.Evidence[L"owner_image"] = instance.OwningImageName;
+            record.Evidence[L"subscriber_count"] = DecText(instance.Subscribers.size());
+            record.Evidence[L"data_size"] = DecText(instance.DataSize);
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureVbs(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        VbsScanner scanner(device, symbols);
+        VbsScanner::Options options = {};
+        options.Target = VbsScanner::Scope::Vbs;
+        VbsScanResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"vbs", error);
+            AddWarnings(document, L"vbs", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"vbs", result.Warnings);
+
+        SnapshotRecord vbs;
+        vbs.Domain = L"vbs";
+        vbs.Identity = L"vbs:state";
+        vbs.Display = L"VBS state";
+        vbs.Risk = L"info";
+        vbs.Tags = {L"vbs"};
+        vbs.Evidence[L"vbs_active"] = BoolText(result.VbsActive);
+        vbs.Evidence[L"secure_kernel_loaded"] = BoolText(result.SecureKernelLoaded);
+        vbs.Evidence[L"skci_loaded"] = BoolText(result.SkciLoaded);
+        vbs.Evidence[L"hypervisor_present"] = BoolText(result.Hypervisor.HypervisorPresent);
+        vbs.Evidence[L"hypervisor_vendor"] = result.Hypervisor.VendorSignature;
+        AddRecord(document, std::move(vbs));
+
+        SnapshotRecord ci;
+        ci.Domain = L"vbs";
+        ci.Identity = L"ci:options";
+        ci.Display = L"Code Integrity options";
+        ci.Risk = L"info";
+        ci.Tags = {L"ci"};
+        ci.Evidence[L"resolved"] = BoolText(result.CiOptions.Resolved);
+        ci.Evidence[L"raw"] = SnapshotHex(result.CiOptions.Raw, 8);
+        ci.Evidence[L"ci_enabled"] = BoolText(result.CiOptions.CodeIntegrityEnabled);
+        ci.Evidence[L"testsign"] = BoolText(result.CiOptions.TestSign);
+        ci.Evidence[L"umci"] = BoolText(result.CiOptions.UmciEnabled);
+        ci.Evidence[L"hvci"] = BoolText(result.CiOptions.HvciEnforced);
+        ci.Evidence[L"hvci_debug"] = BoolText(result.CiOptions.HvciDebugMode);
+        AddRecord(document, std::move(ci));
+    }
+
+    void CaptureByovdCatalogMetadata(ByovdScanner& scanner, SnapshotDocument* document)
+    {
+        ByovdCatalogStatus status = {};
+        std::wstring error;
+
+        if (scanner.QueryCatalogStatus(&status, &error))
+        {
+            document->Metadata[L"byovd_catalog_path"] = status.CatalogPath;
+            document->Metadata[L"byovd_catalog_entries"] = DecText(status.EntryCount);
+            document->Metadata[L"byovd_catalog_age_seconds"] = DecText(status.AgeSeconds);
+            document->Metadata[L"byovd_catalog_stale"] = BoolText(status.Stale);
+            document->Metadata[L"byovd_catalog_fingerprint"] = FingerprintFileFnv64(status.CatalogPath);
+        }
+        else
+        {
+            AddWarning(document, L"byovd", error);
+        }
+    }
+
+    void CaptureByovd(SymbolEngine& symbols, const SnapshotCaptureOptions& options, SnapshotDocument* document)
+    {
+        ByovdScanner scanner(symbols, options.ExecutableDirectory);
+        std::wstring error;
+        ByovdScanOptions scanOptions = {};
+        scanOptions.AutoUpdate = options.AllowByovdAutoUpdate;
+        scanOptions.ForceUpdate = false;
+        scanOptions.EnableYara = false;
+        ByovdScanResult result = {};
+
+        if (!scanner.Scan(scanOptions, &result, &error))
+        {
+            AddWarning(document, L"byovd", error);
+            AddWarnings(document, L"byovd", result.Warnings);
+            CaptureByovdCatalogMetadata(scanner, document);
+            return;
+        }
+
+        CaptureByovdCatalogMetadata(scanner, document);
+        AddWarnings(document, L"byovd", result.Warnings);
+        for (const ByovdModuleRecord& module : result.Records)
+        {
+            if (module.Matches.empty())
+            {
+                continue;
+            }
+
+            bool high = RecordHasHighByovdMatch(module);
+            SnapshotRecord record;
+            record.Domain = L"byovd";
+            record.Identity = L"byovd:" + SnapshotToLower(module.ImageName) + L":" +
+                SnapshotToLower(module.Sha256);
+            record.Display = module.ImageName;
+            record.Risk = high ? L"high" : L"medium";
+            record.Tags = {L"byovd"};
+            if (high)
+            {
+                record.Tags.push_back(L"high-confidence");
+            }
+            record.Evidence[L"image"] = module.ImageName;
+            record.Evidence[L"path"] = module.DiskPath;
+            record.Evidence[L"base"] = SnapshotHex(module.Base, 16);
+            record.Evidence[L"size"] = DecText(module.Size);
+            record.Evidence[L"sha256"] = module.Sha256;
+            record.Evidence[L"file_version"] = module.FileVersion;
+            record.Evidence[L"matches"] = ByovdMatchSummary(module);
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureVadDkomForNewProcesses(DeviceClient& device, SymbolEngine& symbols, const SnapshotCaptureOptions& options, SnapshotDocument* document)
+    {
+        if (options.BaselineForVadDkom == nullptr || document == nullptr)
+        {
+            return;
+        }
+
+        std::set<std::wstring> baselineProcesses = BuildBaselineProcessSet(*options.BaselineForVadDkom);
+        ProcessTriageScanner scanner(device, symbols);
+
+        for (const SnapshotProcessRecord& process : document->Processes)
+        {
+            if (process.Identity.empty() ||
+                baselineProcesses.find(process.Identity) != baselineProcesses.end())
+            {
+                continue;
+            }
+
+            SnapshotRecord scanned;
+            scanned.Domain = L"vad-dkom";
+            scanned.Identity = L"vad-scan:" + process.Identity;
+            scanned.Display = process.ImageName + L" pid=" + std::to_wstring(process.ProcessId);
+            scanned.Risk = L"info";
+            scanned.Tags = {L"vad-dkom", L"process-scanned"};
+            scanned.Evidence[L"pid"] = DecText(process.ProcessId);
+            scanned.Evidence[L"image"] = process.ImageName;
+            scanned.Evidence[L"eprocess"] = SnapshotHex(process.Eprocess, 16);
+            scanned.Evidence[L"dtb"] = SnapshotHex(process.DirectoryTableBase, 16);
+
+            ProcessVadScanOptions vadOptions = {};
+            vadOptions.Target = BuildTriageTarget(process);
+            vadOptions.ScanHiddenPtes = true;
+            vadOptions.SummaryOnly = true;
+            ProcessVadScanResult vadResult = {};
+            std::wstring error;
+            if (!scanner.ScanVad(vadOptions, &vadResult, &error))
+            {
+                scanned.Risk = L"low";
+                scanned.Tags.push_back(L"scan-failed");
+                scanned.Evidence[L"scan_failed"] = L"true";
+                scanned.Evidence[L"error"] = error;
+                AddWarning(document, L"vad-dkom", process.ImageName + L" pid=" +
+                    std::to_wstring(process.ProcessId) + L": " + error);
+                AddRecord(document, std::move(scanned));
+                continue;
+            }
+
+            scanned.Evidence[L"hidden_pte_ranges"] = DecText(vadResult.HiddenPteRanges);
+            scanned.Evidence[L"hidden_pte_bytes"] = DecText(vadResult.HiddenPteBytes);
+            scanned.Evidence[L"hidden_pte_wx"] = DecText(vadResult.HiddenPteWxCount);
+            scanned.Evidence[L"hidden_pte_exec"] = DecText(vadResult.HiddenPteExecutableCount);
+            AddWarnings(document, L"vad-dkom", vadResult.Warnings);
+            AddRecord(document, std::move(scanned));
+
+            for (const ProcessHiddenVadPteRecord& hidden : vadResult.HiddenPteRecords)
+            {
+                SnapshotRecord record;
+                record.Domain = L"vad-dkom";
+                record.Identity = L"hidden-pte:" + process.Identity + L":" +
+                    SnapshotHex(hidden.StartAddress, 16) + L":" + SnapshotHex(hidden.EndAddress, 16);
+                record.Display = process.ImageName + L" hidden PTE " + SnapshotHex(hidden.StartAddress, 16);
+                record.Risk = (hidden.Writable && hidden.Executable) ? L"high" :
+                    (hidden.Executable ? L"medium" : L"low");
+                record.Tags = {L"vad-dkom", L"hidden-pte"};
+                if (hidden.Writable && hidden.Executable)
+                {
+                    record.Tags.push_back(L"wx");
+                }
+                if (hidden.Executable)
+                {
+                    record.Tags.push_back(L"executable");
+                }
+                record.Evidence[L"pid"] = DecText(process.ProcessId);
+                record.Evidence[L"image"] = process.ImageName;
+                record.Evidence[L"eprocess"] = SnapshotHex(process.Eprocess, 16);
+                record.Evidence[L"start"] = SnapshotHex(hidden.StartAddress, 16);
+                record.Evidence[L"end"] = SnapshotHex(hidden.EndAddress, 16);
+                record.Evidence[L"size"] = DecText(hidden.Size);
+                record.Evidence[L"pages"] = DecText(hidden.PageCount);
+                record.Evidence[L"physical"] = SnapshotHex(hidden.PhysicalAddress, 16);
+                record.Evidence[L"leaf_entry_address"] = SnapshotHex(hidden.LeafEntryAddress, 16);
+                record.Evidence[L"leaf_entry"] = SnapshotHex(hidden.LeafEntry, 16);
+                record.Evidence[L"writable"] = BoolText(hidden.Writable);
+                record.Evidence[L"executable"] = BoolText(hidden.Executable);
+                record.Evidence[L"user_accessible"] = BoolText(hidden.UserAccessible);
+                record.Evidence[L"notes"] = hidden.Notes;
+                AddRecord(document, std::move(record));
+            }
+        }
+    }
+}
+
+SnapshotCollector::SnapshotCollector(DeviceClient& device, SymbolEngine& symbols) :
+    device_(device),
+    symbols_(symbols)
+{
+}
+
+bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotDocument* document, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (document == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid snapshot output buffer";
+            }
+            break;
+        }
+
+        *document = SnapshotDocument{};
+        document->Schema = L"kn-live-dbg.snapshot.v1";
+        document->Label = options.Label.empty() ? L"snapshot" : options.Label;
+        document->TimestampUtc = SnapshotCurrentUtcTimestamp();
+        document->SameBootOnly = true;
+        document->BootId = SnapshotCurrentBootId();
+        document->Metadata[L"include_all"] = BoolText(options.IncludeAll);
+        document->Metadata[L"vad_dkom_new_process_mode"] = BoolText(options.CaptureVadDkomForNewProcesses);
+        document->Metadata[L"byovd_auto_update"] = BoolText(options.AllowByovdAutoUpdate);
+
+        CaptureProcessInventory(options, document);
+
+        if (!options.IncludeAll)
+        {
+            ok = true;
+            break;
+        }
+
+        CaptureModules(device_, symbols_, document);
+        CaptureDrivers(device_, symbols_, document);
+        CaptureCallbacks(device_, symbols_, document);
+        CaptureEtw(device_, symbols_, document);
+        CaptureNmi(device_, symbols_, document);
+        CaptureFirmwareTables(device_, symbols_, document);
+        CapturePool(device_, symbols_, document);
+        CapturePoolPe(device_, document);
+        CaptureWfp(document);
+        CaptureAlpc(device_, symbols_, document);
+        CaptureWnf(device_, symbols_, document);
+        CaptureVbs(device_, symbols_, document);
+        CaptureByovd(symbols_, options, document);
+
+        if (options.CaptureVadDkomForNewProcesses)
+        {
+            CaptureVadDkomForNewProcesses(device_, symbols_, options, document);
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}

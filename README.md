@@ -62,19 +62,20 @@ kn-live-dbg/
 27. Checks live module and driver-object integrity with `!module integrity` and `!driver integrity` -- reading live PE headers/sections for loaded modules, validating PE/section invariants with reason codes, flagging static/effective W+X evidence or live SizeOfImage drift, walking `\Driver` objects through Object Manager metadata, and annotating `DRIVER_OBJECT.MajorFunction[]` dispatch targets with module/symbol ownership.
 28. Scans loaded kernel modules for BYOVD risk with `byovd` / `!byovd` -- maintaining a local catalog from the Microsoft vulnerable driver blocklist plus LOLDrivers hash/YARA feeds, auto-refreshing it when older than 24 hours, hashing loaded module images on disk, optionally running LOLDrivers YARA rules through an operator-supplied `yara64.exe` / `yara.exe`, and reporting exact hash/YARA matches as `HIGH` confidence plus Microsoft file-name/version blocklist hints as `MEDIUM` confidence. A benign no-op fixture driver (`amdryzenmasterdriver.sys`) can be loaded with `byovd fixture load` to exercise the Microsoft name/version positive-control path without shipping an actual vulnerable driver.
 29. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), W+X page attributes (`/wx`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
-30. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
-31. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
-32. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
-33. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
-34. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
-35. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
+30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, focusing diff output on records that were absent from the baseline but present later, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first.
+31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
+32. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
+33. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
+34. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
+35. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
+36. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
 
 ## Design Notes
 
 - `docs/ARCHITECTURE.md` describes the driver/user split and backend routing.
 - `docs/WINDBG_COMMAND_COVERAGE.md` tracks native and DbgEng-routed WinDbg command coverage.
 - `docs/AI_ASSISTED_WORKFLOWS.md` documents the implemented AI intent router, evidence analysis, command planning, write safety, playbooks, reporting, and operator examples.
-- `docs/FEATURE_PLAN.md` tracks completed feature slices and remaining high-value work such as snapshots/diffs, richer driver-object/device-stack inspection, WNF stabilization, WFP kernel callout resolution, and probe fixtures.
+- `docs/FEATURE_PLAN.md` tracks completed feature slices and remaining high-value work such as richer driver-object/device-stack inspection, WNF stabilization, WFP kernel callout resolution, and probe fixtures.
 
 ## Build
 
@@ -205,6 +206,11 @@ byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-
 !byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
 byovd fixture [status|load [sys-path]|unload|path]
 !pool [big|find|summary] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx]
+!snapshot baseline [/all] [/name <label>]
+!snapshot save <path> [/all] [/name <label>]
+!snapshot show [baseline|<path>] [/domains] [/warnings]
+!diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+!diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
 dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
 pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
@@ -305,6 +311,9 @@ knkd> !pool find /tag Wmem /annotate
 knkd> !pool find /wx /limit 20
 knkd> !pool find /min 0x10000 /annotate
 knkd> !pool summary
+knkd> !snapshot baseline /name clean-boot
+knkd> !diff baseline
+knkd> !diff baseline /domain pool /limit 20
 knkd> dump-raw nt!KiSystemServiceUser 0x200 .\kiSystemServiceUser.bin
 knkd> dump-pe nt .\ntoskrnl-live.exe
 knkd> dump-pe Wdf01000 .\wdf01000-live.sys
@@ -435,7 +444,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!fwtable`, `!module`, `!driver`, `!pool`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!fwtable`, `!module`, `!driver`, `!pool`, `!snapshot`, `!diff`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -746,6 +755,40 @@ Requirements and caveats:
 - The host must be elevated. `NtQuerySystemInformation(SystemBigPoolInformation)` returns `STATUS_ACCESS_DENIED` without `SeDebugPrivilege`; the error path reports the NTSTATUS verbatim.
 - Only big pool (>= one page) is tracked by `nt!PoolBigPageTable`. Smaller allocations served from per-CPU lookasides and the segment heap are not visible to this command.
 - `/annotate` requires the `KnLiveDbg.sys` device to be open. The TUI auto-disables the flag with a warning when the device is not available. `/wx` requires the device because it cannot classify effective permissions without page-table translation.
+
+## Session Baseline Diffing
+
+`!snapshot` and `!diff` turn the existing native scanners into a same-boot evidence baseline workflow. `!snapshot baseline` captures process inventory plus the high-value domains, stores the baseline in memory, and writes JSON plus a Markdown snapshot report. `!diff baseline` captures a fresh current snapshot, compares it against the in-memory baseline, writes the current JSON plus Markdown reports, and prints a compact new-focused summary.
+
+```text
+!snapshot baseline [/all] [/name <label>]
+!snapshot save <path> [/all] [/name <label>]
+!snapshot show [baseline|<path>] [/domains] [/warnings]
+!diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+!diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+```
+
+Default files are written under the EXE directory's `.kn-live-dbg\snapshots` and `.kn-live-dbg\reports` trees. The JSON schema is `kn-live-dbg.snapshot.v1`; reports are Markdown and are generated automatically for both baseline snapshots and diffs.
+
+The diff is intentionally biased toward what appeared after the baseline:
+
+1. Added records are shown when the identity was absent from the baseline and present in the current snapshot.
+2. Escalations are shown when an existing identity becomes high-risk, such as driver dispatch redirection, ETW GetCpuClock tampering, pool records gaining W+X/PE evidence, or VAD DKOM hidden-PTE evidence.
+3. Removed records are not shown by default; this keeps launch-time and post-event triage focused on new attack surface.
+4. Pool output is ordered as pool-PE suspect first, pool-PE hit second, W+X NonPaged third, then large NonPaged by descending size.
+5. `!diff baseline` scans VAD DKOM hidden-PTE evidence for every process that is new since the baseline and still alive at diff time.
+
+The `/all` option is accepted for explicitness; the current native baseline captures the full implemented domain set by default: modules, drivers, callbacks, ETW, NMI, firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, BYOVD, and process inventory. BYOVD catalog auto-update is allowed for `!snapshot baseline` and `!snapshot save`, but `!diff baseline` reuses the local catalog in no-update mode and emits a warning if the catalog fingerprint differs between snapshots. YARA is not run by the snapshot path unless the standalone `byovd scan /yara` command is used.
+
+Typical clean-baseline flow:
+
+```text
+knkd> !snapshot baseline /name clean-boot
+knkd> !snapshot show baseline /domains /warnings
+... launch the workload ...
+knkd> !diff baseline /limit 20
+knkd> !diff baseline /domain pool /risk high /limit 30
+```
 
 Native physical memory support is intentionally explicit:
 

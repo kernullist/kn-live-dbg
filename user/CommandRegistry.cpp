@@ -111,6 +111,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!dml_proc", L"!dml_proc [pid]", L"kernel", L"list processes from EPROCESS ActiveProcessLinks, optionally filtered by PID", CommandSupport::Native),
         Make(L"!vad", L"!vad <pid|image|eprocess>", L"kernel", L"walk a process VAD tree and flag executable, private, W+X, and PE-like regions", CommandSupport::Native),
         Make(L"!threads", L"!threads <pid|image|eprocess>", L"kernel", L"walk a process thread list and flag suspicious starts and APC evidence", CommandSupport::Native),
+        Make(L"!snapshot", L"!snapshot", L"session", L"capture same-boot baseline evidence snapshots with automatic JSON and Markdown reports", CommandSupport::Native),
+        Make(L"!diff", L"!diff", L"session", L"compare snapshots with new-focused same-boot evidence semantics", CommandSupport::Native),
         Make(L"!wfp", L"!wfp", L"kernel", L"enumerate Windows Filtering Platform objects via fwpuclnt.dll", CommandSupport::Native),
         Make(L"!alpc", L"!alpc", L"kernel", L"enumerate ALPC ports, connection pairings, and queue depths from kernel memory", CommandSupport::Native),
         Make(L"!byovd", L"!byovd", L"kernel", L"scan loaded kernel modules against local Microsoft and LOLDrivers BYOVD hash/YARA intelligence", CommandSupport::Native),
