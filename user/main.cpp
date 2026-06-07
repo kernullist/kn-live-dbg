@@ -164,6 +164,11 @@ static void PrintColoredText(const wchar_t* text, WORD color)
     }
 }
 
+static void PrintCommandRegistryColoredText(const std::wstring& text, CommandRegistryColor color)
+{
+    PrintColoredText(text, static_cast<WORD>(color));
+}
+
 static std::wstring GetExecutableDirectory();
 
 // -------- Output logging: tee stdout to a file --------------------------
@@ -1684,91 +1689,76 @@ static bool HasHelpToken(const std::vector<std::wstring>& args, size_t first)
 
 static void PrintHelp(bool includeDbgEng)
 {
-    std::wcout << L"KnLiveDbg WinDbg-compatible command surface\n";
-    std::wcout << L"interactive: press Tab to complete commands; Up/Down recalls command history\n";
+    PrintColoredText(L"KnLiveDbg command help", KNDBG_COLOR_TITLE);
     std::wcout << L"\n";
-    std::wcout << L"how to read this help:\n";
-    std::wcout << L"  help                 show native and TUI command summary\n";
-    std::wcout << L"  help all             include DbgEng-routed WinDbg commands\n";
-    std::wcout << L"  help <command>       show detailed syntax and notes for one command family\n";
-    std::wcout << L"  <command> help       same as help <command>\n";
-    std::wcout << L"  ai help <topic>      show AI subcommand help\n";
+    std::wcout << L"  WinDbg-compatible live-kernel console with native memory IOCTLs, symbols, scanners, and optional DbgEng routing.\n";
+    std::wcout << L"  Press Tab for completion. Up/Down recalls history. Empty Enter repeats the last command.\n";
     std::wcout << L"\n";
-    std::wcout << L"syntax notes:\n";
-    std::wcout << L"  <address|symbol> accepts numbers, loaded symbols, and + or - arithmetic\n";
-    std::wcout << L"  nt! is normalized to the loaded kernel image when resolving symbols and types\n";
-    std::wcout << L"  d*/e*/vtop support /process <process-id>; procctx pins a default process context\n";
-    std::wcout << L"  virtual e* writes default to System(pid 4) context for kernel addresses\n";
-    std::wcout << L"  unreadable memory is rendered as ?? where sparse reads can continue\n";
-    std::wcout << L"  native means implemented by KnLiveDbg; dbgeng means routed to IDebugControl\n";
+
+    PrintColoredText(L"quick start", KNDBG_COLOR_ACCENT);
     std::wcout << L"\n";
-    std::wcout << L"high-value help topics:\n";
+    std::wcout << L"  help                     show native and TUI commands grouped by feature\n";
+    std::wcout << L"  help all                 also include DbgEng-routed WinDbg commands\n";
+    std::wcout << L"  help <command>           show syntax, options, notes, and examples for one family\n";
+    std::wcout << L"  <command> help           same as help <command>\n";
+    std::wcout << L"  ai help <subcommand>     show AI subcommand help\n";
+    std::wcout << L"\n";
+
+    PrintColoredText(L"operator rules", KNDBG_COLOR_ACCENT);
+    std::wcout << L"\n";
+    std::wcout << L"  <address|symbol> accepts numbers, loaded symbols, and + or - arithmetic.\n";
+    std::wcout << L"  nt! is normalized to the loaded kernel image for symbol and type lookup.\n";
+    std::wcout << L"  d*/e*/vtop support /process <process-id>; procctx pins a default process context.\n";
+    std::wcout << L"  Virtual e* writes default to System(pid 4) context for kernel addresses.\n";
+    std::wcout << L"  Sparse reads keep layout and render unreadable bytes as ??.\n";
+    std::wcout << L"  ";
+    PrintColoredText(L"native", KNDBG_COLOR_OK);
+    std::wcout << L" means KnLiveDbg implementation; ";
+    PrintColoredText(L"alias", KNDBG_COLOR_ACCENT);
+    std::wcout << L" means local alias; ";
+    PrintColoredText(L"dbgeng", KNDBG_COLOR_WARN);
+    std::wcout << L" means routed to IDebugControl.\n";
+    std::wcout << L"\n";
+
+    PrintColoredText(L"high-value topics", KNDBG_COLOR_ACCENT);
+    std::wcout << L"\n";
     std::wcout << L"  help callbacks       callback scanners and module filters\n";
+    std::wcout << L"  help !vad            VAD tree triage, hidden PTE checks, PE-like private memory\n";
+    std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
+    std::wcout << L"  help !pool           big-pool allocation triage and W+X annotation\n";
+    std::wcout << L"  help !address        canonicality, page-table walk, effective permissions, owner symbol\n";
     std::wcout << L"  help dt              type layout, wildcard, and field filters\n";
     std::wcout << L"  help e               virtual memory editing and /process behavior\n";
     std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
     std::wcout << L"  ai help              AI question, config, plan, explain, run, and write commands\n";
     std::wcout << L"\n";
-    std::wcout << L"usage examples:\n";
-    std::wcout << L"  help <command>\n";
-    std::wcout << L"  <command> help\n";
-    std::wcout << L"  ai help <subcommand>\n";
-    std::wcout << L"  ai <subcommand> help\n";
-    std::wcout << L"  home\n";
-    std::wcout << L"  .sympath SRV*<exe-dir>\\symbols*https://msdl.microsoft.com/download/symbols\n";
-    std::wcout << L"  .reload\n";
-    std::wcout << L"  lm nt\n";
-    std::wcout << L"  x nt!*Process*\n";
-    std::wcout << L"  ln nt!PsLoadedModuleList\n";
-    std::wcout << L"  u nt!KiSystemCall64 8\n";
-    std::wcout << L"  uf nt!KiSystemCall64 512\n";
-    std::wcout << L"  dq nt!PsLoadedModuleList 8\n";
-    std::wcout << L"  dt nt!_EPROCESS <address>\n";
-    std::wcout << L"  callbacks all\n";
-    std::wcout << L"  callbacks imageload\n";
-    std::wcout << L"  callbacks all WdFilter.sys\n";
-    std::wcout << L"  callbacks process WdFilter.sys\n";
-    std::wcout << L"  procctx <pid>\n";
-    std::wcout << L"  vtop /process <pid> <user-address>\n";
-    std::wcout << L"  db /process <pid> <user-address> 80\n";
-    std::wcout << L"  eb nt!SomeSymbol 90\n";
-    std::wcout << L"  eb /process <pid> <user-address> 90\n";
-    std::wcout << L"  vtop nt!PsLoadedModuleList\n";
-    std::wcout << L"  pdb <physical-address> 80\n";
-    std::wcout << L"  !db <physical-address> 80\n";
-    std::wcout << L"  probe load\n";
-    std::wcout << L"  probe info\n";
-    std::wcout << L"  kdinit\n";
-    std::wcout << L"  backend dbgeng\n";
-    std::wcout << L"  !dml_proc [pid]\n";
-    std::wcout << L"  !wfp providers\n";
-    std::wcout << L"  !wfp callouts /module tcpip\n";
-    std::wcout << L"  !wfp filters /layer ALE_AUTH_CONNECT_V4\n";
-    std::wcout << L"  !alpc ports\n";
-    std::wcout << L"  !alpc connections\n";
-    std::wcout << L"  !alpc queues <port-address>\n";
-    std::wcout << L"  !vbs\n";
-    std::wcout << L"  !ci options\n";
-    std::wcout << L"  !securekernel\n";
-    std::wcout << L"  !etw loggers\n";
-    std::wcout << L"  !nmi callbacks\n";
-    std::wcout << L"  !fwtable providers\n";
-    std::wcout << L"  !wnf decode 0x41c64e6da3bc0075\n";
-    std::wcout << L"  !wnf instances\n";
-    std::wcout << L"  write off\n";
-    std::wcout << L"  ed <address> <value>\n";
-    std::wcout << L"  peq <physical-address> <value>\n";
-    std::wcout << L"  !eb <physical-address>\n";
-    std::wcout << L"  !eq <physical-address> <value>\n";
-    std::wcout << L"  ai a.exe eprocess\n";
-    std::wcout << L"  ai explain callbacks all\n";
-    std::wcout << L"  drvstatus\n";
+
+    PrintColoredText(L"example workflows", KNDBG_COLOR_ACCENT);
     std::wcout << L"\n";
+    std::wcout << L"  session       home | drvstatus | probe load | probe info | backend dbgeng | kdinit\n";
+    std::wcout << L"  symbols       .sympath SRV*<exe-dir>\\symbols*https://msdl.microsoft.com/download/symbols\n";
+    std::wcout << L"  symbols       .reload | lm nt | x nt!*Process* | ln nt!PsLoadedModuleList\n";
+    std::wcout << L"  memory        dq nt!PsLoadedModuleList 8 | db /process <pid> <user-address> 80\n";
+    std::wcout << L"  memory        procctx <pid> | vtop /process <pid> <user-address> | pdb <pa> 80\n";
+    std::wcout << L"  types/code    dt nt!_EPROCESS <address> | u nt!KiSystemCall64 8 | uf nt!KiSystemCall64 512\n";
+    std::wcout << L"  callbacks     callbacks all | callbacks imageload | callbacks process WdFilter.sys\n";
+    std::wcout << L"  process       !dml_proc [pid] | !vad <pid> /exec /private | !threads <pid> /apc\n";
+    std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
+    std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
+    std::wcout << L"  hunting       !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
+    std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
+    std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
+    std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
+    std::wcout << L"  ai            ai a.exe eprocess | ai explain callbacks all | ai plan check VBS status\n";
+    std::wcout << L"\n";
+
     CommandRegistry::PrintSummary(includeDbgEng);
     if (!includeDbgEng)
     {
         std::wcout << L"\n";
-        std::wcout << L"type help all to include DbgEng-routed WinDbg commands.\n";
+        std::wcout << L"type ";
+        PrintColoredText(L"help all", KNDBG_COLOR_ACCENT);
+        std::wcout << L" to include DbgEng-routed WinDbg commands.\n";
     }
 }
 
@@ -17971,6 +17961,27 @@ static void PrintQuietHelp()
     std::wcout << L"  Toggles quiet-mode state used by native output paths that honor it.\n";
 }
 
+static void PrintLogHelp()
+{
+    std::wcout << L"log command:\n";
+    std::wcout << L"  log [enable|disable|status]\n";
+    std::wcout << L"  log [on|off|start|stop]\n";
+    std::wcout << L"\n";
+    std::wcout << L"subcommands:\n";
+    std::wcout << L"  enable|on|start     mirror console output to a new UTF-8 log file in the EXE directory\n";
+    std::wcout << L"  disable|off|stop    flush, close, and detach the active log file\n";
+    std::wcout << L"  status              show whether logging is active and print the current path\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  The live console keeps colors; the log file receives clean text without console attributes.\n";
+    std::wcout << L"  The default subcommand is status.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  log enable\n";
+    std::wcout << L"  log status\n";
+    std::wcout << L"  log disable\n";
+}
+
 static void PrintSymbolHelp(const std::wstring& command)
 {
     std::wcout << L"symbol command:\n";
@@ -18551,6 +18562,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"sq")
         {
             PrintQuietHelp();
+        }
+        else if (command == L"log")
+        {
+            PrintLogHelp();
         }
         else if (command == L".sympath" || command == L"sympath" || command == L".sympath+" ||
                  command == L".reload" || command == L"reload" || command == L"ld" ||
@@ -29044,6 +29059,7 @@ int wmain(int argc, wchar_t** argv)
     // capture's chain (which would silently drop the tee on the next
     // capture's destructor).
     InstallOutputTee();
+    CommandRegistry::SetColorPrinter(PrintCommandRegistryColoredText);
 
     int exitCode = 1;
     DebuggerState state = {};

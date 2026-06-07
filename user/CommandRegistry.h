@@ -3,6 +3,9 @@
 #include <string>
 #include <vector>
 
+using CommandRegistryColor = unsigned short;
+using CommandRegistryColorPrinter = void (*)(const std::wstring& text, CommandRegistryColor color);
+
 enum class CommandSupport
 {
     Native,
@@ -23,6 +26,7 @@ struct CommandInfo
 class CommandRegistry
 {
 public:
+    static void SetColorPrinter(CommandRegistryColorPrinter printer);
     static std::wstring Normalize(const std::wstring& command);
     static const CommandInfo* Find(const std::wstring& command);
     static bool IsKnown(const std::wstring& command);

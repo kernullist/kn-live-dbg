@@ -1,13 +1,214 @@
 #include "CommandRegistry.h"
 
+#include <algorithm>
 #include <cwctype>
 #include <iostream>
+#include <string>
+#include <vector>
+
+static constexpr CommandRegistryColor kRegistryColorBlue = 0x0001;
+static constexpr CommandRegistryColor kRegistryColorGreen = 0x0002;
+static constexpr CommandRegistryColor kRegistryColorRed = 0x0004;
+static constexpr CommandRegistryColor kRegistryColorIntensity = 0x0008;
+
+static constexpr CommandRegistryColor kHelpColorDim = kRegistryColorBlue | kRegistryColorGreen;
+static constexpr CommandRegistryColor kHelpColorTitle = kRegistryColorGreen | kRegistryColorIntensity;
+static constexpr CommandRegistryColor kHelpColorAccent = kRegistryColorBlue | kRegistryColorGreen | kRegistryColorIntensity;
+static constexpr CommandRegistryColor kHelpColorNative = kRegistryColorGreen | kRegistryColorIntensity;
+static constexpr CommandRegistryColor kHelpColorAlias = kRegistryColorBlue | kRegistryColorGreen | kRegistryColorIntensity;
+static constexpr CommandRegistryColor kHelpColorDbgEng = kRegistryColorRed | kRegistryColorGreen | kRegistryColorIntensity;
+static constexpr CommandRegistryColor kHelpColorExtension = kRegistryColorBlue | kRegistryColorIntensity;
+
+static CommandRegistryColorPrinter g_ColorPrinter = nullptr;
+
+static void PrintRegistryColoredText(const std::wstring& text, CommandRegistryColor color)
+{
+    if (g_ColorPrinter != nullptr)
+    {
+        g_ColorPrinter(text, color);
+    }
+    else
+    {
+        std::wcout << text;
+    }
+}
+
+static void PrintRegistryColoredText(const wchar_t* text, CommandRegistryColor color)
+{
+    if (text != nullptr)
+    {
+        PrintRegistryColoredText(std::wstring(text), color);
+    }
+}
+
+static const wchar_t* SupportText(CommandSupport support)
+{
+    const wchar_t* text = L"native";
+
+    if (support == CommandSupport::Alias)
+    {
+        text = L"alias";
+    }
+    else if (support == CommandSupport::DbgEng)
+    {
+        text = L"dbgeng";
+    }
+    else if (support == CommandSupport::Extension)
+    {
+        text = L"extension";
+    }
+
+    return text;
+}
+
+static CommandRegistryColor SupportColor(CommandSupport support)
+{
+    CommandRegistryColor color = kHelpColorNative;
+
+    if (support == CommandSupport::Alias)
+    {
+        color = kHelpColorAlias;
+    }
+    else if (support == CommandSupport::DbgEng)
+    {
+        color = kHelpColorDbgEng;
+    }
+    else if (support == CommandSupport::Extension)
+    {
+        color = kHelpColorExtension;
+    }
+
+    return color;
+}
+
+static void PrintSupportTag(CommandSupport support)
+{
+    std::wcout << L"[";
+    PrintRegistryColoredText(SupportText(support), SupportColor(support));
+    std::wcout << L"]";
+}
+
+static std::wstring CommandSectionKey(const CommandInfo& info)
+{
+    std::wstring group = info.Group != nullptr ? info.Group : L"";
+    std::wstring key = L"other";
+
+    if (group == L"session" || group == L"version" || group == L"target")
+    {
+        key = L"session";
+    }
+    else if (group == L"symbols" || group == L"type")
+    {
+        key = L"symbols";
+    }
+    else if (group == L"memory" || group == L"search")
+    {
+        key = L"memory";
+    }
+    else if (group == L"kernel")
+    {
+        key = L"kernel";
+    }
+    else if (group == L"ai")
+    {
+        key = L"ai";
+    }
+    else if (group == L"expression")
+    {
+        key = L"expression";
+    }
+    else if (group == L"code")
+    {
+        key = L"code";
+    }
+    else if (group == L"script" || group == L"alias" || group == L"breakpoint" ||
+             group == L"execution" || group == L"stack" || group == L"register" ||
+             group == L"exception" || group == L"locals" || group == L"data-model" ||
+             group == L"source" || group == L"selector" || group == L"port" ||
+             group == L"control")
+    {
+        key = L"dbgeng";
+    }
+
+    return key;
+}
+
+struct CommandSummarySection
+{
+    const wchar_t* Key;
+    const wchar_t* Title;
+    const wchar_t* Description;
+    CommandRegistryColor Color;
+};
+
+static const CommandSummarySection kCommandSummarySections[] =
+{
+    {
+        L"session",
+        L"Session, target, and backend",
+        L"lifecycle, driver/service state, backend routing, target identity",
+        kHelpColorTitle
+    },
+    {
+        L"symbols",
+        L"Symbols and types",
+        L"module lists, symbol lookup, symbol paths, dt/dtx type inspection",
+        kHelpColorAccent
+    },
+    {
+        L"memory",
+        L"Virtual and physical memory",
+        L"read, write, search, fill, move, translate, dump, and process-context commands",
+        kHelpColorNative
+    },
+    {
+        L"kernel",
+        L"Kernel inspection and security",
+        L"callbacks, process/VAD/thread triage, integrity scanners, ETW, WNF, pool, BYOVD",
+        kHelpColorDbgEng
+    },
+    {
+        L"ai",
+        L"AI assistance",
+        L"provider config, command planning, evidence explanation, reports, transcript/audit",
+        kHelpColorExtension
+    },
+    {
+        L"code",
+        L"Disassembly and code",
+        L"native disassembly plus DbgEng code commands when help all is requested",
+        kHelpColorAccent
+    },
+    {
+        L"expression",
+        L"Expressions",
+        L"numeric or symbol expression evaluation and number-base control",
+        kHelpColorTitle
+    },
+    {
+        L"dbgeng",
+        L"DbgEng and WinDbg stop-state",
+        L"breakpoints, stepping, registers, stack, source, data model, scripts, aliases",
+        kHelpColorDbgEng
+    },
+    {
+        L"other",
+        L"Other commands",
+        L"miscellaneous registered commands",
+        kHelpColorDim
+    }
+};
 
 static const wchar_t* kRequiresDbgEng =
     L"routed to DbgEng for KD stop-state semantics";
 
 static const wchar_t* kRequiresParser =
     L"routed to DbgEng for full WinDbg parser semantics";
+
+void CommandRegistry::SetColorPrinter(CommandRegistryColorPrinter printer)
+{
+    g_ColorPrinter = printer;
+}
 
 static CommandInfo Make(const wchar_t* name, const wchar_t* canonical, const wchar_t* group, const wchar_t* summary, CommandSupport support)
 {
@@ -324,9 +525,8 @@ bool CommandRegistry::IsKnown(const std::wstring& command)
 
 void CommandRegistry::PrintSummary(bool includeDbgEng)
 {
-    std::wcout << L"registered commands:\n";
-    std::wcout << L"  states: native=KnLiveDbg implementation, alias=local alias, dbgeng=DbgEng-routed\n";
-    std::wcout << L"  detail: type help <command> or <command> help for command-family syntax\n";
+    size_t visibleCount = 0;
+    size_t maxNameWidth = 0;
 
     for (const CommandInfo& info : Commands())
     {
@@ -335,24 +535,112 @@ void CommandRegistry::PrintSummary(bool includeDbgEng)
             continue;
         }
 
-        const wchar_t* state = L"native";
-        if (info.Support == CommandSupport::Alias)
-        {
-            state = L"alias";
-        }
-        else if (info.Support == CommandSupport::DbgEng)
-        {
-            state = L"dbgeng";
-        }
-        else if (info.Support == CommandSupport::Extension)
-        {
-            state = L"extension";
-        }
+        ++visibleCount;
 
-        std::wcout << L"  " << info.Name << L" [" << state << L"] " << info.Summary << L"\n";
+        if (info.Name != nullptr)
+        {
+            maxNameWidth = std::max(maxNameWidth, std::wstring(info.Name).size());
+        }
     }
 
-    std::wcout << L"  !<extension> [dbgeng] routed to DbgEng extension host\n";
+    if (maxNameWidth < 12)
+    {
+        maxNameWidth = 12;
+    }
+
+    PrintRegistryColoredText(L"registered commands", kHelpColorTitle);
+    std::wcout << L" (" << visibleCount << L")\n";
+    std::wcout << L"  ";
+    PrintSupportTag(CommandSupport::Native);
+    std::wcout << L" KnLiveDbg implementation   ";
+    PrintSupportTag(CommandSupport::Alias);
+    std::wcout << L" local alias   ";
+    PrintSupportTag(CommandSupport::DbgEng);
+    std::wcout << L" DbgEng-routed\n";
+    std::wcout << L"  detail: type ";
+    PrintRegistryColoredText(L"help <command>", kHelpColorAccent);
+    std::wcout << L" or ";
+    PrintRegistryColoredText(L"<command> help", kHelpColorAccent);
+    std::wcout << L" for command-family syntax\n";
+
+    for (const CommandSummarySection& section : kCommandSummarySections)
+    {
+        size_t sectionCount = 0;
+
+        for (const CommandInfo& info : Commands())
+        {
+            if (!includeDbgEng && info.Support == CommandSupport::DbgEng)
+            {
+                continue;
+            }
+
+            if (CommandSectionKey(info) == section.Key)
+            {
+                ++sectionCount;
+            }
+        }
+
+        if (sectionCount == 0)
+        {
+            continue;
+        }
+
+        std::wcout << L"\n";
+        PrintRegistryColoredText(section.Title, section.Color);
+        std::wcout << L" (" << sectionCount << L")\n";
+        std::wcout << L"  " << section.Description << L"\n";
+
+        for (const CommandInfo& info : Commands())
+        {
+            if (!includeDbgEng && info.Support == CommandSupport::DbgEng)
+            {
+                continue;
+            }
+
+            if (CommandSectionKey(info) != section.Key)
+            {
+                continue;
+            }
+
+            std::wstring name = info.Name != nullptr ? info.Name : L"";
+            std::wcout << L"  ";
+            PrintRegistryColoredText(name, info.Support == CommandSupport::DbgEng ? kHelpColorDbgEng : kHelpColorAccent);
+
+            if (name.size() < maxNameWidth)
+            {
+                std::wcout << std::wstring(maxNameWidth - name.size(), L' ');
+            }
+
+            std::wcout << L" ";
+            PrintSupportTag(info.Support);
+
+            if (info.Support == CommandSupport::Alias &&
+                info.Canonical != nullptr &&
+                std::wstring(info.Canonical) != name)
+            {
+                std::wcout << L" -> ";
+                PrintRegistryColoredText(info.Canonical, kHelpColorAccent);
+            }
+
+            if (info.Summary != nullptr)
+            {
+                std::wcout << L"  " << info.Summary;
+            }
+
+            std::wcout << L"\n";
+        }
+    }
+
+    if (includeDbgEng)
+    {
+        std::wcout << L"\n";
+        PrintRegistryColoredText(L"Extension commands", kHelpColorDbgEng);
+        std::wcout << L"\n  ";
+        PrintRegistryColoredText(L"!<extension>", kHelpColorDbgEng);
+        std::wcout << L" ";
+        PrintSupportTag(CommandSupport::Extension);
+        std::wcout << L"  routed to DbgEng extension host\n";
+    }
 }
 
 void CommandRegistry::PrintCommandStatus(const std::wstring& command)
@@ -364,11 +652,17 @@ void CommandRegistry::PrintCommandStatus(const std::wstring& command)
             const CommandInfo* meta = Find(command);
             if (meta != nullptr && meta->Support != CommandSupport::DbgEng)
             {
-                std::wcout << meta->Name << L": native, " << meta->Summary << L"\n";
+                PrintRegistryColoredText(meta->Name, kHelpColorAccent);
+                std::wcout << L": ";
+                PrintSupportTag(meta->Support);
+                std::wcout << L" " << meta->Summary << L"\n";
             }
             else
             {
-                std::wcout << command << L": dbgeng, routed to DbgEng extension host in auto/dbgeng mode\n";
+                PrintRegistryColoredText(command, kHelpColorDbgEng);
+                std::wcout << L": ";
+                PrintSupportTag(CommandSupport::DbgEng);
+                std::wcout << L" routed to DbgEng extension host in auto/dbgeng mode\n";
             }
             break;
         }
@@ -378,11 +672,17 @@ void CommandRegistry::PrintCommandStatus(const std::wstring& command)
             const CommandInfo* meta = Find(command);
             if (meta != nullptr)
             {
-                std::wcout << meta->Name << L": native, " << meta->Summary << L"\n";
+                PrintRegistryColoredText(meta->Name, kHelpColorAccent);
+                std::wcout << L": ";
+                PrintSupportTag(meta->Support);
+                std::wcout << L" " << meta->Summary << L"\n";
             }
             else
             {
-                std::wcout << command << L": dbgeng, routed to DbgEng meta-command handling in auto/dbgeng mode\n";
+                PrintRegistryColoredText(command, kHelpColorDbgEng);
+                std::wcout << L": ";
+                PrintSupportTag(CommandSupport::DbgEng);
+                std::wcout << L" routed to DbgEng meta-command handling in auto/dbgeng mode\n";
             }
             break;
         }
@@ -390,20 +690,23 @@ void CommandRegistry::PrintCommandStatus(const std::wstring& command)
         const CommandInfo* info = Find(command);
         if (info == nullptr)
         {
-            std::wcout << command << L": unknown command\n";
+            PrintRegistryColoredText(command, kHelpColorDim);
+            std::wcout << L": unknown command\n";
             break;
         }
 
-        const wchar_t* state = L"native";
-        if (info->Support == CommandSupport::Alias)
+        PrintRegistryColoredText(info->Name, info->Support == CommandSupport::DbgEng ? kHelpColorDbgEng : kHelpColorAccent);
+        std::wcout << L": ";
+        PrintSupportTag(info->Support);
+
+        if (info->Support == CommandSupport::Alias &&
+            info->Canonical != nullptr &&
+            std::wstring(info->Canonical) != std::wstring(info->Name))
         {
-            state = L"alias";
-        }
-        else if (info->Support == CommandSupport::DbgEng)
-        {
-            state = L"dbgeng";
+            std::wcout << L" -> ";
+            PrintRegistryColoredText(info->Canonical, kHelpColorAccent);
         }
 
-        std::wcout << info->Name << L": " << state << L", " << info->Summary << L"\n";
+        std::wcout << L" " << info->Summary << L"\n";
     } while (false);
 }
