@@ -11,23 +11,29 @@ namespace
 {
     constexpr uint64_t kKernelSpaceMin = 0xff00000000000000ull;
     constexpr uint32_t kMaxFirmwareProviders = 512;
+    constexpr uint32_t kMaxFirmwareLayoutProbeProviders = 8;
     constexpr uint32_t kMaxRawBytesPerRead = 0x100;
     constexpr uint32_t kFirmwareProviderNodeSize = 0x28;
-    constexpr uint32_t kFirmwareProviderLinkOffset = 0x00;
-    constexpr uint32_t kFirmwareProviderSignatureOffset = 0x10;
-    constexpr uint32_t kFirmwareProviderRegisterOffset = 0x14;
-    constexpr uint32_t kFirmwareProviderHandlerOffset = 0x18;
-    constexpr uint32_t kFirmwareProviderDriverObjectOffset = 0x20;
+    constexpr uint32_t kFirmwareProviderListFirstLinkOffset = 0x00;
+    constexpr uint32_t kFirmwareProviderListFirstSignatureOffset = 0x10;
+    constexpr uint32_t kFirmwareProviderListFirstRegisterOffset = 0x14;
+    constexpr uint32_t kFirmwareProviderListFirstHandlerOffset = 0x18;
+    constexpr uint32_t kFirmwareProviderListFirstDriverObjectOffset = 0x20;
+    constexpr uint32_t kFirmwareProviderHandlerFirstSignatureOffset = 0x00;
+    constexpr uint32_t kFirmwareProviderHandlerFirstRegisterOffset = 0x04;
+    constexpr uint32_t kFirmwareProviderHandlerFirstHandlerOffset = 0x08;
+    constexpr uint32_t kFirmwareProviderHandlerFirstDriverObjectOffset = 0x10;
+    constexpr uint32_t kFirmwareProviderHandlerFirstLinkOffset = 0x18;
 
     struct FirmwareProviderLayout
     {
         std::wstring TypeName;
         uint32_t NodeSize = kFirmwareProviderNodeSize;
-        uint32_t LinkOffset = kFirmwareProviderLinkOffset;
-        uint32_t ProviderSignatureOffset = kFirmwareProviderSignatureOffset;
-        uint32_t RegisterOffset = kFirmwareProviderRegisterOffset;
-        uint32_t HandlerOffset = kFirmwareProviderHandlerOffset;
-        uint32_t DriverObjectOffset = kFirmwareProviderDriverObjectOffset;
+        uint32_t LinkOffset = kFirmwareProviderHandlerFirstLinkOffset;
+        uint32_t ProviderSignatureOffset = kFirmwareProviderHandlerFirstSignatureOffset;
+        uint32_t RegisterOffset = kFirmwareProviderHandlerFirstRegisterOffset;
+        uint32_t HandlerOffset = kFirmwareProviderHandlerFirstHandlerOffset;
+        uint32_t DriverObjectOffset = kFirmwareProviderHandlerFirstDriverObjectOffset;
         bool FromPdb = false;
     };
 
@@ -735,7 +741,331 @@ namespace
         return ok;
     }
 
-    FirmwareProviderLayout ResolveFirmwareProviderLayout(SymbolEngine& symbols)
+    bool GetFirmwareProviderRequiredSize(const FirmwareProviderLayout& layout, uint32_t* requiredSize)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (requiredSize == nullptr)
+            {
+                break;
+            }
+
+            *requiredSize = 0;
+            if (!UpdateRequiredNodeSize(layout.LinkOffset, static_cast<uint32_t>(sizeof(uint64_t) * 2), requiredSize) ||
+                !UpdateRequiredNodeSize(layout.DriverObjectOffset, static_cast<uint32_t>(sizeof(uint64_t)), requiredSize) ||
+                !UpdateRequiredNodeSize(layout.HandlerOffset, static_cast<uint32_t>(sizeof(uint64_t)), requiredSize) ||
+                !UpdateRequiredNodeSize(layout.ProviderSignatureOffset, static_cast<uint32_t>(sizeof(uint32_t)), requiredSize) ||
+                !UpdateRequiredNodeSize(layout.RegisterOffset, static_cast<uint32_t>(sizeof(uint8_t)), requiredSize) ||
+                *requiredSize > layout.NodeSize)
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    FirmwareProviderLayout MakeFallbackFirmwareProviderLayout(
+        const std::wstring& name,
+        uint32_t linkOffset,
+        uint32_t providerSignatureOffset,
+        uint32_t registerOffset,
+        uint32_t handlerOffset,
+        uint32_t driverObjectOffset)
+    {
+        FirmwareProviderLayout layout = {};
+
+        layout.TypeName = name;
+        layout.NodeSize = kFirmwareProviderNodeSize;
+        layout.LinkOffset = linkOffset;
+        layout.ProviderSignatureOffset = providerSignatureOffset;
+        layout.RegisterOffset = registerOffset;
+        layout.HandlerOffset = handlerOffset;
+        layout.DriverObjectOffset = driverObjectOffset;
+        layout.FromPdb = false;
+
+        return layout;
+    }
+
+    std::vector<FirmwareProviderLayout> FallbackFirmwareProviderLayouts()
+    {
+        std::vector<FirmwareProviderLayout> layouts;
+
+        layouts.push_back(MakeFallbackFirmwareProviderLayout(
+            L"fallback:handler-first",
+            kFirmwareProviderHandlerFirstLinkOffset,
+            kFirmwareProviderHandlerFirstSignatureOffset,
+            kFirmwareProviderHandlerFirstRegisterOffset,
+            kFirmwareProviderHandlerFirstHandlerOffset,
+            kFirmwareProviderHandlerFirstDriverObjectOffset));
+
+        layouts.push_back(MakeFallbackFirmwareProviderLayout(
+            L"fallback:list-entry-first",
+            kFirmwareProviderListFirstLinkOffset,
+            kFirmwareProviderListFirstSignatureOffset,
+            kFirmwareProviderListFirstRegisterOffset,
+            kFirmwareProviderListFirstHandlerOffset,
+            kFirmwareProviderListFirstDriverObjectOffset));
+
+        return layouts;
+    }
+
+    bool ReadFirmwareProviderNode(
+        DeviceClient& device,
+        uint64_t listEntry,
+        const FirmwareProviderLayout& layout,
+        uint64_t* node,
+        std::vector<uint8_t>* bytes,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (node == nullptr || bytes == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid firmware provider node output";
+                }
+                break;
+            }
+
+            uint32_t requiredSize = 0;
+            if (!GetFirmwareProviderRequiredSize(layout, &requiredSize))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"firmware provider node layout has invalid field offsets";
+                }
+                break;
+            }
+
+            if (!TrySub(listEntry, layout.LinkOffset, node))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"firmware provider node address underflow";
+                }
+                break;
+            }
+
+            if (!ReadKernelBytes(device, *node, layout.NodeSize, bytes, error))
+            {
+                break;
+            }
+
+            if (bytes->size() < requiredSize)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"firmware provider node layout exceeds read size";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void DecodeFirmwareProviderRecordFields(
+        const FirmwareProviderLayout& layout,
+        const std::vector<uint8_t>& bytes,
+        FirmwareTableProviderRecord* record)
+    {
+        do
+        {
+            if (record == nullptr)
+            {
+                break;
+            }
+
+            memcpy(&record->Flink, bytes.data() + layout.LinkOffset + 0x00, sizeof(uint64_t));
+            memcpy(&record->Blink, bytes.data() + layout.LinkOffset + 0x08, sizeof(uint64_t));
+            memcpy(&record->ProviderSignature, bytes.data() + layout.ProviderSignatureOffset, sizeof(uint32_t));
+            memcpy(&record->RegisterFlag, bytes.data() + layout.RegisterOffset, sizeof(uint8_t));
+            memcpy(&record->FirmwareTableHandler, bytes.data() + layout.HandlerOffset, sizeof(uint64_t));
+            memcpy(&record->DriverObject, bytes.data() + layout.DriverObjectOffset, sizeof(uint64_t));
+        } while (false);
+    }
+
+    int ScoreFirmwareProviderLayout(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t listHead,
+        uint64_t first,
+        const FirmwareProviderLayout& layout)
+    {
+        int score = 0;
+
+        do
+        {
+            if (first == listHead)
+            {
+                break;
+            }
+
+            uint32_t requiredSize = 0;
+            if (!GetFirmwareProviderRequiredSize(layout, &requiredSize))
+            {
+                score -= 100;
+                break;
+            }
+
+            std::set<uint64_t> visited;
+            uint64_t current = first;
+            uint32_t count = 0;
+
+            while (current != listHead && count < kMaxFirmwareLayoutProbeProviders)
+            {
+                if (!IsKernelAddress(current))
+                {
+                    score -= 40;
+                    break;
+                }
+                if (visited.find(current) != visited.end())
+                {
+                    score -= 20;
+                    break;
+                }
+                visited.insert(current);
+
+                uint64_t node = 0;
+                std::vector<uint8_t> bytes;
+                if (!ReadFirmwareProviderNode(device, current, layout, &node, &bytes, nullptr))
+                {
+                    score -= 40;
+                    break;
+                }
+
+                FirmwareTableProviderRecord record = {};
+                DecodeFirmwareProviderRecordFields(layout, bytes, &record);
+
+                if (record.Flink == listHead || IsKernelAddress(record.Flink))
+                {
+                    score += 2;
+                }
+                else
+                {
+                    score -= 8;
+                }
+
+                if (record.Blink == listHead || IsKernelAddress(record.Blink))
+                {
+                    score += 2;
+                }
+                else
+                {
+                    score -= 8;
+                }
+
+                if (IsStandardProviderSignature(record.ProviderSignature))
+                {
+                    score += 12;
+                }
+                else if (record.ProviderSignature == 0)
+                {
+                    score -= 6;
+                }
+                else if (!ProviderSignatureText(record.ProviderSignature).empty())
+                {
+                    score += 1;
+                }
+                else
+                {
+                    score -= 2;
+                }
+
+                if (record.RegisterFlag == 0 || record.RegisterFlag == 1)
+                {
+                    score += 1;
+                }
+                else
+                {
+                    score -= 2;
+                }
+
+                if (record.FirmwareTableHandler != 0 && IsKernelAddress(record.FirmwareTableHandler))
+                {
+                    score += 8;
+                    if (FindModuleForAddress(symbols.Modules(), record.FirmwareTableHandler) != nullptr)
+                    {
+                        score += 8;
+                    }
+                    else
+                    {
+                        score -= 4;
+                    }
+                }
+                else
+                {
+                    score -= 8;
+                }
+
+                if (record.DriverObject == 0 || IsKernelAddress(record.DriverObject))
+                {
+                    score += 1;
+                }
+                else
+                {
+                    score -= 6;
+                }
+
+                current = record.Flink;
+                ++count;
+            }
+
+            if (count == 0)
+            {
+                score -= 20;
+            }
+            else
+            {
+                score += static_cast<int>(count);
+            }
+        } while (false);
+
+        return score;
+    }
+
+    FirmwareProviderLayout SelectFallbackFirmwareProviderLayout(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t listHead,
+        uint64_t first,
+        std::vector<std::wstring>* warnings)
+    {
+        FirmwareProviderLayout selected = {};
+        int selectedScore = -1000000;
+        std::vector<FirmwareProviderLayout> layouts = FallbackFirmwareProviderLayouts();
+
+        for (const FirmwareProviderLayout& layout : layouts)
+        {
+            int score = ScoreFirmwareProviderLayout(device, symbols, listHead, first, layout);
+            if (score > selectedScore)
+            {
+                selected = layout;
+                selectedScore = score;
+            }
+        }
+
+        if (warnings != nullptr && selectedScore < 0 && first != listHead)
+        {
+            warnings->push_back(
+                L"firmware provider fallback layout validation was weak; selected " +
+                selected.TypeName);
+        }
+
+        return selected;
+    }
+
+    FirmwareProviderLayout ResolvePdbFirmwareProviderLayout(SymbolEngine& symbols)
     {
         FirmwareProviderLayout layout = {};
 
@@ -775,12 +1105,7 @@ namespace
             }
 
             uint32_t requiredSize = 0;
-            if (!UpdateRequiredNodeSize(candidate.LinkOffset, static_cast<uint32_t>(sizeof(uint64_t) * 2), &requiredSize) ||
-                !UpdateRequiredNodeSize(candidate.DriverObjectOffset, static_cast<uint32_t>(sizeof(uint64_t)), &requiredSize) ||
-                !UpdateRequiredNodeSize(candidate.HandlerOffset, static_cast<uint32_t>(sizeof(uint64_t)), &requiredSize) ||
-                !UpdateRequiredNodeSize(candidate.ProviderSignatureOffset, static_cast<uint32_t>(sizeof(uint32_t)), &requiredSize) ||
-                !UpdateRequiredNodeSize(candidate.RegisterOffset, static_cast<uint32_t>(sizeof(uint8_t)), &requiredSize) ||
-                requiredSize > candidate.NodeSize)
+            if (!GetFirmwareProviderRequiredSize(candidate, &requiredSize))
             {
                 continue;
             }
@@ -812,8 +1137,11 @@ namespace
 
             if (driverObject == 0)
             {
-                record->Suspicious = true;
                 AppendNote(&record->Notes, L"DriverObject is null");
+                if (!record->StandardProvider)
+                {
+                    record->Suspicious = true;
+                }
                 break;
             }
             if (!IsKernelAddress(driverObject))
@@ -906,8 +1234,7 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
         result->ListHeadAddress = listHead;
         result->ListHeadSymbol = L"nt!ExpFirmwareTableProviderListHead";
 
-        FirmwareProviderLayout providerLayout = ResolveFirmwareProviderLayout(symbols_);
-        result->UsedFallbackLayout = !providerLayout.FromPdb;
+        FirmwareProviderLayout providerLayout = ResolvePdbFirmwareProviderLayout(symbols_);
 
         std::wstring ignored;
         uint64_t resource = 0;
@@ -947,6 +1274,19 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
         uint64_t current = first;
         uint32_t slot = 0;
 
+        if (!providerLayout.FromPdb)
+        {
+            providerLayout = SelectFallbackFirmwareProviderLayout(
+                device_,
+                symbols_,
+                listHead,
+                first,
+                &result->Warnings);
+        }
+
+        result->UsedFallbackLayout = !providerLayout.FromPdb;
+        result->LayoutName = providerLayout.TypeName;
+
         while (current != listHead)
         {
             if (slot >= kMaxFirmwareProviders)
@@ -969,33 +1309,11 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
             visited.insert(current);
 
             uint64_t node = 0;
-            if (!TrySub(current, providerLayout.LinkOffset, &node))
-            {
-                result->Warnings.push_back(L"firmware provider node address underflow at " + HexText(current, 16));
-                break;
-            }
-
             std::vector<uint8_t> bytes;
             readError.clear();
-            if (!ReadKernelBytes(device_, node, providerLayout.NodeSize, &bytes, &readError))
+            if (!ReadFirmwareProviderNode(device_, current, providerLayout, &node, &bytes, &readError))
             {
                 result->Warnings.push_back(L"failed to read firmware provider node " + HexText(node, 16) + L": " + readError);
-                break;
-            }
-
-            uint32_t requiredSize = 0;
-            if (!UpdateRequiredNodeSize(providerLayout.LinkOffset, static_cast<uint32_t>(sizeof(uint64_t) * 2), &requiredSize) ||
-                !UpdateRequiredNodeSize(providerLayout.DriverObjectOffset, static_cast<uint32_t>(sizeof(uint64_t)), &requiredSize) ||
-                !UpdateRequiredNodeSize(providerLayout.HandlerOffset, static_cast<uint32_t>(sizeof(uint64_t)), &requiredSize) ||
-                !UpdateRequiredNodeSize(providerLayout.ProviderSignatureOffset, static_cast<uint32_t>(sizeof(uint32_t)), &requiredSize) ||
-                !UpdateRequiredNodeSize(providerLayout.RegisterOffset, static_cast<uint32_t>(sizeof(uint8_t)), &requiredSize))
-            {
-                result->Warnings.push_back(L"firmware provider node layout has invalid field offsets at " + HexText(node, 16));
-                break;
-            }
-            if (bytes.size() < requiredSize)
-            {
-                result->Warnings.push_back(L"firmware provider node layout exceeds read size at " + HexText(node, 16));
                 break;
             }
 
@@ -1003,12 +1321,7 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
             record.Slot = slot;
             record.NodeAddress = node;
             record.ListEntry = current;
-            memcpy(&record.Flink, bytes.data() + providerLayout.LinkOffset + 0x00, sizeof(uint64_t));
-            memcpy(&record.Blink, bytes.data() + providerLayout.LinkOffset + 0x08, sizeof(uint64_t));
-            memcpy(&record.ProviderSignature, bytes.data() + providerLayout.ProviderSignatureOffset, sizeof(uint32_t));
-            memcpy(&record.RegisterFlag, bytes.data() + providerLayout.RegisterOffset, sizeof(uint8_t));
-            memcpy(&record.FirmwareTableHandler, bytes.data() + providerLayout.HandlerOffset, sizeof(uint64_t));
-            memcpy(&record.DriverObject, bytes.data() + providerLayout.DriverObjectOffset, sizeof(uint64_t));
+            DecodeFirmwareProviderRecordFields(providerLayout, bytes, &record);
 
             record.ProviderText = ProviderSignatureText(record.ProviderSignature);
             record.StandardProvider = IsStandardProviderSignature(record.ProviderSignature);

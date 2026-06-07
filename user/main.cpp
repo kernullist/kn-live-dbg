@@ -13239,7 +13239,15 @@ static void HandleFirmwareTableCommand(
                          suspiciousCount == 0 ? KNDBG_COLOR_OK : KNDBG_COLOR_FAIL);
         std::wcout << L" listHead=" << result.ListHeadSymbol
                    << L"(" << HexTextWidth(result.ListHeadAddress, 16, true) << L")";
-        std::wcout << L" layout=" << (result.UsedFallbackLayout ? L"fallback" : L"pdb");
+        std::wcout << L" layout=";
+        if (!result.LayoutName.empty())
+        {
+            std::wcout << result.LayoutName;
+        }
+        else
+        {
+            std::wcout << (result.UsedFallbackLayout ? L"fallback" : L"pdb");
+        }
         if (result.ResourceAddress != 0)
         {
             std::wcout << L" resource=" << result.ResourceSymbol

@@ -38,6 +38,7 @@ struct FirmwareTableScanResult
     uint64_t ResourceAddress = 0;
     std::wstring ListHeadSymbol;
     std::wstring ResourceSymbol;
+    std::wstring LayoutName;
     bool UsedFallbackLayout = true;
 };
 
