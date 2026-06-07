@@ -136,6 +136,62 @@ function Get-HashTypeFromValue
     return ""
 }
 
+function Get-FileSha256
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $stream = $null
+    $sha256 = $null
+
+    try
+    {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $bytes = $sha256.ComputeHash($stream)
+        return (($bytes | ForEach-Object { $_.ToString("x2") }) -join "")
+    }
+    finally
+    {
+        if ($null -ne $sha256)
+        {
+            $sha256.Dispose()
+        }
+        if ($null -ne $stream)
+        {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Expand-ZipFile
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    $expandArchive = Get-Command -Name Expand-Archive -ErrorAction SilentlyContinue
+    if ($null -ne $expandArchive)
+    {
+        Expand-Archive -LiteralPath $Path -DestinationPath $DestinationPath -Force
+        return
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path -LiteralPath $DestinationPath)
+    {
+        Remove-Item -LiteralPath $DestinationPath -Recurse -Force
+    }
+    New-Directory -Path $DestinationPath
+
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($Path, $DestinationPath)
+}
+
 function Add-MicrosoftPolicyEntries
 {
     param(
@@ -282,10 +338,10 @@ try
     $downloaded.Add([pscustomobject]@{
         source = "microsoft_blocklist"
         url = $microsoftZipUrl
-        sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash
+        sha256 = Get-FileSha256 -Path $zipPath
     }) | Out-Null
 
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $tempExtract -Force
+    Expand-ZipFile -Path $zipPath -DestinationPath $tempExtract
     $xml = Get-ChildItem -LiteralPath $tempExtract -Recurse -Filter "DriverPolicy_Enforced.xml" -File |
         Select-Object -First 1
     if ($null -eq $xml)
@@ -316,7 +372,7 @@ try
         $downloaded.Add([pscustomobject]@{
             source = "loldrivers_yara"
             url = $feed.Url
-            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash
+            sha256 = Get-FileSha256 -Path $destination
         }) | Out-Null
     }
 

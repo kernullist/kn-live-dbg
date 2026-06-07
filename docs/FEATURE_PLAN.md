@@ -353,7 +353,9 @@ Implemented behavior:
 3. Hashes loaded kernel module images on disk with MD5/SHA1/SHA256 and reports
    exact catalog hits as `HIGH` confidence.
 4. Reads PE fixed file versions and reports Microsoft name/version blocklist
-   hits as `MEDIUM` confidence signer-unverified triage hints.
+   hits as `MEDIUM` confidence signer-unverified triage hints. PE version-info
+   vendor metadata suppresses third-party rule collisions against
+   Microsoft-owned OS binaries.
 5. Emits stable `kn-live-dbg.byovd-scan.v1` JSON and includes the updater
    script in release packages.
 6. Runs downloaded LOLDrivers YARA rules over loaded driver images when

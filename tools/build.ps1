@@ -443,6 +443,28 @@ function Copy-DebuggingToolsRuntime
     }
 }
 
+function Copy-ByovdUpdaterScript
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDir
+    )
+
+    $source = Join-Path $repo "tools\update-byovd-intel.ps1"
+    if (-not (Test-Path $source))
+    {
+        Write-Warning "BYOVD updater script was not found: $source"
+        return
+    }
+
+    $toolsDir = Join-Path $DestinationDir "tools"
+    New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+
+    $destination = Join-Path $toolsDir "update-byovd-intel.ps1"
+    Copy-Item -LiteralPath $source -Destination $destination -Force
+    Write-Host "BYOVD: copied update-byovd-intel.ps1"
+}
+
 $visualStudioInstallations = Get-VisualStudioInstallations
 if ($visualStudioInstallations.Count -eq 0)
 {
@@ -518,6 +540,7 @@ if (-not (Test-Path (Join-Path $runtimeSourceDir "dbghelp.dll")) -or
 
 Write-Host "Runtime source: $runtimeSourceDir"
 Copy-DebuggingToolsRuntime -SourceDir $runtimeSourceDir -DestinationDir $outputDir
+Copy-ByovdUpdaterScript -DestinationDir $outputDir
 
 if ($BumpVersion)
 {

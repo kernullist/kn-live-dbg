@@ -32,6 +32,20 @@ namespace
         std::wstring Sha256;
     };
 
+    struct FileVersionMetadata
+    {
+        std::wstring FileVersion;
+        std::wstring CompanyName;
+        std::wstring ProductName;
+        std::wstring OriginalFilename;
+    };
+
+    struct VersionTranslation
+    {
+        WORD Language;
+        WORD CodePage;
+    };
+
     struct YaraScanProcessResult
     {
         std::vector<std::wstring> Lines;
@@ -1032,16 +1046,101 @@ namespace
         return stream.str();
     }
 
-    bool ReadFileVersion(const std::wstring& path, std::wstring* versionText)
+    bool QueryVersionString(
+        const std::vector<BYTE>& buffer,
+        WORD language,
+        WORD codePage,
+        const wchar_t* name,
+        std::wstring* value)
     {
         bool ok = false;
 
         do
         {
-            if (versionText == nullptr)
+            if (name == nullptr || value == nullptr)
             {
                 break;
             }
+
+            std::wstringstream block;
+            block << L"\\StringFileInfo\\"
+                  << std::hex << std::setw(4) << std::setfill(L'0') << language
+                  << std::setw(4) << std::setfill(L'0') << codePage
+                  << L"\\" << name;
+
+            wchar_t* text = nullptr;
+            UINT textSize = 0;
+            if (!VerQueryValueW(
+                    buffer.data(),
+                    block.str().c_str(),
+                    reinterpret_cast<LPVOID*>(&text),
+                    &textSize) ||
+                text == nullptr ||
+                text[0] == L'\0')
+            {
+                break;
+            }
+
+            *value = text;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void ReadVersionString(
+        const std::vector<BYTE>& buffer,
+        const std::vector<VersionTranslation>& translations,
+        const wchar_t* name,
+        std::wstring* value)
+    {
+        do
+        {
+            if (value == nullptr || !value->empty())
+            {
+                break;
+            }
+
+            for (const VersionTranslation& translation : translations)
+            {
+                if (QueryVersionString(buffer, translation.Language, translation.CodePage, name, value))
+                {
+                    break;
+                }
+            }
+
+            if (!value->empty())
+            {
+                break;
+            }
+
+            static const VersionTranslation fallbacks[] =
+            {
+                {0x0409, 1200},
+                {0x0409, 1252}
+            };
+
+            for (const VersionTranslation& fallback : fallbacks)
+            {
+                if (QueryVersionString(buffer, fallback.Language, fallback.CodePage, name, value))
+                {
+                    break;
+                }
+            }
+        } while (false);
+    }
+
+    bool ReadFileVersionMetadata(const std::wstring& path, FileVersionMetadata* metadata)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (metadata == nullptr)
+            {
+                break;
+            }
+            *metadata = FileVersionMetadata{};
 
             DWORD handle = 0;
             DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
@@ -1072,7 +1171,28 @@ namespace
             version.Parts[1] = LOWORD(info->dwFileVersionMS);
             version.Parts[2] = HIWORD(info->dwFileVersionLS);
             version.Parts[3] = LOWORD(info->dwFileVersionLS);
-            *versionText = VersionToText(version);
+            metadata->FileVersion = VersionToText(version);
+
+            std::vector<VersionTranslation> translations;
+            VersionTranslation* translationData = nullptr;
+            UINT translationSize = 0;
+            if (VerQueryValueW(
+                    buffer.data(),
+                    L"\\VarFileInfo\\Translation",
+                    reinterpret_cast<LPVOID*>(&translationData),
+                    &translationSize) &&
+                translationData != nullptr)
+            {
+                size_t count = translationSize / sizeof(VersionTranslation);
+                for (size_t index = 0; index < count; ++index)
+                {
+                    translations.push_back(translationData[index]);
+                }
+            }
+
+            ReadVersionString(buffer, translations, L"CompanyName", &metadata->CompanyName);
+            ReadVersionString(buffer, translations, L"ProductName", &metadata->ProductName);
+            ReadVersionString(buffer, translations, L"OriginalFilename", &metadata->OriginalFilename);
             ok = true;
         } while (false);
 
@@ -1139,21 +1259,67 @@ namespace
         return entry.MatchType == L"file_version" && !entry.Name.empty();
     }
 
+    bool TextContainsMicrosoft(const std::wstring& value)
+    {
+        std::wstring lower = ToLowerCopy(value);
+        return lower.find(L"microsoft") != std::wstring::npos;
+    }
+
+    bool RecordLooksMicrosoftOwned(const ByovdModuleRecord& record)
+    {
+        return TextContainsMicrosoft(record.FileCompanyName) ||
+            TextContainsMicrosoft(record.FileProductName);
+    }
+
+    bool FileAttributeDescriptionLooksMicrosoftOwned(const ByovdCatalogEntry& entry)
+    {
+        std::wstring lower = ToLowerCopy(entry.Description);
+        return lower.find(L"microsoft") != std::wstring::npos ||
+            lower.find(L"ms windows") != std::wstring::npos;
+    }
+
+    bool ShouldSuppressFileVersionHint(const ByovdCatalogEntry& entry, const ByovdModuleRecord& record)
+    {
+        bool suppress = false;
+
+        do
+        {
+            if (entry.Source != L"microsoft_blocklist" ||
+                entry.Category != L"microsoft_file_attribute")
+            {
+                break;
+            }
+
+            if (!RecordLooksMicrosoftOwned(record))
+            {
+                break;
+            }
+
+            if (FileAttributeDescriptionLooksMicrosoftOwned(entry))
+            {
+                break;
+            }
+
+            suppress = true;
+        } while (false);
+
+        return suppress;
+    }
+
     void AddFileVersionMatches(
         const std::vector<ByovdCatalogEntry>& entries,
         const std::wstring& baseName,
-        const std::wstring& fileVersion,
         ByovdModuleRecord* record,
         ByovdScanResult* result)
     {
         do
         {
-            if (record == nullptr || result == nullptr || baseName.empty() || fileVersion.empty())
+            if (record == nullptr || result == nullptr || baseName.empty() || record->FileVersion.empty())
             {
                 break;
             }
 
-            VersionQuad version = ParseVersion(fileVersion);
+            VersionQuad version = ParseVersion(record->FileVersion);
             if (!version.Valid)
             {
                 break;
@@ -1173,6 +1339,10 @@ namespace
                 }
 
                 if (!VersionInRange(version, entry.MinimumVersion, entry.MaximumVersion))
+                {
+                    continue;
+                }
+                if (ShouldSuppressFileVersionHint(entry, *record))
                 {
                     continue;
                 }
@@ -1651,12 +1821,9 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
             break;
         }
 
-        if (symbols_.Modules().empty())
+        if (!symbols_.LoadKernelModules(error))
         {
-            if (!symbols_.LoadKernelModules(error))
-            {
-                break;
-            }
+            break;
         }
 
         std::unordered_map<std::wstring, std::vector<size_t>> md5Index;
@@ -1732,10 +1899,15 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
 
             if (!options.ExactOnly)
             {
-                if (ReadFileVersion(record.DiskPath, &record.FileVersion))
+                FileVersionMetadata versionMetadata = {};
+                if (ReadFileVersionMetadata(record.DiskPath, &versionMetadata))
                 {
                     record.VersionRead = true;
-                    AddFileVersionMatches(entries, BaseNameOfPath(record.DiskPath), record.FileVersion, &record, result);
+                    record.FileVersion = versionMetadata.FileVersion;
+                    record.FileCompanyName = versionMetadata.CompanyName;
+                    record.FileProductName = versionMetadata.ProductName;
+                    record.FileOriginalName = versionMetadata.OriginalFilename;
+                    AddFileVersionMatches(entries, BaseNameOfPath(record.DiskPath), &record, result);
                 }
             }
 
@@ -1885,6 +2057,9 @@ std::wstring BuildByovdScanJson(const ByovdScanResult& result)
         stream << L"\"base\":" << record.Base << L",";
         stream << L"\"size\":" << record.Size << L",";
         stream << L"\"file_version\":\"" << JsonEscape(record.FileVersion) << L"\",";
+        stream << L"\"file_company_name\":\"" << JsonEscape(record.FileCompanyName) << L"\",";
+        stream << L"\"file_product_name\":\"" << JsonEscape(record.FileProductName) << L"\",";
+        stream << L"\"file_original_name\":\"" << JsonEscape(record.FileOriginalName) << L"\",";
         stream << L"\"md5\":\"" << JsonEscape(record.Md5) << L"\",";
         stream << L"\"sha1\":\"" << JsonEscape(record.Sha1) << L"\",";
         stream << L"\"sha256\":\"" << JsonEscape(record.Sha256) << L"\",";

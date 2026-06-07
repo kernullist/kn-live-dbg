@@ -32,6 +32,9 @@ struct ByovdModuleRecord
     std::wstring ImagePath;
     std::wstring DiskPath;
     std::wstring FileVersion;
+    std::wstring FileCompanyName;
+    std::wstring FileProductName;
+    std::wstring FileOriginalName;
     std::wstring Md5;
     std::wstring Sha1;
     std::wstring Sha256;
