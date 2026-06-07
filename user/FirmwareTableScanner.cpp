@@ -1171,9 +1171,15 @@ namespace
                     record->Suspicious = true;
                     AppendNote(&record->Notes, L"DriverStart is outside loaded module ranges");
                 }
+                else
+                {
+                    record->Suspicious = true;
+                    AppendNote(&record->Notes, L"DriverStart is null");
+                }
             }
             else
             {
+                record->Suspicious = true;
                 AppendNote(&record->Notes, L"DriverStart unreadable");
             }
 
