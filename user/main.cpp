@@ -14,6 +14,10 @@
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
 #include "ProcessTriageScanner.h"
+#include "SnapshotCollector.h"
+#include "SnapshotDiff.h"
+#include "SnapshotJson.h"
+#include "SnapshotPrinter.h"
 #include "ThreatIntelSubscriber.h"
 #include "NmiScanner.h"
 #include "PoolScanner.h"
@@ -581,6 +585,10 @@ struct DebuggerState
     ProcessAddressContext KernelProcessContext;
     bool HasProcessContext;
     ProcessAddressContext ProcessContext;
+    bool HasSnapshotBaseline;
+    SnapshotDocument SnapshotBaseline;
+    std::wstring SnapshotBaselineJsonPath;
+    std::wstring SnapshotBaselineReportPath;
     enum class BackendMode
     {
         Auto,
@@ -2063,6 +2071,8 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!dml_proc" ||
         command == L"!vad" ||
         command == L"!threads" ||
+        command == L"!snapshot" ||
+        command == L"!diff" ||
         command == L"!wfp" ||
         command == L"!alpc" ||
         command == L"!byovd" ||
@@ -3076,6 +3086,39 @@ static void AddThreadsOptionCompletionCandidates(std::vector<std::wstring>* cand
     AddCompletionCandidates(candidates, values);
 }
 
+static void AddSnapshotCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"baseline",
+        L"save",
+        L"show",
+        L"/all",
+        L"/name",
+        L"/domains",
+        L"/warnings",
+        L"help"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
+static void AddDiffCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"baseline",
+        L"/summary",
+        L"/details",
+        L"/domain",
+        L"/risk",
+        L"/limit",
+        L"help"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
 static void AddWfpScopeCompletionCandidates(std::vector<std::wstring>* candidates)
 {
     static const wchar_t* values[] =
@@ -3249,6 +3292,8 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!dml_proc",
         L"!vad",
         L"!threads",
+        L"!snapshot",
+        L"!diff",
         L"!wfp",
         L"!alpc",
         L"!vbs",
@@ -3680,6 +3725,14 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddFirmwareTableCompletionCandidates(&candidates, false);
                 }
+                else if (topic == L"!snapshot")
+                {
+                    AddSnapshotCompletionCandidates(&candidates);
+                }
+                else if (topic == L"!diff")
+                {
+                    AddDiffCompletionCandidates(&candidates);
+                }
                 else if (topic == L"!module")
                 {
                     static const wchar_t* values[] =
@@ -3798,6 +3851,14 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         else if (command == L"!threads")
         {
             AddThreadsOptionCompletionCandidates(&candidates);
+        }
+        else if (command == L"!snapshot")
+        {
+            AddSnapshotCompletionCandidates(&candidates);
+        }
+        else if (command == L"!diff")
+        {
+            AddDiffCompletionCandidates(&candidates);
         }
         else if (command == L"!alpc")
         {
@@ -6452,11 +6513,13 @@ struct DmlProcessLayout
     TypeFieldInfo InheritedFromUniqueProcessId = {};
     TypeFieldInfo ActiveThreads = {};
     TypeFieldInfo Peb = {};
+    TypeFieldInfo CreateTime = {};
     uint32_t DirectoryTableBaseOffset = 0;
     uint32_t UserDirectoryTableBaseOffset = 0;
     bool HasInheritedFromUniqueProcessId = false;
     bool HasActiveThreads = false;
     bool HasPeb = false;
+    bool HasCreateTime = false;
 };
 
 struct DmlProcessRecord
@@ -6470,11 +6533,13 @@ struct DmlProcessRecord
     uint64_t DirectoryTableBase = 0;
     uint64_t UserDirectoryTableBase = 0;
     uint64_t Peb = 0;
+    uint64_t CreateTime = 0;
     uint32_t ActiveThreads = 0;
     std::wstring ImageName;
     bool HasParentProcessId = false;
     bool HasActiveThreads = false;
     bool HasPeb = false;
+    bool HasCreateTime = false;
 };
 
 static bool ReadKernelBytes(
@@ -6635,6 +6700,8 @@ static bool ResolveDmlProcessLayout(SymbolEngine& symbols, DmlProcessLayout* lay
             FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"ActiveThreads", &layout->ActiveThreads, &ignored);
         layout->HasPeb =
             FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"Peb", &layout->Peb, &ignored);
+        layout->HasCreateTime =
+            FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"CreateTime", &layout->CreateTime, &ignored);
 
         if (!ResolveProcessDirectoryTableBaseOffsets(symbols, &layout->DirectoryTableBaseOffset, &layout->UserDirectoryTableBaseOffset, error))
         {
@@ -6809,6 +6876,12 @@ static bool ReadDmlProcessRecord(
         {
             record->HasPeb =
                 ReadKernelFieldInteger(device, eprocess, layout.Peb, sizeof(uint64_t), &record->Peb, nullptr);
+        }
+
+        if (layout.HasCreateTime)
+        {
+            record->HasCreateTime =
+                ReadKernelFieldInteger(device, eprocess, layout.CreateTime, sizeof(uint64_t), &record->CreateTime, nullptr);
         }
 
         uint64_t directoryTableBaseAddress = 0;
@@ -7085,6 +7158,649 @@ static bool CollectDmlProcessRecords(
     } while (false);
 
     return ok;
+}
+
+static bool BuildSnapshotProcessInventory(
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::vector<SnapshotProcessRecord>* processes,
+    std::vector<std::wstring>* warnings,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (processes == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid process inventory output";
+            }
+            break;
+        }
+
+        processes->clear();
+        DmlProcessCollection collection = {};
+        if (!CollectDmlProcessRecords(state, device, symbols, &collection, error))
+        {
+            break;
+        }
+
+        if (warnings != nullptr)
+        {
+            warnings->insert(warnings->end(), collection.Warnings.begin(), collection.Warnings.end());
+            if (collection.Truncated)
+            {
+                warnings->push_back(L"process inventory was truncated");
+            }
+        }
+
+        for (const DmlProcessRecord& record : collection.Records)
+        {
+            SnapshotProcessRecord process = {};
+            process.ProcessId = static_cast<uint32_t>(record.ProcessId);
+            process.Eprocess = record.Eprocess;
+            process.DirectoryTableBase = record.DirectoryTableBase;
+            process.UserDirectoryTableBase = record.UserDirectoryTableBase;
+            process.Peb = record.Peb;
+            process.HasPeb = record.HasPeb;
+            process.CreateTime = record.CreateTime;
+            process.HasCreateTime = record.HasCreateTime;
+            process.ImageName = record.ImageName;
+            process.Identity = BuildSnapshotProcessIdentity(process, warnings);
+            processes->push_back(std::move(process));
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring BuildSnapshotDefaultPath(
+    const std::wstring& subdirectory,
+    const std::wstring& timestamp,
+    const std::wstring& label,
+    const std::wstring& suffix)
+{
+    std::wstring safeLabel = SnapshotSafeFileComponent(label);
+    std::wstring path = GetExecutableDirectory();
+    path += L"\\.kn-live-dbg\\";
+    path += subdirectory;
+    path += L"\\";
+    path += SnapshotSafeFileComponent(timestamp);
+    path += L"-";
+    path += safeLabel;
+    path += suffix;
+    return path;
+}
+
+static bool CaptureSnapshotForCommand(
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const std::wstring& label,
+    bool captureVadDkom,
+    bool allowByovdAutoUpdate,
+    const SnapshotDocument* baselineForVadDkom,
+    SnapshotDocument* document,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (document == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid snapshot output";
+            }
+            break;
+        }
+
+        std::vector<SnapshotProcessRecord> processes;
+        std::vector<std::wstring> processWarnings;
+        if (!BuildSnapshotProcessInventory(state, device, symbols, &processes, &processWarnings, error))
+        {
+            break;
+        }
+
+        SnapshotCaptureOptions options = {};
+        options.Label = label;
+        options.ExecutableDirectory = GetExecutableDirectory();
+        options.IncludeAll = true;
+        options.AllowByovdAutoUpdate = allowByovdAutoUpdate;
+        options.CaptureVadDkomForNewProcesses = captureVadDkom;
+        options.BaselineForVadDkom = baselineForVadDkom;
+        options.Processes = std::move(processes);
+
+        SnapshotCollector collector(device, symbols);
+        if (!collector.Capture(options, document, error))
+        {
+            break;
+        }
+
+        if (!processWarnings.empty())
+        {
+            document->DomainWarnings[L"process"].insert(
+                document->DomainWarnings[L"process"].end(),
+                processWarnings.begin(),
+                processWarnings.end());
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void PrintSnapshotHelp()
+{
+    std::wcout << L"!snapshot command:\n";
+    std::wcout << L"  !snapshot baseline [/all] [/name <label>]\n";
+    std::wcout << L"  !snapshot save <path> [/all] [/name <label>]\n";
+    std::wcout << L"  !snapshot show [baseline|<path>] [/domains] [/warnings]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Captures same-boot evidence snapshots over native scanners and stores a\n";
+    std::wcout << L"  session baseline in memory plus JSON and Markdown files under .kn-live-dbg.\n";
+    std::wcout << L"  Baseline captures process inventory; VAD DKOM hidden-PTE scans run during\n";
+    std::wcout << L"  !diff baseline for processes newly present since the baseline.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !snapshot baseline /name clean-boot\n";
+    std::wcout << L"  !snapshot save .\\after-game.json /name after-game\n";
+    std::wcout << L"  !snapshot show baseline /warnings\n";
+}
+
+static void PrintDiffHelp()
+{
+    std::wcout << L"!diff command:\n";
+    std::wcout << L"  !diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]\n";
+    std::wcout << L"  !diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Compares snapshots with new-focused semantics: records absent from baseline\n";
+    std::wcout << L"  but present now, plus high-risk escalations. !diff baseline captures a fresh\n";
+    std::wcout << L"  current snapshot, scans VAD DKOM for newly live processes, writes JSON and\n";
+    std::wcout << L"  a Markdown diff report, then prints compact domain summaries.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !diff baseline\n";
+    std::wcout << L"  !diff baseline /domain pool /limit 20\n";
+    std::wcout << L"  !diff .\\clean.json .\\after.json /risk high\n";
+}
+
+static bool ParseSnapshotNameOption(
+    const std::vector<std::wstring>& args,
+    size_t start,
+    std::wstring* label,
+    bool* parseError)
+{
+    bool ok = false;
+
+    do
+    {
+        if (label == nullptr || parseError == nullptr)
+        {
+            break;
+        }
+
+        *parseError = false;
+        size_t index = start;
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/all")
+            {
+                ++index;
+                continue;
+            }
+            if (option == L"/name")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!snapshot: /name requires a label\n";
+                    *parseError = true;
+                    break;
+                }
+                *label = args[index + 1];
+                index += 2;
+                continue;
+            }
+
+            std::wcerr << L"!snapshot: unrecognised option \"" << args[index] << L"\"\n";
+            *parseError = true;
+            break;
+        }
+
+        ok = !*parseError;
+    } while (false);
+
+    return ok;
+}
+
+static bool FinalizeAndWriteSnapshot(
+    SnapshotDocument* document,
+    const std::wstring& jsonPath,
+    const std::wstring& reportPath,
+    bool printSummary)
+{
+    bool ok = false;
+    std::wstring error;
+
+    do
+    {
+        if (document == nullptr)
+        {
+            break;
+        }
+
+        document->JsonPath = jsonPath;
+        document->ReportPath = reportPath;
+
+        if (!WriteSnapshotJsonFile(jsonPath, *document, &error))
+        {
+            std::wcerr << L"!snapshot json failed: " << error << L"\n";
+            break;
+        }
+
+        if (!WriteSnapshotTextFile(reportPath, BuildSnapshotBaselineMarkdown(*document), &error))
+        {
+            std::wcerr << L"!snapshot report failed: " << error << L"\n";
+            break;
+        }
+
+        if (printSummary)
+        {
+            PrintSnapshotSummary(*document, true, false);
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void HandleSnapshotCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        if (args.size() < 2 || HasHelpToken(args, 1))
+        {
+            PrintSnapshotHelp();
+            break;
+        }
+
+        std::wstring action = ToLower(args[1]);
+        if (action == L"show")
+        {
+            bool domains = true;
+            bool warnings = false;
+            bool parseError = false;
+            std::wstring target = L"baseline";
+            size_t index = 2;
+            if (index < args.size() && args[index][0] != L'/')
+            {
+                target = args[index];
+                ++index;
+            }
+            while (index < args.size())
+            {
+                std::wstring option = ToLower(args[index]);
+                if (option == L"/domains")
+                {
+                    domains = true;
+                }
+                else if (option == L"/warnings")
+                {
+                    warnings = true;
+                }
+                else
+                {
+                    std::wcerr << L"!snapshot show: unrecognised option \"" << args[index] << L"\"\n";
+                    parseError = true;
+                    break;
+                }
+                ++index;
+            }
+            if (parseError)
+            {
+                break;
+            }
+
+            if (ToLower(target) == L"baseline")
+            {
+                if (!state.HasSnapshotBaseline)
+                {
+                    std::wcerr << L"!snapshot show: no session baseline captured\n";
+                    break;
+                }
+                PrintSnapshotSummary(state.SnapshotBaseline, domains, warnings);
+            }
+            else
+            {
+                SnapshotDocument document = {};
+                if (!ReadSnapshotJsonFile(target, &document, &error))
+                {
+                    std::wcerr << L"!snapshot show failed: " << error << L"\n";
+                    break;
+                }
+                PrintSnapshotSummary(document, domains, warnings);
+            }
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!snapshot requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (action == L"baseline")
+        {
+            std::wstring label = L"baseline";
+            bool parseError = false;
+            if (!ParseSnapshotNameOption(args, 2, &label, &parseError) || parseError)
+            {
+                break;
+            }
+
+            SnapshotDocument document = {};
+            if (!CaptureSnapshotForCommand(state, device, symbols, label, false, true, nullptr, &document, &error))
+            {
+                std::wcerr << L"!snapshot baseline failed: " << error << L"\n";
+                break;
+            }
+
+            std::wstring jsonPath = BuildSnapshotDefaultPath(L"snapshots", document.TimestampUtc, label, L".json");
+            std::wstring reportPath = BuildSnapshotDefaultPath(L"reports", document.TimestampUtc, label + L"-baseline", L".md");
+            if (!FinalizeAndWriteSnapshot(&document, jsonPath, reportPath, true))
+            {
+                break;
+            }
+
+            state.SnapshotBaseline = document;
+            state.HasSnapshotBaseline = true;
+            state.SnapshotBaselineJsonPath = jsonPath;
+            state.SnapshotBaselineReportPath = reportPath;
+            break;
+        }
+
+        if (action == L"save")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: !snapshot save <path> [/all] [/name <label>]\n";
+                break;
+            }
+
+            std::wstring jsonPath = args[2];
+            std::wstring label = L"snapshot";
+            bool parseError = false;
+            if (!ParseSnapshotNameOption(args, 3, &label, &parseError) || parseError)
+            {
+                break;
+            }
+
+            SnapshotDocument document = {};
+            if (!CaptureSnapshotForCommand(state, device, symbols, label, false, true, nullptr, &document, &error))
+            {
+                std::wcerr << L"!snapshot save failed: " << error << L"\n";
+                break;
+            }
+
+            std::wstring reportPath = BuildSnapshotDefaultPath(L"reports", document.TimestampUtc, label + L"-snapshot", L".md");
+            if (!FinalizeAndWriteSnapshot(&document, jsonPath, reportPath, true))
+            {
+                break;
+            }
+            break;
+        }
+
+        std::wcerr << L"usage: !snapshot baseline|save|show\n";
+    } while (false);
+}
+
+static bool ParseDiffOptions(
+    const std::vector<std::wstring>& args,
+    size_t start,
+    DebuggerState& state,
+    SnapshotDiffOptions* options,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (options == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid diff options output";
+            }
+            break;
+        }
+
+        *options = SnapshotDiffOptions{};
+        size_t index = start;
+        bool parseError = false;
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/summary")
+            {
+                options->SummaryOnly = true;
+                ++index;
+                continue;
+            }
+            if (option == L"/details")
+            {
+                options->Details = true;
+                options->SummaryOnly = false;
+                ++index;
+                continue;
+            }
+            if (option == L"/domain")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/domain requires a value";
+                    }
+                    parseError = true;
+                    break;
+                }
+                options->DomainFilter = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (option == L"/risk")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/risk requires high or all";
+                    }
+                    parseError = true;
+                    break;
+                }
+                std::wstring risk = ToLower(args[index + 1]);
+                if (risk == L"high")
+                {
+                    options->HighOnly = true;
+                }
+                else if (risk == L"all")
+                {
+                    options->HighOnly = false;
+                }
+                else
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/risk supports high or all";
+                    }
+                    parseError = true;
+                    break;
+                }
+                index += 2;
+                continue;
+            }
+            if (option == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/limit requires a value";
+                    }
+                    parseError = true;
+                    break;
+                }
+                uint64_t value = 0;
+                if (!ParseUnsigned(args[index + 1], state.NumberBase, &value) || value > 0xffffffffull)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"invalid /limit value";
+                    }
+                    parseError = true;
+                    break;
+                }
+                options->Limit = static_cast<uint32_t>(value);
+                index += 2;
+                continue;
+            }
+
+            if (error != nullptr)
+            {
+                *error = L"unrecognised option: " + args[index];
+            }
+            parseError = true;
+            break;
+        }
+
+        ok = !parseError;
+    } while (false);
+
+    return ok;
+}
+
+static void HandleDiffCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        if (args.size() < 2 || HasHelpToken(args, 1))
+        {
+            PrintDiffHelp();
+            break;
+        }
+
+        std::wstring target = ToLower(args[1]);
+        SnapshotDocument oldSnapshot = {};
+        SnapshotDocument newSnapshot = {};
+        SnapshotDiffOptions options = {};
+        size_t optionStart = 0;
+
+        if (target == L"baseline")
+        {
+            if (!state.HasSnapshotBaseline)
+            {
+                std::wcerr << L"!diff baseline: no session baseline captured\n";
+                break;
+            }
+            if (!device.IsOpen())
+            {
+                std::wcerr << L"!diff baseline requires the KnLiveDbg.sys driver device to be open\n";
+                break;
+            }
+
+            if (!ParseDiffOptions(args, 2, state, &options, &error))
+            {
+                std::wcerr << L"!diff baseline failed: " << error << L"\n";
+                break;
+            }
+
+            oldSnapshot = state.SnapshotBaseline;
+            std::wstring label = L"current";
+            if (!CaptureSnapshotForCommand(state, device, symbols, label, true, false, &state.SnapshotBaseline, &newSnapshot, &error))
+            {
+                std::wcerr << L"!diff baseline capture failed: " << error << L"\n";
+                break;
+            }
+
+            newSnapshot.JsonPath = BuildSnapshotDefaultPath(L"snapshots", newSnapshot.TimestampUtc, label, L".json");
+            newSnapshot.ReportPath = BuildSnapshotDefaultPath(L"reports", newSnapshot.TimestampUtc, label + L"-snapshot", L".md");
+            if (!WriteSnapshotJsonFile(newSnapshot.JsonPath, newSnapshot, &error))
+            {
+                std::wcerr << L"!diff current json failed: " << error << L"\n";
+                break;
+            }
+            if (!WriteSnapshotTextFile(newSnapshot.ReportPath, BuildSnapshotBaselineMarkdown(newSnapshot), &error))
+            {
+                std::wcerr << L"!diff current report failed: " << error << L"\n";
+                break;
+            }
+        }
+        else
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: !diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]\n";
+                break;
+            }
+
+            if (!ReadSnapshotJsonFile(args[1], &oldSnapshot, &error))
+            {
+                std::wcerr << L"!diff old snapshot failed: " << error << L"\n";
+                break;
+            }
+            if (!ReadSnapshotJsonFile(args[2], &newSnapshot, &error))
+            {
+                std::wcerr << L"!diff new snapshot failed: " << error << L"\n";
+                break;
+            }
+            optionStart = 3;
+            if (!ParseDiffOptions(args, optionStart, state, &options, &error))
+            {
+                std::wcerr << L"!diff failed: " << error << L"\n";
+                break;
+            }
+        }
+
+        SnapshotDiffResult diff = {};
+        if (!BuildSnapshotDiff(oldSnapshot, newSnapshot, options, &diff, &error))
+        {
+            std::wcerr << L"!diff failed: " << error << L"\n";
+            break;
+        }
+
+        std::wstring reportPath = BuildSnapshotDefaultPath(L"reports", SnapshotCurrentUtcTimestamp(), newSnapshot.Label + L"-diff", L".md");
+        diff.ReportPath = reportPath;
+        if (!WriteSnapshotTextFile(reportPath, BuildSnapshotDiffMarkdown(diff, options), &error))
+        {
+            std::wcerr << L"!diff report failed: " << error << L"\n";
+        }
+
+        PrintSnapshotDiff(diff, options);
+    } while (false);
 }
 
 static void HandleDmlProcCommand(
@@ -17630,6 +18346,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintThreadsHelp();
         }
+        else if (command == L"!snapshot")
+        {
+            PrintSnapshotHelp();
+        }
+        else if (command == L"!diff")
+        {
+            PrintDiffHelp();
+        }
         else if (command == L"!wfp")
         {
             PrintWfpHelp();
@@ -27856,6 +28580,14 @@ static bool HandleCommand(
         {
             HandleThreadsCommand(args, state, device, symbols);
         }
+        else if (command == L"!snapshot")
+        {
+            HandleSnapshotCommand(args, state, device, symbols);
+        }
+        else if (command == L"!diff")
+        {
+            HandleDiffCommand(args, state, device, symbols);
+        }
         else if (command == L"!wfp")
         {
             HandleWfpCommand(args);
@@ -28257,6 +28989,10 @@ int wmain(int argc, wchar_t** argv)
     state.ProbeDriverUnloaded = false;
     state.ByovdFixtureCleanupRequested = false;
     state.ByovdFixtureUnloaded = false;
+    state.HasSnapshotBaseline = false;
+    state.SnapshotBaseline = SnapshotDocument{};
+    state.SnapshotBaselineJsonPath.clear();
+    state.SnapshotBaselineReportPath.clear();
     state.Backend = DebuggerState::BackendMode::Auto;
 
     DriverService service;

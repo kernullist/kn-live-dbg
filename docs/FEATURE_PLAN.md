@@ -41,29 +41,40 @@ Remaining priority order:
 
 ## 1. Session Baseline Snapshots And Diffs
 
-Add `!snapshot` and `!diff` as a persistent evidence layer over existing
-commands.
+Status: implemented. `!snapshot` and `!diff` provide a same-boot evidence
+baseline layer over the existing native scanners.
 
-Target shape:
+Implemented command shape:
 
 ```text
-!snapshot save <path> [/all] [/callbacks] [/wfp] [/alpc] [/etw] [/nmi] [/pool] [/wnf] [/modules]
-!snapshot show <path>
-!diff <old-snapshot.json> <new-snapshot.json> [/summary] [/details]
+!snapshot baseline [/all] [/name <label>]
+!snapshot save <path> [/all] [/name <label>]
+!snapshot show [baseline|<path>] [/domains] [/warnings]
+!diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+!diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
 ```
 
-Implementation notes:
+Implemented behavior:
 
-1. Reuse existing scanners instead of creating alternate parsers.
-2. Save structured records for modules, callbacks, WFP objects, ALPC ports,
-   ETW logger hooks, NMI callbacks, big-pool summary/high-signal records, WNF
-   instances, and tool/session metadata.
-3. Diff by stable identity first: address, GUID, module name, callback surface,
-   pool tag/address, WNF entry address, or command-specific key.
-4. Highlight new callback owners, new executable/W+X pool entries, new WFP
-   providers/callouts, new ALPC server families, changed ETW GetCpuClock
-   targets, and new NMI handlers.
-5. Emit a compact console summary plus optional detailed JSON/Markdown output.
+1. Reuses the existing native scanners instead of introducing alternate
+   parsers.
+2. Stores the session baseline in memory and automatically writes JSON plus a
+   Markdown report under `.kn-live-dbg\snapshots` and `.kn-live-dbg\reports`.
+3. Captures process inventory, modules, drivers/dispatch, callbacks, ETW,
+   NMI, firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, and
+   BYOVD in the default full snapshot.
+4. Uses new-focused diff semantics: records absent from baseline but present
+   now, plus selected high-risk escalations. Removed records are intentionally
+   not shown by default.
+5. Runs VAD DKOM hidden-PTE scans during `!diff baseline` for every process
+   that is new since the baseline and still alive.
+6. Prioritizes pool findings as pool-PE suspect, pool-PE hit, W+X NonPaged,
+   then large NonPaged sorted by size.
+7. Generates a compact console summary, machine-readable JSON snapshots, and
+   Markdown reports by default.
+8. Keeps BYOVD YARA out of the snapshot path. Baseline/save may refresh the
+   local catalog, but `!diff baseline` disables catalog auto-update and warns
+   when catalog fingerprints differ.
 
 Operational value:
 
