@@ -40,7 +40,14 @@ namespace
         }
         else if (record.Domain == L"drivers")
         {
-            follow = L"!driver integrity " + EvidenceValue(record, L"driver");
+            std::wstring driver = EvidenceValue(record, L"driver");
+            if (driver.empty())
+            {
+                driver = EvidenceValue(record, L"name");
+            }
+            follow = driver.empty()
+                ? L"!driver integrity"
+                : L"!driver integrity " + driver;
         }
         else if (record.Domain == L"modules")
         {
@@ -221,7 +228,12 @@ void PrintSnapshotDiff(const SnapshotDiffResult& diff, const SnapshotDiffOptions
             std::wcout << L"[diff." << domain.Domain << L"] added=" << domain.Added
                        << L" escalated=" << domain.Escalated
                        << L" high=" << domain.High
-                       << L" medium=" << domain.Medium << L"\n";
+                       << L" medium=" << domain.Medium;
+            if (domain.HiddenChildFindings != 0)
+            {
+                std::wcout << L" hiddenChildren=" << domain.HiddenChildFindings;
+            }
+            std::wcout << L"\n";
         }
     }
 
@@ -267,6 +279,15 @@ void PrintSnapshotDiff(const SnapshotDiffResult& diff, const SnapshotDiffOptions
                        << L" size=" << EvidenceValue(record, L"size")
                        << L" wx=" << EvidenceValue(record, L"writable") << L"/"
                        << EvidenceValue(record, L"executable") << L"\n";
+        }
+        else if (record.Domain == L"drivers" && SnapshotRecordHasTag(record, L"driver"))
+        {
+            std::wcout << L"    evidence: name=" << EvidenceValue(record, L"name")
+                       << L" object=" << EvidenceValue(record, L"object")
+                       << L" size=" << EvidenceValue(record, L"size")
+                       << L" owning_module=" << EvidenceValue(record, L"owning_module")
+                       << L" suspicious_dispatch=" << EvidenceValue(record, L"suspicious_dispatch_count")
+                       << L"\n";
         }
         else
         {
@@ -371,6 +392,10 @@ std::wstring BuildSnapshotDiffMarkdown(const SnapshotDiffResult& diff, const Sna
                << L" escalated=" << domain.Escalated
                << L" high=" << domain.High
                << L" medium=" << domain.Medium;
+        if (domain.HiddenChildFindings != 0)
+        {
+            stream << L" hiddenChildren=" << domain.HiddenChildFindings;
+        }
         if (domain.Domain == L"pool")
         {
             stream << L" peSuspect=" << domain.PoolPeSuspect
@@ -387,8 +412,8 @@ std::wstring BuildSnapshotDiffMarkdown(const SnapshotDiffResult& diff, const Sna
     }
 
     stream << L"\n## Top Findings\n\n";
-    uint32_t emitted = 0;
-    uint32_t limit = PrintedLimit(options) * 4;
+    uint64_t emitted = 0;
+    uint64_t limit = static_cast<uint64_t>(PrintedLimit(options)) * 4ull;
     for (const SnapshotDiffFinding& finding : diff.Findings)
     {
         if (!ShouldPrintFinding(finding, options))

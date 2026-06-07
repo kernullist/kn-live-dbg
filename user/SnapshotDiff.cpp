@@ -1,6 +1,7 @@
 #include "SnapshotDiff.h"
 
 #include <algorithm>
+#include <set>
 #include <sstream>
 
 namespace
@@ -103,6 +104,30 @@ namespace
             SnapshotRecordHasTag(record, L"process-scanned");
     }
 
+    bool IsDriverDispatchRecord(const SnapshotRecord& record)
+    {
+        return record.Domain == L"drivers" &&
+            SnapshotRecordHasTag(record, L"dispatch");
+    }
+
+    std::wstring DriverParentKeyFromDispatch(const SnapshotRecord& record)
+    {
+        std::wstring key;
+
+        do
+        {
+            auto driver = record.Evidence.find(L"driver");
+            if (driver == record.Evidence.end() || driver->second.empty())
+            {
+                break;
+            }
+
+            key = L"drivers\n" + std::wstring(L"driver:") + SnapshotToLower(driver->second);
+        } while (false);
+
+        return key;
+    }
+
     void AddVadScanCounters(SnapshotDiffResult* result, const SnapshotRecord& record)
     {
         if (result == nullptr || !IsVadScanRecord(record))
@@ -147,7 +172,15 @@ namespace
     {
         bool less = false;
 
-        if (a.NewRecord.Domain == L"pool" || b.NewRecord.Domain == L"pool")
+        uint32_t ra = SnapshotRiskRank(a.NewRecord.Risk);
+        uint32_t rb = SnapshotRiskRank(b.NewRecord.Risk);
+        if (ra != rb)
+        {
+            less = ra > rb;
+            return less;
+        }
+
+        if (a.NewRecord.Domain == L"pool" && b.NewRecord.Domain == L"pool")
         {
             int pa = PoolPriority(a);
             int pb = PoolPriority(b);
@@ -166,13 +199,7 @@ namespace
             }
         }
 
-        uint32_t ra = SnapshotRiskRank(a.NewRecord.Risk);
-        uint32_t rb = SnapshotRiskRank(b.NewRecord.Risk);
-        if (ra != rb)
-        {
-            less = ra > rb;
-        }
-        else if (a.NewRecord.Domain != b.NewRecord.Domain)
+        if (a.NewRecord.Domain != b.NewRecord.Domain)
         {
             less = a.NewRecord.Domain < b.NewRecord.Domain;
         }
@@ -268,10 +295,11 @@ bool BuildSnapshotDiff(
             !newSnapshot.BootId.empty() &&
             oldSnapshot.BootId != L"boot-unknown" &&
             newSnapshot.BootId != L"boot-unknown";
-        result->SameBoot = oldSnapshot.SameBootOnly &&
-            newSnapshot.SameBootOnly &&
-            comparableBootIds &&
-            oldSnapshot.BootId == newSnapshot.BootId;
+        result->SameBoot = options.InMemoryBaseline ||
+            (oldSnapshot.SameBootOnly &&
+                newSnapshot.SameBootOnly &&
+                comparableBootIds &&
+                oldSnapshot.BootId == newSnapshot.BootId);
         if (!result->SameBoot)
         {
             result->Warnings.push_back(L"snapshot boot identifiers differ or are missing");
@@ -290,6 +318,22 @@ bool BuildSnapshotDiff(
         for (const SnapshotRecord& record : oldSnapshot.Records)
         {
             oldRecords[DiffRecordKey(record)] = record;
+        }
+
+        std::set<std::wstring> addedDriverParents;
+        for (const SnapshotRecord& record : newSnapshot.Records)
+        {
+            if (record.Domain != L"drivers" ||
+                !SnapshotRecordHasTag(record, L"driver") ||
+                !DomainAllowed(options, record.Domain))
+            {
+                continue;
+            }
+
+            if (oldRecords.find(DiffRecordKey(record)) == oldRecords.end())
+            {
+                addedDriverParents.insert(DiffRecordKey(record));
+            }
         }
 
         for (const SnapshotRecord& record : newSnapshot.Records)
@@ -316,6 +360,21 @@ bool BuildSnapshotDiff(
             if (options.HighOnly && SnapshotRiskRank(record.Risk) < 3)
             {
                 continue;
+            }
+
+            if (!options.Details &&
+                SnapshotRiskRank(record.Risk) < 3 &&
+                IsDriverDispatchRecord(record))
+            {
+                std::wstring parentKey = DriverParentKeyFromDispatch(record);
+                if (!parentKey.empty() &&
+                    addedDriverParents.find(parentKey) != addedDriverParents.end())
+                {
+                    SnapshotDiffDomainSummary& domain = result->Domains[L"drivers"];
+                    domain.Domain = L"drivers";
+                    ++domain.HiddenChildFindings;
+                    continue;
+                }
             }
 
             auto oldIt = oldRecords.find(DiffRecordKey(record));

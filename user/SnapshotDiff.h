@@ -11,6 +11,7 @@ struct SnapshotDiffOptions
     bool Details = false;
     bool SummaryOnly = false;
     bool HighOnly = false;
+    bool InMemoryBaseline = false;
     uint32_t Limit = 10;
     std::wstring DomainFilter;
 };
@@ -37,6 +38,7 @@ struct SnapshotDiffDomainSummary
     uint64_t VadHiddenPte = 0;
     uint64_t VadWxHidden = 0;
     uint64_t VadFailed = 0;
+    uint64_t HiddenChildFindings = 0;
 };
 
 struct SnapshotDiffResult
