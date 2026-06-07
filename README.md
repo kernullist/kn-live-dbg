@@ -53,7 +53,7 @@ kn-live-dbg/
 18. Detects active LA57 paging and reports whether translation used PML4 or PML5, including the physical address of each page-table entry that was walked.
 19. Supports DbgEng local-kernel and remote-kernel attach modes through `kdinit /local` and `kdinit /remote`.
 20. Falls back to DIA SDK type parsing when `DbgHelp` cannot provide enough UDT/field metadata.
-21. Builds and manages `KnLiveDbgProbe.sys`, a positive-control test driver with known virtual and physical buffer addresses.
+21. Builds and manages `KnLiveDbgProbe.sys`, a positive-control test driver with known virtual/physical buffer addresses and a test firmware table provider registration.
 22. Enumerates Windows Filtering Platform providers, sublayers, callouts, filters, and layers natively through the user-mode Base Filtering Engine (`fwpuclnt.dll`) with `!wfp`, including layer/provider/sublayer name resolution and decoded action/flag mnemonics.
 23. Enumerates ALPC ports natively from live kernel memory with `!alpc`, recursively walking the Object Manager namespace from `nt!ObpRootDirectoryObject`, following `_ALPC_PORT.CommunicationInfo` to discover paired server/client ports, counting queue depths from `MainQueue`/`PendingQueue`/`LargeMessageQueue`/`CanceledQueue`/`WaitQueue`, and grouping records by `ConnectionPort` into client/server families.
 24. Reports VBS, HVCI, Secure Kernel, and IUM trustlet status with `!vbs`, `!ci`, and `!securekernel` — decoding `nt!g_CiOptions` flag bits, reading `nt!HvlpVsmVtlCallVa` for VBS active state, scanning `PsLoadedModuleList` for `securekernel.exe`/`skci.dll`, querying CPUID leaves `0x40000000`/`0x40000006` for hypervisor identification, and walking `PsActiveProcessHead` with `_KPROCESS.SecureState` (or known trustlet image-name prefixes when the field is unavailable) for the trustlet list.
@@ -691,7 +691,7 @@ Firmware table provider flow:
 
 1. `nt!ExpFirmwareTableProviderListHead` is resolved through the loaded kernel PDB, with `nt!ExpFirmwareTableResource` reported when present.
 2. The provider list is walked as `LIST_ENTRY` with a visited-node guard, maximum-entry cap, canonical-pointer checks, guarded reads, and Flink/Blink backlink validation.
-3. Node decoding prefers private PDB type metadata when available and falls back to the guarded x64 layout used by `SYSTEM_FIRMWARE_TABLE_HANDLER` registrations: `LIST_ENTRY` at `+0x00`, `ProviderSignature` at `+0x10`, `Register` at `+0x14`, `FirmwareTableHandler` at `+0x18`, and `DriverObject` at `+0x20`.
+3. Node decoding prefers private PDB type metadata when available. When private types are absent, fallback candidates are scored against live nodes; the normal public-symbol fallback is `SYSTEM_FIRMWARE_TABLE_HANDLER` fields first (`ProviderSignature +0x00`, `Register +0x04`, `FirmwareTableHandler +0x08`, `DriverObject +0x10`) with the list entry at `+0x18`.
 4. Each record prints the provider signature as hex plus FourCC when printable, the handler address with owning module and nearest symbol, and the DriverObject name/start/size/owner module when `_DRIVER_OBJECT` fields are available.
 5. Triage flags include nonstandard providers outside the ACPI/FIRM/RSMB baseline, duplicate signatures, null or nonkernel pointers, handlers outside loaded image ranges, handler/DriverObject owner mismatches, DriverStart values outside loaded modules, and corrupt list links.
 
@@ -1332,7 +1332,7 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 
 ## Positive-Control Probe
 
-`KnLiveDbgProbe.sys` is an optional test driver that exposes a deterministic 4 KB contiguous nonpaged buffer. It is intended for smoke tests of virtual reads, VA-to-PA translation, physical reads, physical writes, and restore flows without guessing at arbitrary kernel memory.
+`KnLiveDbgProbe.sys` is an optional test driver that exposes a deterministic 4 KB contiguous nonpaged buffer and registers a test firmware table provider with signature `KNFW`. It is intended for smoke tests of virtual reads, VA-to-PA translation, physical reads, physical writes, firmware-table provider detection, and restore flows without guessing at arbitrary kernel memory.
 
 ```text
 probe load
@@ -1344,7 +1344,7 @@ probe reset
 probe unload
 ```
 
-The buffer pattern is `(index * 13 + 0x5a) & 0xff`. `probe info` prints both the virtual and physical buffer addresses and example `db`/`pdb` commands.
+The buffer pattern is `(index * 13 + 0x5a) & 0xff`. `probe info` prints both the virtual and physical buffer addresses, firmware provider registration status, and example `db`/`pdb`/`!fwtable` commands. After `probe load`, `!fwtable provider KNFW` should report `KnLiveDbgProbe.sys` as a suspicious nonstandard provider; `probe unload` unregisters it.
 
 ## Operational Caveats
 

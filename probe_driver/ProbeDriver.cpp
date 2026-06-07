@@ -7,7 +7,20 @@ static DRIVER_DISPATCH KnDbgProbeCreateClose;
 static DRIVER_DISPATCH KnDbgProbeDeviceControl;
 static DRIVER_DISPATCH KnDbgProbeNotSupportedDispatch;
 
+#ifndef SystemRegisterFirmwareTableInformationHandler
+#define SystemRegisterFirmwareTableInformationHandler 0x4B
+#endif
+
+typedef NTSTATUS(NTAPI* KNDBG_PROBE_ZW_SET_SYSTEM_INFORMATION)(
+    _In_ ULONG SystemInformationClass,
+    _In_reads_bytes_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength);
+
 static PVOID g_KnDbgProbeBuffer = nullptr;
+static PDRIVER_OBJECT g_KnDbgProbeDriverObject = nullptr;
+static BOOLEAN g_KnDbgProbeFirmwareProviderRegistered = FALSE;
+static NTSTATUS g_KnDbgProbeFirmwareProviderRegisterStatus = STATUS_NOT_FOUND;
+static NTSTATUS g_KnDbgProbeFirmwareProviderUnregisterStatus = STATUS_SUCCESS;
 static const GUID KNDBG_PROBE_DEVICE_CLASS_GUID =
 {
     0x8f5f4de1,
@@ -22,6 +35,118 @@ static NTSTATUS KnDbgProbeCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG_PTR Infor
     Irp->IoStatus.Information = Information;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return Status;
+}
+
+static NTSTATUS __cdecl KnDbgProbeFirmwareTableHandler(
+    _Inout_ PSYSTEM_FIRMWARE_TABLE_INFORMATION SystemFirmwareTableInfo)
+{
+    NTSTATUS status = STATUS_INVALID_PARAMETER;
+
+    do
+    {
+        if (SystemFirmwareTableInfo == nullptr)
+        {
+            break;
+        }
+
+        if (SystemFirmwareTableInfo->ProviderSignature != KNDBG_PROBE_FIRMWARE_PROVIDER_SIGNATURE)
+        {
+            break;
+        }
+
+        if (SystemFirmwareTableInfo->Action == SystemFirmwareTable_Enumerate)
+        {
+            SystemFirmwareTableInfo->TableBufferLength = 0;
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        if (SystemFirmwareTableInfo->Action == SystemFirmwareTable_Get)
+        {
+            SystemFirmwareTableInfo->TableBufferLength = 0;
+            status = STATUS_NOT_FOUND;
+            break;
+        }
+    } while (false);
+
+    return status;
+}
+
+static NTSTATUS KnDbgProbeSetFirmwareTableProvider(BOOLEAN Register)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    do
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        {
+            status = STATUS_INVALID_DEVICE_STATE;
+            break;
+        }
+
+        if (g_KnDbgProbeDriverObject == nullptr)
+        {
+            status = STATUS_INVALID_DEVICE_STATE;
+            break;
+        }
+
+        UNICODE_STRING routineName = RTL_CONSTANT_STRING(L"ZwSetSystemInformation");
+        KNDBG_PROBE_ZW_SET_SYSTEM_INFORMATION zwSetSystemInformation =
+            reinterpret_cast<KNDBG_PROBE_ZW_SET_SYSTEM_INFORMATION>(
+                MmGetSystemRoutineAddress(&routineName));
+        if (zwSetSystemInformation == nullptr)
+        {
+            status = STATUS_PROCEDURE_NOT_FOUND;
+            break;
+        }
+
+        SYSTEM_FIRMWARE_TABLE_HANDLER tableHandler = {};
+        tableHandler.ProviderSignature = KNDBG_PROBE_FIRMWARE_PROVIDER_SIGNATURE;
+        tableHandler.Register = Register;
+        tableHandler.FirmwareTableHandler = KnDbgProbeFirmwareTableHandler;
+        tableHandler.DriverObject = g_KnDbgProbeDriverObject;
+
+        status = zwSetSystemInformation(
+            SystemRegisterFirmwareTableInformationHandler,
+            &tableHandler,
+            sizeof(tableHandler));
+    } while (false);
+
+    return status;
+}
+
+static void KnDbgProbeRegisterFirmwareTableProvider()
+{
+    do
+    {
+        if (g_KnDbgProbeFirmwareProviderRegistered)
+        {
+            break;
+        }
+
+        g_KnDbgProbeFirmwareProviderRegisterStatus = KnDbgProbeSetFirmwareTableProvider(TRUE);
+        if (NT_SUCCESS(g_KnDbgProbeFirmwareProviderRegisterStatus))
+        {
+            g_KnDbgProbeFirmwareProviderRegistered = TRUE;
+        }
+    } while (false);
+}
+
+static void KnDbgProbeUnregisterFirmwareTableProvider()
+{
+    do
+    {
+        if (!g_KnDbgProbeFirmwareProviderRegistered)
+        {
+            break;
+        }
+
+        g_KnDbgProbeFirmwareProviderUnregisterStatus = KnDbgProbeSetFirmwareTableProvider(FALSE);
+        if (NT_SUCCESS(g_KnDbgProbeFirmwareProviderUnregisterStatus))
+        {
+            g_KnDbgProbeFirmwareProviderRegistered = FALSE;
+        }
+    } while (false);
 }
 
 static void KnDbgProbeFillPattern()
@@ -70,6 +195,14 @@ static NTSTATUS KnDbgProbeHandleGetInfo(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
         response->PatternSeed = KNDBG_PROBE_PATTERN_SEED;
         response->BufferVirtualAddress = reinterpret_cast<KNDBG_PROBE_UINT64>(g_KnDbgProbeBuffer);
         response->BufferPhysicalAddress = static_cast<KNDBG_PROBE_UINT64>(physical.QuadPart);
+        response->FirmwareProviderSignature = KNDBG_PROBE_FIRMWARE_PROVIDER_SIGNATURE;
+        response->FirmwareProviderRegistered = g_KnDbgProbeFirmwareProviderRegistered ? 1u : 0u;
+        response->FirmwareProviderRegisterStatus =
+            static_cast<KNDBG_PROBE_UINT32>(g_KnDbgProbeFirmwareProviderRegisterStatus);
+        response->FirmwareProviderUnregisterStatus =
+            static_cast<KNDBG_PROBE_UINT32>(g_KnDbgProbeFirmwareProviderUnregisterStatus);
+        response->FirmwareTableHandlerAddress =
+            reinterpret_cast<KNDBG_PROBE_UINT64>(&KnDbgProbeFirmwareTableHandler);
 
         information = sizeof(KNDBG_PROBE_INFO_RESPONSE);
         status = STATUS_SUCCESS;
@@ -113,6 +246,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     do
     {
+        g_KnDbgProbeDriverObject = DriverObject;
+
         for (ULONG index = 0; index <= IRP_MJ_MAXIMUM_FUNCTION; ++index)
         {
             DriverObject->MajorFunction[index] = KnDbgProbeNotSupportedDispatch;
@@ -167,11 +302,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
         symbolicLinkCreated = true;
         deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+        KnDbgProbeRegisterFirmwareTableProvider();
         status = STATUS_SUCCESS;
     } while (false);
 
     if (!NT_SUCCESS(status))
     {
+        KnDbgProbeUnregisterFirmwareTableProvider();
+
         if (symbolicLinkCreated)
         {
             IoDeleteSymbolicLink(&symbolicLinkName);
@@ -187,6 +325,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
             MmFreeContiguousMemory(g_KnDbgProbeBuffer);
             g_KnDbgProbeBuffer = nullptr;
         }
+
+        g_KnDbgProbeDriverObject = nullptr;
     }
 
     return status;
@@ -195,6 +335,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 static VOID KnDbgProbeUnload(PDRIVER_OBJECT DriverObject)
 {
     UNICODE_STRING symbolicLinkName = RTL_CONSTANT_STRING(KNDBG_PROBE_DOS_DEVICE_NAME);
+
+    KnDbgProbeUnregisterFirmwareTableProvider();
 
     IoDeleteSymbolicLink(&symbolicLinkName);
 
@@ -208,6 +350,8 @@ static VOID KnDbgProbeUnload(PDRIVER_OBJECT DriverObject)
         MmFreeContiguousMemory(g_KnDbgProbeBuffer);
         g_KnDbgProbeBuffer = nullptr;
     }
+
+    g_KnDbgProbeDriverObject = nullptr;
 }
 
 static NTSTATUS KnDbgProbeCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
