@@ -591,8 +591,21 @@ namespace
             record.Evidence[L"node"] = SnapshotHex(provider.NodeAddress, 16);
             record.Evidence[L"handler"] = SnapshotHex(provider.FirmwareTableHandler, 16);
             record.Evidence[L"handler_module"] = provider.HandlerModule;
+            if (provider.HandlerModule.empty() && provider.FirmwareTableHandler != 0)
+            {
+                record.Evidence[L"handler_module_address"] = SnapshotHex(provider.FirmwareTableHandler, 16);
+            }
             record.Evidence[L"handler_symbol"] = provider.HandlerSymbol;
-            record.Evidence[L"driver"] = provider.DriverName;
+            record.Evidence[L"driver_object"] = SnapshotHex(provider.DriverObject, 16);
+            record.Evidence[L"driver"] = provider.DriverName.empty() && provider.DriverObject != 0 ?
+                SnapshotHex(provider.DriverObject, 16) :
+                provider.DriverName;
+            record.Evidence[L"driver_start"] = SnapshotHex(provider.DriverStart, 16);
+            record.Evidence[L"driver_module"] = provider.DriverModule;
+            if (provider.DriverModule.empty() && provider.DriverStart != 0)
+            {
+                record.Evidence[L"driver_module_address"] = SnapshotHex(provider.DriverStart, 16);
+            }
             record.Evidence[L"notes"] = provider.Notes;
             AddRecord(document, std::move(record));
         }
