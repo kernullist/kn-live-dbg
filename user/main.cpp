@@ -9707,6 +9707,28 @@ static bool ResetProbePattern(std::wstring* error)
     return ok;
 }
 
+static std::wstring ProbeFirmwareSignatureText(uint32_t signature)
+{
+    std::wstring text;
+
+    do
+    {
+        for (uint32_t index = 0; index < 4; ++index)
+        {
+            uint8_t ch = static_cast<uint8_t>((signature >> ((3 - index) * 8)) & 0xffu);
+            if (ch < 0x20 || ch > 0x7e)
+            {
+                text.clear();
+                break;
+            }
+
+            text.push_back(static_cast<wchar_t>(ch));
+        }
+    } while (false);
+
+    return text;
+}
+
 static void PrintProbeInfo(const KNDBG_PROBE_INFO_RESPONSE& info)
 {
     PrintColoredText(L"probe", KNDBG_COLOR_TITLE);
@@ -9717,9 +9739,22 @@ static void PrintProbeInfo(const KNDBG_PROBE_INFO_RESPONSE& info)
     std::wcout << L"=" << HexTextWidth(info.BufferVirtualAddress, 16, true) << L"\n";
     PrintColoredText(L"probe physical", KNDBG_COLOR_TITLE);
     std::wcout << L"=" << HexTextWidth(info.BufferPhysicalAddress, 16, true) << L"\n";
+    PrintColoredText(L"probe firmware", KNDBG_COLOR_ACCENT);
+    std::wcout << L" signature=" << HexTextWidth(info.FirmwareProviderSignature, 8, true);
+    std::wstring fourcc = ProbeFirmwareSignatureText(info.FirmwareProviderSignature);
+    if (!fourcc.empty())
+    {
+        std::wcout << L" fourcc=\"" << fourcc << L"\"";
+    }
+    std::wcout << L" registered=" << (info.FirmwareProviderRegistered != 0 ? L"yes" : L"no")
+               << L" registerStatus=" << HexTextWidth(info.FirmwareProviderRegisterStatus, 8, true)
+               << L" unregisterStatus=" << HexTextWidth(info.FirmwareProviderUnregisterStatus, 8, true)
+               << L" handler=" << HexTextWidth(info.FirmwareTableHandlerAddress, 16, true)
+               << L"\n";
     std::wcout << L"try: db 0x" << std::hex << info.BufferVirtualAddress
                << L" 40; pdb 0x" << info.BufferPhysicalAddress
                << L" 40" << std::dec << L"\n";
+    std::wcout << L"try: !fwtable provider " << fourcc << L"; !fwtable providers /module KnLiveDbgProbe.sys\n";
 }
 
 static bool LoadDriverServiceWithUx(
@@ -10550,6 +10585,7 @@ static std::wstring BuildProbePanelText()
             {
                 text += L" va=" + HexText(info.BufferVirtualAddress);
                 text += L" pa=" + HexText(info.BufferPhysicalAddress);
+                text += info.FirmwareProviderRegistered != 0 ? L" fw=KNFW" : L" fw=not-registered";
             }
         }
     } while (false);
@@ -10586,7 +10622,7 @@ static void PrintStartupTui(
     PrintTuiLine(L"  help          show native command summary", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  help all      include DbgEng-routed WinDbg commands", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  drvstatus     inspect service/session/write gate state", KNDBG_COLOR_TEXT);
-    PrintTuiLine(L"  probe load    load positive-control VA/PA test buffer", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  probe load    load positive-control VA/PA and fwtable provider", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  callbacks all enumerate callback surfaces including minifilters", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  ai status     inspect provider, model, policy, and credentials", KNDBG_COLOR_TEXT);
     PrintTuiBlank();
@@ -17628,13 +17664,14 @@ static void PrintProbeHelp()
     std::wcout << L"subcommands:\n";
     std::wcout << L"  status   show KnLiveDbgProbe service state and buffer addresses\n";
     std::wcout << L"  load     install/start KnLiveDbgProbe.sys from the EXE directory or sys-path\n";
-    std::wcout << L"  info     query the probe buffer virtual and physical addresses\n";
+    std::wcout << L"  info     query the probe buffer addresses and KNFW firmware provider state\n";
     std::wcout << L"  reset    rewrite the probe pattern\n";
     std::wcout << L"  unload   stop/delete the probe service\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  probe load\n";
     std::wcout << L"  probe info\n";
+    std::wcout << L"  !fwtable provider KNFW\n";
     std::wcout << L"  probe unload\n";
 }
 

@@ -9,9 +9,10 @@ typedef unsigned __int64 KNDBG_PROBE_UINT64;
 #define KNDBG_PROBE_SERVICE_NAME L"KnLiveDbgProbe"
 #define KNDBG_PROBE_DISPLAY_NAME L"Kn Live Debug Probe Driver"
 
-#define KNDBG_PROBE_ABI_VERSION 1u
+#define KNDBG_PROBE_ABI_VERSION 2u
 #define KNDBG_PROBE_BUFFER_LENGTH 0x1000u
 #define KNDBG_PROBE_PATTERN_SEED 0x5Au
+#define KNDBG_PROBE_FIRMWARE_PROVIDER_SIGNATURE 0x4B4E4657u
 
 #ifndef CTL_CODE
 #define CTL_CODE(DeviceType, Function, Method, Access) \
@@ -54,6 +55,11 @@ typedef struct _KNDBG_PROBE_INFO_RESPONSE
     KNDBG_PROBE_UINT32 PatternSeed;
     KNDBG_PROBE_UINT64 BufferVirtualAddress;
     KNDBG_PROBE_UINT64 BufferPhysicalAddress;
+    KNDBG_PROBE_UINT32 FirmwareProviderSignature;
+    KNDBG_PROBE_UINT32 FirmwareProviderRegistered;
+    KNDBG_PROBE_UINT32 FirmwareProviderRegisterStatus;
+    KNDBG_PROBE_UINT32 FirmwareProviderUnregisterStatus;
+    KNDBG_PROBE_UINT64 FirmwareTableHandlerAddress;
 } KNDBG_PROBE_INFO_RESPONSE;
 
 #pragma pack(pop)
