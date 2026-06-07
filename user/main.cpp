@@ -7737,6 +7737,7 @@ static void HandleDiffCommand(
                 std::wcerr << L"!diff baseline failed: " << error << L"\n";
                 break;
             }
+            options.InMemoryBaseline = true;
 
             oldSnapshot = state.SnapshotBaseline;
             std::wstring label = L"current";
@@ -7797,6 +7798,7 @@ static void HandleDiffCommand(
         if (!WriteSnapshotTextFile(reportPath, BuildSnapshotDiffMarkdown(diff, options), &error))
         {
             std::wcerr << L"!diff report failed: " << error << L"\n";
+            break;
         }
 
         PrintSnapshotDiff(diff, options);

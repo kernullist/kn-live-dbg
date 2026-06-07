@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <cwctype>
-#include <cstring>
 #include <iomanip>
 #include <sstream>
 
@@ -63,11 +62,22 @@ std::wstring SnapshotCurrentBootId()
                 GetProcAddress(ntdll, "NtQuerySystemInformation"));
             if (query != nullptr)
             {
-                uint8_t buffer[64] = {};
-                LONG status = query(3, buffer, static_cast<ULONG>(sizeof(buffer)), nullptr);
+                struct SystemTimeOfDayInformation
+                {
+                    LARGE_INTEGER BootTime;
+                    LARGE_INTEGER CurrentTime;
+                    LARGE_INTEGER TimeZoneBias;
+                    ULONG TimeZoneId;
+                    ULONG Reserved;
+                    ULONGLONG BootTimeBias;
+                    ULONGLONG SleepTimeBias;
+                };
+
+                SystemTimeOfDayInformation timeOfDay = {};
+                LONG status = query(3, &timeOfDay, static_cast<ULONG>(sizeof(timeOfDay)), nullptr);
                 if (status >= 0)
                 {
-                    std::memcpy(&bootFileTime, buffer, sizeof(bootFileTime));
+                    bootFileTime = static_cast<uint64_t>(timeOfDay.BootTime.QuadPart);
                 }
             }
         }

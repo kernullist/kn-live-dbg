@@ -72,7 +72,10 @@ Implemented behavior:
    then large NonPaged sorted by size.
 7. Generates a compact console summary, machine-readable JSON snapshots, and
    Markdown reports by default.
-8. Keeps BYOVD YARA out of the snapshot path. Baseline/save may refresh the
+8. Folds low-risk child findings implied by a newly added parent, such as
+   routine dispatch entries for a newly loaded driver, unless `/details` is
+   requested.
+9. Keeps BYOVD YARA out of the snapshot path. Baseline/save may refresh the
    local catalog, but `!diff baseline` disables catalog auto-update and warns
    when catalog fingerprints differ.
 
