@@ -49,6 +49,9 @@ static FAST_MUTEX g_KnDbgOwnerLock;
 static ULONG g_KnDbgOwnerPid = 0;
 static ULONG g_KnDbgOwnerOpenCount = 0;
 
+static bool KnDbgIsLa57Active();
+static bool KnDbgIsCanonicalAddress(ULONGLONG VirtualAddress, bool La57Active);
+
 typedef struct _KNDBG_TLB_FLUSH_CONTEXT
 {
     ULONGLONG StartAddress;
@@ -114,13 +117,121 @@ static bool KnDbgRangeOverflows(ULONGLONG Address, SIZE_T Length)
     return overflows;
 }
 
+static bool KnDbgIsCanonicalSystemRange(ULONGLONG Address, SIZE_T Length)
+{
+    bool valid = false;
+
+    do
+    {
+        if (Length == 0)
+        {
+            break;
+        }
+
+        if (KnDbgRangeOverflows(Address, Length))
+        {
+            break;
+        }
+
+        bool la57Active = KnDbgIsLa57Active();
+        if (!KnDbgIsCanonicalAddress(Address, la57Active))
+        {
+            break;
+        }
+
+        ULONGLONG endAddress = Address + Length - 1;
+        if (!KnDbgIsCanonicalAddress(endAddress, la57Active))
+        {
+            break;
+        }
+
+        ULONGLONG systemRangeStart = static_cast<ULONGLONG>(reinterpret_cast<ULONG_PTR>(MmSystemRangeStart));
+        if (Address < systemRangeStart)
+        {
+            break;
+        }
+
+        if (endAddress < systemRangeStart)
+        {
+            break;
+        }
+
+        valid = true;
+    } while (false);
+
+    return valid;
+}
+
+static bool KnDbgPreflightResidentSystemRange(PVOID Address, SIZE_T Length)
+{
+    bool resident = false;
+
+    do
+    {
+        if (Address == nullptr || Length == 0)
+        {
+            break;
+        }
+
+        ULONGLONG startAddress = static_cast<ULONGLONG>(reinterpret_cast<ULONG_PTR>(Address));
+        if (!KnDbgIsCanonicalSystemRange(startAddress, Length))
+        {
+            break;
+        }
+
+        ULONGLONG endAddress = startAddress + Length - 1;
+        ULONGLONG page = startAddress & ~KNDBG_PAGE_OFFSET_MASK;
+        ULONGLONG endPage = endAddress & ~KNDBG_PAGE_OFFSET_MASK;
+        bool allPagesResident = true;
+
+        while (page <= endPage)
+        {
+            BOOLEAN pageValid = FALSE;
+            __try
+            {
+                pageValid = MmIsAddressValid(reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(page)));
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                pageValid = FALSE;
+            }
+
+            if (pageValid == FALSE)
+            {
+                allPagesResident = false;
+                break;
+            }
+
+            if (page == endPage)
+            {
+                break;
+            }
+
+            if (page > (~0ull - PAGE_SIZE))
+            {
+                allPagesResident = false;
+                break;
+            }
+
+            page += PAGE_SIZE;
+        }
+
+        if (!allPagesResident)
+        {
+            break;
+        }
+
+        resident = true;
+    } while (false);
+
+    return resident;
+}
+
 // MDL-based read used only when the caller explicitly allows the fallback.
-// MmCopyMemory only reads currently-resident pages; for paged-out kernel memory
-// (typical for rarely-touched sections like .rsrc/GFIDS in third-party drivers
-// and some .reloc pages) MmProbeAndLockPages can force a page-in. Pages that
-// are truly torn down (e.g. discardable INIT after DriverEntry) still raise an
-// exception here, so the caller continues to receive STATUS_INVALID_ADDRESS for
-// those and the user-mode dump-pe path zero-fills the affected range.
+// MmProbeAndLockPages can bugcheck on arbitrary invalid system VAs, so this
+// path is intentionally conservative: only canonical system ranges whose pages
+// are already resident pass the preflight. Everything else stays on the safer
+// MmCopyMemory result and surfaces as a failed or partial read to user mode.
 static NTSTATUS KnDbgReadVirtualAddressViaMdl(PVOID Address, PVOID Output, SIZE_T Length, PSIZE_T BytesCopied)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -145,7 +256,15 @@ static NTSTATUS KnDbgReadVirtualAddressViaMdl(PVOID Address, PVOID Output, SIZE_
         // probe would access user-mode page tables under the system DTB). We
         // are a kernel-debug helper and only read kernel ranges, so refuse
         // anything below MmSystemRangeStart up front.
-        if (Address < MmSystemRangeStart)
+        ULONGLONG inputAddress = static_cast<ULONGLONG>(reinterpret_cast<ULONG_PTR>(Address));
+        ULONGLONG systemRangeStart = static_cast<ULONGLONG>(reinterpret_cast<ULONG_PTR>(MmSystemRangeStart));
+        if (inputAddress < systemRangeStart)
+        {
+            status = STATUS_INVALID_ADDRESS;
+            break;
+        }
+
+        if (!KnDbgPreflightResidentSystemRange(Address, Length))
         {
             status = STATUS_INVALID_ADDRESS;
             break;
