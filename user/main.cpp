@@ -580,7 +580,6 @@ struct DebuggerState
     bool ProbeDriverUnloaded;
     bool ByovdFixtureCleanupRequested;
     bool ByovdFixtureUnloaded;
-    std::wstring LastCommand;
     std::vector<std::wstring> CommandHistory;
     std::wstring DbgEngConnectOptions;
     bool DbgEngRemoteKernel;
@@ -1692,7 +1691,7 @@ static void PrintHelp(bool includeDbgEng)
     PrintColoredText(L"KnLiveDbg command help", KNDBG_COLOR_TITLE);
     std::wcout << L"\n";
     std::wcout << L"  WinDbg-compatible live-kernel console with native memory IOCTLs, symbols, scanners, and optional DbgEng routing.\n";
-    std::wcout << L"  Press Tab for completion. Up/Down recalls history. Empty Enter repeats the last command.\n";
+    std::wcout << L"  Press Tab for completion. Up/Down recalls history. Empty Enter opens a fresh prompt.\n";
     std::wcout << L"\n";
 
     PrintColoredText(L"quick start", KNDBG_COLOR_ACCENT);
@@ -1702,6 +1701,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help <command>           show syntax, options, notes, and examples for one family\n";
     std::wcout << L"  <command> help           same as help <command>\n";
     std::wcout << L"  ai help <subcommand>     show AI subcommand help\n";
+    std::wcout << L"  cls                      clear the console screen\n";
     std::wcout << L"\n";
 
     PrintColoredText(L"operator rules", KNDBG_COLOR_ACCENT);
@@ -10037,6 +10037,98 @@ static bool IsConsoleOutputHandle(HANDLE handle)
     return isConsole;
 }
 
+static bool ClearConsoleScreen(std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (!IsConsoleOutputHandle(handle))
+        {
+            if (error != nullptr)
+            {
+                *error = L"stdout is not a console";
+            }
+            break;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
+
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (!GetConsoleScreenBufferInfo(handle, &info))
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"GetConsoleScreenBufferInfo failed", GetLastError());
+            }
+            break;
+        }
+
+        if (info.dwSize.X <= 0 || info.dwSize.Y <= 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"console buffer size is invalid";
+            }
+            break;
+        }
+
+        DWORD cellCount = static_cast<DWORD>(info.dwSize.X) * static_cast<DWORD>(info.dwSize.Y);
+        COORD origin = {};
+        DWORD written = 0;
+        if (!FillConsoleOutputCharacterW(handle, L' ', cellCount, origin, &written))
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"FillConsoleOutputCharacterW failed", GetLastError());
+            }
+            break;
+        }
+
+        if (written != cellCount)
+        {
+            if (error != nullptr)
+            {
+                *error = L"FillConsoleOutputCharacterW wrote fewer cells than requested";
+            }
+            break;
+        }
+
+        written = 0;
+        if (!FillConsoleOutputAttribute(handle, info.wAttributes, cellCount, origin, &written))
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"FillConsoleOutputAttribute failed", GetLastError());
+            }
+            break;
+        }
+
+        if (written != cellCount)
+        {
+            if (error != nullptr)
+            {
+                *error = L"FillConsoleOutputAttribute wrote fewer cells than requested";
+            }
+            break;
+        }
+
+        if (!SetConsoleCursorPosition(handle, origin))
+        {
+            if (error != nullptr)
+            {
+                *error = FormatWin32Error(L"SetConsoleCursorPosition failed", GetLastError());
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool WriteConsoleTuiLineDirect(
     HANDLE handle,
     const std::wstring& value,
@@ -18058,6 +18150,12 @@ static void PrintSessionHelp(const std::wstring& command)
         std::wcout << L"  dashboard\n";
         std::wcout << L"  Redraw the startup dashboard.\n";
     }
+    else if (name == L"cls")
+    {
+        std::wcout << L"cls command:\n";
+        std::wcout << L"  cls\n";
+        std::wcout << L"  Clear the console screen and return the cursor to the top-left cell.\n";
+    }
     else if (name == L"drvstatus")
     {
         std::wcout << L"drvstatus command:\n";
@@ -18583,7 +18681,7 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
                  command == L"kd" || command == L"kddetach" || command == L"unload" ||
                  command == L"||" || command == L"||s" || command == L"|" ||
                  command == L"q" || command == L"qq" || command == L"qd" ||
-                 command == L"quit" || command == L"exit")
+                 command == L"quit" || command == L"exit" || command == L"cls")
         {
             PrintSessionHelp(command);
         }
@@ -19911,6 +20009,7 @@ static bool IsAiSessionMutationCommand(const std::wstring& command)
     if (command == L"backend" ||
         command == L"kdinit" ||
         command == L"kddetach" ||
+        command == L"cls" ||
         command == L"probe")
     {
         blocked = true;
@@ -20267,7 +20366,7 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
             command == L"drvstatus" || command == L"unload" || command == L"q" ||
             command == L"qq" || command == L"qd" || command == L"quit" || command == L"exit" ||
             command == L"version" || command == L"vertarget" || command == L"vercommand" ||
-            command == L"home" || command == L"dashboard")
+            command == L"home" || command == L"dashboard" || command == L"cls")
         {
             commandClass = L"session";
             break;
@@ -21795,7 +21894,7 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !vad, !threads, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, !fwtable, !wnf, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
     stream << L"- For VAD DKOM or hidden PTE checks, use !vad target /hiddenpte where target is a concrete PID, image name, or EPROCESS address. Add /summary or /limit <n> when the operator asks for concise output.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
-    stream << L"- Do not use backend, kdinit, kddetach, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
+    stream << L"- Do not use backend, kdinit, kddetach, cls, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
     stream << L"- Every command must include purpose, risk, backend, and expected_output.\n";
     stream << L"Operator request:\n";
@@ -28340,6 +28439,13 @@ static bool HandleCommand(
         {
             PrintStartupTui(state, service, device, symbols, ai);
         }
+        else if (command == L"cls")
+        {
+            if (!ClearConsoleScreen(&error))
+            {
+                std::wcerr << L"cls failed: " << error << L"\n";
+            }
+        }
         else if (command == L"backend")
         {
             if (args.size() >= 2)
@@ -28464,6 +28570,7 @@ static bool HandleCommand(
                  command != L"q" && command != L"qq" && command != L"qd" &&
                  command != L"quit" && command != L"exit" &&
                  command != L"unload" && command != L"drvstatus" &&
+                 command != L"cls" &&
                  command != L"probe" &&
                  command != L"procctx" &&
                  command != L"callbacks" &&
@@ -29250,18 +29357,13 @@ int wmain(int argc, wchar_t** argv)
                 break;
             }
 
-            if (line.empty() && !state.LastCommand.empty())
+            std::vector<std::wstring> args = Split(line);
+            if (args.empty())
             {
-                line = state.LastCommand;
-                std::wcout << line << L"\n";
+                continue;
             }
 
-            std::vector<std::wstring> args = Split(line);
-            if (!args.empty())
-            {
-                state.LastCommand = line;
-                AddCommandHistory(&state, line);
-            }
+            AddCommandHistory(&state, line);
 
             CommandExecutionResult commandResult = ExecuteCommandWithTranscript(
                 args,
