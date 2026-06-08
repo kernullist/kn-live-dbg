@@ -153,6 +153,7 @@ callbacks <scope> help
 ai <subcommand> help
 home
 dashboard
+cls
 backend [auto|native|dbgeng]
 kdinit [/local [connect-options]|/remote <connect-options>]
 kd <windbg-command>

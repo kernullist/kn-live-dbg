@@ -219,7 +219,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
 {
     static const std::vector<CommandInfo> commands =
     {
-        Make(L"enter", L"enter", L"session", L"repeat last command", CommandSupport::Native),
+        Make(L"cls", L"cls", L"session", L"clear the console screen", CommandSupport::Native),
         Make(L"$<", L"$<", L"script", kRequiresParser, CommandSupport::DbgEng),
         Make(L"$><", L"$><", L"script", kRequiresParser, CommandSupport::DbgEng),
         Make(L"$$<", L"$$<", L"script", kRequiresParser, CommandSupport::DbgEng),
