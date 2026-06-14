@@ -144,6 +144,9 @@
     <ClInclude Include="IntegrityScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="LayoutResolver.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="AddressInspector.h">
       <Filter>Header Files</Filter>
     </ClInclude>
