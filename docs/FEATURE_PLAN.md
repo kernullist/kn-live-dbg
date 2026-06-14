@@ -61,7 +61,8 @@ Implemented behavior:
 2. Stores the session baseline in memory and automatically writes JSON plus a
    Markdown report under `.kn-live-dbg\snapshots` and `.kn-live-dbg\reports`.
 3. Captures process inventory, modules, drivers/dispatch, callbacks, ETW,
-   NMI, firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, and
+   NMI, cpu-state (SYSCALL MSRs / control registers / SSDT / IDT),
+   firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, and
    BYOVD in the default full snapshot.
 4. Uses new-focused diff semantics: records absent from baseline but present
    now, plus selected high-risk escalations. Removed records are intentionally

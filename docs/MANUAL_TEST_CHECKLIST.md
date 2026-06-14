@@ -63,6 +63,16 @@ suspicious row on a clean box is a false positive to fix.
 - Known limitation: only the boot processor IDT is walked; per-processor
   comparison is a future enhancement.
 
+### CPU-state in snapshot / diff
+- `!snapshot baseline` on a clean box, then `!snapshot show baseline /domains` shows a
+  `cpu-state` domain with info-risk records (MSR values, CR0/CR4, SSDT/IDT
+  fingerprints) and no high-risk records.
+- `!diff baseline` immediately after (same boot, unchanged) reports no cpu-state
+  changes.
+- Confirm: a later SSDT/IDT/MSR/CR change within the same boot surfaces in
+  `!diff baseline` as a cpu-state escalation (value/fingerprint change), and a
+  new hook appears as a high-risk added `cpu-state` record.
+
 ## M1 - reliability / security
 
 ### Nested `FindField`  (commit 7e102dc)

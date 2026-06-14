@@ -7,6 +7,10 @@
 #include "FirmwareTableScanner.h"
 #include "IntegrityScanner.h"
 #include "NmiScanner.h"
+#include "MsrScanner.h"
+#include "CrScanner.h"
+#include "SsdtScanner.h"
+#include "IdtScanner.h"
 #include "PoolPeHunter.h"
 #include "PoolScanner.h"
 #include "ProcessTriageScanner.h"
@@ -559,6 +563,241 @@ namespace
         }
     }
 
+    uint64_t Fnv1aFold(uint64_t hash, uint64_t value)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            uint8_t b = static_cast<uint8_t>((value >> (i * 8)) & 0xFFull);
+            hash ^= b;
+            hash *= 0x100000001b3ull;
+        }
+        return hash;
+    }
+
+    // Captures the CPU-state detection surface (SYSCALL MSRs, control
+    // registers, SSDT, IDT) into the snapshot. Records use stable identities
+    // with the entry-pointer value or a routine-set fingerprint in evidence, so
+    // an in-image change between a same-boot baseline and a later snapshot
+    // surfaces as an escalation; suspicious findings are emitted as high-risk
+    // records that surface as additions. Reuses the native CPU-state scanners;
+    // no new driver IOCTL is involved here.
+    void CaptureCpuState(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        {
+            MsrScanner scanner(device, symbols);
+            MsrScanResult result = {};
+            std::wstring error;
+            if (!scanner.Scan(&result, &error))
+            {
+                AddWarning(document, L"cpu-state", L"msr: " + error);
+                AddWarnings(document, L"cpu-state", result.Warnings);
+            }
+            else
+            {
+                AddWarnings(document, L"cpu-state", result.Warnings);
+                for (const MsrReading& msr : result.Readings)
+                {
+                    if (msr.PerCpuValues.empty())
+                    {
+                        continue;
+                    }
+                    uint64_t value = msr.PerCpuValues.front();
+                    SnapshotRecord record;
+                    record.Domain = L"cpu-state";
+                    record.Identity = L"cpu-state:msr:" + msr.MsrName;
+                    record.Display = msr.MsrName;
+                    record.Risk = msr.Suspicious ? L"high" : L"info";
+                    record.Tags = {L"cpu-state", L"msr"};
+                    if (msr.Suspicious)
+                    {
+                        record.Tags.push_back(L"suspicious");
+                    }
+                    record.Evidence[L"msr"] = msr.MsrName;
+                    record.Evidence[L"value"] = SnapshotHex(value, 16);
+                    if (!msr.OwningModule.empty())
+                    {
+                        record.Evidence[L"module"] = msr.OwningModule;
+                    }
+                    if (!msr.NearestSymbol.empty())
+                    {
+                        record.Evidence[L"symbol"] = msr.NearestSymbol;
+                    }
+                    if (msr.Divergent)
+                    {
+                        record.Evidence[L"divergent"] = L"true";
+                    }
+                    if (!msr.Notes.empty())
+                    {
+                        record.Evidence[L"notes"] = msr.Notes;
+                    }
+                    AddRecord(document, std::move(record));
+                }
+            }
+        }
+
+        {
+            CrScanner scanner(device);
+            CrScanResult result = {};
+            std::wstring error;
+            if (!scanner.Scan(&result, &error))
+            {
+                AddWarning(document, L"cpu-state", L"cr: " + error);
+                AddWarnings(document, L"cpu-state", result.Warnings);
+            }
+            else
+            {
+                AddWarnings(document, L"cpu-state", result.Warnings);
+                for (const CrReading& cr : result.Readings)
+                {
+                    if (cr.Name == L"CR8" || cr.PerCpuValues.empty())
+                    {
+                        continue; // CR8 is TPR, not integrity-relevant
+                    }
+                    uint64_t value = cr.PerCpuValues.front();
+                    SnapshotRecord record;
+                    record.Domain = L"cpu-state";
+                    record.Identity = L"cpu-state:cr:" + cr.Name;
+                    record.Display = cr.Name;
+                    record.Risk = cr.Suspicious ? L"high" : L"info";
+                    record.Tags = {L"cpu-state", L"cr"};
+                    if (cr.Suspicious)
+                    {
+                        record.Tags.push_back(L"suspicious");
+                    }
+                    record.Evidence[L"register"] = cr.Name;
+                    record.Evidence[L"value"] = SnapshotHex(value, 16);
+                    if (cr.Divergent)
+                    {
+                        record.Evidence[L"divergent"] = L"true";
+                    }
+                    if (!cr.Notes.empty())
+                    {
+                        record.Evidence[L"notes"] = cr.Notes;
+                    }
+                    AddRecord(document, std::move(record));
+                }
+            }
+        }
+
+        {
+            SsdtScanner scanner(device, symbols);
+            SsdtScanResult result = {};
+            std::wstring error;
+            if (!scanner.Scan(&result, &error))
+            {
+                AddWarning(document, L"cpu-state", L"ssdt: " + error);
+                AddWarnings(document, L"cpu-state", result.Warnings);
+            }
+            else
+            {
+                AddWarnings(document, L"cpu-state", result.Warnings);
+                for (const SsdtTable& table : result.Tables)
+                {
+                    if (!table.Resolved)
+                    {
+                        continue;
+                    }
+
+                    uint64_t fingerprint = 0xcbf29ce484222325ull;
+                    for (const SsdtEntry& entry : table.Entries)
+                    {
+                        fingerprint = Fnv1aFold(fingerprint, entry.Routine);
+                    }
+
+                    SnapshotRecord summary;
+                    summary.Domain = L"cpu-state";
+                    summary.Identity = L"cpu-state:ssdt:" + table.Name;
+                    summary.Display = L"SSDT " + table.Name;
+                    summary.Risk = table.SuspiciousCount > 0 ? L"high" : L"info";
+                    summary.Tags = {L"cpu-state", L"ssdt"};
+                    summary.Evidence[L"table"] = table.Name;
+                    summary.Evidence[L"base"] = SnapshotHex(table.TableBase, 16);
+                    summary.Evidence[L"count"] = DecText(table.Limit);
+                    summary.Evidence[L"suspicious"] = DecText(table.SuspiciousCount);
+                    summary.Evidence[L"fingerprint"] = SnapshotHex(fingerprint, 16);
+                    AddRecord(document, std::move(summary));
+
+                    for (const SsdtEntry& entry : table.Entries)
+                    {
+                        if (!entry.Suspicious)
+                        {
+                            continue;
+                        }
+                        SnapshotRecord record;
+                        record.Domain = L"cpu-state";
+                        record.Identity = L"cpu-state:ssdt-hook:" + table.Name + L":" + DecText(entry.Index) +
+                            L":" + SnapshotHex(entry.Routine, 16);
+                        record.Display = L"SSDT hook #" + DecText(entry.Index);
+                        record.Risk = L"high";
+                        record.Tags = {L"cpu-state", L"ssdt", L"suspicious"};
+                        record.Evidence[L"index"] = DecText(entry.Index);
+                        record.Evidence[L"routine"] = SnapshotHex(entry.Routine, 16);
+                        record.Evidence[L"module"] = entry.Module;
+                        record.Evidence[L"symbol"] = entry.Symbol;
+                        record.Evidence[L"notes"] = entry.Notes;
+                        AddRecord(document, std::move(record));
+                    }
+                }
+            }
+        }
+
+        {
+            IdtScanner scanner(device, symbols);
+            IdtScanResult result = {};
+            std::wstring error;
+            if (!scanner.Scan(&result, &error))
+            {
+                AddWarning(document, L"cpu-state", L"idt: " + error);
+                AddWarnings(document, L"cpu-state", result.Warnings);
+            }
+            else
+            {
+                AddWarnings(document, L"cpu-state", result.Warnings);
+
+                uint64_t fingerprint = 0xcbf29ce484222325ull;
+                for (const IdtEntry& entry : result.Entries)
+                {
+                    if (entry.Present)
+                    {
+                        fingerprint = Fnv1aFold(fingerprint, entry.Handler);
+                    }
+                }
+
+                SnapshotRecord summary;
+                summary.Domain = L"cpu-state";
+                summary.Identity = L"cpu-state:idt";
+                summary.Display = L"IDT (cpu " + DecText(result.ProcessorNumber) + L")";
+                summary.Risk = result.AnySuspicious ? L"high" : L"info";
+                summary.Tags = {L"cpu-state", L"idt"};
+                summary.Evidence[L"base"] = SnapshotHex(result.IdtBase, 16);
+                summary.Evidence[L"entries"] = DecText(result.EntryCount);
+                summary.Evidence[L"suspicious"] = DecText(result.SuspiciousCount);
+                summary.Evidence[L"fingerprint"] = SnapshotHex(fingerprint, 16);
+                AddRecord(document, std::move(summary));
+
+                for (const IdtEntry& entry : result.Entries)
+                {
+                    if (!entry.Suspicious)
+                    {
+                        continue;
+                    }
+                    SnapshotRecord record;
+                    record.Domain = L"cpu-state";
+                    record.Identity = L"cpu-state:idt-hook:" + DecText(entry.Vector) + L":" + SnapshotHex(entry.Handler, 16);
+                    record.Display = L"IDT hook vector " + DecText(entry.Vector);
+                    record.Risk = L"high";
+                    record.Tags = {L"cpu-state", L"idt", L"suspicious"};
+                    record.Evidence[L"vector"] = DecText(entry.Vector);
+                    record.Evidence[L"handler"] = SnapshotHex(entry.Handler, 16);
+                    record.Evidence[L"module"] = entry.Module;
+                    record.Evidence[L"symbol"] = entry.Symbol;
+                    record.Evidence[L"notes"] = entry.Notes;
+                    AddRecord(document, std::move(record));
+                }
+            }
+        }
+    }
+
     void CaptureFirmwareTables(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
     {
         FirmwareTableScanner scanner(device, symbols);
@@ -1092,6 +1331,7 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
         CaptureCallbacks(device_, symbols_, document);
         CaptureEtw(device_, symbols_, document);
         CaptureNmi(device_, symbols_, document);
+        CaptureCpuState(device_, symbols_, document);
         CaptureFirmwareTables(device_, symbols_, document);
         CapturePool(device_, symbols_, document);
         CapturePoolPe(device_, document);
