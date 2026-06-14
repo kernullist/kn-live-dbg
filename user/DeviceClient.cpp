@@ -239,6 +239,61 @@ bool DeviceClient::ReadMsr(
     return ok;
 }
 
+bool DeviceClient::ReadControlRegisters(
+    uint32_t processorNumber,
+    ControlRegisters* registers,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (registers == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid control register output";
+            }
+            break;
+        }
+
+        union
+        {
+            KNDBG_READ_CR_REQUEST Request;
+            KNDBG_READ_CR_RESPONSE Response;
+        } buffer = {};
+
+        buffer.Request.Size = sizeof(KNDBG_READ_CR_REQUEST);
+        buffer.Request.Flags = 0;
+        buffer.Request.ProcessorNumber = processorNumber;
+
+        DWORD returned = 0;
+        if (!Ioctl(IOCTL_KNDBG_READ_CONTROL_REGISTERS, &buffer, sizeof(KNDBG_READ_CR_REQUEST), sizeof(KNDBG_READ_CR_RESPONSE), &returned, error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(KNDBG_READ_CR_RESPONSE))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short control register response";
+            }
+            break;
+        }
+
+        registers->ProcessorNumber = buffer.Response.ProcessorNumber;
+        registers->Cr0 = buffer.Response.Cr0;
+        registers->Cr2 = buffer.Response.Cr2;
+        registers->Cr3 = buffer.Response.Cr3;
+        registers->Cr4 = buffer.Response.Cr4;
+        registers->Cr8 = buffer.Response.Cr8;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::ResolveProcess(
     uint32_t processId,
     uint32_t directoryTableBaseOffset,

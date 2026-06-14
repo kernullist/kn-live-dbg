@@ -46,6 +46,16 @@ struct ProcessAddressContext
     uint64_t UserDirectoryTableBase;
 };
 
+struct ControlRegisters
+{
+    uint32_t ProcessorNumber;
+    uint64_t Cr0;
+    uint64_t Cr2;
+    uint64_t Cr3;
+    uint64_t Cr4;
+    uint64_t Cr8;
+};
+
 class DeviceClient
 {
 public:
@@ -107,6 +117,13 @@ public:
         uint32_t processorNumber,
         uint64_t* value,
         uint32_t* actualProcessor,
+        std::wstring* error);
+
+    // Reads the x64 control registers on the requested logical processor.
+    // Read-only; does not require write mode.
+    bool ReadControlRegisters(
+        uint32_t processorNumber,
+        ControlRegisters* registers,
         std::wstring* error);
 
 private:
