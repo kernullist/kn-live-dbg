@@ -792,7 +792,7 @@ The diff is intentionally biased toward what appeared after the baseline:
 5. `!diff baseline` scans VAD DKOM hidden-PTE evidence for every process that is new since the baseline and still alive at diff time.
 6. Low-risk child records implied by a newly added parent, such as a new driver's routine dispatch entries, are folded by default and counted as `hiddenChildren`; add `/details` to expand them.
 
-The `/all` option is accepted for explicitness; the current native baseline captures the full implemented domain set by default: modules, drivers, callbacks, ETW, NMI, firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, BYOVD, and process inventory. BYOVD catalog auto-update is allowed for `!snapshot baseline` and `!snapshot save`, but `!diff baseline` reuses the local catalog in no-update mode and emits a warning if the catalog fingerprint differs between snapshots. YARA is not run by the snapshot path unless the standalone `byovd scan /yara` command is used.
+The `/all` option is accepted for explicitness; the current native baseline captures the full implemented domain set by default: modules, drivers, callbacks, ETW, NMI, cpu-state (SYSCALL MSRs / control registers / SSDT / IDT), firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, BYOVD, and process inventory. BYOVD catalog auto-update is allowed for `!snapshot baseline` and `!snapshot save`, but `!diff baseline` reuses the local catalog in no-update mode and emits a warning if the catalog fingerprint differs between snapshots. YARA is not run by the snapshot path unless the standalone `byovd scan /yara` command is used.
 
 Typical clean-baseline flow:
 

@@ -89,6 +89,16 @@ namespace
                 SnapshotRiskRank(newRecord.Risk) >= 2;
         }
 
+        if (!escalated && newRecord.Domain == L"cpu-state")
+        {
+            // The kernel keeps these values/tables stable within a boot, so any
+            // change to a SYSCALL MSR / control register value or an SSDT/IDT
+            // routine-set fingerprint between a same-boot baseline and a later
+            // snapshot is a tampering signal, regardless of risk rank.
+            escalated = EvidenceChanged(oldRecord, newRecord, L"value") ||
+                EvidenceChanged(oldRecord, newRecord, L"fingerprint");
+        }
+
         if (!escalated && newRecord.Domain == L"pool")
         {
             escalated = (SnapshotRecordHasTag(newRecord, L"wx") &&
