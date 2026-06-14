@@ -23,6 +23,7 @@
 #include "MsrScanner.h"
 #include "CrScanner.h"
 #include "SsdtScanner.h"
+#include "IdtScanner.h"
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
 #include "VbsScanner.h"
@@ -1748,7 +1749,8 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  process       !dml_proc [pid] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
-    std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP) | !ssdt (syscall table hooks)\n";
+    std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
+    std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
     std::wcout << L"  hunting       !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
     std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
@@ -2078,6 +2080,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!msrcheck" ||
         command == L"!cr" ||
         command == L"!ssdt" ||
+        command == L"!idt" ||
         command == L"!fwtable" ||
         command == L"!module" ||
         command == L"!driver" ||
@@ -3301,6 +3304,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!msrcheck",
         L"!cr",
         L"!ssdt",
+        L"!idt",
         L"!fwtable",
         L"!module",
         L"!driver",
@@ -13454,6 +13458,124 @@ static void HandleSsdtCommand(
     } while (false);
 }
 
+static void PrintIdtHelp()
+{
+    std::wcout << L"!idt command:\n";
+    std::wcout << L"  !idt\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Reads the boot processor IDTR (via __sidt) through the read-only IDT primitive and\n";
+    std::wcout << L"  walks the interrupt gate descriptors from live kernel memory.\n";
+    std::wcout << L"\n";
+    std::wcout << L"checks:\n";
+    std::wcout << L"  Each present gate's handler is rebuilt (OffsetLow | Middle<<16 | High<<32) and\n";
+    std::wcout << L"  validated to reside in a loaded kernel module. Handlers outside every loaded module\n";
+    std::wcout << L"  are flagged as interrupt-hook evidence. Only flagged gates are listed; a clean table\n";
+    std::wcout << L"  prints a one-line summary. Per-processor IDT comparison is a future enhancement.\n";
+}
+
+static void HandleIdtCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!idt requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
+        {
+            PrintIdtHelp();
+            break;
+        }
+
+        if (args.size() > 1)
+        {
+            std::wcerr << L"!idt: unexpected extra argument \"" << args[1] << L"\"\n";
+            PrintIdtHelp();
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!idt failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        IdtScanner scanner(device, symbols);
+        IdtScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!idt failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!idt warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!idt warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"idt", KNDBG_COLOR_TITLE);
+        std::wcout << L" cpu=" << std::dec << result.ProcessorNumber
+                   << L" base=" << HexTextWidth(result.IdtBase, 16, true)
+                   << L" entries=" << std::dec << result.EntryCount;
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            std::wcout << L" hooks=" << std::dec << result.SuspiciousCount;
+        }
+        std::wcout << L"\n";
+
+        if (!result.AnySuspicious)
+        {
+            std::wcout << L"  all present interrupt handlers resolve into loaded kernel modules\n";
+        }
+
+        for (const IdtEntry& entry : result.Entries)
+        {
+            if (!entry.Suspicious)
+            {
+                continue;
+            }
+
+            std::wcout << L"  ";
+            PrintColoredText(L"[idt.hook]", KNDBG_COLOR_FAIL);
+            std::wcout << L" vector=" << std::dec << entry.Vector
+                       << L" handler=" << HexTextWidth(entry.Handler, 16, true);
+            if (!entry.Module.empty())
+            {
+                std::wcout << L" module=";
+                PrintColoredText(entry.Module, KNDBG_COLOR_WARN);
+            }
+            if (!entry.Symbol.empty())
+            {
+                std::wcout << L" symbol=" << entry.Symbol;
+            }
+            std::wcout << L"\n";
+            if (!entry.Notes.empty())
+            {
+                std::wcout << L"    note: ";
+                PrintColoredText(entry.Notes, KNDBG_COLOR_WARN);
+                std::wcout << L"\n";
+            }
+        }
+    } while (false);
+}
+
 static void PrintFirmwareTableHelp()
 {
     std::wcout << L"!fwtable command:\n";
@@ -19009,6 +19131,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintSsdtHelp();
         }
+        else if (command == L"!idt")
+        {
+            PrintIdtHelp();
+        }
         else if (command == L"!fwtable")
         {
             PrintFirmwareTableHelp();
@@ -23548,6 +23674,7 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
             normalized == L"!msrcheck" ||
             normalized == L"!cr" ||
             normalized == L"!ssdt" ||
+            normalized == L"!idt" ||
             normalized == L"!fwtable" ||
             normalized == L"!module" ||
             normalized == L"!driver" ||
@@ -29342,6 +29469,10 @@ static bool HandleCommand(
         else if (command == L"!ssdt")
         {
             HandleSsdtCommand(args, device, symbols);
+        }
+        else if (command == L"!idt")
+        {
+            HandleIdtCommand(args, device, symbols);
         }
         else if (command == L"!fwtable")
         {

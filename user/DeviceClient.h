@@ -56,6 +56,13 @@ struct ControlRegisters
     uint64_t Cr8;
 };
 
+struct IdtInfo
+{
+    uint32_t ProcessorNumber;
+    uint64_t Base;
+    uint32_t Limit;
+};
+
 class DeviceClient
 {
 public:
@@ -124,6 +131,13 @@ public:
     bool ReadControlRegisters(
         uint32_t processorNumber,
         ControlRegisters* registers,
+        std::wstring* error);
+
+    // Reads the IDTR (base + limit) on the requested logical processor via
+    // __sidt. Read-only; does not require write mode.
+    bool ReadIdt(
+        uint32_t processorNumber,
+        IdtInfo* info,
         std::wstring* error);
 
 private:
