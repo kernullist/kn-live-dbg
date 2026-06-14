@@ -294,6 +294,58 @@ bool DeviceClient::ReadControlRegisters(
     return ok;
 }
 
+bool DeviceClient::ReadIdt(
+    uint32_t processorNumber,
+    IdtInfo* info,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (info == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid IDT output";
+            }
+            break;
+        }
+
+        union
+        {
+            KNDBG_READ_IDT_REQUEST Request;
+            KNDBG_READ_IDT_RESPONSE Response;
+        } buffer = {};
+
+        buffer.Request.Size = sizeof(KNDBG_READ_IDT_REQUEST);
+        buffer.Request.Flags = 0;
+        buffer.Request.ProcessorNumber = processorNumber;
+
+        DWORD returned = 0;
+        if (!Ioctl(IOCTL_KNDBG_READ_IDT, &buffer, sizeof(KNDBG_READ_IDT_REQUEST), sizeof(KNDBG_READ_IDT_RESPONSE), &returned, error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(KNDBG_READ_IDT_RESPONSE))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short IDT response";
+            }
+            break;
+        }
+
+        info->ProcessorNumber = buffer.Response.ProcessorNumber;
+        info->Base = buffer.Response.IdtBase;
+        info->Limit = buffer.Response.IdtLimit;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::ResolveProcess(
     uint32_t processId,
     uint32_t directoryTableBaseOffset,

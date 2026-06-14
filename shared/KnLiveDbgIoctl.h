@@ -10,7 +10,7 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SERVICE_NAME L"KnLiveDbg"
 #define KNDBG_DISPLAY_NAME L"Kn Live Debug Driver"
 
-#define KNDBG_ABI_VERSION 9u
+#define KNDBG_ABI_VERSION 10u
 #define KNDBG_MAX_TRANSFER_SIZE (1024u * 1024u)
 #define KNDBG_WRITE_ACK_MAGIC 0x4B4E444247574F4Full
 
@@ -107,6 +107,9 @@ typedef unsigned __int64 KNDBG_UINT64;
 
 #define IOCTL_KNDBG_READ_CONTROL_REGISTERS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80E, METHOD_BUFFERED, FILE_READ_DATA)
+
+#define IOCTL_KNDBG_READ_IDT \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80F, METHOD_BUFFERED, FILE_READ_DATA)
 
 // Known _EPROCESS.Protection byte values. The PS_PROTECTION struct packs
 // Signer (high nibble) over Audit (bit 3) over Type (bits 0..2).
@@ -336,5 +339,22 @@ typedef struct _KNDBG_READ_CR_RESPONSE
     KNDBG_UINT64 Cr4;
     KNDBG_UINT64 Cr8;
 } KNDBG_READ_CR_RESPONSE;
+
+typedef struct _KNDBG_READ_IDT_REQUEST
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 Flags;
+    KNDBG_UINT32 ProcessorNumber; // logical processor to read IDTR on (clamped to active count)
+    KNDBG_UINT32 Reserved;
+} KNDBG_READ_IDT_REQUEST;
+
+typedef struct _KNDBG_READ_IDT_RESPONSE
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 ProcessorNumber; // processor the IDTR was actually read on
+    KNDBG_UINT64 IdtBase;
+    KNDBG_UINT32 IdtLimit;        // raw IDTR limit (table size in bytes minus one)
+    KNDBG_UINT32 Reserved2;
+} KNDBG_READ_IDT_RESPONSE;
 
 #pragma pack(pop)

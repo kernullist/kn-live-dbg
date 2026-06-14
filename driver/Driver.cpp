@@ -1931,6 +1931,77 @@ static NTSTATUS KnDbgHandleReadControlRegisters(PIRP Irp, PIO_STACK_LOCATION Sta
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+#pragma pack(push, 1)
+typedef struct _KNDBG_IDTR_RAW
+{
+    unsigned short Limit;
+    unsigned __int64 Base;
+} KNDBG_IDTR_RAW;
+#pragma pack(pop)
+
+// Reads the IDTR (limit + base) on a caller-selected logical processor via
+// __sidt. Read-only; no write-mode gate. Each processor has its own IDT base,
+// so the caller selects the processor; user mode then reads and validates the
+// gate descriptors through the existing memory-read primitive.
+static NTSTATUS KnDbgHandleReadIdt(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_READ_IDT_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (outputLength < sizeof(KNDBG_READ_IDT_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        KNDBG_READ_IDT_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+
+        RtlZeroMemory(Buffer, outputLength);
+
+        ULONG activeCount = KeQueryActiveProcessorCountEx(0);
+        if (activeCount == 0)
+        {
+            activeCount = 1;
+        }
+
+        ULONG targetProcessor = request.ProcessorNumber;
+        if (targetProcessor >= activeCount)
+        {
+            targetProcessor = 0;
+        }
+
+        KAFFINITY affinity = (KAFFINITY)1 << targetProcessor;
+        KAFFINITY previousAffinity = KeSetSystemAffinityThreadEx(affinity);
+        ULONG actualProcessor = KeGetCurrentProcessorNumberEx(NULL);
+        KNDBG_IDTR_RAW idtr = {};
+        __sidt(&idtr);
+        KeRevertToUserAffinityThreadEx(previousAffinity);
+
+        KNDBG_READ_IDT_RESPONSE* response = reinterpret_cast<KNDBG_READ_IDT_RESPONSE*>(Buffer);
+        response->Size = sizeof(KNDBG_READ_IDT_RESPONSE);
+        response->ProcessorNumber = actualProcessor;
+        response->IdtBase = idtr.Base;
+        response->IdtLimit = idtr.Limit;
+
+        information = sizeof(KNDBG_READ_IDT_RESPONSE);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -1982,6 +2053,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_READ_CONTROL_REGISTERS:
         status = KnDbgHandleReadControlRegisters(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_READ_IDT:
+        status = KnDbgHandleReadIdt(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

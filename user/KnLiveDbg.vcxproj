@@ -117,6 +117,7 @@
     <ClCompile Include="MsrScanner.cpp" />
     <ClCompile Include="CrScanner.cpp" />
     <ClCompile Include="SsdtScanner.cpp" />
+    <ClCompile Include="IdtScanner.cpp" />
     <ClCompile Include="MemoryDumper.cpp" />
     <ClCompile Include="PoolPeHunter.cpp" />
     <ClCompile Include="ProcessTriageScanner.cpp" />
@@ -157,6 +158,7 @@
     <ClInclude Include="MsrScanner.h" />
     <ClInclude Include="CrScanner.h" />
     <ClInclude Include="SsdtScanner.h" />
+    <ClInclude Include="IdtScanner.h" />
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="NmiScanner.h" />
     <ClInclude Include="MemoryDumper.h" />
