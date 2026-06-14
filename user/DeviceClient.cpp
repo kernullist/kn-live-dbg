@@ -182,6 +182,63 @@ bool DeviceClient::QuerySessionStatus(DriverSessionStatus* status, std::wstring*
     return ok;
 }
 
+bool DeviceClient::ReadMsr(
+    uint32_t msrIndex,
+    uint32_t processorNumber,
+    uint64_t* value,
+    uint32_t* actualProcessor,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (value == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid MSR value output";
+            }
+            break;
+        }
+
+        union
+        {
+            KNDBG_READ_MSR_REQUEST Request;
+            KNDBG_READ_MSR_RESPONSE Response;
+        } buffer = {};
+
+        buffer.Request.Size = sizeof(KNDBG_READ_MSR_REQUEST);
+        buffer.Request.Flags = 0;
+        buffer.Request.MsrIndex = msrIndex;
+        buffer.Request.ProcessorNumber = processorNumber;
+
+        DWORD returned = 0;
+        if (!Ioctl(IOCTL_KNDBG_READ_MSR, &buffer, sizeof(KNDBG_READ_MSR_REQUEST), sizeof(KNDBG_READ_MSR_RESPONSE), &returned, error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(KNDBG_READ_MSR_RESPONSE))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short MSR read response";
+            }
+            break;
+        }
+
+        *value = buffer.Response.Value;
+        if (actualProcessor != nullptr)
+        {
+            *actualProcessor = buffer.Response.ProcessorNumber;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::ResolveProcess(
     uint32_t processId,
     uint32_t directoryTableBaseOffset,

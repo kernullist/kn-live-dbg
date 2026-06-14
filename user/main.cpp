@@ -20,6 +20,7 @@
 #include "SnapshotPrinter.h"
 #include "ThreatIntelSubscriber.h"
 #include "NmiScanner.h"
+#include "MsrScanner.h"
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
 #include "VbsScanner.h"
@@ -1745,6 +1746,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  process       !dml_proc [pid] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
+    std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook detection)\n";
     std::wcout << L"  hunting       !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
     std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
@@ -2071,6 +2073,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!securekernel" ||
         command == L"!etw" ||
         command == L"!nmi" ||
+        command == L"!msrcheck" ||
         command == L"!fwtable" ||
         command == L"!module" ||
         command == L"!driver" ||
@@ -3291,6 +3294,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!securekernel",
         L"!etw",
         L"!nmi",
+        L"!msrcheck",
         L"!fwtable",
         L"!module",
         L"!driver",
@@ -12997,6 +13001,165 @@ static void HandleNmiCommand(
     } while (false);
 }
 
+static void PrintMsrCheckHelp()
+{
+    std::wcout << L"!msrcheck command:\n";
+    std::wcout << L"  !msrcheck\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Reads the SYSCALL-configuration MSRs (IA32_LSTAR/CSTAR/STAR/FMASK/EFER) on every\n";
+    std::wcout << L"  active processor in group 0 through the driver's read-only MSR primitive.\n";
+    std::wcout << L"\n";
+    std::wcout << L"checks:\n";
+    std::wcout << L"  LSTAR must equal nt!KiSystemCall64; a mismatch, a per-CPU divergence, or an entry\n";
+    std::wcout << L"  pointer outside the loaded kernel image is flagged as a possible SYSCALL hook.\n";
+    std::wcout << L"  CSTAR is validated only when non-zero (it is unused on most Intel parts). STAR\n";
+    std::wcout << L"  selectors and EFER bits are decoded for inspection.\n";
+}
+
+static void PrintMsrReadingRecord(const MsrReading& reading)
+{
+    PrintColoredText(L"[msr]", KNDBG_COLOR_TITLE);
+    std::wcout << L" ";
+    PrintColoredText(reading.MsrName, KNDBG_COLOR_ACCENT);
+
+    if (reading.PerCpuValues.empty())
+    {
+        std::wcout << L" read-failed\n";
+        return;
+    }
+
+    uint64_t value = reading.PerCpuValues.front();
+    std::wcout << L"=" << HexTextWidth(value, 16, true);
+    if (reading.Suspicious)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+    }
+    std::wcout << L"\n";
+
+    if (reading.IsPointer && (!reading.OwningModule.empty() || !reading.NearestSymbol.empty()))
+    {
+        std::wcout << L"  ";
+        if (!reading.OwningModule.empty())
+        {
+            std::wcout << L"module=";
+            PrintColoredText(reading.OwningModule, KNDBG_COLOR_OK);
+            std::wcout << L" ";
+        }
+        if (!reading.NearestSymbol.empty())
+        {
+            std::wcout << L"symbol=";
+            PrintColoredText(reading.NearestSymbol, KNDBG_COLOR_OK);
+        }
+        std::wcout << L"\n";
+    }
+
+    if (reading.MsrIndex == KNDBG_MSR_IA32_STAR)
+    {
+        uint32_t compatEip = static_cast<uint32_t>(value & 0xFFFFFFFFull);
+        uint16_t syscallCsSs = static_cast<uint16_t>((value >> 32) & 0xFFFFull);
+        uint16_t sysretCsSs = static_cast<uint16_t>((value >> 48) & 0xFFFFull);
+        std::wcout << L"  syscall_cs_ss=" << HexTextWidth(syscallCsSs, 4, true)
+                   << L" sysret_cs_ss=" << HexTextWidth(sysretCsSs, 4, true)
+                   << L" compat_eip=" << HexTextWidth(compatEip, 8, true) << L"\n";
+    }
+    else if (reading.MsrIndex == KNDBG_MSR_IA32_EFER)
+    {
+        std::wcout << L"  SCE=" << ((value & 0x1ull) != 0 ? L"1" : L"0")
+                   << L" LME=" << ((value & 0x100ull) != 0 ? L"1" : L"0")
+                   << L" LMA=" << ((value & 0x400ull) != 0 ? L"1" : L"0")
+                   << L" NXE=" << ((value & 0x800ull) != 0 ? L"1" : L"0") << L"\n";
+    }
+
+    if (reading.Divergent)
+    {
+        std::wcout << L"  per-cpu:";
+        for (size_t i = 0; i < reading.PerCpuValues.size(); ++i)
+        {
+            std::wcout << L" cpu" << std::dec << i << L"=" << HexTextWidth(reading.PerCpuValues[i], 16, true);
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!reading.Notes.empty())
+    {
+        std::wcout << L"  note: ";
+        PrintColoredText(reading.Notes, KNDBG_COLOR_WARN);
+        std::wcout << L"\n";
+    }
+}
+
+static void HandleMsrCheckCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!msrcheck requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
+        {
+            PrintMsrCheckHelp();
+            break;
+        }
+
+        if (args.size() > 1)
+        {
+            std::wcerr << L"!msrcheck: unexpected extra argument \"" << args[1] << L"\"\n";
+            PrintMsrCheckHelp();
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!msrcheck failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        MsrScanner scanner(device, symbols);
+        MsrScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!msrcheck failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!msrcheck warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!msrcheck warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"msr syscall-config", KNDBG_COLOR_TITLE);
+        std::wcout << L" cpus=" << std::dec << result.ProcessorCount;
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+        }
+        std::wcout << L"\n";
+
+        for (const MsrReading& reading : result.Readings)
+        {
+            PrintMsrReadingRecord(reading);
+        }
+    } while (false);
+}
+
 static void PrintFirmwareTableHelp()
 {
     std::wcout << L"!fwtable command:\n";
@@ -18540,6 +18703,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintNmiHelp();
         }
+        else if (command == L"!msrcheck")
+        {
+            PrintMsrCheckHelp();
+        }
         else if (command == L"!fwtable")
         {
             PrintFirmwareTableHelp();
@@ -23076,6 +23243,7 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
             normalized == L"!securekernel" ||
             normalized == L"!etw" ||
             normalized == L"!nmi" ||
+            normalized == L"!msrcheck" ||
             normalized == L"!fwtable" ||
             normalized == L"!module" ||
             normalized == L"!driver" ||
@@ -28858,6 +29026,10 @@ static bool HandleCommand(
         else if (command == L"!nmi")
         {
             HandleNmiCommand(args, device, symbols);
+        }
+        else if (command == L"!msrcheck")
+        {
+            HandleMsrCheckCommand(args, device, symbols);
         }
         else if (command == L"!fwtable")
         {

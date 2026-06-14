@@ -98,6 +98,17 @@ public:
         uint64_t* eprocessAddress,
         std::wstring* error);
 
+    // Reads one architectural MSR (must be a KNDBG_MSR_* whitelist value) on
+    // the requested logical processor. Read-only; does not require write mode.
+    // On success, value receives the MSR value and actualProcessor (optional)
+    // receives the processor the read actually ran on.
+    bool ReadMsr(
+        uint32_t msrIndex,
+        uint32_t processorNumber,
+        uint64_t* value,
+        uint32_t* actualProcessor,
+        std::wstring* error);
+
 private:
     bool Ioctl(DWORD code, void* buffer, DWORD inLength, DWORD outLength, DWORD* returned, std::wstring* error);
 
