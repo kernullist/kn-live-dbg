@@ -324,6 +324,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!nmi", L"!nmi", L"kernel", L"walk nt!KiNmiCallbackListHead and annotate registered NMI handlers", CommandSupport::Native),
         Make(L"!msrcheck", L"!msrcheck", L"kernel", L"read SYSCALL MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) and flag entry-pointer hooks or per-CPU divergence", CommandSupport::Native),
         Make(L"!cr", L"!cr", L"kernel", L"read control registers (CR0/CR4/CR8) and flag CR0.WP-off, SMEP/SMAP-off, or per-CPU divergence", CommandSupport::Native),
+        Make(L"!ssdt", L"!ssdt", L"kernel", L"walk the native and win32k shadow SSDT and flag service routines outside the expected kernel image", CommandSupport::Native),
         Make(L"!fwtable", L"!fwtable", L"kernel", L"walk firmware table provider registrations and annotate handler/DriverObject ownership", CommandSupport::Native),
         Make(L"!module", L"!module", L"kernel", L"check loaded kernel module PE headers and executable section page permissions for W+X integrity drift", CommandSupport::Native),
         Make(L"!driver", L"!driver", L"kernel", L"walk \\Driver objects and flag suspicious DRIVER_OBJECT dispatch targets", CommandSupport::Native),
