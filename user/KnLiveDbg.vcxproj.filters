@@ -64,6 +64,9 @@
     <ClCompile Include="CrScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="SsdtScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="MemoryDumper.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -157,6 +160,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CrScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SsdtScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AddressInspector.h">

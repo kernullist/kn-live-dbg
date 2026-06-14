@@ -22,6 +22,7 @@
 #include "NmiScanner.h"
 #include "MsrScanner.h"
 #include "CrScanner.h"
+#include "SsdtScanner.h"
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
 #include "VbsScanner.h"
@@ -1747,7 +1748,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  process       !dml_proc [pid] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
-    std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
+    std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP) | !ssdt (syscall table hooks)\n";
     std::wcout << L"  hunting       !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
     std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
@@ -2076,6 +2077,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!nmi" ||
         command == L"!msrcheck" ||
         command == L"!cr" ||
+        command == L"!ssdt" ||
         command == L"!fwtable" ||
         command == L"!module" ||
         command == L"!driver" ||
@@ -3298,6 +3300,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!nmi",
         L"!msrcheck",
         L"!cr",
+        L"!ssdt",
         L"!fwtable",
         L"!module",
         L"!driver",
@@ -13292,6 +13295,165 @@ static void HandleCrCommand(
     } while (false);
 }
 
+static void PrintSsdtHelp()
+{
+    std::wcout << L"!ssdt command:\n";
+    std::wcout << L"  !ssdt\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Walks the native SSDT (nt!KeServiceDescriptorTable -> KiServiceTable) and, when\n";
+    std::wcout << L"  win32k modules are loaded, the win32k shadow table\n";
+    std::wcout << L"  (nt!KeServiceDescriptorTableShadow[1]).\n";
+    std::wcout << L"\n";
+    std::wcout << L"checks:\n";
+    std::wcout << L"  Each service routine is decoded (x64: KiServiceTable + (entry >> 4)) and validated\n";
+    std::wcout << L"  to reside in the expected kernel image (ntoskrnl for the native table, win32k* for\n";
+    std::wcout << L"  the shadow table). Routines outside the expected module, or outside all loaded\n";
+    std::wcout << L"  modules, are flagged as syscall-hook evidence. Only hooked entries are listed; a\n";
+    std::wcout << L"  clean table prints a one-line summary.\n";
+}
+
+static void PrintSsdtTable(const SsdtTable& table)
+{
+    PrintColoredText(L"[ssdt.table]", KNDBG_COLOR_TITLE);
+    std::wcout << L" ";
+    PrintColoredText(table.Name, KNDBG_COLOR_ACCENT);
+
+    if (!table.Resolved)
+    {
+        std::wcout << L" unresolved";
+        if (!table.Warning.empty())
+        {
+            std::wcout << L": " << table.Warning;
+        }
+        std::wcout << L"\n";
+        return;
+    }
+
+    std::wcout << L" base=" << HexTextWidth(table.TableBase, 16, true)
+               << L" count=" << std::dec << table.Limit
+               << L" expected=" << table.ExpectedModule;
+    if (table.SuspiciousCount > 0)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+        std::wcout << L" hooks=" << std::dec << table.SuspiciousCount;
+    }
+    std::wcout << L"\n";
+
+    if (!table.Warning.empty())
+    {
+        std::wcout << L"  warning: " << table.Warning << L"\n";
+    }
+
+    if (table.SuspiciousCount == 0)
+    {
+        std::wcout << L"  all " << std::dec << table.Limit << L" service routines resolve into "
+                   << table.ExpectedModule << L"\n";
+        return;
+    }
+
+    for (const SsdtEntry& entry : table.Entries)
+    {
+        if (!entry.Suspicious)
+        {
+            continue;
+        }
+
+        std::wcout << L"  ";
+        PrintColoredText(L"[ssdt.hook]", KNDBG_COLOR_FAIL);
+        std::wcout << L" index=" << std::dec << entry.Index
+                   << L" routine=" << HexTextWidth(entry.Routine, 16, true);
+        if (!entry.Module.empty())
+        {
+            std::wcout << L" module=";
+            PrintColoredText(entry.Module, KNDBG_COLOR_WARN);
+        }
+        if (!entry.Symbol.empty())
+        {
+            std::wcout << L" symbol=" << entry.Symbol;
+        }
+        std::wcout << L"\n";
+        if (!entry.Notes.empty())
+        {
+            std::wcout << L"    note: ";
+            PrintColoredText(entry.Notes, KNDBG_COLOR_WARN);
+            std::wcout << L"\n";
+        }
+    }
+}
+
+static void HandleSsdtCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!ssdt requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
+        {
+            PrintSsdtHelp();
+            break;
+        }
+
+        if (args.size() > 1)
+        {
+            std::wcerr << L"!ssdt: unexpected extra argument \"" << args[1] << L"\"\n";
+            PrintSsdtHelp();
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!ssdt failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        SsdtScanner scanner(device, symbols);
+        SsdtScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!ssdt failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!ssdt warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!ssdt warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"ssdt", KNDBG_COLOR_TITLE);
+        std::wcout << L" tables=" << std::dec << result.Tables.size();
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            std::wcout << L" hooks=" << std::dec << result.SuspiciousCount;
+        }
+        std::wcout << L"\n";
+
+        for (const SsdtTable& table : result.Tables)
+        {
+            PrintSsdtTable(table);
+        }
+    } while (false);
+}
+
 static void PrintFirmwareTableHelp()
 {
     std::wcout << L"!fwtable command:\n";
@@ -18843,6 +19005,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintCrCheckHelp();
         }
+        else if (command == L"!ssdt")
+        {
+            PrintSsdtHelp();
+        }
         else if (command == L"!fwtable")
         {
             PrintFirmwareTableHelp();
@@ -23381,6 +23547,7 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
             normalized == L"!nmi" ||
             normalized == L"!msrcheck" ||
             normalized == L"!cr" ||
+            normalized == L"!ssdt" ||
             normalized == L"!fwtable" ||
             normalized == L"!module" ||
             normalized == L"!driver" ||
@@ -29171,6 +29338,10 @@ static bool HandleCommand(
         else if (command == L"!cr")
         {
             HandleCrCommand(args, device);
+        }
+        else if (command == L"!ssdt")
+        {
+            HandleSsdtCommand(args, device, symbols);
         }
         else if (command == L"!fwtable")
         {

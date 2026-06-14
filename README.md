@@ -71,6 +71,7 @@ kn-live-dbg/
 36. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
 37. Inspects the SYSCALL-configuration model-specific registers with `!msrcheck` -- reading `IA32_LSTAR`, `IA32_CSTAR`, `IA32_STAR`, `IA32_FMASK`, and `IA32_EFER` on every active processor through a new read-only `IOCTL_KNDBG_READ_MSR` driver primitive (ABI version 8; the driver permits only a fixed architectural MSR whitelist and pins per-CPU affinity so single-core hooks are visible). It flags `LSTAR` that does not equal `nt!KiSystemCall64`, any per-CPU divergence (the kernel programs these MSRs uniformly), and entry pointers outside the loaded kernel image as possible SYSCALL hooks, while decoding `STAR` selectors and `EFER` bits for inspection. This closes the previously blind SYSCALL-entry attack surface and establishes the read-only CPU-state IOCTL pattern reused by future control-register/IDT/SSDT checks.
 38. Inspects the x64 control registers with `!cr` -- reading `CR0`, `CR4`, and `CR8` on every active processor through the read-only `IOCTL_KNDBG_READ_CONTROL_REGISTERS` primitive (ABI version 9; same per-CPU affinity-pinned pattern as `!msrcheck`). It flags `CR0.WP=0` (kernel write-protect disabled, a classic code-patching enabler) and any per-CPU divergence of `CR0`/`CR4` as suspicious, decodes the `CR4` mitigation bits (`SMEP`/`SMAP`/`UMIP`/`LA57`/`CET`/`PKE`), and surfaces `SMEP`/`SMAP` being disabled as a mitigation-weakened note (legacy CPUs may legitimately lack them).
+39. Detects SSDT / shadow-SSDT syscall hooks with `!ssdt` -- walking the native `nt!KeServiceDescriptorTable` (`KiServiceTable`) and, when win32k modules are loaded, the win32k shadow table `nt!KeServiceDescriptorTableShadow[1]` from live kernel memory. Each service routine is decoded with the x64 encoding (`routine = KiServiceTable + (entry >> 4)`) and validated to reside in the expected kernel image -- ntoskrnl for the native table, a `win32k*` module for the shadow table. Routines outside the expected module, or outside every loaded kernel module, are flagged as syscall-hook evidence; clean tables print a one-line summary so only hooked entries are listed. No new driver IOCTL is required: the scanner reuses the existing memory-read primitive plus the PDB-first layout resolver for the `_KSERVICE_TABLE_DESCRIPTOR` Base/Limit fields.
 
 ## Design Notes
 
@@ -203,6 +204,7 @@ callbacks [scope] /module <module>
 !nmi [callbacks]
 !msrcheck
 !cr
+!ssdt
 !fwtable [providers|provider <signature>]
 !fwtable providers /module <name>
 !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]
@@ -305,6 +307,7 @@ knkd> !etw integrity
 knkd> !nmi callbacks
 knkd> !msrcheck
 knkd> !cr
+knkd> !ssdt
 knkd> !fwtable providers
 knkd> !fwtable providers /module WdFilter
 knkd> !fwtable provider ACPI
