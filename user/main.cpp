@@ -21,6 +21,7 @@
 #include "ThreatIntelSubscriber.h"
 #include "NmiScanner.h"
 #include "MsrScanner.h"
+#include "CrScanner.h"
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
 #include "VbsScanner.h"
@@ -1746,7 +1747,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  process       !dml_proc [pid] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
-    std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook detection)\n";
+    std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
     std::wcout << L"  hunting       !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
     std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
@@ -2074,6 +2075,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!etw" ||
         command == L"!nmi" ||
         command == L"!msrcheck" ||
+        command == L"!cr" ||
         command == L"!fwtable" ||
         command == L"!module" ||
         command == L"!driver" ||
@@ -3295,6 +3297,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!etw",
         L"!nmi",
         L"!msrcheck",
+        L"!cr",
         L"!fwtable",
         L"!module",
         L"!driver",
@@ -13160,6 +13163,135 @@ static void HandleMsrCheckCommand(
     } while (false);
 }
 
+static void PrintCrCheckHelp()
+{
+    std::wcout << L"!cr command:\n";
+    std::wcout << L"  !cr\n";
+    std::wcout << L"\n";
+    std::wcout << L"output:\n";
+    std::wcout << L"  Reads CR0/CR4/CR8 on every active processor in group 0 through the driver's\n";
+    std::wcout << L"  read-only control-register primitive.\n";
+    std::wcout << L"\n";
+    std::wcout << L"checks:\n";
+    std::wcout << L"  CR0.WP must be 1 (kernel write-protect); WP=0 or any per-CPU divergence of CR0/CR4\n";
+    std::wcout << L"  is flagged as suspicious. SMEP/SMAP/UMIP/LA57/CET/PKE bits in CR4 are decoded; SMEP\n";
+    std::wcout << L"  or SMAP off is surfaced as a mitigation-weakened note (legacy CPUs may lack them).\n";
+}
+
+static void PrintCrReadingRecord(const CrReading& reading)
+{
+    PrintColoredText(L"[cr]", KNDBG_COLOR_TITLE);
+    std::wcout << L" ";
+    PrintColoredText(reading.Name, KNDBG_COLOR_ACCENT);
+
+    if (reading.PerCpuValues.empty())
+    {
+        std::wcout << L" read-failed\n";
+        return;
+    }
+
+    uint64_t value = reading.PerCpuValues.front();
+    std::wcout << L"=" << HexTextWidth(value, 16, true);
+    if (reading.Suspicious)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+    }
+    std::wcout << L"\n";
+
+    if (reading.Name == L"CR0")
+    {
+        std::wcout << L"  WP=" << ((value & (1ull << 16)) != 0 ? L"1" : L"0")
+                   << L" PG=" << ((value & (1ull << 31)) != 0 ? L"1" : L"0")
+                   << L" NE=" << ((value & (1ull << 5)) != 0 ? L"1" : L"0") << L"\n";
+    }
+    else if (reading.Name == L"CR4")
+    {
+        std::wcout << L"  SMEP=" << ((value & (1ull << 20)) != 0 ? L"1" : L"0")
+                   << L" SMAP=" << ((value & (1ull << 21)) != 0 ? L"1" : L"0")
+                   << L" UMIP=" << ((value & (1ull << 11)) != 0 ? L"1" : L"0")
+                   << L" LA57=" << ((value & (1ull << 12)) != 0 ? L"1" : L"0")
+                   << L" CET=" << ((value & (1ull << 23)) != 0 ? L"1" : L"0")
+                   << L" PKE=" << ((value & (1ull << 22)) != 0 ? L"1" : L"0") << L"\n";
+    }
+
+    if (reading.Divergent)
+    {
+        std::wcout << L"  per-cpu:";
+        for (size_t i = 0; i < reading.PerCpuValues.size(); ++i)
+        {
+            std::wcout << L" cpu" << std::dec << i << L"=" << HexTextWidth(reading.PerCpuValues[i], 16, true);
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!reading.Notes.empty())
+    {
+        std::wcout << L"  note: ";
+        PrintColoredText(reading.Notes, KNDBG_COLOR_WARN);
+        std::wcout << L"\n";
+    }
+}
+
+static void HandleCrCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!cr requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
+        {
+            PrintCrCheckHelp();
+            break;
+        }
+
+        if (args.size() > 1)
+        {
+            std::wcerr << L"!cr: unexpected extra argument \"" << args[1] << L"\"\n";
+            PrintCrCheckHelp();
+            break;
+        }
+
+        CrScanner scanner(device);
+        CrScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!cr failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!cr warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!cr warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"control registers", KNDBG_COLOR_TITLE);
+        std::wcout << L" cpus=" << std::dec << result.ProcessorCount;
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+        }
+        std::wcout << L"\n";
+
+        for (const CrReading& reading : result.Readings)
+        {
+            PrintCrReadingRecord(reading);
+        }
+    } while (false);
+}
+
 static void PrintFirmwareTableHelp()
 {
     std::wcout << L"!fwtable command:\n";
@@ -18707,6 +18839,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintMsrCheckHelp();
         }
+        else if (command == L"!cr")
+        {
+            PrintCrCheckHelp();
+        }
         else if (command == L"!fwtable")
         {
             PrintFirmwareTableHelp();
@@ -23244,6 +23380,7 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
             normalized == L"!etw" ||
             normalized == L"!nmi" ||
             normalized == L"!msrcheck" ||
+            normalized == L"!cr" ||
             normalized == L"!fwtable" ||
             normalized == L"!module" ||
             normalized == L"!driver" ||
@@ -29030,6 +29167,10 @@ static bool HandleCommand(
         else if (command == L"!msrcheck")
         {
             HandleMsrCheckCommand(args, device, symbols);
+        }
+        else if (command == L"!cr")
+        {
+            HandleCrCommand(args, device);
         }
         else if (command == L"!fwtable")
         {

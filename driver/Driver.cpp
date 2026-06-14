@@ -11,8 +11,11 @@ PsLookupProcessByProcessId(
     PEPROCESS* Process);
 
 #if defined(_M_X64)
+#pragma intrinsic(__readcr0)
+#pragma intrinsic(__readcr2)
 #pragma intrinsic(__readcr3)
 #pragma intrinsic(__readcr4)
+#pragma intrinsic(__readcr8)
 #pragma intrinsic(__invlpg)
 #pragma intrinsic(__readmsr)
 #endif
@@ -1859,6 +1862,75 @@ static NTSTATUS KnDbgHandleReadMsr(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buf
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+// Reads the x64 control registers on a caller-selected logical processor.
+// Read-only and whitelist-free (the CR set is fixed); no write-mode gate is
+// required. The caller iterates processors to surface per-CPU divergence of
+// CR0/CR4 (the kernel keeps these uniform across cores).
+static NTSTATUS KnDbgHandleReadControlRegisters(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_READ_CR_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (outputLength < sizeof(KNDBG_READ_CR_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        KNDBG_READ_CR_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+
+        RtlZeroMemory(Buffer, outputLength);
+
+        ULONG activeCount = KeQueryActiveProcessorCountEx(0);
+        if (activeCount == 0)
+        {
+            activeCount = 1;
+        }
+
+        ULONG targetProcessor = request.ProcessorNumber;
+        if (targetProcessor >= activeCount)
+        {
+            targetProcessor = 0;
+        }
+
+        KAFFINITY affinity = (KAFFINITY)1 << targetProcessor;
+        KAFFINITY previousAffinity = KeSetSystemAffinityThreadEx(affinity);
+        ULONG actualProcessor = KeGetCurrentProcessorNumberEx(NULL);
+        ULONG64 cr0 = __readcr0();
+        ULONG64 cr2 = __readcr2();
+        ULONG64 cr3 = __readcr3();
+        ULONG64 cr4 = __readcr4();
+        ULONG64 cr8 = __readcr8();
+        KeRevertToUserAffinityThreadEx(previousAffinity);
+
+        KNDBG_READ_CR_RESPONSE* response = reinterpret_cast<KNDBG_READ_CR_RESPONSE*>(Buffer);
+        response->Size = sizeof(KNDBG_READ_CR_RESPONSE);
+        response->ProcessorNumber = actualProcessor;
+        response->Cr0 = cr0;
+        response->Cr2 = cr2;
+        response->Cr3 = cr3;
+        response->Cr4 = cr4;
+        response->Cr8 = cr8;
+
+        information = sizeof(KNDBG_READ_CR_RESPONSE);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -1907,6 +1979,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_READ_MSR:
         status = KnDbgHandleReadMsr(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_READ_CONTROL_REGISTERS:
+        status = KnDbgHandleReadControlRegisters(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
