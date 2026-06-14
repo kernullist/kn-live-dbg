@@ -1078,6 +1078,10 @@ bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, 
             ExtractJsonStringValue(object, L"identity", &record.Identity);
             ExtractJsonStringValue(object, L"display", &record.Display);
             ExtractJsonStringValue(object, L"risk", &record.Risk);
+            // Clamp an attacker-supplied or malformed risk string to the known
+            // {high,medium,low,info} set (unknown collapses to "info") so diff
+            // ranking/sorting cannot be skewed by a crafted snapshot file.
+            record.Risk = SnapshotRiskNormalize(record.Risk);
             ExtractJsonBoolValue(object, L"volatile", &record.Volatile);
             record.Tags = ExtractJsonStringArrayValues(object, L"tags");
             record.Evidence = ParseJsonStringMap(ExtractJsonObjectValue(object, L"evidence"));

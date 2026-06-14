@@ -15438,35 +15438,14 @@ static bool CheckSelfIsPplAntimalware(
         }
     }
 
-    // DirectoryTableBase lives in _KPROCESS (the Pcb sub-structure at offset
-    // 0 inside _EPROCESS). On builds where the user-mode SymbolEngine cannot
-    // chase nested fields we try alternate spellings before giving up.
-    TypeFieldInfo dtbField = {};
+    // DirectoryTableBase lives in _KPROCESS (the Pcb sub-structure at offset 0
+    // inside _EPROCESS). Reuse the canonical resolver instead of duplicating
+    // the layout fallback; SymbolEngine::FindField now resolves the nested
+    // Pcb.DirectoryTableBase path directly.
+    uint32_t dtbOffset = 0;
+    uint32_t userDtbOffset = 0;
     std::wstring dtbError;
-    const wchar_t* dtbTypes[] = { L"nt!_EPROCESS", L"nt!_KPROCESS" };
-    const wchar_t* dtbNames[] = { L"DirectoryTableBase", L"Pcb.DirectoryTableBase" };
-    bool dtbResolved = false;
-    for (const wchar_t* t : dtbTypes)
-    {
-        for (const wchar_t* n : dtbNames)
-        {
-            std::wstring tryError;
-            if (symbols.FindField(t, n, &dtbField, &tryError))
-            {
-                dtbResolved = true;
-                break;
-            }
-            if (dtbError.empty())
-            {
-                dtbError = tryError;
-            }
-        }
-        if (dtbResolved)
-        {
-            break;
-        }
-    }
-    if (!dtbResolved)
+    if (!ResolveProcessDirectoryTableBaseOffsets(symbols, &dtbOffset, &userDtbOffset, &dtbError))
     {
         if (error != nullptr)
         {
@@ -15489,7 +15468,7 @@ static bool CheckSelfIsPplAntimalware(
     uint32_t pid = GetCurrentProcessId();
     ProcessAddressContext ctx = {};
     std::wstring resolveError;
-    if (!device.ResolveProcess(pid, dtbField.Offset, 0, &ctx, &resolveError))
+    if (!device.ResolveProcess(pid, dtbOffset, 0, &ctx, &resolveError))
     {
         if (error != nullptr)
         {
@@ -18854,13 +18833,89 @@ static bool IsSecretTokenChar(wchar_t ch)
     return result;
 }
 
+// ASCII case-insensitive keyword match at a given offset. Used to spot
+// provider-agnostic credential markers ("Bearer ", "Authorization") that do
+// not start with the "sk-" prefix, such as ChatGPT/Codex OAuth JWTs and
+// OpenRouter session tokens.
+static bool MatchesKeywordCI(const std::wstring& value, size_t index, const wchar_t* keyword)
+{
+    bool matched = true;
+
+    for (size_t k = 0; keyword[k] != L'\0'; ++k)
+    {
+        if (index + k >= value.size())
+        {
+            matched = false;
+            break;
+        }
+
+        wchar_t a = value[index + k];
+        wchar_t b = keyword[k];
+        if (a >= L'A' && a <= L'Z')
+        {
+            a = static_cast<wchar_t>(a - L'A' + L'a');
+        }
+        if (b >= L'A' && b <= L'Z')
+        {
+            b = static_cast<wchar_t>(b - L'A' + L'a');
+        }
+        if (a != b)
+        {
+            matched = false;
+            break;
+        }
+    }
+
+    return matched;
+}
+
 static std::wstring RedactTranscriptText(const std::wstring& value)
 {
     std::wstring result;
 
     for (size_t index = 0; index < value.size();)
     {
-        if (index + 3 <= value.size() &&
+        if (MatchesKeywordCI(value, index, L"Bearer "))
+        {
+            // HTTP bearer token: redact the token that follows the scheme.
+            result += L"Bearer <redacted>";
+            index += 7; // length of "Bearer "
+            while (index < value.size() && (value[index] == L' ' || value[index] == L'\t'))
+            {
+                ++index;
+            }
+            while (index < value.size() && IsSecretTokenChar(value[index]))
+            {
+                ++index;
+            }
+        }
+        else if (MatchesKeywordCI(value, index, L"Authorization"))
+        {
+            // Only treat this as a header when a colon follows; otherwise it is
+            // ordinary text and must be preserved verbatim.
+            size_t scan = index + 13; // length of "Authorization"
+            while (scan < value.size() && (value[scan] == L' ' || value[scan] == L'\t'))
+            {
+                ++scan;
+            }
+
+            if (scan < value.size() && value[scan] == L':')
+            {
+                result += L"Authorization: <redacted>";
+                ++scan; // past ':'
+                while (scan < value.size() && value[scan] != L'\r' && value[scan] != L'\n')
+                {
+                    ++scan;
+                }
+                index = scan;
+            }
+            else
+            {
+                result.append(value, index, 13);
+                index += 13;
+            }
+        }
+        else if (index + 3 <= value.size() &&
             value[index] == L's' &&
             value[index + 1] == L'k' &&
             value[index + 2] == L'-')

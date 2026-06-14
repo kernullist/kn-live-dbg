@@ -2863,18 +2863,64 @@ bool SymbolEngine::FindField(const std::wstring& typeName, const std::wstring& f
             break;
         }
 
-        std::vector<TypeFieldInfo> fields;
-        if (!GetTypeFields(typeName, &fields, nullptr, error))
+        // Split the field name on '.' so callers can resolve nested paths such
+        // as "Pcb.DirectoryTableBase" through embedded UDTs without manually
+        // chasing each level. A single segment keeps the original flat-lookup
+        // behavior. Pointer dereference paths are intentionally not supported;
+        // this resolves field offsets within a structure for "<base> + Offset"
+        // address math, so only embedded aggregate members are descended into.
+        std::vector<std::wstring> segments;
+        bool malformedPath = false;
+        size_t pathStart = 0;
+        while (pathStart <= fieldName.size())
+        {
+            size_t dot = fieldName.find(L'.', pathStart);
+            std::wstring segment = (dot == std::wstring::npos)
+                ? fieldName.substr(pathStart)
+                : fieldName.substr(pathStart, dot - pathStart);
+            if (segment.empty())
+            {
+                malformedPath = true;
+                break;
+            }
+            segments.push_back(segment);
+            if (dot == std::wstring::npos)
+            {
+                break;
+            }
+            pathStart = dot + 1;
+        }
+
+        if (malformedPath || segments.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid field path";
+            }
+            break;
+        }
+
+        auto findInFields = [](const std::vector<TypeFieldInfo>& fields, const std::wstring& name) -> const TypeFieldInfo*
+        {
+            for (const TypeFieldInfo& candidate : fields)
+            {
+                if (_wcsicmp(candidate.Name.c_str(), name.c_str()) == 0)
+                {
+                    return &candidate;
+                }
+            }
+            return nullptr;
+        };
+
+        // Resolve the first segment against the root type by name.
+        std::vector<TypeFieldInfo> rootFields;
+        if (!GetTypeFields(typeName, &rootFields, nullptr, error))
         {
             break;
         }
 
-        auto match = std::find_if(fields.begin(), fields.end(), [&](const TypeFieldInfo& candidate)
-        {
-            return _wcsicmp(candidate.Name.c_str(), fieldName.c_str()) == 0;
-        });
-
-        if (match == fields.end())
+        const TypeFieldInfo* match = findInFields(rootFields, segments[0]);
+        if (match == nullptr)
         {
             if (error != nullptr)
             {
@@ -2883,7 +2929,56 @@ bool SymbolEngine::FindField(const std::wstring& typeName, const std::wstring& f
             break;
         }
 
-        *field = *match;
+        TypeFieldInfo current = *match;
+        ULONG cumulativeOffset = current.Offset;
+        bool pathOk = true;
+
+        // Descend through each remaining segment by enumerating the embedded
+        // aggregate type identified by the parent field's ChildTypeId.
+        for (size_t i = 1; i < segments.size(); ++i)
+        {
+            if (current.ChildTypeId == 0 || current.ModuleBase == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Field path segment is not an aggregate type";
+                }
+                pathOk = false;
+                break;
+            }
+
+            TypeLayoutInfo childLayout = {};
+            if (!GetTypeLayoutById(current.ModuleBase, current.ChildTypeId, current.TypeName, &childLayout, error))
+            {
+                pathOk = false;
+                break;
+            }
+
+            const TypeFieldInfo* childMatch = findInFields(childLayout.Fields, segments[i]);
+            if (childMatch == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Field was not found";
+                }
+                pathOk = false;
+                break;
+            }
+
+            current = *childMatch;
+            cumulativeOffset += current.Offset;
+        }
+
+        if (!pathOk)
+        {
+            break;
+        }
+
+        // The leaf keeps its own type/length/bitfield metadata, but the offset
+        // is reported relative to the root type so callers can use
+        // <root-address> + field.Offset directly.
+        *field = current;
+        field->Offset = cumulativeOffset;
         ok = true;
     } while (false);
 
