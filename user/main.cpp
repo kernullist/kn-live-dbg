@@ -28,6 +28,7 @@
 #include "SymbolEngine.h"
 #include "VbsScanner.h"
 #include "WfpScanner.h"
+#include "WfpCalloutScanner.h"
 #include "WnfScanner.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
@@ -2813,6 +2814,7 @@ static bool IsWfpScopeName(const std::wstring& value)
     return lowered == L"providers" ||
         lowered == L"sublayers" ||
         lowered == L"callouts" ||
+        lowered == L"kernelcallouts" ||
         lowered == L"filters" ||
         lowered == L"layers";
 }
@@ -3126,6 +3128,7 @@ static void AddWfpScopeCompletionCandidates(std::vector<std::wstring>* candidate
         L"providers",
         L"sublayers",
         L"callouts",
+        L"kernelcallouts",
         L"filters",
         L"layers",
         L"help"
@@ -11413,15 +11416,19 @@ static void PrintWfpHelp()
     std::wcout << L"  !wfp providers\n";
     std::wcout << L"  !wfp sublayers\n";
     std::wcout << L"  !wfp callouts [/module <name|GUID>]\n";
+    std::wcout << L"  !wfp kernelcallouts\n";
     std::wcout << L"  !wfp filters [/layer <name|GUID>] [/provider <name|GUID>]\n";
     std::wcout << L"  !wfp layers\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
-    std::wcout << L"  providers  registered WFP providers (driver service identities)\n";
-    std::wcout << L"  sublayers  configured WFP sublayers and weights\n";
-    std::wcout << L"  callouts   registered WFP callouts with applicable layer and owning provider\n";
-    std::wcout << L"  filters    installed WFP filters with layer, sublayer, provider, action, and weight\n";
-    std::wcout << L"  layers     active WFP management layers with kernel/builtin/buffered flags\n";
+    std::wcout << L"  providers       registered WFP providers (driver service identities)\n";
+    std::wcout << L"  sublayers       configured WFP sublayers and weights\n";
+    std::wcout << L"  callouts        registered WFP callouts with applicable layer and owning provider (user-mode BFE)\n";
+    std::wcout << L"  kernelcallouts  kernel-mode classify/notify/flowDelete function pointers from the netio.sys\n";
+    std::wcout << L"                  callout table, joined to callout metadata; flags classify targets outside\n";
+    std::wcout << L"                  loaded kernel modules. Requires the driver device and netio.sys symbols.\n";
+    std::wcout << L"  filters         installed WFP filters with layer, sublayer, provider, action, and weight\n";
+    std::wcout << L"  layers          active WFP management layers with kernel/builtin/buffered flags\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /module <name|GUID>    callouts only; match owning provider service name, display name, or providerKey GUID\n";
@@ -11555,6 +11562,123 @@ static void PrintWfpRecord(const WfpRecord& record)
         PrintColoredText(L"notes", KNDBG_COLOR_WARN);
         std::wcout << L"=" << record.Notes << L"\n";
     }
+}
+
+static void HandleWfpKernelCalloutsCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 2))
+        {
+            PrintWfpHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!wfp kernelcallouts requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!wfp kernelcallouts failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        WfpCalloutScanner scanner(device, symbols);
+        WfpCalloutScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!wfp kernelcallouts failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!wfp kernelcallouts warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!wfp kernelcallouts warning: " << warning << L"\n";
+        }
+
+        if (!result.Resolved)
+        {
+            std::wcout << L"wfp kernel callouts: unresolved (netio.sys layout could not be located; see warnings)\n";
+            break;
+        }
+
+        PrintColoredText(L"wfp kernel callouts", KNDBG_COLOR_TITLE);
+        std::wcout << L" count=" << std::dec << result.Callouts.size()
+                   << L" array=" << HexTextWidth(result.ArrayAddress, 16, true)
+                   << L" layout=" << result.LayoutSource;
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            std::wcout << L" hooks=" << std::dec << result.SuspiciousCount;
+        }
+        std::wcout << L"\n";
+
+        for (const WfpKernelCallout& callout : result.Callouts)
+        {
+            std::wcout << L"  ";
+            PrintColoredText(L"[wfp.kcallout]", callout.ClassifySuspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+            std::wcout << L" id=" << std::dec << callout.CalloutId
+                       << L" classify=" << HexTextWidth(callout.ClassifyFn, 16, true);
+            if (!callout.ClassifyModule.empty())
+            {
+                std::wcout << L" module=";
+                PrintColoredText(callout.ClassifyModule, callout.ClassifySuspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_OK);
+            }
+            if (!callout.ClassifySymbol.empty())
+            {
+                std::wcout << L" (" << callout.ClassifySymbol << L")";
+            }
+            if (callout.ClassifySuspicious)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            }
+            std::wcout << L"\n";
+
+            if (callout.HasMetadata && (!callout.Name.empty() || !callout.LayerName.empty() || !callout.ProviderName.empty()))
+            {
+                std::wcout << L"    ";
+                if (!callout.Name.empty())
+                {
+                    std::wcout << L"name=";
+                    PrintColoredText(callout.Name, KNDBG_COLOR_ACCENT);
+                    std::wcout << L" ";
+                }
+                if (!callout.LayerName.empty())
+                {
+                    std::wcout << L"layer=" << callout.LayerName << L" ";
+                }
+                if (!callout.ProviderName.empty())
+                {
+                    std::wcout << L"provider=" << callout.ProviderName;
+                }
+                std::wcout << L"\n";
+            }
+
+            if (!callout.Notes.empty())
+            {
+                std::wcout << L"    note: ";
+                PrintColoredText(callout.Notes, KNDBG_COLOR_WARN);
+                std::wcout << L"\n";
+            }
+        }
+    } while (false);
 }
 
 static void HandleWfpCommand(const std::vector<std::wstring>& args)
@@ -29432,7 +29556,14 @@ static bool HandleCommand(
         }
         else if (command == L"!wfp")
         {
-            HandleWfpCommand(args);
+            if (args.size() >= 2 && ToLower(args[1]) == L"kernelcallouts")
+            {
+                HandleWfpKernelCalloutsCommand(args, device, symbols);
+            }
+            else
+            {
+                HandleWfpCommand(args);
+            }
         }
         else if (command == L"!alpc")
         {

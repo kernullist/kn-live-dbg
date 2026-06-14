@@ -133,6 +133,7 @@
     <ClCompile Include="SymbolEngine.cpp" />
     <ClCompile Include="VbsScanner.cpp" />
     <ClCompile Include="WfpScanner.cpp" />
+    <ClCompile Include="WfpCalloutScanner.cpp" />
     <ClCompile Include="WnfScanner.cpp" />
     <ClCompile Include="..\third_party\zydis\amalgamated\Zydis.c">
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
@@ -174,6 +175,7 @@
     <ClInclude Include="SymbolEngine.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="WfpScanner.h" />
+    <ClInclude Include="WfpCalloutScanner.h" />
     <ClInclude Include="WnfScanner.h" />
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h" />

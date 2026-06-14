@@ -267,6 +267,17 @@ Operational value:
 
 Extend `!wfp` beyond BFE metadata into kernel callout function ownership.
 
+Status: implemented as `!wfp kernelcallouts` in `WfpCalloutScanner`. It anchors
+on `netio!gWfpGlobal`, scores documented candidate callout-table layouts against
+live classify pointers (with a bounded offset-scan fallback), walks the callout
+array, recovers classify/notify/flowDelete pointers, joins them to user-mode
+callout metadata by callout id, and flags classify targets outside loaded kernel
+modules. It reuses the existing memory-read primitive (no new driver IOCTL) and
+reports cleanly when the netio.sys layout cannot be located. Remaining hardening:
+validate/refine offsets across more Windows builds, optionally use the exported
+`netio!KfdGetRefCallout`/`KfdDeRefCallout` path, and add per-layer callout
+grouping.
+
 Target shape:
 
 ```text
