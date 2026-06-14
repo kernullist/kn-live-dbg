@@ -1,5 +1,7 @@
 #include "NmiScanner.h"
 
+#include "LayoutResolver.h"
+
 #include <algorithm>
 #include <sstream>
 
@@ -256,6 +258,60 @@ bool NmiScanner::Scan(NmiScanResult* result, std::wstring* error)
 
         result->FirstNodeAddress = firstNode;
 
+        // Resolve the KNMI_HANDLER_CALLBACK node layout. Public nt PDBs almost
+        // never expose this internal type, so the guarded fallback offsets
+        // (Next/Callback/Context/Handle = 0x00/0x08/0x10/0x18) are the normal
+        // path; emit a single warning when any field falls back so layout
+        // drift on a future build becomes visible instead of silent.
+        ResolvedFieldOffset nextField     = ResolveFieldOffset(symbols_, L"nt!_KNMI_HANDLER_CALLBACK", L"Next",     0x00);
+        ResolvedFieldOffset callbackField = ResolveFieldOffset(symbols_, L"nt!_KNMI_HANDLER_CALLBACK", L"Callback", 0x08);
+        ResolvedFieldOffset contextField  = ResolveFieldOffset(symbols_, L"nt!_KNMI_HANDLER_CALLBACK", L"Context",  0x10);
+        ResolvedFieldOffset handleField   = ResolveFieldOffset(symbols_, L"nt!_KNMI_HANDLER_CALLBACK", L"Handle",   0x18);
+
+        // Keep per-node reads bounded: a resolved offset must leave room for a
+        // full pointer inside the read window. Revert any implausible offset to
+        // its known-good fallback so a mismatched PDB type cannot push a read
+        // out of bounds.
+        struct FieldFallback { ResolvedFieldOffset* field; uint32_t fallback; };
+        const FieldFallback fieldFallbacks[] =
+        {
+            { &nextField, 0x00 },
+            { &callbackField, 0x08 },
+            { &contextField, 0x10 },
+            { &handleField, 0x18 }
+        };
+        for (const FieldFallback& entry : fieldFallbacks)
+        {
+            if (static_cast<uint64_t>(entry.field->Offset) + sizeof(uint64_t) > kMaxRawBytesPerRead)
+            {
+                entry.field->Offset = entry.fallback;
+                entry.field->FromPdb = false;
+                entry.field->UsedFallback = true;
+            }
+        }
+
+        if (nextField.UsedFallback || callbackField.UsedFallback ||
+            contextField.UsedFallback || handleField.UsedFallback)
+        {
+            result->Warnings.push_back(
+                L"KNMI_HANDLER_CALLBACK layout resolved from guarded fallback offsets "
+                L"(PDB lacks the type); node fields may drift on future Windows builds");
+        }
+
+        uint32_t nodeReadSize = 0x20;
+        for (const FieldFallback& entry : fieldFallbacks)
+        {
+            uint32_t needed = entry.field->Offset + static_cast<uint32_t>(sizeof(uint64_t));
+            if (needed > nodeReadSize)
+            {
+                nodeReadSize = needed;
+            }
+        }
+        if (nodeReadSize > kMaxRawBytesPerRead)
+        {
+            nodeReadSize = kMaxRawBytesPerRead;
+        }
+
         uint64_t current = firstNode;
         std::vector<uint64_t> visited;
         visited.reserve(16);
@@ -276,7 +332,7 @@ bool NmiScanner::Scan(NmiScanResult* result, std::wstring* error)
             visited.push_back(current);
 
             std::vector<uint8_t> nodeBytes;
-            if (!ReadKernelBytes(device_, current, 32, &nodeBytes, nullptr))
+            if (!ReadKernelBytes(device_, current, nodeReadSize, &nodeBytes, nullptr))
             {
                 result->Warnings.push_back(L"failed to read NMI callback node at " + std::to_wstring(current));
                 break;
@@ -286,10 +342,10 @@ bool NmiScanner::Scan(NmiScanResult* result, std::wstring* error)
             uint64_t callback = 0;
             uint64_t context = 0;
             uint64_t handle = 0;
-            memcpy(&next,     nodeBytes.data() + 0x00, sizeof(uint64_t));
-            memcpy(&callback, nodeBytes.data() + 0x08, sizeof(uint64_t));
-            memcpy(&context,  nodeBytes.data() + 0x10, sizeof(uint64_t));
-            memcpy(&handle,   nodeBytes.data() + 0x18, sizeof(uint64_t));
+            memcpy(&next,     nodeBytes.data() + nextField.Offset,     sizeof(uint64_t));
+            memcpy(&callback, nodeBytes.data() + callbackField.Offset, sizeof(uint64_t));
+            memcpy(&context,  nodeBytes.data() + contextField.Offset,  sizeof(uint64_t));
+            memcpy(&handle,   nodeBytes.data() + handleField.Offset,   sizeof(uint64_t));
 
             NmiCallbackRecord record = {};
             record.Slot = static_cast<uint32_t>(visited.size() - 1);

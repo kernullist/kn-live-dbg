@@ -150,6 +150,7 @@
     <ClInclude Include="EtwScanner.h" />
     <ClInclude Include="FirmwareTableScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />
+    <ClInclude Include="LayoutResolver.h" />
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="NmiScanner.h" />
     <ClInclude Include="MemoryDumper.h" />
