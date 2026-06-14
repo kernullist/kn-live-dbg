@@ -32,7 +32,15 @@ namespace
             {
                 if (ch >= L'0' && ch <= L'9')
                 {
-                    value = (value * 10ull) + static_cast<uint64_t>(ch - L'0');
+                    uint64_t digit = static_cast<uint64_t>(ch - L'0');
+                    // Saturate instead of silently wrapping when a crafted
+                    // snapshot supplies an oversized decimal evidence value.
+                    if (value > (0xFFFFFFFFFFFFFFFFull - digit) / 10ull)
+                    {
+                        value = 0xFFFFFFFFFFFFFFFFull;
+                        break;
+                    }
+                    value = (value * 10ull) + digit;
                 }
                 else if (value != 0)
                 {

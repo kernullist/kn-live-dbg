@@ -193,6 +193,17 @@ static bool ReadTextFileUtf8OrWide(const std::wstring& path, std::wstring* outpu
             break;
         }
 
+        // This helper only reads credential/.env files. Reject reparse points
+        // (symlinks/junctions) at the path so a planted link cannot redirect
+        // the read to an arbitrary file and have its contents treated as an
+        // access token or provider configuration.
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        {
+            break;
+        }
+
         file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE)
         {
