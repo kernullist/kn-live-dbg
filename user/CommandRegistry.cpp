@@ -322,6 +322,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!securekernel", L"!securekernel", L"kernel", L"show Secure Kernel module presence and enumerate IUM trustlets", CommandSupport::Native),
         Make(L"!etw", L"!etw", L"kernel", L"enumerate ETW loggers via nt!EtwpDebuggerData and flag suspicious GetCpuClock hooks", CommandSupport::Native),
         Make(L"!nmi", L"!nmi", L"kernel", L"walk nt!KiNmiCallbackListHead and annotate registered NMI handlers", CommandSupport::Native),
+        Make(L"!msrcheck", L"!msrcheck", L"kernel", L"read SYSCALL MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) and flag entry-pointer hooks or per-CPU divergence", CommandSupport::Native),
         Make(L"!fwtable", L"!fwtable", L"kernel", L"walk firmware table provider registrations and annotate handler/DriverObject ownership", CommandSupport::Native),
         Make(L"!module", L"!module", L"kernel", L"check loaded kernel module PE headers and executable section page permissions for W+X integrity drift", CommandSupport::Native),
         Make(L"!driver", L"!driver", L"kernel", L"walk \\Driver objects and flag suspicious DRIVER_OBJECT dispatch targets", CommandSupport::Native),

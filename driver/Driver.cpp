@@ -14,6 +14,7 @@ PsLookupProcessByProcessId(
 #pragma intrinsic(__readcr3)
 #pragma intrinsic(__readcr4)
 #pragma intrinsic(__invlpg)
+#pragma intrinsic(__readmsr)
 #endif
 
 typedef struct _KNDBG_FILE_CONTEXT
@@ -1767,6 +1768,97 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+// Reads one architectural MSR on a caller-selected logical processor. This is
+// a read-only primitive: only the fixed SYSCALL/segment MSR whitelist is
+// permitted (all guaranteed present in x64 long mode, so __readmsr cannot
+// #GP), and no write-mode gate is required. The caller iterates processors to
+// surface per-CPU divergence such as a single-core SYSCALL hook.
+static NTSTATUS KnDbgHandleReadMsr(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_READ_MSR_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (outputLength < sizeof(KNDBG_READ_MSR_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        KNDBG_READ_MSR_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+
+        BOOLEAN permitted = FALSE;
+        switch (request.MsrIndex)
+        {
+        case KNDBG_MSR_IA32_EFER:
+        case KNDBG_MSR_IA32_STAR:
+        case KNDBG_MSR_IA32_LSTAR:
+        case KNDBG_MSR_IA32_CSTAR:
+        case KNDBG_MSR_IA32_FMASK:
+        case KNDBG_MSR_IA32_FS_BASE:
+        case KNDBG_MSR_IA32_GS_BASE:
+        case KNDBG_MSR_IA32_KERNEL_GS_BASE:
+            permitted = TRUE;
+            break;
+        default:
+            permitted = FALSE;
+            break;
+        }
+
+        if (!permitted)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, outputLength);
+
+        // Pin to the requested processor (clamped to the active count in group
+        // 0) so a per-CPU MSR divergence is observable. The dispatch runs at
+        // PASSIVE_LEVEL, which is required for the affinity migration.
+        ULONG activeCount = KeQueryActiveProcessorCountEx(0);
+        if (activeCount == 0)
+        {
+            activeCount = 1;
+        }
+
+        ULONG targetProcessor = request.ProcessorNumber;
+        if (targetProcessor >= activeCount)
+        {
+            targetProcessor = 0;
+        }
+
+        KAFFINITY affinity = (KAFFINITY)1 << targetProcessor;
+        KAFFINITY previousAffinity = KeSetSystemAffinityThreadEx(affinity);
+        ULONG actualProcessor = KeGetCurrentProcessorNumberEx(NULL);
+        ULONG64 value = __readmsr(request.MsrIndex);
+        KeRevertToUserAffinityThreadEx(previousAffinity);
+
+        KNDBG_READ_MSR_RESPONSE* response = reinterpret_cast<KNDBG_READ_MSR_RESPONSE*>(Buffer);
+        response->Size = sizeof(KNDBG_READ_MSR_RESPONSE);
+        response->Flags = 0;
+        response->MsrIndex = request.MsrIndex;
+        response->ProcessorNumber = actualProcessor;
+        response->Value = value;
+
+        information = sizeof(KNDBG_READ_MSR_RESPONSE);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -1812,6 +1904,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_SET_PROCESS_PROTECTION:
         status = KnDbgHandleSetProcessProtection(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_READ_MSR:
+        status = KnDbgHandleReadMsr(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

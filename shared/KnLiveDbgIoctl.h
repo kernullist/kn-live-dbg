@@ -10,9 +10,21 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SERVICE_NAME L"KnLiveDbg"
 #define KNDBG_DISPLAY_NAME L"Kn Live Debug Driver"
 
-#define KNDBG_ABI_VERSION 7u
+#define KNDBG_ABI_VERSION 8u
 #define KNDBG_MAX_TRANSFER_SIZE (1024u * 1024u)
 #define KNDBG_WRITE_ACK_MAGIC 0x4B4E444247574F4Full
+
+// Architectural x64 MSRs exposed read-only through IOCTL_KNDBG_READ_MSR. The
+// driver permits only this fixed whitelist; all of them are always present in
+// x64 long mode, so __readmsr cannot #GP on a permitted index.
+#define KNDBG_MSR_IA32_EFER           0xC0000080u
+#define KNDBG_MSR_IA32_STAR           0xC0000081u
+#define KNDBG_MSR_IA32_LSTAR          0xC0000082u
+#define KNDBG_MSR_IA32_CSTAR          0xC0000083u
+#define KNDBG_MSR_IA32_FMASK          0xC0000084u
+#define KNDBG_MSR_IA32_FS_BASE        0xC0000100u
+#define KNDBG_MSR_IA32_GS_BASE        0xC0000101u
+#define KNDBG_MSR_IA32_KERNEL_GS_BASE 0xC0000102u
 
 #define KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK 0x00000001u
 
@@ -89,6 +101,9 @@ typedef unsigned __int64 KNDBG_UINT64;
 
 #define IOCTL_KNDBG_SET_PROCESS_PROTECTION \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80C, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+
+#define IOCTL_KNDBG_READ_MSR \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80D, METHOD_BUFFERED, FILE_READ_DATA)
 
 // Known _EPROCESS.Protection byte values. The PS_PROTECTION struct packs
 // Signer (high nibble) over Audit (bit 3) over Type (bits 0..2).
@@ -282,5 +297,22 @@ typedef struct _KNDBG_SET_PROCESS_PROTECTION_RESPONSE
     KNDBG_UINT8  Reserved;
     KNDBG_UINT64 EprocessAddress;
 } KNDBG_SET_PROCESS_PROTECTION_RESPONSE;
+
+typedef struct _KNDBG_READ_MSR_REQUEST
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 Flags;
+    KNDBG_UINT32 MsrIndex;        // must be one of the KNDBG_MSR_* whitelist values
+    KNDBG_UINT32 ProcessorNumber; // logical processor to read on (clamped to active count)
+} KNDBG_READ_MSR_REQUEST;
+
+typedef struct _KNDBG_READ_MSR_RESPONSE
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 Flags;
+    KNDBG_UINT32 MsrIndex;
+    KNDBG_UINT32 ProcessorNumber; // processor the value was actually read on
+    KNDBG_UINT64 Value;
+} KNDBG_READ_MSR_RESPONSE;
 
 #pragma pack(pop)

@@ -69,6 +69,7 @@ kn-live-dbg/
 34. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
 35. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
 36. Decodes Windows Notification Facility (WNF) state names with `!wnf` and walks live `_WNF_NAME_INSTANCE` records via two code paths: the legacy `RTL_AVL_TABLE` traversal from `nt!ExpWnfSiloState` (Win10 / early Win11), and a modern LIST_ENTRY heuristic walker that enumerates instance chains hanging off silo-state structures on Win11 builds that have migrated WNF tracking away from `RTL_AVL_TABLE`. The decoder applies the documented `0x41C64E6DA3BC0074` XOR mask to surface Version/Lifetime/DataScope/PermanentData/Sequence/OwnerTag bit fields and optionally dumps the last-published `WNF_STATE_DATA` payload. Three diagnostic subcommands -- `!wnf candidates`, `!wnf lists`, and the runner-up list reporting in `!wnf instances` -- expose the silo discovery and list-shape detection for manual inspection when automatic mode picks the wrong chain.
+37. Inspects the SYSCALL-configuration model-specific registers with `!msrcheck` -- reading `IA32_LSTAR`, `IA32_CSTAR`, `IA32_STAR`, `IA32_FMASK`, and `IA32_EFER` on every active processor through a new read-only `IOCTL_KNDBG_READ_MSR` driver primitive (ABI version 8; the driver permits only a fixed architectural MSR whitelist and pins per-CPU affinity so single-core hooks are visible). It flags `LSTAR` that does not equal `nt!KiSystemCall64`, any per-CPU divergence (the kernel programs these MSRs uniformly), and entry pointers outside the loaded kernel image as possible SYSCALL hooks, while decoding `STAR` selectors and `EFER` bits for inspection. This closes the previously blind SYSCALL-entry attack surface and establishes the read-only CPU-state IOCTL pattern reused by future control-register/IDT/SSDT checks.
 
 ## Design Notes
 
@@ -199,6 +200,7 @@ callbacks [scope] /module <module>
 !securekernel
 !etw [loggers|logger <index|name>|integrity]
 !nmi [callbacks]
+!msrcheck
 !fwtable [providers|provider <signature>]
 !fwtable providers /module <name>
 !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]
@@ -299,6 +301,7 @@ knkd> !etw loggers
 knkd> !etw logger "Circular Kernel Context Logger"
 knkd> !etw integrity
 knkd> !nmi callbacks
+knkd> !msrcheck
 knkd> !fwtable providers
 knkd> !fwtable providers /module WdFilter
 knkd> !fwtable provider ACPI
