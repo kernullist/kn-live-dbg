@@ -115,6 +115,9 @@
     <ClCompile Include="WfpScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="WfpCalloutScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="WnfScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -217,6 +220,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WfpScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WfpCalloutScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WnfScanner.h">

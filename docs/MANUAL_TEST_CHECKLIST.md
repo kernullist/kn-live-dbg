@@ -73,6 +73,23 @@ suspicious row on a clean box is a false positive to fix.
   `!diff baseline` as a cpu-state escalation (value/fingerprint change), and a
   new hook appears as a high-risk added `cpu-state` record.
 
+## WFP kernel callouts
+
+### `!wfp kernelcallouts`
+- On a clean box expect `wfp kernel callouts count=N array=... layout=...` with a
+  plausible count (tens to low hundreds) and no `[SUSPICIOUS]`; most classify
+  pointers resolve into `netio.sys` / `tcpip.sys` / `mpsdrv.sys` / `wfplwfs.sys`
+  / `fwpkclnt`-style modules, with callout name/layer/provider metadata joined.
+- Confirm: (a) `netio!gWfpGlobal` resolves (netio.sys symbols downloaded); if not,
+  the command prints a clean "unresolved" message rather than fabricating; (b)
+  the chosen `layout=` matches one of the documented candidates (or the scored
+  fallback) and the count/array look sane; (c) no false-positive hooks on a clean
+  box. **The netio.sys callout-table offsets are build-dependent** -- if the count
+  is absurd or classify pointers do not resolve into modules, the offsets need RE
+  refinement for this build (compare `dx @$cursession`/WinDbg against
+  `gWfpGlobal` and adjust the candidate layouts in `WfpCalloutScanner.cpp`).
+- Cross-reference callout ids with `!wfp callouts` to confirm the metadata join.
+
 ## M1 - reliability / security
 
 ### Nested `FindField`  (commit 7e102dc)

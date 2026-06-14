@@ -73,6 +73,7 @@ kn-live-dbg/
 38. Inspects the x64 control registers with `!cr` -- reading `CR0`, `CR4`, and `CR8` on every active processor through the read-only `IOCTL_KNDBG_READ_CONTROL_REGISTERS` primitive (ABI version 9; same per-CPU affinity-pinned pattern as `!msrcheck`). It flags `CR0.WP=0` (kernel write-protect disabled, a classic code-patching enabler) and any per-CPU divergence of `CR0`/`CR4` as suspicious, decodes the `CR4` mitigation bits (`SMEP`/`SMAP`/`UMIP`/`LA57`/`CET`/`PKE`), and surfaces `SMEP`/`SMAP` being disabled as a mitigation-weakened note (legacy CPUs may legitimately lack them).
 39. Detects SSDT / shadow-SSDT syscall hooks with `!ssdt` -- walking the native `nt!KeServiceDescriptorTable` (`KiServiceTable`) and, when win32k modules are loaded, the win32k shadow table `nt!KeServiceDescriptorTableShadow[1]` from live kernel memory. Each service routine is decoded with the x64 encoding (`routine = KiServiceTable + (entry >> 4)`) and validated to reside in the expected kernel image -- ntoskrnl for the native table, a `win32k*` module for the shadow table. Routines outside the expected module, or outside every loaded kernel module, are flagged as syscall-hook evidence; clean tables print a one-line summary so only hooked entries are listed. No new driver IOCTL is required: the scanner reuses the existing memory-read primitive plus the PDB-first layout resolver for the `_KSERVICE_TABLE_DESCRIPTOR` Base/Limit fields.
 40. Detects IDT (interrupt descriptor table) hooks with `!idt` -- reading the boot processor IDTR through the read-only `IOCTL_KNDBG_READ_IDT` primitive (ABI version 10; `__sidt` under the same per-CPU affinity-pinned pattern), walking the gate descriptors from live kernel memory, rebuilding each handler from its split offset fields (`OffsetLow | OffsetMiddle << 16 | OffsetHigh << 32`), and flagging any present gate whose handler falls outside every loaded kernel module as interrupt-hook evidence. Clean tables print a one-line summary; per-processor IDT comparison is a future enhancement.
+41. Resolves kernel-mode WFP callout function pointers with `!wfp kernelcallouts` -- the user-mode Base Filtering Engine does not expose the classify/notify/flowDelete pointers, which are the actual hook surface for network filter drivers. The scanner anchors on the public symbol `netio!gWfpGlobal`, scores documented candidate callout-table layouts (e.g. array at `+0x198` with `0x50`-byte slots, or `+0x550` with `0x40`-byte slots; classify at `+0x10`) against live pointers -- the same guarded-fallback discipline used by the firmware-table and WNF scanners, with a bounded offset-scan fallback for build drift -- then walks the callout array, recovers each slot's classify/notify/flowDelete pointers, joins them to the user-mode callout metadata (name/layer/provider) by callout id, and flags any classify target outside every loaded kernel module. No new driver IOCTL is required (it reuses the existing memory-read primitive); netio.sys symbols and an open driver device are required, and the command reports cleanly when the layout cannot be located so offsets can be refined per build.
 
 ## Design Notes
 
@@ -193,6 +194,7 @@ callbacks [scope] /module <module>
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|filters|layers]
+!wfp kernelcallouts
 !wfp callouts /module <name|GUID>
 !wfp filters /layer <name|GUID> /provider <name|GUID>
 !alpc [ports|port|connections|queues] [/name <pattern>] [/pid <pid>]
@@ -293,6 +295,7 @@ knkd> !dml_proc
 knkd> !dml_proc 4
 knkd> !wfp providers
 knkd> !wfp callouts /module tcpip
+knkd> !wfp kernelcallouts
 knkd> !wfp filters /layer ALE_AUTH_CONNECT_V4
 knkd> !wfp layers
 knkd> !alpc ports
