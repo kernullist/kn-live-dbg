@@ -8101,6 +8101,22 @@ static bool BeginTemporaryWritablePageEntry(
             break;
         }
 
+        // Refuse to flip the write bit on a read-only large-page leaf: the
+        // PDPTE/PDE entry governs an entire 1 GB / 2 MB region shared by other
+        // mappings, so temporarily enabling writes there would widen write
+        // access far beyond the target. (An already-writable large page took
+        // the early-out above and is safe.)
+        if (leaf.Name == L"pdpte" || leaf.Name == L"pde")
+        {
+            if (error != nullptr)
+            {
+                *error = L"refusing to write through a read-only large-page (" + leaf.Name +
+                    L") mapping: enabling writes would affect the whole large-page region; "
+                    L"target a 4 KB-mapped address instead";
+            }
+            break;
+        }
+
         uint64_t currentEntry = 0;
         if (!ReadPhysicalQword(device, leaf.PhysicalAddress, &currentEntry, error))
         {
@@ -8371,6 +8387,27 @@ static bool WriteProcessVirtualMemory(
                     {
                         *error = L"PTE restore failed: " + restoreError;
                     }
+                }
+                break;
+            }
+
+            // Read-back verification: confirm the bytes actually landed before
+            // advancing. A silent short or dropped write (e.g. a racing remap
+            // or copy-on-write split) would otherwise pass unnoticed. Reads do
+            // not require the write bit, so this runs after the PTE is restored.
+            std::vector<uint8_t> verifyBytes;
+            std::wstring verifyError;
+            bool verifyRead = writeViaKernelVirtualAddress
+                ? device.ReadMemory(current, chunk, &verifyBytes, &verifyError)
+                : device.ReadPhysical(translation.PhysicalAddress, chunk, &verifyBytes, &verifyError);
+            if (!verifyRead || verifyBytes.size() != pageBytes.size() ||
+                memcmp(verifyBytes.data(), pageBytes.data(), pageBytes.size()) != 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"write verification failed" + writeTargetText +
+                        L": target did not read back the written bytes" +
+                        (verifyError.empty() ? L"" : (L" (" + verifyError + L")"));
                 }
                 break;
             }
@@ -13605,7 +13642,8 @@ static void PrintIdtHelp()
     std::wcout << L"  Each present gate's handler is rebuilt (OffsetLow | Middle<<16 | High<<32) and\n";
     std::wcout << L"  validated to reside in a loaded kernel module. Handlers outside every loaded module\n";
     std::wcout << L"  are flagged as interrupt-hook evidence. Only flagged gates are listed; a clean table\n";
-    std::wcout << L"  prints a one-line summary. Per-processor IDT comparison is a future enhancement.\n";
+    std::wcout << L"  prints a one-line summary. Every active processor's IDT is cross-checked against\n";
+    std::wcout << L"  the boot processor; a per-CPU handler divergence (single-core hook) is flagged.\n";
 }
 
 static void HandleIdtCommand(
