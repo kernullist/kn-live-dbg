@@ -190,7 +190,7 @@ dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 callbacks [scope] /module <module>
-!dml_proc [pid]
+!dml_proc [pid|name]
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|filters|layers]
@@ -293,6 +293,7 @@ knkd> callbacks all WdFilter.sys
 knkd> callbacks /module WdFilter.sys
 knkd> !dml_proc
 knkd> !dml_proc 4
+knkd> !dml_proc lsass
 knkd> !wfp providers
 knkd> !wfp callouts /module tcpip
 knkd> !wfp kernelcallouts
@@ -515,7 +516,7 @@ When `DbgHelp` cannot return a usable UDT layout, the symbol engine tries a DIA 
 !dml_proc [pid]
 ```
 
-The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.ActiveProcessLinks`, then walks the active process list from live kernel memory. If a decimal PID argument is supplied, for example `!dml_proc 4`, only records whose process ID matches that value are printed. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a ready-to-run `dt nt!_EPROCESS <address>` follow-up.
+The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.ActiveProcessLinks`, then walks the active process list from live kernel memory. If a decimal PID argument is supplied, for example `!dml_proc 4`, only records whose process ID matches that value are printed; any other argument, for example `!dml_proc lsass`, is treated as a case-insensitive image-name substring filter and prints only matching processes. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a ready-to-run `dt nt!_EPROCESS <address>` follow-up.
 
 ## Native VAD And Thread Triage
 
