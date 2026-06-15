@@ -240,6 +240,10 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
 
         const LayoutCandidate documented[] =
         {
+            // Win11 (validated on a 26x00-era build): engine struct behind the
+            // pointer at gWfpGlobal, count @ +0x198, array @ +0x1a0, 0x60-byte
+            // slots, classify @ +0x10.
+            { 0x198, 0x1a0, 0x60, 0x10, L"*gWfpGlobal+0x1a0 / 0x60-byte slots / classify +0x10 (Win11)" },
             { 0x190, 0x198, 0x50, 0x10, L"gWfpGlobal+0x198 / 0x50-byte slots / classify +0x10" },
             { 0x548, 0x550, 0x40, 0x10, L"gWfpGlobal+0x550 / 0x40-byte slots / classify +0x10" }
         };
