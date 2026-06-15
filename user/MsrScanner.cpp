@@ -136,10 +136,10 @@ bool MsrScanner::Scan(MsrScanResult* result, std::wstring* error)
 
         *result = MsrScanResult{};
 
-        // Iterate processors in group 0; the driver clamps to the same group's
-        // active count. Multi-group (>64 logical processors) systems are not
-        // fully covered by this first slice.
-        uint32_t cpuCount = static_cast<uint32_t>(GetActiveProcessorCount(0));
+        // Iterate every active logical processor across all groups; the driver
+        // pins to the matching system-wide processor index, so >64-processor
+        // (multi-group) machines are fully covered.
+        uint32_t cpuCount = static_cast<uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
         if (cpuCount == 0)
         {
             cpuCount = 1;

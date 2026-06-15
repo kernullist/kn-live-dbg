@@ -1771,6 +1771,36 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+// Pins the calling thread to the system-wide logical processor 'Index'
+// (across all processor groups) so callers can sample per-CPU register state
+// on machines with more than 64 logical processors. Returns the previous
+// group affinity for the caller to restore via KeRevertToUserGroupAffinityThread;
+// *ActualProcessor receives the processor the thread actually landed on. Must
+// run at PASSIVE_LEVEL.
+static GROUP_AFFINITY KnDbgPinToProcessor(ULONG Index, ULONG* ActualProcessor)
+{
+    PROCESSOR_NUMBER processorNumber = {};
+    if (!NT_SUCCESS(KeGetProcessorNumberFromIndex(Index, &processorNumber)))
+    {
+        RtlZeroMemory(&processorNumber, sizeof(processorNumber));
+        KeGetProcessorNumberFromIndex(0, &processorNumber);
+    }
+
+    GROUP_AFFINITY target = {};
+    target.Group = processorNumber.Group;
+    target.Mask = (KAFFINITY)1 << processorNumber.Number;
+
+    GROUP_AFFINITY previous = {};
+    KeSetSystemGroupAffinityThread(&target, &previous);
+
+    if (ActualProcessor != NULL)
+    {
+        *ActualProcessor = KeGetCurrentProcessorNumberEx(NULL);
+    }
+
+    return previous;
+}
+
 // Reads one architectural MSR on a caller-selected logical processor. This is
 // a read-only primitive: only the fixed SYSCALL/segment MSR whitelist is
 // permitted (all guaranteed present in x64 long mode, so __readmsr cannot
@@ -1827,10 +1857,10 @@ static NTSTATUS KnDbgHandleReadMsr(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buf
 
         RtlZeroMemory(Buffer, outputLength);
 
-        // Pin to the requested processor (clamped to the active count in group
-        // 0) so a per-CPU MSR divergence is observable. The dispatch runs at
-        // PASSIVE_LEVEL, which is required for the affinity migration.
-        ULONG activeCount = KeQueryActiveProcessorCountEx(0);
+        // Pin to the requested system-wide processor (across all groups) so a
+        // per-CPU MSR divergence is observable on >64-processor machines too.
+        // The dispatch runs at PASSIVE_LEVEL, required for affinity migration.
+        ULONG activeCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
         if (activeCount == 0)
         {
             activeCount = 1;
@@ -1842,11 +1872,10 @@ static NTSTATUS KnDbgHandleReadMsr(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buf
             targetProcessor = 0;
         }
 
-        KAFFINITY affinity = (KAFFINITY)1 << targetProcessor;
-        KAFFINITY previousAffinity = KeSetSystemAffinityThreadEx(affinity);
-        ULONG actualProcessor = KeGetCurrentProcessorNumberEx(NULL);
+        ULONG actualProcessor = 0;
+        GROUP_AFFINITY previousAffinity = KnDbgPinToProcessor(targetProcessor, &actualProcessor);
         ULONG64 value = __readmsr(request.MsrIndex);
-        KeRevertToUserAffinityThreadEx(previousAffinity);
+        KeRevertToUserGroupAffinityThread(&previousAffinity);
 
         KNDBG_READ_MSR_RESPONSE* response = reinterpret_cast<KNDBG_READ_MSR_RESPONSE*>(Buffer);
         response->Size = sizeof(KNDBG_READ_MSR_RESPONSE);
@@ -1893,7 +1922,7 @@ static NTSTATUS KnDbgHandleReadControlRegisters(PIRP Irp, PIO_STACK_LOCATION Sta
 
         RtlZeroMemory(Buffer, outputLength);
 
-        ULONG activeCount = KeQueryActiveProcessorCountEx(0);
+        ULONG activeCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
         if (activeCount == 0)
         {
             activeCount = 1;
@@ -1905,15 +1934,14 @@ static NTSTATUS KnDbgHandleReadControlRegisters(PIRP Irp, PIO_STACK_LOCATION Sta
             targetProcessor = 0;
         }
 
-        KAFFINITY affinity = (KAFFINITY)1 << targetProcessor;
-        KAFFINITY previousAffinity = KeSetSystemAffinityThreadEx(affinity);
-        ULONG actualProcessor = KeGetCurrentProcessorNumberEx(NULL);
+        ULONG actualProcessor = 0;
+        GROUP_AFFINITY previousAffinity = KnDbgPinToProcessor(targetProcessor, &actualProcessor);
         ULONG64 cr0 = __readcr0();
         ULONG64 cr2 = __readcr2();
         ULONG64 cr3 = __readcr3();
         ULONG64 cr4 = __readcr4();
         ULONG64 cr8 = __readcr8();
-        KeRevertToUserAffinityThreadEx(previousAffinity);
+        KeRevertToUserGroupAffinityThread(&previousAffinity);
 
         KNDBG_READ_CR_RESPONSE* response = reinterpret_cast<KNDBG_READ_CR_RESPONSE*>(Buffer);
         response->Size = sizeof(KNDBG_READ_CR_RESPONSE);
@@ -1970,7 +1998,7 @@ static NTSTATUS KnDbgHandleReadIdt(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buf
 
         RtlZeroMemory(Buffer, outputLength);
 
-        ULONG activeCount = KeQueryActiveProcessorCountEx(0);
+        ULONG activeCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
         if (activeCount == 0)
         {
             activeCount = 1;
@@ -1982,12 +2010,11 @@ static NTSTATUS KnDbgHandleReadIdt(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buf
             targetProcessor = 0;
         }
 
-        KAFFINITY affinity = (KAFFINITY)1 << targetProcessor;
-        KAFFINITY previousAffinity = KeSetSystemAffinityThreadEx(affinity);
-        ULONG actualProcessor = KeGetCurrentProcessorNumberEx(NULL);
+        ULONG actualProcessor = 0;
+        GROUP_AFFINITY previousAffinity = KnDbgPinToProcessor(targetProcessor, &actualProcessor);
         KNDBG_IDTR_RAW idtr = {};
         __sidt(&idtr);
-        KeRevertToUserAffinityThreadEx(previousAffinity);
+        KeRevertToUserGroupAffinityThread(&previousAffinity);
 
         KNDBG_READ_IDT_RESPONSE* response = reinterpret_cast<KNDBG_READ_IDT_RESPONSE*>(Buffer);
         response->Size = sizeof(KNDBG_READ_IDT_RESPONSE);
