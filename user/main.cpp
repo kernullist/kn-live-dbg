@@ -11629,6 +11629,16 @@ static void HandleWfpKernelCalloutsCommand(
         }
         std::wcout << L"\n";
 
+        // Report the resolved engine base and the offsets that validated, so a
+        // fallback-scan layout can be pinned as a documented candidate.
+        std::wcout << L"  gWfpGlobal=" << HexTextWidth(result.GlobalSymbol, 16, true)
+                   << L" engine=" << HexTextWidth(result.EngineBase, 16, true)
+                   << (result.EngineFromPointer ? L" [deref]" : L" [direct]") << L"\n";
+        std::wcout << L"  offsets: count@+0x" << std::hex << result.CountOffset
+                   << L" array@+0x" << result.ArrayOffset
+                   << L" entry=0x" << result.EntrySize
+                   << L" classify@+0x" << result.ClassifyOffset << std::dec << L"\n";
+
         for (const WfpKernelCallout& callout : result.Callouts)
         {
             std::wcout << L"  ";

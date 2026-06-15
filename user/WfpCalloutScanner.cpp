@@ -311,6 +311,9 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
         result->Count = bestCount;
         result->EntrySize = bestLayout.EntrySize;
         result->ClassifyOffset = bestLayout.ClassifyOffset;
+        result->CountOffset = bestLayout.CountOffset;
+        result->ArrayOffset = bestLayout.ArrayOffset;
+        result->EngineFromPointer = (bestBase != globalSymbol);
         result->LayoutSource = bestLayout.Source;
         result->Resolved = true;
 
