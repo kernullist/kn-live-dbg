@@ -40,6 +40,9 @@ struct WfpCalloutScanResult
     uint32_t Count = 0;          // callout slot count
     uint32_t EntrySize = 0;      // bytes per callout slot
     uint32_t ClassifyOffset = 0; // classifyFn offset within a slot
+    uint32_t CountOffset = 0;    // count field offset within the engine struct
+    uint32_t ArrayOffset = 0;    // array-pointer offset within the engine struct
+    bool EngineFromPointer = false; // true if engine base came from *gWfpGlobal
     std::wstring LayoutSource;   // which candidate layout validated
     std::vector<WfpKernelCallout> Callouts;
     std::vector<std::wstring> Warnings;
