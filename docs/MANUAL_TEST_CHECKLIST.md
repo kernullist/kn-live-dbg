@@ -116,13 +116,28 @@ suspicious row on a clean box is a false positive to fix.
   install a self-removing hook; until then, validation relies on the clean-box
   negative result plus code review of the suspicion logic.
 
-## Deferred (implement, then add tests here)
+## Write-path safety (C5/C6)
 
-- C5/C6 kernel write-path: read-back verification and large-page write
-  fail-fast (write path - validate in VM as it is implemented).
-- 1B `IsValidKernelPointer` retrofits (VAD node / trustlet EPROCESS / WNF).
-- Per-processor IDT comparison; control-register `!cr` on >64-logical-processor
-  (multi-group) systems; SSDT/MSR coverage on multi-group systems.
+- **Read-back verification (C5):** a normal `e*` / `eb`/`eq` write to a 4 KB-mapped
+  address still succeeds and the value is confirmed (a silent dropped write now
+  surfaces as `write verification failed ...`). Smoke test with `write on` then
+  e.g. `eb <writable-kernel-or-process-addr> AA` and confirm the byte reads back.
+- **Large-page write fail-fast (C6):** writing through a read-only large-page
+  (2 MB/1 GB) mapping is refused with `refusing to write through a read-only
+  large-page (pde|pdpte) mapping ...` instead of flipping a shared parent
+  entry's write bit. (Hard to trigger on demand; verify the message appears if a
+  large-page target is hit, and that normal 4 KB writes are unaffected.)
+
+## Deferred
+
+- 1B `IsValidKernelPointer` retrofits -- assessed low value: the existing
+  `>= 0xffff800000000000` canonical check is already correct for LA48, data-
+  pointer dereferences fail safely through the driver's MmCopyMemory, and code-
+  pointer module containment already exists per-scanner via FindOwningModule. A
+  shared helper would be a DRY refactor, not new detection. Revisit only if
+  consolidating the duplicated containment checks.
+- GDT integrity (`!gdt`); WMI/TraceLogging provider scanner; tool self-protection
+  (randomized device/service names, IOCTL session nonce, driver self-integrity).
 
 See also the plan at
 `C:\Users\kernulist\.claude\plans\crispy-sauteeing-sky.md`.
