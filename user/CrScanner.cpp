@@ -69,7 +69,7 @@ bool CrScanner::Scan(CrScanResult* result, std::wstring* error)
 
         *result = CrScanResult{};
 
-        uint32_t cpuCount = static_cast<uint32_t>(GetActiveProcessorCount(0));
+        uint32_t cpuCount = static_cast<uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
         if (cpuCount == 0)
         {
             cpuCount = 1;

@@ -188,6 +188,94 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
             result->Entries.push_back(entry);
         }
 
+        // Cross-check every other active processor's IDT against the BSP. The
+        // kernel programs identical handlers on every core, so a per-CPU
+        // handler divergence is a single-core interrupt-hook signal. Per-CPU
+        // IDT bases legitimately differ, so only handler values are compared.
+        uint32_t cpuCount = static_cast<uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+        if (cpuCount > 256)
+        {
+            cpuCount = 256;
+        }
+
+        for (uint32_t cpu = 1; cpu < cpuCount; ++cpu)
+        {
+            IdtInfo other = {};
+            std::wstring otherError;
+            if (!device_.ReadIdt(cpu, &other, &otherError))
+            {
+                result->Warnings.push_back(L"failed to read IDTR on cpu " + std::to_wstring(cpu) + L": " + otherError);
+                continue;
+            }
+
+            if (!IsKernelAddress(other.Base))
+            {
+                continue;
+            }
+
+            uint32_t otherCount = (other.Limit + 1u) / kIdtEntrySize;
+            if (otherCount == 0)
+            {
+                continue;
+            }
+            if (otherCount > entryCount)
+            {
+                otherCount = entryCount;
+            }
+
+            std::vector<uint8_t> otherBytes;
+            uint32_t otherTableBytes = otherCount * kIdtEntrySize;
+            if (!device_.ReadMemory(other.Base, otherTableBytes, &otherBytes, nullptr) || otherBytes.size() != otherTableBytes)
+            {
+                result->Warnings.push_back(L"failed to read IDT entries on cpu " + std::to_wstring(cpu));
+                continue;
+            }
+
+            ++result->ProcessorsCompared;
+
+            for (uint32_t vector = 0; vector < otherCount && vector < result->Entries.size(); ++vector)
+            {
+                IdtEntry& base = result->Entries[vector];
+                if (!base.Present)
+                {
+                    continue;
+                }
+
+                const uint8_t* p = otherBytes.data() + (static_cast<size_t>(vector) * kIdtEntrySize);
+                uint16_t offsetLow = ReadU16(p + 0);
+                uint16_t offsetMid = ReadU16(p + 6);
+                uint32_t offsetHigh = ReadU32(p + 8);
+                uint64_t handler = static_cast<uint64_t>(offsetLow) |
+                                   (static_cast<uint64_t>(offsetMid) << 16) |
+                                   (static_cast<uint64_t>(offsetHigh) << 32);
+
+                if (handler == base.Handler)
+                {
+                    continue;
+                }
+
+                if (!base.Divergent)
+                {
+                    base.Divergent = true;
+                    ++result->DivergentCount;
+                    if (!base.Suspicious)
+                    {
+                        base.Suspicious = true;
+                        ++result->SuspiciousCount;
+                        result->AnySuspicious = true;
+                    }
+                }
+
+                std::wstringstream note;
+                note << L"handler differs on cpu " << cpu << L" (0x" << std::hex << handler << L")";
+                if (!base.Notes.empty())
+                {
+                    base.Notes += L"; ";
+                }
+                base.Notes += note.str();
+            }
+        }
+
         ok = true;
     } while (false);
 

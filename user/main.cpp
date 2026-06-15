@@ -13665,18 +13665,28 @@ static void HandleIdtCommand(
         PrintColoredText(L"idt", KNDBG_COLOR_TITLE);
         std::wcout << L" cpu=" << std::dec << result.ProcessorNumber
                    << L" base=" << HexTextWidth(result.IdtBase, 16, true)
-                   << L" entries=" << std::dec << result.EntryCount;
+                   << L" entries=" << std::dec << result.EntryCount
+                   << L" cpus-compared=" << std::dec << (result.ProcessorsCompared + 1);
         if (result.AnySuspicious)
         {
             std::wcout << L" ";
             PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
             std::wcout << L" hooks=" << std::dec << result.SuspiciousCount;
+            if (result.DivergentCount > 0)
+            {
+                std::wcout << L" divergent=" << std::dec << result.DivergentCount;
+            }
         }
         std::wcout << L"\n";
 
         if (!result.AnySuspicious)
         {
-            std::wcout << L"  all present interrupt handlers resolve into loaded kernel modules\n";
+            std::wcout << L"  all present interrupt handlers resolve into loaded kernel modules";
+            if (result.ProcessorsCompared > 0)
+            {
+                std::wcout << L" and match across all " << std::dec << (result.ProcessorsCompared + 1) << L" processors";
+            }
+            std::wcout << L"\n";
         }
 
         for (const IdtEntry& entry : result.Entries)
