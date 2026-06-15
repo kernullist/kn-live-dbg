@@ -1747,7 +1747,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  memory        procctx <pid> | vtop /process <pid> <user-address> | pdb <pa> 80\n";
     std::wcout << L"  types/code    dt nt!_EPROCESS <address> | u nt!KiSystemCall64 8 | uf nt!KiSystemCall64 512\n";
     std::wcout << L"  callbacks     callbacks all | callbacks imageload | callbacks process WdFilter.sys\n";
-    std::wcout << L"  process       !dml_proc [pid] | !vad <pid> /exec /private | !threads <pid> /apc\n";
+    std::wcout << L"  process       !dml_proc [pid|name] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
     std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
@@ -6969,16 +6969,24 @@ static bool DmlProcessAlreadyVisited(const std::vector<uint64_t>& visited, uint6
     return std::find(visited.begin(), visited.end(), entry) != visited.end();
 }
 
-static bool DmlProcessMatchesFilter(const DmlProcessRecord& record, bool hasPidFilter, uint64_t pidFilter)
+static bool DmlProcessMatchesFilter(
+    const DmlProcessRecord& record,
+    bool hasPidFilter,
+    uint64_t pidFilter,
+    const std::wstring& nameFilter)
 {
-    bool matched = true;
-
     if (hasPidFilter)
     {
-        matched = record.ProcessId == pidFilter;
+        return record.ProcessId == pidFilter;
     }
 
-    return matched;
+    if (!nameFilter.empty())
+    {
+        // Case-insensitive substring match against the image name.
+        return ToLower(record.ImageName).find(ToLower(nameFilter)) != std::wstring::npos;
+    }
+
+    return true;
 }
 
 static bool ParseDmlProcessPidFilter(const std::wstring& value, uint64_t* pid)
@@ -7812,6 +7820,8 @@ static void HandleDiffCommand(
     } while (false);
 }
 
+static void PrintDmlProcHelp();
+
 static void HandleDmlProcCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -7824,21 +7834,36 @@ static void HandleDmlProcCommand(
     {
         if (args.size() > 2)
         {
-            std::wcerr << L"usage: !dml_proc [pid]\n";
+            std::wcerr << L"usage: !dml_proc [pid|name]\n";
             break;
         }
 
         bool hasPidFilter = false;
         uint64_t pidFilter = 0;
+        std::wstring nameFilter;
         if (args.size() == 2)
         {
-            if (!ParseDmlProcessPidFilter(args[1], &pidFilter))
+            if (HasHelpToken(args, 1))
             {
-                std::wcerr << L"invalid process id\n";
+                PrintDmlProcHelp();
                 break;
             }
 
-            hasPidFilter = true;
+            if (ParseDmlProcessPidFilter(args[1], &pidFilter))
+            {
+                hasPidFilter = true;
+            }
+            else if (IsSwitchLikeToken(args[1]))
+            {
+                std::wcerr << L"usage: !dml_proc [pid|name]\n";
+                break;
+            }
+            else
+            {
+                // A non-decimal argument is a case-insensitive image-name
+                // substring filter, e.g. !dml_proc lsass.
+                nameFilter = args[1];
+            }
         }
 
         DmlProcessCollection collection = {};
@@ -7855,7 +7880,7 @@ static void HandleDmlProcCommand(
         PrintDmlProcessHeader();
         for (const DmlProcessRecord& record : collection.Records)
         {
-            if (DmlProcessMatchesFilter(record, hasPidFilter, pidFilter))
+            if (DmlProcessMatchesFilter(record, hasPidFilter, pidFilter, nameFilter))
             {
                 PrintDmlProcessRecord(record);
                 ++count;
@@ -7874,6 +7899,12 @@ static void HandleDmlProcCommand(
             std::wcout << L" ";
             PrintColoredText(L"pid", KNDBG_COLOR_ACCENT);
             std::wcout << L"=" << std::dec << pidFilter;
+        }
+        else if (!nameFilter.empty())
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"name", KNDBG_COLOR_ACCENT);
+            std::wcout << L"=" << nameFilter;
         }
         if (collection.Truncated)
         {
@@ -10769,7 +10800,7 @@ static void PrintStartupTui(
     PrintTuiLine(L"  dt nt!_EPROCESS <addr>   dq nt!PsLoadedModuleList 8", KNDBG_COLOR_DIM);
     PrintTuiLine(L"  vtop <addr>              pdb <physical-address> 80", KNDBG_COLOR_DIM);
     PrintTuiLine(L"  u nt!KiSystemCall64 8    uf nt!KiSystemCall64", KNDBG_COLOR_DIM);
-    PrintTuiLine(L"  !dml_proc [pid]          backend native", KNDBG_COLOR_DIM);
+    PrintTuiLine(L"  !dml_proc [pid|name]     backend native", KNDBG_COLOR_DIM);
     PrintTuiRule();
     PrintTuiLine(L"Type home to redraw this screen. Type q, quit, or exit to unload and leave.", KNDBG_COLOR_WARN);
     PrintTuiRule();
@@ -18545,15 +18576,17 @@ static void PrintWriteHelp()
 static void PrintDmlProcHelp()
 {
     std::wcout << L"!dml_proc command:\n";
-    std::wcout << L"  !dml_proc [pid]\n";
+    std::wcout << L"  !dml_proc [pid|name]\n";
     std::wcout << L"\n";
     std::wcout << L"subcommands/options:\n";
-    std::wcout << L"  pid   optional decimal process ID filter, for example !dml_proc 4\n";
+    std::wcout << L"  pid    optional decimal process ID filter, for example !dml_proc 4\n";
+    std::wcout << L"  name   optional case-insensitive image-name substring, for example !dml_proc lsass\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Native process listing that does not require a DbgEng current process/thread.\n";
     std::wcout << L"  The all-process form resolves PID 4, then walks _EPROCESS.ActiveProcessLinks.\n";
-    std::wcout << L"  With a PID argument, only matching process records are printed.\n";
+    std::wcout << L"  A decimal argument filters by PID; any other argument is an image-name substring.\n";
+    std::wcout << L"  With a PID or name argument, only matching process records are printed.\n";
     std::wcout << L"  Output includes EPROCESS, PID, parent PID, active thread count, DTB, and image name.\n";
 }
 
@@ -22044,7 +22077,7 @@ static bool ValidateAiPlanArgumentShape(
             {
                 if (reason != nullptr)
                 {
-                    *reason = L"!dml_proc accepts at most one decimal PID argument";
+                    *reason = L"!dml_proc accepts at most one PID or name argument";
                 }
                 break;
             }
@@ -22052,11 +22085,14 @@ static bool ValidateAiPlanArgumentShape(
             if (args.size() == 2)
             {
                 uint64_t pid = 0;
-                if (!ParseDmlProcessPidFilter(args[1], &pid))
+                std::wstring unsafeReason;
+                if (!ParseDmlProcessPidFilter(args[1], &pid) &&
+                    (ContainsUnsafeAiCommandCharacters(args[1], &unsafeReason) ||
+                     IsHelpToken(args[1]) || IsSwitchLikeToken(args[1])))
                 {
                     if (reason != nullptr)
                     {
-                        *reason = L"!dml_proc PID argument must be a decimal process ID";
+                        *reason = L"!dml_proc argument must be a decimal PID or a plain image-name substring";
                     }
                     break;
                 }
