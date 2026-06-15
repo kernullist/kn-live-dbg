@@ -126,3 +126,17 @@ suspicious row on a clean box is a false positive to fix.
 
 See also the plan at
 `C:\Users\kernulist\.claude\plans\crispy-sauteeing-sky.md`.
+
+## Validation log
+
+- **2026-06-15, Windows 11 (4 logical processors), test-signing VM** -- all
+  CPU-state commands returned false-positive 0 on a clean box:
+  - `!idt`: 256 entries, all present handlers in loaded modules.
+  - `!ssdt`: native 489 routines in ntoskrnl.exe; win32k shadow 1493 in win32k*.
+  - `!cr`: CR0.WP=1, CR4 SMEP/SMAP/UMIP=1, LA57=0, no per-CPU divergence.
+  - `!msrcheck`: LSTAR=KiSystemCall64, CSTAR=KiSystemCall32, EFER SCE=1.
+  - `!wfp kernelcallouts`: 86 callouts resolved with classify symbols and
+    name/layer/provider metadata (tcpip/Ndu/mpsdrv/wtd/WdNisDrv). The build's
+    callout layout was engine=`*gWfpGlobal` (deref), count@+0x198, array@+0x1a0,
+    0x60-byte slots, classify@+0x10 -- now pinned as the first documented
+    candidate, so subsequent runs hit the fast path without the fallback scan.
