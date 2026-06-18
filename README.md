@@ -529,10 +529,16 @@ memory. `/quick` keeps the scan to cheaper process/VAD/module/thread signals,
 while `/deep` adds executable live-vs-disk page comparison, hidden executable PTE
 checks when VAD coverage is reliable, modified-page execution correlation, local
 BYOVD exact-hash catalog matching, Gentlemen-style EDR-killer driver-name IOC
-correlation, suffix-normalized Gentlemen EDR-killer process-name matching,
-SCM driver-service IOC correlation, `_DRIVER_OBJECT` dispatch/start integrity
-checks, and recent `!ti` ring correlation for strong Gentlemen process/staging
-indicators that performed driver I/O or repeated process-impairment activity.
+correlation, context-gated suffix-normalized Gentlemen EDR-killer process-name
+matching, SCM driver-service IOC correlation, `_DRIVER_OBJECT`
+dispatch/start integrity checks, and recent `!ti` ring correlation for strong
+Gentlemen process/staging indicators that performed driver I/O or repeated
+process-impairment activity. The TI correlation path also raises a behavioral
+finding when one caller repeatedly controls or terminates known security-product
+processes from the GentleKiller target list, even if the caller name was changed.
+Process-profile findings include bounded on-disk metadata evidence for the ESET
+evasion layer: Authenticode trust state, version strings, original filename,
+file description, and icon-resource presence.
 Deep stack correlation uses
 a per-process stack-pointer cache, so JSON findings for modified executable pages
 include `stack_reference_cache_samples` and `stack_reference_cache_limited`

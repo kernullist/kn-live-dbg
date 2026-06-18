@@ -5,6 +5,7 @@
 
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <WinTrust.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -134,10 +135,12 @@ namespace
     struct EdrKillerProcessProfile
     {
         const wchar_t* ImageName;
+        const wchar_t* SuffixBase;
         const wchar_t* Family;
         const wchar_t* Tool;
         bool StrongNameSignal;
         bool CredentialTool;
+        bool SuffixContextRequired;
     };
 
     struct EdrKillerDriverProfile
@@ -164,6 +167,28 @@ namespace
         bool Running = false;
     };
 
+    struct VersionTranslation
+    {
+        WORD Language;
+        WORD CodePage;
+    };
+
+    struct ImageMetadataRecord
+    {
+        bool VersionInfoPresent = false;
+        bool SignatureChecked = false;
+        bool SignaturePresent = false;
+        bool SignatureValid = false;
+        bool IconResourcePresent = false;
+        LONG SignatureStatus = 0;
+        std::wstring FilePath;
+        std::wstring FileVersion;
+        std::wstring CompanyName;
+        std::wstring ProductName;
+        std::wstring OriginalFilename;
+        std::wstring FileDescription;
+    };
+
     struct ThreatIntelCorrelationBucket
     {
         uint32_t ProcessId = 0;
@@ -174,12 +199,16 @@ namespace
         const EdrKillerProcessProfile* Profile = nullptr;
         bool GentlemenStagingPath = false;
         bool SuffixNormalizedProfile = false;
+        bool SuffixContextRequired = false;
         std::wstring NormalizedProfileBase;
         uint64_t DriverIoCount = 0;
         uint64_t ProcessImpairmentCount = 0;
+        uint64_t SecurityProductImpairmentCount = 0;
         std::set<uint32_t> TargetProcessIds;
+        std::set<std::wstring> SecurityProductTargetNames;
         HuntTelemetryEvent FirstDriverIoEvent;
         HuntTelemetryEvent FirstProcessImpairmentEvent;
+        HuntTelemetryEvent FirstSecurityProductImpairmentEvent;
     };
 
     struct SectionBackingLayout
@@ -368,80 +397,115 @@ namespace
         return stem;
     }
 
-    std::wstring NormalizeGentlemenSuffixStem(const std::wstring& leaf)
+    bool GentlemenSuffixTailIsValid(const std::wstring& tail)
     {
-        std::wstring stem = StemWithoutExeExtension(leaf);
-
-        for (;;)
-        {
-            bool changed = false;
-            if (EndsWithText(stem, L"light"))
-            {
-                stem.resize(stem.size() - 5);
-                changed = true;
-            }
-            else if (EndsWithText(stem, L"clear"))
-            {
-                stem.resize(stem.size() - 5);
-                changed = true;
-            }
-            else if (!stem.empty() && (stem.back() == L'1' || stem.back() == L'2'))
-            {
-                stem.pop_back();
-                changed = true;
-            }
-
-            if (!changed)
-            {
-                break;
-            }
-        }
-
-        return stem;
-    }
-
-    bool CanUseGentlemenSuffixNormalizedBase(const std::wstring& stem)
-    {
-        bool usable = false;
+        bool valid = false;
 
         do
         {
-            if (stem.size() < 4)
+            if (tail.empty())
             {
                 break;
             }
 
-            usable = true;
+            size_t offset = 0;
+            while (offset < tail.size())
+            {
+                std::wstring remaining = tail.substr(offset);
+                if (remaining.rfind(L"light", 0) == 0)
+                {
+                    offset += 5;
+                }
+                else if (remaining.rfind(L"clear", 0) == 0)
+                {
+                    offset += 5;
+                }
+                else if (tail[offset] == L'1' || tail[offset] == L'2')
+                {
+                    ++offset;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            valid = offset == tail.size();
         } while (false);
 
-        return usable;
+        return valid;
+    }
+
+    bool GentlemenSuffixPatternMatches(
+        const std::wstring& leaf,
+        const wchar_t* suffixBase,
+        std::wstring* normalizedBase)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (suffixBase == nullptr || suffixBase[0] == L'\0')
+            {
+                break;
+            }
+
+            std::wstring stem = StemWithoutExeExtension(leaf);
+            std::wstring base = HuntToLower(suffixBase);
+            if (stem.size() <= base.size())
+            {
+                break;
+            }
+
+            if (stem.compare(0, base.size(), base) != 0)
+            {
+                break;
+            }
+
+            std::wstring tail = stem.substr(base.size());
+            if (!GentlemenSuffixTailIsValid(tail))
+            {
+                break;
+            }
+
+            if (normalizedBase != nullptr)
+            {
+                *normalizedBase = base;
+            }
+            matched = true;
+        } while (false);
+
+        return matched;
     }
 
     const EdrKillerProcessProfile* FindEdrKillerProcessProfileByLeaf(
         const std::wstring& leaf,
         bool* suffixNormalized = nullptr,
-        std::wstring* normalizedBase = nullptr)
+        std::wstring* normalizedBase = nullptr,
+        bool* suffixContextRequired = nullptr)
     {
         const EdrKillerProcessProfile* profile = nullptr;
 
         static const EdrKillerProcessProfile kProfiles[] =
         {
-            { L"kasps.exe", L"GentleKiller", L"Kaspersky variant", true, false },
-            { L"faceit1.exe", L"GentleKiller", L"FACEIT Anti-Cheat variant", true, false },
-            { L"valorant2.exe", L"GentleKiller", L"Valorant variant", true, false },
-            { L"easolo2light.exe", L"GentleKiller", L"Javelin variant", true, false },
-            { L"easolo1clear.exe", L"GentleKiller", L"Javelin variant", true, false },
-            { L"eaanticheatlight.exe", L"GentleKiller", L"Javelin variant", true, false },
-            { L"bitd1.exe", L"GentleKiller", L"WatchDog variant", true, false },
-            { L"mb2.exe", L"GentleKiller", L"Network Blocker variant", true, false },
-            { L"deletor.exe", L"GentleKiller", L"Cleaner variant", true, false },
-            { L"symantec.exe", L"GentleKiller", L"G11 variant", false, false },
-            { L"avast.exe", L"HexKiller", L"HexKiller with Gentlemen evasion layer", false, false },
-            { L"sent.exe", L"ThrottleBlood", L"ThrottleBlood with Gentlemen evasion layer", true, false },
-            { L"sophos.exe", L"HavocKiller", L"HavocKiller with Gentlemen evasion layer", false, false },
-            { L"hwaudkiller.exe", L"HavocKiller", L"HavocKiller", true, false },
-            { L"buildx641.exe", L"OxideHarvest", L"credential stealer", true, true },
-            { L"buildx64.exe", L"OxideHarvest", L"credential stealer", true, true }
+            { L"kasps.exe", L"kasps", L"GentleKiller", L"Kaspersky variant", true, false, false },
+            { L"kasp1.exe", L"kasp", L"GentleKiller", L"Kaspersky variant", true, false, false },
+            { L"faceit1.exe", L"faceit", L"GentleKiller", L"FACEIT Anti-Cheat variant", true, false, false },
+            { L"valorant2.exe", L"valorant", L"GentleKiller", L"Valorant variant", true, false, false },
+            { L"easolo2light.exe", L"easolo", L"GentleKiller", L"Javelin variant", true, false, false },
+            { L"easolo1clear.exe", L"easolo", L"GentleKiller", L"Javelin variant", true, false, false },
+            { L"eaanticheatlight.exe", L"eaanticheat", L"GentleKiller", L"Javelin variant", true, false, false },
+            { L"bitd1.exe", L"bitd", L"GentleKiller", L"WatchDog variant", true, false, false },
+            { L"mb2.exe", L"mb", L"GentleKiller", L"Network Blocker variant", true, false, true },
+            { L"deletor.exe", nullptr, L"GentleKiller", L"Cleaner variant", true, false, false },
+            { L"g11.exe", L"g11", L"GentleKiller", L"G11 variant", true, false, true },
+            { L"symantec.exe", L"symantec", L"GentleKiller", L"G11 variant", false, false, false },
+            { L"avast.exe", L"avast", L"HexKiller", L"HexKiller with Gentlemen evasion layer", false, false, false },
+            { L"sent.exe", L"sent", L"ThrottleBlood", L"ThrottleBlood with Gentlemen evasion layer", true, false, false },
+            { L"sophos.exe", L"sophos", L"HavocKiller", L"HavocKiller with Gentlemen evasion layer", false, false, false },
+            { L"hwaudkiller.exe", L"hwaudkiller", L"HavocKiller", L"HavocKiller", true, false, false },
+            { L"buildx641.exe", nullptr, L"OxideHarvest", L"credential stealer", true, true, false },
+            { L"buildx64.exe", nullptr, L"OxideHarvest", L"credential stealer", true, true, false }
         };
 
         do
@@ -459,6 +523,10 @@ namespace
             {
                 normalizedBase->clear();
             }
+            if (suffixContextRequired != nullptr)
+            {
+                *suffixContextRequired = false;
+            }
 
             for (const EdrKillerProcessProfile& item : kProfiles)
             {
@@ -474,14 +542,6 @@ namespace
                 break;
             }
 
-            std::wstring candidateBase = NormalizeGentlemenSuffixStem(leaf);
-            if (candidateBase.empty() ||
-                candidateBase == StemWithoutExeExtension(leaf) ||
-                !CanUseGentlemenSuffixNormalizedBase(candidateBase))
-            {
-                break;
-            }
-
             for (const EdrKillerProcessProfile& item : kProfiles)
             {
                 if (item.CredentialTool)
@@ -489,13 +549,8 @@ namespace
                     continue;
                 }
 
-                std::wstring profileBase = NormalizeGentlemenSuffixStem(item.ImageName);
-                if (!CanUseGentlemenSuffixNormalizedBase(profileBase))
-                {
-                    continue;
-                }
-
-                if (candidateBase == profileBase)
+                std::wstring candidateBase;
+                if (GentlemenSuffixPatternMatches(leaf, item.SuffixBase, &candidateBase))
                 {
                     profile = &item;
                     if (suffixNormalized != nullptr)
@@ -505,6 +560,10 @@ namespace
                     if (normalizedBase != nullptr)
                     {
                         *normalizedBase = candidateBase;
+                    }
+                    if (suffixContextRequired != nullptr)
+                    {
+                        *suffixContextRequired = item.SuffixContextRequired;
                     }
                     break;
                 }
@@ -523,10 +582,12 @@ namespace
             { L"eb.sys", L"GentleKiller", L"Kaspersky variant custom rootkit", true },
             { L"nseckrnl.sys", L"GentleKiller", L"NSecsoft NSecKrnl driver", true },
             { L"vgk.sys", L"GentleKiller", L"Tower of Fantasy AntiCheat driver", false },
+            { L"gamedriverx64.sys", L"GentleKiller", L"Tower of Fantasy AntiCheat driver", false },
             { L"stpm_old.sys", L"GentleKiller", L"Safetica Process Monitor driver", true },
             { L"stpm_new.sys", L"GentleKiller", L"Safetica Process Monitor driver", true },
             { L"dmx.sys", L"GentleKiller", L"Zemana WatchDog driver", true },
             { L"360netmon_wfp.sys", L"GentleKiller", L"Qihoo 360 network monitor driver", false },
+            { L"360netmon.sys", L"GentleKiller", L"Qihoo 360 network monitor driver", false },
             { L"imfforcedelete", L"GentleKiller", L"IObit IMF ForceDelete filter driver", true },
             { L"g11.sys", L"GentleKiller", L"PoisonX rootkit", true },
             { L"googleapiutil64.sys", L"HexKiller", L"Baidu Antivirus BdApi driver", true },
@@ -565,7 +626,8 @@ namespace
         const HuntProcessRecord& process,
         std::wstring* matchedLeaf,
         bool* suffixNormalized = nullptr,
-        std::wstring* normalizedBase = nullptr)
+        std::wstring* normalizedBase = nullptr,
+        bool* suffixContextRequired = nullptr)
     {
         const EdrKillerProcessProfile* profile = nullptr;
 
@@ -578,6 +640,10 @@ namespace
             if (normalizedBase != nullptr)
             {
                 normalizedBase->clear();
+            }
+            if (suffixContextRequired != nullptr)
+            {
+                *suffixContextRequired = false;
             }
 
             std::vector<std::wstring> candidates =
@@ -600,10 +666,12 @@ namespace
 
                 bool localSuffixNormalized = false;
                 std::wstring localNormalizedBase;
+                bool localSuffixContextRequired = false;
                 profile = FindEdrKillerProcessProfileByLeaf(
                     leaf,
                     &localSuffixNormalized,
-                    &localNormalizedBase);
+                    &localNormalizedBase,
+                    &localSuffixContextRequired);
                 if (profile != nullptr)
                 {
                     if (matchedLeaf != nullptr)
@@ -617,6 +685,10 @@ namespace
                     if (normalizedBase != nullptr)
                     {
                         *normalizedBase = localNormalizedBase;
+                    }
+                    if (suffixContextRequired != nullptr)
+                    {
+                        *suffixContextRequired = localSuffixContextRequired;
                     }
                     break;
                 }
@@ -3586,6 +3658,368 @@ namespace
         return path;
     }
 
+    bool QueryVersionString(
+        const std::vector<uint8_t>& buffer,
+        WORD language,
+        WORD codePage,
+        const std::wstring& name,
+        std::wstring* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr)
+            {
+                break;
+            }
+
+            wchar_t subBlock[128] = {};
+            swprintf_s(
+                subBlock,
+                L"\\StringFileInfo\\%04x%04x\\%s",
+                language,
+                codePage,
+                name.c_str());
+
+            wchar_t* rawValue = nullptr;
+            UINT rawSize = 0;
+            if (!VerQueryValueW(
+                    const_cast<uint8_t*>(buffer.data()),
+                    subBlock,
+                    reinterpret_cast<LPVOID*>(&rawValue),
+                    &rawSize) ||
+                rawValue == nullptr ||
+                rawSize == 0)
+            {
+                break;
+            }
+
+            value->assign(rawValue);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void ReadVersionString(
+        const std::vector<uint8_t>& buffer,
+        const std::vector<VersionTranslation>& translations,
+        const std::wstring& name,
+        std::wstring* value)
+    {
+        do
+        {
+            if (value == nullptr)
+            {
+                break;
+            }
+
+            value->clear();
+            for (const VersionTranslation& translation : translations)
+            {
+                if (QueryVersionString(buffer, translation.Language, translation.CodePage, name, value))
+                {
+                    break;
+                }
+            }
+
+            if (!value->empty())
+            {
+                break;
+            }
+
+            static const VersionTranslation kFallbacks[] =
+            {
+                {0x0409, 1200},
+                {0x0409, 1252}
+            };
+
+            for (const VersionTranslation& fallback : kFallbacks)
+            {
+                if (QueryVersionString(buffer, fallback.Language, fallback.CodePage, name, value))
+                {
+                    break;
+                }
+            }
+        } while (false);
+    }
+
+    bool ReadImageVersionMetadata(const std::wstring& path, ImageMetadataRecord* metadata)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (metadata == nullptr || path.empty())
+            {
+                break;
+            }
+
+            DWORD handle = 0;
+            DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
+            if (size == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> buffer(size);
+            if (!GetFileVersionInfoW(path.c_str(), 0, size, buffer.data()))
+            {
+                break;
+            }
+
+            VS_FIXEDFILEINFO* info = nullptr;
+            UINT infoSize = 0;
+            if (VerQueryValueW(
+                    buffer.data(),
+                    L"\\",
+                    reinterpret_cast<LPVOID*>(&info),
+                    &infoSize) &&
+                info != nullptr &&
+                infoSize >= sizeof(VS_FIXEDFILEINFO) &&
+                info->dwSignature == VS_FFI_SIGNATURE)
+            {
+                std::wstringstream version;
+                version << HIWORD(info->dwFileVersionMS)
+                        << L"."
+                        << LOWORD(info->dwFileVersionMS)
+                        << L"."
+                        << HIWORD(info->dwFileVersionLS)
+                        << L"."
+                        << LOWORD(info->dwFileVersionLS);
+                metadata->FileVersion = version.str();
+            }
+
+            std::vector<VersionTranslation> translations;
+            VersionTranslation* translationData = nullptr;
+            UINT translationSize = 0;
+            if (VerQueryValueW(
+                    buffer.data(),
+                    L"\\VarFileInfo\\Translation",
+                    reinterpret_cast<LPVOID*>(&translationData),
+                    &translationSize) &&
+                translationData != nullptr)
+            {
+                size_t count = translationSize / sizeof(VersionTranslation);
+                for (size_t index = 0; index < count; ++index)
+                {
+                    translations.push_back(translationData[index]);
+                }
+            }
+
+            ReadVersionString(buffer, translations, L"CompanyName", &metadata->CompanyName);
+            ReadVersionString(buffer, translations, L"ProductName", &metadata->ProductName);
+            ReadVersionString(buffer, translations, L"OriginalFilename", &metadata->OriginalFilename);
+            ReadVersionString(buffer, translations, L"FileDescription", &metadata->FileDescription);
+            metadata->VersionInfoPresent = true;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    BOOL CALLBACK HuntIconResourceNameCallback(HMODULE, LPCWSTR, LPWSTR, LONG_PTR parameter)
+    {
+        if (parameter != 0)
+        {
+            bool* found = reinterpret_cast<bool*>(parameter);
+            *found = true;
+        }
+
+        return FALSE;
+    }
+
+    bool ImageHasGroupIconResource(const std::wstring& path)
+    {
+        bool present = false;
+        HMODULE module = nullptr;
+
+        do
+        {
+            if (path.empty())
+            {
+                break;
+            }
+
+            module = LoadLibraryExW(
+                path.c_str(),
+                nullptr,
+                LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+            if (module == nullptr)
+            {
+                break;
+            }
+
+            EnumResourceNamesW(
+                module,
+                RT_GROUP_ICON,
+                HuntIconResourceNameCallback,
+                reinterpret_cast<LONG_PTR>(&present));
+        } while (false);
+
+        if (module != nullptr)
+        {
+            FreeLibrary(module);
+        }
+
+        return present;
+    }
+
+    bool IsNoAuthenticodeSignatureStatus(LONG status)
+    {
+        return status == static_cast<LONG>(TRUST_E_NOSIGNATURE) ||
+            status == static_cast<LONG>(TRUST_E_SUBJECT_FORM_UNKNOWN) ||
+            status == static_cast<LONG>(TRUST_E_PROVIDER_UNKNOWN);
+    }
+
+    bool VerifyImageAuthenticodeSignature(const std::wstring& path, ImageMetadataRecord* metadata)
+    {
+        bool checked = false;
+        HMODULE wintrust = nullptr;
+
+        typedef LONG (WINAPI* WinVerifyTrustFn)(HWND, GUID*, LPVOID);
+
+        do
+        {
+            if (metadata == nullptr || path.empty())
+            {
+                break;
+            }
+
+            wintrust = LoadLibraryW(L"wintrust.dll");
+            if (wintrust == nullptr)
+            {
+                break;
+            }
+
+            WinVerifyTrustFn verify =
+                reinterpret_cast<WinVerifyTrustFn>(GetProcAddress(wintrust, "WinVerifyTrust"));
+            if (verify == nullptr)
+            {
+                break;
+            }
+
+            WINTRUST_FILE_INFO fileInfo = {};
+            fileInfo.cbStruct = sizeof(fileInfo);
+            fileInfo.pcwszFilePath = path.c_str();
+
+            WINTRUST_DATA data = {};
+            data.cbStruct = sizeof(data);
+            data.dwUIChoice = WTD_UI_NONE;
+            data.fdwRevocationChecks = WTD_REVOKE_NONE;
+            data.dwUnionChoice = WTD_CHOICE_FILE;
+            data.pFile = &fileInfo;
+            data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+            GUID action =
+            {
+                0x00aac56b,
+                0xcd44,
+                0x11d0,
+                {0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee}
+            };
+
+            LONG status = verify(nullptr, &action, &data);
+            metadata->SignatureStatus = status;
+            metadata->SignatureChecked = true;
+            metadata->SignatureValid = status == ERROR_SUCCESS;
+            metadata->SignaturePresent = metadata->SignatureValid || !IsNoAuthenticodeSignatureStatus(status);
+            checked = true;
+        } while (false);
+
+        if (wintrust != nullptr)
+        {
+            FreeLibrary(wintrust);
+        }
+
+        return checked;
+    }
+
+    bool ReadImageMetadataForPath(const std::wstring& rawPath, ImageMetadataRecord* metadata)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (metadata == nullptr || rawPath.empty())
+            {
+                break;
+            }
+
+            *metadata = ImageMetadataRecord{};
+            std::wstring path = DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(rawPath));
+            if (path.empty())
+            {
+                break;
+            }
+
+            DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES ||
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                break;
+            }
+
+            metadata->FilePath = path;
+            ReadImageVersionMetadata(path, metadata);
+            VerifyImageAuthenticodeSignature(path, metadata);
+            metadata->IconResourcePresent = ImageHasGroupIconResource(path);
+            ok = metadata->VersionInfoPresent ||
+                metadata->SignatureChecked ||
+                metadata->IconResourcePresent;
+        } while (false);
+
+        return ok;
+    }
+
+    void AddImageMetadataEvidence(
+        const std::wstring& rawPath,
+        bool addVersionIconReasons,
+        std::vector<std::wstring>* reasons,
+        std::map<std::wstring, std::wstring>* evidence)
+    {
+        do
+        {
+            if (reasons == nullptr || evidence == nullptr || rawPath.empty())
+            {
+                break;
+            }
+
+            ImageMetadataRecord metadata = {};
+            if (!ReadImageMetadataForPath(rawPath, &metadata))
+            {
+                break;
+            }
+
+            (*evidence)[L"image_metadata_path"] = metadata.FilePath;
+            (*evidence)[L"image_version_info_present"] = metadata.VersionInfoPresent ? L"true" : L"false";
+            (*evidence)[L"image_file_version"] = metadata.FileVersion;
+            (*evidence)[L"image_company_name"] = metadata.CompanyName;
+            (*evidence)[L"image_product_name"] = metadata.ProductName;
+            (*evidence)[L"image_original_filename"] = metadata.OriginalFilename;
+            (*evidence)[L"image_file_description"] = metadata.FileDescription;
+            (*evidence)[L"image_icon_resource_present"] = metadata.IconResourcePresent ? L"true" : L"false";
+            (*evidence)[L"image_signature_checked"] = metadata.SignatureChecked ? L"true" : L"false";
+            (*evidence)[L"image_signature_present"] = metadata.SignaturePresent ? L"true" : L"false";
+            (*evidence)[L"image_signature_valid"] = metadata.SignatureValid ? L"true" : L"false";
+            (*evidence)[L"image_signature_status"] = HuntHex(static_cast<uint32_t>(metadata.SignatureStatus), 8);
+
+            if (metadata.SignaturePresent && !metadata.SignatureValid)
+            {
+                AddUnique(reasons, L"edr_killer_invalid_code_signature");
+            }
+            if (addVersionIconReasons && metadata.VersionInfoPresent)
+            {
+                AddUnique(reasons, L"edr_killer_version_info_impersonation_evidence");
+            }
+            if (addVersionIconReasons && metadata.IconResourcePresent)
+            {
+                AddUnique(reasons, L"edr_killer_icon_impersonation_evidence");
+            }
+        } while (false);
+    }
+
     std::vector<std::wstring> ExpectedPathsForBuiltinProfile(
         const BuiltinProcessProfile& profile,
         const std::wstring& leaf)
@@ -4096,12 +4530,22 @@ namespace
             std::wstring matchedLeaf;
             bool suffixNormalized = false;
             std::wstring normalizedBase;
+            bool suffixContextRequired = false;
             const EdrKillerProcessProfile* profile =
-                FindEdrKillerProcessProfileForProcess(process, &matchedLeaf, &suffixNormalized, &normalizedBase);
+                FindEdrKillerProcessProfileForProcess(
+                    process,
+                    &matchedLeaf,
+                    &suffixNormalized,
+                    &normalizedBase,
+                    &suffixContextRequired);
             bool gentlemenStagingPath =
                 PathContainsGentlemenCollection(imagePath) ||
                 PathContainsGentlemenCollection(process.PebCommandLine);
             if (profile == nullptr && !gentlemenStagingPath)
+            {
+                break;
+            }
+            if (suffixContextRequired && !gentlemenStagingPath)
             {
                 break;
             }
@@ -4125,6 +4569,7 @@ namespace
                 evidence[L"matched_image_leaf"] = matchedLeaf;
                 evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
                 evidence[L"suffix_normalized_ioc"] = suffixNormalized ? L"true" : L"false";
+                evidence[L"suffix_context_required"] = suffixContextRequired ? L"true" : L"false";
                 if (suffixNormalized)
                 {
                     AddUnique(&reasons, L"gentlemen_suffix_normalized_process_name");
@@ -4141,6 +4586,12 @@ namespace
                 AddUnique(&reasons, L"gentlemen_collection_staging_path");
                 evidence[L"gentlemen_collection_path"] = L"true";
             }
+
+            AddImageMetadataEvidence(
+                imagePath,
+                profile != nullptr || gentlemenStagingPath,
+                &reasons,
+                &evidence);
 
             if (reasons.empty())
             {
@@ -4210,6 +4661,52 @@ namespace
         return matched;
     }
 
+    bool HuntIsProcessLeafChar(wchar_t ch)
+    {
+        return std::iswalnum(ch) != 0 ||
+            ch == L'_' ||
+            ch == L'-' ||
+            ch == L'.';
+    }
+
+    bool HuntTextContainsDelimitedProcessLeaf(
+        const std::wstring& text,
+        const std::wstring& leaf)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (text.empty() || leaf.empty())
+            {
+                break;
+            }
+
+            size_t offset = 0;
+            while (offset < text.size())
+            {
+                size_t found = text.find(leaf, offset);
+                if (found == std::wstring::npos)
+                {
+                    break;
+                }
+
+                size_t end = found + leaf.size();
+                bool leftDelimited = found == 0 || !HuntIsProcessLeafChar(text[found - 1]);
+                bool rightDelimited = end >= text.size() || !HuntIsProcessLeafChar(text[end]);
+                if (leftDelimited && rightDelimited)
+                {
+                    matched = true;
+                    break;
+                }
+
+                offset = found + 1;
+            }
+        } while (false);
+
+        return matched;
+    }
+
     std::wstring ThreatIntelActionText(const HuntTelemetryEvent& event)
     {
         std::wstring text;
@@ -4273,6 +4770,105 @@ namespace
         }
 
         return JoinWideValues(values, L";");
+    }
+
+    std::wstring ThreatIntelSecurityProductTargetsText(const std::set<std::wstring>& targetNames)
+    {
+        std::vector<std::wstring> values;
+
+        for (const std::wstring& name : targetNames)
+        {
+            values.push_back(name);
+        }
+
+        return JoinWideValues(values, L";");
+    }
+
+    bool ThreatIntelEventTargetsKnownSecurityProduct(
+        const HuntTelemetryEvent& event,
+        std::wstring* matchedTarget)
+    {
+        bool matched = false;
+
+        static const wchar_t* kTargets[] =
+        {
+            L"acronis_agent.exe", L"backupandrecoveryagent.exe", L"managementagenthost.exe", L"mms.exe",
+            L"alienvault-agent.exe", L"osqueryd.exe",
+            L"afwserv.exe", L"aswengsrv.exe", L"aswidsagent.exe", L"aswtoolssvc.exe", L"avastsvc.exe", L"avastui.exe", L"bccavsvc.exe", L"wsc_proxy.exe",
+            L"avgui.exe", L"avgsvc.exe", L"avgnt.exe", L"avgsvca.exe", L"avgtoolssvc.exe",
+            L"binarydefenseagent.exe",
+            L"arrakis3.exe", L"bdavscanner.exe", L"bdfstray.exe", L"bdfileserver.exe", L"bdlived2.exe", L"bdlogger.exe", L"bdscheduler.exe", L"bdstatistics.exe", L"bdagent.exe", L"bdemsrv.exe", L"bdntwrk.exe", L"bdredline.exe", L"bdregsvr2.exe", L"bdservicehost.exe",
+            L"blumiraagent.exe",
+            L"bromiumdaemon.exe", L"brdifxapi.exe",
+            L"cb.exe", L"cbcomms.exe", L"cbdefense.exe", L"carbonsensor.exe", L"repmgr.exe",
+            L"cfrutil.exe", L"ciscoampcefwdriver.exe", L"cisco_amp_connector.exe", L"immunet.exe",
+            L"arwsrvc.exe", L"arcupdate.exe", L"csfalconcontainer.exe", L"csfalconservice.exe", L"csfalconui.exe", L"csfalcondataprotect.exe", L"csfalcondaterepair.exe", L"reprsvc.exe",
+            L"cyneteps.exe", L"cynetms.exe", L"cynetsvc.exe",
+            L"activeconsole.exe", L"cybereason.exe", L"cybereasonactiveprobe.exe", L"cybereasoncr.exe",
+            L"cyveraconsole.exe", L"cyveraservice.exe", L"cyvragentsvc.exe", L"cyvrfsflt.exe",
+            L"cylancesvc.exe",
+            L"darktracetsa.exe",
+            L"deepinstinct.exe", L"deepinstinctservice.exe", L"diagentservice.exe",
+            L"a2guard.exe", L"a2service.exe",
+            L"eamonm.exe", L"eamsi.exe", L"ecls.exe", L"efwd.exe", L"egui.exe", L"eguiproxy.exe", L"ekrn.exe", L"ekrnepfw.exe", L"eraagent.exe", L"eraagentsvc.exe",
+            L"firesvc.exe", L"firetray.exe", L"fortitray.exe", L"fortiedr.exe", L"fw.exe",
+            L"gddserver.exe", L"qhpisvr.exe", L"quhlpsvc.exe", L"sapissvc.exe",
+            L"heimdalsecurityagent.exe",
+            L"huntressagent.exe", L"huntressrmm.exe",
+            L"avp.exe", L"avpsus.exe", L"avpui.exe", L"kavfs.exe", L"kavfsscs.exe", L"kavfswh.exe", L"kavfswp.exe", L"kavtray.exe", L"klactprx.exe", L"klcsldcl.exe", L"klcsweb.exe", L"klnagent.exe", L"klnagchk.exe", L"klscctl.exe", L"klserver.exe", L"klwtblfs.exe", L"kpf4ss.exe", L"ksde.exe", L"ksdeui.exe", L"vapm.exe",
+            L"logprocessorservice.exe",
+            L"agmservice.exe", L"agsservice.exe", L"masvc.exe", L"macmnsvc.exe", L"mcafeeagent.exe", L"mcshield.exe", L"mfeann.exe", L"mfevtps.exe", L"mfetp.exe", L"mfeepehost.exe", L"mfefire.exe", L"mfemactl.exe", L"mfemacsvc.exe", L"mfemgr.exe", L"mfemms.exe", L"mgntsvc.exe", L"modulecoreservice.exe", L"tepfsvc.exe",
+            L"msascui.exe", L"msascuil.exe", L"mpdefendercoreservice.exe", L"msmpeng.exe", L"msmpsvc.exe", L"mssense.exe", L"msseces.exe", L"nissrv.exe", L"securityhealthservice.exe", L"securityhealthsystray.exe", L"sensecncproxy.exe", L"senseir.exe", L"sensendr.exe", L"sensesampleuploader.exe", L"smartscreen.exe", L"windefend.exe",
+            L"morphisecservice.exe",
+            L"ccapp.exe", L"ccsvchst.exe", L"ns.exe", L"nsservice.exe", L"nortonsecurity.exe", L"rtvscan.exe", L"sepmasterservice.exe", L"sepwscsvc64.exe", L"smc.exe", L"smcgui.exe", L"snac.exe", L"symcorpui.exe", L"symwsc.exe",
+            L"ossec-agent.exe", L"wazuh-agent.exe",
+            L"cortexservice.exe", L"trapsagent.exe", L"trapsd.exe", L"traps.exe",
+            L"panda_url_filtering.exe", L"pavfnsvr.exe", L"pavsrv.exe", L"psanhost.exe", L"pselamsvc.exe", L"psuamain.exe", L"psuaservice.exe", L"pangps.exe",
+            L"qualys-cloud-agent.exe", L"qualysagent.exe",
+            L"ir_agent.exe", L"rapid7_endpoint.exe",
+            L"redcanaryagent.exe",
+            L"csaagent.exe", L"csaservice.exe", L"sangforagent.exe", L"sangforcsa.exe", L"sangforedr.exe", L"sangforinterface.exe", L"sangformonitor.exe", L"sangforprotect.exe", L"sangforservice.exe", L"sangfortray.exe", L"sangforud.exe",
+            L"sentinel.exe", L"sentinelagent.exe", L"sentinelagentworker.exe", L"sentinelctl.exe", L"sentinelhelperservice.exe", L"sentinelmemoryscanner.exe", L"sentinelpowershellextension.exe", L"sentinelranger.exe", L"sentinelservicehost.exe", L"sentinelstaticengine.exe", L"sentinelstaticenginescanner.exe", L"sentinelui.exe",
+            L"sonicwallclientprotectionservice.exe", L"swc_service.exe",
+            L"hmpalert.exe", L"mcsagent.exe", L"mcsclient.exe", L"savapi.exe", L"savadminservice.exe", L"savservice.exe", L"sedservice.exe", L"sophosadsyncservice.exe", L"sophosclean.exe", L"sophoscleanm64.exe", L"sophosfimservice.exe", L"sophosfs.exe", L"sophoshealth.exe", L"sophoslivequeryservice.exe", L"sophosmtr.exe", L"sophosmtrextension.exe", L"sophosnetfilter.exe", L"sophosntpservice.exe", L"sophososquery.exe", L"sophososqueryextension.exe", L"sophos.policyevaluation.service.exe", L"sophossafestore64.exe", L"sophosui.exe", L"sophosupdatemgr.exe", L"sophosav.exe", L"sophossps.exe", L"sspservice.exe",
+            L"taniumclient.exe", L"taniumcx.exe", L"tanclient.exe",
+            L"threatlockerconsent.exe", L"threatlockerservice.exe", L"threatlockertray.exe",
+            L"coreframeworkhost.exe", L"coreserviceshell.exe", L"ntrtscan.exe", L"ofcservice.exe", L"ofcddasvr.exe", L"pccntmon.exe", L"pccnt.exe", L"tisafe.exe", L"tisafesvc.exe", L"tmccsf.exe", L"tmicagentsetting.exe", L"tmbmsrv.exe", L"tm_netsrv.exe", L"tmlisten.exe", L"tmntsrv.exe", L"tmpfw.exe", L"tmproxy.exe", L"tmprefilter.exe", L"tmssclient.exe", L"tmsainstance64.exe", L"tmwscsvc.exe", L"voneagentconsole.exe", L"voneagentconsoletray.exe",
+            L"vectoragent.exe", L"uptycsagent.exe",
+            L"datadvantage.exe", L"varonisagent.exe",
+            L"wlcsservice.exe",
+            L"wrsa.exe", L"wrskyclient.exe", L"wrsvc.exe",
+            L"sysmon.exe", L"sysmon64.exe",
+            L"zlclient.exe"
+        };
+
+        do
+        {
+            std::wstring targetLeaf = LeafName(event.TargetImageBase);
+            std::wstring text = ThreatIntelActionText(event);
+
+            for (const wchar_t* target : kTargets)
+            {
+                if (target == nullptr || target[0] == L'\0')
+                {
+                    continue;
+                }
+
+                std::wstring targetName = HuntToLower(target);
+                if (targetLeaf == targetName ||
+                    (targetName.size() >= 8 && HuntTextContainsDelimitedProcessLeaf(text, targetName)))
+                {
+                    if (matchedTarget != nullptr)
+                    {
+                        *matchedTarget = targetName;
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
     }
 
     bool ThreatIntelEventLooksLikeDriverIo(const HuntTelemetryEvent& event)
@@ -4432,6 +5028,7 @@ namespace
             evidence[L"matched_image_leaf"] = bucket.MatchedLeaf;
             evidence[L"gentlemen_collection_path"] = bucket.GentlemenStagingPath ? L"true" : L"false";
             evidence[L"suffix_normalized_ioc"] = bucket.SuffixNormalizedProfile ? L"true" : L"false";
+            evidence[L"suffix_context_required"] = bucket.SuffixContextRequired ? L"true" : L"false";
             evidence[L"normalized_ioc_base"] = bucket.NormalizedProfileBase;
             evidence[L"ti_event_count"] = std::to_wstring(actionCount);
             evidence[L"ti_sample_timestamp"] = std::to_wstring(sample.Timestamp);
@@ -4442,6 +5039,9 @@ namespace
             evidence[L"ti_sample_payload"] = ThreatIntelPayloadEvidenceText(sample);
             evidence[L"target_pid_count"] = std::to_wstring(bucket.TargetProcessIds.size());
             evidence[L"target_pids"] = ThreatIntelTargetPidsText(bucket.TargetProcessIds);
+            evidence[L"security_product_target_count"] = std::to_wstring(bucket.SecurityProductTargetNames.size());
+            evidence[L"security_product_targets"] =
+                ThreatIntelSecurityProductTargetsText(bucket.SecurityProductTargetNames);
             if (sample.TargetProcessId != 0)
             {
                 evidence[L"sample_target_pid"] = std::to_wstring(sample.TargetProcessId);
@@ -4454,6 +5054,14 @@ namespace
                 evidence[L"gentlemen_ioc_image"] = bucket.Profile->ImageName;
                 evidence[L"strong_name_signal"] = bucket.Profile->StrongNameSignal ? L"true" : L"false";
             }
+
+            AddImageMetadataEvidence(
+                bucket.ImagePath,
+                bucket.Profile != nullptr ||
+                    bucket.GentlemenStagingPath ||
+                    bucket.SuffixNormalizedProfile,
+                &reasons,
+                &evidence);
 
             HuntFinding finding = {};
             finding.Risk = SnapshotRiskNormalize(risk);
@@ -4521,6 +5129,10 @@ namespace
                 {
                     continue;
                 }
+                std::wstring securityProductTarget;
+                bool securityProductImpairment =
+                    processImpairment &&
+                    ThreatIntelEventTargetsKnownSecurityProduct(event, &securityProductTarget);
 
                 const HuntProcessRecord* process = nullptr;
                 auto processIt = processes.find(event.ProcessId);
@@ -4533,6 +5145,7 @@ namespace
                 const EdrKillerProcessProfile* profile = nullptr;
                 bool suffixNormalized = false;
                 std::wstring normalizedBase;
+                bool suffixContextRequired = false;
                 bool gentlemenStagingPath = PathContainsGentlemenCollection(event.ImagePath) ||
                     PathContainsGentlemenCollection(ThreatIntelFullText(event));
 
@@ -4542,7 +5155,8 @@ namespace
                         *process,
                         &matchedLeaf,
                         &suffixNormalized,
-                        &normalizedBase);
+                        &normalizedBase,
+                        &suffixContextRequired);
                     gentlemenStagingPath = gentlemenStagingPath ||
                         PathContainsGentlemenCollection(BestProcessImagePath(*process)) ||
                         PathContainsGentlemenCollection(process->PebCommandLine);
@@ -4554,10 +5168,12 @@ namespace
                     profile = FindEdrKillerProcessProfileByLeaf(
                         matchedLeaf,
                         &suffixNormalized,
-                        &normalizedBase);
+                        &normalizedBase,
+                        &suffixContextRequired);
                 }
 
-                if (!ThreatIntelProfileIsActionable(profile, gentlemenStagingPath))
+                if (!ThreatIntelProfileIsActionable(profile, gentlemenStagingPath) &&
+                    !securityProductImpairment)
                 {
                     continue;
                 }
@@ -4570,6 +5186,7 @@ namespace
                 }
                 bucket.GentlemenStagingPath = bucket.GentlemenStagingPath || gentlemenStagingPath;
                 bucket.SuffixNormalizedProfile = bucket.SuffixNormalizedProfile || suffixNormalized;
+                bucket.SuffixContextRequired = bucket.SuffixContextRequired || suffixContextRequired;
                 if (bucket.NormalizedProfileBase.empty() && !normalizedBase.empty())
                 {
                     bucket.NormalizedProfileBase = normalizedBase;
@@ -4628,6 +5245,19 @@ namespace
                         bucket.FirstProcessImpairmentEvent = event;
                     }
                 }
+
+                if (securityProductImpairment)
+                {
+                    ++bucket.SecurityProductImpairmentCount;
+                    if (!securityProductTarget.empty())
+                    {
+                        bucket.SecurityProductTargetNames.insert(securityProductTarget);
+                    }
+                    if (bucket.FirstSecurityProductImpairmentEvent.Timestamp == 0)
+                    {
+                        bucket.FirstSecurityProductImpairmentEvent = event;
+                    }
+                }
             }
 
             for (const auto& item : buckets)
@@ -4667,6 +5297,26 @@ namespace
                             L"repeated_process_control_activity"
                         },
                         bucket.ProcessImpairmentCount);
+                }
+
+                if (bucket.SecurityProductImpairmentCount >= 2 ||
+                    bucket.SecurityProductTargetNames.size() >= 2)
+                {
+                    AddThreatIntelTelemetryFinding(
+                        result,
+                        bucket,
+                        bucket.FirstSecurityProductImpairmentEvent,
+                        L"edr_killer_security_product_impairment_telemetry",
+                        L"Threat-Intelligence events show repeated control of known security-product processes",
+                        bucket.GentlemenStagingPath ? L"high" : L"medium",
+                        bucket.GentlemenStagingPath ? L"high" : L"medium",
+                        {
+                            L"ti_process_impairment_event",
+                            L"defense_impairment_telemetry",
+                            L"known_security_product_process_target",
+                            L"gentlekiller_security_target_list"
+                        },
+                        bucket.SecurityProductImpairmentCount);
                 }
             }
         } while (false);

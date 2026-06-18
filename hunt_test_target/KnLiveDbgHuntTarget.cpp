@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -59,6 +60,8 @@ namespace
         uint64_t Size = 0;
         DWORD ProcessId = 0;
         std::vector<std::wstring> ExpectedReasons;
+        std::vector<std::wstring> ExpectedEvidenceKeys;
+        std::vector<std::pair<std::wstring, std::wstring>> ExpectedEvidenceValues;
         std::wstring Notes;
     };
 
@@ -172,6 +175,24 @@ namespace
         json << L"]";
     }
 
+    void AppendJsonStringObject(
+        std::wstringstream& json,
+        const std::vector<std::pair<std::wstring, std::wstring>>& values)
+    {
+        json << L"{";
+        for (size_t index = 0; index < values.size(); ++index)
+        {
+            if (index != 0)
+            {
+                json << L",";
+            }
+
+            json << L"\"" << JsonEscape(values[index].first) << L"\":\""
+                 << JsonEscape(values[index].second) << L"\"";
+        }
+        json << L"}";
+    }
+
     bool WideToUtf8(const std::wstring& value, std::string* utf8)
     {
         bool ok = false;
@@ -261,7 +282,9 @@ namespace
         uint64_t size,
         std::initializer_list<const wchar_t*> expectedReasons,
         const std::wstring& notes,
-        DWORD processId = 0)
+        DWORD processId = 0,
+        std::initializer_list<const wchar_t*> expectedEvidenceKeys = {},
+        std::initializer_list<std::pair<const wchar_t*, const wchar_t*>> expectedEvidenceValues = {})
     {
         ScenarioRecord record = {};
         record.Name = name;
@@ -276,6 +299,22 @@ namespace
             if (reason != nullptr)
             {
                 record.ExpectedReasons.push_back(reason);
+            }
+        }
+
+        for (const wchar_t* key : expectedEvidenceKeys)
+        {
+            if (key != nullptr)
+            {
+                record.ExpectedEvidenceKeys.push_back(key);
+            }
+        }
+
+        for (const std::pair<const wchar_t*, const wchar_t*>& item : expectedEvidenceValues)
+        {
+            if (item.first != nullptr && item.second != nullptr)
+            {
+                record.ExpectedEvidenceValues.emplace_back(item.first, item.second);
             }
         }
 
@@ -309,6 +348,10 @@ namespace
             json << L",\"size\":" << scenario.Size;
             json << L",\"expected_reasons\":";
             AppendJsonStringArray(json, scenario.ExpectedReasons);
+            json << L",\"expected_evidence_keys\":";
+            AppendJsonStringArray(json, scenario.ExpectedEvidenceKeys);
+            json << L",\"expected_evidence\":";
+            AppendJsonStringObject(json, scenario.ExpectedEvidenceValues);
             json << L",\"notes\":\"" << JsonEscape(scenario.Notes) << L"\"";
             json << L"}";
             if (index + 1 != g_Scenarios.size())
@@ -2020,15 +2063,24 @@ namespace
         return ok;
     }
 
-    bool CreateEdrKillerSuffixNameProcess(const Options& options)
+    bool CreateEdrKillerSuffixNameChild(
+        const Options& options,
+        const wchar_t* fileName,
+        const wchar_t* scenarioName,
+        const wchar_t* notes)
     {
         bool ok = false;
         PROCESS_INFORMATION processInfo = {};
 
         do
         {
+            if (fileName == nullptr || scenarioName == nullptr || notes == nullptr)
+            {
+                break;
+            }
+
             std::wstring childPath;
-            if (!MakeTempSelfCopy(L"Kasps1.exe", &childPath))
+            if (!MakeTempSelfCopy(fileName, &childPath))
             {
                 break;
             }
@@ -2075,13 +2127,31 @@ namespace
                        << processInfo.dwProcessId
                        << L"\n";
             AddScenario(
-                L"edr-killer-suffix-name",
-                L"benign child process named like a Gentlemen suffix-normalized EDR-killer IOC",
+                scenarioName,
+                std::wstring(L"benign child process named ") + fileName + L" like a Gentlemen suffix-normalized EDR-killer IOC",
                 0,
                 0,
                 {L"gentlemen_edr_killer_process_name", L"gentlemen_suffix_normalized_process_name", L"gentlemen_collection_staging_path"},
-                L"copies this test target to a temp GentlemenCollection directory as Kasps1.exe and runs it in baseline child mode",
-                processInfo.dwProcessId);
+                notes,
+                processInfo.dwProcessId,
+                {
+                    L"image_metadata_path",
+                    L"image_version_info_present",
+                    L"image_file_version",
+                    L"image_company_name",
+                    L"image_product_name",
+                    L"image_original_filename",
+                    L"image_file_description",
+                    L"image_signature_checked"
+                },
+                {
+                    { L"image_version_info_present", L"true" },
+                    { L"image_file_version", L"1.2.3.4" },
+                    { L"image_company_name", L"Kaspersky Lab" },
+                    { L"image_product_name", L"Kaspersky Anti-Virus" },
+                    { L"image_original_filename", L"Kasps.exe" },
+                    { L"image_file_description", L"KnLiveDbg hunt EDR-killer metadata fixture" }
+                });
             ok = true;
         } while (false);
 
@@ -2093,6 +2163,62 @@ namespace
         {
             CloseHandle(processInfo.hProcess);
         }
+
+        return ok;
+    }
+
+    bool CreateEdrKillerSuffixNameProcess(const Options& options)
+    {
+        bool ok = false;
+
+        struct SuffixNameFixture
+        {
+            const wchar_t* FileName;
+            const wchar_t* ScenarioName;
+            const wchar_t* Notes;
+        };
+
+        static const SuffixNameFixture kFixtures[] =
+        {
+            {
+                L"Kasps1.exe",
+                L"edr-killer-suffix-name-kasps",
+                L"copies this test target to a temp GentlemenCollection directory as Kasps1.exe and runs it in baseline child mode"
+            },
+            {
+                L"KaspLight.exe",
+                L"edr-killer-suffix-name-kasp",
+                L"validates the Kasp<suffix> alias from the ESET GentleKiller table"
+            },
+            {
+                L"MB1.exe",
+                L"edr-killer-suffix-name-mb",
+                L"validates short MB<suffix> matching gated by GentlemenCollection context"
+            },
+            {
+                L"G111.exe",
+                L"edr-killer-suffix-name-g11",
+                L"validates digit-ending G11<suffix> matching without stripping base digits"
+            }
+        };
+
+        do
+        {
+            bool anyFailure = false;
+            for (const SuffixNameFixture& fixture : kFixtures)
+            {
+                if (!CreateEdrKillerSuffixNameChild(
+                        options,
+                        fixture.FileName,
+                        fixture.ScenarioName,
+                        fixture.Notes))
+                {
+                    anyFailure = true;
+                }
+            }
+
+            ok = !anyFailure;
+        } while (false);
 
         return ok;
     }

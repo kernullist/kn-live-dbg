@@ -87,6 +87,9 @@
   <ItemGroup>
     <ClCompile Include="KnLiveDbgHuntTarget.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="KnLiveDbgHuntTarget.rc" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>

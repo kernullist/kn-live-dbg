@@ -51,7 +51,23 @@ Write-Host "  target_findings=$($targetFindings.Count)"
 foreach ($scenario in $scenarios)
 {
     $expectedReasons = @($scenario.expected_reasons)
-    if ($expectedReasons.Count -eq 0)
+    $expectedEvidenceKeys = @()
+    if ($null -ne $scenario.PSObject.Properties["expected_evidence_keys"])
+    {
+        $expectedEvidenceKeys = @($scenario.expected_evidence_keys)
+    }
+    $expectedEvidence = @{}
+    if ($null -ne $scenario.PSObject.Properties["expected_evidence"] -and
+        $null -ne $scenario.expected_evidence)
+    {
+        foreach ($property in $scenario.expected_evidence.PSObject.Properties)
+        {
+            $expectedEvidence[$property.Name] = [string]$property.Value
+        }
+    }
+    if ($expectedReasons.Count -eq 0 -and
+        $expectedEvidenceKeys.Count -eq 0 -and
+        $expectedEvidence.Count -eq 0)
     {
         continue
     }
@@ -73,6 +89,39 @@ foreach ($scenario in $scenarios)
         else
         {
             Write-Host "  pass scenario=$($scenario.name) pid=$scenarioPid reason=$reason"
+        }
+    }
+
+    foreach ($key in $expectedEvidenceKeys)
+    {
+        $matches = @($scenarioFindings | Where-Object {
+            $null -ne $_.evidence -and $null -ne $_.evidence.PSObject.Properties[$key]
+        })
+        if ($matches.Count -eq 0)
+        {
+            $failures.Add("missing evidence key '$key' for scenario '$($scenario.name)' pid=$scenarioPid")
+        }
+        else
+        {
+            Write-Host "  pass scenario=$($scenario.name) pid=$scenarioPid evidence=$key"
+        }
+    }
+
+    foreach ($key in @($expectedEvidence.Keys | Sort-Object))
+    {
+        $expectedValue = $expectedEvidence[$key]
+        $matches = @($scenarioFindings | Where-Object {
+            $null -ne $_.evidence -and
+                $null -ne $_.evidence.PSObject.Properties[$key] -and
+                [string]$_.evidence.PSObject.Properties[$key].Value -eq $expectedValue
+        })
+        if ($matches.Count -eq 0)
+        {
+            $failures.Add("missing evidence value '$key=$expectedValue' for scenario '$($scenario.name)' pid=$scenarioPid")
+        }
+        else
+        {
+            Write-Host "  pass scenario=$($scenario.name) pid=$scenarioPid evidence=$key value=$expectedValue"
         }
     }
 }
