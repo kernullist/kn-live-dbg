@@ -35,6 +35,10 @@ struct HuntModuleRecord
     bool LdrMemorySeen = false;
     bool LdrInitSeen = false;
     bool PrivatePeVadSeen = false;
+    bool VadImageSeen = false;
+    uint64_t VadAddress = 0;
+    std::wstring VadBackingPath;
+    std::wstring VadBackingState;
 };
 
 struct HuntProcessRecord
@@ -54,8 +58,22 @@ struct HuntProcessRecord
     std::wstring SystemProcessImageName;
     std::wstring ToolhelpImageName;
     std::wstring ApiImagePath;
+    uint64_t PebImageBase = 0;
+    bool HasPebImageBase = false;
+    uint64_t MainImageBase = 0;
+    uint64_t MainImageSize = 0;
+    uint64_t MainImageVad = 0;
+    std::wstring SectionBackingPath;
+    std::wstring SectionBackingState;
+    std::wstring DiskPath;
     std::wstring PebImagePath;
     std::wstring PebCommandLine;
+    std::wstring ParentImageName;
+    std::wstring BuiltinProfile;
+    bool BuiltinProfileMatched = false;
+    bool BuiltinSignatureVerified = false;
+    std::vector<std::wstring> BuiltinProfileExpectedPaths;
+    std::vector<std::wstring> BuiltinProfileViolations;
     bool ToolhelpModuleEnumerated = false;
     bool PebLdrEnumerated = false;
     std::vector<ProcessVadRecord> VadRecords;
