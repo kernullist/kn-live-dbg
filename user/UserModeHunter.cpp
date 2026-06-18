@@ -201,6 +201,7 @@ namespace
         bool SuffixNormalizedProfile = false;
         bool SuffixContextRequired = false;
         std::wstring NormalizedProfileBase;
+        std::wstring SuffixTail;
         uint64_t DriverIoCount = 0;
         uint64_t ProcessImpairmentCount = 0;
         uint64_t SecurityProductImpairmentCount = 0;
@@ -439,7 +440,8 @@ namespace
     bool GentlemenSuffixPatternMatches(
         const std::wstring& leaf,
         const wchar_t* suffixBase,
-        std::wstring* normalizedBase)
+        std::wstring* normalizedBase,
+        std::wstring* suffixTail)
     {
         bool matched = false;
 
@@ -472,17 +474,142 @@ namespace
             {
                 *normalizedBase = base;
             }
+            if (suffixTail != nullptr)
+            {
+                *suffixTail = tail;
+            }
             matched = true;
         } while (false);
 
         return matched;
     }
 
+    void AddGentlemenSuffixEvidence(
+        const std::wstring& suffixTail,
+        std::map<std::wstring, std::wstring>* evidence)
+    {
+        do
+        {
+            if (evidence == nullptr || suffixTail.empty())
+            {
+                break;
+            }
+
+            std::vector<std::wstring> components;
+            bool hasEnigma = false;
+            bool hasThemida = false;
+            bool hasLight = false;
+            bool hasClear = false;
+            size_t offset = 0;
+            while (offset < suffixTail.size())
+            {
+                std::wstring remaining = suffixTail.substr(offset);
+                if (remaining.rfind(L"light", 0) == 0)
+                {
+                    components.push_back(L"light");
+                    hasLight = true;
+                    offset += 5;
+                }
+                else if (remaining.rfind(L"clear", 0) == 0)
+                {
+                    components.push_back(L"clear");
+                    hasClear = true;
+                    offset += 5;
+                }
+                else if (suffixTail[offset] == L'1')
+                {
+                    components.push_back(L"1");
+                    hasEnigma = true;
+                    ++offset;
+                }
+                else if (suffixTail[offset] == L'2')
+                {
+                    components.push_back(L"2");
+                    hasThemida = true;
+                    ++offset;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            std::wstring componentsText;
+            for (size_t index = 0; index < components.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    componentsText += L";";
+                }
+                componentsText += components[index];
+            }
+
+            (*evidence)[L"gentlemen_suffix_tail"] = suffixTail;
+            (*evidence)[L"gentlemen_suffix_components"] = componentsText;
+            uint32_t protectionClasses = 0;
+            if (hasEnigma)
+            {
+                ++protectionClasses;
+            }
+            if (hasThemida)
+            {
+                ++protectionClasses;
+            }
+            if (hasLight || hasClear)
+            {
+                ++protectionClasses;
+            }
+
+            if (protectionClasses > 1)
+            {
+                (*evidence)[L"gentlemen_suffix_protection_hint"] = L"mixed";
+            }
+            else if (hasThemida)
+            {
+                (*evidence)[L"gentlemen_suffix_protection_hint"] = L"themida";
+            }
+            else if (hasEnigma)
+            {
+                (*evidence)[L"gentlemen_suffix_protection_hint"] = L"enigma";
+            }
+            else if (hasLight || hasClear)
+            {
+                (*evidence)[L"gentlemen_suffix_protection_hint"] = L"none";
+            }
+            else
+            {
+                (*evidence)[L"gentlemen_suffix_protection_hint"] = L"unknown";
+            }
+
+            if (hasClear && (hasEnigma || hasThemida || hasLight))
+            {
+                (*evidence)[L"gentlemen_suffix_fake_signature_expected"] = L"mixed";
+                (*evidence)[L"gentlemen_suffix_fake_version_expected"] = L"mixed";
+            }
+            else if (hasClear)
+            {
+                (*evidence)[L"gentlemen_suffix_fake_signature_expected"] = L"false";
+                (*evidence)[L"gentlemen_suffix_fake_version_expected"] = L"false";
+            }
+            else if (hasEnigma || hasThemida || hasLight)
+            {
+                (*evidence)[L"gentlemen_suffix_fake_signature_expected"] = L"true";
+                (*evidence)[L"gentlemen_suffix_fake_version_expected"] = L"true";
+            }
+            else
+            {
+                (*evidence)[L"gentlemen_suffix_fake_signature_expected"] = L"unknown";
+                (*evidence)[L"gentlemen_suffix_fake_version_expected"] = L"unknown";
+            }
+        } while (false);
+    }
+
     const EdrKillerProcessProfile* FindEdrKillerProcessProfileByLeaf(
         const std::wstring& leaf,
         bool* suffixNormalized = nullptr,
         std::wstring* normalizedBase = nullptr,
-        bool* suffixContextRequired = nullptr)
+        bool* suffixContextRequired = nullptr,
+        std::wstring* suffixTail = nullptr)
     {
         const EdrKillerProcessProfile* profile = nullptr;
 
@@ -527,12 +654,37 @@ namespace
             {
                 *suffixContextRequired = false;
             }
+            if (suffixTail != nullptr)
+            {
+                suffixTail->clear();
+            }
 
             for (const EdrKillerProcessProfile& item : kProfiles)
             {
                 if (leaf == item.ImageName)
                 {
                     profile = &item;
+                    std::wstring candidateBase;
+                    std::wstring candidateTail;
+                    if (GentlemenSuffixPatternMatches(leaf, item.SuffixBase, &candidateBase, &candidateTail))
+                    {
+                        if (suffixNormalized != nullptr)
+                        {
+                            *suffixNormalized = true;
+                        }
+                        if (normalizedBase != nullptr)
+                        {
+                            *normalizedBase = candidateBase;
+                        }
+                        if (suffixContextRequired != nullptr)
+                        {
+                            *suffixContextRequired = item.SuffixContextRequired;
+                        }
+                        if (suffixTail != nullptr)
+                        {
+                            *suffixTail = candidateTail;
+                        }
+                    }
                     break;
                 }
             }
@@ -550,7 +702,8 @@ namespace
                 }
 
                 std::wstring candidateBase;
-                if (GentlemenSuffixPatternMatches(leaf, item.SuffixBase, &candidateBase))
+                std::wstring candidateTail;
+                if (GentlemenSuffixPatternMatches(leaf, item.SuffixBase, &candidateBase, &candidateTail))
                 {
                     profile = &item;
                     if (suffixNormalized != nullptr)
@@ -564,6 +717,10 @@ namespace
                     if (suffixContextRequired != nullptr)
                     {
                         *suffixContextRequired = item.SuffixContextRequired;
+                    }
+                    if (suffixTail != nullptr)
+                    {
+                        *suffixTail = candidateTail;
                     }
                     break;
                 }
@@ -627,7 +784,8 @@ namespace
         std::wstring* matchedLeaf,
         bool* suffixNormalized = nullptr,
         std::wstring* normalizedBase = nullptr,
-        bool* suffixContextRequired = nullptr)
+        bool* suffixContextRequired = nullptr,
+        std::wstring* suffixTail = nullptr)
     {
         const EdrKillerProcessProfile* profile = nullptr;
 
@@ -644,6 +802,10 @@ namespace
             if (suffixContextRequired != nullptr)
             {
                 *suffixContextRequired = false;
+            }
+            if (suffixTail != nullptr)
+            {
+                suffixTail->clear();
             }
 
             std::vector<std::wstring> candidates =
@@ -667,11 +829,13 @@ namespace
                 bool localSuffixNormalized = false;
                 std::wstring localNormalizedBase;
                 bool localSuffixContextRequired = false;
+                std::wstring localSuffixTail;
                 profile = FindEdrKillerProcessProfileByLeaf(
                     leaf,
                     &localSuffixNormalized,
                     &localNormalizedBase,
-                    &localSuffixContextRequired);
+                    &localSuffixContextRequired,
+                    &localSuffixTail);
                 if (profile != nullptr)
                 {
                     if (matchedLeaf != nullptr)
@@ -689,6 +853,10 @@ namespace
                     if (suffixContextRequired != nullptr)
                     {
                         *suffixContextRequired = localSuffixContextRequired;
+                    }
+                    if (suffixTail != nullptr)
+                    {
+                        *suffixTail = localSuffixTail;
                     }
                     break;
                 }
@@ -736,6 +904,185 @@ namespace
         } while (false);
 
         return image;
+    }
+
+    std::vector<std::wstring> SplitCommandLineForHuntShape(const std::wstring& commandLine)
+    {
+        std::vector<std::wstring> arguments;
+
+        do
+        {
+            if (commandLine.empty())
+            {
+                break;
+            }
+
+            std::wstring current;
+            bool inQuotes = false;
+            for (wchar_t ch : commandLine)
+            {
+                if (ch == L'"')
+                {
+                    inQuotes = !inQuotes;
+                    continue;
+                }
+
+                if (!inQuotes && std::iswspace(ch) != 0)
+                {
+                    if (!current.empty())
+                    {
+                        arguments.push_back(current);
+                        current.clear();
+                    }
+                    continue;
+                }
+
+                current.push_back(ch);
+            }
+
+            if (!current.empty())
+            {
+                arguments.push_back(current);
+            }
+        } while (false);
+
+        return arguments;
+    }
+
+    bool OxideHarvestOptionTokenIsKnown(
+        const std::wstring& argument,
+        const wchar_t* const* options,
+        size_t optionCount)
+    {
+        bool known = false;
+
+        do
+        {
+            std::wstring lowered = HuntToLower(argument);
+            for (size_t index = 0; index < optionCount; ++index)
+            {
+                if (options[index] == nullptr)
+                {
+                    continue;
+                }
+
+                std::wstring option = options[index];
+                if (lowered == option ||
+                    lowered.rfind(option + L"=", 0) == 0 ||
+                    lowered.rfind(option + L":", 0) == 0)
+                {
+                    known = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return known;
+    }
+
+    bool OxideHarvestOptionHasValue(
+        const std::vector<std::wstring>& arguments,
+        const std::wstring& option,
+        const wchar_t* const* options,
+        size_t optionCount)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (arguments.empty() || option.empty())
+            {
+                break;
+            }
+
+            std::wstring equalsPrefix = option + L"=";
+            std::wstring colonPrefix = option + L":";
+            for (size_t index = 0; index < arguments.size(); ++index)
+            {
+                std::wstring argument = HuntToLower(arguments[index]);
+                if (argument == option)
+                {
+                    if (index + 1 >= arguments.size())
+                    {
+                        continue;
+                    }
+
+                    const std::wstring& value = arguments[index + 1];
+                    if (!value.empty() &&
+                        !OxideHarvestOptionTokenIsKnown(value, options, optionCount))
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                else if (argument.rfind(equalsPrefix, 0) == 0 &&
+                    argument.size() > equalsPrefix.size())
+                {
+                    matched = true;
+                    break;
+                }
+                else if (argument.rfind(colonPrefix, 0) == 0 &&
+                    argument.size() > colonPrefix.size())
+                {
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool OxideHarvestCommandLineShape(
+        const std::wstring& commandLine,
+        std::wstring* matchedOptions)
+    {
+        bool matched = false;
+
+        static const wchar_t* kOptions[] =
+        {
+            L"-i",
+            L"-u",
+            L"-p",
+            L"-t",
+            L"-o"
+        };
+
+        do
+        {
+            std::vector<std::wstring> arguments = SplitCommandLineForHuntShape(commandLine);
+            std::vector<std::wstring> values;
+            for (const wchar_t* option : kOptions)
+            {
+                if (option == nullptr)
+                {
+                    continue;
+                }
+
+                if (OxideHarvestOptionHasValue(arguments, option, kOptions, _countof(kOptions)))
+                {
+                    values.push_back(option);
+                }
+            }
+
+            if (matchedOptions != nullptr)
+            {
+                std::wstring text;
+                for (size_t index = 0; index < values.size(); ++index)
+                {
+                    if (index != 0)
+                    {
+                        text += L";";
+                    }
+                    text += values[index];
+                }
+                *matchedOptions = text;
+            }
+
+            matched = values.size() == _countof(kOptions);
+        } while (false);
+
+        return matched;
     }
 
     std::wstring ExpandEnvironmentText(const std::wstring& value)
@@ -4531,13 +4878,15 @@ namespace
             bool suffixNormalized = false;
             std::wstring normalizedBase;
             bool suffixContextRequired = false;
+            std::wstring suffixTail;
             const EdrKillerProcessProfile* profile =
                 FindEdrKillerProcessProfileForProcess(
                     process,
                     &matchedLeaf,
                     &suffixNormalized,
                     &normalizedBase,
-                    &suffixContextRequired);
+                    &suffixContextRequired,
+                    &suffixTail);
             bool gentlemenStagingPath =
                 PathContainsGentlemenCollection(imagePath) ||
                 PathContainsGentlemenCollection(process.PebCommandLine);
@@ -4546,6 +4895,10 @@ namespace
                 break;
             }
             if (suffixContextRequired && !gentlemenStagingPath)
+            {
+                break;
+            }
+            if (profile != nullptr && !profile->StrongNameSignal && !gentlemenStagingPath)
             {
                 break;
             }
@@ -4574,10 +4927,20 @@ namespace
                 {
                     AddUnique(&reasons, L"gentlemen_suffix_normalized_process_name");
                     evidence[L"normalized_ioc_base"] = normalizedBase;
+                    AddGentlemenSuffixEvidence(suffixTail, &evidence);
                 }
                 if (!profile->StrongNameSignal)
                 {
                     AddUnique(&reasons, L"security_vendor_impersonation_name");
+                }
+                if (profile->CredentialTool)
+                {
+                    std::wstring matchedOptions;
+                    if (OxideHarvestCommandLineShape(process.PebCommandLine, &matchedOptions))
+                    {
+                        AddUnique(&reasons, L"oxideharvest_cli_shape");
+                        evidence[L"oxideharvest_cli_options"] = matchedOptions;
+                    }
                 }
             }
 
@@ -5030,6 +5393,10 @@ namespace
             evidence[L"suffix_normalized_ioc"] = bucket.SuffixNormalizedProfile ? L"true" : L"false";
             evidence[L"suffix_context_required"] = bucket.SuffixContextRequired ? L"true" : L"false";
             evidence[L"normalized_ioc_base"] = bucket.NormalizedProfileBase;
+            if (bucket.SuffixNormalizedProfile)
+            {
+                AddGentlemenSuffixEvidence(bucket.SuffixTail, &evidence);
+            }
             evidence[L"ti_event_count"] = std::to_wstring(actionCount);
             evidence[L"ti_sample_timestamp"] = std::to_wstring(sample.Timestamp);
             evidence[L"ti_sample_task"] = sample.TaskName;
@@ -5146,6 +5513,7 @@ namespace
                 bool suffixNormalized = false;
                 std::wstring normalizedBase;
                 bool suffixContextRequired = false;
+                std::wstring suffixTail;
                 bool gentlemenStagingPath = PathContainsGentlemenCollection(event.ImagePath) ||
                     PathContainsGentlemenCollection(ThreatIntelFullText(event));
 
@@ -5156,7 +5524,8 @@ namespace
                         &matchedLeaf,
                         &suffixNormalized,
                         &normalizedBase,
-                        &suffixContextRequired);
+                        &suffixContextRequired,
+                        &suffixTail);
                     gentlemenStagingPath = gentlemenStagingPath ||
                         PathContainsGentlemenCollection(BestProcessImagePath(*process)) ||
                         PathContainsGentlemenCollection(process->PebCommandLine);
@@ -5169,7 +5538,8 @@ namespace
                         matchedLeaf,
                         &suffixNormalized,
                         &normalizedBase,
-                        &suffixContextRequired);
+                        &suffixContextRequired,
+                        &suffixTail);
                 }
 
                 if (!ThreatIntelProfileIsActionable(profile, gentlemenStagingPath) &&
@@ -5190,6 +5560,10 @@ namespace
                 if (bucket.NormalizedProfileBase.empty() && !normalizedBase.empty())
                 {
                     bucket.NormalizedProfileBase = normalizedBase;
+                }
+                if (bucket.SuffixTail.empty() && !suffixTail.empty())
+                {
+                    bucket.SuffixTail = suffixTail;
                 }
                 if (!matchedLeaf.empty())
                 {

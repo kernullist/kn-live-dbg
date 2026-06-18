@@ -38,6 +38,7 @@ namespace
         bool ImageRwxSection = false;
         bool LabBuiltinProfile = false;
         bool EdrKillerSuffixName = false;
+        bool OxideHarvestCli = false;
         bool Baseline = false;
         bool Help = false;
         DWORD ChildWaitParentPid = 0;
@@ -60,6 +61,7 @@ namespace
         uint64_t Size = 0;
         DWORD ProcessId = 0;
         std::vector<std::wstring> ExpectedReasons;
+        std::vector<std::wstring> UnexpectedReasons;
         std::vector<std::wstring> ExpectedEvidenceKeys;
         std::vector<std::pair<std::wstring, std::wstring>> ExpectedEvidenceValues;
         std::wstring Notes;
@@ -284,7 +286,8 @@ namespace
         const std::wstring& notes,
         DWORD processId = 0,
         std::initializer_list<const wchar_t*> expectedEvidenceKeys = {},
-        std::initializer_list<std::pair<const wchar_t*, const wchar_t*>> expectedEvidenceValues = {})
+        std::initializer_list<std::pair<const wchar_t*, const wchar_t*>> expectedEvidenceValues = {},
+        std::initializer_list<const wchar_t*> unexpectedReasons = {})
     {
         ScenarioRecord record = {};
         record.Name = name;
@@ -318,6 +321,14 @@ namespace
             }
         }
 
+        for (const wchar_t* reason : unexpectedReasons)
+        {
+            if (reason != nullptr)
+            {
+                record.UnexpectedReasons.push_back(reason);
+            }
+        }
+
         g_Scenarios.push_back(record);
     }
 
@@ -348,6 +359,8 @@ namespace
             json << L",\"size\":" << scenario.Size;
             json << L",\"expected_reasons\":";
             AppendJsonStringArray(json, scenario.ExpectedReasons);
+            json << L",\"unexpected_reasons\":";
+            AppendJsonStringArray(json, scenario.UnexpectedReasons);
             json << L",\"expected_evidence_keys\":";
             AppendJsonStringArray(json, scenario.ExpectedEvidenceKeys);
             json << L",\"expected_evidence\":";
@@ -369,7 +382,7 @@ namespace
     void PrintUsage()
     {
         std::wcout << L"KnLiveDbgHuntTarget command:\n";
-        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/edr-killer-suffix-name] [/lab-builtin-profile] [/manifest path] [/seconds n]\n";
+        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/edr-killer-suffix-name] [/oxideharvest-cli] [/lab-builtin-profile] [/manifest path] [/seconds n]\n";
         std::wcout << L"\n";
         std::wcout << L"notes:\n";
         std::wcout << L"  This is a lab-only positive-control target for !hunt.\n";
@@ -442,6 +455,7 @@ namespace
                     options->SectionImageStomp = true;
                     options->ImageRwxSection = true;
                     options->EdrKillerSuffixName = true;
+                    options->OxideHarvestCli = true;
                     options->LabBuiltinProfile = true;
                     sawScenario = true;
                 }
@@ -535,6 +549,11 @@ namespace
                     options->EdrKillerSuffixName = true;
                     sawScenario = true;
                 }
+                else if (arg == L"/oxideharvest-cli")
+                {
+                    options->OxideHarvestCli = true;
+                    sawScenario = true;
+                }
                 else if (arg == L"/lab-builtin-profile")
                 {
                     options->LabBuiltinProfile = true;
@@ -564,6 +583,15 @@ namespace
                     if (index + 1 >= argc || !ParseUInt32(argv[index + 1], &options->RunSeconds))
                     {
                         std::wcerr << L"invalid /seconds value\n";
+                        break;
+                    }
+                    ++index;
+                }
+                else if (arg == L"-i" || arg == L"-u" || arg == L"-p" || arg == L"-t" || arg == L"-o")
+                {
+                    if (index + 1 >= argc)
+                    {
+                        std::wcerr << L"invalid OxideHarvest fixture option value\n";
                         break;
                     }
                     ++index;
@@ -614,6 +642,7 @@ namespace
                 options->SectionImageStomp = true;
                 options->ImageRwxSection = true;
                 options->EdrKillerSuffixName = false;
+                options->OxideHarvestCli = false;
                 options->LabBuiltinProfile = false;
             }
 
@@ -636,6 +665,7 @@ namespace
                 options->SectionImageStomp = false;
                 options->ImageRwxSection = false;
                 options->EdrKillerSuffixName = false;
+                options->OxideHarvestCli = false;
                 options->LabBuiltinProfile = false;
             }
         } while (false);
@@ -743,7 +773,10 @@ namespace
         return ok;
     }
 
-    bool MakeTempSelfCopy(const wchar_t* fileName, std::wstring* path)
+    bool MakeTempSelfCopy(
+        const wchar_t* fileName,
+        std::wstring* path,
+        bool gentlemenCollection = true)
     {
         bool ok = false;
 
@@ -772,12 +805,12 @@ namespace
             directoryStream << tempPath
                             << L"knhunt-"
                             << GetCurrentProcessId()
-                            << L"-GentlemenCollection";
+                            << (gentlemenCollection ? L"-GentlemenCollection" : L"-WeakVendorControl");
             std::wstring directory = directoryStream.str();
             if (!CreateDirectoryW(directory.c_str(), nullptr) &&
                 GetLastError() != ERROR_ALREADY_EXISTS)
             {
-                std::wcerr << Win32ErrorText(L"CreateDirectoryW GentlemenCollection temp failed") << L"\n";
+                std::wcerr << Win32ErrorText(L"CreateDirectoryW temp copy directory failed") << L"\n";
                 break;
             }
 
@@ -2067,14 +2100,26 @@ namespace
         const Options& options,
         const wchar_t* fileName,
         const wchar_t* scenarioName,
-        const wchar_t* notes)
+        const wchar_t* notes,
+        const wchar_t* expectedSuffixTail,
+        const wchar_t* expectedSuffixComponents,
+        const wchar_t* expectedProtectionHint,
+        const wchar_t* expectedFakeSignature,
+        const wchar_t* expectedFakeVersion)
     {
         bool ok = false;
         PROCESS_INFORMATION processInfo = {};
 
         do
         {
-            if (fileName == nullptr || scenarioName == nullptr || notes == nullptr)
+            if (fileName == nullptr ||
+                scenarioName == nullptr ||
+                notes == nullptr ||
+                expectedSuffixTail == nullptr ||
+                expectedSuffixComponents == nullptr ||
+                expectedProtectionHint == nullptr ||
+                expectedFakeSignature == nullptr ||
+                expectedFakeVersion == nullptr)
             {
                 break;
             }
@@ -2142,7 +2187,12 @@ namespace
                     L"image_product_name",
                     L"image_original_filename",
                     L"image_file_description",
-                    L"image_signature_checked"
+                    L"image_signature_checked",
+                    L"gentlemen_suffix_tail",
+                    L"gentlemen_suffix_components",
+                    L"gentlemen_suffix_protection_hint",
+                    L"gentlemen_suffix_fake_signature_expected",
+                    L"gentlemen_suffix_fake_version_expected"
                 },
                 {
                     { L"image_version_info_present", L"true" },
@@ -2150,7 +2200,183 @@ namespace
                     { L"image_company_name", L"Kaspersky Lab" },
                     { L"image_product_name", L"Kaspersky Anti-Virus" },
                     { L"image_original_filename", L"Kasps.exe" },
-                    { L"image_file_description", L"KnLiveDbg hunt EDR-killer metadata fixture" }
+                    { L"image_file_description", L"KnLiveDbg hunt EDR-killer metadata fixture" },
+                    { L"gentlemen_suffix_tail", expectedSuffixTail },
+                    { L"gentlemen_suffix_components", expectedSuffixComponents },
+                    { L"gentlemen_suffix_protection_hint", expectedProtectionHint },
+                    { L"gentlemen_suffix_fake_signature_expected", expectedFakeSignature },
+                    { L"gentlemen_suffix_fake_version_expected", expectedFakeVersion }
+                });
+            ok = true;
+        } while (false);
+
+        if (processInfo.hThread != nullptr)
+        {
+            CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != nullptr)
+        {
+            CloseHandle(processInfo.hProcess);
+        }
+
+        return ok;
+    }
+
+    bool CreateWeakVendorStandaloneNegativeChild(const Options& options)
+    {
+        bool ok = false;
+        PROCESS_INFORMATION processInfo = {};
+
+        do
+        {
+            std::wstring childPath;
+            if (!MakeTempSelfCopy(L"Avast.exe", &childPath, false))
+            {
+                break;
+            }
+
+            std::wstringstream command;
+            command << L"\""
+                    << childPath
+                    << L"\" /baseline /child-wait-parent "
+                    << GetCurrentProcessId()
+                    << L" /seconds "
+                    << options.RunSeconds;
+            std::wstring commandLine = command.str();
+
+            STARTUPINFOW startup = {};
+            startup.cb = sizeof(startup);
+            if (!CreateProcessW(
+                    childPath.c_str(),
+                    commandLine.data(),
+                    nullptr,
+                    nullptr,
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    nullptr,
+                    nullptr,
+                    &startup,
+                    &processInfo))
+            {
+                std::wcerr << Win32ErrorText(L"CreateProcessW weak vendor negative child failed") << L"\n";
+                break;
+            }
+
+            if (processInfo.hThread != nullptr)
+            {
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = nullptr;
+            }
+
+            g_ChildProcesses.push_back(processInfo.hProcess);
+            processInfo.hProcess = nullptr;
+
+            std::wcout << L"edr-killer-weak-vendor-negative child="
+                       << childPath
+                       << L" pid="
+                       << processInfo.dwProcessId
+                       << L"\n";
+            AddScenario(
+                L"edr-killer-weak-vendor-standalone-negative",
+                L"benign child process named Avast.exe outside GentlemenCollection",
+                0,
+                0,
+                {},
+                L"validates that weak vendor-impersonation names do not alert without staging or telemetry context",
+                processInfo.dwProcessId,
+                {},
+                {},
+                {
+                    L"gentlemen_edr_killer_process_name",
+                    L"security_vendor_impersonation_name",
+                    L"gentlemen_suffix_normalized_process_name"
+                });
+            ok = true;
+        } while (false);
+
+        if (processInfo.hThread != nullptr)
+        {
+            CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != nullptr)
+        {
+            CloseHandle(processInfo.hProcess);
+        }
+
+        return ok;
+    }
+
+    bool CreateOxideHarvestCliProcess(const Options& options)
+    {
+        bool ok = false;
+        PROCESS_INFORMATION processInfo = {};
+
+        do
+        {
+            std::wstring childPath;
+            if (!MakeTempSelfCopy(L"buildx641.exe", &childPath, false))
+            {
+                break;
+            }
+
+            std::wstringstream command;
+            command << L"\""
+                    << childPath
+                    << L"\" /baseline /child-wait-parent "
+                    << GetCurrentProcessId()
+                    << L" /seconds "
+                    << options.RunSeconds
+                    << L" -i hosts.txt -u lab-user -p lab-pass -t 4 -o creds.txt";
+            std::wstring commandLine = command.str();
+
+            STARTUPINFOW startup = {};
+            startup.cb = sizeof(startup);
+            if (!CreateProcessW(
+                    childPath.c_str(),
+                    commandLine.data(),
+                    nullptr,
+                    nullptr,
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    nullptr,
+                    nullptr,
+                    &startup,
+                    &processInfo))
+            {
+                std::wcerr << Win32ErrorText(L"CreateProcessW OxideHarvest CLI child failed") << L"\n";
+                break;
+            }
+
+            if (processInfo.hThread != nullptr)
+            {
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = nullptr;
+            }
+
+            g_ChildProcesses.push_back(processInfo.hProcess);
+            processInfo.hProcess = nullptr;
+
+            std::wcout << L"oxideharvest-cli child="
+                       << childPath
+                       << L" pid="
+                       << processInfo.dwProcessId
+                       << L"\n";
+            AddScenario(
+                L"oxideharvest-cli",
+                L"benign child process named buildx641.exe with OxideHarvest-style CLI options",
+                0,
+                0,
+                {
+                    L"gentlemen_related_credential_tool_name",
+                    L"oxideharvest_cli_shape"
+                },
+                L"validates buildx641.exe credential-tool IOC plus -i/-u/-p/-t/-o command-line shape",
+                processInfo.dwProcessId,
+                {
+                    L"oxideharvest_cli_options"
+                },
+                {
+                    { L"oxideharvest_cli_options", L"-i;-u;-p;-t;-o" }
                 });
             ok = true;
         } while (false);
@@ -2176,6 +2402,11 @@ namespace
             const wchar_t* FileName;
             const wchar_t* ScenarioName;
             const wchar_t* Notes;
+            const wchar_t* ExpectedSuffixTail;
+            const wchar_t* ExpectedSuffixComponents;
+            const wchar_t* ExpectedProtectionHint;
+            const wchar_t* ExpectedFakeSignature;
+            const wchar_t* ExpectedFakeVersion;
         };
 
         static const SuffixNameFixture kFixtures[] =
@@ -2183,22 +2414,132 @@ namespace
             {
                 L"Kasps1.exe",
                 L"edr-killer-suffix-name-kasps",
-                L"copies this test target to a temp GentlemenCollection directory as Kasps1.exe and runs it in baseline child mode"
+                L"copies this test target to a temp GentlemenCollection directory as Kasps1.exe and runs it in baseline child mode",
+                L"1",
+                L"1",
+                L"enigma",
+                L"true",
+                L"true"
             },
             {
                 L"KaspLight.exe",
                 L"edr-killer-suffix-name-kasp",
-                L"validates the Kasp<suffix> alias from the ESET GentleKiller table"
+                L"validates the Kasp<suffix> alias from the ESET GentleKiller table",
+                L"light",
+                L"light",
+                L"none",
+                L"true",
+                L"true"
+            },
+            {
+                L"FaceIT1.exe",
+                L"edr-killer-suffix-name-faceit",
+                L"validates exact FaceIT<suffix> IOC handling without losing suffix evidence",
+                L"1",
+                L"1",
+                L"enigma",
+                L"true",
+                L"true"
+            },
+            {
+                L"Valorant2.exe",
+                L"edr-killer-suffix-name-valorant",
+                L"validates exact Valorant<suffix> IOC handling without losing suffix evidence",
+                L"2",
+                L"2",
+                L"themida",
+                L"true",
+                L"true"
+            },
+            {
+                L"EAAntiCheatLight.exe",
+                L"edr-killer-suffix-name-eaanticheat",
+                L"validates exact EAAntiCheat<suffix> IOC handling",
+                L"light",
+                L"light",
+                L"none",
+                L"true",
+                L"true"
+            },
+            {
+                L"EASolo1Clear.exe",
+                L"edr-killer-suffix-name-easolo",
+                L"validates combined EASolo<suffix> tail handling",
+                L"1clear",
+                L"1;clear",
+                L"mixed",
+                L"mixed",
+                L"mixed"
+            },
+            {
+                L"BitD1.exe",
+                L"edr-killer-suffix-name-bitd",
+                L"validates exact BitD<suffix> IOC handling",
+                L"1",
+                L"1",
+                L"enigma",
+                L"true",
+                L"true"
             },
             {
                 L"MB1.exe",
                 L"edr-killer-suffix-name-mb",
-                L"validates short MB<suffix> matching gated by GentlemenCollection context"
+                L"validates short MB<suffix> matching gated by GentlemenCollection context",
+                L"1",
+                L"1",
+                L"enigma",
+                L"true",
+                L"true"
             },
             {
                 L"G111.exe",
                 L"edr-killer-suffix-name-g11",
-                L"validates digit-ending G11<suffix> matching without stripping base digits"
+                L"validates digit-ending G11<suffix> matching without stripping base digits",
+                L"1",
+                L"1",
+                L"enigma",
+                L"true",
+                L"true"
+            },
+            {
+                L"SymantecClear.exe",
+                L"edr-killer-suffix-name-symantec",
+                L"validates weak Symantec<suffix> vendor impersonation gated by staging context",
+                L"clear",
+                L"clear",
+                L"none",
+                L"false",
+                L"false"
+            },
+            {
+                L"Avast1.exe",
+                L"edr-killer-suffix-name-avast",
+                L"validates HexKiller Avast<suffix> handling gated by staging context",
+                L"1",
+                L"1",
+                L"enigma",
+                L"true",
+                L"true"
+            },
+            {
+                L"Sent2.exe",
+                L"edr-killer-suffix-name-sent",
+                L"validates ThrottleBlood Sent<suffix> handling",
+                L"2",
+                L"2",
+                L"themida",
+                L"true",
+                L"true"
+            },
+            {
+                L"SophosLight.exe",
+                L"edr-killer-suffix-name-sophos",
+                L"validates HavocKiller Sophos<suffix> handling gated by staging context",
+                L"light",
+                L"light",
+                L"none",
+                L"true",
+                L"true"
             }
         };
 
@@ -2211,10 +2552,20 @@ namespace
                         options,
                         fixture.FileName,
                         fixture.ScenarioName,
-                        fixture.Notes))
+                        fixture.Notes,
+                        fixture.ExpectedSuffixTail,
+                        fixture.ExpectedSuffixComponents,
+                        fixture.ExpectedProtectionHint,
+                        fixture.ExpectedFakeSignature,
+                        fixture.ExpectedFakeVersion))
                 {
                     anyFailure = true;
                 }
+            }
+
+            if (!CreateWeakVendorStandaloneNegativeChild(options))
+            {
+                anyFailure = true;
             }
 
             ok = !anyFailure;
@@ -2300,6 +2651,10 @@ namespace
         {
             std::wcout << L"  gentlemen_edr_killer_process_name, gentlemen_suffix_normalized_process_name, "
                        << L"gentlemen_collection_staging_path\n";
+        }
+        if (options.OxideHarvestCli)
+        {
+            std::wcout << L"  gentlemen_related_credential_tool_name, oxideharvest_cli_shape\n";
         }
         if (options.LabBuiltinProfile)
         {
@@ -2387,6 +2742,10 @@ namespace
                 anyFailure = true;
             }
             if (options.EdrKillerSuffixName && !CreateEdrKillerSuffixNameProcess(options))
+            {
+                anyFailure = true;
+            }
+            if (options.OxideHarvestCli && !CreateOxideHarvestCliProcess(options))
             {
                 anyFailure = true;
             }

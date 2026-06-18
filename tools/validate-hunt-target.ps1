@@ -51,6 +51,11 @@ Write-Host "  target_findings=$($targetFindings.Count)"
 foreach ($scenario in $scenarios)
 {
     $expectedReasons = @($scenario.expected_reasons)
+    $unexpectedReasons = @()
+    if ($null -ne $scenario.PSObject.Properties["unexpected_reasons"])
+    {
+        $unexpectedReasons = @($scenario.unexpected_reasons)
+    }
     $expectedEvidenceKeys = @()
     if ($null -ne $scenario.PSObject.Properties["expected_evidence_keys"])
     {
@@ -66,6 +71,7 @@ foreach ($scenario in $scenarios)
         }
     }
     if ($expectedReasons.Count -eq 0 -and
+        $unexpectedReasons.Count -eq 0 -and
         $expectedEvidenceKeys.Count -eq 0 -and
         $expectedEvidence.Count -eq 0)
     {
@@ -89,6 +95,19 @@ foreach ($scenario in $scenarios)
         else
         {
             Write-Host "  pass scenario=$($scenario.name) pid=$scenarioPid reason=$reason"
+        }
+    }
+
+    foreach ($reason in $unexpectedReasons)
+    {
+        $matches = @($scenarioFindings | Where-Object { @($_.reasons) -contains $reason })
+        if ($matches.Count -ne 0)
+        {
+            $failures.Add("unexpected reason '$reason' for scenario '$($scenario.name)' pid=$scenarioPid")
+        }
+        else
+        {
+            Write-Host "  pass scenario=$($scenario.name) pid=$scenarioPid absent_reason=$reason"
         }
     }
 
