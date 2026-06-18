@@ -25,38 +25,111 @@ x64\Release\tools\KnLiveDbgHuntTargetDll.dll
 Start the target in a normal console:
 
 ```powershell
-.\x64\Release\tools\KnLiveDbgHuntTarget.exe /all /seconds 300
+.\x64\Release\tools\KnLiveDbgHuntTarget.exe /all /manifest .\hunt-target-manifest.json /seconds 300
 ```
 
 Then run KnLiveDbg elevated in another console:
 
 ```text
-!hunt /deep /limit 80 /json .\hunt-target.json
+!hunt /deep /limit 120 /json .\hunt-target.json
+```
+
+Validate the `!hunt` output against the target manifest:
+
+```powershell
+.\tools\validate-hunt-target.ps1 -Manifest .\hunt-target-manifest.json -HuntJson .\hunt-target.json
 ```
 
 ## Scenarios
 
 | Option | Artifact | Expected `!hunt` reason codes |
 | --- | --- | --- |
+| `/baseline` | No positive-control artifacts | No target-specific findings in strict baseline validation |
 | `/private-exec` | Private executable RX page | `private_executable_vad` |
 | `/rwx` | Private executable writable page | `wx_user_vad`, `private_executable_vad` |
+| `/large-private-exec` | Large private executable RX region | `large_private_executable_vad`, `private_executable_vad` |
 | `/pe-like` | Private executable page copied from this EXE's PE header | `private_pe_mapping`, `private_pe_without_loader_entry` |
 | `/wiped-pe` | PE-like private page with wiped `MZ` and `PE` signatures | `wiped_pe_header`, `private_pe_mapping` |
 | `/thread` | Thread start address inside private executable memory | `suspicious_thread_start` |
 | `/apc` | Queued APC normal routine inside private executable memory | `suspicious_apc_routine` |
 | `/module-patch` | Loaded fixture DLL export bytes modified in this process | `live_disk_exec_page_mismatch`, `module_text_mismatch` or `module_entrypoint_mismatch` |
+| `/module-patch-late` | Loaded fixture DLL export in a later executable section modified in this process | `live_disk_exec_page_mismatch`, `module_text_mismatch`, `module_stomping_evidence` |
+| `/stomp-thread` | Thread start address inside a modified module executable page | `thread_start_in_modified_module_page`, `module_stomping_evidence` |
+| `/stomp-apc` | Queued APC normal routine inside a modified module executable page | `apc_target_in_modified_module_page`, `module_stomping_evidence` |
+| `/section-image-map` | Copied fixture DLL mapped as `SEC_IMAGE` without loader participation | `section_image_without_loader_entry`, `vad_image_not_in_loader` |
+| `/locked-backed-image` | Loader-invisible `SEC_IMAGE` mapping whose backing file denies read sharing | `section_backing_inaccessible`, `section_image_without_loader_entry`, `vad_image_not_in_loader` |
+| `/section-image-stomp` | Loader-invisible `SEC_IMAGE` mapping with a modified executable page | `section_image_without_loader_entry`, `vad_image_not_in_loader`, `live_disk_exec_page_mismatch`, `module_text_mismatch`, `module_stomping_evidence` |
+| `/lab-builtin-profile` | Test-only built-in profile violation gated by an explicit lab flag | `builtin_profile_path_mismatch`, `system_name_from_non_system_path` |
+| `/manifest <path>` | Writes a machine-readable scenario manifest | `kn-live-dbg.hunt-target-manifest.v1` |
 
-If no scenario option is supplied, the target enables all scenarios. `/seconds
-0` keeps the target alive until Ctrl+C.
+`/all` enables every positive-control scenario, including the command-line
+gated lab built-in profile. If no scenario option is supplied, the target
+enables all memory/module/thread/APC/image-section scenarios but leaves the lab
+built-in profile disabled because that profile intentionally requires an
+explicit command-line marker. `/seconds 0` keeps the target alive until Ctrl+C.
+
+## Manifest Validation
+
+The target manifest records:
+
+1. Target PID and image path.
+2. Scenario name and artifact type.
+3. Artifact address and size.
+4. Expected `!hunt` reason codes.
+
+`tools\validate-hunt-target.ps1` reads the manifest and `!hunt` JSON, filters
+findings by the target PID, and fails if any expected reason code is missing.
+Use `-Strict` with `/baseline` when validating that the target process itself
+does not produce positive-control findings.
+
+## Image-Section Fixtures
+
+The image-section scenarios use temporary copies of
+`KnLiveDbgHuntTargetDll.dll` and keep all artifacts inside the current process:
+
+1. `/section-image-map` creates a file-backed image VAD that is absent from
+   Toolhelp and PEB loader views.
+2. `/locked-backed-image` keeps the mapped image alive while an open backing
+   file handle denies read sharing, forcing the scanner's backing-path reopen
+   check to report `section_backing_inaccessible`.
+3. `/section-image-stomp` modifies the mapped image's first executable section
+   page in memory only, so deep live-vs-disk comparison can verify the hidden
+   image mapping and module-stomping paths together.
+
+These cases are intentionally not cross-process injection samples. They are
+positive controls for hunt invariants: VAD image ownership, loader cross-view
+absence, backing-path accessibility, and live-vs-disk executable page mismatch.
+
+## Known Fixture Gap
+
+The target does not currently include a main-image live-vs-disk mismatch or
+process-image replacement fixture. That scenario is intentionally left out
+because safely replacing or mutating the process main image without resembling
+an offensive hollowing/doppelganging sample needs a separate benign harness.
+`!hunt` still emits `section_path_mismatch`, `section_backing_inaccessible`,
+`disk_live_image_mismatch`, and `process_doppelganging_evidence` when live
+system evidence supports those invariants. The `SEC_IMAGE` fixtures above cover
+the same section/backing invariants for non-main image mappings.
 
 ## Operator Notes
 
 1. Use `/quick` only for smoke tests. Hidden-PTE and live-vs-disk module checks
    require default or `/deep` mode.
-2. The module patch scenario modifies `KnLiveDbgHuntTargetDll.dll` only in the
-   target process address space. The DLL file on disk is not modified.
-3. Browser, .NET, and JIT-heavy systems may produce additional private
+2. The module patch and stomp scenarios modify `KnLiveDbgHuntTargetDll.dll`
+   only in the target process address space. The DLL file on disk is not
+   modified.
+3. `/lab-builtin-profile` does not rename the process to a Windows built-in
+   binary. It triggers a deterministic test-only profile in `!hunt` so profile
+   path validation can be tested without impersonating protected Windows
+   processes.
+4. `/stomp-thread` and `/stomp-apc` intentionally put execution provenance on
+   the same modified executable module page so `!hunt` can validate correlation
+   rather than only byte mismatch.
+5. `/locked-backed-image` uses share-mode denial rather than deleting the
+   backing file because Windows normally blocks immediate deletion of an active
+   image section with `ERROR_ACCESS_DENIED`.
+6. Browser, .NET, and JIT-heavy systems may produce additional private
    executable findings. Filter by `image=KnLiveDbgHuntTarget.exe` or use the
    JSON output when validating reason codes.
-4. The target is intentionally noisy. Do not run it as a clean-baseline
+7. The target is intentionally noisy. Do not run it as a clean-baseline
    process.
