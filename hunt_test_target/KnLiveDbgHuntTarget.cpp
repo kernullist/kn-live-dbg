@@ -36,8 +36,10 @@ namespace
         bool SectionImageStomp = false;
         bool ImageRwxSection = false;
         bool LabBuiltinProfile = false;
+        bool EdrKillerSuffixName = false;
         bool Baseline = false;
         bool Help = false;
+        DWORD ChildWaitParentPid = 0;
         DWORD RunSeconds = kDefaultRunSeconds;
         std::wstring ManifestPath;
     };
@@ -55,6 +57,7 @@ namespace
         std::wstring Artifact;
         uint64_t Address = 0;
         uint64_t Size = 0;
+        DWORD ProcessId = 0;
         std::vector<std::wstring> ExpectedReasons;
         std::wstring Notes;
     };
@@ -81,6 +84,9 @@ namespace
     HANDLE g_StopEvent = nullptr;
     std::vector<RegionRecord> g_Regions;
     std::vector<HANDLE> g_Threads;
+    std::vector<HANDLE> g_ChildProcesses;
+    std::vector<std::wstring> g_TempFiles;
+    std::vector<std::wstring> g_TempDirectories;
     std::vector<ScenarioRecord> g_Scenarios;
     std::vector<MappedImageRecord> g_MappedImages;
     HMODULE g_FixtureDll = nullptr;
@@ -254,13 +260,15 @@ namespace
         uint64_t address,
         uint64_t size,
         std::initializer_list<const wchar_t*> expectedReasons,
-        const std::wstring& notes)
+        const std::wstring& notes,
+        DWORD processId = 0)
     {
         ScenarioRecord record = {};
         record.Name = name;
         record.Artifact = artifact;
         record.Address = address;
         record.Size = size;
+        record.ProcessId = processId;
         record.Notes = notes;
 
         for (const wchar_t* reason : expectedReasons)
@@ -293,6 +301,10 @@ namespace
             json << L"    {";
             json << L"\"name\":\"" << JsonEscape(scenario.Name) << L"\"";
             json << L",\"artifact\":\"" << JsonEscape(scenario.Artifact) << L"\"";
+            if (scenario.ProcessId != 0)
+            {
+                json << L",\"pid\":" << scenario.ProcessId;
+            }
             json << L",\"address\":\"" << Hex(scenario.Address) << L"\"";
             json << L",\"size\":" << scenario.Size;
             json << L",\"expected_reasons\":";
@@ -314,7 +326,7 @@ namespace
     void PrintUsage()
     {
         std::wcout << L"KnLiveDbgHuntTarget command:\n";
-        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/lab-builtin-profile] [/manifest path] [/seconds n]\n";
+        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/edr-killer-suffix-name] [/lab-builtin-profile] [/manifest path] [/seconds n]\n";
         std::wcout << L"\n";
         std::wcout << L"notes:\n";
         std::wcout << L"  This is a lab-only positive-control target for !hunt.\n";
@@ -386,6 +398,7 @@ namespace
                     options->LockedBackedImage = true;
                     options->SectionImageStomp = true;
                     options->ImageRwxSection = true;
+                    options->EdrKillerSuffixName = true;
                     options->LabBuiltinProfile = true;
                     sawScenario = true;
                 }
@@ -474,10 +487,24 @@ namespace
                     options->ImageRwxSection = true;
                     sawScenario = true;
                 }
+                else if (arg == L"/edr-killer-suffix-name")
+                {
+                    options->EdrKillerSuffixName = true;
+                    sawScenario = true;
+                }
                 else if (arg == L"/lab-builtin-profile")
                 {
                     options->LabBuiltinProfile = true;
                     sawScenario = true;
+                }
+                else if (arg == L"/child-wait-parent")
+                {
+                    if (index + 1 >= argc || !ParseUInt32(argv[index + 1], &options->ChildWaitParentPid))
+                    {
+                        std::wcerr << L"invalid /child-wait-parent value\n";
+                        break;
+                    }
+                    ++index;
                 }
                 else if (arg == L"/manifest")
                 {
@@ -525,7 +552,7 @@ namespace
                 break;
             }
 
-            if (!sawScenario)
+            if (!sawScenario && options->ChildWaitParentPid == 0)
             {
                 options->PrivateExec = true;
                 options->Rwx = true;
@@ -543,6 +570,7 @@ namespace
                 options->LockedBackedImage = true;
                 options->SectionImageStomp = true;
                 options->ImageRwxSection = true;
+                options->EdrKillerSuffixName = false;
                 options->LabBuiltinProfile = false;
             }
 
@@ -564,6 +592,7 @@ namespace
                 options->LockedBackedImage = false;
                 options->SectionImageStomp = false;
                 options->ImageRwxSection = false;
+                options->EdrKillerSuffixName = false;
                 options->LabBuiltinProfile = false;
             }
         } while (false);
@@ -641,6 +670,120 @@ namespace
             *directory = path.substr(0, slash + 1);
             ok = true;
         } while (false);
+
+        return ok;
+    }
+
+    bool GetSelfPath(std::wstring* path)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (path == nullptr)
+            {
+                break;
+            }
+
+            std::vector<wchar_t> buffer(32768, L'\0');
+            DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (length == 0 || length >= buffer.size())
+            {
+                std::wcerr << Win32ErrorText(L"GetModuleFileNameW self path failed") << L"\n";
+                break;
+            }
+
+            path->assign(buffer.data(), length);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool MakeTempSelfCopy(const wchar_t* fileName, std::wstring* path)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (fileName == nullptr || path == nullptr)
+            {
+                break;
+            }
+
+            std::wstring selfPath;
+            if (!GetSelfPath(&selfPath))
+            {
+                break;
+            }
+
+            wchar_t tempPath[MAX_PATH + 1] = {};
+            DWORD tempLength = GetTempPathW(static_cast<DWORD>(_countof(tempPath)), tempPath);
+            if (tempLength == 0 || tempLength >= _countof(tempPath))
+            {
+                std::wcerr << Win32ErrorText(L"GetTempPathW failed") << L"\n";
+                break;
+            }
+
+            std::wstringstream directoryStream;
+            directoryStream << tempPath
+                            << L"knhunt-"
+                            << GetCurrentProcessId()
+                            << L"-GentlemenCollection";
+            std::wstring directory = directoryStream.str();
+            if (!CreateDirectoryW(directory.c_str(), nullptr) &&
+                GetLastError() != ERROR_ALREADY_EXISTS)
+            {
+                std::wcerr << Win32ErrorText(L"CreateDirectoryW GentlemenCollection temp failed") << L"\n";
+                break;
+            }
+
+            std::wstring candidate = directory + L"\\" + fileName;
+            if (!CopyFileW(selfPath.c_str(), candidate.c_str(), FALSE))
+            {
+                std::wcerr << Win32ErrorText(L"CopyFileW self temp copy failed") << L"\n";
+                break;
+            }
+
+            g_TempDirectories.push_back(directory);
+            g_TempFiles.push_back(candidate);
+            *path = candidate;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool WaitAsChildProcess(const Options& options)
+    {
+        bool ok = false;
+        HANDLE parent = nullptr;
+
+        do
+        {
+            DWORD waitMs = INFINITE;
+            if (options.RunSeconds != 0 && options.RunSeconds <= 0xffffffffu / 1000u)
+            {
+                waitMs = options.RunSeconds * 1000u;
+            }
+
+            parent = OpenProcess(SYNCHRONIZE, FALSE, options.ChildWaitParentPid);
+            if (parent == nullptr)
+            {
+                WaitForSingleObject(g_StopEvent, waitMs);
+                ok = true;
+                break;
+            }
+
+            HANDLE handles[2] = { g_StopEvent, parent };
+            WaitForMultipleObjects(2, handles, FALSE, waitMs);
+            ok = true;
+        } while (false);
+
+        if (parent != nullptr)
+        {
+            CloseHandle(parent);
+        }
 
         return ok;
     }
@@ -1877,6 +2020,83 @@ namespace
         return ok;
     }
 
+    bool CreateEdrKillerSuffixNameProcess(const Options& options)
+    {
+        bool ok = false;
+        PROCESS_INFORMATION processInfo = {};
+
+        do
+        {
+            std::wstring childPath;
+            if (!MakeTempSelfCopy(L"Kasps1.exe", &childPath))
+            {
+                break;
+            }
+
+            std::wstringstream command;
+            command << L"\""
+                    << childPath
+                    << L"\" /baseline /child-wait-parent "
+                    << GetCurrentProcessId()
+                    << L" /seconds "
+                    << options.RunSeconds;
+            std::wstring commandLine = command.str();
+
+            STARTUPINFOW startup = {};
+            startup.cb = sizeof(startup);
+            if (!CreateProcessW(
+                    childPath.c_str(),
+                    commandLine.data(),
+                    nullptr,
+                    nullptr,
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    nullptr,
+                    nullptr,
+                    &startup,
+                    &processInfo))
+            {
+                std::wcerr << Win32ErrorText(L"CreateProcessW EDR-killer suffix child failed") << L"\n";
+                break;
+            }
+
+            if (processInfo.hThread != nullptr)
+            {
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = nullptr;
+            }
+
+            g_ChildProcesses.push_back(processInfo.hProcess);
+            processInfo.hProcess = nullptr;
+
+            std::wcout << L"edr-killer-suffix-name child="
+                       << childPath
+                       << L" pid="
+                       << processInfo.dwProcessId
+                       << L"\n";
+            AddScenario(
+                L"edr-killer-suffix-name",
+                L"benign child process named like a Gentlemen suffix-normalized EDR-killer IOC",
+                0,
+                0,
+                {L"gentlemen_edr_killer_process_name", L"gentlemen_suffix_normalized_process_name", L"gentlemen_collection_staging_path"},
+                L"copies this test target to a temp GentlemenCollection directory as Kasps1.exe and runs it in baseline child mode",
+                processInfo.dwProcessId);
+            ok = true;
+        } while (false);
+
+        if (processInfo.hThread != nullptr)
+        {
+            CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != nullptr)
+        {
+            CloseHandle(processInfo.hProcess);
+        }
+
+        return ok;
+    }
+
     void PrintExpectedFindings(const Options& options)
     {
         std::wcout << L"\nexpected !hunt reason codes:\n";
@@ -1949,6 +2169,11 @@ namespace
         if (options.ImageRwxSection)
         {
             std::wcout << L"  image_rwx_section_vad, mockingjay_rwx_section_candidate, wx_user_vad\n";
+        }
+        if (options.EdrKillerSuffixName)
+        {
+            std::wcout << L"  gentlemen_edr_killer_process_name, gentlemen_suffix_normalized_process_name, "
+                       << L"gentlemen_collection_staging_path\n";
         }
         if (options.LabBuiltinProfile)
         {
@@ -2035,6 +2260,10 @@ namespace
             {
                 anyFailure = true;
             }
+            if (options.EdrKillerSuffixName && !CreateEdrKillerSuffixNameProcess(options))
+            {
+                anyFailure = true;
+            }
             if (options.LabBuiltinProfile)
             {
                 HMODULE module = nullptr;
@@ -2066,6 +2295,7 @@ namespace
         {
             std::wcout << L"  " << scenario.Name
                        << L" artifact=\"" << scenario.Artifact << L"\""
+                       << L" pid=" << (scenario.ProcessId == 0 ? GetCurrentProcessId() : scenario.ProcessId)
                        << L" address=" << Hex(scenario.Address)
                        << L" size=" << scenario.Size
                        << L"\n";
@@ -2104,6 +2334,17 @@ int wmain(int argc, wchar_t** argv)
 
         std::wcout << L"KnLiveDbgHuntTarget pid=" << GetCurrentProcessId() << L"\n";
         std::wcout << L"run_seconds=" << options.RunSeconds << L"\n";
+        if (options.ChildWaitParentPid != 0)
+        {
+            std::wcout << L"child_wait_parent=" << options.ChildWaitParentPid << L"\n";
+            if (!WaitAsChildProcess(options))
+            {
+                break;
+            }
+            exitCode = 0;
+            break;
+        }
+
         PrintExpectedFindings(options);
 
         if (!CreateScenarios(options))
@@ -2158,6 +2399,34 @@ int wmain(int argc, wchar_t** argv)
             CloseHandle(thread);
         }
     }
+
+    for (HANDLE process : g_ChildProcesses)
+    {
+        if (process == nullptr)
+        {
+            continue;
+        }
+
+        if (WaitForSingleObject(process, 1500) == WAIT_TIMEOUT)
+        {
+            TerminateProcess(process, 0);
+            WaitForSingleObject(process, 1500);
+        }
+        CloseHandle(process);
+    }
+    g_ChildProcesses.clear();
+
+    for (const std::wstring& path : g_TempFiles)
+    {
+        DeleteFileW(path.c_str());
+    }
+    g_TempFiles.clear();
+
+    for (const std::wstring& directory : g_TempDirectories)
+    {
+        RemoveDirectoryW(directory.c_str());
+    }
+    g_TempDirectories.clear();
 
     if (g_StopEvent != nullptr)
     {
