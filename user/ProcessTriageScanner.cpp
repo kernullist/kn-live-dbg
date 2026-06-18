@@ -32,6 +32,8 @@ namespace
     constexpr size_t kMaxVadNodes = 65536;
     constexpr size_t kMaxThreads = 16384;
     constexpr size_t kMaxApcEntriesPerQueue = 16;
+    constexpr uint64_t kMaxThreadStackScanBytes = 64ull * 1024ull;
+    constexpr size_t kMaxStackReferencesPerThread = 16;
 
     struct VadInterval
     {
@@ -766,6 +768,16 @@ namespace
                 break;
             }
 
+            if (result->HiddenPteTruncated)
+            {
+                break;
+            }
+
+            if (options.HiddenPteExecutableOnly && !mapping.Executable)
+            {
+                break;
+            }
+
             uint64_t size = endAddress - startAddress + 1ull;
             uint64_t offset = startAddress - mapping.StartAddress;
 
@@ -809,7 +821,9 @@ namespace
                 }
             }
 
-            uint32_t recordLimit = options.Limit != 0 ? options.Limit : kDefaultHiddenPteRecordLimit;
+            uint32_t recordLimit = options.HiddenPteLimit != 0
+                ? options.HiddenPteLimit
+                : (options.Limit != 0 ? options.Limit : kDefaultHiddenPteRecordLimit);
             if (result->HiddenPteRecords.size() >= recordLimit)
             {
                 result->HiddenPteTruncated = true;
@@ -831,6 +845,16 @@ namespace
         do
         {
             if (vadCursor == nullptr || result == nullptr || mapping.EndAddress < mapping.StartAddress)
+            {
+                break;
+            }
+
+            if (result->HiddenPteTruncated)
+            {
+                break;
+            }
+
+            if (options.HiddenPteExecutableOnly && !mapping.Executable)
             {
                 break;
             }
@@ -857,6 +881,10 @@ namespace
                         uncoveredStart,
                         std::min(mapping.EndAddress, interval.StartAddress - 1ull),
                         result);
+                    if (result->HiddenPteTruncated)
+                    {
+                        break;
+                    }
                 }
 
                 if (interval.EndAddress == std::numeric_limits<uint64_t>::max())
@@ -876,7 +904,7 @@ namespace
                 ++index;
             }
 
-            if (uncoveredStart <= mapping.EndAddress)
+            if (!result->HiddenPteTruncated && uncoveredStart <= mapping.EndAddress)
             {
                 AppendHiddenPteRecord(options, mapping, uncoveredStart, mapping.EndAddress, result);
             }
@@ -913,6 +941,11 @@ namespace
         uint64_t maxUserAddress = MaxUserAddressForPagingLevels(pagingLevels);
         for (size_t index = 0; index <= lastIndex; ++index)
         {
+            if (result != nullptr && result->HiddenPteTruncated)
+            {
+                break;
+            }
+
             uint64_t entry = DecodePageTableEntry(page, index);
             if ((entry & kPtePresent) == 0)
             {
@@ -1267,6 +1300,241 @@ namespace
         }
 
         return found;
+    }
+
+    bool ReadProcessU64ByDtb(DeviceClient& device, uint64_t dtb, uint64_t address, uint64_t* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr)
+            {
+                break;
+            }
+
+            *value = 0;
+            std::vector<uint8_t> bytes;
+            std::wstring ignored;
+            if (!ReadProcessMemoryByDtb(device, dtb, address, sizeof(uint64_t), &bytes, &ignored) ||
+                bytes.size() != sizeof(uint64_t))
+            {
+                break;
+            }
+
+            memcpy(value, bytes.data(), sizeof(uint64_t));
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadUserStackBoundsFromTeb(DeviceClient& device, uint64_t dtb, ProcessThreadRecord* record)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (record == nullptr)
+            {
+                break;
+            }
+
+            record->UserStackBase = 0;
+            record->UserStackLimit = 0;
+            record->HasUserStackBounds = false;
+
+            uint64_t stackBase = 0;
+            uint64_t stackLimit = 0;
+            if (record->HasTeb && IsUserAddress(record->Teb))
+            {
+                if (!ReadProcessU64ByDtb(device, dtb, record->Teb + 0x08, &stackBase) ||
+                    !ReadProcessU64ByDtb(device, dtb, record->Teb + 0x10, &stackLimit))
+                {
+                    stackBase = 0;
+                    stackLimit = 0;
+                }
+            }
+
+            if ((stackBase == 0 || stackLimit == 0) &&
+                record->HasStackBounds &&
+                IsUserAddress(record->StackBase) &&
+                IsUserAddress(record->StackLimit))
+            {
+                stackBase = record->StackBase;
+                stackLimit = record->StackLimit;
+            }
+
+            if (!IsUserAddress(stackBase) ||
+                !IsUserAddress(stackLimit) ||
+                stackBase <= stackLimit)
+            {
+                break;
+            }
+
+            uint64_t stackSize = stackBase - stackLimit;
+            if (stackSize == 0 || stackSize > 512ull * 1024ull * 1024ull)
+            {
+                break;
+            }
+
+            record->UserStackBase = stackBase;
+            record->UserStackLimit = stackLimit;
+            record->HasUserStackBounds = true;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool StackReferenceAlreadyRecorded(const ProcessThreadRecord& record, uint64_t value)
+    {
+        bool found = false;
+
+        for (const ProcessStackReferenceRecord& item : record.StackReferences)
+        {
+            if (item.Value == value)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        return found;
+    }
+
+    void TryAppendStackReference(
+        const std::vector<ProcessUserModuleRange>& modules,
+        const std::vector<ProcessVadRecord>& vadRecords,
+        uint64_t stackAddress,
+        uint64_t value,
+        ProcessThreadRecord* record)
+    {
+        do
+        {
+            if (record == nullptr ||
+                record->StackReferences.size() >= kMaxStackReferencesPerThread ||
+                !IsUserAddress(value) ||
+                StackReferenceAlreadyRecorded(*record, value))
+            {
+                break;
+            }
+
+            const ProcessVadRecord* vad = FindVadForAddress(vadRecords, value);
+            if (vad == nullptr || !vad->Executable)
+            {
+                break;
+            }
+
+            const ProcessUserModuleRange* module = FindUserModule(modules, value);
+            bool privateExec = vad->HasPrivateMemory && vad->PrivateMemory && vad->Executable;
+            bool wx = vad->Executable && vad->Writable;
+            bool userModuleEnumerationAvailable = !modules.empty();
+            bool executableOutsideModule = userModuleEnumerationAvailable && module == nullptr;
+            if (!privateExec && !wx && !executableOutsideModule)
+            {
+                break;
+            }
+
+            ProcessStackReferenceRecord ref = {};
+            ref.StackAddress = stackAddress;
+            ref.Value = value;
+            ref.UserModuleEnumerationAvailable = userModuleEnumerationAvailable;
+            ref.ValueInUserModule = module != nullptr;
+            ref.ValueOutsideUserModules = executableOutsideModule;
+            ref.ValueModule = module != nullptr ? module->ImageName : L"";
+            ref.VadClassification = vad->Classification;
+            ref.ValueInPrivateExecVad = privateExec;
+            ref.ValueInWxVad = wx;
+            ref.Suspicious = true;
+            if (privateExec)
+            {
+                ref.Notes = L"stack value lands in private executable VAD";
+            }
+            else if (wx)
+            {
+                ref.Notes = L"stack value lands in writable executable VAD";
+            }
+            else
+            {
+                ref.Notes = L"stack value lands in executable VAD outside enumerated modules";
+            }
+
+            record->StackReferences.push_back(ref);
+        } while (false);
+    }
+
+    void ScanUserStackReferences(
+        DeviceClient& device,
+        const std::vector<ProcessUserModuleRange>& modules,
+        const std::vector<ProcessVadRecord>& vadRecords,
+        uint64_t dtb,
+        ProcessThreadRecord* record)
+    {
+        do
+        {
+            if (record == nullptr ||
+                !record->HasUserStackBounds ||
+                dtb == 0 ||
+                record->UserStackBase <= record->UserStackLimit)
+            {
+                break;
+            }
+
+            uint64_t scanEnd = record->UserStackBase;
+            uint64_t scanStart = record->UserStackLimit;
+            if (scanEnd - scanStart > kMaxThreadStackScanBytes)
+            {
+                scanStart = scanEnd - kMaxThreadStackScanBytes;
+            }
+            if ((scanStart & 0x7ull) != 0)
+            {
+                scanStart = (scanStart + 0x7ull) & ~0x7ull;
+            }
+            if (scanEnd < sizeof(uint64_t))
+            {
+                break;
+            }
+
+            uint64_t current = scanStart;
+            while (current <= scanEnd - sizeof(uint64_t) &&
+                   record->StackReferences.size() < kMaxStackReferencesPerThread)
+            {
+                uint64_t nextPage = (current & ~(kPageSize - 1ull)) + kPageSize;
+                uint64_t chunkEnd = nextPage < scanEnd ? nextPage : scanEnd;
+                if (chunkEnd <= current)
+                {
+                    break;
+                }
+
+                uint32_t chunkSize = static_cast<uint32_t>(chunkEnd - current);
+                std::vector<uint8_t> bytes;
+                std::wstring ignored;
+                if (ReadProcessMemoryByDtb(device, dtb, current, chunkSize, &bytes, &ignored))
+                {
+                    for (size_t offset = 0;
+                         offset + sizeof(uint64_t) <= bytes.size() &&
+                         record->StackReferences.size() < kMaxStackReferencesPerThread;
+                         offset += sizeof(uint64_t))
+                    {
+                        uint64_t value = 0;
+                        memcpy(&value, bytes.data() + offset, sizeof(uint64_t));
+                        TryAppendStackReference(
+                            modules,
+                            vadRecords,
+                            current + offset,
+                            value,
+                            record);
+                    }
+                }
+
+                current = chunkEnd;
+                if ((current & 0x7ull) != 0)
+                {
+                    current = (current + 0x7ull) & ~0x7ull;
+                }
+            }
+        } while (false);
     }
 
     void AnnotateKernelPointer(SymbolEngine& symbols, uint64_t address, std::wstring* moduleName, std::wstring* symbolName)
@@ -1916,7 +2184,11 @@ namespace
                 record->NormalRoutine = value;
                 record->HasNormalRoutine = true;
                 AnnotateUserOrKernelAddress(symbols, modules, value, &record->NormalRoutineModule, nullptr);
-                if (value != 0 && userQueue && IsUserAddress(value) && FindUserModule(modules, value) == nullptr)
+                if (value != 0 &&
+                    userQueue &&
+                    IsUserAddress(value) &&
+                    !modules.empty() &&
+                    FindUserModule(modules, value) == nullptr)
                 {
                     record->Suspicious = true;
                     if (!record->Notes.empty())
@@ -2090,9 +2362,16 @@ bool ProcessTriageScanner::ScanVad(
         {
             if (options.ScanHiddenPtes)
             {
-                AddKnownVadlessUserMappings(&vadIntervals);
-                NormalizeVadIntervals(&vadIntervals);
-                ScanHiddenVadPtes(device_, options, vadIntervals, result);
+                if (options.RequireVadCoverageForHiddenPtes)
+                {
+                    result->Warnings.push_back(L"hidden PTE scan skipped: VAD root is empty");
+                }
+                else
+                {
+                    AddKnownVadlessUserMappings(&vadIntervals);
+                    NormalizeVadIntervals(&vadIntervals);
+                    ScanHiddenVadPtes(device_, options, vadIntervals, result);
+                }
             }
             ok = true;
             break;
@@ -2104,6 +2383,7 @@ bool ProcessTriageScanner::ScanVad(
 
         uint64_t dtb = TargetUserDtb(options.Target);
         bool vadTraversalHitLimit = false;
+        bool vadCoverageReliable = true;
         while (!stack.empty() && result->NodesVisited < kMaxVadNodes)
         {
             uint64_t node = stack.back();
@@ -2117,12 +2397,14 @@ bool ProcessTriageScanner::ScanVad(
             if (!IsKernelAddress(node))
             {
                 result->Warnings.push_back(L"VAD node is not kernel-canonical: " + Hex(node, 16));
+                vadCoverageReliable = false;
                 continue;
             }
 
             if (std::find(visited.begin(), visited.end(), node) != visited.end())
             {
                 result->Warnings.push_back(L"VAD cycle detected at " + Hex(node, 16));
+                vadCoverageReliable = false;
                 continue;
             }
             visited.push_back(node);
@@ -2133,6 +2415,7 @@ bool ProcessTriageScanner::ScanVad(
             if (!ReadVadRecord(device_, layout, node, &record, &readError))
             {
                 result->Warnings.push_back(L"failed to read VAD node " + Hex(node, 16) + L": " + readError);
+                vadCoverageReliable = false;
                 continue;
             }
 
@@ -2217,6 +2500,7 @@ bool ProcessTriageScanner::ScanVad(
         if (result->NodesVisited >= kMaxVadNodes)
         {
             vadTraversalHitLimit = true;
+            vadCoverageReliable = false;
             result->Truncated = true;
             result->Warnings.push_back(L"VAD traversal hit the node limit");
         }
@@ -2227,9 +2511,16 @@ bool ProcessTriageScanner::ScanVad(
             {
                 result->Warnings.push_back(L"hidden PTE scan is lower confidence because VAD coverage hit the traversal limit");
             }
-            AddKnownVadlessUserMappings(&vadIntervals);
-            NormalizeVadIntervals(&vadIntervals);
-            ScanHiddenVadPtes(device_, options, vadIntervals, result);
+            if (options.RequireVadCoverageForHiddenPtes && (!vadCoverageReliable || vadIntervals.empty()))
+            {
+                result->Warnings.push_back(L"hidden PTE scan skipped: VAD coverage is incomplete");
+            }
+            else
+            {
+                AddKnownVadlessUserMappings(&vadIntervals);
+                NormalizeVadIntervals(&vadIntervals);
+                ScanHiddenVadPtes(device_, options, vadIntervals, result);
+            }
         }
 
         ok = true;
@@ -2287,6 +2578,8 @@ bool ProcessTriageScanner::ScanThreads(
         {
             result->Warnings.push_back(L"VAD correlation unavailable for thread-start classification");
         }
+
+        uint64_t userDtb = TargetUserDtb(options.Target);
 
         uint64_t listHead = 0;
         if (!TryAdd(options.Target.Eprocess, layout.ThreadListHead.Offset, &listHead))
@@ -2355,6 +2648,15 @@ bool ProcessTriageScanner::ScanThreads(
             bool hasStackLimit = false;
             ReadOptionalPointerField(device_, ethread, layout.StackLimit, layout.HasStackLimit, &record.StackLimit, &hasStackLimit);
             record.HasStackBounds = record.HasStackBounds && hasStackLimit;
+
+            if (options.IncludeStacks && userDtb != 0)
+            {
+                if (ReadUserStackBoundsFromTeb(device_, userDtb, &record))
+                {
+                    ScanUserStackReferences(device_, userModules, vadRecords, userDtb, &record);
+                    result->StackReferenceCount += record.StackReferences.size();
+                }
+            }
 
             uint64_t classifyAddress = record.HasWin32StartAddress && record.Win32StartAddress != 0
                 ? record.Win32StartAddress
@@ -2550,6 +2852,7 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
          << L",\"records\":" << result.MatchingRecords
          << L",\"suspicious_start\":" << result.SuspiciousStartCount
          << L",\"nonempty_apc_queues\":" << result.ApcNonEmptyCount
+         << L",\"stack_references\":" << result.StackReferenceCount
          << L",\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},\n";
     json << L"  \"warnings\":[";
     for (size_t i = 0; i < result.Warnings.size(); ++i)
@@ -2572,6 +2875,8 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
              << L"\",\"teb\":\"" << Hex(r.Teb, 16)
              << L"\",\"stack_base\":\"" << Hex(r.StackBase, 16)
              << L"\",\"stack_limit\":\"" << Hex(r.StackLimit, 16)
+             << L"\",\"user_stack_base\":\"" << Hex(r.UserStackBase, 16)
+             << L"\",\"user_stack_limit\":\"" << Hex(r.UserStackLimit, 16)
              << L"\",\"start_module\":\"" << JsonEscape(r.StartModule)
              << L"\",\"win32_start_module\":\"" << JsonEscape(r.Win32StartModule)
              << L"\",\"vad\":\"" << JsonEscape(r.VadClassification)
@@ -2604,6 +2909,25 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
                      << L"}";
             }
             json << L"]}";
+        }
+        json << L"],\"stack_references\":[";
+        for (size_t s = 0; s < r.StackReferences.size(); ++s)
+        {
+            const ProcessStackReferenceRecord& ref = r.StackReferences[s];
+            if (s != 0)
+            {
+                json << L",";
+            }
+            json << L"{\"stack\":\"" << Hex(ref.StackAddress, 16)
+                 << L"\",\"value\":\"" << Hex(ref.Value, 16)
+                 << L"\",\"module\":\"" << JsonEscape(ref.ValueModule)
+                 << L"\",\"vad\":\"" << JsonEscape(ref.VadClassification)
+                 << L"\",\"module_enum_available\":" << (ref.UserModuleEnumerationAvailable ? L"true" : L"false")
+                 << L",\"outside_modules\":" << (ref.ValueOutsideUserModules ? L"true" : L"false")
+                 << L"\",\"private_exec\":" << (ref.ValueInPrivateExecVad ? L"true" : L"false")
+                 << L",\"wx\":" << (ref.ValueInWxVad ? L"true" : L"false")
+                 << L",\"notes\":\"" << JsonEscape(ref.Notes)
+                 << L"\"}";
         }
         json << L"]}";
         if (i + 1 != result.Records.size())

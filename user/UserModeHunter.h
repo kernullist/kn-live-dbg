@@ -20,7 +20,7 @@ enum class HuntMode
 struct HuntOptions
 {
     HuntMode Mode = HuntMode::Default;
-    uint32_t RenderLimit = 0;
+    uint32_t RenderLimit = 200;
     std::vector<SnapshotProcessRecord> Processes;
 };
 
@@ -76,6 +76,9 @@ struct HuntProcessRecord
     std::vector<std::wstring> BuiltinProfileViolations;
     bool ToolhelpModuleEnumerated = false;
     bool PebLdrEnumerated = false;
+    bool PebLdrLoadEnumerated = false;
+    bool PebLdrMemoryEnumerated = false;
+    bool PebLdrInitEnumerated = false;
     std::vector<ProcessVadRecord> VadRecords;
     std::vector<ProcessHiddenVadPteRecord> HiddenPteRecords;
     std::vector<ProcessThreadRecord> ThreadRecords;
@@ -91,6 +94,7 @@ struct HuntProcessRecord
     uint64_t ThreadsVisited = 0;
     uint64_t SuspiciousThreadStarts = 0;
     uint64_t NonEmptyApcQueues = 0;
+    uint64_t StackReferenceCount = 0;
 };
 
 struct HuntFinding

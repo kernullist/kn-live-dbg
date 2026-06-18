@@ -20,11 +20,17 @@ namespace
     constexpr LONG kStatusBufferTooSmall = static_cast<LONG>(0xc0000023);
     constexpr uint64_t kPageSize = 0x1000ull;
     constexpr uint64_t kLargePrivateExecThreshold = 64ull * 1024ull * 1024ull;
+    constexpr uint32_t kMaxWeakPrivateExecFindingsPerProcess = 8;
     constexpr size_t kMaxPebStringBytes = 32768;
     constexpr size_t kMaxLdrModules = 1024;
+    constexpr uint32_t kHuntHiddenPteRecordLimitPerProcess = 64;
     constexpr size_t kMaxDeepModuleComparisonsPerProcess = 96;
     constexpr size_t kMaxDeepPagesPerProcess = 512;
     constexpr size_t kMaxSampledExecPagesPerSection = 2;
+    constexpr size_t kMaxStackReferenceFindingsPerProcess = 16;
+    constexpr size_t kMaxDeepStackPointerSamplesPerProcess = 32768;
+    constexpr uint64_t kMaxThreadStackScanBytes = 64ull * 1024ull;
+    constexpr size_t kMaxBuiltinModuleProvenanceFindingsPerProcess = 8;
     constexpr uint64_t kKernelAddressMin = 0xffff800000000000ull;
 
     struct HuntLocalUnicodeString
@@ -51,6 +57,26 @@ namespace
         HANDLE InheritedFromUniqueProcessId;
     };
 
+    struct DeepStackPointerSample
+    {
+        uint64_t ThreadId = 0;
+        uint64_t StackAddress = 0;
+        uint64_t Value = 0;
+    };
+
+    struct DeepAddressRange
+    {
+        uint64_t Start = 0;
+        uint64_t End = 0;
+    };
+
+    struct DeepStackReferenceCache
+    {
+        bool Built = false;
+        bool LimitReached = false;
+        std::vector<DeepStackPointerSample> Samples;
+    };
+
     typedef LONG (NTAPI* NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
 
     struct ApiProcessRecord
@@ -70,16 +96,21 @@ namespace
         uint32_t SizeOfRawData = 0;
         uint32_t Characteristics = 0;
         bool Executable = false;
+        bool Writable = false;
     };
 
     struct DiskPeMetadata
     {
+        uint64_t ImageBase = 0;
         uint32_t EntryPointRva = 0;
         uint32_t FirstExecutableSectionRva = 0;
         uint32_t SizeOfHeaders = 0;
+        uint32_t SizeOfImage = 0;
         bool HasEntryPoint = false;
         bool HasExecutableSection = false;
         std::vector<DiskPeSection> Sections;
+        std::set<uint32_t> RelocationPages;
+        std::set<uint32_t> LoaderMutablePages;
     };
 
     struct BuiltinProcessProfile
@@ -98,9 +129,11 @@ namespace
     {
         TypeFieldInfo SubsectionControlArea = {};
         TypeFieldInfo ControlAreaFilePointer = {};
+        TypeFieldInfo ControlAreaImageFlag = {};
         TypeFieldInfo FileObjectFileName = {};
         bool HasSubsectionControlArea = false;
         bool HasControlAreaFilePointer = false;
+        bool HasControlAreaImageFlag = false;
         bool HasFileObjectFileName = false;
         bool Resolved = false;
         std::vector<std::wstring> Warnings;
@@ -218,6 +251,37 @@ namespace
         return same;
     }
 
+    bool LeafHasAnySuffix(const std::wstring& path, const std::vector<std::wstring>& suffixes)
+    {
+        bool matched = false;
+
+        do
+        {
+            std::wstring leaf = LeafName(path);
+            if (leaf.empty())
+            {
+                break;
+            }
+
+            for (const std::wstring& suffix : suffixes)
+            {
+                if (leaf.size() >= suffix.size() &&
+                    leaf.compare(leaf.size() - suffix.size(), suffix.size(), suffix) == 0)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool LooksLikePeImagePath(const std::wstring& path)
+    {
+        return LeafHasAnySuffix(path, {L".exe", L".dll", L".sys", L".ocx", L".cpl", L".scr"});
+    }
+
     std::wstring FirstCommandLineImage(const std::wstring& commandLine)
     {
         std::wstring image;
@@ -284,6 +348,14 @@ namespace
         return process.UserDirectoryTableBase != 0
             ? process.UserDirectoryTableBase
             : process.DirectoryTableBase;
+    }
+
+    bool HasVerifiedUserAddressSpace(const SnapshotProcessRecord& process)
+    {
+        return process.ProcessId > 4 &&
+            process.HasPeb &&
+            process.Peb != 0 &&
+            TargetUserDtb(process) != 0;
     }
 
     bool IsUserAddress(uint64_t value)
@@ -799,6 +871,49 @@ namespace
         return result;
     }
 
+    bool IsDriveQualifiedPath(const std::wstring& path)
+    {
+        return path.size() >= 3 &&
+            ((path[0] >= L'a' && path[0] <= L'z') || (path[0] >= L'A' && path[0] <= L'Z')) &&
+            path[1] == L':' &&
+            path[2] == L'\\';
+    }
+
+    bool IsRootRelativePath(const std::wstring& path)
+    {
+        return path.size() >= 2 &&
+            path[0] == L'\\' &&
+            path[1] != L'\\';
+    }
+
+    bool SameCanonicalPathWithRootRelativeFallback(const std::wstring& left, const std::wstring& right)
+    {
+        bool same = false;
+
+        do
+        {
+            if (left == right)
+            {
+                same = true;
+                break;
+            }
+
+            if (IsRootRelativePath(left) && IsDriveQualifiedPath(right))
+            {
+                same = (right.substr(0, 2) + left) == right;
+                break;
+            }
+
+            if (IsRootRelativePath(right) && IsDriveQualifiedPath(left))
+            {
+                same = left == (left.substr(0, 2) + right);
+                break;
+            }
+        } while (false);
+
+        return same;
+    }
+
     std::wstring EnsureTrailingSlash(std::wstring path)
     {
         if (!path.empty() && path.back() != L'\\')
@@ -871,7 +986,7 @@ namespace
                 break;
             }
 
-            same = l == r;
+            same = SameCanonicalPathWithRootRelativeFallback(l, r);
         } while (false);
 
         return same;
@@ -1023,6 +1138,23 @@ namespace
         }
 
         return hash;
+    }
+
+    size_t CountDifferentBytes(const std::vector<uint8_t>& left, const std::vector<uint8_t>& right)
+    {
+        size_t count = 0;
+        size_t common = std::min(left.size(), right.size());
+
+        for (size_t index = 0; index < common; ++index)
+        {
+            if (left[index] != right[index])
+            {
+                ++count;
+            }
+        }
+
+        count += left.size() > right.size() ? left.size() - right.size() : right.size() - left.size();
+        return count;
     }
 
     bool ReadProcessMemoryByDtb(
@@ -1324,6 +1456,8 @@ namespace
                 FindFieldRecursive(symbols, {L"nt!_SUBSECTION", L"_SUBSECTION"}, L"ControlArea", &layout->SubsectionControlArea);
             layout->HasControlAreaFilePointer =
                 FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"FilePointer", &layout->ControlAreaFilePointer);
+            layout->HasControlAreaImageFlag =
+                FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"Image", &layout->ControlAreaImageFlag);
             layout->HasFileObjectFileName =
                 FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"FileName", &layout->FileObjectFileName);
 
@@ -1354,7 +1488,8 @@ namespace
         const ProcessVadRecord& vad,
         std::wstring* path,
         std::wstring* state,
-        std::wstring* warning)
+        std::wstring* warning,
+        bool* imageSection = nullptr)
     {
         bool ok = false;
         static SectionBackingLayout layout;
@@ -1368,6 +1503,10 @@ namespace
 
             path->clear();
             *state = L"unavailable";
+            if (imageSection != nullptr)
+            {
+                *imageSection = false;
+            }
 
             if (!vad.HasSubsection || vad.Subsection == 0)
             {
@@ -1395,6 +1534,16 @@ namespace
                     *warning = L"failed to read VAD subsection control area";
                 }
                 break;
+            }
+
+            if (imageSection != nullptr && layout.HasControlAreaImageFlag)
+            {
+                uint64_t imageFlag = 0;
+                std::wstring ignored;
+                if (ReadFieldInteger(device, controlArea, layout.ControlAreaImageFlag, sizeof(uint32_t), &imageFlag, &ignored))
+                {
+                    *imageSection = imageFlag != 0;
+                }
             }
 
             uint64_t fileFastRef = 0;
@@ -1534,6 +1683,101 @@ namespace
         return module.ToolhelpSeen || module.LdrLoadSeen || module.LdrMemorySeen || module.LdrInitSeen;
     }
 
+    bool ModuleHasCoreLdrView(const HuntModuleRecord& module)
+    {
+        return module.LdrLoadSeen || module.LdrMemorySeen;
+    }
+
+    bool ProcessHasReliableCoreLdrView(const HuntProcessRecord& process)
+    {
+        return process.PebLdrLoadEnumerated && process.PebLdrMemoryEnumerated;
+    }
+
+    bool CanonicalPathUnderDirectory(const std::wstring& path, const std::wstring& directory)
+    {
+        bool matched = false;
+
+        do
+        {
+            std::wstring canonicalPath = CanonicalPathForCompare(path);
+            std::wstring canonicalDirectory = CanonicalPathForCompare(directory);
+            if (canonicalPath.empty() || canonicalDirectory.empty())
+            {
+                break;
+            }
+
+            canonicalDirectory = EnsureTrailingSlash(canonicalDirectory);
+            if (canonicalPath.size() <= canonicalDirectory.size())
+            {
+                break;
+            }
+
+            matched = canonicalPath.compare(0, canonicalDirectory.size(), canonicalDirectory) == 0;
+        } while (false);
+
+        return matched;
+    }
+
+    bool IsWindowsBackedModulePath(const std::wstring& path)
+    {
+        bool backed = false;
+
+        do
+        {
+            if (path.empty())
+            {
+                break;
+            }
+
+            backed = CanonicalPathUnderDirectory(path, WindowsDirectory());
+        } while (false);
+
+        return backed;
+    }
+
+    bool ShouldAuditBuiltinModuleProvenance(const HuntProcessRecord& process)
+    {
+        bool audit = false;
+
+        do
+        {
+            if (!process.BuiltinProfileMatched)
+            {
+                break;
+            }
+
+            if (process.BuiltinProfile == L"hunt_lab_builtin_profile")
+            {
+                audit = true;
+                break;
+            }
+
+            static const wchar_t* kProfiles[] =
+            {
+                L"smss.exe",
+                L"csrss.exe",
+                L"wininit.exe",
+                L"winlogon.exe",
+                L"services.exe",
+                L"lsass.exe",
+                L"svchost.exe",
+                L"spoolsv.exe",
+                L"searchindexer.exe"
+            };
+
+            for (const wchar_t* profile : kProfiles)
+            {
+                if (process.BuiltinProfile == profile)
+                {
+                    audit = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return audit;
+    }
+
     bool LoaderModuleCoversAddress(
         const HuntProcessRecord& process,
         uint64_t address,
@@ -1548,7 +1792,7 @@ namespace
                 continue;
             }
 
-            if (ModuleHasLoaderView(module) && AddressInsideModule(module, address))
+            if ((module.ToolhelpSeen || ModuleHasCoreLdrView(module)) && AddressInsideModule(module, address))
             {
                 covered = true;
                 break;
@@ -1556,6 +1800,24 @@ namespace
         }
 
         return covered;
+    }
+
+    const HuntModuleRecord* FindLoaderModuleContainingAddress(
+        const HuntProcessRecord& process,
+        uint64_t address)
+    {
+        const HuntModuleRecord* found = nullptr;
+
+        for (const HuntModuleRecord& module : process.Modules)
+        {
+            if ((module.ToolhelpSeen || ModuleHasCoreLdrView(module)) && AddressInsideModule(module, address))
+            {
+                found = &module;
+                break;
+            }
+        }
+
+        return found;
     }
 
     const ProcessVadRecord* FindVadContaining(const HuntProcessRecord& process, uint64_t address)
@@ -1604,6 +1866,249 @@ namespace
         } while (false);
 
         return ok;
+    }
+
+    bool RvaToRawOffset(const DiskPeMetadata& metadata, uint32_t rva, uint64_t* rawOffset)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (rawOffset == nullptr)
+            {
+                break;
+            }
+
+            if (metadata.SizeOfHeaders != 0 && rva < metadata.SizeOfHeaders)
+            {
+                *rawOffset = rva;
+                ok = true;
+                break;
+            }
+
+            for (const DiskPeSection& section : metadata.Sections)
+            {
+                uint64_t mappedSpan = std::max(section.VirtualSize, section.SizeOfRawData);
+                if (mappedSpan == 0)
+                {
+                    continue;
+                }
+
+                uint64_t sectionStart = section.VirtualAddress;
+                uint64_t sectionEnd = sectionStart + mappedSpan;
+                if (sectionEnd < sectionStart ||
+                    rva < sectionStart ||
+                    rva >= sectionEnd)
+                {
+                    continue;
+                }
+
+                uint64_t rawSpan = section.SizeOfRawData;
+                if (rawSpan > mappedSpan)
+                {
+                    rawSpan = mappedSpan;
+                }
+
+                uint64_t delta = static_cast<uint64_t>(rva) - sectionStart;
+                if (delta >= rawSpan)
+                {
+                    break;
+                }
+
+                *rawOffset = static_cast<uint64_t>(section.PointerToRawData) + delta;
+                ok = true;
+                break;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    const DiskPeSection* FindDiskSectionForRva(const DiskPeMetadata& metadata, uint32_t rva)
+    {
+        const DiskPeSection* found = nullptr;
+
+        for (const DiskPeSection& section : metadata.Sections)
+        {
+            uint64_t mappedSpan = std::max(section.VirtualSize, section.SizeOfRawData);
+            if (mappedSpan == 0)
+            {
+                continue;
+            }
+
+            uint64_t sectionStart = section.VirtualAddress;
+            uint64_t sectionEnd = sectionStart + mappedSpan;
+            if (sectionEnd < sectionStart)
+            {
+                continue;
+            }
+
+            if (rva >= sectionStart && rva < sectionEnd)
+            {
+                found = &section;
+                break;
+            }
+        }
+
+        return found;
+    }
+
+    bool ReadDiskBytesForRva(
+        HANDLE file,
+        const DiskPeMetadata& metadata,
+        uint32_t rva,
+        uint32_t length,
+        std::vector<uint8_t>* bytes)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (bytes == nullptr || length == 0)
+            {
+                break;
+            }
+
+            uint64_t rawOffset = 0;
+            if (!RvaToRawOffset(metadata, rva, &rawOffset))
+            {
+                break;
+            }
+
+            ok = ReadFileBytesAt(file, rawOffset, length, bytes);
+        } while (false);
+
+        return ok;
+    }
+
+    void PopulateRelocationPages(
+        HANDLE file,
+        DiskPeMetadata* metadata,
+        uint32_t relocRva,
+        uint32_t relocSize)
+    {
+        do
+        {
+            if (metadata == nullptr || file == INVALID_HANDLE_VALUE || relocRva == 0 || relocSize < sizeof(IMAGE_BASE_RELOCATION))
+            {
+                break;
+            }
+
+            uint32_t parsed = 0;
+            while (parsed + sizeof(IMAGE_BASE_RELOCATION) <= relocSize)
+            {
+                std::vector<uint8_t> blockHeader;
+                if (!ReadDiskBytesForRva(file, *metadata, relocRva + parsed, sizeof(IMAGE_BASE_RELOCATION), &blockHeader) ||
+                    blockHeader.size() < sizeof(IMAGE_BASE_RELOCATION))
+                {
+                    break;
+                }
+
+                const IMAGE_BASE_RELOCATION* block =
+                    reinterpret_cast<const IMAGE_BASE_RELOCATION*>(blockHeader.data());
+                if (block->VirtualAddress == 0 ||
+                    block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                    parsed + block->SizeOfBlock > relocSize)
+                {
+                    break;
+                }
+
+                uint32_t entryBytes = block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
+                std::vector<uint8_t> entries;
+                if (!ReadDiskBytesForRva(
+                        file,
+                        *metadata,
+                        relocRva + parsed + sizeof(IMAGE_BASE_RELOCATION),
+                        entryBytes,
+                        &entries) ||
+                    entries.size() < entryBytes)
+                {
+                    break;
+                }
+
+                size_t entryCount = entryBytes / sizeof(uint16_t);
+                for (size_t index = 0; index < entryCount; ++index)
+                {
+                    uint16_t entry = 0;
+                    std::memcpy(&entry, entries.data() + index * sizeof(uint16_t), sizeof(entry));
+                    uint16_t type = entry >> 12;
+                    uint16_t offset = entry & 0x0fffu;
+                    if (type == IMAGE_REL_BASED_ABSOLUTE)
+                    {
+                        continue;
+                    }
+
+                    uint32_t fixupRva = block->VirtualAddress + offset;
+                    metadata->RelocationPages.insert(fixupRva & 0xfffff000u);
+                }
+
+                parsed += block->SizeOfBlock;
+            }
+        } while (false);
+    }
+
+    void AddRvaRangePages(std::set<uint32_t>* pages, uint32_t rva, uint32_t size)
+    {
+        do
+        {
+            if (pages == nullptr || rva == 0 || size == 0)
+            {
+                break;
+            }
+
+            uint64_t start = rva & 0xfffff000u;
+            uint64_t end = static_cast<uint64_t>(rva) + size;
+            if (end < rva)
+            {
+                break;
+            }
+
+            for (uint64_t page = start; page < end; page += kPageSize)
+            {
+                if (page > std::numeric_limits<uint32_t>::max())
+                {
+                    break;
+                }
+
+                pages->insert(static_cast<uint32_t>(page));
+            }
+        } while (false);
+    }
+
+    void AddLoaderMutableDirectoryPages(
+        std::set<uint32_t>* pages,
+        const IMAGE_DATA_DIRECTORY* directories,
+        uint32_t count)
+    {
+        do
+        {
+            if (pages == nullptr || directories == nullptr)
+            {
+                break;
+            }
+
+            const uint32_t mutableDirectories[] =
+            {
+                IMAGE_DIRECTORY_ENTRY_IMPORT,
+                IMAGE_DIRECTORY_ENTRY_IAT,
+                IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT,
+                IMAGE_DIRECTORY_ENTRY_TLS,
+                IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG
+            };
+
+            for (uint32_t directoryIndex : mutableDirectories)
+            {
+                if (directoryIndex >= count)
+                {
+                    continue;
+                }
+
+                AddRvaRangePages(
+                    pages,
+                    directories[directoryIndex].VirtualAddress,
+                    directories[directoryIndex].Size);
+            }
+        } while (false);
     }
 
     bool ReadDiskPeMetadata(const std::wstring& rawPath, DiskPeMetadata* metadata, std::wstring* error)
@@ -1684,20 +2189,44 @@ namespace
                 }
             }
 
+            uint32_t relocRva = 0;
+            uint32_t relocSize = 0;
             uint16_t magic = *reinterpret_cast<const uint16_t*>(header.data() + optionalOffset);
             if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
             {
                 const IMAGE_OPTIONAL_HEADER64* optional =
                     reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(header.data() + optionalOffset);
+                metadata->ImageBase = optional->ImageBase;
                 metadata->EntryPointRva = optional->AddressOfEntryPoint;
                 metadata->SizeOfHeaders = optional->SizeOfHeaders;
+                metadata->SizeOfImage = optional->SizeOfImage;
+                AddLoaderMutableDirectoryPages(
+                    &metadata->LoaderMutablePages,
+                    optional->DataDirectory,
+                    optional->NumberOfRvaAndSizes);
+                if (optional->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
+                {
+                    relocRva = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+                    relocSize = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                }
             }
             else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
             {
                 const IMAGE_OPTIONAL_HEADER32* optional =
                     reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(header.data() + optionalOffset);
+                metadata->ImageBase = optional->ImageBase;
                 metadata->EntryPointRva = optional->AddressOfEntryPoint;
                 metadata->SizeOfHeaders = optional->SizeOfHeaders;
+                metadata->SizeOfImage = optional->SizeOfImage;
+                AddLoaderMutableDirectoryPages(
+                    &metadata->LoaderMutablePages,
+                    optional->DataDirectory,
+                    optional->NumberOfRvaAndSizes);
+                if (optional->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
+                {
+                    relocRva = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+                    relocSize = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                }
             }
             else
             {
@@ -1725,6 +2254,7 @@ namespace
                 section.SizeOfRawData = sections[index].SizeOfRawData;
                 section.Characteristics = sections[index].Characteristics;
                 section.Executable = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+                section.Writable = (section.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
                 metadata->Sections.push_back(section);
 
                 if (!metadata->HasExecutableSection &&
@@ -1734,6 +2264,8 @@ namespace
                     metadata->HasExecutableSection = true;
                 }
             }
+
+            PopulateRelocationPages(file, metadata, relocRva, relocSize);
 
             ok = true;
         } while (false);
@@ -2326,10 +2858,13 @@ namespace
             bool loadSeen = WalkPebLdrList(device, process, ldr + 0x10, 0x00, L"load");
             bool memorySeen = WalkPebLdrList(device, process, ldr + 0x20, 0x10, L"memory");
             bool initSeen = WalkPebLdrList(device, process, ldr + 0x30, 0x20, L"init");
-            process->PebLdrEnumerated = loadSeen || memorySeen || initSeen;
+            process->PebLdrLoadEnumerated = loadSeen;
+            process->PebLdrMemoryEnumerated = memorySeen;
+            process->PebLdrInitEnumerated = initSeen;
+            process->PebLdrEnumerated = loadSeen && memorySeen;
             if (!process->PebLdrEnumerated)
             {
-                AddUnique(&process->Warnings, L"PEB LDR list heads could not be read");
+                AddUnique(&process->Warnings, L"PEB LDR core list heads could not be read");
             }
         } while (false);
     }
@@ -2591,6 +3126,11 @@ namespace
                 break;
             }
 
+            if (process.ProcessId <= 4)
+            {
+                break;
+            }
+
             std::map<std::wstring, std::wstring> evidence;
             evidence[L"active_process_links_seen"] = process.ActiveProcessLinksSeen ? L"true" : L"false";
             evidence[L"system_process_information_seen"] = process.SystemProcessInformationSeen ? L"true" : L"false";
@@ -2616,12 +3156,14 @@ namespace
                     evidence);
             }
             else if (!process.ActiveProcessLinksSeen &&
-                     (process.SystemProcessInformationSeen || process.ToolhelpProcessSeen))
+                     process.SystemProcessInformationSeen &&
+                     process.ToolhelpProcessSeen)
             {
+                evidence[L"snapshot_race_possible"] = L"true";
                 AddFinding(
                     result,
                     process,
-                    L"medium",
+                    L"low",
                     L"low",
                     L"process_cross_view",
                     L"process is visible through user API views but missing from ActiveProcessLinks",
@@ -2633,11 +3175,12 @@ namespace
             else if (process.ActiveProcessLinksSeen &&
                      (!process.SystemProcessInformationSeen || !process.ToolhelpProcessSeen))
             {
+                evidence[L"snapshot_race_possible"] = L"true";
                 AddFinding(
                     result,
                     process,
+                    L"info",
                     L"low",
-                    L"medium",
                     L"process_cross_view",
                     L"process has a partial cross-view mismatch",
                     0,
@@ -2838,6 +3381,9 @@ namespace
                 break;
             }
 
+            uint32_t weakPrivateExecFindings = 0;
+            bool weakPrivateExecLimitWarned = false;
+            std::map<std::wstring, DiskPeMetadata> diskMetadataCache;
             for (const ProcessVadRecord& vad : process->VadRecords)
             {
                 bool privateMemory = vad.HasPrivateMemory && vad.PrivateMemory;
@@ -2848,10 +3394,85 @@ namespace
                 bool sectionBackedExecutable = vad.Executable &&
                     vad.HasSubsection &&
                     vad.Subsection != 0 &&
-                    !privateMemory &&
-                    vad.PeHeaderFound;
-                bool loaderCovered = sectionBackedExecutable &&
-                    LoaderModuleCoversAddress(*process, vad.StartAddress, nullptr);
+                    !privateMemory;
+                const HuntModuleRecord* loaderOwner = sectionBackedExecutable
+                    ? FindLoaderModuleContainingAddress(*process, vad.StartAddress)
+                    : nullptr;
+                bool loaderCovered = loaderOwner != nullptr;
+                std::vector<std::wstring> imageSectionReasons;
+                std::map<std::wstring, std::wstring> imageSectionEvidence;
+
+                if (sectionBackedExecutable &&
+                    loaderOwner != nullptr &&
+                    !loaderOwner->Path.empty() &&
+                    vad.StartAddress >= loaderOwner->Base &&
+                    vad.StartAddress - loaderOwner->Base <= std::numeric_limits<uint32_t>::max())
+                {
+                    DiskPeMetadata metadata = {};
+                    bool metadataReady = false;
+                    std::wstring cacheKey = CanonicalPathForCompare(loaderOwner->Path);
+                    if (cacheKey.empty())
+                    {
+                        cacheKey = loaderOwner->Path;
+                    }
+
+                    auto cached = diskMetadataCache.find(cacheKey);
+                    if (cached != diskMetadataCache.end())
+                    {
+                        metadata = cached->second;
+                        metadataReady = true;
+                    }
+                    else
+                    {
+                        std::wstring metadataError;
+                        if (ReadDiskPeMetadata(loaderOwner->Path, &metadata, &metadataError))
+                        {
+                            diskMetadataCache[cacheKey] = metadata;
+                            metadataReady = true;
+                        }
+                    }
+
+                    if (metadataReady)
+                    {
+                        uint32_t rva = static_cast<uint32_t>(vad.StartAddress - loaderOwner->Base);
+                        const DiskPeSection* section = FindDiskSectionForRva(metadata, rva);
+                        if (section != nullptr)
+                        {
+                            bool liveWritableExecutable = vad.Executable && vad.Writable;
+                            bool executePermissionDrift = vad.Executable && !section->Executable;
+                            bool writePermissionDrift = liveWritableExecutable && section->Executable && !section->Writable;
+                            bool defaultWritableExecutableSection = liveWritableExecutable && section->Executable && section->Writable;
+
+                            if (executePermissionDrift)
+                            {
+                                AddUnique(&imageSectionReasons, L"image_section_execute_permission_drift");
+                            }
+                            if (writePermissionDrift)
+                            {
+                                AddUnique(&imageSectionReasons, L"image_section_write_permission_drift");
+                            }
+                            if (defaultWritableExecutableSection)
+                            {
+                                AddUnique(&imageSectionReasons, L"image_rwx_section_vad");
+                                AddUnique(&imageSectionReasons, L"mockingjay_rwx_section_candidate");
+                            }
+
+                            if (!imageSectionReasons.empty())
+                            {
+                                imageSectionEvidence[L"owner_module"] = loaderOwner->Name;
+                                imageSectionEvidence[L"owner_module_base"] = HuntHex(loaderOwner->Base, 16);
+                                imageSectionEvidence[L"owner_module_path"] = loaderOwner->Path;
+                                imageSectionEvidence[L"disk_section_name"] = section->Name;
+                                imageSectionEvidence[L"disk_section_rva"] = HuntHex(section->VirtualAddress, 8);
+                                imageSectionEvidence[L"disk_section_executable"] = section->Executable ? L"true" : L"false";
+                                imageSectionEvidence[L"disk_section_writable"] = section->Writable ? L"true" : L"false";
+                                imageSectionEvidence[L"vad_rva"] = HuntHex(rva, 8);
+                                imageSectionEvidence[L"vad_executable"] = vad.Executable ? L"true" : L"false";
+                                imageSectionEvidence[L"vad_writable"] = vad.Writable ? L"true" : L"false";
+                            }
+                        }
+                    }
+                }
 
                 if (sectionBackedExecutable &&
                     !loaderCovered &&
@@ -2861,13 +3482,16 @@ namespace
                     std::wstring backingPath;
                     std::wstring backingState = L"unresolved";
                     std::wstring backingWarning;
-                    if (ResolveVadSectionBackingPath(device, symbols, vad, &backingPath, &backingState, &backingWarning))
+                    bool imageSection = false;
+                    bool backingOpenable = true;
+                    if (ResolveVadSectionBackingPath(device, symbols, vad, &backingPath, &backingState, &backingWarning, &imageSection))
                     {
                         if (backingState == L"resolved" &&
                             !backingPath.empty() &&
                             !CanOpenDiskImagePath(backingPath))
                         {
                             backingState = L"inaccessible";
+                            backingOpenable = false;
                         }
                     }
                     else if (!backingWarning.empty())
@@ -2875,19 +3499,40 @@ namespace
                         AddUnique(&process->Warnings, L"VAD section backing failed: " + backingWarning);
                     }
 
-                    HuntModuleRecord module = {};
-                    module.Base = vad.StartAddress;
-                    module.Size = vad.PeProbe.SizeOfImage != 0 ? vad.PeProbe.SizeOfImage : vad.Size;
-                    module.Name = backingPath.empty() ? L"section-image" : LeafName(backingPath);
-                    module.Path = backingPath;
-                    module.VadImageSeen = true;
-                    module.VadAddress = vad.VadAddress;
-                    module.VadBackingPath = backingPath;
-                    module.VadBackingState = backingState;
-                    MergeModule(&process->Modules, module);
+                    bool peLikeBackingName = LooksLikePeImagePath(backingPath);
+                    if (imageSection || peLikeBackingName)
+                    {
+                        uint64_t moduleSize = vad.Size;
+                        if (backingOpenable && !backingPath.empty())
+                        {
+                            DiskPeMetadata metadata = {};
+                            std::wstring metadataError;
+                            if (ReadDiskPeMetadata(backingPath, &metadata, &metadataError) && metadata.SizeOfImage != 0)
+                            {
+                                moduleSize = metadata.SizeOfImage;
+                            }
+                        }
+
+                        HuntModuleRecord module = {};
+                        module.Base = vad.StartAddress;
+                        module.Size = moduleSize;
+                        module.Name = backingPath.empty() ? L"section-image" : LeafName(backingPath);
+                        module.Path = backingPath;
+                        module.VadImageSeen = true;
+                        module.VadAddress = vad.VadAddress;
+                        module.VadBackingPath = backingPath;
+                        module.VadBackingState = backingState;
+                        MergeModule(&process->Modules, module);
+                    }
                 }
 
-                if (!privateExecutable && !wx && !largePrivateExecutable && !privatePe && !vad.PeHeaderSuspicious)
+                bool imageSectionPermissionSuspicious = !imageSectionReasons.empty();
+                if (!privateExecutable &&
+                    !wx &&
+                    !largePrivateExecutable &&
+                    !privatePe &&
+                    !vad.PeHeaderSuspicious &&
+                    !imageSectionPermissionSuspicious)
                 {
                     continue;
                 }
@@ -2923,6 +3568,27 @@ namespace
                 {
                     reasons.push_back(L"wiped_pe_header");
                 }
+                for (const std::wstring& reason : imageSectionReasons)
+                {
+                    AddUnique(&reasons, reason);
+                }
+
+                bool weakPrivateExecutableOnly = privateExecutable &&
+                    !wx &&
+                    !largePrivateExecutable &&
+                    !privatePe &&
+                    !vad.PeHeaderSuspicious &&
+                    !process->BuiltinProfileMatched;
+                if (weakPrivateExecutableOnly &&
+                    weakPrivateExecFindings >= kMaxWeakPrivateExecFindingsPerProcess)
+                {
+                    if (!weakPrivateExecLimitWarned)
+                    {
+                        AddUnique(&process->Warnings, L"weak private executable VAD findings were capped");
+                        weakPrivateExecLimitWarned = true;
+                    }
+                    continue;
+                }
 
                 std::map<std::wstring, std::wstring> evidence;
                 evidence[L"vad"] = HuntHex(vad.VadAddress, 16);
@@ -2934,6 +3600,10 @@ namespace
                 evidence[L"pe_like"] = vad.PeHeaderFound ? L"true" : L"false";
                 evidence[L"pe_suspicious"] = vad.PeHeaderSuspicious ? L"true" : L"false";
                 evidence[L"classification"] = vad.Classification;
+                for (const auto& item : imageSectionEvidence)
+                {
+                    evidence[item.first] = item.second;
+                }
                 if (vad.PeProbeAttempted)
                 {
                     evidence[L"pe_mz_wiped"] = vad.PeProbe.MzWiped ? L"true" : L"false";
@@ -2945,6 +3615,34 @@ namespace
 
                 std::wstring risk = wx || vad.PeHeaderSuspicious || privatePe || process->BuiltinProfileMatched ? L"high" : L"medium";
                 std::wstring confidence = privatePe || wx ? L"high" : L"medium";
+                if (imageSectionPermissionSuspicious)
+                {
+                    if (std::find(
+                            imageSectionReasons.begin(),
+                            imageSectionReasons.end(),
+                            L"image_section_execute_permission_drift") != imageSectionReasons.end() ||
+                        std::find(
+                            imageSectionReasons.begin(),
+                            imageSectionReasons.end(),
+                            L"image_section_write_permission_drift") != imageSectionReasons.end() ||
+                        process->BuiltinProfileMatched)
+                    {
+                        risk = L"high";
+                    }
+                    else if (risk != L"high")
+                    {
+                        risk = L"medium";
+                    }
+                    confidence = L"high";
+                }
+                if (weakPrivateExecutableOnly)
+                {
+                    risk = L"low";
+                    confidence = L"low";
+                    evidence[L"weak_private_exec_only"] = L"true";
+                    ++weakPrivateExecFindings;
+                }
+
                 AddFinding(
                     result,
                     *process,
@@ -3013,6 +3711,7 @@ namespace
                 break;
             }
 
+            size_t stackReferenceFindings = 0;
             for (const ProcessThreadRecord& thread : process.ThreadRecords)
             {
                 if (thread.SuspiciousStart)
@@ -3051,6 +3750,66 @@ namespace
                         findingModule,
                         reasons,
                         evidence);
+                }
+
+                for (const ProcessStackReferenceRecord& ref : thread.StackReferences)
+                {
+                    if (!ref.Suspicious)
+                    {
+                        continue;
+                    }
+
+                    if (stackReferenceFindings >= kMaxStackReferenceFindingsPerProcess)
+                    {
+                        AddUnique(&result->Warnings, L"thread stack reference findings were capped for pid " + std::to_wstring(process.ProcessId));
+                        break;
+                    }
+
+                    std::map<std::wstring, std::wstring> evidence;
+                    evidence[L"ethread"] = HuntHex(thread.Ethread, 16);
+                    evidence[L"tid"] = std::to_wstring(thread.ThreadId);
+                    evidence[L"teb"] = HuntHex(thread.Teb, 16);
+                    evidence[L"user_stack_base"] = HuntHex(thread.UserStackBase, 16);
+                    evidence[L"user_stack_limit"] = HuntHex(thread.UserStackLimit, 16);
+                    evidence[L"stack_address"] = HuntHex(ref.StackAddress, 16);
+                    evidence[L"referenced_address"] = HuntHex(ref.Value, 16);
+                    evidence[L"referenced_module"] = ref.ValueModule;
+                    evidence[L"referenced_vad"] = ref.VadClassification;
+                    evidence[L"user_module_enumeration_available"] = ref.UserModuleEnumerationAvailable ? L"true" : L"false";
+                    evidence[L"referenced_private_exec_vad"] = ref.ValueInPrivateExecVad ? L"true" : L"false";
+                    evidence[L"referenced_wx_vad"] = ref.ValueInWxVad ? L"true" : L"false";
+                    evidence[L"referenced_in_user_module"] = ref.ValueInUserModule ? L"true" : L"false";
+                    evidence[L"referenced_outside_user_modules"] = ref.ValueOutsideUserModules ? L"true" : L"false";
+                    evidence[L"notes"] = ref.Notes;
+
+                    std::vector<std::wstring> reasons = {L"stack_reference_to_executable_memory"};
+                    if (ref.ValueInPrivateExecVad)
+                    {
+                        AddUnique(&reasons, L"stack_reference_to_private_executable_vad");
+                    }
+                    if (ref.ValueInWxVad)
+                    {
+                        AddUnique(&reasons, L"stack_reference_to_wx_vad");
+                    }
+                    if (ref.ValueOutsideUserModules)
+                    {
+                        AddUnique(&reasons, L"stack_reference_to_user_executable_outside_module");
+                    }
+                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
+
+                    std::wstring risk = ref.ValueInPrivateExecVad || ref.ValueInWxVad || process.BuiltinProfileMatched ? L"high" : L"medium";
+                    AddFinding(
+                        result,
+                        process,
+                        risk,
+                        L"medium",
+                        L"thread_stack_provenance",
+                        L"thread stack references suspicious executable memory",
+                        ref.Value,
+                        ref.ValueModule,
+                        reasons,
+                        evidence);
+                    ++stackReferenceFindings;
                 }
 
                 for (const ProcessApcQueueRecord& queue : thread.ApcQueues)
@@ -3111,7 +3870,8 @@ namespace
 
             for (const HuntModuleRecord& module : process.Modules)
             {
-                bool ldrSeen = module.LdrLoadSeen || module.LdrMemorySeen || module.LdrInitSeen;
+                bool coreLdrSeen = ModuleHasCoreLdrView(module);
+                bool reliableCoreLdr = ProcessHasReliableCoreLdrView(process);
                 std::map<std::wstring, std::wstring> evidence;
                 evidence[L"base"] = HuntHex(module.Base, 16);
                 evidence[L"size"] = std::to_wstring(module.Size);
@@ -3135,6 +3895,8 @@ namespace
                     bool covered = LoaderModuleCoversAddress(process, module.Base, &module);
                     if (!covered)
                     {
+                        bool backingWeakButOpenable = module.VadBackingState == L"resolved" &&
+                            !module.VadBackingPath.empty();
                         std::vector<std::wstring> reasons = {L"section_image_without_loader_entry", L"vad_image_not_in_loader"};
                         if (module.VadBackingState == L"inaccessible")
                         {
@@ -3149,8 +3911,8 @@ namespace
                         AddFinding(
                             result,
                             process,
-                            module.VadBackingState == L"inaccessible" ? L"high" : L"medium",
-                            module.VadBackingPath.empty() ? L"medium" : L"high",
+                            module.VadBackingState == L"inaccessible" ? L"high" : (backingWeakButOpenable ? L"low" : L"medium"),
+                            backingWeakButOpenable ? L"medium" : (module.VadBackingPath.empty() ? L"medium" : L"high"),
                             L"module_cross_view",
                             L"section-backed executable image mapping is absent from loader module views",
                             module.Base,
@@ -3197,7 +3959,8 @@ namespace
                 }
 
                 if (process.PebLdrEnumerated &&
-                    ldrSeen &&
+                    reliableCoreLdr &&
+                    coreLdrSeen &&
                     !(module.LdrLoadSeen && module.LdrMemorySeen))
                 {
                     std::vector<std::wstring> reasons = {L"partial_ldr_unlink"};
@@ -3217,8 +3980,10 @@ namespace
 
                 if (process.ToolhelpModuleEnumerated &&
                     process.PebLdrEnumerated &&
-                    module.ToolhelpSeen != ldrSeen &&
-                    !module.PrivatePeVadSeen)
+                    reliableCoreLdr &&
+                    module.ToolhelpSeen != coreLdrSeen &&
+                    !module.PrivatePeVadSeen &&
+                    (process.BuiltinProfileMatched || module.VadImageSeen))
                 {
                     std::vector<std::wstring> reasons = {L"module_view_mismatch"};
                     AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
@@ -3274,6 +4039,72 @@ namespace
         } while (false);
 
         return isMain;
+    }
+
+    void AddBuiltinModuleProvenanceFindings(HuntResult* result, const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr || !ShouldAuditBuiltinModuleProvenance(process))
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            for (const HuntModuleRecord& module : process.Modules)
+            {
+                if (findings >= kMaxBuiltinModuleProvenanceFindingsPerProcess)
+                {
+                    AddUnique(&result->Warnings, L"built-in module provenance findings were capped for pid " + std::to_wstring(process.ProcessId));
+                    break;
+                }
+
+                if (module.Base == 0 ||
+                    module.Size == 0 ||
+                    module.Path.empty() ||
+                    IsMainImageModule(process, module) ||
+                    !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)) ||
+                    IsWindowsBackedModulePath(module.Path))
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"module_base"] = HuntHex(module.Base, 16);
+                evidence[L"module_size"] = std::to_wstring(module.Size);
+                evidence[L"module_name"] = module.Name;
+                evidence[L"module_path"] = module.Path;
+                evidence[L"toolhelp_seen"] = module.ToolhelpSeen ? L"true" : L"false";
+                evidence[L"ldr_load_seen"] = module.LdrLoadSeen ? L"true" : L"false";
+                evidence[L"ldr_memory_seen"] = module.LdrMemorySeen ? L"true" : L"false";
+                evidence[L"ldr_init_seen"] = module.LdrInitSeen ? L"true" : L"false";
+                evidence[L"windows_backed_module_path"] = L"false";
+
+                std::vector<std::wstring> reasons =
+                {
+                    L"builtin_process_non_windows_module",
+                    L"dll_load_in_builtin_process"
+                };
+                if (process.BuiltinProfile == L"hunt_lab_builtin_profile")
+                {
+                    AddUnique(&reasons, L"lab_builtin_profile_non_windows_module");
+                }
+                AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
+
+                AddFinding(
+                    result,
+                    process,
+                    process.BuiltinProfileViolations.empty() ? L"medium" : L"high",
+                    L"medium",
+                    L"builtin_module_provenance",
+                    L"built-in Windows process loaded a module from a non-Windows path",
+                    module.Base,
+                    module.Name,
+                    reasons,
+                    evidence);
+                ++findings;
+            }
+        } while (false);
     }
 
     void AddMainImageVadFinding(
@@ -3366,20 +4197,12 @@ namespace
                 }
                 else if (!process->SectionBackingPath.empty())
                 {
-                    bool diskOpen = false;
-                    std::wstring openPath = DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(process->SectionBackingPath));
-                    HANDLE file = CreateFileW(
-                        openPath.c_str(),
-                        GENERIC_READ,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        nullptr,
-                        OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL,
-                        nullptr);
-                    if (file != INVALID_HANDLE_VALUE)
+                    bool diskOpen = CanOpenDiskImagePath(process->SectionBackingPath);
+                    if (!diskOpen &&
+                        !module.Path.empty() &&
+                        SameCanonicalPath(process->SectionBackingPath, module.Path))
                     {
-                        diskOpen = true;
-                        CloseHandle(file);
+                        diskOpen = CanOpenDiskImagePath(module.Path);
                     }
 
                     if (!diskOpen)
@@ -3461,7 +4284,263 @@ namespace
         } while (false);
     }
 
+    void AppendDeepTargetRange(std::vector<DeepAddressRange>* ranges, uint64_t start, uint64_t end)
+    {
+        do
+        {
+            if (ranges == nullptr || start == 0 || end <= start)
+            {
+                break;
+            }
+
+            DeepAddressRange range = {};
+            range.Start = start;
+            range.End = end;
+            ranges->push_back(range);
+        } while (false);
+    }
+
+    void BuildDeepTargetRanges(const HuntProcessRecord& process, std::vector<DeepAddressRange>* ranges)
+    {
+        do
+        {
+            if (ranges == nullptr)
+            {
+                break;
+            }
+
+            ranges->clear();
+            ranges->reserve(process.Modules.size() + process.VadRecords.size());
+
+            for (const HuntModuleRecord& module : process.Modules)
+            {
+                uint64_t end = 0;
+                if (module.Size != 0 && TryAdd(module.Base, module.Size, &end))
+                {
+                    AppendDeepTargetRange(ranges, module.Base, end);
+                }
+            }
+
+            for (const ProcessVadRecord& vad : process.VadRecords)
+            {
+                if (!vad.Executable)
+                {
+                    continue;
+                }
+
+                uint64_t end = vad.EndAddress == std::numeric_limits<uint64_t>::max()
+                    ? std::numeric_limits<uint64_t>::max()
+                    : vad.EndAddress + 1;
+                AppendDeepTargetRange(ranges, vad.StartAddress, end);
+            }
+
+            std::sort(
+                ranges->begin(),
+                ranges->end(),
+                [](const DeepAddressRange& left, const DeepAddressRange& right)
+                {
+                    if (left.Start != right.Start)
+                    {
+                        return left.Start < right.Start;
+                    }
+                    return left.End < right.End;
+                });
+
+            std::vector<DeepAddressRange> merged;
+            merged.reserve(ranges->size());
+            for (const DeepAddressRange& range : *ranges)
+            {
+                if (merged.empty() || range.Start > merged.back().End)
+                {
+                    merged.push_back(range);
+                    continue;
+                }
+
+                if (range.End > merged.back().End)
+                {
+                    merged.back().End = range.End;
+                }
+            }
+
+            *ranges = std::move(merged);
+        } while (false);
+    }
+
+    bool ValueInsideDeepTargetRanges(const std::vector<DeepAddressRange>& ranges, uint64_t value)
+    {
+        bool inside = false;
+
+        do
+        {
+            if (!IsUserAddress(value) || ranges.empty())
+            {
+                break;
+            }
+
+            size_t left = 0;
+            size_t right = ranges.size();
+            while (left < right)
+            {
+                size_t middle = left + ((right - left) / 2);
+                const DeepAddressRange& range = ranges[middle];
+                if (value < range.Start)
+                {
+                    right = middle;
+                }
+                else if (value >= range.End)
+                {
+                    left = middle + 1;
+                }
+                else
+                {
+                    inside = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return inside;
+    }
+
+    void BuildDeepStackReferenceCache(
+        DeviceClient& device,
+        const HuntProcessRecord& process,
+        DeepStackReferenceCache* cache)
+    {
+        do
+        {
+            if (cache == nullptr || cache->Built)
+            {
+                break;
+            }
+
+            cache->Built = true;
+            cache->Samples.clear();
+            cache->LimitReached = false;
+
+            uint64_t dtb = TargetUserDtb(process.Kernel);
+            if (dtb == 0)
+            {
+                break;
+            }
+
+            std::vector<DeepAddressRange> targetRanges;
+            BuildDeepTargetRanges(process, &targetRanges);
+            if (targetRanges.empty())
+            {
+                break;
+            }
+
+            for (const ProcessThreadRecord& thread : process.ThreadRecords)
+            {
+                if (!thread.HasUserStackBounds ||
+                    thread.UserStackBase <= thread.UserStackLimit)
+                {
+                    continue;
+                }
+
+                uint64_t scanEnd = thread.UserStackBase;
+                uint64_t scanStart = thread.UserStackLimit;
+                if (scanEnd - scanStart > kMaxThreadStackScanBytes)
+                {
+                    scanStart = scanEnd - kMaxThreadStackScanBytes;
+                }
+                if ((scanStart & 0x7ull) != 0)
+                {
+                    scanStart = (scanStart + 0x7ull) & ~0x7ull;
+                }
+                if (scanEnd < sizeof(uint64_t))
+                {
+                    continue;
+                }
+
+                uint64_t current = scanStart;
+                while (current <= scanEnd - sizeof(uint64_t) && !cache->LimitReached)
+                {
+                    uint64_t nextPage = (current & ~(kPageSize - 1ull)) + kPageSize;
+                    uint64_t chunkEnd = nextPage < scanEnd ? nextPage : scanEnd;
+                    if (chunkEnd <= current)
+                    {
+                        break;
+                    }
+
+                    std::vector<uint8_t> bytes;
+                    std::wstring ignored;
+                    uint32_t chunkSize = static_cast<uint32_t>(chunkEnd - current);
+                    if (ReadProcessMemoryByDtb(device, dtb, current, chunkSize, &bytes, &ignored))
+                    {
+                        for (size_t offset = 0;
+                             offset + sizeof(uint64_t) <= bytes.size() && !cache->LimitReached;
+                             offset += sizeof(uint64_t))
+                        {
+                            uint64_t value = 0;
+                            memcpy(&value, bytes.data() + offset, sizeof(uint64_t));
+                            if (!ValueInsideDeepTargetRanges(targetRanges, value))
+                            {
+                                continue;
+                            }
+
+                            DeepStackPointerSample sample = {};
+                            sample.ThreadId = thread.ThreadId;
+                            sample.StackAddress = current + offset;
+                            sample.Value = value;
+                            cache->Samples.push_back(sample);
+                            if (cache->Samples.size() >= kMaxDeepStackPointerSamplesPerProcess)
+                            {
+                                cache->LimitReached = true;
+                            }
+                        }
+                    }
+
+                    current = chunkEnd;
+                    if ((current & 0x7ull) != 0)
+                    {
+                        current = (current + 0x7ull) & ~0x7ull;
+                    }
+                }
+
+                if (cache->LimitReached)
+                {
+                    break;
+                }
+            }
+        } while (false);
+    }
+
+    void FindStackReferencesToRange(
+        const DeepStackReferenceCache& cache,
+        uint64_t rangeStart,
+        uint64_t rangeEnd,
+        std::vector<std::wstring>* threadIds,
+        std::vector<std::wstring>* stackSlots)
+    {
+        do
+        {
+            if (threadIds == nullptr ||
+                stackSlots == nullptr ||
+                rangeStart >= rangeEnd)
+            {
+                break;
+            }
+
+            for (const DeepStackPointerSample& sample : cache.Samples)
+            {
+                if (stackSlots->size() >= kMaxStackReferenceFindingsPerProcess)
+                {
+                    break;
+                }
+
+                if (sample.Value >= rangeStart && sample.Value < rangeEnd)
+                {
+                    AddUnique(threadIds, std::to_wstring(sample.ThreadId));
+                    stackSlots->push_back(HuntHex(sample.StackAddress, 16) + L"=" + HuntHex(sample.Value, 16));
+                }
+            }
+        } while (false);
+    }
+
     void AddDeepPageCompareFinding(
+        DeviceClient& device,
         HuntResult* result,
         const HuntProcessRecord& process,
         const HuntModuleRecord& module,
@@ -3469,7 +4548,8 @@ namespace
         const std::wstring& sectionName,
         uint32_t rva,
         const std::vector<uint8_t>& livePage,
-        const std::vector<uint8_t>& diskPage)
+        const std::vector<uint8_t>& diskPage,
+        DeepStackReferenceCache* stackCache)
     {
         do
         {
@@ -3491,6 +4571,7 @@ namespace
             evidence[L"disk_hash"] = HuntHex(Fnv1a64(diskPage), 16);
             evidence[L"live_bytes"] = std::to_wstring(livePage.size());
             evidence[L"disk_bytes"] = std::to_wstring(diskPage.size());
+            evidence[L"diff_bytes"] = std::to_wstring(CountDifferentBytes(livePage, diskPage));
             evidence[L"modified_page_owner"] = module.Name;
 
             bool mainImage = IsMainImageModule(process, module);
@@ -3539,10 +4620,17 @@ namespace
                 }
             }
 
-            uint64_t pageStart = module.Base + rva;
-            uint64_t pageEnd = pageStart + kPageSize;
+            uint64_t pageStart = 0;
+            uint64_t pageEnd = 0;
+            if (!TryAdd(module.Base, rva, &pageStart) ||
+                !TryAdd(pageStart, kPageSize, &pageEnd))
+            {
+                break;
+            }
             std::vector<std::wstring> threadIds;
             std::vector<std::wstring> apcThreadIds;
+            std::vector<std::wstring> stackThreadIds;
+            std::vector<std::wstring> stackReferences;
             for (const ProcessThreadRecord& thread : process.ThreadRecords)
             {
                 if (thread.HasStartAddress &&
@@ -3570,11 +4658,21 @@ namespace
                     }
                 }
             }
+            if (stackCache != nullptr)
+            {
+                BuildDeepStackReferenceCache(device, process, stackCache);
+                FindStackReferencesToRange(*stackCache, pageStart, pageEnd, &stackThreadIds, &stackReferences);
+                evidence[L"stack_reference_cache_samples"] = std::to_wstring(stackCache->Samples.size());
+                evidence[L"stack_reference_cache_limited"] = stackCache->LimitReached ? L"true" : L"false";
+            }
 
             evidence[L"thread_start_count"] = std::to_wstring(threadIds.size());
             evidence[L"apc_target_count"] = std::to_wstring(apcThreadIds.size());
+            evidence[L"stack_reference_count"] = std::to_wstring(stackReferences.size());
             evidence[L"thread_ids"] = JoinWideValues(threadIds, L";");
             evidence[L"apc_thread_ids"] = JoinWideValues(apcThreadIds, L";");
+            evidence[L"stack_thread_ids"] = JoinWideValues(stackThreadIds, L";");
+            evidence[L"stack_references"] = JoinWideValues(stackReferences, L";");
 
             if (!threadIds.empty())
             {
@@ -3584,9 +4682,13 @@ namespace
             {
                 AddUnique(&reasons, L"apc_target_in_modified_module_page");
             }
+            if (!stackReferences.empty())
+            {
+                AddUnique(&reasons, L"thread_stack_references_modified_module_page");
+            }
             AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
 
-            bool executionOnPage = !threadIds.empty() || !apcThreadIds.empty();
+            bool executionOnPage = !threadIds.empty() || !apcThreadIds.empty() || !stackReferences.empty();
             bool doppelganging = mainImage &&
                 std::find(reasons.begin(), reasons.end(), L"process_doppelganging_evidence") != reasons.end();
             std::wstring risk = mainImage || executionOnPage || process.BuiltinProfileMatched ? L"high" : L"medium";
@@ -3599,11 +4701,38 @@ namespace
                 confidence,
                 doppelganging ? L"process_doppelganging" : (mainImage ? L"process_image_integrity" : L"module_stomping"),
                 mainImage ? L"live main image page differs from disk" : L"live module executable page differs from disk",
-                module.Base + rva,
+                pageStart,
                 module.Name,
                 reasons,
                 evidence);
         } while (false);
+    }
+
+    bool PageHasExpectedRelocationDelta(
+        const HuntModuleRecord& module,
+        const DiskPeMetadata& metadata,
+        uint32_t pageRva)
+    {
+        bool relocated = false;
+
+        do
+        {
+            if (metadata.ImageBase == 0 ||
+                module.Base == 0 ||
+                module.Base == metadata.ImageBase)
+            {
+                break;
+            }
+
+            relocated = metadata.RelocationPages.find(pageRva) != metadata.RelocationPages.end();
+        } while (false);
+
+        return relocated;
+    }
+
+    bool PageHasExpectedLoaderMutableData(const DiskPeMetadata& metadata, uint32_t pageRva)
+    {
+        return metadata.LoaderMutablePages.find(pageRva) != metadata.LoaderMutablePages.end();
     }
 
     void CompareModulePage(
@@ -3614,11 +4743,22 @@ namespace
         const DiskPeMetadata& metadata,
         const std::wstring& pageName,
         const std::wstring& sectionName,
-        uint32_t rva)
+        uint32_t rva,
+        DeepStackReferenceCache* stackCache)
     {
         do
         {
             uint32_t pageRva = rva & 0xfffff000u;
+            if (PageHasExpectedRelocationDelta(module, metadata, pageRva))
+            {
+                break;
+            }
+
+            if (PageHasExpectedLoaderMutableData(metadata, pageRva))
+            {
+                break;
+            }
+
             std::vector<uint8_t> livePage;
             std::wstring ignored;
             if (!ReadProcessMemoryByDtb(
@@ -3647,7 +4787,17 @@ namespace
 
             if (!livePage.empty() && livePage != diskPage)
             {
-                AddDeepPageCompareFinding(result, process, module, pageName, sectionName, pageRva, livePage, diskPage);
+                AddDeepPageCompareFinding(
+                    device,
+                    result,
+                    process,
+                    module,
+                    pageName,
+                    sectionName,
+                    pageRva,
+                    livePage,
+                    diskPage,
+                    stackCache);
             }
         } while (false);
     }
@@ -3663,8 +4813,51 @@ namespace
 
             size_t compared = 0;
             size_t pagesCompared = 0;
+            DeepStackReferenceCache stackReferenceCache = {};
+            std::vector<const HuntModuleRecord*> modules;
+            modules.reserve(process->Modules.size());
             for (const HuntModuleRecord& module : process->Modules)
             {
+                modules.push_back(&module);
+            }
+
+            std::stable_sort(
+                modules.begin(),
+                modules.end(),
+                [process](const HuntModuleRecord* left, const HuntModuleRecord* right)
+                {
+                    auto priority = [process](const HuntModuleRecord* module)
+                    {
+                        if (module == nullptr)
+                        {
+                            return 4;
+                        }
+                        if (module->VadImageSeen)
+                        {
+                            return 0;
+                        }
+                        if (IsMainImageModule(*process, *module))
+                        {
+                            return 1;
+                        }
+                        if (ModuleHasLoaderView(*module))
+                        {
+                            return 2;
+                        }
+                        return 3;
+                    };
+
+                    return priority(left) < priority(right);
+                });
+
+            for (const HuntModuleRecord* modulePtr : modules)
+            {
+                if (modulePtr == nullptr)
+                {
+                    continue;
+                }
+
+                const HuntModuleRecord& module = *modulePtr;
                 if (compared >= kMaxDeepModuleComparisonsPerProcess)
                 {
                     AddUnique(&process->Warnings, L"deep module comparison limit reached");
@@ -3691,7 +4884,16 @@ namespace
                     uint32_t pageRva = metadata.EntryPointRva & 0xfffff000u;
                     if (pagesCompared < kMaxDeepPagesPerProcess)
                     {
-                        CompareModulePage(device, result, *process, module, metadata, L"entrypoint", L"", metadata.EntryPointRva);
+                        CompareModulePage(
+                            device,
+                            result,
+                            *process,
+                            module,
+                            metadata,
+                            L"entrypoint",
+                            L"",
+                            metadata.EntryPointRva,
+                            &stackReferenceCache);
                         comparedPageRvas.insert(pageRva);
                         ++pagesCompared;
                     }
@@ -3754,7 +4956,8 @@ namespace
                             metadata,
                             L"executable_section",
                             section.Name,
-                            pageRva);
+                            pageRva,
+                            &stackReferenceCache);
                         comparedPageRvas.insert(pageRva);
                         ++sectionPagesCompared;
                         ++pagesCompared;
@@ -3762,6 +4965,11 @@ namespace
                 }
 
                 ++compared;
+            }
+
+            if (stackReferenceCache.LimitReached)
+            {
+                AddUnique(&process->Warnings, L"deep stack reference cache hit the per-process sample limit");
             }
         } while (false);
     }
@@ -3988,7 +5196,12 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 ProcessVadScanOptions vadOptions = {};
                 vadOptions.Target = BuildTriageTarget(process.Kernel);
                 vadOptions.ProbePe = true;
-                vadOptions.ScanHiddenPtes = options.Mode != HuntMode::Quick;
+                vadOptions.ScanHiddenPtes =
+                    options.Mode != HuntMode::Quick &&
+                    HasVerifiedUserAddressSpace(process.Kernel);
+                vadOptions.HiddenPteExecutableOnly = true;
+                vadOptions.RequireVadCoverageForHiddenPtes = true;
+                vadOptions.HiddenPteLimit = kHuntHiddenPteRecordLimitPerProcess;
 
                 ProcessVadScanResult vadResult = {};
                 std::wstring scanError;
@@ -4004,6 +5217,10 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     process.HiddenPteRanges = vadResult.HiddenPteRanges;
                     process.HiddenPteBytes = vadResult.HiddenPteBytes;
                     process.Warnings.insert(process.Warnings.end(), vadResult.Warnings.begin(), vadResult.Warnings.end());
+                    if (vadResult.HiddenPteTruncated)
+                    {
+                        AddUnique(&process.Warnings, L"hidden PTE scan hit the hunt per-process record limit");
+                    }
                     result->VadRecordCount += vadResult.TotalRecords;
                     result->HiddenPteRangeCount += vadResult.HiddenPteRanges;
                 }
@@ -4025,6 +5242,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     process.ThreadsVisited = threadResult.ThreadsVisited;
                     process.SuspiciousThreadStarts = threadResult.SuspiciousStartCount;
                     process.NonEmptyApcQueues = threadResult.ApcNonEmptyCount;
+                    process.StackReferenceCount = threadResult.StackReferenceCount;
                     process.Warnings.insert(process.Warnings.end(), threadResult.Warnings.begin(), threadResult.Warnings.end());
                     result->ThreadRecordCount += threadResult.MatchingRecords;
                 }
@@ -4037,6 +5255,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 AddVadFindings(device_, symbols_, result, &process);
                 AddThreadFindings(result, process);
                 AddModuleCrossViewFindings(result, process);
+                AddBuiltinModuleProvenanceFindings(result, process);
                 AddMainImageVadFinding(device_, symbols_, result, &process);
 
                 if (options.Mode == HuntMode::Deep)
@@ -4176,6 +5395,10 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"builtin_profile_violations\":";
         AppendJsonStringArray(json, process.BuiltinProfileViolations);
         json << L",\"builtin_signature_verified\":" << (process.BuiltinSignatureVerified ? L"true" : L"false");
+        json << L",\"peb_ldr_core_enumerated\":" << (process.PebLdrEnumerated ? L"true" : L"false");
+        json << L",\"peb_ldr_load_enumerated\":" << (process.PebLdrLoadEnumerated ? L"true" : L"false");
+        json << L",\"peb_ldr_memory_enumerated\":" << (process.PebLdrMemoryEnumerated ? L"true" : L"false");
+        json << L",\"peb_ldr_init_enumerated\":" << (process.PebLdrInitEnumerated ? L"true" : L"false");
         json << L",\"main_image_base\":";
         if (process.MainImageBase != 0)
         {
@@ -4226,6 +5449,7 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"pe_like_vads\":" << process.PeLikeVadCount;
         json << L",\"hidden_pte_ranges\":" << process.HiddenPteRanges;
         json << L",\"suspicious_thread_starts\":" << process.SuspiciousThreadStarts;
+        json << L",\"stack_references\":" << process.StackReferenceCount;
         json << L"},\"warnings\":";
         AppendJsonStringArray(json, process.Warnings);
         json << L"}";

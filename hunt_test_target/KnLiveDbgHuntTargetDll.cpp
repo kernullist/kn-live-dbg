@@ -1,5 +1,13 @@
 #include <Windows.h>
 
+#pragma section(".hrwx", read, execute)
+#pragma comment(linker, "/SECTION:.hrwx,ERW")
+extern "C" __declspec(dllexport) __declspec(allocate(".hrwx")) volatile unsigned char HuntTargetDllRwxSectionAnchor[16] =
+{
+    0x48, 0x55, 0x4e, 0x54, 0x52, 0x57, 0x58, 0x31,
+    0x90, 0x90, 0x90, 0x90, 0xc3, 0x90, 0x90, 0x90
+};
+
 extern "C" __declspec(dllexport) DWORD WINAPI HuntTargetDllProbe()
 {
     volatile DWORD value = GetTickCount();
