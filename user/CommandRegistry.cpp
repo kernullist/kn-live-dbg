@@ -310,6 +310,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"dtx", L"dtx", L"type", L"display type fields through native type reader", CommandSupport::Alias),
         Make(L"callbacks", L"callbacks", L"kernel", L"list callbacks: all|object|registry|process|thread|imageload|minifilter [module]", CommandSupport::Native),
         Make(L"!dml_proc", L"!dml_proc [pid|name]", L"kernel", L"list processes from EPROCESS ActiveProcessLinks, optionally filtered by PID or image-name substring", CommandSupport::Native),
+        Make(L"!hunt", L"!hunt", L"kernel", L"scan all processes for masquerade, hidden mapped code, module stomping, and thread/APC evidence", CommandSupport::Native),
         Make(L"!vad", L"!vad <pid|image|eprocess>", L"kernel", L"walk a process VAD tree and flag executable, private, W+X, and PE-like regions", CommandSupport::Native),
         Make(L"!threads", L"!threads <pid|image|eprocess>", L"kernel", L"walk a process thread list and flag suspicious starts and APC evidence", CommandSupport::Native),
         Make(L"!snapshot", L"!snapshot", L"session", L"capture same-boot baseline evidence snapshots with automatic JSON and Markdown reports", CommandSupport::Native),
