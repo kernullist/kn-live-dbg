@@ -133,6 +133,8 @@ struct HuntResult
     uint64_t ByovdMatchedDriverCount = 0;
     uint64_t DriverObjectCount = 0;
     uint64_t SuspiciousDriverObjectCount = 0;
+    uint64_t DriverServiceCount = 0;
+    uint64_t EdrKillerDriverServiceCount = 0;
     uint64_t HighFindings = 0;
     uint64_t MediumFindings = 0;
     uint64_t LowFindings = 0;

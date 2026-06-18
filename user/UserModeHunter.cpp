@@ -147,6 +147,22 @@ namespace
         bool StrongNameSignal;
     };
 
+    struct DriverServiceRecord
+    {
+        std::wstring ServiceName;
+        std::wstring DisplayName;
+        std::wstring BinaryPath;
+        std::wstring ExpandedBinaryPath;
+        std::wstring BinaryLeaf;
+        std::wstring StateText;
+        std::wstring StartTypeText;
+        DWORD ServiceType = 0;
+        DWORD CurrentState = 0;
+        DWORD StartType = 0;
+        bool HasConfig = false;
+        bool Running = false;
+    };
+
     struct SectionBackingLayout
     {
         TypeFieldInfo SubsectionControlArea = {};
@@ -474,6 +490,326 @@ namespace
         } while (false);
 
         return image;
+    }
+
+    std::wstring ExpandEnvironmentText(const std::wstring& value)
+    {
+        std::wstring expanded = value;
+
+        do
+        {
+            if (value.empty())
+            {
+                break;
+            }
+
+            DWORD required = ExpandEnvironmentStringsW(value.c_str(), nullptr, 0);
+            if (required == 0)
+            {
+                break;
+            }
+
+            std::vector<wchar_t> buffer(required + 1);
+            DWORD written = ExpandEnvironmentStringsW(value.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (written == 0 || written > buffer.size())
+            {
+                break;
+            }
+
+            expanded.assign(buffer.data());
+        } while (false);
+
+        return expanded;
+    }
+
+    std::wstring DriverServiceStateText(DWORD state)
+    {
+        std::wstring text = L"unknown";
+
+        if (state == SERVICE_STOPPED)
+        {
+            text = L"stopped";
+        }
+        else if (state == SERVICE_START_PENDING)
+        {
+            text = L"start_pending";
+        }
+        else if (state == SERVICE_STOP_PENDING)
+        {
+            text = L"stop_pending";
+        }
+        else if (state == SERVICE_RUNNING)
+        {
+            text = L"running";
+        }
+        else if (state == SERVICE_CONTINUE_PENDING)
+        {
+            text = L"continue_pending";
+        }
+        else if (state == SERVICE_PAUSE_PENDING)
+        {
+            text = L"pause_pending";
+        }
+        else if (state == SERVICE_PAUSED)
+        {
+            text = L"paused";
+        }
+
+        return text;
+    }
+
+    std::wstring DriverServiceStartTypeText(DWORD startType)
+    {
+        std::wstring text = L"unknown";
+
+        if (startType == SERVICE_BOOT_START)
+        {
+            text = L"boot";
+        }
+        else if (startType == SERVICE_SYSTEM_START)
+        {
+            text = L"system";
+        }
+        else if (startType == SERVICE_AUTO_START)
+        {
+            text = L"auto";
+        }
+        else if (startType == SERVICE_DEMAND_START)
+        {
+            text = L"demand";
+        }
+        else if (startType == SERVICE_DISABLED)
+        {
+            text = L"disabled";
+        }
+
+        return text;
+    }
+
+    std::wstring Win32FilePathFromMaybeNtPath(const std::wstring& path);
+    std::wstring DosPathFromDevicePath(const std::wstring& path);
+
+    std::wstring TrimServiceImagePathToken(std::wstring value)
+    {
+        do
+        {
+            size_t begin = value.find_first_not_of(L" \t\r\n");
+            if (begin == std::wstring::npos)
+            {
+                value.clear();
+                break;
+            }
+
+            size_t end = value.find_last_not_of(L" \t\r\n");
+            value = value.substr(begin, end - begin + 1);
+
+            if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"')
+            {
+                value = value.substr(1, value.size() - 2);
+            }
+        } while (false);
+
+        return value;
+    }
+
+    std::wstring DriverServiceBinaryImagePath(const std::wstring& binaryPath)
+    {
+        std::wstring path;
+
+        do
+        {
+            std::wstring trimmed = TrimServiceImagePathToken(binaryPath);
+            if (trimmed.empty())
+            {
+                break;
+            }
+
+            std::wstring lowered = HuntToLower(trimmed);
+            size_t sys = lowered.find(L".sys");
+            if (sys != std::wstring::npos)
+            {
+                path = TrimServiceImagePathToken(trimmed.substr(0, sys + 4));
+                break;
+            }
+
+            path = FirstCommandLineImage(trimmed);
+            if (path.empty())
+            {
+                path = trimmed;
+            }
+        } while (false);
+
+        return path;
+    }
+
+    std::wstring DriverServiceBinaryLeaf(const std::wstring& binaryPath)
+    {
+        std::wstring leaf;
+
+        do
+        {
+            std::wstring path = DriverServiceBinaryImagePath(binaryPath);
+            if (path.empty())
+            {
+                path = binaryPath;
+            }
+
+            path = ExpandEnvironmentText(path);
+            path = Win32FilePathFromMaybeNtPath(path);
+            path = DosPathFromDevicePath(path);
+            leaf = LeafName(path);
+        } while (false);
+
+        return leaf;
+    }
+
+    bool QueryDriverServiceConfig(SC_HANDLE service, DriverServiceRecord* record)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (service == nullptr || record == nullptr)
+            {
+                break;
+            }
+
+            DWORD required = 0;
+            QueryServiceConfigW(service, nullptr, 0, &required);
+            DWORD error = GetLastError();
+            if (required == 0 || error != ERROR_INSUFFICIENT_BUFFER)
+            {
+                break;
+            }
+
+            std::vector<BYTE> buffer(required);
+            QUERY_SERVICE_CONFIGW* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
+            if (!QueryServiceConfigW(service, config, static_cast<DWORD>(buffer.size()), &required))
+            {
+                break;
+            }
+
+            record->HasConfig = true;
+            record->StartType = config->dwStartType;
+            record->StartTypeText = DriverServiceStartTypeText(config->dwStartType);
+            if (config->lpBinaryPathName != nullptr)
+            {
+                record->BinaryPath = config->lpBinaryPathName;
+                record->ExpandedBinaryPath = ExpandEnvironmentText(record->BinaryPath);
+                record->BinaryLeaf = DriverServiceBinaryLeaf(record->BinaryPath);
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void CollectDriverServices(std::vector<DriverServiceRecord>* records, std::vector<std::wstring>* warnings)
+    {
+        do
+        {
+            if (records == nullptr)
+            {
+                break;
+            }
+
+            SC_HANDLE scm = OpenSCManagerW(
+                nullptr,
+                nullptr,
+                SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+            if (scm == nullptr)
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"OpenSCManagerW failed for driver service enumeration: " + std::to_wstring(GetLastError()));
+                }
+                break;
+            }
+
+            DWORD bytesNeeded = 0;
+            DWORD serviceCount = 0;
+            DWORD resumeHandle = 0;
+            EnumServicesStatusExW(
+                scm,
+                SC_ENUM_PROCESS_INFO,
+                SERVICE_DRIVER,
+                SERVICE_STATE_ALL,
+                nullptr,
+                0,
+                &bytesNeeded,
+                &serviceCount,
+                &resumeHandle,
+                nullptr);
+
+            DWORD error = GetLastError();
+            if (bytesNeeded == 0 || error != ERROR_MORE_DATA)
+            {
+                if (error != ERROR_SUCCESS && warnings != nullptr)
+                {
+                    warnings->push_back(L"EnumServicesStatusExW sizing failed: " + std::to_wstring(error));
+                }
+                CloseServiceHandle(scm);
+                break;
+            }
+
+            std::vector<BYTE> buffer(bytesNeeded);
+            resumeHandle = 0;
+            if (!EnumServicesStatusExW(
+                    scm,
+                    SC_ENUM_PROCESS_INFO,
+                    SERVICE_DRIVER,
+                    SERVICE_STATE_ALL,
+                    buffer.data(),
+                    static_cast<DWORD>(buffer.size()),
+                    &bytesNeeded,
+                    &serviceCount,
+                    &resumeHandle,
+                    nullptr))
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"EnumServicesStatusExW failed: " + std::to_wstring(GetLastError()));
+                }
+                CloseServiceHandle(scm);
+                break;
+            }
+
+            ENUM_SERVICE_STATUS_PROCESSW* services =
+                reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
+            for (DWORD index = 0; index < serviceCount; ++index)
+            {
+                DriverServiceRecord record = {};
+                if (services[index].lpServiceName != nullptr)
+                {
+                    record.ServiceName = services[index].lpServiceName;
+                }
+                if (services[index].lpDisplayName != nullptr)
+                {
+                    record.DisplayName = services[index].lpDisplayName;
+                }
+                record.ServiceType = services[index].ServiceStatusProcess.dwServiceType;
+                record.CurrentState = services[index].ServiceStatusProcess.dwCurrentState;
+                record.StateText = DriverServiceStateText(record.CurrentState);
+                record.Running = record.CurrentState == SERVICE_RUNNING;
+
+                SC_HANDLE service = OpenServiceW(scm, record.ServiceName.c_str(), SERVICE_QUERY_CONFIG);
+                if (service != nullptr)
+                {
+                    QueryDriverServiceConfig(service, &record);
+                    CloseServiceHandle(service);
+                }
+
+                if (record.BinaryLeaf.empty())
+                {
+                    record.BinaryLeaf = LeafName(record.ServiceName);
+                }
+
+                records->push_back(std::move(record));
+            }
+
+            CloseServiceHandle(scm);
+        } while (false);
     }
 
     uint32_t ConfidenceRank(const std::wstring& confidence)
@@ -5564,6 +5900,153 @@ namespace
         } while (false);
     }
 
+    const EdrKillerDriverProfile* FindDriverProfileForServiceRecord(
+        const DriverServiceRecord& record,
+        std::wstring* matchedLeaf)
+    {
+        const EdrKillerDriverProfile* profile = nullptr;
+
+        do
+        {
+            std::vector<std::wstring> candidates =
+            {
+                record.BinaryLeaf,
+                record.BinaryPath,
+                record.ExpandedBinaryPath,
+                record.ServiceName,
+                record.DisplayName
+            };
+
+            for (const std::wstring& candidate : candidates)
+            {
+                std::wstring leaf = LeafName(candidate);
+                if (leaf.empty())
+                {
+                    continue;
+                }
+
+                profile = FindEdrKillerDriverProfileByLeaf(leaf);
+                if (profile != nullptr)
+                {
+                    if (matchedLeaf != nullptr)
+                    {
+                        *matchedLeaf = leaf;
+                    }
+                    break;
+                }
+            }
+        } while (false);
+
+        return profile;
+    }
+
+    void AddDriverServiceHuntFindings(HuntResult* result)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            std::vector<DriverServiceRecord> services;
+            std::vector<std::wstring> warnings;
+            CollectDriverServices(&services, &warnings);
+            result->DriverServiceCount = services.size();
+
+            for (const std::wstring& warning : warnings)
+            {
+                AddUnique(&result->Warnings, L"driver service scan warning: " + warning);
+            }
+
+            for (const DriverServiceRecord& service : services)
+            {
+                std::wstring matchedLeaf;
+                const EdrKillerDriverProfile* profile =
+                    FindDriverProfileForServiceRecord(service, &matchedLeaf);
+                if (profile == nullptr)
+                {
+                    continue;
+                }
+
+                ++result->EdrKillerDriverServiceCount;
+
+                std::vector<std::wstring> reasons =
+                {
+                    L"driver_service_installed",
+                    L"driver_service_binary_name_ioc",
+                    L"gentlemen_edr_killer_driver_service"
+                };
+                if (service.Running)
+                {
+                    AddUnique(&reasons, L"driver_service_running");
+                }
+                else
+                {
+                    AddUnique(&reasons, L"driver_service_not_running");
+                }
+                if (!profile->StrongNameSignal)
+                {
+                    AddUnique(&reasons, L"name_only_requires_hash_or_service_correlation");
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"service_name"] = service.ServiceName;
+                evidence[L"display_name"] = service.DisplayName;
+                evidence[L"service_type"] = HuntHex(service.ServiceType, 8);
+                evidence[L"state"] = service.StateText;
+                evidence[L"start_type"] = service.StartTypeText;
+                evidence[L"binary_path"] = service.BinaryPath;
+                evidence[L"expanded_binary_path"] = service.ExpandedBinaryPath;
+                evidence[L"binary_leaf"] = service.BinaryLeaf;
+                evidence[L"matched_driver_leaf"] = matchedLeaf;
+                evidence[L"has_config"] = service.HasConfig ? L"true" : L"false";
+                evidence[L"gentlemen_family"] = profile->Family;
+                evidence[L"gentlemen_tool"] = profile->Tool;
+                evidence[L"gentlemen_ioc_driver"] = profile->ImageName;
+                evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+
+                std::vector<std::wstring> followups =
+                {
+                    L"sc.exe qc " + service.ServiceName,
+                    L"sc.exe query " + service.ServiceName,
+                    L"!byovd scan /no-update /exact /limit 40",
+                    L"!driver integrity all /limit 200"
+                };
+
+                std::wstring risk = L"low";
+                std::wstring confidence = L"low";
+                if (profile->StrongNameSignal && service.Running)
+                {
+                    risk = L"high";
+                    confidence = L"high";
+                }
+                else if (profile->StrongNameSignal)
+                {
+                    risk = L"medium";
+                    confidence = L"high";
+                }
+                else if (service.Running)
+                {
+                    risk = L"medium";
+                    confidence = L"medium";
+                }
+
+                AddSystemFinding(
+                    result,
+                    risk,
+                    confidence,
+                    L"edr_killer_driver_service",
+                    L"driver service matches Gentlemen EDR-killer driver IOC",
+                    0,
+                    matchedLeaf,
+                    reasons,
+                    evidence,
+                    followups);
+            }
+        } while (false);
+    }
+
     std::wstring SuspiciousDispatchEvidenceText(const DriverIntegrityRecord& record)
     {
         std::vector<std::wstring> values;
@@ -5739,6 +6222,8 @@ namespace
                 }
                 AddGentlemenDriverNameFindings(result, symbols.Modules(), emittedLeaves);
             }
+
+            AddDriverServiceHuntFindings(result);
 
             IntegrityScanner integrityScanner(device, symbols);
             DriverIntegrityOptions integrityOptions = {};
@@ -6113,6 +6598,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"byovd_matched_drivers\":" << result.ByovdMatchedDriverCount;
     json << L",\"driver_objects\":" << result.DriverObjectCount;
     json << L",\"suspicious_driver_objects\":" << result.SuspiciousDriverObjectCount;
+    json << L",\"driver_services\":" << result.DriverServiceCount;
+    json << L",\"edr_killer_driver_services\":" << result.EdrKillerDriverServiceCount;
     json << L"},\n";
 
     json << L"  \"warnings\":";

@@ -18624,7 +18624,8 @@ static void PrintHuntHelp()
     std::wcout << L"options:\n";
     std::wcout << L"  /quick    skip hidden-PTE and disk-vs-live page comparison\n";
     std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, live-vs-disk executable page,\n";
-    std::wcout << L"            local BYOVD exact-hash catalog, EDR-killer driver-name, and driver-object integrity checks\n";
+    std::wcout << L"            local BYOVD exact-hash catalog, EDR-killer driver-name/service,\n";
+    std::wcout << L"            and driver-object integrity checks\n";
     std::wcout << L"  /limit n  cap rendered findings only (default 200; 0 renders all); JSON keeps the full scan result\n";
     std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
     std::wcout << L"\n";
@@ -25371,6 +25372,8 @@ static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit)
                << L" byovd_matches=" << result.ByovdMatchedDriverCount
                << L" driver_objects=" << result.DriverObjectCount
                << L" suspicious_drivers=" << result.SuspiciousDriverObjectCount
+               << L" driver_services=" << result.DriverServiceCount
+               << L" edr_killer_services=" << result.EdrKillerDriverServiceCount
                << L"\n";
 
     PrintHuntWarnings(result);
