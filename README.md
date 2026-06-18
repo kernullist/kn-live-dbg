@@ -191,6 +191,7 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 callbacks [scope] /module <module>
 !dml_proc [pid|name]
+!hunt [/quick] [/deep] [/limit <n>] [/json <path>]
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|filters|layers]
@@ -518,6 +519,20 @@ When `DbgHelp` cannot return a usable UDT layout, the symbol engine tries a DIA 
 
 The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.ActiveProcessLinks`, then walks the active process list from live kernel memory. If a decimal PID argument is supplied, for example `!dml_proc 4`, only records whose process ID matches that value are printed; any other argument, for example `!dml_proc lsass`, is treated as a case-insensitive image-name substring filter and prints only matching processes. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a ready-to-run `dt nt!_EPROCESS <address>` follow-up.
 
+## No-Target User-Mode Hunt
+
+`!hunt` scans visible live user processes without requiring a target PID. The
+default mode correlates process cross-view state, image path/profile evidence,
+VAD-backed mapped code, module loader/VAD cross-view mismatches, thread/APC
+execution provenance, and bounded stack references into suspicious executable
+memory. `/quick` keeps the scan to cheaper process/VAD/module/thread signals,
+while `/deep` adds executable live-vs-disk page comparison, hidden executable PTE
+checks when VAD coverage is reliable, and modified-page execution correlation.
+Deep stack correlation uses a per-process stack-pointer cache, so JSON findings
+for modified executable pages include `stack_reference_cache_samples` and
+`stack_reference_cache_limited` evidence instead of rereading every stack for
+every mismatched page.
+
 ## Native VAD And Thread Triage
 
 `!vad` and `!threads` add read-only process memory triage without adding new kernel parsing logic:
@@ -529,7 +544,7 @@ The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.
 
 Targets can be decimal PID, image name, or EPROCESS address. `!vad` resolves `_EPROCESS.VadRoot` through PDB/DIA type metadata, walks the balanced tree with bounded traversal and cycle detection, decodes VPN range, protection, private-memory, commit, large/no-change, subsection, and PE-like first-page evidence when available, then prints a compact table plus `[vad.summary]`. `/exec`, `/private`, `/wx`, and `/pe` narrow the output; `/pe` probes private VAD first pages with the same PE header detector used by pool PE hunting. `/hiddenpte` also walks the target process page tables from its DTB, subtracts the normalized VAD coverage plus known VAD-less OS shared mappings, and prints `[hidden-pte]` ranges where a present user PTE exists without VAD coverage, which is a DKOM-style hidden memory signal.
 
-`!threads` walks the process thread list, prints ETHREAD/TID/start/Win32StartAddress/TEB/module/VAD annotations, optionally includes stack bounds, and `/apc` surfaces conservative APC queue evidence when ETHREAD/KAPC layouts are available. Both commands support `/json <path>` with stable field names for diffing. Warnings are expected on PDB drift, protected process/module enumeration failures, partial reads, or APC layouts that cannot be interpreted confidently.
+`!threads` walks the process thread list, prints ETHREAD/TID/start/Win32StartAddress/TEB/module/VAD annotations, optionally includes user-stack bounds plus bounded stack references into suspicious executable memory, and `/apc` surfaces conservative APC queue evidence when ETHREAD/KAPC layouts are available. Both commands support `/json <path>` with stable field names for diffing. Warnings are expected on PDB drift, protected process/module enumeration failures, partial reads, or APC layouts that cannot be interpreted confidently.
 
 ## Kernel Callback Scanner
 

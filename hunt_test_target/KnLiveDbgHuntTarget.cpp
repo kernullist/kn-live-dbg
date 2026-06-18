@@ -26,6 +26,7 @@ namespace
         bool WipedPe = false;
         bool Thread = false;
         bool Apc = false;
+        bool ThreadlessStack = false;
         bool ModulePatch = false;
         bool ModulePatchLate = false;
         bool StompThread = false;
@@ -33,6 +34,7 @@ namespace
         bool SectionImageMap = false;
         bool LockedBackedImage = false;
         bool SectionImageStomp = false;
+        bool ImageRwxSection = false;
         bool LabBuiltinProfile = false;
         bool Baseline = false;
         bool Help = false;
@@ -312,7 +314,7 @@ namespace
     void PrintUsage()
     {
         std::wcout << L"KnLiveDbgHuntTarget command:\n";
-        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/lab-builtin-profile] [/manifest path] [/seconds n]\n";
+        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/lab-builtin-profile] [/manifest path] [/seconds n]\n";
         std::wcout << L"\n";
         std::wcout << L"notes:\n";
         std::wcout << L"  This is a lab-only positive-control target for !hunt.\n";
@@ -375,6 +377,7 @@ namespace
                     options->WipedPe = true;
                     options->Thread = true;
                     options->Apc = true;
+                    options->ThreadlessStack = true;
                     options->ModulePatch = true;
                     options->ModulePatchLate = true;
                     options->StompThread = true;
@@ -382,6 +385,7 @@ namespace
                     options->SectionImageMap = true;
                     options->LockedBackedImage = true;
                     options->SectionImageStomp = true;
+                    options->ImageRwxSection = true;
                     options->LabBuiltinProfile = true;
                     sawScenario = true;
                 }
@@ -425,6 +429,11 @@ namespace
                     options->Apc = true;
                     sawScenario = true;
                 }
+                else if (arg == L"/threadless-stack")
+                {
+                    options->ThreadlessStack = true;
+                    sawScenario = true;
+                }
                 else if (arg == L"/module-patch")
                 {
                     options->ModulePatch = true;
@@ -458,6 +467,11 @@ namespace
                 else if (arg == L"/section-image-stomp")
                 {
                     options->SectionImageStomp = true;
+                    sawScenario = true;
+                }
+                else if (arg == L"/image-rwx-section")
+                {
+                    options->ImageRwxSection = true;
                     sawScenario = true;
                 }
                 else if (arg == L"/lab-builtin-profile")
@@ -520,6 +534,7 @@ namespace
                 options->WipedPe = true;
                 options->Thread = true;
                 options->Apc = true;
+                options->ThreadlessStack = true;
                 options->ModulePatch = true;
                 options->ModulePatchLate = true;
                 options->StompThread = true;
@@ -527,6 +542,7 @@ namespace
                 options->SectionImageMap = true;
                 options->LockedBackedImage = true;
                 options->SectionImageStomp = true;
+                options->ImageRwxSection = true;
                 options->LabBuiltinProfile = false;
             }
 
@@ -539,6 +555,7 @@ namespace
                 options->WipedPe = false;
                 options->Thread = false;
                 options->Apc = false;
+                options->ThreadlessStack = false;
                 options->ModulePatch = false;
                 options->ModulePatchLate = false;
                 options->StompThread = false;
@@ -546,6 +563,7 @@ namespace
                 options->SectionImageMap = false;
                 options->LockedBackedImage = false;
                 options->SectionImageStomp = false;
+                options->ImageRwxSection = false;
                 options->LabBuiltinProfile = false;
             }
         } while (false);
@@ -1368,6 +1386,62 @@ namespace
         return ok;
     }
 
+    DWORD WINAPI StackReferenceSleeper(void* parameter)
+    {
+        volatile uintptr_t references[8] = {};
+        references[0] = reinterpret_cast<uintptr_t>(parameter);
+
+        while (WaitForSingleObject(g_StopEvent, 1000) == WAIT_TIMEOUT)
+        {
+            volatile uintptr_t keepAlive = references[0];
+            if (keepAlive == 0)
+            {
+                break;
+            }
+        }
+
+        return 0;
+    }
+
+    bool CreateThreadlessStackReference()
+    {
+        bool ok = false;
+
+        do
+        {
+            std::vector<uint8_t> code(kPageSize, 0x90);
+            code[0] = 0xc3;
+
+            void* base = nullptr;
+            if (!AllocateBytes(L"threadless-stack-reference-rx", code, PAGE_EXECUTE_READ, &base))
+            {
+                break;
+            }
+
+            DWORD threadId = 0;
+            HANDLE thread = CreateThread(nullptr, 0, StackReferenceSleeper, base, 0, &threadId);
+            if (thread == nullptr)
+            {
+                std::wcerr << Win32ErrorText(L"CreateThread stack-reference sleeper failed") << L"\n";
+                break;
+            }
+
+            g_Threads.push_back(thread);
+            std::wcout << L"threadless-stack tid=" << threadId
+                       << L" referenced=" << Hex(reinterpret_cast<uint64_t>(base)) << L"\n";
+            AddScenario(
+                L"threadless-stack",
+                L"normal thread stack references private executable memory",
+                reinterpret_cast<uint64_t>(base),
+                kPageSize,
+                {L"private_executable_vad", L"stack_reference_to_executable_memory", L"stack_reference_to_private_executable_vad", L"stack_reference_to_user_executable_outside_module"},
+                L"thread start remains in the target module while a stack slot preserves the private RX address");
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     bool LoadFixtureDll(HMODULE* module)
     {
         bool ok = false;
@@ -1391,6 +1465,62 @@ namespace
             }
 
             *module = g_FixtureDll;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool IsWritableExecutableProtection(DWORD protect)
+    {
+        DWORD baseProtect = protect & 0xff;
+        return baseProtect == PAGE_EXECUTE_READWRITE ||
+            baseProtect == PAGE_EXECUTE_WRITECOPY;
+    }
+
+    bool CreateImageRwxSection()
+    {
+        bool ok = false;
+
+        do
+        {
+            HMODULE module = nullptr;
+            if (!LoadFixtureDll(&module))
+            {
+                break;
+            }
+
+            void* anchor = reinterpret_cast<void*>(GetProcAddress(module, "HuntTargetDllRwxSectionAnchor"));
+            if (anchor == nullptr)
+            {
+                std::wcerr << Win32ErrorText(L"GetProcAddress RWX section anchor failed") << L"\n";
+                break;
+            }
+
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(anchor, &info, sizeof(info)) == 0)
+            {
+                std::wcerr << Win32ErrorText(L"VirtualQuery RWX section anchor failed") << L"\n";
+                break;
+            }
+
+            if (!IsWritableExecutableProtection(info.Protect))
+            {
+                std::wcerr << L"fixture RWX section anchor is not mapped with writable executable protection\n";
+                break;
+            }
+
+            std::wcout << L"image-rwx-section dll=KnLiveDbgHuntTargetDll.dll"
+                       << L" anchor=" << Hex(reinterpret_cast<uint64_t>(anchor))
+                       << L" protect=0x" << std::hex << info.Protect << std::dec
+                       << L"\n";
+            AddScenario(
+                L"image-rwx-section",
+                L"loaded fixture DLL section with default writable executable protection",
+                reinterpret_cast<uint64_t>(anchor),
+                16,
+                {L"image_rwx_section_vad", L"mockingjay_rwx_section_candidate", L"wx_user_vad"},
+                L"models Mockingjay-style reuse of an existing image-backed RWX section");
             ok = true;
         } while (false);
 
@@ -1760,7 +1890,7 @@ namespace
         }
         if (options.Rwx)
         {
-            std::wcout << L"  wx_user_vad\n";
+            std::wcout << L"  wx_user_vad, private_executable_vad\n";
         }
         if (options.LargePrivateExec)
         {
@@ -1776,11 +1906,17 @@ namespace
         }
         if (options.Thread)
         {
-            std::wcout << L"  suspicious_thread_start\n";
+            std::wcout << L"  suspicious_thread_start, private_executable_vad\n";
         }
         if (options.Apc)
         {
-            std::wcout << L"  suspicious_apc_routine\n";
+            std::wcout << L"  suspicious_apc_routine, private_executable_vad\n";
+        }
+        if (options.ThreadlessStack)
+        {
+            std::wcout << L"  private_executable_vad, stack_reference_to_executable_memory, "
+                       << L"stack_reference_to_private_executable_vad, "
+                       << L"stack_reference_to_user_executable_outside_module\n";
         }
         if (options.ModulePatch)
         {
@@ -1810,9 +1946,15 @@ namespace
         {
             std::wcout << L"  section_image_without_loader_entry, vad_image_not_in_loader, live_disk_exec_page_mismatch, module_stomping_evidence\n";
         }
+        if (options.ImageRwxSection)
+        {
+            std::wcout << L"  image_rwx_section_vad, mockingjay_rwx_section_candidate, wx_user_vad\n";
+        }
         if (options.LabBuiltinProfile)
         {
-            std::wcout << L"  builtin_profile_path_mismatch, system_name_from_non_system_path\n";
+            std::wcout << L"  builtin_profile_path_mismatch, system_name_from_non_system_path, "
+                       << L"builtin_process_non_windows_module, dll_load_in_builtin_process, "
+                       << L"lab_builtin_profile_non_windows_module\n";
         }
         if (!options.ManifestPath.empty())
         {
@@ -1857,6 +1999,10 @@ namespace
             {
                 anyFailure = true;
             }
+            if (options.ThreadlessStack && !CreateThreadlessStackReference())
+            {
+                anyFailure = true;
+            }
             if (options.ModulePatch && !CreateModulePatch())
             {
                 anyFailure = true;
@@ -1885,15 +2031,26 @@ namespace
             {
                 anyFailure = true;
             }
+            if (options.ImageRwxSection && !CreateImageRwxSection())
+            {
+                anyFailure = true;
+            }
             if (options.LabBuiltinProfile)
             {
+                HMODULE module = nullptr;
+                if (!LoadFixtureDll(&module))
+                {
+                    anyFailure = true;
+                    break;
+                }
+
                 AddScenario(
                     L"lab-builtin-profile",
                     L"test-only built-in process profile violation",
                     0,
                     0,
-                    {L"builtin_profile_path_mismatch", L"system_name_from_non_system_path"},
-                    L"enabled by command line flag and matched only by the hunt lab profile gate");
+                    {L"builtin_profile_path_mismatch", L"system_name_from_non_system_path", L"builtin_process_non_windows_module", L"dll_load_in_builtin_process", L"lab_builtin_profile_non_windows_module"},
+                    L"enabled by command line flag and loads the fixture DLL from the target directory");
             }
 
             ok = !anyFailure;
@@ -1986,8 +2143,6 @@ int wmain(int argc, wchar_t** argv)
     if (g_StopEvent != nullptr)
     {
         SetEvent(g_StopEvent);
-        CloseHandle(g_StopEvent);
-        g_StopEvent = nullptr;
     }
 
     for (MappedImageRecord& record : g_MappedImages)
@@ -2002,6 +2157,12 @@ int wmain(int argc, wchar_t** argv)
         {
             CloseHandle(thread);
         }
+    }
+
+    if (g_StopEvent != nullptr)
+    {
+        CloseHandle(g_StopEvent);
+        g_StopEvent = nullptr;
     }
 
     return exitCode;

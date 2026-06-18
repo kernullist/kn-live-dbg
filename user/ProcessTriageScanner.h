@@ -87,6 +87,9 @@ struct ProcessVadScanOptions
     bool PeOnly = false;
     bool ProbePe = false;
     bool ScanHiddenPtes = false;
+    bool HiddenPteExecutableOnly = false;
+    bool RequireVadCoverageForHiddenPtes = false;
+    uint32_t HiddenPteLimit = 0;
     uint32_t Limit = 0;
 };
 
@@ -150,6 +153,21 @@ struct ProcessApcQueueRecord
     std::vector<ProcessApcEntryRecord> Entries;
 };
 
+struct ProcessStackReferenceRecord
+{
+    uint64_t StackAddress = 0;
+    uint64_t Value = 0;
+    std::wstring ValueModule;
+    std::wstring VadClassification;
+    std::wstring Notes;
+    bool UserModuleEnumerationAvailable = false;
+    bool ValueInUserModule = false;
+    bool ValueOutsideUserModules = false;
+    bool ValueInPrivateExecVad = false;
+    bool ValueInWxVad = false;
+    bool Suspicious = false;
+};
+
 struct ProcessThreadRecord
 {
     uint64_t Ethread = 0;
@@ -160,6 +178,8 @@ struct ProcessThreadRecord
     uint64_t Teb = 0;
     uint64_t StackBase = 0;
     uint64_t StackLimit = 0;
+    uint64_t UserStackBase = 0;
+    uint64_t UserStackLimit = 0;
     std::wstring StartModule;
     std::wstring StartSymbol;
     std::wstring Win32StartModule;
@@ -170,11 +190,13 @@ struct ProcessThreadRecord
     bool HasWin32StartAddress = false;
     bool HasTeb = false;
     bool HasStackBounds = false;
+    bool HasUserStackBounds = false;
     bool StartInUserModule = false;
     bool StartInPrivateExecVad = false;
     bool StartInWxVad = false;
     bool SuspiciousStart = false;
     std::vector<ProcessApcQueueRecord> ApcQueues;
+    std::vector<ProcessStackReferenceRecord> StackReferences;
 };
 
 struct ProcessThreadScanOptions
@@ -194,6 +216,7 @@ struct ProcessThreadScanResult
     uint64_t MatchingRecords = 0;
     uint64_t SuspiciousStartCount = 0;
     uint64_t ApcNonEmptyCount = 0;
+    uint64_t StackReferenceCount = 0;
     bool Truncated = false;
     std::wstring LayoutSource;
 };

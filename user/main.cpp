@@ -18624,7 +18624,7 @@ static void PrintHuntHelp()
     std::wcout << L"options:\n";
     std::wcout << L"  /quick    skip hidden-PTE and disk-vs-live page comparison\n";
     std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, and live-vs-disk executable page checks\n";
-    std::wcout << L"  /limit n  cap rendered findings only; JSON keeps the full scan result\n";
+    std::wcout << L"  /limit n  cap rendered findings only (default 200; 0 renders all); JSON keeps the full scan result\n";
     std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
@@ -25466,8 +25466,6 @@ static void HandleHuntCommand(
         }
 
         result.Warnings.insert(result.Warnings.begin(), processWarnings.begin(), processWarnings.end());
-        PrintHuntResult(result, options.RenderLimit);
-
         if (!jsonPath.empty())
         {
             if (WriteUtf8TextFile(jsonPath, BuildHuntJson(result), &error))
@@ -25479,6 +25477,8 @@ static void HandleHuntCommand(
                 std::wcerr << L"!hunt json failed: " << error << L"\n";
             }
         }
+
+        PrintHuntResult(result, options.RenderLimit);
     } while (false);
 }
 
