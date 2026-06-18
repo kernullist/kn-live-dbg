@@ -129,6 +129,10 @@ struct HuntResult
     uint64_t HiddenPteRangeCount = 0;
     uint64_t ThreadRecordCount = 0;
     uint64_t ModuleRecordCount = 0;
+    uint64_t KernelModuleCount = 0;
+    uint64_t ByovdMatchedDriverCount = 0;
+    uint64_t DriverObjectCount = 0;
+    uint64_t SuspiciousDriverObjectCount = 0;
     uint64_t HighFindings = 0;
     uint64_t MediumFindings = 0;
     uint64_t LowFindings = 0;
@@ -138,13 +142,17 @@ struct HuntResult
 class UserModeHunter
 {
 public:
-    UserModeHunter(DeviceClient& device, SymbolEngine& symbols);
+    UserModeHunter(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const std::wstring& executableDirectory);
 
     bool Scan(const HuntOptions& options, HuntResult* result, std::wstring* error);
 
 private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
+    std::wstring executableDirectory_;
 };
 
 std::wstring HuntModeToText(HuntMode mode);
