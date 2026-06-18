@@ -62,6 +62,7 @@ Validate the `!hunt` output against the target manifest:
 | `/section-image-stomp` | Loader-invisible `SEC_IMAGE` mapping with a modified executable page | `section_image_without_loader_entry`, `vad_image_not_in_loader`, `live_disk_exec_page_mismatch`, `module_text_mismatch`, `module_stomping_evidence` |
 | `/image-rwx-section` | Loaded fixture DLL section with default writable executable protection | `image_rwx_section_vad`, `mockingjay_rwx_section_candidate`, `wx_user_vad` |
 | `/edr-killer-suffix-name` | Benign child copies launched from `GentlemenCollection` with ESET-style suffix names | `gentlemen_edr_killer_process_name`, `gentlemen_suffix_normalized_process_name`, `gentlemen_collection_staging_path` |
+| `/oxideharvest-cli` | Benign child copy launched as `buildx641.exe` with OxideHarvest-style CLI options | `gentlemen_related_credential_tool_name`, `oxideharvest_cli_shape` |
 | `/lab-builtin-profile` | Test-only built-in profile violation gated by an explicit lab flag and a non-Windows fixture DLL load | `builtin_profile_path_mismatch`, `system_name_from_non_system_path`, `builtin_process_non_windows_module`, `dll_load_in_builtin_process` |
 | `/manifest <path>` | Writes a machine-readable scenario manifest | `kn-live-dbg.hunt-target-manifest.v1` |
 
@@ -79,16 +80,18 @@ The target manifest records:
 2. Scenario name and artifact type.
 3. Artifact address and size.
 4. Expected `!hunt` reason codes.
-5. Optional expected JSON evidence keys and exact evidence values.
+5. Unexpected `!hunt` reason codes that must not appear for negative controls.
+6. Optional expected JSON evidence keys and exact evidence values.
 
 `tools\validate-hunt-target.ps1` reads the manifest and `!hunt` JSON, filters
 findings by the target PID, or by a scenario-level `pid` when the manifest
 records a child positive-control process, and fails if any expected reason code
-or expected evidence key/value is missing.
+or expected evidence key/value is missing. It also fails if a scenario-level
+`unexpected_reasons` entry appears for that PID.
 Use `-Strict` with `/baseline` when validating that the target process itself
 does not produce positive-control findings.
-This is a reason-code plus bounded evidence-contract check; inspect the full JSON
-evidence when validating address ownership or page-level provenance.
+This is a reason-code plus bounded evidence-contract check; inspect the full
+JSON evidence when validating address ownership or page-level provenance.
 
 ## Image-Section Fixtures
 
@@ -111,21 +114,41 @@ The image-section scenarios use temporary copies of
 
 `/edr-killer-suffix-name` copies the test target to a temporary
 `GentlemenCollection` directory and launches benign baseline child processes
-named `Kasps1.exe`, `KaspLight.exe`, `MB1.exe`, and `G111.exe`. This validates
-the Gentlemen naming pattern described by ESET: known EDR-killer base names may
-carry suffixes such as `1`, `2`, `Light`, or `Clear` to indicate protection and
-impersonation choices. The fixture covers regular aliases, the `Kasp<suffix>`
-alias, short `MB<suffix>` names that require staging context, and digit-ending
-`G11<suffix>` names that must not be normalized by stripping base digits. The
-children do not load a driver, perform injection, or modify another process;
-they only create benign process-name and staging-path positive controls. The
-manifest records the child PID on each scenario so the validator checks findings
-for the child instead of the parent target PID. The target EXE carries lab-only
-version metadata (`CompanyName=Kaspersky Lab`, `OriginalFilename=Kasps.exe`,
+named after the ESET Table 3/4 suffix families: `Kasps1.exe`, `KaspLight.exe`,
+`FaceIT1.exe`, `Valorant2.exe`, `EAAntiCheatLight.exe`,
+`EASolo1Clear.exe`, `BitD1.exe`, `MB1.exe`, `G111.exe`,
+`SymantecClear.exe`, `Avast1.exe`, `Sent2.exe`, and `SophosLight.exe`. This
+validates the Gentlemen naming pattern described by ESET: known EDR-killer base
+names may carry suffixes such as `1`, `2`, `Light`, or `Clear` to indicate
+protection and impersonation choices. The fixture covers regular aliases,
+exact already-suffixed IoCs, short `MB<suffix>` names that require staging
+context, digit-ending `G11<suffix>` names that must not be normalized by
+stripping base digits, and weak vendor-impersonation names that are only
+elevated when the `GentlemenCollection` staging context is present. The children
+do not load a driver, perform injection, or modify another process; they only
+create benign process-name and staging-path positive controls. The manifest
+records the child PID on each scenario so the validator checks findings for the
+child instead of the parent target PID. The target EXE carries lab-only version
+metadata (`CompanyName=Kaspersky Lab`, `OriginalFilename=Kasps.exe`,
 `ProductName=Kaspersky Anti-Virus`) so metadata evidence such as
-`image_version_info_present`, `image_company_name`, and
-`image_original_filename` can be validated with exact expected values without
+`image_version_info_present`, `image_company_name`, `image_original_filename`,
+and `gentlemen_suffix_tail` can be validated with exact expected values without
 using a real EDR-killer binary.
+
+The same mode also launches `Avast.exe` from a temp directory that does not
+contain `GentlemenCollection`. Its manifest entry is a negative control: weak
+vendor-impersonation names must not produce Gentlemen process-name findings
+without staging or telemetry context.
+
+## OxideHarvest Fixture
+
+`/oxideharvest-cli` copies the target to a temporary directory as
+`buildx641.exe` and launches it with the OxideHarvest-style options documented
+by ESET: `-i`, `-u`, `-p`, `-t`, and `-o`, each with a value. The child remains
+benign and runs in baseline wait mode; the command line exists only so `!hunt`
+can validate that the credential-tool name IOC is accompanied by
+`oxideharvest_cli_shape` and the exact `oxideharvest_cli_options` evidence
+value.
 
 These cases are intentionally not cross-process injection samples. They are
 positive controls for hunt invariants: VAD image ownership, loader cross-view

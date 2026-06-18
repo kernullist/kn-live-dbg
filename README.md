@@ -536,9 +536,14 @@ Gentlemen process/staging indicators that performed driver I/O or repeated
 process-impairment activity. The TI correlation path also raises a behavioral
 finding when one caller repeatedly controls or terminates known security-product
 processes from the GentleKiller target list, even if the caller name was changed.
-Process-profile findings include bounded on-disk metadata evidence for the ESET
-evasion layer: Authenticode trust state, version strings, original filename,
-file description, and icon-resource presence.
+Process-profile findings include bounded on-disk metadata and suffix evidence
+for the ESET evasion layer: Authenticode trust state, version strings, original
+filename, file description, icon-resource presence, and the `1`/`2`/`Light`/
+`Clear` suffix tail. Weak vendor-impersonation process names are not promoted as
+standalone findings unless stronger Gentlemen staging or telemetry context is
+present. The related OxideHarvest credential-tool profile also records the
+`-i`/`-u`/`-p`/`-t`/`-o` command-line shape described by ESET when all required
+options have values.
 Deep stack correlation uses
 a per-process stack-pointer cache, so JSON findings for modified executable pages
 include `stack_reference_cache_samples` and `stack_reference_cache_limited`
