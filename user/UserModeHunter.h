@@ -17,11 +17,35 @@ enum class HuntMode
     Deep
 };
 
+struct HuntTelemetryField
+{
+    std::wstring Name;
+    std::wstring Value;
+};
+
+struct HuntTelemetryEvent
+{
+    uint64_t Timestamp = 0;
+    uint32_t ProcessId = 0;
+    uint32_t TargetProcessId = 0;
+    uint16_t TaskId = 0;
+    uint8_t Opcode = 0;
+    std::wstring TaskName;
+    std::wstring OpcodeName;
+    std::wstring ImagePath;
+    std::wstring TargetImageBase;
+    std::vector<HuntTelemetryField> Payload;
+    std::wstring RawPayloadHex;
+};
+
 struct HuntOptions
 {
     HuntMode Mode = HuntMode::Default;
     uint32_t RenderLimit = 200;
     std::vector<SnapshotProcessRecord> Processes;
+    bool ThreatIntelActive = false;
+    bool ThreatIntelAvailable = false;
+    std::vector<HuntTelemetryEvent> ThreatIntelEvents;
 };
 
 struct HuntModuleRecord
@@ -135,6 +159,10 @@ struct HuntResult
     uint64_t SuspiciousDriverObjectCount = 0;
     uint64_t DriverServiceCount = 0;
     uint64_t EdrKillerDriverServiceCount = 0;
+    bool ThreatIntelActive = false;
+    bool ThreatIntelAvailable = false;
+    uint64_t ThreatIntelEventCount = 0;
+    uint64_t ThreatIntelCorrelationCount = 0;
     uint64_t HighFindings = 0;
     uint64_t MediumFindings = 0;
     uint64_t LowFindings = 0;
