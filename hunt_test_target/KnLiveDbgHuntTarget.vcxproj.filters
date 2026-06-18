@@ -5,10 +5,19 @@
       <UniqueIdentifier>{D3111F7B-A427-4F2E-B40E-0E9CC3340CA2}</UniqueIdentifier>
       <Extensions>cpp;c;cxx</Extensions>
     </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{F2778E77-9C3E-4711-9BD5-59110266A0F5}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="KnLiveDbgHuntTarget.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="KnLiveDbgHuntTarget.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

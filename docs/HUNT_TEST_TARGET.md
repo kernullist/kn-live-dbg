@@ -61,7 +61,7 @@ Validate the `!hunt` output against the target manifest:
 | `/locked-backed-image` | Loader-invisible `SEC_IMAGE` mapping whose backing file denies read sharing | `section_backing_inaccessible`, `section_image_without_loader_entry`, `vad_image_not_in_loader` |
 | `/section-image-stomp` | Loader-invisible `SEC_IMAGE` mapping with a modified executable page | `section_image_without_loader_entry`, `vad_image_not_in_loader`, `live_disk_exec_page_mismatch`, `module_text_mismatch`, `module_stomping_evidence` |
 | `/image-rwx-section` | Loaded fixture DLL section with default writable executable protection | `image_rwx_section_vad`, `mockingjay_rwx_section_candidate`, `wx_user_vad` |
-| `/edr-killer-suffix-name` | Benign child copy launched as `GentlemenCollection\Kasps1.exe` | `gentlemen_edr_killer_process_name`, `gentlemen_suffix_normalized_process_name`, `gentlemen_collection_staging_path` |
+| `/edr-killer-suffix-name` | Benign child copies launched from `GentlemenCollection` with ESET-style suffix names | `gentlemen_edr_killer_process_name`, `gentlemen_suffix_normalized_process_name`, `gentlemen_collection_staging_path` |
 | `/lab-builtin-profile` | Test-only built-in profile violation gated by an explicit lab flag and a non-Windows fixture DLL load | `builtin_profile_path_mismatch`, `system_name_from_non_system_path`, `builtin_process_non_windows_module`, `dll_load_in_builtin_process` |
 | `/manifest <path>` | Writes a machine-readable scenario manifest | `kn-live-dbg.hunt-target-manifest.v1` |
 
@@ -79,15 +79,16 @@ The target manifest records:
 2. Scenario name and artifact type.
 3. Artifact address and size.
 4. Expected `!hunt` reason codes.
+5. Optional expected JSON evidence keys and exact evidence values.
 
 `tools\validate-hunt-target.ps1` reads the manifest and `!hunt` JSON, filters
 findings by the target PID, or by a scenario-level `pid` when the manifest
 records a child positive-control process, and fails if any expected reason code
-is missing.
+or expected evidence key/value is missing.
 Use `-Strict` with `/baseline` when validating that the target process itself
 does not produce positive-control findings.
-This is a reason-code coverage check; inspect the JSON evidence when validating
-address ownership or page-level provenance.
+This is a reason-code plus bounded evidence-contract check; inspect the full JSON
+evidence when validating address ownership or page-level provenance.
 
 ## Image-Section Fixtures
 
@@ -109,14 +110,22 @@ The image-section scenarios use temporary copies of
 ## EDR-Killer Name Fixture
 
 `/edr-killer-suffix-name` copies the test target to a temporary
-`GentlemenCollection` directory as `Kasps1.exe` and runs the copy in baseline
-child mode. This validates the Gentlemen naming pattern described by ESET:
-known EDR-killer base names may carry suffixes such as `1`, `2`, `Light`, or
-`Clear` to indicate protection and impersonation choices. The child does not
-load a driver, perform injection, or modify another process; it only creates a
-benign process-name and staging-path positive control. The manifest records the
-child PID on that scenario so the validator checks findings for the child
-instead of the parent target PID.
+`GentlemenCollection` directory and launches benign baseline child processes
+named `Kasps1.exe`, `KaspLight.exe`, `MB1.exe`, and `G111.exe`. This validates
+the Gentlemen naming pattern described by ESET: known EDR-killer base names may
+carry suffixes such as `1`, `2`, `Light`, or `Clear` to indicate protection and
+impersonation choices. The fixture covers regular aliases, the `Kasp<suffix>`
+alias, short `MB<suffix>` names that require staging context, and digit-ending
+`G11<suffix>` names that must not be normalized by stripping base digits. The
+children do not load a driver, perform injection, or modify another process;
+they only create benign process-name and staging-path positive controls. The
+manifest records the child PID on each scenario so the validator checks findings
+for the child instead of the parent target PID. The target EXE carries lab-only
+version metadata (`CompanyName=Kaspersky Lab`, `OriginalFilename=Kasps.exe`,
+`ProductName=Kaspersky Anti-Virus`) so metadata evidence such as
+`image_version_info_present`, `image_company_name`, and
+`image_original_filename` can be validated with exact expected values without
+using a real EDR-killer binary.
 
 These cases are intentionally not cross-process injection samples. They are
 positive controls for hunt invariants: VAD image ownership, loader cross-view
@@ -179,6 +188,7 @@ the same section/backing invariants for non-main image mappings.
     per-process cap.
 12. The target is intentionally noisy. Do not run it as a clean-baseline
     process.
-13. `/edr-killer-suffix-name` creates a temporary self-copy and child process.
-    The child waits for the parent process or the configured `/seconds` timeout,
-    and parent cleanup removes the temporary copy after the child exits.
+13. `/edr-killer-suffix-name` creates temporary self-copies and child processes.
+    Each child waits for the parent process or the configured `/seconds`
+    timeout, and parent cleanup removes the temporary copies after the children
+    exit.
