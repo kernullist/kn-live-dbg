@@ -173,6 +173,8 @@ namespace
         std::wstring MatchedLeaf;
         const EdrKillerProcessProfile* Profile = nullptr;
         bool GentlemenStagingPath = false;
+        bool SuffixNormalizedProfile = false;
+        std::wstring NormalizedProfileBase;
         uint64_t DriverIoCount = 0;
         uint64_t ProcessImpairmentCount = 0;
         std::set<uint32_t> TargetProcessIds;
@@ -337,7 +339,88 @@ namespace
         return LeafHasAnySuffix(path, {L".exe", L".dll", L".sys", L".ocx", L".cpl", L".scr"});
     }
 
-    const EdrKillerProcessProfile* FindEdrKillerProcessProfileByLeaf(const std::wstring& leaf)
+    bool EndsWithText(const std::wstring& value, const std::wstring& suffix)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (value.size() < suffix.size())
+            {
+                break;
+            }
+
+            matched = value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+        } while (false);
+
+        return matched;
+    }
+
+    std::wstring StemWithoutExeExtension(const std::wstring& leaf)
+    {
+        std::wstring stem = HuntToLower(leaf);
+
+        if (EndsWithText(stem, L".exe"))
+        {
+            stem.resize(stem.size() - 4);
+        }
+
+        return stem;
+    }
+
+    std::wstring NormalizeGentlemenSuffixStem(const std::wstring& leaf)
+    {
+        std::wstring stem = StemWithoutExeExtension(leaf);
+
+        for (;;)
+        {
+            bool changed = false;
+            if (EndsWithText(stem, L"light"))
+            {
+                stem.resize(stem.size() - 5);
+                changed = true;
+            }
+            else if (EndsWithText(stem, L"clear"))
+            {
+                stem.resize(stem.size() - 5);
+                changed = true;
+            }
+            else if (!stem.empty() && (stem.back() == L'1' || stem.back() == L'2'))
+            {
+                stem.pop_back();
+                changed = true;
+            }
+
+            if (!changed)
+            {
+                break;
+            }
+        }
+
+        return stem;
+    }
+
+    bool CanUseGentlemenSuffixNormalizedBase(const std::wstring& stem)
+    {
+        bool usable = false;
+
+        do
+        {
+            if (stem.size() < 4)
+            {
+                break;
+            }
+
+            usable = true;
+        } while (false);
+
+        return usable;
+    }
+
+    const EdrKillerProcessProfile* FindEdrKillerProcessProfileByLeaf(
+        const std::wstring& leaf,
+        bool* suffixNormalized = nullptr,
+        std::wstring* normalizedBase = nullptr)
     {
         const EdrKillerProcessProfile* profile = nullptr;
 
@@ -368,11 +451,61 @@ namespace
                 break;
             }
 
+            if (suffixNormalized != nullptr)
+            {
+                *suffixNormalized = false;
+            }
+            if (normalizedBase != nullptr)
+            {
+                normalizedBase->clear();
+            }
+
             for (const EdrKillerProcessProfile& item : kProfiles)
             {
                 if (leaf == item.ImageName)
                 {
                     profile = &item;
+                    break;
+                }
+            }
+
+            if (profile != nullptr)
+            {
+                break;
+            }
+
+            std::wstring candidateBase = NormalizeGentlemenSuffixStem(leaf);
+            if (candidateBase.empty() ||
+                candidateBase == StemWithoutExeExtension(leaf) ||
+                !CanUseGentlemenSuffixNormalizedBase(candidateBase))
+            {
+                break;
+            }
+
+            for (const EdrKillerProcessProfile& item : kProfiles)
+            {
+                if (item.CredentialTool)
+                {
+                    continue;
+                }
+
+                std::wstring profileBase = NormalizeGentlemenSuffixStem(item.ImageName);
+                if (!CanUseGentlemenSuffixNormalizedBase(profileBase))
+                {
+                    continue;
+                }
+
+                if (candidateBase == profileBase)
+                {
+                    profile = &item;
+                    if (suffixNormalized != nullptr)
+                    {
+                        *suffixNormalized = true;
+                    }
+                    if (normalizedBase != nullptr)
+                    {
+                        *normalizedBase = candidateBase;
+                    }
                     break;
                 }
             }
@@ -430,12 +563,23 @@ namespace
 
     const EdrKillerProcessProfile* FindEdrKillerProcessProfileForProcess(
         const HuntProcessRecord& process,
-        std::wstring* matchedLeaf)
+        std::wstring* matchedLeaf,
+        bool* suffixNormalized = nullptr,
+        std::wstring* normalizedBase = nullptr)
     {
         const EdrKillerProcessProfile* profile = nullptr;
 
         do
         {
+            if (suffixNormalized != nullptr)
+            {
+                *suffixNormalized = false;
+            }
+            if (normalizedBase != nullptr)
+            {
+                normalizedBase->clear();
+            }
+
             std::vector<std::wstring> candidates =
             {
                 process.KernelImageName,
@@ -454,12 +598,25 @@ namespace
                     continue;
                 }
 
-                profile = FindEdrKillerProcessProfileByLeaf(leaf);
+                bool localSuffixNormalized = false;
+                std::wstring localNormalizedBase;
+                profile = FindEdrKillerProcessProfileByLeaf(
+                    leaf,
+                    &localSuffixNormalized,
+                    &localNormalizedBase);
                 if (profile != nullptr)
                 {
                     if (matchedLeaf != nullptr)
                     {
                         *matchedLeaf = leaf;
+                    }
+                    if (suffixNormalized != nullptr)
+                    {
+                        *suffixNormalized = localSuffixNormalized;
+                    }
+                    if (normalizedBase != nullptr)
+                    {
+                        *normalizedBase = localNormalizedBase;
                     }
                     break;
                 }
@@ -3937,8 +4094,10 @@ namespace
             std::wstring imageName = BestProcessImageName(process);
             std::wstring imagePath = BestProcessImagePath(process);
             std::wstring matchedLeaf;
+            bool suffixNormalized = false;
+            std::wstring normalizedBase;
             const EdrKillerProcessProfile* profile =
-                FindEdrKillerProcessProfileForProcess(process, &matchedLeaf);
+                FindEdrKillerProcessProfileForProcess(process, &matchedLeaf, &suffixNormalized, &normalizedBase);
             bool gentlemenStagingPath =
                 PathContainsGentlemenCollection(imagePath) ||
                 PathContainsGentlemenCollection(process.PebCommandLine);
@@ -3965,6 +4124,12 @@ namespace
                 evidence[L"gentlemen_ioc_image"] = profile->ImageName;
                 evidence[L"matched_image_leaf"] = matchedLeaf;
                 evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+                evidence[L"suffix_normalized_ioc"] = suffixNormalized ? L"true" : L"false";
+                if (suffixNormalized)
+                {
+                    AddUnique(&reasons, L"gentlemen_suffix_normalized_process_name");
+                    evidence[L"normalized_ioc_base"] = normalizedBase;
+                }
                 if (!profile->StrongNameSignal)
                 {
                     AddUnique(&reasons, L"security_vendor_impersonation_name");
@@ -4251,6 +4416,10 @@ namespace
             {
                 AddUnique(&reasons, L"gentlemen_collection_staging_path");
             }
+            if (bucket.SuffixNormalizedProfile)
+            {
+                AddUnique(&reasons, L"gentlemen_suffix_normalized_process_name");
+            }
             for (const std::wstring& reason : actionReasons)
             {
                 AddUnique(&reasons, reason);
@@ -4262,6 +4431,8 @@ namespace
             evidence[L"caller_image_path"] = bucket.ImagePath;
             evidence[L"matched_image_leaf"] = bucket.MatchedLeaf;
             evidence[L"gentlemen_collection_path"] = bucket.GentlemenStagingPath ? L"true" : L"false";
+            evidence[L"suffix_normalized_ioc"] = bucket.SuffixNormalizedProfile ? L"true" : L"false";
+            evidence[L"normalized_ioc_base"] = bucket.NormalizedProfileBase;
             evidence[L"ti_event_count"] = std::to_wstring(actionCount);
             evidence[L"ti_sample_timestamp"] = std::to_wstring(sample.Timestamp);
             evidence[L"ti_sample_task"] = sample.TaskName;
@@ -4360,12 +4531,18 @@ namespace
 
                 std::wstring matchedLeaf;
                 const EdrKillerProcessProfile* profile = nullptr;
+                bool suffixNormalized = false;
+                std::wstring normalizedBase;
                 bool gentlemenStagingPath = PathContainsGentlemenCollection(event.ImagePath) ||
                     PathContainsGentlemenCollection(ThreatIntelFullText(event));
 
                 if (process != nullptr)
                 {
-                    profile = FindEdrKillerProcessProfileForProcess(*process, &matchedLeaf);
+                    profile = FindEdrKillerProcessProfileForProcess(
+                        *process,
+                        &matchedLeaf,
+                        &suffixNormalized,
+                        &normalizedBase);
                     gentlemenStagingPath = gentlemenStagingPath ||
                         PathContainsGentlemenCollection(BestProcessImagePath(*process)) ||
                         PathContainsGentlemenCollection(process->PebCommandLine);
@@ -4374,7 +4551,10 @@ namespace
                 if (profile == nullptr)
                 {
                     matchedLeaf = LeafName(event.ImagePath);
-                    profile = FindEdrKillerProcessProfileByLeaf(matchedLeaf);
+                    profile = FindEdrKillerProcessProfileByLeaf(
+                        matchedLeaf,
+                        &suffixNormalized,
+                        &normalizedBase);
                 }
 
                 if (!ThreatIntelProfileIsActionable(profile, gentlemenStagingPath))
@@ -4384,15 +4564,37 @@ namespace
 
                 ThreatIntelCorrelationBucket& bucket = buckets[event.ProcessId];
                 bucket.ProcessId = event.ProcessId;
-                bucket.Profile = profile;
-                bucket.GentlemenStagingPath = gentlemenStagingPath;
-                bucket.MatchedLeaf = matchedLeaf;
-                bucket.ImagePath = event.ImagePath;
-                bucket.ImageName = LeafName(event.ImagePath);
+                if (bucket.Profile == nullptr && profile != nullptr)
+                {
+                    bucket.Profile = profile;
+                }
+                bucket.GentlemenStagingPath = bucket.GentlemenStagingPath || gentlemenStagingPath;
+                bucket.SuffixNormalizedProfile = bucket.SuffixNormalizedProfile || suffixNormalized;
+                if (bucket.NormalizedProfileBase.empty() && !normalizedBase.empty())
+                {
+                    bucket.NormalizedProfileBase = normalizedBase;
+                }
+                if (!matchedLeaf.empty())
+                {
+                    bucket.MatchedLeaf = matchedLeaf;
+                }
+                if (!event.ImagePath.empty())
+                {
+                    bucket.ImagePath = event.ImagePath;
+                }
+                std::wstring eventImageName = LeafName(event.ImagePath);
+                if (!eventImageName.empty())
+                {
+                    bucket.ImageName = eventImageName;
+                }
                 if (process != nullptr)
                 {
                     bucket.Eprocess = process->Kernel.Eprocess;
-                    bucket.ImageName = BestProcessImageName(*process);
+                    std::wstring bestName = BestProcessImageName(*process);
+                    if (!bestName.empty())
+                    {
+                        bucket.ImageName = bestName;
+                    }
                     if (bucket.ImagePath.empty())
                     {
                         bucket.ImagePath = BestProcessImagePath(*process);

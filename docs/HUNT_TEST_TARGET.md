@@ -61,6 +61,7 @@ Validate the `!hunt` output against the target manifest:
 | `/locked-backed-image` | Loader-invisible `SEC_IMAGE` mapping whose backing file denies read sharing | `section_backing_inaccessible`, `section_image_without_loader_entry`, `vad_image_not_in_loader` |
 | `/section-image-stomp` | Loader-invisible `SEC_IMAGE` mapping with a modified executable page | `section_image_without_loader_entry`, `vad_image_not_in_loader`, `live_disk_exec_page_mismatch`, `module_text_mismatch`, `module_stomping_evidence` |
 | `/image-rwx-section` | Loaded fixture DLL section with default writable executable protection | `image_rwx_section_vad`, `mockingjay_rwx_section_candidate`, `wx_user_vad` |
+| `/edr-killer-suffix-name` | Benign child copy launched as `GentlemenCollection\Kasps1.exe` | `gentlemen_edr_killer_process_name`, `gentlemen_suffix_normalized_process_name`, `gentlemen_collection_staging_path` |
 | `/lab-builtin-profile` | Test-only built-in profile violation gated by an explicit lab flag and a non-Windows fixture DLL load | `builtin_profile_path_mismatch`, `system_name_from_non_system_path`, `builtin_process_non_windows_module`, `dll_load_in_builtin_process` |
 | `/manifest <path>` | Writes a machine-readable scenario manifest | `kn-live-dbg.hunt-target-manifest.v1` |
 
@@ -80,7 +81,9 @@ The target manifest records:
 4. Expected `!hunt` reason codes.
 
 `tools\validate-hunt-target.ps1` reads the manifest and `!hunt` JSON, filters
-findings by the target PID, and fails if any expected reason code is missing.
+findings by the target PID, or by a scenario-level `pid` when the manifest
+records a child positive-control process, and fails if any expected reason code
+is missing.
 Use `-Strict` with `/baseline` when validating that the target process itself
 does not produce positive-control findings.
 This is a reason-code coverage check; inspect the JSON evidence when validating
@@ -102,6 +105,18 @@ The image-section scenarios use temporary copies of
 4. `/image-rwx-section` loads the fixture DLL's purpose-built RWX image section
    and validates hunt coverage for Mockingjay-style reuse of writable executable
    code caves inside otherwise legitimate image mappings.
+
+## EDR-Killer Name Fixture
+
+`/edr-killer-suffix-name` copies the test target to a temporary
+`GentlemenCollection` directory as `Kasps1.exe` and runs the copy in baseline
+child mode. This validates the Gentlemen naming pattern described by ESET:
+known EDR-killer base names may carry suffixes such as `1`, `2`, `Light`, or
+`Clear` to indicate protection and impersonation choices. The child does not
+load a driver, perform injection, or modify another process; it only creates a
+benign process-name and staging-path positive control. The manifest records the
+child PID on that scenario so the validator checks findings for the child
+instead of the parent target PID.
 
 These cases are intentionally not cross-process injection samples. They are
 positive controls for hunt invariants: VAD image ownership, loader cross-view
@@ -164,3 +179,6 @@ the same section/backing invariants for non-main image mappings.
     per-process cap.
 12. The target is intentionally noisy. Do not run it as a clean-baseline
     process.
+13. `/edr-killer-suffix-name` creates a temporary self-copy and child process.
+    The child waits for the parent process or the configured `/seconds` timeout,
+    and parent cleanup removes the temporary copy after the child exits.

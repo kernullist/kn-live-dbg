@@ -56,16 +56,23 @@ foreach ($scenario in $scenarios)
         continue
     }
 
+    $scenarioPid = $targetPid
+    if ($null -ne $scenario.PSObject.Properties["pid"])
+    {
+        $scenarioPid = [int]$scenario.pid
+    }
+    $scenarioFindings = @($huntDoc.findings | Where-Object { [int]$_.pid -eq $scenarioPid })
+
     foreach ($reason in $expectedReasons)
     {
-        $matches = @($targetFindings | Where-Object { @($_.reasons) -contains $reason })
+        $matches = @($scenarioFindings | Where-Object { @($_.reasons) -contains $reason })
         if ($matches.Count -eq 0)
         {
-            $failures.Add("missing reason '$reason' for scenario '$($scenario.name)'")
+            $failures.Add("missing reason '$reason' for scenario '$($scenario.name)' pid=$scenarioPid")
         }
         else
         {
-            Write-Host "  pass scenario=$($scenario.name) reason=$reason"
+            Write-Host "  pass scenario=$($scenario.name) pid=$scenarioPid reason=$reason"
         }
     }
 }
