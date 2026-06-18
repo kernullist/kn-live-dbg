@@ -121,6 +121,7 @@
     <ClCompile Include="MemoryDumper.cpp" />
     <ClCompile Include="PoolPeHunter.cpp" />
     <ClCompile Include="ProcessTriageScanner.cpp" />
+    <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
     <ClCompile Include="PoolScanner.cpp" />
     <ClCompile Include="SnapshotCollector.cpp" />
@@ -165,6 +166,7 @@
     <ClInclude Include="MemoryDumper.h" />
     <ClInclude Include="PoolPeHunter.h" />
     <ClInclude Include="ProcessTriageScanner.h" />
+    <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="PoolScanner.h" />
     <ClInclude Include="SnapshotCollector.h" />

@@ -26,6 +26,7 @@
 #include "IdtScanner.h"
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
+#include "UserModeHunter.h"
 #include "VbsScanner.h"
 #include "WfpScanner.h"
 #include "WfpCalloutScanner.h"
@@ -1728,6 +1729,7 @@ static void PrintHelp(bool includeDbgEng)
     PrintColoredText(L"high-value topics", KNDBG_COLOR_ACCENT);
     std::wcout << L"\n";
     std::wcout << L"  help callbacks       callback scanners and module filters\n";
+    std::wcout << L"  help !hunt           whole-system user-mode anomaly hunt\n";
     std::wcout << L"  help !vad            VAD tree triage, hidden PTE checks, PE-like private memory\n";
     std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
     std::wcout << L"  help !pool           big-pool allocation triage and W+X annotation\n";
@@ -1747,12 +1749,12 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  memory        procctx <pid> | vtop /process <pid> <user-address> | pdb <pa> 80\n";
     std::wcout << L"  types/code    dt nt!_EPROCESS <address> | u nt!KiSystemCall64 8 | uf nt!KiSystemCall64 512\n";
     std::wcout << L"  callbacks     callbacks all | callbacks imageload | callbacks process WdFilter.sys\n";
-    std::wcout << L"  process       !dml_proc [pid|name] | !vad <pid> /exec /private | !threads <pid> /apc\n";
+    std::wcout << L"  process       !hunt /deep | !dml_proc [pid|name] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
     std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
     std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
-    std::wcout << L"  hunting       !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
+    std::wcout << L"  hunting       !hunt | !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
     std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
@@ -2066,6 +2068,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
 
     if (IsNativePhysicalBangCommand(command) ||
         command == L"!dml_proc" ||
+        command == L"!hunt" ||
         command == L"!vad" ||
         command == L"!threads" ||
         command == L"!snapshot" ||
@@ -3074,6 +3077,20 @@ static void AddVadOptionCompletionCandidates(std::vector<std::wstring>* candidat
     AddCompletionCandidates(candidates, values);
 }
 
+static void AddHuntOptionCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"/quick",
+        L"/deep",
+        L"/limit",
+        L"/json",
+        L"help"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
 static void AddThreadsOptionCompletionCandidates(std::vector<std::wstring>* candidates)
 {
     static const wchar_t* values[] =
@@ -3293,6 +3310,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"x",
         L"vtop",
         L"!dml_proc",
+        L"!hunt",
         L"!vad",
         L"!threads",
         L"!snapshot",
@@ -3693,6 +3711,10 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddWfpScopeCompletionCandidates(&candidates);
                 }
+                else if (topic == L"!hunt")
+                {
+                    AddHuntOptionCompletionCandidates(&candidates);
+                }
                 else if (topic == L"!vad")
                 {
                     AddVadOptionCompletionCandidates(&candidates);
@@ -3854,6 +3876,10 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         else if (command == L"!vad")
         {
             AddVadOptionCompletionCandidates(&candidates);
+        }
+        else if (command == L"!hunt")
+        {
+            AddHuntOptionCompletionCandidates(&candidates);
         }
         else if (command == L"!threads")
         {
@@ -18590,6 +18616,23 @@ static void PrintDmlProcHelp()
     std::wcout << L"  Output includes EPROCESS, PID, parent PID, active thread count, DTB, and image name.\n";
 }
 
+static void PrintHuntHelp()
+{
+    std::wcout << L"!hunt command:\n";
+    std::wcout << L"  !hunt [/quick] [/deep] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /quick    skip hidden-PTE and disk-vs-live page comparison\n";
+    std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, and live-vs-disk executable page checks\n";
+    std::wcout << L"  /limit n  cap rendered findings only; JSON keeps the full scan result\n";
+    std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  No process target is accepted. The command scans the whole current system view.\n";
+    std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, and APC evidence.\n";
+    std::wcout << L"  Evidence is a lead with risk and confidence; use printed !vad, !threads, and !address follow-ups for triage.\n";
+}
+
 static void PrintVadHelp()
 {
     std::wcout << L"!vad command:\n";
@@ -19285,6 +19328,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"!dml_proc")
         {
             PrintDmlProcHelp();
+        }
+        else if (command == L"!hunt")
+        {
+            PrintHuntHelp();
         }
         else if (command == L"!vad")
         {
@@ -21815,6 +21862,72 @@ static bool ValidateVadCommandArgumentShape(
     return ok;
 }
 
+static bool ValidateHuntCommandArgumentShape(
+    const std::vector<std::wstring>& args,
+    std::wstring* reason)
+{
+    bool ok = false;
+
+    do
+    {
+        size_t index = 1;
+        bool shapeOk = true;
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (IsHelpToken(option) ||
+                option == L"/quick" ||
+                option == L"/deep")
+            {
+                ++index;
+                continue;
+            }
+
+            if (option == L"/limit" || option == L"/json")
+            {
+                if (index + 1 >= args.size() || IsSwitchLikeToken(args[index + 1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!hunt " + option + L" requires a value";
+                    }
+                    shapeOk = false;
+                    break;
+                }
+
+                index += 2;
+                continue;
+            }
+
+            if (!IsSwitchLikeToken(args[index]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!hunt does not accept a process target; run !hunt with no target";
+                }
+                shapeOk = false;
+                break;
+            }
+
+            if (reason != nullptr)
+            {
+                *reason = L"!hunt supports /quick, /deep, /limit, and /json options";
+            }
+            shapeOk = false;
+            break;
+        }
+
+        if (!shapeOk)
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ValidateThreadsCommandArgumentShape(
     const std::vector<std::wstring>& args,
     std::wstring* reason)
@@ -22101,6 +22214,13 @@ static bool ValidateAiPlanArgumentShape(
         else if (command == L"!vad")
         {
             if (!ValidateVadCommandArgumentShape(args, reason))
+            {
+                break;
+            }
+        }
+        else if (command == L"!hunt")
+        {
+            if (!ValidateHuntCommandArgumentShape(args, reason))
             {
                 break;
             }
@@ -23880,6 +24000,7 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
             normalized == L"x" ||
             normalized == L"vtop" ||
             normalized == L"!dml_proc" ||
+            normalized == L"!hunt" ||
             normalized == L"!vad" ||
             normalized == L"!threads" ||
             normalized == L"!wfp" ||
@@ -25064,6 +25185,301 @@ static void PrintThreadScanResult(const ProcessThreadScanResult& result, bool in
                << L" nonempty_apc_queues=" << result.ApcNonEmptyCount
                << L" truncated=" << (result.Truncated ? L"yes" : L"no")
                << L"\n";
+}
+
+static WORD HuntRiskColor(const std::wstring& risk)
+{
+    WORD color = KNDBG_COLOR_ACCENT;
+    std::wstring normalized = SnapshotRiskNormalize(risk);
+
+    if (normalized == L"high")
+    {
+        color = KNDBG_COLOR_WARN;
+    }
+    else if (normalized == L"medium")
+    {
+        color = KNDBG_COLOR_TITLE;
+    }
+    else if (normalized == L"low")
+    {
+        color = KNDBG_COLOR_ACCENT;
+    }
+
+    return color;
+}
+
+static std::wstring JoinHuntValues(const std::vector<std::wstring>& values)
+{
+    std::wstringstream stream;
+
+    for (size_t index = 0; index < values.size(); ++index)
+    {
+        if (index != 0)
+        {
+            stream << L",";
+        }
+        stream << values[index];
+    }
+
+    return stream.str();
+}
+
+static void PrintHuntFinding(const HuntFinding& finding, size_t index)
+{
+    PrintColoredText(L"[hunt.finding] ", HuntRiskColor(finding.Risk));
+    std::wcout << L"#" << std::dec << (index + 1)
+               << L" risk=" << finding.Risk
+               << L" confidence=" << finding.Confidence
+               << L" class=" << finding.ClassName
+               << L" pid=" << finding.ProcessId;
+
+    if (finding.Eprocess != 0)
+    {
+        std::wcout << L" eprocess=" << HexTextWidth(finding.Eprocess, 16, true);
+    }
+
+    if (finding.Address != 0)
+    {
+        std::wcout << L" address=" << HexTextWidth(finding.Address, 16, true);
+    }
+
+    if (!finding.ImageName.empty())
+    {
+        std::wcout << L" image=" << finding.ImageName;
+    }
+
+    if (!finding.ModuleName.empty())
+    {
+        std::wcout << L" module=" << finding.ModuleName;
+    }
+
+    std::wcout << L"\n";
+    std::wcout << L"  title: " << finding.Title << L"\n";
+
+    if (!finding.ReasonCodes.empty())
+    {
+        std::wcout << L"  reasons: " << JoinHuntValues(finding.ReasonCodes) << L"\n";
+    }
+
+    if (!finding.Evidence.empty())
+    {
+        std::wcout << L"  evidence:";
+        for (const auto& item : finding.Evidence)
+        {
+            if (!item.second.empty())
+            {
+                std::wcout << L" " << item.first << L"=" << item.second;
+            }
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!finding.Followups.empty())
+    {
+        std::wcout << L"  follow-up:";
+        for (const std::wstring& followup : finding.Followups)
+        {
+            std::wcout << L" " << followup << L";";
+        }
+        std::wcout << L"\n";
+    }
+}
+
+static void PrintHuntWarnings(const HuntResult& result)
+{
+    uint64_t processWarnings = 0;
+
+    for (const HuntProcessRecord& process : result.Processes)
+    {
+        processWarnings += process.Warnings.size();
+    }
+
+    if (result.Warnings.empty() && processWarnings == 0)
+    {
+        return;
+    }
+
+    PrintColoredText(L"[hunt.warnings]", KNDBG_COLOR_WARN);
+    std::wcout << L" global=" << result.Warnings.size()
+               << L" process=" << processWarnings
+               << L"\n";
+
+    for (const std::wstring& warning : result.Warnings)
+    {
+        std::wcerr << L"!hunt warning: " << warning << L"\n";
+    }
+
+    uint32_t printed = 0;
+    for (const HuntProcessRecord& process : result.Processes)
+    {
+        for (const std::wstring& warning : process.Warnings)
+        {
+            if (printed >= 32)
+            {
+                std::wcerr << L"!hunt warning: additional process warnings suppressed in console; use /json for all warnings\n";
+                return;
+            }
+
+            std::wcerr << L"!hunt warning: pid=" << process.ProcessId
+                       << L" image=" << process.KernelImageName
+                       << L": " << warning << L"\n";
+            ++printed;
+        }
+    }
+}
+
+static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit)
+{
+    PrintColoredText(L"!hunt", KNDBG_COLOR_TITLE);
+    std::wcout << L" mode=" << result.ModeText
+               << L" schema=" << result.Schema
+               << L" timestamp=" << result.TimestampUtc
+               << L"\n";
+
+    size_t rendered = 0;
+    size_t findingLimit = renderLimit != 0 ? renderLimit : result.Findings.size();
+    for (size_t index = 0; index < result.Findings.size() && rendered < findingLimit; ++index)
+    {
+        PrintHuntFinding(result.Findings[index], index);
+        ++rendered;
+    }
+
+    if (rendered < result.Findings.size())
+    {
+        PrintColoredText(L"[hunt.render]", KNDBG_COLOR_ACCENT);
+        std::wcout << L" rendered=" << rendered
+                   << L" total_findings=" << result.Findings.size()
+                   << L" use /json for the full finding set\n";
+    }
+
+    PrintColoredText(L"[hunt.summary]", KNDBG_COLOR_TITLE);
+    std::wcout << L" kernel_processes=" << result.KernelProcessCount
+               << L" spi_processes=" << result.SystemProcessInfoCount
+               << L" toolhelp_processes=" << result.ToolhelpProcessCount
+               << L" scanned=" << result.ScannedProcessCount
+               << L" findings=" << result.Findings.size()
+               << L" high=" << result.HighFindings
+               << L" medium=" << result.MediumFindings
+               << L" low=" << result.LowFindings
+               << L" vad_records=" << result.VadRecordCount
+               << L" hidden_pte_ranges=" << result.HiddenPteRangeCount
+               << L" thread_records=" << result.ThreadRecordCount
+               << L" modules=" << result.ModuleRecordCount
+               << L"\n";
+
+    PrintHuntWarnings(result);
+}
+
+static void HandleHuntCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    std::wstring error;
+
+    do
+    {
+        if (args.size() >= 2 && IsHelpToken(args[1]))
+        {
+            PrintHuntHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!hunt requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        HuntOptions options = {};
+        std::wstring jsonPath;
+        bool parseOk = true;
+        for (size_t index = 1; index < args.size(); ++index)
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/quick")
+            {
+                options.Mode = HuntMode::Quick;
+            }
+            else if (option == L"/deep")
+            {
+                options.Mode = HuntMode::Deep;
+            }
+            else if (option == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!hunt failed: /limit requires a value\n";
+                    parseOk = false;
+                    break;
+                }
+                if (!ParseProcessTriageLimit(args[index + 1], state.NumberBase, &options.RenderLimit, &error))
+                {
+                    std::wcerr << L"!hunt failed: " << error << L"\n";
+                    parseOk = false;
+                    break;
+                }
+                ++index;
+            }
+            else if (option == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!hunt failed: /json requires a path\n";
+                    parseOk = false;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                ++index;
+            }
+            else
+            {
+                std::wcerr << L"!hunt failed: unknown option or target " << args[index] << L"\n";
+                std::wcerr << L"!hunt scans the whole system and does not accept a process target\n";
+                parseOk = false;
+                break;
+            }
+        }
+
+        if (!parseOk)
+        {
+            break;
+        }
+
+        std::vector<SnapshotProcessRecord> processes;
+        std::vector<std::wstring> processWarnings;
+        if (!BuildSnapshotProcessInventory(state, device, symbols, &processes, &processWarnings, &error))
+        {
+            std::wcerr << L"!hunt process inventory failed: " << error << L"\n";
+            break;
+        }
+
+        options.Processes = std::move(processes);
+
+        UserModeHunter hunter(device, symbols);
+        HuntResult result = {};
+        if (!hunter.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!hunt failed: " << error << L"\n";
+            break;
+        }
+
+        result.Warnings.insert(result.Warnings.begin(), processWarnings.begin(), processWarnings.end());
+        PrintHuntResult(result, options.RenderLimit);
+
+        if (!jsonPath.empty())
+        {
+            if (WriteUtf8TextFile(jsonPath, BuildHuntJson(result), &error))
+            {
+                std::wcout << L"json written: " << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!hunt json failed: " << error << L"\n";
+            }
+        }
+    } while (false);
 }
 
 static void HandleVadCommand(
@@ -29631,6 +30047,10 @@ static bool HandleCommand(
         else if (command == L"!dml_proc")
         {
             HandleDmlProcCommand(args, state, device, symbols);
+        }
+        else if (command == L"!hunt")
+        {
+            HandleHuntCommand(args, state, device, symbols);
         }
         else if (command == L"!vad")
         {
