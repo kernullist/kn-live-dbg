@@ -18625,7 +18625,7 @@ static void PrintHuntHelp()
     std::wcout << L"  /quick    skip hidden-PTE and disk-vs-live page comparison\n";
     std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, live-vs-disk executable page,\n";
     std::wcout << L"            local BYOVD exact-hash catalog, EDR-killer driver-name/service,\n";
-    std::wcout << L"            and driver-object integrity checks\n";
+    std::wcout << L"            driver-object integrity checks, and existing !ti ring correlation\n";
     std::wcout << L"  /limit n  cap rendered findings only (default 200; 0 renders all); JSON keeps the full scan result\n";
     std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
     std::wcout << L"\n";
@@ -18633,6 +18633,7 @@ static void PrintHuntHelp()
     std::wcout << L"  No process target is accepted. The command scans the whole current system view.\n";
     std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, APC,\n";
     std::wcout << L"  and kernel-driver evidence. The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
+    std::wcout << L"  /deep reuses recent !ti events if the Threat-Intelligence subscriber has captured any.\n";
     std::wcout << L"  Evidence is a lead with risk and confidence; use printed !vad, !threads, and !address follow-ups for triage.\n";
 }
 
@@ -25374,6 +25375,10 @@ static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit)
                << L" suspicious_drivers=" << result.SuspiciousDriverObjectCount
                << L" driver_services=" << result.DriverServiceCount
                << L" edr_killer_services=" << result.EdrKillerDriverServiceCount
+               << L" ti_active=" << (result.ThreatIntelActive ? L"yes" : L"no")
+               << L" ti_available=" << (result.ThreatIntelAvailable ? L"yes" : L"no")
+               << L" ti_events=" << result.ThreatIntelEventCount
+               << L" ti_correlations=" << result.ThreatIntelCorrelationCount
                << L"\n";
 
     PrintHuntWarnings(result);
@@ -25465,6 +25470,39 @@ static void HandleHuntCommand(
         }
 
         options.Processes = std::move(processes);
+
+        if (options.Mode == HuntMode::Deep)
+        {
+            TiSubscriber& ti = GetTiSubscriberInstance();
+            options.ThreatIntelActive = ti.IsActive();
+            std::vector<TiEventRecord> recentTiEvents = ti.Recent(4096, true);
+            options.ThreatIntelAvailable = !recentTiEvents.empty();
+            options.ThreatIntelEvents.reserve(recentTiEvents.size());
+
+            for (const TiEventRecord& tiEvent : recentTiEvents)
+            {
+                HuntTelemetryEvent event = {};
+                event.Timestamp = tiEvent.Timestamp;
+                event.ProcessId = tiEvent.ProcessId;
+                event.TargetProcessId = tiEvent.TargetProcessId;
+                event.TaskId = tiEvent.TaskId;
+                event.Opcode = tiEvent.Opcode;
+                event.TaskName = tiEvent.TaskName;
+                event.OpcodeName = tiEvent.OpcodeName;
+                event.ImagePath = tiEvent.ImagePath;
+                event.TargetImageBase = tiEvent.TargetImageBase;
+                event.RawPayloadHex = tiEvent.RawPayloadHex;
+                event.Payload.reserve(tiEvent.Payload.size());
+                for (const TiPayloadField& field : tiEvent.Payload)
+                {
+                    HuntTelemetryField huntField = {};
+                    huntField.Name = field.Name;
+                    huntField.Value = field.Value;
+                    event.Payload.push_back(std::move(huntField));
+                }
+                options.ThreatIntelEvents.push_back(std::move(event));
+            }
+        }
 
         UserModeHunter hunter(device, symbols, GetExecutableDirectory());
         HuntResult result = {};

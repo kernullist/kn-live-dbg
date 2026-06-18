@@ -36,6 +36,7 @@ namespace
     constexpr size_t kMaxBuiltinModuleProvenanceFindingsPerProcess = 8;
     constexpr size_t kMaxByovdMatchEvidence = 6;
     constexpr size_t kMaxDriverDispatchEvidence = 8;
+    constexpr size_t kMaxTelemetryPayloadEvidence = 8;
     constexpr uint64_t kKernelAddressMin = 0xffff800000000000ull;
 
     struct HuntLocalUnicodeString
@@ -161,6 +162,22 @@ namespace
         DWORD StartType = 0;
         bool HasConfig = false;
         bool Running = false;
+    };
+
+    struct ThreatIntelCorrelationBucket
+    {
+        uint32_t ProcessId = 0;
+        uint64_t Eprocess = 0;
+        std::wstring ImageName;
+        std::wstring ImagePath;
+        std::wstring MatchedLeaf;
+        const EdrKillerProcessProfile* Profile = nullptr;
+        bool GentlemenStagingPath = false;
+        uint64_t DriverIoCount = 0;
+        uint64_t ProcessImpairmentCount = 0;
+        std::set<uint32_t> TargetProcessIds;
+        HuntTelemetryEvent FirstDriverIoEvent;
+        HuntTelemetryEvent FirstProcessImpairmentEvent;
     };
 
     struct SectionBackingLayout
@@ -4004,6 +4021,455 @@ namespace
         } while (false);
     }
 
+    bool HuntTextContainsAny(const std::wstring& text, const std::vector<std::wstring>& needles)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (text.empty())
+            {
+                break;
+            }
+
+            for (const std::wstring& needle : needles)
+            {
+                if (!needle.empty() && text.find(needle) != std::wstring::npos)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    std::wstring ThreatIntelActionText(const HuntTelemetryEvent& event)
+    {
+        std::wstring text;
+
+        text += event.TaskName;
+        text += L" ";
+        text += event.OpcodeName;
+        text += L" ";
+        text += event.TargetImageBase;
+        text += L" ";
+        text += event.RawPayloadHex;
+
+        for (const HuntTelemetryField& field : event.Payload)
+        {
+            text += L" ";
+            text += field.Name;
+            text += L"=";
+            text += field.Value;
+        }
+
+        return HuntToLower(text);
+    }
+
+    std::wstring ThreatIntelFullText(const HuntTelemetryEvent& event)
+    {
+        std::wstring text = ThreatIntelActionText(event);
+        text += L" ";
+        text += HuntToLower(event.ImagePath);
+        return text;
+    }
+
+    std::wstring ThreatIntelPayloadEvidenceText(const HuntTelemetryEvent& event)
+    {
+        std::vector<std::wstring> values;
+
+        for (const HuntTelemetryField& field : event.Payload)
+        {
+            if (values.size() >= kMaxTelemetryPayloadEvidence)
+            {
+                break;
+            }
+
+            values.push_back(field.Name + L"=" + field.Value);
+        }
+
+        if (values.empty() && !event.RawPayloadHex.empty())
+        {
+            values.push_back(L"raw=" + event.RawPayloadHex);
+        }
+
+        return JoinWideValues(values, L";");
+    }
+
+    std::wstring ThreatIntelTargetPidsText(const std::set<uint32_t>& targetPids)
+    {
+        std::vector<std::wstring> values;
+
+        for (uint32_t pid : targetPids)
+        {
+            values.push_back(std::to_wstring(pid));
+        }
+
+        return JoinWideValues(values, L";");
+    }
+
+    bool ThreatIntelEventLooksLikeDriverIo(const HuntTelemetryEvent& event)
+    {
+        bool matched = false;
+
+        do
+        {
+            std::wstring text = ThreatIntelActionText(event);
+            if (HuntTextContainsAny(
+                    text,
+                    {
+                        L"deviceiocontrol",
+                        L"ntdeviceiocontrolfile",
+                        L"ioctl",
+                        L"io_control",
+                        L"i/o control",
+                        L"irp_mj_device_control",
+                        L"driverobject",
+                        L"driver object",
+                        L"deviceobject",
+                        L"device object",
+                        L"fileobject",
+                        L"file object",
+                        L"\\device\\"
+                    }))
+            {
+                matched = true;
+                break;
+            }
+
+            std::wstring task = HuntToLower(event.TaskName);
+            if (task.find(L"driver") != std::wstring::npos ||
+                task.find(L"device") != std::wstring::npos)
+            {
+                matched = true;
+                break;
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool ThreatIntelEventLooksLikeProcessImpairment(const HuntTelemetryEvent& event)
+    {
+        bool matched = false;
+
+        do
+        {
+            std::wstring text = ThreatIntelActionText(event);
+            if (HuntTextContainsAny(
+                    text,
+                    {
+                        L"terminateprocess",
+                        L"ntterminateprocess",
+                        L"zwterminateprocess",
+                        L"process_terminate",
+                        L"process terminate",
+                        L"terminate process",
+                        L"processdelete",
+                        L"process delete",
+                        L"processstop",
+                        L"process stop"
+                    }))
+            {
+                matched = true;
+                break;
+            }
+
+            if (event.TargetProcessId != 0 &&
+                HuntTextContainsAny(
+                    text,
+                    {
+                        L"terminate",
+                        L"openprocess",
+                        L"process access",
+                        L"desiredaccess"
+                    }))
+            {
+                matched = true;
+                break;
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool ThreatIntelProfileIsActionable(
+        const EdrKillerProcessProfile* profile,
+        bool gentlemenStagingPath)
+    {
+        bool actionable = false;
+
+        do
+        {
+            if (profile != nullptr && profile->CredentialTool)
+            {
+                break;
+            }
+
+            if (gentlemenStagingPath)
+            {
+                actionable = true;
+                break;
+            }
+
+            if (profile != nullptr && profile->StrongNameSignal)
+            {
+                actionable = true;
+                break;
+            }
+        } while (false);
+
+        return actionable;
+    }
+
+    void AddThreatIntelTelemetryFinding(
+        HuntResult* result,
+        const ThreatIntelCorrelationBucket& bucket,
+        const HuntTelemetryEvent& sample,
+        const std::wstring& className,
+        const std::wstring& title,
+        const std::wstring& risk,
+        const std::wstring& confidence,
+        const std::vector<std::wstring>& actionReasons,
+        uint64_t actionCount)
+    {
+        do
+        {
+            if (result == nullptr || actionCount == 0)
+            {
+                break;
+            }
+
+            std::vector<std::wstring> reasons;
+            if (bucket.Profile != nullptr)
+            {
+                AddUnique(&reasons, L"gentlemen_edr_killer_process_name");
+            }
+            if (bucket.GentlemenStagingPath)
+            {
+                AddUnique(&reasons, L"gentlemen_collection_staging_path");
+            }
+            for (const std::wstring& reason : actionReasons)
+            {
+                AddUnique(&reasons, reason);
+            }
+
+            std::map<std::wstring, std::wstring> evidence;
+            evidence[L"caller_pid"] = std::to_wstring(bucket.ProcessId);
+            evidence[L"caller_image"] = bucket.ImageName;
+            evidence[L"caller_image_path"] = bucket.ImagePath;
+            evidence[L"matched_image_leaf"] = bucket.MatchedLeaf;
+            evidence[L"gentlemen_collection_path"] = bucket.GentlemenStagingPath ? L"true" : L"false";
+            evidence[L"ti_event_count"] = std::to_wstring(actionCount);
+            evidence[L"ti_sample_timestamp"] = std::to_wstring(sample.Timestamp);
+            evidence[L"ti_sample_task"] = sample.TaskName;
+            evidence[L"ti_sample_task_id"] = std::to_wstring(sample.TaskId);
+            evidence[L"ti_sample_opcode"] = sample.OpcodeName;
+            evidence[L"ti_sample_opcode_id"] = std::to_wstring(sample.Opcode);
+            evidence[L"ti_sample_payload"] = ThreatIntelPayloadEvidenceText(sample);
+            evidence[L"target_pid_count"] = std::to_wstring(bucket.TargetProcessIds.size());
+            evidence[L"target_pids"] = ThreatIntelTargetPidsText(bucket.TargetProcessIds);
+            if (sample.TargetProcessId != 0)
+            {
+                evidence[L"sample_target_pid"] = std::to_wstring(sample.TargetProcessId);
+                evidence[L"sample_target_image"] = sample.TargetImageBase;
+            }
+            if (bucket.Profile != nullptr)
+            {
+                evidence[L"gentlemen_family"] = bucket.Profile->Family;
+                evidence[L"gentlemen_tool"] = bucket.Profile->Tool;
+                evidence[L"gentlemen_ioc_image"] = bucket.Profile->ImageName;
+                evidence[L"strong_name_signal"] = bucket.Profile->StrongNameSignal ? L"true" : L"false";
+            }
+
+            HuntFinding finding = {};
+            finding.Risk = SnapshotRiskNormalize(risk);
+            finding.Confidence = confidence;
+            finding.ClassName = className;
+            finding.Title = title;
+            finding.ProcessId = bucket.ProcessId;
+            finding.Eprocess = bucket.Eprocess;
+            finding.ImageName = bucket.ImageName;
+            finding.ReasonCodes = reasons;
+            finding.Evidence = evidence;
+            if (bucket.Eprocess != 0)
+            {
+                std::wstring target = HuntHex(bucket.Eprocess, 16);
+                finding.Followups.push_back(L"!vad " + target + L" /pe /hiddenpte /limit 40");
+                finding.Followups.push_back(L"!threads " + target + L" /apc /stacks /limit 40");
+            }
+            finding.Followups.push_back(L"!ti by pid " + std::to_wstring(bucket.ProcessId));
+            if (className == L"edr_killer_driver_io_telemetry")
+            {
+                finding.Followups.push_back(L"!ti grep DeviceIoControl");
+                finding.Followups.push_back(L"!driver integrity all /limit 200");
+            }
+            else
+            {
+                finding.Followups.push_back(L"!ti grep TerminateProcess");
+                finding.Followups.push_back(L"!ti grep OpenProcess");
+            }
+            finding.Followups.push_back(L"!ti save .\\hunt-ti-events.jsonl");
+
+            result->Findings.push_back(std::move(finding));
+            ++result->ThreatIntelCorrelationCount;
+        } while (false);
+    }
+
+    void AddThreatIntelCorrelationFindings(
+        HuntResult* result,
+        const std::map<uint32_t, HuntProcessRecord>& processes,
+        const HuntOptions& options)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            result->ThreatIntelEventCount = options.ThreatIntelEvents.size();
+            if (options.ThreatIntelEvents.empty())
+            {
+                break;
+            }
+
+            std::map<uint32_t, ThreatIntelCorrelationBucket> buckets;
+            for (const HuntTelemetryEvent& event : options.ThreatIntelEvents)
+            {
+                if (event.ProcessId <= 4)
+                {
+                    continue;
+                }
+
+                bool driverIo = ThreatIntelEventLooksLikeDriverIo(event);
+                bool processImpairment = ThreatIntelEventLooksLikeProcessImpairment(event);
+                if (!driverIo && !processImpairment)
+                {
+                    continue;
+                }
+
+                const HuntProcessRecord* process = nullptr;
+                auto processIt = processes.find(event.ProcessId);
+                if (processIt != processes.end())
+                {
+                    process = &processIt->second;
+                }
+
+                std::wstring matchedLeaf;
+                const EdrKillerProcessProfile* profile = nullptr;
+                bool gentlemenStagingPath = PathContainsGentlemenCollection(event.ImagePath) ||
+                    PathContainsGentlemenCollection(ThreatIntelFullText(event));
+
+                if (process != nullptr)
+                {
+                    profile = FindEdrKillerProcessProfileForProcess(*process, &matchedLeaf);
+                    gentlemenStagingPath = gentlemenStagingPath ||
+                        PathContainsGentlemenCollection(BestProcessImagePath(*process)) ||
+                        PathContainsGentlemenCollection(process->PebCommandLine);
+                }
+
+                if (profile == nullptr)
+                {
+                    matchedLeaf = LeafName(event.ImagePath);
+                    profile = FindEdrKillerProcessProfileByLeaf(matchedLeaf);
+                }
+
+                if (!ThreatIntelProfileIsActionable(profile, gentlemenStagingPath))
+                {
+                    continue;
+                }
+
+                ThreatIntelCorrelationBucket& bucket = buckets[event.ProcessId];
+                bucket.ProcessId = event.ProcessId;
+                bucket.Profile = profile;
+                bucket.GentlemenStagingPath = gentlemenStagingPath;
+                bucket.MatchedLeaf = matchedLeaf;
+                bucket.ImagePath = event.ImagePath;
+                bucket.ImageName = LeafName(event.ImagePath);
+                if (process != nullptr)
+                {
+                    bucket.Eprocess = process->Kernel.Eprocess;
+                    bucket.ImageName = BestProcessImageName(*process);
+                    if (bucket.ImagePath.empty())
+                    {
+                        bucket.ImagePath = BestProcessImagePath(*process);
+                    }
+                }
+
+                if (bucket.ImageName.empty())
+                {
+                    bucket.ImageName = L"<unknown>";
+                }
+
+                if (event.TargetProcessId != 0)
+                {
+                    bucket.TargetProcessIds.insert(event.TargetProcessId);
+                }
+
+                if (driverIo)
+                {
+                    ++bucket.DriverIoCount;
+                    if (bucket.FirstDriverIoEvent.Timestamp == 0)
+                    {
+                        bucket.FirstDriverIoEvent = event;
+                    }
+                }
+
+                if (processImpairment)
+                {
+                    ++bucket.ProcessImpairmentCount;
+                    if (bucket.FirstProcessImpairmentEvent.Timestamp == 0)
+                    {
+                        bucket.FirstProcessImpairmentEvent = event;
+                    }
+                }
+            }
+
+            for (const auto& item : buckets)
+            {
+                const ThreatIntelCorrelationBucket& bucket = item.second;
+                if (bucket.DriverIoCount != 0)
+                {
+                    AddThreatIntelTelemetryFinding(
+                        result,
+                        bucket,
+                        bucket.FirstDriverIoEvent,
+                        L"edr_killer_driver_io_telemetry",
+                        L"Threat-Intelligence event correlates an EDR-killer profile with driver I/O",
+                        bucket.GentlemenStagingPath ? L"high" : L"medium",
+                        bucket.GentlemenStagingPath ? L"high" : L"medium",
+                        {
+                            L"ti_driver_io_event",
+                            L"native_api_driver_control",
+                            L"deviceiocontrol_or_driver_object_activity"
+                        },
+                        bucket.DriverIoCount);
+                }
+
+                if (bucket.ProcessImpairmentCount >= 2 || bucket.TargetProcessIds.size() >= 2)
+                {
+                    AddThreatIntelTelemetryFinding(
+                        result,
+                        bucket,
+                        bucket.FirstProcessImpairmentEvent,
+                        L"edr_killer_process_impairment_telemetry",
+                        L"Threat-Intelligence events correlate an EDR-killer profile with process impairment",
+                        bucket.GentlemenStagingPath ? L"high" : L"medium",
+                        L"medium",
+                        {
+                            L"ti_process_impairment_event",
+                            L"defense_impairment_telemetry",
+                            L"repeated_process_control_activity"
+                        },
+                        bucket.ProcessImpairmentCount);
+                }
+            }
+        } while (false);
+    }
+
     bool CanOpenDiskImagePath(const std::wstring& rawPath)
     {
         bool openable = false;
@@ -6371,6 +6837,8 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         result->Schema = L"kn-live-dbg.hunt.v1";
         result->TimestampUtc = SnapshotCurrentUtcTimestamp();
         result->ModeText = HuntModeToText(options.Mode);
+        result->ThreatIntelActive = options.ThreatIntelActive;
+        result->ThreatIntelAvailable = options.ThreatIntelAvailable || !options.ThreatIntelEvents.empty();
         result->Warnings.push_back(L"PspCidTable process-object cross-view is not implemented; cid_table_seen is null");
         result->Warnings.push_back(L"builtin process signer verification is not implemented; publisher evidence unavailable");
 
@@ -6559,6 +7027,8 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             AddKernelDriverHuntFindings(device_, symbols_, executableDirectory_, result);
         }
 
+        AddThreatIntelCorrelationFindings(result, processes, options);
+
         result->Processes.reserve(processes.size());
         for (auto& item : processes)
         {
@@ -6600,6 +7070,10 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"suspicious_driver_objects\":" << result.SuspiciousDriverObjectCount;
     json << L",\"driver_services\":" << result.DriverServiceCount;
     json << L",\"edr_killer_driver_services\":" << result.EdrKillerDriverServiceCount;
+    json << L",\"threat_intel_active\":" << (result.ThreatIntelActive ? L"true" : L"false");
+    json << L",\"threat_intel_available\":" << (result.ThreatIntelAvailable ? L"true" : L"false");
+    json << L",\"threat_intel_events\":" << result.ThreatIntelEventCount;
+    json << L",\"threat_intel_correlations\":" << result.ThreatIntelCorrelationCount;
     json << L"},\n";
 
     json << L"  \"warnings\":";

@@ -529,8 +529,10 @@ memory. `/quick` keeps the scan to cheaper process/VAD/module/thread signals,
 while `/deep` adds executable live-vs-disk page comparison, hidden executable PTE
 checks when VAD coverage is reliable, modified-page execution correlation, local
 BYOVD exact-hash catalog matching, Gentlemen-style EDR-killer driver-name IOC
-correlation, SCM driver-service IOC correlation, and `_DRIVER_OBJECT`
-dispatch/start integrity checks. Deep stack correlation uses
+correlation, SCM driver-service IOC correlation, `_DRIVER_OBJECT`
+dispatch/start integrity checks, and recent `!ti` ring correlation for strong
+Gentlemen process/staging indicators that performed driver I/O or repeated
+process-impairment activity. Deep stack correlation uses
 a per-process stack-pointer cache, so JSON findings for modified executable pages
 include `stack_reference_cache_samples` and `stack_reference_cache_limited`
 evidence instead of rereading every stack for every mismatched page. The `/deep`
@@ -542,6 +544,10 @@ The SCM scan is also read-only and surfaces installed or running driver services
 whose service name or configured binary path matches the EDR-killer driver IOC
 set, so a driver-service staging artifact can be found even before a module is
 successfully loaded.
+The TI correlation is best-effort and history-based: start `!ti` before the
+workload when you need DeviceIoControl or native-API behavior to appear in the
+same hunt report. Without a populated TI ring, `/deep` still runs the static and
+kernel-object evidence layers and reports `ti_events=0`.
 
 ## Native VAD And Thread Triage
 
