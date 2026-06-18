@@ -1,5 +1,8 @@
 #include "UserModeHunter.h"
 
+#include "ByovdScanner.h"
+#include "IntegrityScanner.h"
+
 #include <Windows.h>
 #include <TlHelp32.h>
 
@@ -31,6 +34,8 @@ namespace
     constexpr size_t kMaxDeepStackPointerSamplesPerProcess = 32768;
     constexpr uint64_t kMaxThreadStackScanBytes = 64ull * 1024ull;
     constexpr size_t kMaxBuiltinModuleProvenanceFindingsPerProcess = 8;
+    constexpr size_t kMaxByovdMatchEvidence = 6;
+    constexpr size_t kMaxDriverDispatchEvidence = 8;
     constexpr uint64_t kKernelAddressMin = 0xffff800000000000ull;
 
     struct HuntLocalUnicodeString
@@ -123,6 +128,23 @@ namespace
         const wchar_t* const* ParentNames;
         size_t ParentNameCount;
         bool SvchostCommandLine;
+    };
+
+    struct EdrKillerProcessProfile
+    {
+        const wchar_t* ImageName;
+        const wchar_t* Family;
+        const wchar_t* Tool;
+        bool StrongNameSignal;
+        bool CredentialTool;
+    };
+
+    struct EdrKillerDriverProfile
+    {
+        const wchar_t* ImageName;
+        const wchar_t* Family;
+        const wchar_t* Tool;
+        bool StrongNameSignal;
     };
 
     struct SectionBackingLayout
@@ -280,6 +302,138 @@ namespace
     bool LooksLikePeImagePath(const std::wstring& path)
     {
         return LeafHasAnySuffix(path, {L".exe", L".dll", L".sys", L".ocx", L".cpl", L".scr"});
+    }
+
+    const EdrKillerProcessProfile* FindEdrKillerProcessProfileByLeaf(const std::wstring& leaf)
+    {
+        const EdrKillerProcessProfile* profile = nullptr;
+
+        static const EdrKillerProcessProfile kProfiles[] =
+        {
+            { L"kasps.exe", L"GentleKiller", L"Kaspersky variant", true, false },
+            { L"faceit1.exe", L"GentleKiller", L"FACEIT Anti-Cheat variant", true, false },
+            { L"valorant2.exe", L"GentleKiller", L"Valorant variant", true, false },
+            { L"easolo2light.exe", L"GentleKiller", L"Javelin variant", true, false },
+            { L"easolo1clear.exe", L"GentleKiller", L"Javelin variant", true, false },
+            { L"eaanticheatlight.exe", L"GentleKiller", L"Javelin variant", true, false },
+            { L"bitd1.exe", L"GentleKiller", L"WatchDog variant", true, false },
+            { L"mb2.exe", L"GentleKiller", L"Network Blocker variant", true, false },
+            { L"deletor.exe", L"GentleKiller", L"Cleaner variant", true, false },
+            { L"symantec.exe", L"GentleKiller", L"G11 variant", false, false },
+            { L"avast.exe", L"HexKiller", L"HexKiller with Gentlemen evasion layer", false, false },
+            { L"sent.exe", L"ThrottleBlood", L"ThrottleBlood with Gentlemen evasion layer", true, false },
+            { L"sophos.exe", L"HavocKiller", L"HavocKiller with Gentlemen evasion layer", false, false },
+            { L"hwaudkiller.exe", L"HavocKiller", L"HavocKiller", true, false },
+            { L"buildx641.exe", L"OxideHarvest", L"credential stealer", true, true },
+            { L"buildx64.exe", L"OxideHarvest", L"credential stealer", true, true }
+        };
+
+        do
+        {
+            if (leaf.empty())
+            {
+                break;
+            }
+
+            for (const EdrKillerProcessProfile& item : kProfiles)
+            {
+                if (leaf == item.ImageName)
+                {
+                    profile = &item;
+                    break;
+                }
+            }
+        } while (false);
+
+        return profile;
+    }
+
+    const EdrKillerDriverProfile* FindEdrKillerDriverProfileByLeaf(const std::wstring& leaf)
+    {
+        const EdrKillerDriverProfile* profile = nullptr;
+
+        static const EdrKillerDriverProfile kProfiles[] =
+        {
+            { L"eb.sys", L"GentleKiller", L"Kaspersky variant custom rootkit", true },
+            { L"nseckrnl.sys", L"GentleKiller", L"NSecsoft NSecKrnl driver", true },
+            { L"vgk.sys", L"GentleKiller", L"Tower of Fantasy AntiCheat driver", false },
+            { L"stpm_old.sys", L"GentleKiller", L"Safetica Process Monitor driver", true },
+            { L"stpm_new.sys", L"GentleKiller", L"Safetica Process Monitor driver", true },
+            { L"dmx.sys", L"GentleKiller", L"Zemana WatchDog driver", true },
+            { L"360netmon_wfp.sys", L"GentleKiller", L"Qihoo 360 network monitor driver", false },
+            { L"imfforcedelete", L"GentleKiller", L"IObit IMF ForceDelete filter driver", true },
+            { L"g11.sys", L"GentleKiller", L"PoisonX rootkit", true },
+            { L"googleapiutil64.sys", L"HexKiller", L"Baidu Antivirus BdApi driver", true },
+            { L"throttleblood.sys", L"ThrottleBlood", L"ThrottleStop driver", true },
+            { L"havoc.sys", L"HavocKiller", L"Huawei vulnerable driver", true }
+        };
+
+        do
+        {
+            if (leaf.empty())
+            {
+                break;
+            }
+
+            for (const EdrKillerDriverProfile& item : kProfiles)
+            {
+                if (leaf == item.ImageName)
+                {
+                    profile = &item;
+                    break;
+                }
+            }
+        } while (false);
+
+        return profile;
+    }
+
+    bool PathContainsGentlemenCollection(const std::wstring& path)
+    {
+        return NormalizePathText(path).find(L"gentlemencollection") != std::wstring::npos;
+    }
+
+    std::wstring FirstCommandLineImage(const std::wstring& commandLine);
+
+    const EdrKillerProcessProfile* FindEdrKillerProcessProfileForProcess(
+        const HuntProcessRecord& process,
+        std::wstring* matchedLeaf)
+    {
+        const EdrKillerProcessProfile* profile = nullptr;
+
+        do
+        {
+            std::vector<std::wstring> candidates =
+            {
+                process.KernelImageName,
+                process.ToolhelpImageName,
+                process.SystemProcessImageName,
+                process.ApiImagePath,
+                process.PebImagePath,
+                FirstCommandLineImage(process.PebCommandLine)
+            };
+
+            for (const std::wstring& candidate : candidates)
+            {
+                std::wstring leaf = LeafName(candidate);
+                if (leaf.empty())
+                {
+                    continue;
+                }
+
+                profile = FindEdrKillerProcessProfileByLeaf(leaf);
+                if (profile != nullptr)
+                {
+                    if (matchedLeaf != nullptr)
+                    {
+                        *matchedLeaf = leaf;
+                    }
+                    break;
+                }
+            }
+        } while (false);
+
+        return profile;
     }
 
     std::wstring FirstCommandLineImage(const std::wstring& commandLine)
@@ -3117,6 +3271,89 @@ namespace
         } while (false);
     }
 
+    void AddSystemFinding(
+        HuntResult* result,
+        const std::wstring& risk,
+        const std::wstring& confidence,
+        const std::wstring& className,
+        const std::wstring& title,
+        uint64_t address,
+        const std::wstring& moduleName,
+        const std::vector<std::wstring>& reasons,
+        const std::map<std::wstring, std::wstring>& evidence,
+        const std::vector<std::wstring>& followups)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            HuntFinding finding = {};
+            finding.Risk = SnapshotRiskNormalize(risk);
+            finding.Confidence = confidence;
+            finding.ClassName = className;
+            finding.Title = title;
+            finding.Address = address;
+            finding.ModuleName = moduleName;
+            finding.ReasonCodes = reasons;
+            finding.Evidence = evidence;
+            finding.Followups = followups;
+
+            result->Findings.push_back(std::move(finding));
+        } while (false);
+    }
+
+    std::wstring ByovdMatchEvidenceText(const std::vector<ByovdMatch>& matches)
+    {
+        std::vector<std::wstring> values;
+
+        for (const ByovdMatch& match : matches)
+        {
+            if (values.size() >= kMaxByovdMatchEvidence)
+            {
+                break;
+            }
+
+            std::wstringstream stream;
+            stream << match.Entry.Source
+                   << L":"
+                   << match.Entry.Category
+                   << L":"
+                   << match.Entry.MatchType;
+            if (!match.Entry.Name.empty())
+            {
+                stream << L":"
+                       << match.Entry.Name;
+            }
+            if (!match.Confidence.empty())
+            {
+                stream << L":"
+                       << match.Confidence;
+            }
+            values.push_back(stream.str());
+        }
+
+        return JoinWideValues(values, L";");
+    }
+
+    bool HasHighConfidenceByovdMatch(const std::vector<ByovdMatch>& matches)
+    {
+        bool high = false;
+
+        for (const ByovdMatch& match : matches)
+        {
+            if (ConfidenceRank(match.Confidence) >= ConfidenceRank(L"high"))
+            {
+                high = true;
+                break;
+            }
+        }
+
+        return high;
+    }
+
     void AddProcessViewFindings(HuntResult* result, const HuntProcessRecord& process)
     {
         do
@@ -3332,6 +3569,102 @@ namespace
                     {L"system_name_from_non_system_path"},
                     evidence);
             }
+        } while (false);
+    }
+
+    void AddEdrKillerProcessProfileFindings(HuntResult* result, const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr || process.ProcessId <= 4)
+            {
+                break;
+            }
+
+            std::wstring imageName = BestProcessImageName(process);
+            std::wstring imagePath = BestProcessImagePath(process);
+            std::wstring matchedLeaf;
+            const EdrKillerProcessProfile* profile =
+                FindEdrKillerProcessProfileForProcess(process, &matchedLeaf);
+            bool gentlemenStagingPath =
+                PathContainsGentlemenCollection(imagePath) ||
+                PathContainsGentlemenCollection(process.PebCommandLine);
+            if (profile == nullptr && !gentlemenStagingPath)
+            {
+                break;
+            }
+
+            std::vector<std::wstring> reasons;
+            std::map<std::wstring, std::wstring> evidence;
+
+            evidence[L"image_name"] = imageName;
+            evidence[L"image_path"] = imagePath;
+            evidence[L"peb_image_path"] = process.PebImagePath;
+            evidence[L"peb_command_line"] = process.PebCommandLine;
+
+            if (profile != nullptr)
+            {
+                AddUnique(&reasons, profile->CredentialTool
+                    ? L"gentlemen_related_credential_tool_name"
+                    : L"gentlemen_edr_killer_process_name");
+                evidence[L"gentlemen_family"] = profile->Family;
+                evidence[L"gentlemen_tool"] = profile->Tool;
+                evidence[L"gentlemen_ioc_image"] = profile->ImageName;
+                evidence[L"matched_image_leaf"] = matchedLeaf;
+                evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+                if (!profile->StrongNameSignal)
+                {
+                    AddUnique(&reasons, L"security_vendor_impersonation_name");
+                }
+            }
+
+            if (gentlemenStagingPath)
+            {
+                AddUnique(&reasons, L"gentlemen_collection_staging_path");
+                evidence[L"gentlemen_collection_path"] = L"true";
+            }
+
+            if (reasons.empty())
+            {
+                break;
+            }
+
+            std::wstring risk = L"low";
+            std::wstring confidence = L"low";
+            if (gentlemenStagingPath && profile != nullptr)
+            {
+                risk = L"high";
+                confidence = L"high";
+            }
+            else if (profile != nullptr && profile->StrongNameSignal)
+            {
+                risk = L"medium";
+                confidence = L"high";
+            }
+            else if (gentlemenStagingPath)
+            {
+                risk = L"medium";
+                confidence = L"medium";
+            }
+            else
+            {
+                risk = L"low";
+                confidence = L"medium";
+            }
+
+            AddFinding(
+                result,
+                process,
+                risk,
+                confidence,
+                profile != nullptr && profile->CredentialTool ? L"gentlemen_related_tool" : L"edr_killer_process_profile",
+                profile != nullptr && profile->CredentialTool
+                    ? L"process name matches Gentlemen-related credential tooling"
+                    : L"process matches Gentlemen EDR-killer masquerade profile",
+                0,
+                L"",
+                reasons,
+                evidence);
         } while (false);
     }
 
@@ -4974,6 +5307,462 @@ namespace
         } while (false);
     }
 
+    const EdrKillerDriverProfile* FindDriverProfileForModuleRecord(
+        const ByovdModuleRecord& record,
+        std::wstring* matchedLeaf)
+    {
+        const EdrKillerDriverProfile* profile = nullptr;
+
+        do
+        {
+            std::vector<std::wstring> candidates =
+            {
+                record.ImageName,
+                record.ImagePath,
+                record.DiskPath
+            };
+
+            for (const std::wstring& candidate : candidates)
+            {
+                std::wstring leaf = LeafName(candidate);
+                if (leaf.empty())
+                {
+                    continue;
+                }
+
+                profile = FindEdrKillerDriverProfileByLeaf(leaf);
+                if (profile != nullptr)
+                {
+                    if (matchedLeaf != nullptr)
+                    {
+                        *matchedLeaf = leaf;
+                    }
+                    break;
+                }
+            }
+        } while (false);
+
+        return profile;
+    }
+
+    const EdrKillerDriverProfile* FindDriverProfileForKernelModule(
+        const KernelModuleInfo& module,
+        std::wstring* matchedLeaf)
+    {
+        const EdrKillerDriverProfile* profile = nullptr;
+
+        do
+        {
+            std::vector<std::wstring> candidates =
+            {
+                module.ImageName,
+                module.ImagePath
+            };
+
+            for (const std::wstring& candidate : candidates)
+            {
+                std::wstring leaf = LeafName(candidate);
+                if (leaf.empty())
+                {
+                    continue;
+                }
+
+                profile = FindEdrKillerDriverProfileByLeaf(leaf);
+                if (profile != nullptr)
+                {
+                    if (matchedLeaf != nullptr)
+                    {
+                        *matchedLeaf = leaf;
+                    }
+                    break;
+                }
+            }
+        } while (false);
+
+        return profile;
+    }
+
+    const EdrKillerDriverProfile* FindDriverProfileForIntegrityRecord(
+        const DriverIntegrityRecord& record,
+        std::wstring* matchedLeaf)
+    {
+        const EdrKillerDriverProfile* profile = nullptr;
+
+        do
+        {
+            std::vector<std::wstring> candidates =
+            {
+                record.Name,
+                record.DirectoryPath,
+                record.OwningModule
+            };
+
+            for (const std::wstring& candidate : candidates)
+            {
+                std::wstring leaf = LeafName(candidate);
+                if (leaf.empty())
+                {
+                    continue;
+                }
+
+                profile = FindEdrKillerDriverProfileByLeaf(leaf);
+                if (profile != nullptr)
+                {
+                    if (matchedLeaf != nullptr)
+                    {
+                        *matchedLeaf = leaf;
+                    }
+                    break;
+                }
+            }
+        } while (false);
+
+        return profile;
+    }
+
+    void AddByovdHuntFindings(
+        HuntResult* result,
+        const ByovdScanResult& byovd,
+        std::set<std::wstring>* emittedLeaves)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            for (const ByovdModuleRecord& record : byovd.Records)
+            {
+                if (record.Matches.empty())
+                {
+                    continue;
+                }
+
+                std::wstring matchedLeaf;
+                const EdrKillerDriverProfile* profile = FindDriverProfileForModuleRecord(record, &matchedLeaf);
+                if (!matchedLeaf.empty() && emittedLeaves != nullptr)
+                {
+                    emittedLeaves->insert(matchedLeaf);
+                }
+
+                std::vector<std::wstring> reasons =
+                {
+                    L"byovd_catalog_match",
+                    L"loaded_vulnerable_or_malicious_driver"
+                };
+                if (profile != nullptr)
+                {
+                    AddUnique(&reasons, L"gentlemen_edr_killer_driver_name");
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"driver_image_name"] = record.ImageName;
+                evidence[L"driver_image_path"] = record.ImagePath;
+                evidence[L"driver_disk_path"] = record.DiskPath;
+                evidence[L"driver_base"] = HuntHex(record.Base, 16);
+                evidence[L"driver_size"] = std::to_wstring(record.Size);
+                evidence[L"file_hashed"] = record.FileHashed ? L"true" : L"false";
+                evidence[L"md5"] = record.Md5;
+                evidence[L"sha1"] = record.Sha1;
+                evidence[L"sha256"] = record.Sha256;
+                evidence[L"match_count"] = std::to_wstring(record.Matches.size());
+                evidence[L"matches"] = ByovdMatchEvidenceText(record.Matches);
+                if (profile != nullptr)
+                {
+                    evidence[L"gentlemen_family"] = profile->Family;
+                    evidence[L"gentlemen_tool"] = profile->Tool;
+                    evidence[L"gentlemen_ioc_driver"] = profile->ImageName;
+                    evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+                }
+
+                std::vector<std::wstring> followups =
+                {
+                    L"!byovd scan /no-update /limit 40",
+                    L"!driver integrity all /limit 200"
+                };
+
+                AddSystemFinding(
+                    result,
+                    HasHighConfidenceByovdMatch(record.Matches) ? L"high" : L"medium",
+                    HasHighConfidenceByovdMatch(record.Matches) ? L"high" : L"medium",
+                    L"edr_killer_driver",
+                    L"loaded kernel driver matches BYOVD intelligence",
+                    record.Base,
+                    !record.ImageName.empty() ? record.ImageName : matchedLeaf,
+                    reasons,
+                    evidence,
+                    followups);
+            }
+        } while (false);
+    }
+
+    void AddGentlemenDriverNameFindings(
+        HuntResult* result,
+        const std::vector<KernelModuleInfo>& modules,
+        const std::set<std::wstring>& emittedLeaves)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            for (const KernelModuleInfo& module : modules)
+            {
+                std::wstring matchedLeaf;
+                const EdrKillerDriverProfile* profile = FindDriverProfileForKernelModule(module, &matchedLeaf);
+                if (profile == nullptr || matchedLeaf.empty())
+                {
+                    continue;
+                }
+
+                if (emittedLeaves.find(matchedLeaf) != emittedLeaves.end())
+                {
+                    continue;
+                }
+
+                std::vector<std::wstring> reasons =
+                {
+                    L"gentlemen_edr_killer_driver_name",
+                    L"loaded_driver_name_ioc"
+                };
+                if (!profile->StrongNameSignal)
+                {
+                    AddUnique(&reasons, L"name_only_requires_hash_or_service_correlation");
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"driver_image_name"] = module.ImageName;
+                evidence[L"driver_image_path"] = module.ImagePath;
+                evidence[L"driver_base"] = HuntHex(module.Base, 16);
+                evidence[L"driver_size"] = std::to_wstring(module.Size);
+                evidence[L"gentlemen_family"] = profile->Family;
+                evidence[L"gentlemen_tool"] = profile->Tool;
+                evidence[L"gentlemen_ioc_driver"] = profile->ImageName;
+                evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+
+                std::vector<std::wstring> followups =
+                {
+                    L"!byovd scan /no-update /exact /limit 40",
+                    L"!driver integrity all /limit 200"
+                };
+
+                AddSystemFinding(
+                    result,
+                    profile->StrongNameSignal ? L"medium" : L"low",
+                    profile->StrongNameSignal ? L"medium" : L"low",
+                    L"edr_killer_driver_profile",
+                    L"loaded kernel driver name matches Gentlemen EDR-killer driver IOC",
+                    module.Base,
+                    module.ImageName,
+                    reasons,
+                    evidence,
+                    followups);
+            }
+        } while (false);
+    }
+
+    std::wstring SuspiciousDispatchEvidenceText(const DriverIntegrityRecord& record)
+    {
+        std::vector<std::wstring> values;
+
+        for (const DriverDispatchRecord& dispatch : record.Dispatch)
+        {
+            if (!dispatch.Suspicious)
+            {
+                continue;
+            }
+
+            if (values.size() >= kMaxDriverDispatchEvidence)
+            {
+                break;
+            }
+
+            std::wstringstream stream;
+            stream << dispatch.Name
+                   << L"="
+                   << HuntHex(dispatch.Function, 16);
+            if (!dispatch.ModuleName.empty())
+            {
+                stream << L":"
+                       << dispatch.ModuleName;
+            }
+            if (!dispatch.Notes.empty())
+            {
+                stream << L":"
+                       << dispatch.Notes;
+            }
+            values.push_back(stream.str());
+        }
+
+        return JoinWideValues(values, L";");
+    }
+
+    void AddDriverIntegrityHuntFindings(
+        HuntResult* result,
+        const DriverIntegrityResult& driverIntegrity)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            for (const DriverIntegrityRecord& record : driverIntegrity.Records)
+            {
+                if (!record.Suspicious)
+                {
+                    continue;
+                }
+
+                std::wstring matchedLeaf;
+                const EdrKillerDriverProfile* profile =
+                    FindDriverProfileForIntegrityRecord(record, &matchedLeaf);
+
+                std::vector<std::wstring> reasons =
+                {
+                    L"driver_object_integrity_anomaly"
+                };
+                if (record.SuspiciousDispatchCount != 0)
+                {
+                    AddUnique(&reasons, L"driver_dispatch_pointer_anomaly");
+                }
+                if (record.HasDriverStart && record.OwningModule.empty())
+                {
+                    AddUnique(&reasons, L"driver_start_outside_loaded_module");
+                }
+                if (profile != nullptr)
+                {
+                    AddUnique(&reasons, L"gentlemen_edr_killer_driver_name");
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"driver_name"] = record.Name;
+                evidence[L"driver_directory"] = record.DirectoryPath;
+                evidence[L"driver_object"] = HuntHex(record.DriverObject, 16);
+                evidence[L"driver_start"] = HuntHex(record.DriverStart, 16);
+                evidence[L"driver_size"] = std::to_wstring(record.DriverSize);
+                evidence[L"driver_section"] = HuntHex(record.DriverSection, 16);
+                evidence[L"owning_module"] = record.OwningModule;
+                evidence[L"suspicious_dispatch_count"] = std::to_wstring(record.SuspiciousDispatchCount);
+                evidence[L"suspicious_dispatch"] = SuspiciousDispatchEvidenceText(record);
+                evidence[L"notes"] = record.Notes;
+                if (profile != nullptr)
+                {
+                    evidence[L"gentlemen_family"] = profile->Family;
+                    evidence[L"gentlemen_tool"] = profile->Tool;
+                    evidence[L"gentlemen_ioc_driver"] = profile->ImageName;
+                    evidence[L"matched_driver_leaf"] = matchedLeaf;
+                    evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+                }
+
+                std::vector<std::wstring> followups =
+                {
+                    L"!driver integrity " + record.Name + L" /limit 80",
+                    L"!ssdt",
+                    L"callbacks all"
+                };
+
+                AddSystemFinding(
+                    result,
+                    L"high",
+                    L"medium",
+                    L"kernel_driver_integrity",
+                    L"driver object dispatch or start pointer integrity anomaly",
+                    record.DriverObject,
+                    record.Name,
+                    reasons,
+                    evidence,
+                    followups);
+            }
+        } while (false);
+    }
+
+    void AddKernelDriverHuntFindings(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const std::wstring& executableDirectory,
+        HuntResult* result)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            std::set<std::wstring> emittedLeaves;
+
+            ByovdScanner byovdScanner(symbols, executableDirectory);
+            ByovdScanOptions byovdOptions = {};
+            byovdOptions.AutoUpdate = false;
+            byovdOptions.ForceUpdate = false;
+            byovdOptions.ExactOnly = true;
+            byovdOptions.EnableYara = false;
+            byovdOptions.Verbose = false;
+            byovdOptions.Limit = 0;
+
+            ByovdScanResult byovd = {};
+            std::wstring error;
+            if (byovdScanner.Scan(byovdOptions, &byovd, &error))
+            {
+                result->KernelModuleCount = byovd.ModulesScanned;
+                result->ByovdMatchedDriverCount = byovd.MatchedModules;
+                for (const std::wstring& warning : byovd.Warnings)
+                {
+                    AddUnique(&result->Warnings, L"BYOVD scan warning: " + warning);
+                }
+                AddByovdHuntFindings(result, byovd, &emittedLeaves);
+            }
+            else
+            {
+                AddUnique(&result->Warnings, L"deep BYOVD scan failed: " + error);
+            }
+
+            if (symbols.Modules().empty())
+            {
+                error.clear();
+                if (!symbols.LoadKernelModules(&error))
+                {
+                    AddUnique(&result->Warnings, L"kernel module list unavailable for EDR-killer driver name scan: " + error);
+                }
+            }
+
+            if (!symbols.Modules().empty())
+            {
+                if (result->KernelModuleCount == 0)
+                {
+                    result->KernelModuleCount = symbols.Modules().size();
+                }
+                AddGentlemenDriverNameFindings(result, symbols.Modules(), emittedLeaves);
+            }
+
+            IntegrityScanner integrityScanner(device, symbols);
+            DriverIntegrityOptions integrityOptions = {};
+            integrityOptions.Limit = 0;
+
+            DriverIntegrityResult driverIntegrity = {};
+            error.clear();
+            if (integrityScanner.ScanDrivers(integrityOptions, &driverIntegrity, &error))
+            {
+                result->DriverObjectCount = driverIntegrity.DriversScanned;
+                result->SuspiciousDriverObjectCount = driverIntegrity.SuspiciousDrivers;
+                for (const std::wstring& warning : driverIntegrity.Warnings)
+                {
+                    AddUnique(&result->Warnings, L"driver integrity warning: " + warning);
+                }
+                AddDriverIntegrityHuntFindings(result, driverIntegrity);
+            }
+            else
+            {
+                AddUnique(&result->Warnings, L"deep driver integrity scan failed: " + error);
+            }
+        } while (false);
+    }
+
     void SortAndCountFindings(HuntResult* result)
     {
         do
@@ -5068,9 +5857,13 @@ std::wstring HuntModeToText(HuntMode mode)
     return text;
 }
 
-UserModeHunter::UserModeHunter(DeviceClient& device, SymbolEngine& symbols) :
+UserModeHunter::UserModeHunter(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const std::wstring& executableDirectory) :
     device_(device),
-    symbols_(symbols)
+    symbols_(symbols),
+    executableDirectory_(executableDirectory)
 {
 }
 
@@ -5252,6 +6045,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 }
 
                 AddIdentityFindings(result, process);
+                AddEdrKillerProcessProfileFindings(result, process);
                 AddVadFindings(device_, symbols_, result, &process);
                 AddThreadFindings(result, process);
                 AddModuleCrossViewFindings(result, process);
@@ -5269,9 +6063,15 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             {
                 ApplyBuiltinProfile(&process);
                 AddIdentityFindings(result, process);
+                AddEdrKillerProcessProfileFindings(result, process);
             }
 
             result->ModuleRecordCount += process.Modules.size();
+        }
+
+        if (options.Mode == HuntMode::Deep)
+        {
+            AddKernelDriverHuntFindings(device_, symbols_, executableDirectory_, result);
         }
 
         result->Processes.reserve(processes.size());
@@ -5309,6 +6109,10 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"hidden_pte_ranges\":" << result.HiddenPteRangeCount;
     json << L",\"thread_records\":" << result.ThreadRecordCount;
     json << L",\"module_records\":" << result.ModuleRecordCount;
+    json << L",\"kernel_modules\":" << result.KernelModuleCount;
+    json << L",\"byovd_matched_drivers\":" << result.ByovdMatchedDriverCount;
+    json << L",\"driver_objects\":" << result.DriverObjectCount;
+    json << L",\"suspicious_driver_objects\":" << result.SuspiciousDriverObjectCount;
     json << L"},\n";
 
     json << L"  \"warnings\":";

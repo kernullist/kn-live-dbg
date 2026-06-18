@@ -527,11 +527,16 @@ VAD-backed mapped code, module loader/VAD cross-view mismatches, thread/APC
 execution provenance, and bounded stack references into suspicious executable
 memory. `/quick` keeps the scan to cheaper process/VAD/module/thread signals,
 while `/deep` adds executable live-vs-disk page comparison, hidden executable PTE
-checks when VAD coverage is reliable, and modified-page execution correlation.
-Deep stack correlation uses a per-process stack-pointer cache, so JSON findings
-for modified executable pages include `stack_reference_cache_samples` and
-`stack_reference_cache_limited` evidence instead of rereading every stack for
-every mismatched page.
+checks when VAD coverage is reliable, modified-page execution correlation, local
+BYOVD exact-hash catalog matching, Gentlemen-style EDR-killer driver-name IOC
+correlation, and `_DRIVER_OBJECT` dispatch/start integrity checks. Deep stack correlation uses
+a per-process stack-pointer cache, so JSON findings for modified executable pages
+include `stack_reference_cache_samples` and `stack_reference_cache_limited`
+evidence instead of rereading every stack for every mismatched page. The `/deep`
+BYOVD path is offline/reproducible and high-signal: it reuses the local catalog,
+never runs the updater script from inside `!hunt`, and suppresses name/version
+hints that require signer context. Run `byovd update` explicitly when fresh
+driver intelligence is needed, or `byovd scan` when broader hinting is desired.
 
 ## Native VAD And Thread Triage
 

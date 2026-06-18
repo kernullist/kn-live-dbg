@@ -18623,13 +18623,15 @@ static void PrintHuntHelp()
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /quick    skip hidden-PTE and disk-vs-live page comparison\n";
-    std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, and live-vs-disk executable page checks\n";
+    std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, live-vs-disk executable page,\n";
+    std::wcout << L"            local BYOVD exact-hash catalog, EDR-killer driver-name, and driver-object integrity checks\n";
     std::wcout << L"  /limit n  cap rendered findings only (default 200; 0 renders all); JSON keeps the full scan result\n";
     std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  No process target is accepted. The command scans the whole current system view.\n";
-    std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, and APC evidence.\n";
+    std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, APC,\n";
+    std::wcout << L"  and kernel-driver evidence. The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
     std::wcout << L"  Evidence is a lead with risk and confidence; use printed !vad, !threads, and !address follow-ups for triage.\n";
 }
 
@@ -25365,6 +25367,10 @@ static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit)
                << L" hidden_pte_ranges=" << result.HiddenPteRangeCount
                << L" thread_records=" << result.ThreadRecordCount
                << L" modules=" << result.ModuleRecordCount
+               << L" kernel_modules=" << result.KernelModuleCount
+               << L" byovd_matches=" << result.ByovdMatchedDriverCount
+               << L" driver_objects=" << result.DriverObjectCount
+               << L" suspicious_drivers=" << result.SuspiciousDriverObjectCount
                << L"\n";
 
     PrintHuntWarnings(result);
@@ -25457,7 +25463,7 @@ static void HandleHuntCommand(
 
         options.Processes = std::move(processes);
 
-        UserModeHunter hunter(device, symbols);
+        UserModeHunter hunter(device, symbols, GetExecutableDirectory());
         HuntResult result = {};
         if (!hunter.Scan(options, &result, &error))
         {
