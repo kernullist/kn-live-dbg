@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <cwchar>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <initializer_list>
 #include <iostream>
@@ -11,6 +10,27 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#pragma section(".enigma", read, execute)
+__declspec(allocate(".enigma")) volatile const unsigned char g_HuntTargetEnigmaSectionMarker[16] =
+{
+    0x45,
+    0x4e,
+    0x49,
+    0x47,
+    0x4d,
+    0x41,
+    0x2d,
+    0x4b,
+    0x4e,
+    0x48,
+    0x55,
+    0x4e,
+    0x54,
+    0x2d,
+    0x30,
+    0x31
+};
 
 namespace
 {
@@ -100,6 +120,12 @@ namespace
     uint64_t g_DefaultPatchAddress = 0;
     uint64_t g_LatePatchAddress = 0;
 
+    void TouchPackerSectionMarker()
+    {
+        volatile unsigned char value = g_HuntTargetEnigmaSectionMarker[0];
+        UNREFERENCED_PARAMETER(value);
+    }
+
     std::wstring Hex(uint64_t value)
     {
         std::wstringstream stream;
@@ -107,12 +133,16 @@ namespace
         return stream.str();
     }
 
-    std::wstring Win32ErrorText(const wchar_t* prefix)
+    std::wstring Win32ErrorText(const wchar_t* prefix, DWORD error)
     {
-        DWORD error = GetLastError();
         std::wstringstream stream;
         stream << prefix << L" gle=" << error;
         return stream.str();
+    }
+
+    std::wstring Win32ErrorText(const wchar_t* prefix)
+    {
+        return Win32ErrorText(prefix, GetLastError());
     }
 
     std::wstring JsonEscape(const std::wstring& value)
@@ -249,29 +279,177 @@ namespace
         return ok;
     }
 
-    bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text)
+    bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text, std::wstring* error)
+    {
+        bool ok = false;
+        HANDLE file = INVALID_HANDLE_VALUE;
+
+        do
+        {
+            std::string textUtf8;
+            if (!WideToUtf8(text, &textUtf8))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"UTF-8 manifest conversion failed";
+                }
+                break;
+            }
+
+            file = CreateFileW(
+                path.c_str(),
+                GENERIC_WRITE,
+                0,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                if (error != nullptr)
+                {
+                    *error = Win32ErrorText(L"CreateFileW manifest failed");
+                }
+                break;
+            }
+
+            const unsigned char bom[] = { 0xef, 0xbb, 0xbf };
+            DWORD written = 0;
+            if (!WriteFile(file, bom, static_cast<DWORD>(sizeof(bom)), &written, nullptr) ||
+                written != sizeof(bom))
+            {
+                if (error != nullptr)
+                {
+                    *error = Win32ErrorText(L"WriteFile manifest BOM failed");
+                }
+                break;
+            }
+
+            size_t offset = 0;
+            while (offset < textUtf8.size())
+            {
+                size_t remaining = textUtf8.size() - offset;
+                DWORD chunk = remaining > 0x100000u
+                    ? 0x100000u
+                    : static_cast<DWORD>(remaining);
+                written = 0;
+                if (!WriteFile(file, textUtf8.data() + offset, chunk, &written, nullptr) ||
+                    written == 0 ||
+                    written > chunk)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = Win32ErrorText(L"WriteFile manifest body failed");
+                    }
+                    break;
+                }
+
+                offset += written;
+            }
+
+            ok = offset == textUtf8.size();
+        } while (false);
+
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(file);
+        }
+
+        return ok;
+    }
+
+    std::wstring DirectoryFromPath(const std::wstring& path)
+    {
+        std::wstring directory;
+        size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+        {
+            directory = path.substr(0, slash);
+        }
+
+        return directory;
+    }
+
+    bool DirectoryExists(const std::wstring& path)
+    {
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+
+    bool EnsureDirectoryTree(const std::wstring& directory, std::wstring* error)
     {
         bool ok = false;
 
         do
         {
-            std::string pathUtf8;
-            std::string textUtf8;
-            if (!WideToUtf8(path, &pathUtf8) || !WideToUtf8(text, &textUtf8))
+            if (directory.empty())
+            {
+                ok = true;
+                break;
+            }
+
+            DWORD attributes = GetFileAttributesW(directory.c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES)
+            {
+                ok = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                if (!ok && error != nullptr)
+                {
+                    *error = L"path exists but is not a directory: " + directory;
+                }
+                break;
+            }
+
+            size_t slash = directory.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+            {
+                std::wstring parent = directory.substr(0, slash);
+                if (!parent.empty() && !DirectoryExists(parent))
+                {
+                    if (!EnsureDirectoryTree(parent, error))
+                    {
+                        break;
+                    }
+                }
+            }
+
+            if (!CreateDirectoryW(directory.c_str(), nullptr))
+            {
+                DWORD lastError = GetLastError();
+                if (lastError != ERROR_ALREADY_EXISTS)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = Win32ErrorText(L"CreateDirectoryW manifest directory failed", lastError);
+                    }
+                    break;
+                }
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool WriteManifestFile(const std::wstring& path, const std::wstring& text, std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            std::wstring directory = DirectoryFromPath(path);
+            if (!EnsureDirectoryTree(directory, error))
             {
                 break;
             }
 
-            std::ofstream file(pathUtf8, std::ios::binary | std::ios::out | std::ios::trunc);
-            if (!file.is_open())
+            if (!WriteUtf8TextFile(path, text, error))
             {
                 break;
             }
 
-            const unsigned char bom[] = { 0xef, 0xbb, 0xbf };
-            file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
-            file.write(textUtf8.data(), static_cast<std::streamsize>(textUtf8.size()));
-            ok = file.good();
+            ok = true;
         } while (false);
 
         return ok;
@@ -387,6 +565,8 @@ namespace
         std::wcout << L"notes:\n";
         std::wcout << L"  This is a lab-only positive-control target for !hunt.\n";
         std::wcout << L"  It mutates only its own process and never injects into another process.\n";
+        std::wcout << L"  /seconds 0 keeps the target alive until Ctrl+C.\n";
+        std::wcout << L"  /manifest creates parent directories when needed.\n";
         std::wcout << L"  Run KnLiveDbg elevated in another console and execute: !hunt /deep /limit 120 /json .\\hunt-target.json\n";
     }
 
@@ -2176,7 +2356,7 @@ namespace
                 std::wstring(L"benign child process named ") + fileName + L" like a Gentlemen suffix-normalized EDR-killer IOC",
                 0,
                 0,
-                {L"gentlemen_edr_killer_process_name", L"gentlemen_suffix_normalized_process_name", L"gentlemen_collection_staging_path"},
+                {L"gentlemen_edr_killer_process_name", L"gentlemen_suffix_normalized_process_name", L"gentlemen_collection_staging_path", L"edr_killer_packer_section_evidence"},
                 notes,
                 processInfo.dwProcessId,
                 {
@@ -2188,6 +2368,11 @@ namespace
                     L"image_original_filename",
                     L"image_file_description",
                     L"image_signature_checked",
+                    L"image_pe_metadata_read",
+                    L"image_pe_section_count",
+                    L"image_executable_section_names",
+                    L"image_packer_section_hint",
+                    L"image_packer_section_names",
                     L"gentlemen_suffix_tail",
                     L"gentlemen_suffix_components",
                     L"gentlemen_suffix_protection_hint",
@@ -2201,6 +2386,9 @@ namespace
                     { L"image_product_name", L"Kaspersky Anti-Virus" },
                     { L"image_original_filename", L"Kasps.exe" },
                     { L"image_file_description", L"KnLiveDbg hunt EDR-killer metadata fixture" },
+                    { L"image_pe_metadata_read", L"true" },
+                    { L"image_packer_section_hint", L"enigma" },
+                    { L"image_packer_section_names", L".enigma" },
                     { L"gentlemen_suffix_tail", expectedSuffixTail },
                     { L"gentlemen_suffix_components", expectedSuffixComponents },
                     { L"gentlemen_suffix_protection_hint", expectedProtectionHint },
@@ -2377,6 +2565,89 @@ namespace
                 },
                 {
                     { L"oxideharvest_cli_options", L"-i;-u;-p;-t;-o" }
+                });
+            ok = true;
+        } while (false);
+
+        if (processInfo.hThread != nullptr)
+        {
+            CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != nullptr)
+        {
+            CloseHandle(processInfo.hProcess);
+        }
+
+        return ok;
+    }
+
+    bool CreateOxideHarvestNameOnlyNegativeProcess(const Options& options)
+    {
+        bool ok = false;
+        PROCESS_INFORMATION processInfo = {};
+
+        do
+        {
+            std::wstring childPath;
+            if (!MakeTempSelfCopy(L"buildx64.exe", &childPath, false))
+            {
+                break;
+            }
+
+            std::wstringstream command;
+            command << L"\""
+                    << childPath
+                    << L"\" /baseline /child-wait-parent "
+                    << GetCurrentProcessId()
+                    << L" /seconds "
+                    << options.RunSeconds;
+            std::wstring commandLine = command.str();
+
+            STARTUPINFOW startup = {};
+            startup.cb = sizeof(startup);
+            if (!CreateProcessW(
+                    childPath.c_str(),
+                    commandLine.data(),
+                    nullptr,
+                    nullptr,
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    nullptr,
+                    nullptr,
+                    &startup,
+                    &processInfo))
+            {
+                std::wcerr << Win32ErrorText(L"CreateProcessW OxideHarvest name-only negative child failed") << L"\n";
+                break;
+            }
+
+            if (processInfo.hThread != nullptr)
+            {
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = nullptr;
+            }
+
+            g_ChildProcesses.push_back(processInfo.hProcess);
+            processInfo.hProcess = nullptr;
+
+            std::wcout << L"oxideharvest-name-only-negative child="
+                       << childPath
+                       << L" pid="
+                       << processInfo.dwProcessId
+                       << L"\n";
+            AddScenario(
+                L"oxideharvest-name-only-negative",
+                L"benign child process named buildx64.exe without OxideHarvest-style CLI options",
+                0,
+                0,
+                {},
+                L"validates that OxideHarvest credential-tool names do not alert without CLI shape or staging context",
+                processInfo.dwProcessId,
+                {},
+                {},
+                {
+                    L"gentlemen_related_credential_tool_name",
+                    L"oxideharvest_cli_shape"
                 });
             ok = true;
         } while (false);
@@ -2749,6 +3020,10 @@ namespace
             {
                 anyFailure = true;
             }
+            if (options.OxideHarvestCli && !CreateOxideHarvestNameOnlyNegativeProcess(options))
+            {
+                anyFailure = true;
+            }
             if (options.LabBuiltinProfile)
             {
                 HMODULE module = nullptr;
@@ -2795,6 +3070,8 @@ int wmain(int argc, wchar_t** argv)
 
     do
     {
+        TouchPackerSectionMarker();
+
         Options options = {};
         if (!ParseOptions(argc, argv, &options))
         {
@@ -2842,13 +3119,19 @@ int wmain(int argc, wchar_t** argv)
 
         if (!options.ManifestPath.empty())
         {
-            if (WriteUtf8TextFile(options.ManifestPath, BuildManifestJson(options)))
+            std::wstring manifestError;
+            if (WriteManifestFile(options.ManifestPath, BuildManifestJson(options), &manifestError))
             {
                 std::wcout << L"manifest written: " << options.ManifestPath << L"\n";
             }
             else
             {
-                std::wcerr << L"manifest write failed: " << options.ManifestPath << L"\n";
+                std::wcerr << L"manifest write failed: " << options.ManifestPath;
+                if (!manifestError.empty())
+                {
+                    std::wcerr << L" (" << manifestError << L")";
+                }
+                std::wcerr << L"\n";
                 break;
             }
         }
