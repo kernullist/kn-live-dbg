@@ -180,13 +180,18 @@ namespace
         bool SignaturePresent = false;
         bool SignatureValid = false;
         bool IconResourcePresent = false;
+        bool PeMetadataRead = false;
         LONG SignatureStatus = 0;
+        uint32_t PeSectionCount = 0;
         std::wstring FilePath;
         std::wstring FileVersion;
         std::wstring CompanyName;
         std::wstring ProductName;
         std::wstring OriginalFilename;
         std::wstring FileDescription;
+        std::wstring ExecutableSectionNames;
+        std::wstring PackerSectionHint;
+        std::wstring PackerSectionNames;
     };
 
     struct ThreatIntelCorrelationBucket
@@ -4283,6 +4288,76 @@ namespace
         return checked;
     }
 
+    std::wstring PackerFamilyFromSectionName(const std::wstring& name)
+    {
+        std::wstring family;
+
+        do
+        {
+            std::wstring lowered = HuntToLower(name);
+            if (lowered.find(L"themida") != std::wstring::npos ||
+                lowered.find(L"winlice") != std::wstring::npos)
+            {
+                family = L"themida";
+                break;
+            }
+
+            if (lowered.find(L"enigma") != std::wstring::npos)
+            {
+                family = L"enigma";
+                break;
+            }
+        } while (false);
+
+        return family;
+    }
+
+    void ReadImagePeSectionEvidence(const std::wstring& path, ImageMetadataRecord* metadata)
+    {
+        do
+        {
+            if (metadata == nullptr || path.empty())
+            {
+                break;
+            }
+
+            DiskPeMetadata pe = {};
+            std::wstring ignored;
+            if (!ReadDiskPeMetadata(path, &pe, &ignored))
+            {
+                break;
+            }
+
+            metadata->PeMetadataRead = true;
+            metadata->PeSectionCount = static_cast<uint32_t>(pe.Sections.size());
+
+            std::vector<std::wstring> executableNames;
+            std::vector<std::wstring> packerNames;
+            std::vector<std::wstring> packerFamilies;
+            for (const DiskPeSection& section : pe.Sections)
+            {
+                if (section.Executable && !section.Name.empty())
+                {
+                    executableNames.push_back(section.Name);
+                }
+
+                std::wstring family = PackerFamilyFromSectionName(section.Name);
+                if (!family.empty())
+                {
+                    if (!section.Name.empty())
+                    {
+                        packerNames.push_back(section.Name);
+                    }
+                    AddUnique(&packerFamilies, family);
+                }
+            }
+
+            metadata->ExecutableSectionNames = JoinWideValues(executableNames, L";");
+            metadata->PackerSectionNames = JoinWideValues(packerNames, L";");
+            metadata->PackerSectionHint = JoinWideValues(packerFamilies, L";");
+        } while (false);
+    }
+
     bool ReadImageMetadataForPath(const std::wstring& rawPath, ImageMetadataRecord* metadata)
     {
         bool ok = false;
@@ -4312,9 +4387,11 @@ namespace
             ReadImageVersionMetadata(path, metadata);
             VerifyImageAuthenticodeSignature(path, metadata);
             metadata->IconResourcePresent = ImageHasGroupIconResource(path);
+            ReadImagePeSectionEvidence(path, metadata);
             ok = metadata->VersionInfoPresent ||
                 metadata->SignatureChecked ||
-                metadata->IconResourcePresent;
+                metadata->IconResourcePresent ||
+                metadata->PeMetadataRead;
         } while (false);
 
         return ok;
@@ -4351,6 +4428,11 @@ namespace
             (*evidence)[L"image_signature_present"] = metadata.SignaturePresent ? L"true" : L"false";
             (*evidence)[L"image_signature_valid"] = metadata.SignatureValid ? L"true" : L"false";
             (*evidence)[L"image_signature_status"] = HuntHex(static_cast<uint32_t>(metadata.SignatureStatus), 8);
+            (*evidence)[L"image_pe_metadata_read"] = metadata.PeMetadataRead ? L"true" : L"false";
+            (*evidence)[L"image_pe_section_count"] = std::to_wstring(metadata.PeSectionCount);
+            (*evidence)[L"image_executable_section_names"] = metadata.ExecutableSectionNames;
+            (*evidence)[L"image_packer_section_hint"] = metadata.PackerSectionHint;
+            (*evidence)[L"image_packer_section_names"] = metadata.PackerSectionNames;
 
             if (metadata.SignaturePresent && !metadata.SignatureValid)
             {
@@ -4363,6 +4445,10 @@ namespace
             if (addVersionIconReasons && metadata.IconResourcePresent)
             {
                 AddUnique(reasons, L"edr_killer_icon_impersonation_evidence");
+            }
+            if (addVersionIconReasons && !metadata.PackerSectionNames.empty())
+            {
+                AddUnique(reasons, L"edr_killer_packer_section_evidence");
             }
         } while (false);
     }
@@ -4890,6 +4976,10 @@ namespace
             bool gentlemenStagingPath =
                 PathContainsGentlemenCollection(imagePath) ||
                 PathContainsGentlemenCollection(process.PebCommandLine);
+            std::wstring oxideHarvestCliOptions;
+            bool oxideHarvestCliShape = profile != nullptr &&
+                profile->CredentialTool &&
+                OxideHarvestCommandLineShape(process.PebCommandLine, &oxideHarvestCliOptions);
             if (profile == nullptr && !gentlemenStagingPath)
             {
                 break;
@@ -4899,6 +4989,13 @@ namespace
                 break;
             }
             if (profile != nullptr && !profile->StrongNameSignal && !gentlemenStagingPath)
+            {
+                break;
+            }
+            if (profile != nullptr &&
+                profile->CredentialTool &&
+                !gentlemenStagingPath &&
+                !oxideHarvestCliShape)
             {
                 break;
             }
@@ -4935,11 +5032,10 @@ namespace
                 }
                 if (profile->CredentialTool)
                 {
-                    std::wstring matchedOptions;
-                    if (OxideHarvestCommandLineShape(process.PebCommandLine, &matchedOptions))
+                    if (oxideHarvestCliShape)
                     {
                         AddUnique(&reasons, L"oxideharvest_cli_shape");
-                        evidence[L"oxideharvest_cli_options"] = matchedOptions;
+                        evidence[L"oxideharvest_cli_options"] = oxideHarvestCliOptions;
                     }
                 }
             }
@@ -7550,16 +7646,16 @@ namespace
                 {
                     continue;
                 }
+                if (!profile->StrongNameSignal)
+                {
+                    continue;
+                }
 
                 std::vector<std::wstring> reasons =
                 {
                     L"gentlemen_edr_killer_driver_name",
                     L"loaded_driver_name_ioc"
                 };
-                if (!profile->StrongNameSignal)
-                {
-                    AddUnique(&reasons, L"name_only_requires_hash_or_service_correlation");
-                }
 
                 std::map<std::wstring, std::wstring> evidence;
                 evidence[L"driver_image_name"] = module.ImageName;

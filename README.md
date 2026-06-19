@@ -528,9 +528,9 @@ execution provenance, and bounded stack references into suspicious executable
 memory. `/quick` keeps the scan to cheaper process/VAD/module/thread signals,
 while `/deep` adds executable live-vs-disk page comparison, hidden executable PTE
 checks when VAD coverage is reliable, modified-page execution correlation, local
-BYOVD exact-hash catalog matching, Gentlemen-style EDR-killer driver-name IOC
-correlation, context-gated suffix-normalized Gentlemen EDR-killer process-name
-matching, SCM driver-service IOC correlation, `_DRIVER_OBJECT`
+BYOVD exact-hash catalog matching, strong Gentlemen-style EDR-killer driver-name
+IOC correlation, context-gated suffix-normalized Gentlemen EDR-killer
+process-name matching, SCM driver-service IOC correlation, `_DRIVER_OBJECT`
 dispatch/start integrity checks, and recent `!ti` ring correlation for strong
 Gentlemen process/staging indicators that performed driver I/O or repeated
 process-impairment activity. The TI correlation path also raises a behavioral
@@ -539,19 +539,23 @@ processes from the GentleKiller target list, even if the caller name was changed
 Process-profile findings include bounded on-disk metadata and suffix evidence
 for the ESET evasion layer: Authenticode trust state, version strings, original
 filename, file description, icon-resource presence, and the `1`/`2`/`Light`/
-`Clear` suffix tail. Weak vendor-impersonation process names are not promoted as
-standalone findings unless stronger Gentlemen staging or telemetry context is
-present. The related OxideHarvest credential-tool profile also records the
-`-i`/`-u`/`-p`/`-t`/`-o` command-line shape described by ESET when all required
-options have values.
+`Clear` suffix tail. Known Enigma/Themida PE section-name hints are recorded as
+supporting packer evidence only after Gentlemen process/staging context already
+exists. Weak vendor-impersonation process names are not promoted as standalone
+findings unless stronger Gentlemen staging or telemetry context is present. The
+related OxideHarvest credential-tool profile is gated by
+Gentlemen staging context or the `-i`/`-u`/`-p`/`-t`/`-o` command-line shape
+described by ESET when all required options have values.
 Deep stack correlation uses
 a per-process stack-pointer cache, so JSON findings for modified executable pages
 include `stack_reference_cache_samples` and `stack_reference_cache_limited`
 evidence instead of rereading every stack for every mismatched page. The `/deep`
 BYOVD path is offline/reproducible and high-signal: it reuses the local catalog,
 never runs the updater script from inside `!hunt`, and suppresses name/version
-hints that require signer context. Run `byovd update` explicitly when fresh
-driver intelligence is needed, or `byovd scan` when broader hinting is desired.
+hints that require signer context. Weak ESET driver names are also suppressed in
+the loaded-module name-only sweep unless hash, service, or integrity evidence
+supplies stronger context. Run `byovd update` explicitly when fresh driver
+intelligence is needed, or `byovd scan` when broader hinting is desired.
 The SCM scan is also read-only and surfaces installed or running driver services
 whose service name or configured binary path matches the EDR-killer driver IOC
 set, so a driver-service staging artifact can be found even before a module is

@@ -28,6 +28,11 @@ Start the target in a normal console:
 .\x64\Release\tools\KnLiveDbgHuntTarget.exe /all /manifest .\hunt-target-manifest.json /seconds 300
 ```
 
+The manifest writer creates missing parent directories, so paths such as
+`.\.build\hunt-live-manifest.json` work from a clean lab directory. Use
+`/seconds 0` for live validation sessions where the target should stay alive
+until Ctrl+C.
+
 Then run KnLiveDbg elevated in another console:
 
 ```text
@@ -61,7 +66,7 @@ Validate the `!hunt` output against the target manifest:
 | `/locked-backed-image` | Loader-invisible `SEC_IMAGE` mapping whose backing file denies read sharing | `section_backing_inaccessible`, `section_image_without_loader_entry`, `vad_image_not_in_loader` |
 | `/section-image-stomp` | Loader-invisible `SEC_IMAGE` mapping with a modified executable page | `section_image_without_loader_entry`, `vad_image_not_in_loader`, `live_disk_exec_page_mismatch`, `module_text_mismatch`, `module_stomping_evidence` |
 | `/image-rwx-section` | Loaded fixture DLL section with default writable executable protection | `image_rwx_section_vad`, `mockingjay_rwx_section_candidate`, `wx_user_vad` |
-| `/edr-killer-suffix-name` | Benign child copies launched from `GentlemenCollection` with ESET-style suffix names | `gentlemen_edr_killer_process_name`, `gentlemen_suffix_normalized_process_name`, `gentlemen_collection_staging_path` |
+| `/edr-killer-suffix-name` | Benign child copies launched from `GentlemenCollection` with ESET-style suffix names and lab-only `.enigma` section evidence | `gentlemen_edr_killer_process_name`, `gentlemen_suffix_normalized_process_name`, `gentlemen_collection_staging_path`, `edr_killer_packer_section_evidence` |
 | `/oxideharvest-cli` | Benign child copy launched as `buildx641.exe` with OxideHarvest-style CLI options | `gentlemen_related_credential_tool_name`, `oxideharvest_cli_shape` |
 | `/lab-builtin-profile` | Test-only built-in profile violation gated by an explicit lab flag and a non-Windows fixture DLL load | `builtin_profile_path_mismatch`, `system_name_from_non_system_path`, `builtin_process_non_windows_module`, `dll_load_in_builtin_process` |
 | `/manifest <path>` | Writes a machine-readable scenario manifest | `kn-live-dbg.hunt-target-manifest.v1` |
@@ -71,6 +76,7 @@ gated lab built-in profile. If no scenario option is supplied, the target
 enables all memory/module/thread/APC/image-section scenarios but leaves the lab
 built-in profile disabled because that profile intentionally requires an
 explicit command-line marker. `/seconds 0` keeps the target alive until Ctrl+C.
+`/manifest` creates missing parent directories before writing the JSON file.
 
 ## Manifest Validation
 
@@ -132,8 +138,8 @@ child instead of the parent target PID. The target EXE carries lab-only version
 metadata (`CompanyName=Kaspersky Lab`, `OriginalFilename=Kasps.exe`,
 `ProductName=Kaspersky Anti-Virus`) so metadata evidence such as
 `image_version_info_present`, `image_company_name`, `image_original_filename`,
-and `gentlemen_suffix_tail` can be validated with exact expected values without
-using a real EDR-killer binary.
+`gentlemen_suffix_tail`, and lab-only `.enigma` PE section evidence can be
+validated with exact expected values without using a real EDR-killer binary.
 
 The same mode also launches `Avast.exe` from a temp directory that does not
 contain `GentlemenCollection`. Its manifest entry is a negative control: weak
@@ -148,7 +154,9 @@ by ESET: `-i`, `-u`, `-p`, `-t`, and `-o`, each with a value. The child remains
 benign and runs in baseline wait mode; the command line exists only so `!hunt`
 can validate that the credential-tool name IOC is accompanied by
 `oxideharvest_cli_shape` and the exact `oxideharvest_cli_options` evidence
-value.
+value. The same mode also launches a `buildx64.exe` child without those
+options as a negative control, so the credential-tool name alone does not alert
+outside Gentlemen staging context.
 
 These cases are intentionally not cross-process injection samples. They are
 positive controls for hunt invariants: VAD image ownership, loader cross-view
