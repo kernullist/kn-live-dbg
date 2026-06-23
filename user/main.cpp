@@ -11651,6 +11651,20 @@ static void PrintWfpRecord(const WfpRecord& record)
         std::wcout << L"  description=\"" << record.Description << L"\"\n";
     }
 
+    if (record.Kind == L"wfp.filter" && record.HasAppIdCondition)
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"appId", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=\"" << record.AppIdText << L"\"\n";
+    }
+
+    if (record.Kind == L"wfp.filter" && !record.ConditionsText.empty())
+    {
+        std::wcout << L"  ";
+        PrintColoredText(L"conditions", KNDBG_COLOR_ACCENT);
+        std::wcout << L"=\"" << record.ConditionsText << L"\"\n";
+    }
+
     if (!record.Notes.empty())
     {
         std::wcout << L"  ";
@@ -18627,8 +18641,8 @@ static void PrintHuntHelp()
     std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, live-vs-disk executable page,\n";
     std::wcout << L"            local BYOVD exact-hash catalog, EDR-killer driver-name/service,\n";
     std::wcout << L"            driver-object integrity checks, and existing !ti ring correlation\n";
-    std::wcout << L"  /summary  print conclusion, assessment, aggregate counts, high-signal IOC, and top triage tables only\n";
-    std::wcout << L"  /details  render per-finding detail after the triage summary\n";
+    std::wcout << L"  /summary  print conclusion, assessment, aggregate counts, and capped warnings only\n";
+    std::wcout << L"  /details  render raw triage tables and per-finding detail after the assessment\n";
     std::wcout << L"  /limit n  render and cap per-finding detail (0 renders all); JSON keeps the full scan result\n";
     std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
     std::wcout << L"\n";
@@ -18637,8 +18651,8 @@ static void PrintHuntHelp()
     std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, APC,\n";
     std::wcout << L"  and kernel-driver evidence. The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
     std::wcout << L"  /deep reuses recent !ti events if the Threat-Intelligence subscriber has captured any.\n";
-    std::wcout << L"  Console output is concise by default: conclusion, assessment, summary, high-signal IOC, and top tables.\n";
-    std::wcout << L"  Per-finding detail is hidden unless /details or /limit is supplied.\n";
+    std::wcout << L"  Console output is concise by default: conclusion, subject/what/why/next assessment, summary, and suppressed detail notice.\n";
+    std::wcout << L"  Default output is a short subject/what/why/next assessment; raw tables and per-finding detail are hidden unless /details or /limit is supplied.\n";
     std::wcout << L"  Evidence is a lead with risk and confidence; use printed !vad, !threads, and !address follow-ups for triage.\n";
 }
 
@@ -25324,6 +25338,10 @@ static std::wstring HuntConsoleClassLabel(const std::wstring& className)
     {
         label = L"defense_evasion_driver_service";
     }
+    else if (lowered == L"network_filter_tampering")
+    {
+        label = L"security_communication_blocking";
+    }
 
     return label;
 }
@@ -25674,6 +25692,54 @@ static std::wstring HuntConsoleReasonLabel(const std::wstring& reason)
     {
         label = L"main_image_section_path_mismatch";
     }
+    else if (lowered == L"main_section_object_vad_backing_mismatch")
+    {
+        label = L"main_section_object_vs_vad_backing_mismatch";
+    }
+    else if (lowered == L"main_section_object_process_path_mismatch")
+    {
+        label = L"main_section_object_vs_process_path_mismatch";
+    }
+    else if (lowered == L"main_section_object_peb_path_mismatch")
+    {
+        label = L"main_section_object_vs_peb_path_mismatch";
+    }
+    else if (lowered == L"main_section_object_api_path_mismatch")
+    {
+        label = L"main_section_object_vs_api_path_mismatch";
+    }
+    else if (lowered == L"kernel_main_section_swap_evidence")
+    {
+        label = L"kernel_main_section_swap_evidence";
+    }
+    else if (lowered == L"process_tampering_primitive_evidence")
+    {
+        label = L"process_tampering_primitive_evidence";
+    }
+    else if (lowered == L"main_image_vad_file_delete_pending")
+    {
+        label = L"main_image_file_delete_pending";
+    }
+    else if (lowered == L"main_section_object_file_delete_pending")
+    {
+        label = L"main_section_object_file_delete_pending";
+    }
+    else if (lowered == L"main_image_vad_file_write_or_delete_access")
+    {
+        label = L"main_image_file_write_or_delete_access";
+    }
+    else if (lowered == L"main_section_object_file_write_or_delete_access")
+    {
+        label = L"main_section_object_file_write_or_delete_access";
+    }
+    else if (lowered == L"main_image_vad_file_section_object_pointer_mismatch")
+    {
+        label = L"main_image_file_section_object_pointer_mismatch";
+    }
+    else if (lowered == L"main_section_object_file_section_object_pointer_mismatch")
+    {
+        label = L"main_section_object_file_section_object_pointer_mismatch";
+    }
     else if (lowered == L"live_disk_exec_page_mismatch")
     {
         label = L"live_executable_page_differs_from_disk";
@@ -25685,6 +25751,58 @@ static std::wstring HuntConsoleReasonLabel(const std::wstring& reason)
     else if (lowered == L"module_text_mismatch")
     {
         label = L"module_text_modified";
+    }
+    else if (lowered == L"image_section_execute_permission_drift")
+    {
+        label = L"image_section_execute_permission_drift";
+    }
+    else if (lowered == L"image_section_write_permission_drift")
+    {
+        label = L"image_section_write_permission_drift";
+    }
+    else if (lowered == L"module_entrypoint_write_permission_drift")
+    {
+        label = L"module_entrypoint_write_permission_drift";
+    }
+    else if (lowered == L"module_stomping_permission_evidence")
+    {
+        label = L"module_stomping_permission_evidence";
+    }
+    else if (lowered == L"image_rwx_section_vad")
+    {
+        label = L"image_rwx_section_vad";
+    }
+    else if (lowered == L"mockingjay_rwx_section_candidate")
+    {
+        label = L"mockingjay_rwx_section_candidate";
+    }
+    else if (lowered == L"security_tool_communication_blocking")
+    {
+        label = L"security_tool_communication_blocking";
+    }
+    else if (lowered == L"wfp_security_product_block_filter")
+    {
+        label = L"wfp_security_product_block_filter";
+    }
+    else if (lowered == L"wfp_anticheat_block_filter")
+    {
+        label = L"wfp_anticheat_block_filter";
+    }
+    else if (lowered == L"wfp_appid_block_condition")
+    {
+        label = L"wfp_appid_block_condition";
+    }
+    else if (lowered == L"wfp_persistent_block_filter")
+    {
+        label = L"wfp_persistent_block_filter";
+    }
+    else if (lowered == L"wfp_clear_action_right_block")
+    {
+        label = L"wfp_clear_action_right_block";
+    }
+    else if (lowered == L"wfp_high_weight_block_filter")
+    {
+        label = L"wfp_high_weight_block_filter";
     }
     else if (lowered == L"thread_start_in_modified_module_page")
     {
@@ -25826,16 +25944,36 @@ static uint32_t HuntConsoleSignalPriority(const std::wstring& signal)
              lowered == L"main_image_entrypoint_modified" ||
              lowered == L"main_image_hash_modified" ||
              lowered == L"main_image_section_path_mismatch" ||
+             lowered == L"main_section_object_vs_vad_backing_mismatch" ||
+             lowered == L"main_section_object_vs_process_path_mismatch" ||
+             lowered == L"main_section_object_vs_peb_path_mismatch" ||
+             lowered == L"main_section_object_vs_api_path_mismatch" ||
+             lowered == L"kernel_main_section_swap_evidence" ||
+             lowered == L"process_tampering_primitive_evidence" ||
+             lowered == L"main_image_file_delete_pending" ||
+             lowered == L"main_section_object_file_delete_pending" ||
+             lowered == L"main_image_file_write_or_delete_access" ||
+             lowered == L"main_section_object_file_write_or_delete_access" ||
+             lowered == L"main_image_file_section_object_pointer_mismatch" ||
+             lowered == L"main_section_object_file_section_object_pointer_mismatch" ||
              lowered == L"live_module_page_modified" ||
              lowered == L"live_executable_page_differs_from_disk" ||
              lowered == L"module_entrypoint_modified" ||
              lowered == L"module_text_modified" ||
+             lowered == L"image_section_execute_permission_drift" ||
+             lowered == L"image_section_write_permission_drift" ||
+             lowered == L"module_entrypoint_write_permission_drift" ||
+             lowered == L"module_stomping_permission_evidence" ||
              lowered == L"thread_started_in_modified_module_page" ||
              lowered == L"apc_targeted_modified_module_page" ||
              lowered == L"stack_referenced_modified_module_page" ||
              lowered == L"image_mapping_without_loader_entry" ||
              lowered == L"image_vad_hidden_from_loader" ||
              lowered == L"manual_mapped_private_pe" ||
+             lowered == L"security_tool_communication_blocking" ||
+             lowered == L"wfp_security_product_block_filter" ||
+             lowered == L"wfp_anticheat_block_filter" ||
+             lowered == L"wfp_appid_block_condition" ||
              lowered == L"builtin_process_injection_context")
     {
         priority = 80;
@@ -25849,6 +25987,11 @@ static uint32_t HuntConsoleSignalPriority(const std::wstring& signal)
              lowered == L"hidden_writable_executable_page" ||
              lowered == L"image_section_backing_inaccessible" ||
              lowered == L"image_section_backing_missing" ||
+             lowered == L"image_rwx_section_vad" ||
+             lowered == L"mockingjay_rwx_section_candidate" ||
+             lowered == L"wfp_persistent_block_filter" ||
+             lowered == L"wfp_clear_action_right_block" ||
+             lowered == L"wfp_high_weight_block_filter" ||
              lowered == L"partial_loader_unlink" ||
              lowered == L"module_view_mismatch")
     {
@@ -25950,6 +26093,13 @@ static std::wstring HuntAssessmentKindForFinding(
     {
         kind = L"security_product_targeting";
     }
+    else if (classLabel == L"security_communication_blocking" ||
+             HuntLabelsContain(labels, L"security_tool_communication_blocking") ||
+             HuntLabelsContain(labels, L"wfp_security_product_block_filter") ||
+             HuntLabelsContain(labels, L"wfp_anticheat_block_filter"))
+    {
+        kind = L"security_communication_blocking";
+    }
     else if (classLabel == L"defense_evasion_process_profile" ||
              HuntLabelsContain(labels, L"known_defense_evasion_tool_name") ||
              HuntLabelsContain(labels, L"renamed_defense_evasion_tool_name"))
@@ -25958,14 +26108,55 @@ static std::wstring HuntAssessmentKindForFinding(
     }
     else if (classLabel == L"process_doppelganging" ||
              classLabel == L"process_image_integrity" ||
-             classLabel == L"module_stomping" ||
-             classLabel == L"module_cross_view" ||
+             HuntLabelsContain(labels, L"main_image_backing_mismatch") ||
+             HuntLabelsContain(labels, L"main_image_section_path_mismatch") ||
+             HuntLabelsContain(labels, L"live_main_image_differs_from_disk") ||
+             HuntLabelsContain(labels, L"main_image_entrypoint_modified") ||
+             HuntLabelsContain(labels, L"main_image_hash_modified") ||
+             HuntLabelsContain(labels, L"kernel_main_section_swap_evidence") ||
+             HuntLabelsContain(labels, L"process_tampering_primitive_evidence") ||
+             HuntLabelsContain(labels, L"main_section_object_vs_vad_backing_mismatch") ||
+             HuntLabelsContain(labels, L"main_section_object_vs_process_path_mismatch") ||
+             HuntLabelsContain(labels, L"main_section_object_vs_peb_path_mismatch") ||
+             HuntLabelsContain(labels, L"main_section_object_vs_api_path_mismatch") ||
+             HuntLabelsContain(labels, L"main_image_file_delete_pending") ||
+             HuntLabelsContain(labels, L"main_section_object_file_delete_pending") ||
+             HuntLabelsContain(labels, L"main_image_file_write_or_delete_access") ||
+             HuntLabelsContain(labels, L"main_section_object_file_write_or_delete_access") ||
+             HuntLabelsContain(labels, L"main_image_file_section_object_pointer_mismatch") ||
+             HuntLabelsContain(labels, L"main_section_object_file_section_object_pointer_mismatch"))
+    {
+        kind = L"process_tampering";
+    }
+    else if (classLabel == L"module_stomping" ||
+             HuntLabelsContain(labels, L"module_stomping_permission_evidence") ||
+             HuntLabelsContain(labels, L"module_entrypoint_write_permission_drift") ||
+             HuntLabelsContain(labels, L"image_section_execute_permission_drift") ||
+             HuntLabelsContain(labels, L"image_section_write_permission_drift") ||
+             HuntLabelsContain(labels, L"image_rwx_section_vad") ||
+             HuntLabelsContain(labels, L"mockingjay_rwx_section_candidate") ||
+             HuntLabelsContain(labels, L"live_module_page_modified") ||
+             HuntLabelsContain(labels, L"live_executable_page_differs_from_disk") ||
+             HuntLabelsContain(labels, L"module_entrypoint_modified") ||
+             HuntLabelsContain(labels, L"module_text_modified") ||
+             HuntLabelsContain(labels, L"thread_started_in_modified_module_page") ||
+             HuntLabelsContain(labels, L"apc_targeted_modified_module_page") ||
+             HuntLabelsContain(labels, L"stack_referenced_modified_module_page"))
+    {
+        kind = L"module_stomping";
+    }
+    else if (classLabel == L"module_cross_view" ||
              classLabel == L"mapped_code" ||
              classLabel == L"manual_map" ||
              classLabel == L"vad_dkom" ||
-             classLabel == L"builtin_module_provenance")
+             classLabel == L"builtin_module_provenance" ||
+             HuntLabelsContain(labels, L"image_mapping_without_loader_entry") ||
+             HuntLabelsContain(labels, L"image_vad_hidden_from_loader") ||
+             HuntLabelsContain(labels, L"manual_mapped_private_pe") ||
+             HuntLabelsContain(labels, L"partial_loader_unlink") ||
+             HuntLabelsContain(labels, L"module_view_mismatch"))
     {
-        kind = L"code_provenance_anomaly";
+        kind = L"mapped_code_or_loader_evasion";
     }
     else
     {
@@ -25992,11 +26183,23 @@ static uint32_t HuntAssessmentPriority(const std::wstring& kind)
     {
         priority = 30;
     }
+    else if (kind == L"process_tampering")
+    {
+        priority = 15;
+    }
     else if (kind == L"security_product_targeting")
     {
         priority = 40;
     }
-    else if (kind == L"code_provenance_anomaly")
+    else if (kind == L"security_communication_blocking")
+    {
+        priority = 45;
+    }
+    else if (kind == L"module_stomping")
+    {
+        priority = 50;
+    }
+    else if (kind == L"mapped_code_or_loader_evasion")
     {
         priority = 80;
     }
@@ -26039,22 +26242,6 @@ static void PrintHuntAssessmentLine(
     }
 }
 
-static std::wstring HuntAssessmentScopeText(const HuntConsoleAssessmentSummary& summary)
-{
-    std::wstring scope = L"processes";
-
-    if (summary.ProcessIds.empty() && summary.SystemFindings != 0)
-    {
-        scope = L"system";
-    }
-    else if (!summary.ProcessIds.empty() && summary.SystemFindings != 0)
-    {
-        scope = L"processes+system";
-    }
-
-    return scope;
-}
-
 static std::wstring HuntAssessmentTechniqueText(const std::wstring& kind)
 {
     std::wstring technique;
@@ -26075,11 +26262,23 @@ static std::wstring HuntAssessmentTechniqueText(const std::wstring& kind)
     {
         technique = L"repeatedly controlled known security-product processes";
     }
+    else if (kind == L"security_communication_blocking")
+    {
+        technique = L"installed a WFP block filter against security or anti-cheat communication";
+    }
     else if (kind == L"defense_evasion_process_profile")
     {
         technique = L"masqueraded as a known defense-evasion tool";
     }
-    else if (kind == L"code_provenance_anomaly")
+    else if (kind == L"process_tampering")
+    {
+        technique = L"tampered with process main image or section backing";
+    }
+    else if (kind == L"module_stomping")
+    {
+        technique = L"modified loaded module code or executable section permissions";
+    }
+    else if (kind == L"mapped_code_or_loader_evasion")
     {
         technique = L"hid or replaced executable code outside the normal loader view";
     }
@@ -26089,42 +26288,6 @@ static std::wstring HuntAssessmentTechniqueText(const std::wstring& kind)
     }
 
     return technique;
-}
-
-static std::wstring HuntAssessmentAffectedText(const std::wstring& kind)
-{
-    std::wstring affected;
-
-    if (kind == L"published_file_hash_ioc")
-    {
-        affected = L"process image, loaded driver, or driver-service binary";
-    }
-    else if (kind == L"defense_evasion_driver_artifact")
-    {
-        affected = L"SCM driver service, loaded driver, or driver image path";
-    }
-    else if (kind == L"credential_collection_tool")
-    {
-        affected = L"process identity and command-line collection surface";
-    }
-    else if (kind == L"security_product_targeting")
-    {
-        affected = L"security-product process list and cross-process control surface";
-    }
-    else if (kind == L"defense_evasion_process_profile")
-    {
-        affected = L"process identity, file metadata, and staging path";
-    }
-    else if (kind == L"code_provenance_anomaly")
-    {
-        affected = L"main image, module pages, loader views, VADs, or thread provenance";
-    }
-    else
-    {
-        affected = L"hunt evidence surface";
-    }
-
-    return affected;
 }
 
 static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
@@ -26220,6 +26383,54 @@ static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
     {
         phrase = L"main image section path mismatch";
     }
+    else if (lowered == L"main_section_object_vs_vad_backing_mismatch")
+    {
+        phrase = L"EPROCESS main section object differs from VAD backing";
+    }
+    else if (lowered == L"main_section_object_vs_process_path_mismatch")
+    {
+        phrase = L"EPROCESS main section object differs from process image path";
+    }
+    else if (lowered == L"main_section_object_vs_peb_path_mismatch")
+    {
+        phrase = L"EPROCESS main section object differs from PEB image path";
+    }
+    else if (lowered == L"main_section_object_vs_api_path_mismatch")
+    {
+        phrase = L"EPROCESS main section object differs from API image path";
+    }
+    else if (lowered == L"kernel_main_section_swap_evidence")
+    {
+        phrase = L"kernel-level main section swap evidence";
+    }
+    else if (lowered == L"process_tampering_primitive_evidence")
+    {
+        phrase = L"process image tampering primitive evidence";
+    }
+    else if (lowered == L"main_image_file_delete_pending")
+    {
+        phrase = L"main image backing file is delete-pending";
+    }
+    else if (lowered == L"main_section_object_file_delete_pending")
+    {
+        phrase = L"EPROCESS main section backing file is delete-pending";
+    }
+    else if (lowered == L"main_image_file_write_or_delete_access")
+    {
+        phrase = L"main image backing FILE_OBJECT has write or delete access";
+    }
+    else if (lowered == L"main_section_object_file_write_or_delete_access")
+    {
+        phrase = L"EPROCESS main section FILE_OBJECT has write or delete access";
+    }
+    else if (lowered == L"main_image_file_section_object_pointer_mismatch")
+    {
+        phrase = L"main image FILE_OBJECT section pointer differs from the VAD control area";
+    }
+    else if (lowered == L"main_section_object_file_section_object_pointer_mismatch")
+    {
+        phrase = L"EPROCESS main section FILE_OBJECT section pointer differs from its control area";
+    }
     else if (lowered == L"live_module_page_modified")
     {
         phrase = L"live module executable page modified";
@@ -26235,6 +26446,58 @@ static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
     else if (lowered == L"module_text_modified")
     {
         phrase = L"module text page modified";
+    }
+    else if (lowered == L"image_section_execute_permission_drift")
+    {
+        phrase = L"image VAD gained execute permission absent from the disk section";
+    }
+    else if (lowered == L"image_section_write_permission_drift")
+    {
+        phrase = L"image VAD gained write permission over a non-writable executable section";
+    }
+    else if (lowered == L"module_entrypoint_write_permission_drift")
+    {
+        phrase = L"module entrypoint section is executable and write-capable";
+    }
+    else if (lowered == L"module_stomping_permission_evidence")
+    {
+        phrase = L"module-stomping permission drift evidence";
+    }
+    else if (lowered == L"image_rwx_section_vad")
+    {
+        phrase = L"loaded image section is writable and executable";
+    }
+    else if (lowered == L"mockingjay_rwx_section_candidate")
+    {
+        phrase = L"Mockingjay-style writable executable image section candidate";
+    }
+    else if (lowered == L"security_tool_communication_blocking")
+    {
+        phrase = L"WFP policy blocks security or anti-cheat communication";
+    }
+    else if (lowered == L"wfp_security_product_block_filter")
+    {
+        phrase = L"WFP block filter targets a security-product process";
+    }
+    else if (lowered == L"wfp_anticheat_block_filter")
+    {
+        phrase = L"WFP block filter targets an anti-cheat process";
+    }
+    else if (lowered == L"wfp_appid_block_condition")
+    {
+        phrase = L"WFP block filter uses an ALE AppId condition";
+    }
+    else if (lowered == L"wfp_persistent_block_filter")
+    {
+        phrase = L"persistent WFP block filter";
+    }
+    else if (lowered == L"wfp_clear_action_right_block")
+    {
+        phrase = L"WFP block filter clears action-right override";
+    }
+    else if (lowered == L"wfp_high_weight_block_filter")
+    {
+        phrase = L"high-weight WFP block filter";
     }
     else if (lowered == L"thread_started_in_modified_module_page")
     {
@@ -26392,7 +26655,18 @@ static bool IsHuntHighSignalReason(const std::wstring& reason)
             lowered == L"driver_service_installed" ||
             lowered == L"driver_service_running" ||
             lowered == L"known_security_product_process_target" ||
-            lowered == L"loaded_driver_name_ioc")
+            lowered == L"loaded_driver_name_ioc" ||
+            lowered == L"process_tampering_primitive_evidence" ||
+            lowered == L"main_image_vad_file_delete_pending" ||
+            lowered == L"main_section_object_file_delete_pending" ||
+            lowered == L"main_image_vad_file_section_object_pointer_mismatch" ||
+            lowered == L"main_section_object_file_section_object_pointer_mismatch" ||
+            lowered == L"module_stomping_permission_evidence" ||
+            lowered == L"module_entrypoint_write_permission_drift" ||
+            lowered == L"security_tool_communication_blocking" ||
+            lowered == L"wfp_security_product_block_filter" ||
+            lowered == L"wfp_anticheat_block_filter" ||
+            lowered == L"wfp_appid_block_condition")
         {
             matched = true;
             break;
@@ -26698,29 +26972,40 @@ static std::vector<HuntConsoleAssessmentSummary> BuildHuntAssessmentSummaries(co
 static void PrintHuntSummaryLine(const HuntResult& result)
 {
     PrintColoredText(L"[hunt.summary]", KNDBG_COLOR_TITLE);
-    std::wcout << L" kernel_processes=" << result.KernelProcessCount
-               << L" spi_processes=" << result.SystemProcessInfoCount
-               << L" toolhelp_processes=" << result.ToolhelpProcessCount
-               << L" scanned=" << result.ScannedProcessCount
+    std::wcout << L" scanned=" << result.ScannedProcessCount
                << L" findings=" << result.Findings.size()
                << L" high=" << result.HighFindings
                << L" medium=" << result.MediumFindings
-               << L" low=" << result.LowFindings
-               << L" vad_records=" << result.VadRecordCount
-               << L" hidden_pte_ranges=" << result.HiddenPteRangeCount
-               << L" thread_records=" << result.ThreadRecordCount
-               << L" modules=" << result.ModuleRecordCount
-               << L" kernel_modules=" << result.KernelModuleCount
-               << L" byovd_matches=" << result.ByovdMatchedDriverCount
-               << L" driver_objects=" << result.DriverObjectCount
-               << L" suspicious_drivers=" << result.SuspiciousDriverObjectCount
-               << L" driver_services=" << result.DriverServiceCount
-               << L" driver_service_iocs=" << result.EdrKillerDriverServiceCount
-               << L" ti_active=" << (result.ThreatIntelActive ? L"yes" : L"no")
-               << L" ti_available=" << (result.ThreatIntelAvailable ? L"yes" : L"no")
-               << L" ti_events=" << result.ThreatIntelEventCount
-               << L" ti_correlations=" << result.ThreatIntelCorrelationCount
-               << L"\n";
+               << L" low=" << result.LowFindings;
+    if (result.KernelModuleCount != 0 ||
+        result.ByovdMatchedDriverCount != 0 ||
+        result.DriverObjectCount != 0 ||
+        result.SuspiciousDriverObjectCount != 0 ||
+        result.DriverServiceCount != 0 ||
+        result.EdrKillerDriverServiceCount != 0)
+    {
+        std::wcout << L" kernel_modules=" << result.KernelModuleCount
+                   << L" byovd_matches=" << result.ByovdMatchedDriverCount
+                   << L" suspicious_drivers=" << result.SuspiciousDriverObjectCount
+                   << L" driver_services=" << result.DriverServiceCount;
+    }
+    if (result.EdrKillerDriverServiceCount != 0)
+    {
+        std::wcout << L" driver_service_iocs=" << result.EdrKillerDriverServiceCount;
+    }
+    if (result.WfpFilterCount != 0 || result.SuspiciousWfpFilterCount != 0)
+    {
+        std::wcout << L" wfp_filters=" << result.WfpFilterCount
+                   << L" suspicious_wfp_filters=" << result.SuspiciousWfpFilterCount;
+    }
+    if (result.ThreatIntelActive || result.ThreatIntelAvailable || result.ThreatIntelEventCount != 0 || result.ThreatIntelCorrelationCount != 0)
+    {
+        std::wcout << L" ti_active=" << (result.ThreatIntelActive ? L"yes" : L"no")
+                   << L" ti_available=" << (result.ThreatIntelAvailable ? L"yes" : L"no")
+                   << L" ti_events=" << result.ThreatIntelEventCount
+                   << L" ti_correlations=" << result.ThreatIntelCorrelationCount;
+    }
+    std::wcout << L"\n";
 }
 
 static void PrintHuntConclusion(const HuntResult& result, uint64_t warningCount)
@@ -26735,20 +27020,20 @@ static void PrintHuntConclusion(const HuntResult& result, uint64_t warningCount)
         verdict = result.Findings.size() >= 1000 ? L"alert_noisy" : L"alert";
         color = KNDBG_COLOR_WARN;
         action = hasHighSignal
-            ? L"read the assessment first, then confirm the high-signal process examples; use /json for full evidence"
-            : L"read the assessment first, then triage high-risk process/reason clusters; use /json for full evidence";
+            ? L"read the assessment first; use /details for raw triage tables or /json for full evidence"
+            : L"read the assessment first; use /details for raw process/reason clusters or /json for full evidence";
     }
     else if (result.MediumFindings != 0)
     {
         verdict = L"review";
         color = KNDBG_COLOR_TITLE;
-        action = L"review medium-risk clusters and confirm with the printed follow-up commands";
+        action = L"review the assessment and confirm with the printed follow-up commands";
     }
     else if (result.LowFindings != 0)
     {
         verdict = L"low_signal";
         color = KNDBG_COLOR_ACCENT;
-        action = L"low-risk leads only; preserve JSON if this is a baseline capture";
+        action = L"low-risk leads only; save JSON if this is a baseline capture";
     }
 
     PrintColoredText(L"[hunt.conclusion]", color);
@@ -26793,48 +27078,176 @@ static void PrintHuntHighSignalTable(const HuntResult& result)
     }
 }
 
+static std::wstring HuntConsoleQuotedText(std::wstring text)
+{
+    std::replace(text.begin(), text.end(), L'"', L'\'');
+    return L"\"" + text + L"\"";
+}
+
+static std::wstring HuntAssessmentSubjectText(const HuntConsoleAssessmentSummary& summary)
+{
+    std::wstring subject = JoinHuntValues(summary.Samples, L",");
+
+    if (subject.empty())
+    {
+        subject = summary.SystemFindings != 0 ? L"system" : L"-";
+    }
+
+    return subject;
+}
+
+static std::wstring HuntAssessmentWhatText(const std::wstring& kind)
+{
+    std::wstring text;
+
+    if (kind == L"published_file_hash_ioc")
+    {
+        text = L"process, driver, or service binary matches a published threat file hash";
+    }
+    else if (kind == L"defense_evasion_driver_artifact")
+    {
+        text = L"SCM or loaded-driver state exposes a known defense-evasion driver artifact";
+    }
+    else if (kind == L"credential_collection_tool")
+    {
+        text = L"process identity or command line matches credential-collection tooling";
+    }
+    else if (kind == L"security_product_targeting")
+    {
+        text = L"process repeatedly controlled known security-product processes";
+    }
+    else if (kind == L"security_communication_blocking")
+    {
+        text = L"WFP block policy targets security or anti-cheat communication";
+    }
+    else if (kind == L"defense_evasion_process_profile")
+    {
+        text = L"process identity or metadata masquerades as a known defense-evasion tool";
+    }
+    else if (kind == L"process_tampering")
+    {
+        text = L"process main image or section backing was swapped, deleted, or write/delete-accessible";
+    }
+    else if (kind == L"module_stomping")
+    {
+        text = L"loaded module code or section permissions indicate module stomping";
+    }
+    else if (kind == L"mapped_code_or_loader_evasion")
+    {
+        text = L"executable code is hidden, replaced, or inconsistent with normal loader views";
+    }
+    else
+    {
+        text = HuntAssessmentTechniqueText(kind);
+    }
+
+    return text;
+}
+
+static std::wstring HuntAssessmentNextText(const HuntConsoleAssessmentSummary& summary)
+{
+    std::wstring next;
+
+    if (summary.Kind == L"published_file_hash_ioc")
+    {
+        next = L"isolate the subject and review matched hash paths in /json";
+    }
+    else if (summary.Kind == L"defense_evasion_driver_artifact")
+    {
+        next = L"review the SCM service, loaded-driver path, and binary hash in /json";
+    }
+    else if (summary.Kind == L"credential_collection_tool")
+    {
+        next = L"review command line, image path, and file identity in /json";
+    }
+    else if (summary.Kind == L"security_product_targeting")
+    {
+        next = L"review recent !ti events and the target process list in /json";
+    }
+    else if (summary.Kind == L"security_communication_blocking")
+    {
+        next = L"run !wfp filters and review filter provider, AppId, and conditions in /json";
+    }
+    else if (summary.Kind == L"defense_evasion_process_profile")
+    {
+        next = L"review image path, signature, version info, and staging path in /json";
+    }
+    else if (summary.Kind == L"process_tampering")
+    {
+        next = L"review main section, VAD backing, and FILE_OBJECT evidence in /json";
+    }
+    else if (summary.Kind == L"module_stomping")
+    {
+        next = L"review module section permissions and live-vs-disk page evidence in /json";
+    }
+    else if (summary.Kind == L"mapped_code_or_loader_evasion")
+    {
+        next = L"run !vad and !threads for the subject, or use /details for raw triage tables";
+    }
+    else
+    {
+        next = L"use /json for full evidence or /details for raw triage tables";
+    }
+
+    return next;
+}
+
 static void PrintHuntAssessment(const HuntResult& result)
 {
-    constexpr size_t maxRows = 5;
-
+    constexpr size_t maxRows = 4;
     std::vector<HuntConsoleAssessmentSummary> summaries = BuildHuntAssessmentSummaries(result);
-    PrintColoredText(L"[hunt.assessment]", summaries.empty() ? KNDBG_COLOR_TITLE : KNDBG_COLOR_WARN);
+
+    PrintColoredText(L"[hunt.assessment]", result.Findings.empty() ? KNDBG_COLOR_TITLE : KNDBG_COLOR_WARN);
     std::wcout << L" showing=" << std::min(maxRows, summaries.size())
-               << L" total=" << summaries.size();
-    if (summaries.empty())
+               << L" total_findings=" << result.Findings.size();
+    if (result.Findings.empty())
     {
         std::wcout << L" none=yes";
     }
     std::wcout << L"\n";
 
+    if (result.Findings.empty())
+    {
+        std::wcout << L"  answer=\"no suspicious hunt findings were emitted for the scanned system view\"\n";
+        return;
+    }
+
     for (size_t index = 0; index < summaries.size() && index < maxRows; ++index)
     {
         const HuntConsoleAssessmentSummary& summary = summaries[index];
-        std::wstringstream row;
-        row << L"  #" << (index + 1)
-            << L" severity=" << HuntAssessmentSeverityText(summary)
-            << L" scope=" << HuntAssessmentScopeText(summary)
-            << L" findings=" << summary.Total
-            << L" high=" << summary.High
-            << L" medium=" << summary.Medium
-            << L" low=" << summary.Low
-            << L" affected_processes=" << summary.ProcessIds.size()
-            << L" system_findings=" << summary.SystemFindings
-            << L"\n";
-        PrintHuntAssessmentLine(summary, row.str());
+        std::wstring severity = HuntAssessmentSeverityText(summary);
+        std::wstring why = HuntAssessmentEvidenceText(summary);
 
-        if (!summary.Samples.empty())
         {
-            PrintHuntAssessmentLine(summary, L"     who=" + JoinHuntValues(summary.Samples) + L"\n");
+            std::wstringstream row;
+            row << L"  #" << (index + 1)
+                << L" severity=" << severity
+                << L" count=" << summary.Total
+                << L" subject=" << HuntConsoleQuotedText(HuntAssessmentSubjectText(summary))
+                << L"\n";
+            PrintHuntAssessmentLine(summary, row.str());
         }
-        PrintHuntAssessmentLine(summary, L"     technique=\"" + HuntAssessmentTechniqueText(summary.Kind) + L"\"\n");
-        PrintHuntAssessmentLine(summary, L"     affected=\"" + HuntAssessmentAffectedText(summary.Kind) + L"\"\n");
-        PrintHuntAssessmentLine(summary, L"     evidence=\"" + HuntAssessmentEvidenceText(summary) + L"\"\n");
+
+        if (why == L"-")
+        {
+            why = L"matched hunt evidence";
+        }
+
+        PrintHuntAssessmentLine(
+            summary,
+            L"     what=" + HuntConsoleQuotedText(HuntAssessmentWhatText(summary.Kind)) + L"\n");
+        PrintHuntAssessmentLine(
+            summary,
+            L"     why=" + HuntConsoleQuotedText(why) + L"\n");
+        PrintHuntAssessmentLine(
+            summary,
+            L"     next=" + HuntConsoleQuotedText(HuntAssessmentNextText(summary)) + L"\n");
     }
 
-    if (!summaries.empty())
+    if (summaries.size() > maxRows)
     {
-        std::wcout << L"  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed\n";
+        std::wcout << L"  more_groups=" << (summaries.size() - maxRows)
+                   << L" use /details for raw triage tables or /json for full evidence\n";
     }
 }
 
@@ -26908,17 +27321,18 @@ static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit, bool
     PrintHuntConclusion(result, warningCount);
     PrintHuntAssessment(result);
     PrintHuntSummaryLine(result);
-    PrintHuntHighSignalTable(result);
-    PrintHuntTriageTables(result);
 
     if (summaryOnly)
     {
         PrintColoredText(L"[hunt.detail]", KNDBG_COLOR_ACCENT);
-        std::wcout << L" suppressed=yes total_findings=" << result.Findings.size()
-                   << L" use /limit n for capped details or /json for full evidence\n";
+        std::wcout << L" suppressed=yes raw_tables=yes total_findings=" << result.Findings.size()
+                   << L" use /details for raw triage tables or /json for full evidence\n";
         PrintHuntWarnings(result, true);
         return;
     }
+
+    PrintHuntHighSignalTable(result);
+    PrintHuntTriageTables(result);
 
     size_t rendered = 0;
     size_t findingLimit = renderLimit != 0 ? renderLimit : result.Findings.size();

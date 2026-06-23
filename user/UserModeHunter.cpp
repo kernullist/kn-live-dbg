@@ -2,6 +2,7 @@
 
 #include "ByovdScanner.h"
 #include "IntegrityScanner.h"
+#include "WfpScanner.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -245,12 +246,93 @@ namespace
         TypeFieldInfo ControlAreaFilePointer = {};
         TypeFieldInfo ControlAreaImageFlag = {};
         TypeFieldInfo FileObjectFileName = {};
+        TypeFieldInfo FileObjectSectionObjectPointer = {};
+        TypeFieldInfo FileObjectDeletePending = {};
+        TypeFieldInfo FileObjectWriteAccess = {};
+        TypeFieldInfo FileObjectDeleteAccess = {};
+        TypeFieldInfo FileObjectSharedWrite = {};
+        TypeFieldInfo FileObjectSharedDelete = {};
+        TypeFieldInfo FileObjectFlags = {};
+        TypeFieldInfo SectionObjectPointersImageSectionObject = {};
+        TypeFieldInfo SectionObjectPointersDataSectionObject = {};
         bool HasSubsectionControlArea = false;
         bool HasControlAreaFilePointer = false;
         bool HasControlAreaImageFlag = false;
         bool HasFileObjectFileName = false;
+        bool HasFileObjectSectionObjectPointer = false;
+        bool HasFileObjectDeletePending = false;
+        bool HasFileObjectWriteAccess = false;
+        bool HasFileObjectDeleteAccess = false;
+        bool HasFileObjectSharedWrite = false;
+        bool HasFileObjectSharedDelete = false;
+        bool HasFileObjectFlags = false;
+        bool HasSectionObjectPointersImageSectionObject = false;
+        bool HasSectionObjectPointersDataSectionObject = false;
         bool Resolved = false;
         std::vector<std::wstring> Warnings;
+    };
+
+    struct MainSectionObjectLayout
+    {
+        TypeFieldInfo EprocessSectionObject = {};
+        TypeFieldInfo SectionObjectSegment = {};
+        TypeFieldInfo SegmentControlArea = {};
+        TypeFieldInfo ControlAreaFilePointer = {};
+        TypeFieldInfo ControlAreaImageFlag = {};
+        TypeFieldInfo FileObjectFileName = {};
+        TypeFieldInfo FileObjectSectionObjectPointer = {};
+        TypeFieldInfo FileObjectDeletePending = {};
+        TypeFieldInfo FileObjectWriteAccess = {};
+        TypeFieldInfo FileObjectDeleteAccess = {};
+        TypeFieldInfo FileObjectSharedWrite = {};
+        TypeFieldInfo FileObjectSharedDelete = {};
+        TypeFieldInfo FileObjectFlags = {};
+        TypeFieldInfo SectionObjectPointersImageSectionObject = {};
+        TypeFieldInfo SectionObjectPointersDataSectionObject = {};
+        bool HasEprocessSectionObject = false;
+        bool HasSectionObjectSegment = false;
+        bool HasSegmentControlArea = false;
+        bool HasControlAreaFilePointer = false;
+        bool HasControlAreaImageFlag = false;
+        bool HasFileObjectFileName = false;
+        bool HasFileObjectSectionObjectPointer = false;
+        bool HasFileObjectDeletePending = false;
+        bool HasFileObjectWriteAccess = false;
+        bool HasFileObjectDeleteAccess = false;
+        bool HasFileObjectSharedWrite = false;
+        bool HasFileObjectSharedDelete = false;
+        bool HasFileObjectFlags = false;
+        bool HasSectionObjectPointersImageSectionObject = false;
+        bool HasSectionObjectPointersDataSectionObject = false;
+        bool Resolved = false;
+        std::vector<std::wstring> Warnings;
+    };
+
+    struct ControlAreaBackingDetails
+    {
+        std::wstring Path;
+        std::wstring State = L"unavailable";
+        uint64_t ControlArea = 0;
+        uint64_t FileFastRef = 0;
+        uint64_t FileObject = 0;
+        uint64_t SectionObjectPointers = 0;
+        uint64_t ImageSectionObject = 0;
+        uint64_t DataSectionObject = 0;
+        uint32_t FileFlags = 0;
+        bool HasFileFlags = false;
+        bool HasDeletePending = false;
+        bool DeletePending = false;
+        bool HasWriteAccess = false;
+        bool WriteAccess = false;
+        bool HasDeleteAccess = false;
+        bool DeleteAccess = false;
+        bool HasSharedWrite = false;
+        bool SharedWrite = false;
+        bool HasSharedDelete = false;
+        bool SharedDelete = false;
+        bool HasSectionObjectPointers = false;
+        bool HasImageSectionObject = false;
+        bool HasDataSectionObject = false;
     };
 
     std::wstring HuntHex(uint64_t value, uint32_t width = 0)
@@ -2872,6 +2954,24 @@ namespace
                 FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"Image", &layout->ControlAreaImageFlag);
             layout->HasFileObjectFileName =
                 FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"FileName", &layout->FileObjectFileName);
+            layout->HasFileObjectSectionObjectPointer =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"SectionObjectPointer", &layout->FileObjectSectionObjectPointer);
+            layout->HasFileObjectDeletePending =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"DeletePending", &layout->FileObjectDeletePending);
+            layout->HasFileObjectWriteAccess =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"WriteAccess", &layout->FileObjectWriteAccess);
+            layout->HasFileObjectDeleteAccess =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"DeleteAccess", &layout->FileObjectDeleteAccess);
+            layout->HasFileObjectSharedWrite =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"SharedWrite", &layout->FileObjectSharedWrite);
+            layout->HasFileObjectSharedDelete =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"SharedDelete", &layout->FileObjectSharedDelete);
+            layout->HasFileObjectFlags =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"Flags", &layout->FileObjectFlags);
+            layout->HasSectionObjectPointersImageSectionObject =
+                FindFieldRecursive(symbols, {L"nt!_SECTION_OBJECT_POINTERS", L"_SECTION_OBJECT_POINTERS"}, L"ImageSectionObject", &layout->SectionObjectPointersImageSectionObject);
+            layout->HasSectionObjectPointersDataSectionObject =
+                FindFieldRecursive(symbols, {L"nt!_SECTION_OBJECT_POINTERS", L"_SECTION_OBJECT_POINTERS"}, L"DataSectionObject", &layout->SectionObjectPointersDataSectionObject);
 
             if (!layout->HasSubsectionControlArea)
             {
@@ -2894,6 +2994,428 @@ namespace
         return ok;
     }
 
+    bool ResolveMainSectionObjectLayout(SymbolEngine& symbols, MainSectionObjectLayout* layout)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (layout == nullptr)
+            {
+                break;
+            }
+
+            if (layout->Resolved)
+            {
+                ok = layout->HasEprocessSectionObject &&
+                    layout->HasSectionObjectSegment &&
+                    layout->HasSegmentControlArea &&
+                    layout->HasControlAreaFilePointer &&
+                    layout->HasFileObjectFileName;
+                break;
+            }
+
+            *layout = MainSectionObjectLayout{};
+            layout->Resolved = true;
+            layout->HasEprocessSectionObject =
+                FindFieldRecursive(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"SectionObject", &layout->EprocessSectionObject);
+            layout->HasSectionObjectSegment =
+                FindFieldRecursive(symbols, {L"nt!_SECTION_OBJECT", L"_SECTION_OBJECT", L"nt!_SECTION", L"_SECTION"}, L"Segment", &layout->SectionObjectSegment);
+            layout->HasSegmentControlArea =
+                FindFieldRecursive(symbols, {L"nt!_SEGMENT", L"_SEGMENT"}, L"ControlArea", &layout->SegmentControlArea);
+            layout->HasControlAreaFilePointer =
+                FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"FilePointer", &layout->ControlAreaFilePointer);
+            layout->HasControlAreaImageFlag =
+                FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"Image", &layout->ControlAreaImageFlag);
+            layout->HasFileObjectFileName =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"FileName", &layout->FileObjectFileName);
+            layout->HasFileObjectSectionObjectPointer =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"SectionObjectPointer", &layout->FileObjectSectionObjectPointer);
+            layout->HasFileObjectDeletePending =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"DeletePending", &layout->FileObjectDeletePending);
+            layout->HasFileObjectWriteAccess =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"WriteAccess", &layout->FileObjectWriteAccess);
+            layout->HasFileObjectDeleteAccess =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"DeleteAccess", &layout->FileObjectDeleteAccess);
+            layout->HasFileObjectSharedWrite =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"SharedWrite", &layout->FileObjectSharedWrite);
+            layout->HasFileObjectSharedDelete =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"SharedDelete", &layout->FileObjectSharedDelete);
+            layout->HasFileObjectFlags =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"Flags", &layout->FileObjectFlags);
+            layout->HasSectionObjectPointersImageSectionObject =
+                FindFieldRecursive(symbols, {L"nt!_SECTION_OBJECT_POINTERS", L"_SECTION_OBJECT_POINTERS"}, L"ImageSectionObject", &layout->SectionObjectPointersImageSectionObject);
+            layout->HasSectionObjectPointersDataSectionObject =
+                FindFieldRecursive(symbols, {L"nt!_SECTION_OBJECT_POINTERS", L"_SECTION_OBJECT_POINTERS"}, L"DataSectionObject", &layout->SectionObjectPointersDataSectionObject);
+
+            if (!layout->HasEprocessSectionObject)
+            {
+                layout->Warnings.push_back(L"_EPROCESS.SectionObject field unavailable");
+            }
+            if (!layout->HasSectionObjectSegment)
+            {
+                layout->Warnings.push_back(L"_SECTION_OBJECT.Segment field unavailable");
+            }
+            if (!layout->HasSegmentControlArea)
+            {
+                layout->Warnings.push_back(L"_SEGMENT.ControlArea field unavailable");
+            }
+            if (!layout->HasControlAreaFilePointer)
+            {
+                layout->Warnings.push_back(L"_CONTROL_AREA.FilePointer field unavailable");
+            }
+            if (!layout->HasFileObjectFileName)
+            {
+                layout->Warnings.push_back(L"_FILE_OBJECT.FileName field unavailable");
+            }
+
+            ok = layout->HasEprocessSectionObject &&
+                layout->HasSectionObjectSegment &&
+                layout->HasSegmentControlArea &&
+                layout->HasControlAreaFilePointer &&
+                layout->HasFileObjectFileName;
+        } while (false);
+
+        return ok;
+    }
+
+    void ReadOptionalKernelBooleanField(
+        DeviceClient& device,
+        uint64_t base,
+        const TypeFieldInfo& field,
+        bool hasField,
+        bool* hasValue,
+        bool* value)
+    {
+        do
+        {
+            if (hasValue == nullptr || value == nullptr)
+            {
+                break;
+            }
+
+            *hasValue = false;
+            *value = false;
+            if (!hasField || base == 0)
+            {
+                break;
+            }
+
+            uint64_t raw = 0;
+            std::wstring ignored;
+            if (!ReadFieldInteger(device, base, field, sizeof(uint8_t), &raw, &ignored))
+            {
+                break;
+            }
+
+            *hasValue = true;
+            *value = raw != 0;
+        } while (false);
+    }
+
+    void ReadOptionalKernelIntegerField(
+        DeviceClient& device,
+        uint64_t base,
+        const TypeFieldInfo& field,
+        bool hasField,
+        size_t fallbackWidth,
+        bool* hasValue,
+        uint64_t* value)
+    {
+        do
+        {
+            if (hasValue == nullptr || value == nullptr)
+            {
+                break;
+            }
+
+            *hasValue = false;
+            *value = 0;
+            if (!hasField || base == 0)
+            {
+                break;
+            }
+
+            std::wstring ignored;
+            if (!ReadFieldInteger(device, base, field, fallbackWidth, value, &ignored))
+            {
+                break;
+            }
+
+            *hasValue = true;
+        } while (false);
+    }
+
+    bool ResolveControlAreaBackingDetails(
+        DeviceClient& device,
+        uint64_t controlArea,
+        const TypeFieldInfo& controlAreaFilePointer,
+        const TypeFieldInfo& fileObjectFileName,
+        const TypeFieldInfo* fileObjectSectionObjectPointer,
+        bool hasFileObjectSectionObjectPointer,
+        const TypeFieldInfo* fileObjectDeletePending,
+        bool hasFileObjectDeletePending,
+        const TypeFieldInfo* fileObjectWriteAccess,
+        bool hasFileObjectWriteAccess,
+        const TypeFieldInfo* fileObjectDeleteAccess,
+        bool hasFileObjectDeleteAccess,
+        const TypeFieldInfo* fileObjectSharedWrite,
+        bool hasFileObjectSharedWrite,
+        const TypeFieldInfo* fileObjectSharedDelete,
+        bool hasFileObjectSharedDelete,
+        const TypeFieldInfo* fileObjectFlags,
+        bool hasFileObjectFlags,
+        const TypeFieldInfo* sectionObjectPointersImageSectionObject,
+        bool hasSectionObjectPointersImageSectionObject,
+        const TypeFieldInfo* sectionObjectPointersDataSectionObject,
+        bool hasSectionObjectPointersDataSectionObject,
+        ControlAreaBackingDetails* details,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (details == nullptr)
+            {
+                break;
+            }
+
+            *details = ControlAreaBackingDetails{};
+            details->ControlArea = controlArea;
+            details->State = L"unavailable";
+
+            uint64_t fileFastRef = 0;
+            if (!ReadFieldInteger(device, controlArea, controlAreaFilePointer, sizeof(uint64_t), &fileFastRef, warning))
+            {
+                if (warning != nullptr && warning->empty())
+                {
+                    *warning = L"failed to read control area file pointer";
+                }
+                break;
+            }
+
+            details->FileFastRef = fileFastRef;
+            uint64_t fileObject = fileFastRef & ~0xfull;
+            details->FileObject = fileObject;
+            if (fileObject == 0)
+            {
+                details->State = L"unbacked";
+                ok = true;
+                break;
+            }
+
+            if (!IsKernelAddress(fileObject))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"control area file pointer is not a kernel address";
+                }
+                break;
+            }
+
+            uint64_t sectionObjectPointers = 0;
+            bool hasSectionObjectPointers = false;
+            if (fileObjectSectionObjectPointer != nullptr)
+            {
+                ReadOptionalKernelIntegerField(
+                    device,
+                    fileObject,
+                    *fileObjectSectionObjectPointer,
+                    hasFileObjectSectionObjectPointer,
+                    sizeof(uint64_t),
+                    &hasSectionObjectPointers,
+                    &sectionObjectPointers);
+            }
+
+            details->HasSectionObjectPointers = hasSectionObjectPointers;
+            details->SectionObjectPointers = sectionObjectPointers;
+            if (hasSectionObjectPointers &&
+                sectionObjectPointers != 0 &&
+                IsKernelAddress(sectionObjectPointers))
+            {
+                uint64_t imageSectionObject = 0;
+                bool hasImageSectionObject = false;
+                if (sectionObjectPointersImageSectionObject != nullptr)
+                {
+                    ReadOptionalKernelIntegerField(
+                        device,
+                        sectionObjectPointers,
+                        *sectionObjectPointersImageSectionObject,
+                        hasSectionObjectPointersImageSectionObject,
+                        sizeof(uint64_t),
+                        &hasImageSectionObject,
+                        &imageSectionObject);
+                }
+
+                uint64_t dataSectionObject = 0;
+                bool hasDataSectionObject = false;
+                if (sectionObjectPointersDataSectionObject != nullptr)
+                {
+                    ReadOptionalKernelIntegerField(
+                        device,
+                        sectionObjectPointers,
+                        *sectionObjectPointersDataSectionObject,
+                        hasSectionObjectPointersDataSectionObject,
+                        sizeof(uint64_t),
+                        &hasDataSectionObject,
+                        &dataSectionObject);
+                }
+
+                details->HasImageSectionObject = hasImageSectionObject;
+                details->ImageSectionObject = imageSectionObject;
+                details->HasDataSectionObject = hasDataSectionObject;
+                details->DataSectionObject = dataSectionObject;
+            }
+
+            if (fileObjectDeletePending != nullptr)
+            {
+                ReadOptionalKernelBooleanField(
+                    device,
+                    fileObject,
+                    *fileObjectDeletePending,
+                    hasFileObjectDeletePending,
+                    &details->HasDeletePending,
+                    &details->DeletePending);
+            }
+            if (fileObjectWriteAccess != nullptr)
+            {
+                ReadOptionalKernelBooleanField(
+                    device,
+                    fileObject,
+                    *fileObjectWriteAccess,
+                    hasFileObjectWriteAccess,
+                    &details->HasWriteAccess,
+                    &details->WriteAccess);
+            }
+            if (fileObjectDeleteAccess != nullptr)
+            {
+                ReadOptionalKernelBooleanField(
+                    device,
+                    fileObject,
+                    *fileObjectDeleteAccess,
+                    hasFileObjectDeleteAccess,
+                    &details->HasDeleteAccess,
+                    &details->DeleteAccess);
+            }
+            if (fileObjectSharedWrite != nullptr)
+            {
+                ReadOptionalKernelBooleanField(
+                    device,
+                    fileObject,
+                    *fileObjectSharedWrite,
+                    hasFileObjectSharedWrite,
+                    &details->HasSharedWrite,
+                    &details->SharedWrite);
+            }
+            if (fileObjectSharedDelete != nullptr)
+            {
+                ReadOptionalKernelBooleanField(
+                    device,
+                    fileObject,
+                    *fileObjectSharedDelete,
+                    hasFileObjectSharedDelete,
+                    &details->HasSharedDelete,
+                    &details->SharedDelete);
+            }
+            if (fileObjectFlags != nullptr)
+            {
+                uint64_t fileFlags = 0;
+                bool hasFileFlags = false;
+                ReadOptionalKernelIntegerField(
+                    device,
+                    fileObject,
+                    *fileObjectFlags,
+                    hasFileObjectFlags,
+                    sizeof(uint32_t),
+                    &hasFileFlags,
+                    &fileFlags);
+                details->HasFileFlags = hasFileFlags;
+                details->FileFlags = static_cast<uint32_t>(fileFlags);
+            }
+
+            uint64_t fileNameAddress = 0;
+            if (!TryAdd(fileObject, fileObjectFileName.Offset, &fileNameAddress))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"FILE_OBJECT.FileName address overflow";
+                }
+                break;
+            }
+
+            std::wstring backingPath;
+            if (!ReadKernelUnicodeString(device, fileNameAddress, kMaxPebStringBytes, &backingPath, warning))
+            {
+                if (warning != nullptr && warning->empty())
+                {
+                    *warning = L"failed to read FILE_OBJECT.FileName";
+                }
+                break;
+            }
+
+            details->Path = backingPath;
+            details->State = backingPath.empty() ? L"empty_file_name" : L"resolved";
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ResolveControlAreaBackingPath(
+        DeviceClient& device,
+        uint64_t controlArea,
+        const TypeFieldInfo& controlAreaFilePointer,
+        const TypeFieldInfo& fileObjectFileName,
+        std::wstring* path,
+        std::wstring* state,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (path == nullptr || state == nullptr)
+            {
+                break;
+            }
+
+            ControlAreaBackingDetails details;
+            ok = ResolveControlAreaBackingDetails(
+                device,
+                controlArea,
+                controlAreaFilePointer,
+                fileObjectFileName,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                nullptr,
+                false,
+                &details,
+                warning);
+            if (ok)
+            {
+                *path = details.Path;
+                *state = details.State;
+            }
+        } while (false);
+
+        return ok;
+    }
+
     bool ResolveVadSectionBackingPath(
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -2901,7 +3423,9 @@ namespace
         std::wstring* path,
         std::wstring* state,
         std::wstring* warning,
-        bool* imageSection = nullptr)
+        bool* imageSection = nullptr,
+        uint64_t* controlAreaOut = nullptr,
+        ControlAreaBackingDetails* details = nullptr)
     {
         bool ok = false;
         static SectionBackingLayout layout;
@@ -2919,10 +3443,22 @@ namespace
             {
                 *imageSection = false;
             }
+            if (controlAreaOut != nullptr)
+            {
+                *controlAreaOut = 0;
+            }
+            if (details != nullptr)
+            {
+                *details = ControlAreaBackingDetails{};
+            }
 
             if (!vad.HasSubsection || vad.Subsection == 0)
             {
                 *state = L"unbacked";
+                if (details != nullptr)
+                {
+                    details->State = L"unbacked";
+                }
                 ok = true;
                 break;
             }
@@ -2947,6 +3483,10 @@ namespace
                 }
                 break;
             }
+            if (controlAreaOut != nullptr)
+            {
+                *controlAreaOut = controlArea;
+            }
 
             if (imageSection != nullptr && layout.HasControlAreaImageFlag)
             {
@@ -2958,59 +3498,371 @@ namespace
                 }
             }
 
-            uint64_t fileFastRef = 0;
-            if (!ReadFieldInteger(device, controlArea, layout.ControlAreaFilePointer, sizeof(uint64_t), &fileFastRef, warning))
+            if (details != nullptr)
             {
-                if (warning != nullptr && warning->empty())
+                ok = ResolveControlAreaBackingDetails(
+                    device,
+                    controlArea,
+                    layout.ControlAreaFilePointer,
+                    layout.FileObjectFileName,
+                    &layout.FileObjectSectionObjectPointer,
+                    layout.HasFileObjectSectionObjectPointer,
+                    &layout.FileObjectDeletePending,
+                    layout.HasFileObjectDeletePending,
+                    &layout.FileObjectWriteAccess,
+                    layout.HasFileObjectWriteAccess,
+                    &layout.FileObjectDeleteAccess,
+                    layout.HasFileObjectDeleteAccess,
+                    &layout.FileObjectSharedWrite,
+                    layout.HasFileObjectSharedWrite,
+                    &layout.FileObjectSharedDelete,
+                    layout.HasFileObjectSharedDelete,
+                    &layout.FileObjectFlags,
+                    layout.HasFileObjectFlags,
+                    &layout.SectionObjectPointersImageSectionObject,
+                    layout.HasSectionObjectPointersImageSectionObject,
+                    &layout.SectionObjectPointersDataSectionObject,
+                    layout.HasSectionObjectPointersDataSectionObject,
+                    details,
+                    warning);
+                if (ok)
                 {
-                    *warning = L"failed to read control area file pointer";
+                    *path = details->Path;
+                    *state = details->State;
                 }
-                break;
             }
-
-            uint64_t fileObject = fileFastRef & ~0xfull;
-            if (fileObject == 0)
+            else
             {
-                *state = L"unbacked";
-                ok = true;
-                break;
+                ok = ResolveControlAreaBackingPath(
+                    device,
+                    controlArea,
+                    layout.ControlAreaFilePointer,
+                    layout.FileObjectFileName,
+                    path,
+                    state,
+                    warning);
             }
-
-            if (!IsKernelAddress(fileObject))
-            {
-                if (warning != nullptr)
-                {
-                    *warning = L"control area file pointer is not a kernel address";
-                }
-                break;
-            }
-
-            uint64_t fileNameAddress = 0;
-            if (!TryAdd(fileObject, layout.FileObjectFileName.Offset, &fileNameAddress))
-            {
-                if (warning != nullptr)
-                {
-                    *warning = L"FILE_OBJECT.FileName address overflow";
-                }
-                break;
-            }
-
-            std::wstring backingPath;
-            if (!ReadKernelUnicodeString(device, fileNameAddress, kMaxPebStringBytes, &backingPath, warning))
-            {
-                if (warning != nullptr && warning->empty())
-                {
-                    *warning = L"failed to read FILE_OBJECT.FileName";
-                }
-                break;
-            }
-
-            *path = backingPath;
-            *state = backingPath.empty() ? L"empty_file_name" : L"resolved";
-            ok = true;
         } while (false);
 
         return ok;
+    }
+
+    bool ResolveEprocessMainSectionBackingPath(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t eprocess,
+        std::wstring* path,
+        std::wstring* state,
+        uint64_t* sectionObject,
+        uint64_t* segment,
+        uint64_t* controlArea,
+        std::wstring* warning,
+        bool* imageSection = nullptr,
+        ControlAreaBackingDetails* details = nullptr)
+    {
+        bool ok = false;
+        static MainSectionObjectLayout layout;
+
+        do
+        {
+            if (path == nullptr || state == nullptr)
+            {
+                break;
+            }
+
+            path->clear();
+            *state = L"unavailable";
+            if (sectionObject != nullptr)
+            {
+                *sectionObject = 0;
+            }
+            if (segment != nullptr)
+            {
+                *segment = 0;
+            }
+            if (controlArea != nullptr)
+            {
+                *controlArea = 0;
+            }
+            if (imageSection != nullptr)
+            {
+                *imageSection = false;
+            }
+            if (details != nullptr)
+            {
+                *details = ControlAreaBackingDetails{};
+            }
+
+            if (eprocess == 0 || !IsKernelAddress(eprocess))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"EPROCESS address is unavailable";
+                }
+                break;
+            }
+
+            if (!ResolveMainSectionObjectLayout(symbols, &layout))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"main section object resolver unavailable: " + JoinWideValues(layout.Warnings, L"; ");
+                }
+                break;
+            }
+
+            uint64_t localSectionObject = 0;
+            if (!ReadFieldInteger(device, eprocess, layout.EprocessSectionObject, sizeof(uint64_t), &localSectionObject, warning))
+            {
+                if (warning != nullptr && warning->empty())
+                {
+                    *warning = L"failed to read EPROCESS section object";
+                }
+                break;
+            }
+            if (sectionObject != nullptr)
+            {
+                *sectionObject = localSectionObject;
+            }
+            if (localSectionObject == 0)
+            {
+                *state = L"no_section_object";
+                if (details != nullptr)
+                {
+                    details->State = L"no_section_object";
+                }
+                ok = true;
+                break;
+            }
+            if (!IsKernelAddress(localSectionObject))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"EPROCESS section object is not a kernel address";
+                }
+                break;
+            }
+
+            uint64_t localSegment = 0;
+            if (!ReadFieldInteger(device, localSectionObject, layout.SectionObjectSegment, sizeof(uint64_t), &localSegment, warning))
+            {
+                if (warning != nullptr && warning->empty())
+                {
+                    *warning = L"failed to read section object segment";
+                }
+                break;
+            }
+            if (segment != nullptr)
+            {
+                *segment = localSegment;
+            }
+            if (localSegment == 0)
+            {
+                *state = L"no_segment";
+                if (details != nullptr)
+                {
+                    details->State = L"no_segment";
+                }
+                ok = true;
+                break;
+            }
+            if (!IsKernelAddress(localSegment))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"section object segment is not a kernel address";
+                }
+                break;
+            }
+
+            uint64_t localControlArea = 0;
+            if (!ReadFieldInteger(device, localSegment, layout.SegmentControlArea, sizeof(uint64_t), &localControlArea, warning))
+            {
+                if (warning != nullptr && warning->empty())
+                {
+                    *warning = L"failed to read segment control area";
+                }
+                break;
+            }
+            if (controlArea != nullptr)
+            {
+                *controlArea = localControlArea;
+            }
+            if (localControlArea == 0)
+            {
+                *state = L"no_control_area";
+                if (details != nullptr)
+                {
+                    details->State = L"no_control_area";
+                }
+                ok = true;
+                break;
+            }
+            if (!IsKernelAddress(localControlArea))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"segment control area is not a kernel address";
+                }
+                break;
+            }
+
+            if (imageSection != nullptr && layout.HasControlAreaImageFlag)
+            {
+                uint64_t imageFlag = 0;
+                std::wstring ignored;
+                if (ReadFieldInteger(device, localControlArea, layout.ControlAreaImageFlag, sizeof(uint32_t), &imageFlag, &ignored))
+                {
+                    *imageSection = imageFlag != 0;
+                }
+            }
+
+            if (details != nullptr)
+            {
+                ok = ResolveControlAreaBackingDetails(
+                    device,
+                    localControlArea,
+                    layout.ControlAreaFilePointer,
+                    layout.FileObjectFileName,
+                    &layout.FileObjectSectionObjectPointer,
+                    layout.HasFileObjectSectionObjectPointer,
+                    &layout.FileObjectDeletePending,
+                    layout.HasFileObjectDeletePending,
+                    &layout.FileObjectWriteAccess,
+                    layout.HasFileObjectWriteAccess,
+                    &layout.FileObjectDeleteAccess,
+                    layout.HasFileObjectDeleteAccess,
+                    &layout.FileObjectSharedWrite,
+                    layout.HasFileObjectSharedWrite,
+                    &layout.FileObjectSharedDelete,
+                    layout.HasFileObjectSharedDelete,
+                    &layout.FileObjectFlags,
+                    layout.HasFileObjectFlags,
+                    &layout.SectionObjectPointersImageSectionObject,
+                    layout.HasSectionObjectPointersImageSectionObject,
+                    &layout.SectionObjectPointersDataSectionObject,
+                    layout.HasSectionObjectPointersDataSectionObject,
+                    details,
+                    warning);
+                if (ok)
+                {
+                    *path = details->Path;
+                    *state = details->State;
+                }
+            }
+            else
+            {
+                ok = ResolveControlAreaBackingPath(
+                    device,
+                    localControlArea,
+                    layout.ControlAreaFilePointer,
+                    layout.FileObjectFileName,
+                    path,
+                    state,
+                    warning);
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    void AddControlAreaBackingEvidence(
+        const std::wstring& prefix,
+        const ControlAreaBackingDetails& details,
+        std::map<std::wstring, std::wstring>* evidence)
+    {
+        do
+        {
+            if (evidence == nullptr || prefix.empty())
+            {
+                break;
+            }
+
+            (*evidence)[prefix + L"_state"] = details.State;
+            (*evidence)[prefix + L"_path"] = details.Path;
+            (*evidence)[prefix + L"_control_area"] = HuntHex(details.ControlArea, 16);
+            (*evidence)[prefix + L"_file_object"] = HuntHex(details.FileObject, 16);
+            (*evidence)[prefix + L"_file_fast_ref"] = HuntHex(details.FileFastRef, 16);
+            if (details.HasSectionObjectPointers)
+            {
+                (*evidence)[prefix + L"_section_object_pointers"] = HuntHex(details.SectionObjectPointers, 16);
+            }
+            if (details.HasImageSectionObject)
+            {
+                (*evidence)[prefix + L"_image_section_object"] = HuntHex(details.ImageSectionObject, 16);
+            }
+            if (details.HasDataSectionObject)
+            {
+                (*evidence)[prefix + L"_data_section_object"] = HuntHex(details.DataSectionObject, 16);
+            }
+            if (details.HasFileFlags)
+            {
+                (*evidence)[prefix + L"_file_flags"] = HuntHex(details.FileFlags, 8);
+            }
+            if (details.HasDeletePending)
+            {
+                (*evidence)[prefix + L"_delete_pending"] = details.DeletePending ? L"true" : L"false";
+            }
+            if (details.HasWriteAccess)
+            {
+                (*evidence)[prefix + L"_write_access"] = details.WriteAccess ? L"true" : L"false";
+            }
+            if (details.HasDeleteAccess)
+            {
+                (*evidence)[prefix + L"_delete_access"] = details.DeleteAccess ? L"true" : L"false";
+            }
+            if (details.HasSharedWrite)
+            {
+                (*evidence)[prefix + L"_shared_write"] = details.SharedWrite ? L"true" : L"false";
+            }
+            if (details.HasSharedDelete)
+            {
+                (*evidence)[prefix + L"_shared_delete"] = details.SharedDelete ? L"true" : L"false";
+            }
+        } while (false);
+    }
+
+    bool ControlAreaBackingHasSuspiciousFileAccess(const ControlAreaBackingDetails& details)
+    {
+        return (details.HasWriteAccess && details.WriteAccess) ||
+            (details.HasDeleteAccess && details.DeleteAccess);
+    }
+
+    bool ControlAreaBackingHasImageSectionPointerMismatch(const ControlAreaBackingDetails& details)
+    {
+        return details.HasImageSectionObject &&
+            details.ImageSectionObject != 0 &&
+            IsKernelAddress(details.ImageSectionObject) &&
+            details.ControlArea != 0 &&
+            IsKernelAddress(details.ControlArea) &&
+            details.ImageSectionObject != details.ControlArea;
+    }
+
+    void AddProcessTamperingPrimitiveReasons(
+        const std::wstring& prefix,
+        const ControlAreaBackingDetails& details,
+        std::vector<std::wstring>* reasons)
+    {
+        do
+        {
+            if (reasons == nullptr)
+            {
+                break;
+            }
+
+            if (details.HasDeletePending && details.DeletePending)
+            {
+                AddUnique(reasons, prefix + L"_file_delete_pending");
+            }
+            if (ControlAreaBackingHasSuspiciousFileAccess(details))
+            {
+                AddUnique(reasons, prefix + L"_file_write_or_delete_access");
+            }
+            if (ControlAreaBackingHasImageSectionPointerMismatch(details))
+            {
+                AddUnique(reasons, prefix + L"_file_section_object_pointer_mismatch");
+            }
+        } while (false);
     }
 
     void MergeModule(std::vector<HuntModuleRecord>* modules, const HuntModuleRecord& incoming)
@@ -6057,6 +6909,258 @@ namespace
         return matched;
     }
 
+    bool HuntTextTargetsKnownSecurityProduct(
+        const std::wstring& text,
+        std::wstring* matchedTarget)
+    {
+        HuntTelemetryEvent event = {};
+        event.TargetImageBase = text;
+        event.TaskName = text;
+        event.Payload.push_back({L"text", text});
+        return ThreatIntelEventTargetsKnownSecurityProduct(event, matchedTarget);
+    }
+
+    bool HuntTextTargetsKnownAntiCheat(
+        const std::wstring& text,
+        std::wstring* matchedTarget)
+    {
+        bool matched = false;
+
+        static const wchar_t* kTargets[] =
+        {
+            L"vgc.exe",
+            L"vgk.sys",
+            L"riotclientservices.exe",
+            L"easyanticheat.exe",
+            L"easyanticheat_eos.exe",
+            L"eac_launcher.exe",
+            L"eaanticheat.exe",
+            L"eaanticheat.gameservice.exe",
+            L"eaanticheatlight.exe",
+            L"beservice.exe",
+            L"battleye.exe",
+            L"belauncher.exe",
+            L"bedaisy.sys",
+            L"faceitclient.exe",
+            L"faceitservice.exe",
+            L"faceit.sys",
+            L"equ8.exe",
+            L"equ8_service.exe",
+            L"xigncode3.exe",
+            L"xigncode3.sys",
+            L"xhunter1.sys",
+            L"mhyprot2.sys",
+            L"ace.exe",
+            L"ace-base.sys",
+            L"ace-guard.sys",
+            L"tessafe.sys",
+            L"tensafe.sys",
+            L"gamedriverx64.sys"
+        };
+
+        do
+        {
+            std::wstring lowered = HuntToLower(text);
+            std::wstring leaf = LeafName(text);
+
+            for (const wchar_t* target : kTargets)
+            {
+                if (target == nullptr || target[0] == L'\0')
+                {
+                    continue;
+                }
+
+                std::wstring targetName = HuntToLower(target);
+                if (leaf == targetName ||
+                    HuntTextContainsDelimitedProcessLeaf(lowered, targetName))
+                {
+                    if (matchedTarget != nullptr)
+                    {
+                        *matchedTarget = targetName;
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool WfpFilterIsDisabled(const WfpRecord& record)
+    {
+        return HuntToLower(record.FlagsText).find(L"disabled") != std::wstring::npos;
+    }
+
+    bool WfpFilterBlocksTraffic(const WfpRecord& record)
+    {
+        std::wstring action = HuntToLower(record.ActionText);
+        return action == L"block" || action == L"bitmaskblock";
+    }
+
+    bool WfpFilterHasHighWeight(const WfpRecord& record)
+    {
+        std::wstring weight = HuntToLower(record.WeightText);
+        return weight.find(L"ffffffffffffffff") != std::wstring::npos ||
+            weight.find(L"0xffffffffffffffff") != std::wstring::npos;
+    }
+
+    std::wstring WfpRecordTargetText(const WfpRecord& record)
+    {
+        std::wstring text;
+        text += record.AppIdText;
+        text += L" ";
+        text += record.ConditionsText;
+        text += L" ";
+        text += record.Name;
+        text += L" ";
+        text += record.Description;
+        text += L" ";
+        text += record.ProviderName;
+        text += L" ";
+        text += record.ProviderService;
+        text += L" ";
+        text += record.SubLayerName;
+        return text;
+    }
+
+    void AddWfpHuntFindings(HuntResult* result)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            WfpScanner scanner;
+            WfpScanner::Options options = {};
+            options.Target = WfpScanner::Scope::Filters;
+
+            WfpScanResult scan = {};
+            std::wstring error;
+            if (!scanner.Scan(options, &scan, &error))
+            {
+                if (!error.empty())
+                {
+                    AddUnique(&result->Warnings, L"WFP filter scan failed: " + error);
+                }
+                break;
+            }
+
+            result->WfpFilterCount = scan.Records.size();
+            for (const std::wstring& warning : scan.Warnings)
+            {
+                AddUnique(&result->Warnings, L"WFP filter warning: " + warning);
+            }
+
+            for (const WfpRecord& record : scan.Records)
+            {
+                if (record.Kind != L"wfp.filter" ||
+                    WfpFilterIsDisabled(record) ||
+                    !WfpFilterBlocksTraffic(record))
+                {
+                    continue;
+                }
+
+                std::wstring appTarget = record.HasAppIdCondition ? record.AppIdText : L"";
+                std::wstring fullTargetText = WfpRecordTargetText(record);
+                std::wstring securityTarget;
+                std::wstring antiCheatTarget;
+                bool appTargetsSecurityProduct = !appTarget.empty() &&
+                    HuntTextTargetsKnownSecurityProduct(appTarget, &securityTarget);
+                bool appTargetsAntiCheat = !appTarget.empty() &&
+                    HuntTextTargetsKnownAntiCheat(appTarget, &antiCheatTarget);
+                bool textTargetsSecurityProduct = !appTargetsSecurityProduct &&
+                    HuntTextTargetsKnownSecurityProduct(fullTargetText, &securityTarget);
+                bool textTargetsAntiCheat = !appTargetsAntiCheat &&
+                    HuntTextTargetsKnownAntiCheat(fullTargetText, &antiCheatTarget);
+                bool targetsSecurityProduct = appTargetsSecurityProduct || textTargetsSecurityProduct;
+                bool targetsAntiCheat = appTargetsAntiCheat || textTargetsAntiCheat;
+                if (!targetsSecurityProduct && !targetsAntiCheat)
+                {
+                    continue;
+                }
+
+                bool appIdBacked = appTargetsSecurityProduct || appTargetsAntiCheat;
+                std::vector<std::wstring> reasons;
+                if (targetsSecurityProduct)
+                {
+                    AddUnique(&reasons, L"wfp_security_product_block_filter");
+                }
+                if (targetsAntiCheat)
+                {
+                    AddUnique(&reasons, L"wfp_anticheat_block_filter");
+                }
+                if (appIdBacked)
+                {
+                    AddUnique(&reasons, L"wfp_appid_block_condition");
+                }
+                if (HuntToLower(record.FlagsText).find(L"persistent") != std::wstring::npos)
+                {
+                    AddUnique(&reasons, L"wfp_persistent_block_filter");
+                }
+                if (HuntToLower(record.FlagsText).find(L"clearactionright") != std::wstring::npos)
+                {
+                    AddUnique(&reasons, L"wfp_clear_action_right_block");
+                }
+                if (WfpFilterHasHighWeight(record))
+                {
+                    AddUnique(&reasons, L"wfp_high_weight_block_filter");
+                }
+                AddUnique(&reasons, L"security_tool_communication_blocking");
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"filter_id"] = std::to_wstring(record.Id);
+                evidence[L"filter_key"] = record.Key;
+                evidence[L"filter_name"] = record.Name;
+                evidence[L"filter_description"] = record.Description;
+                evidence[L"action"] = record.ActionText;
+                evidence[L"weight"] = record.WeightText;
+                evidence[L"flags"] = record.FlagsText;
+                evidence[L"layer"] = record.LayerName;
+                evidence[L"layer_key"] = record.LayerKey;
+                evidence[L"sublayer"] = record.SubLayerName;
+                evidence[L"sublayer_key"] = record.SubLayerKey;
+                evidence[L"provider"] = record.ProviderName;
+                evidence[L"provider_service"] = record.ProviderService;
+                evidence[L"provider_key"] = record.ProviderKey;
+                evidence[L"app_id"] = record.AppIdText;
+                evidence[L"conditions"] = record.ConditionsText;
+                evidence[L"target_source"] = appIdBacked ? L"app_id_condition" : L"filter_metadata";
+                evidence[L"matched_security_target"] = securityTarget;
+                evidence[L"matched_anticheat_target"] = antiCheatTarget;
+
+                bool hardBlock = appIdBacked &&
+                    (HuntToLower(record.FlagsText).find(L"persistent") != std::wstring::npos ||
+                     HuntToLower(record.FlagsText).find(L"clearactionright") != std::wstring::npos ||
+                     WfpFilterHasHighWeight(record));
+                std::vector<std::wstring> followups;
+                if (!record.LayerName.empty())
+                {
+                    followups.push_back(L"!wfp filters /layer " + record.LayerName);
+                }
+                if (!record.ProviderName.empty())
+                {
+                    followups.push_back(L"!wfp filters /provider " + record.ProviderName);
+                }
+
+                AddSystemFinding(
+                    result,
+                    hardBlock ? L"high" : L"medium",
+                    appIdBacked ? L"high" : L"medium",
+                    L"network_filter_tampering",
+                    L"WFP block filter targets security or anti-cheat process communication",
+                    0,
+                    L"",
+                    reasons,
+                    evidence,
+                    followups);
+                ++result->SuspiciousWfpFilterCount;
+            }
+        } while (false);
+    }
+
     bool ThreatIntelEventLooksLikeDriverIo(const HuntTelemetryEvent& event)
     {
         bool matched = false;
@@ -6722,6 +7826,24 @@ namespace
                             bool executePermissionDrift = vad.Executable && !section->Executable;
                             bool writePermissionDrift = liveWritableExecutable && section->Executable && !section->Writable;
                             bool defaultWritableExecutableSection = liveWriteCapableExecutable && section->Executable && section->Writable;
+                            bool vadRvaRangeValid = vad.Size <= std::numeric_limits<uint32_t>::max() &&
+                                rva <= std::numeric_limits<uint32_t>::max() - static_cast<uint32_t>(vad.Size);
+                            uint32_t vadEndRva = vadRvaRangeValid
+                                ? rva + static_cast<uint32_t>(vad.Size)
+                                : std::numeric_limits<uint32_t>::max();
+                            bool entrypointInsideVad =
+                                metadata.HasEntryPoint &&
+                                metadata.EntryPointRva >= rva &&
+                                metadata.EntryPointRva < vadEndRva;
+                            bool firstExecutableSectionInsideVad =
+                                metadata.HasExecutableSection &&
+                                metadata.FirstExecutableSectionRva >= rva &&
+                                metadata.FirstExecutableSectionRva < vadEndRva;
+                            bool entrypointWritePermissionDrift =
+                                liveWriteCapableExecutable &&
+                                section->Executable &&
+                                !section->Writable &&
+                                entrypointInsideVad;
 
                             if (executePermissionDrift)
                             {
@@ -6730,11 +7852,18 @@ namespace
                             if (writePermissionDrift)
                             {
                                 AddUnique(&imageSectionReasons, L"image_section_write_permission_drift");
+                                AddUnique(&imageSectionReasons, L"module_stomping_permission_evidence");
+                            }
+                            if (entrypointWritePermissionDrift)
+                            {
+                                AddUnique(&imageSectionReasons, L"module_entrypoint_write_permission_drift");
+                                AddUnique(&imageSectionReasons, L"module_stomping_permission_evidence");
                             }
                             if (defaultWritableExecutableSection)
                             {
                                 AddUnique(&imageSectionReasons, L"image_rwx_section_vad");
                                 AddUnique(&imageSectionReasons, L"mockingjay_rwx_section_candidate");
+                                AddUnique(&imageSectionReasons, L"module_stomping_permission_evidence");
                             }
 
                             if (!imageSectionReasons.empty())
@@ -6747,6 +7876,9 @@ namespace
                                 imageSectionEvidence[L"disk_section_executable"] = section->Executable ? L"true" : L"false";
                                 imageSectionEvidence[L"disk_section_writable"] = section->Writable ? L"true" : L"false";
                                 imageSectionEvidence[L"vad_rva"] = HuntHex(rva, 8);
+                                imageSectionEvidence[L"vad_end_rva"] = HuntHex(vadEndRva, 8);
+                                imageSectionEvidence[L"entrypoint_inside_vad"] = entrypointInsideVad ? L"true" : L"false";
+                                imageSectionEvidence[L"first_executable_section_inside_vad"] = firstExecutableSectionInsideVad ? L"true" : L"false";
                                 imageSectionEvidence[L"vad_executable"] = vad.Executable ? L"true" : L"false";
                                 imageSectionEvidence[L"vad_writable"] = vad.Writable ? L"true" : L"false";
                                 imageSectionEvidence[L"vad_copy_on_write"] = vad.CopyOnWrite ? L"true" : L"false";
@@ -6818,6 +7950,11 @@ namespace
                         imageSectionReasons.begin(),
                         imageSectionReasons.end(),
                         L"image_section_write_permission_drift") != imageSectionReasons.end();
+                bool moduleStompingPermissionEvidence =
+                    std::find(
+                        imageSectionReasons.begin(),
+                        imageSectionReasons.end(),
+                        L"module_stomping_permission_evidence") != imageSectionReasons.end();
                 bool defaultImageRwxSection =
                     std::find(
                         imageSectionReasons.begin(),
@@ -6829,6 +7966,7 @@ namespace
                     vad.PeHeaderSuspicious ||
                     imageExecutePermissionDrift ||
                     imageWritePermissionDrift ||
+                    moduleStompingPermissionEvidence ||
                     defaultImageRwxSection;
                 bool executionObserved = VadHasExecutionEvidence(*process, vad);
                 bool genericWxOnly = wx && !strongVadEvidence;
@@ -6951,6 +8089,7 @@ namespace
                 {
                     if (imageExecutePermissionDrift ||
                         imageWritePermissionDrift ||
+                        moduleStompingPermissionEvidence ||
                         (process->BuiltinProfileMatched && !process->BuiltinProfileViolations.empty()))
                     {
                         risk = L"high";
@@ -6978,13 +8117,18 @@ namespace
                     ++genericWxFindings;
                 }
 
+                std::wstring className = imageSectionPermissionSuspicious ? L"module_stomping" : L"mapped_code";
+                std::wstring title = imageSectionPermissionSuspicious
+                    ? L"loaded image section has suspicious executable permissions"
+                    : L"suspicious executable user VAD";
+
                 AddFinding(
                     result,
                     *process,
                     risk,
                     confidence,
-                    L"mapped_code",
-                    L"suspicious executable user VAD",
+                    className,
+                    title,
                     vad.StartAddress,
                     L"",
                     reasons,
@@ -7522,7 +8666,18 @@ namespace
                 std::wstring backingWarning;
                 std::wstring backingPath;
                 std::wstring backingState;
-                if (ResolveVadSectionBackingPath(device, symbols, *vad, &backingPath, &backingState, &backingWarning))
+                uint64_t vadControlArea = 0;
+                ControlAreaBackingDetails vadBackingDetails;
+                if (ResolveVadSectionBackingPath(
+                        device,
+                        symbols,
+                        *vad,
+                        &backingPath,
+                        &backingState,
+                        &backingWarning,
+                        nullptr,
+                        &vadControlArea,
+                        &vadBackingDetails))
                 {
                     process->SectionBackingPath = backingPath;
                     process->SectionBackingState = backingState;
@@ -7534,6 +8689,148 @@ namespace
                     {
                         AddUnique(&process->Warnings, L"main image section backing unresolved: " + backingWarning);
                     }
+                }
+
+                std::wstring mainSectionWarning;
+                std::wstring mainSectionPath;
+                std::wstring mainSectionState;
+                uint64_t mainSectionObject = 0;
+                uint64_t mainSectionSegment = 0;
+                uint64_t mainSectionControlArea = 0;
+                ControlAreaBackingDetails mainSectionDetails;
+                if (ResolveEprocessMainSectionBackingPath(
+                        device,
+                        symbols,
+                        process->Kernel.Eprocess,
+                        &mainSectionPath,
+                        &mainSectionState,
+                        &mainSectionObject,
+                        &mainSectionSegment,
+                        &mainSectionControlArea,
+                        &mainSectionWarning,
+                        nullptr,
+                        &mainSectionDetails))
+                {
+                    process->MainSectionObject = mainSectionObject;
+                    process->MainSectionSegment = mainSectionSegment;
+                    process->MainSectionControlArea = mainSectionControlArea;
+                    process->MainSectionBackingPath = mainSectionPath;
+                    process->MainSectionBackingState = mainSectionState;
+                }
+                else if (!mainSectionWarning.empty())
+                {
+                    AddUnique(&process->Warnings, L"EPROCESS main section backing unresolved: " + mainSectionWarning);
+                }
+
+                if (process->MainSectionBackingState == L"resolved" &&
+                    !process->MainSectionBackingPath.empty())
+                {
+                    std::vector<std::wstring> reasons;
+                    bool mainSectionDiffersFromVad = process->SectionBackingState == L"resolved" &&
+                        !process->SectionBackingPath.empty() &&
+                        !SameCanonicalPath(process->MainSectionBackingPath, process->SectionBackingPath);
+                    bool mainSectionDiffersFromModule = !module.Path.empty() &&
+                        !SameCanonicalPath(process->MainSectionBackingPath, module.Path);
+                    bool mainSectionDiffersFromPeb = !process->PebImagePath.empty() &&
+                        !SameCanonicalPath(process->MainSectionBackingPath, process->PebImagePath);
+                    bool mainSectionDiffersFromApi = !process->ApiImagePath.empty() &&
+                        !SameCanonicalPath(process->MainSectionBackingPath, process->ApiImagePath);
+
+                    if (mainSectionDiffersFromVad)
+                    {
+                        AddUnique(&reasons, L"main_section_object_vad_backing_mismatch");
+                    }
+                    if (mainSectionDiffersFromModule)
+                    {
+                        AddUnique(&reasons, L"main_section_object_process_path_mismatch");
+                    }
+                    if (mainSectionDiffersFromPeb)
+                    {
+                        AddUnique(&reasons, L"main_section_object_peb_path_mismatch");
+                    }
+                    if (mainSectionDiffersFromApi)
+                    {
+                        AddUnique(&reasons, L"main_section_object_api_path_mismatch");
+                    }
+
+                    if (!reasons.empty())
+                    {
+                        AddUnique(&reasons, L"kernel_main_section_swap_evidence");
+                        std::map<std::wstring, std::wstring> evidence;
+                        evidence[L"eprocess"] = HuntHex(process->Kernel.Eprocess, 16);
+                        evidence[L"main_image_base"] = HuntHex(module.Base, 16);
+                        evidence[L"main_image_size"] = std::to_wstring(module.Size);
+                        evidence[L"main_image_vad"] = HuntHex(vad->VadAddress, 16);
+                        evidence[L"disk_path"] = module.Path;
+                        evidence[L"api_image_path"] = process->ApiImagePath;
+                        evidence[L"peb_image_path"] = process->PebImagePath;
+                        evidence[L"vad_section_backing_path"] = process->SectionBackingPath;
+                        evidence[L"vad_section_backing_state"] = process->SectionBackingState;
+                        evidence[L"main_section_object"] = HuntHex(process->MainSectionObject, 16);
+                        evidence[L"main_section_segment"] = HuntHex(process->MainSectionSegment, 16);
+                        evidence[L"main_section_control_area"] = HuntHex(process->MainSectionControlArea, 16);
+                        evidence[L"main_section_backing_path"] = process->MainSectionBackingPath;
+                        evidence[L"main_section_backing_state"] = process->MainSectionBackingState;
+
+                        AddFinding(
+                            result,
+                            *process,
+                            (mainSectionDiffersFromVad || mainSectionDiffersFromModule) ? L"high" : L"medium",
+                            (mainSectionDiffersFromVad || mainSectionDiffersFromModule) ? L"high" : L"medium",
+                            L"process_image_integrity",
+                            L"EPROCESS main section object backing differs from process image views",
+                            module.Base,
+                            module.Name,
+                            reasons,
+                            evidence);
+                    }
+                }
+
+                std::vector<std::wstring> primitiveReasons;
+                AddProcessTamperingPrimitiveReasons(
+                    L"main_image_vad",
+                    vadBackingDetails,
+                    &primitiveReasons);
+                AddProcessTamperingPrimitiveReasons(
+                    L"main_section_object",
+                    mainSectionDetails,
+                    &primitiveReasons);
+                bool vadPrimitiveHigh =
+                    (vadBackingDetails.HasDeletePending && vadBackingDetails.DeletePending) ||
+                    ControlAreaBackingHasImageSectionPointerMismatch(vadBackingDetails);
+                bool mainSectionPrimitiveHigh =
+                    (mainSectionDetails.HasDeletePending && mainSectionDetails.DeletePending) ||
+                    ControlAreaBackingHasImageSectionPointerMismatch(mainSectionDetails);
+                bool primitiveAccessOnly =
+                    !primitiveReasons.empty() &&
+                    !vadPrimitiveHigh &&
+                    !mainSectionPrimitiveHigh;
+                if (!primitiveReasons.empty())
+                {
+                    AddUnique(&primitiveReasons, L"process_tampering_primitive_evidence");
+                    std::map<std::wstring, std::wstring> evidence;
+                    evidence[L"eprocess"] = HuntHex(process->Kernel.Eprocess, 16);
+                    evidence[L"main_image_base"] = HuntHex(module.Base, 16);
+                    evidence[L"main_image_size"] = std::to_wstring(module.Size);
+                    evidence[L"main_image_vad"] = HuntHex(vad->VadAddress, 16);
+                    evidence[L"vad_control_area"] = HuntHex(vadControlArea, 16);
+                    evidence[L"disk_path"] = module.Path;
+                    evidence[L"api_image_path"] = process->ApiImagePath;
+                    evidence[L"peb_image_path"] = process->PebImagePath;
+                    AddControlAreaBackingEvidence(L"main_image_vad", vadBackingDetails, &evidence);
+                    AddControlAreaBackingEvidence(L"main_section_object", mainSectionDetails, &evidence);
+
+                    AddFinding(
+                        result,
+                        *process,
+                        primitiveAccessOnly ? L"medium" : L"high",
+                        primitiveAccessOnly ? L"medium" : L"high",
+                        L"process_image_integrity",
+                        L"main image section backing exposes process tampering primitive evidence",
+                        module.Base,
+                        module.Name,
+                        primitiveReasons,
+                        evidence);
                 }
 
                 if (process->SectionBackingState == L"unbacked")
@@ -9080,7 +10377,18 @@ namespace
                 lowered == L"driver_service_installed" ||
                 lowered == L"driver_service_running" ||
                 lowered == L"known_security_product_process_target" ||
-                lowered == L"loaded_driver_name_ioc")
+                lowered == L"loaded_driver_name_ioc" ||
+                lowered == L"process_tampering_primitive_evidence" ||
+                lowered == L"main_image_vad_file_delete_pending" ||
+                lowered == L"main_section_object_file_delete_pending" ||
+                lowered == L"main_image_vad_file_section_object_pointer_mismatch" ||
+                lowered == L"main_section_object_file_section_object_pointer_mismatch" ||
+                lowered == L"module_stomping_permission_evidence" ||
+                lowered == L"module_entrypoint_write_permission_drift" ||
+                lowered == L"security_tool_communication_blocking" ||
+                lowered == L"wfp_security_product_block_filter" ||
+                lowered == L"wfp_anticheat_block_filter" ||
+                lowered == L"wfp_appid_block_condition")
             {
                 matched = true;
                 break;
@@ -9424,6 +10732,11 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             result->ModuleRecordCount += process.Modules.size();
         }
 
+        if (options.Mode != HuntMode::Quick)
+        {
+            AddWfpHuntFindings(result);
+        }
+
         if (options.Mode == HuntMode::Deep)
         {
             AddKernelDriverHuntFindings(device_, symbols_, executableDirectory_, result);
@@ -9472,6 +10785,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"suspicious_driver_objects\":" << result.SuspiciousDriverObjectCount;
     json << L",\"driver_services\":" << result.DriverServiceCount;
     json << L",\"edr_killer_driver_services\":" << result.EdrKillerDriverServiceCount;
+    json << L",\"wfp_filters\":" << result.WfpFilterCount;
+    json << L",\"suspicious_wfp_filters\":" << result.SuspiciousWfpFilterCount;
     json << L",\"threat_intel_active\":" << (result.ThreatIntelActive ? L"true" : L"false");
     json << L",\"threat_intel_available\":" << (result.ThreatIntelAvailable ? L"true" : L"false");
     json << L",\"threat_intel_events\":" << result.ThreatIntelEventCount;
@@ -9587,6 +10902,35 @@ std::wstring BuildHuntJson(const HuntResult& result)
         }
         json << L",\"section_backing_path\":\"" << HuntJsonEscape(process.SectionBackingPath) << L"\"";
         json << L",\"section_backing_state\":\"" << HuntJsonEscape(process.SectionBackingState) << L"\"";
+        json << L",\"main_section_object\":";
+        if (process.MainSectionObject != 0)
+        {
+            json << L"\"" << HuntHex(process.MainSectionObject, 16) << L"\"";
+        }
+        else
+        {
+            json << L"null";
+        }
+        json << L",\"main_section_segment\":";
+        if (process.MainSectionSegment != 0)
+        {
+            json << L"\"" << HuntHex(process.MainSectionSegment, 16) << L"\"";
+        }
+        else
+        {
+            json << L"null";
+        }
+        json << L",\"main_section_control_area\":";
+        if (process.MainSectionControlArea != 0)
+        {
+            json << L"\"" << HuntHex(process.MainSectionControlArea, 16) << L"\"";
+        }
+        else
+        {
+            json << L"null";
+        }
+        json << L",\"main_section_backing_path\":\"" << HuntJsonEscape(process.MainSectionBackingPath) << L"\"";
+        json << L",\"main_section_backing_state\":\"" << HuntJsonEscape(process.MainSectionBackingState) << L"\"";
         json << L",\"disk_path\":\"" << HuntJsonEscape(process.DiskPath) << L"\"";
         json << L",\"parent_pid\":";
         if (process.HasParentProcessId)

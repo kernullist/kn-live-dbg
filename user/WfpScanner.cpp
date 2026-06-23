@@ -452,6 +452,404 @@ namespace
         return stream.str();
     }
 
+    const wchar_t* FwpMatchTypeText(FWP_MATCH_TYPE matchType)
+    {
+        const wchar_t* text = L"Unknown";
+
+        switch (matchType)
+        {
+        case FWP_MATCH_EQUAL:
+            text = L"Equal";
+            break;
+        case FWP_MATCH_GREATER:
+            text = L"Greater";
+            break;
+        case FWP_MATCH_LESS:
+            text = L"Less";
+            break;
+        case FWP_MATCH_GREATER_OR_EQUAL:
+            text = L"GreaterOrEqual";
+            break;
+        case FWP_MATCH_LESS_OR_EQUAL:
+            text = L"LessOrEqual";
+            break;
+        case FWP_MATCH_RANGE:
+            text = L"Range";
+            break;
+        case FWP_MATCH_FLAGS_ALL_SET:
+            text = L"FlagsAllSet";
+            break;
+        case FWP_MATCH_FLAGS_ANY_SET:
+            text = L"FlagsAnySet";
+            break;
+        case FWP_MATCH_FLAGS_NONE_SET:
+            text = L"FlagsNoneSet";
+            break;
+        case FWP_MATCH_EQUAL_CASE_INSENSITIVE:
+            text = L"EqualCaseInsensitive";
+            break;
+        case FWP_MATCH_NOT_EQUAL:
+            text = L"NotEqual";
+            break;
+        case FWP_MATCH_PREFIX:
+            text = L"Prefix";
+            break;
+        case FWP_MATCH_NOT_PREFIX:
+            text = L"NotPrefix";
+            break;
+        default:
+            break;
+        }
+
+        return text;
+    }
+
+    std::wstring FormatConditionFieldKeyText(const GUID& key)
+    {
+        std::wstring text;
+
+        if (GuidsEqual(key, FWPM_CONDITION_ALE_APP_ID))
+        {
+            text = L"ALE_APP_ID";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_ALE_USER_ID))
+        {
+            text = L"ALE_USER_ID";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_LOCAL_ADDRESS))
+        {
+            text = L"IP_LOCAL_ADDRESS";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_REMOTE_ADDRESS))
+        {
+            text = L"IP_REMOTE_ADDRESS";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_LOCAL_ADDRESS_V4))
+        {
+            text = L"IP_LOCAL_ADDRESS_V4";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_REMOTE_ADDRESS_V4))
+        {
+            text = L"IP_REMOTE_ADDRESS_V4";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_LOCAL_ADDRESS_V6))
+        {
+            text = L"IP_LOCAL_ADDRESS_V6";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_REMOTE_ADDRESS_V6))
+        {
+            text = L"IP_REMOTE_ADDRESS_V6";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_PROTOCOL))
+        {
+            text = L"IP_PROTOCOL";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_LOCAL_PORT))
+        {
+            text = L"IP_LOCAL_PORT";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_IP_REMOTE_PORT))
+        {
+            text = L"IP_REMOTE_PORT";
+        }
+        else if (GuidsEqual(key, FWPM_CONDITION_FLAGS))
+        {
+            text = L"FLAGS";
+        }
+        else
+        {
+            text = FormatGuidText(key);
+        }
+
+        return text;
+    }
+
+    std::wstring FormatByteArrayHex(const uint8_t* data, uint32_t size, uint32_t maxBytes)
+    {
+        std::wstringstream stream;
+
+        do
+        {
+            if (data == nullptr || size == 0)
+            {
+                stream << L"<empty>";
+                break;
+            }
+
+            uint32_t printed = std::min(size, maxBytes);
+            stream << L"hex:";
+            for (uint32_t index = 0; index < printed; ++index)
+            {
+                wchar_t byteText[4] = {};
+                swprintf_s(byteText, L"%02x", static_cast<unsigned int>(data[index]));
+                stream << byteText;
+            }
+
+            if (printed < size)
+            {
+                stream << L"...";
+            }
+        } while (false);
+
+        return stream.str();
+    }
+
+    std::wstring FormatByteBlobText(const FWP_BYTE_BLOB* blob)
+    {
+        std::wstring text;
+
+        do
+        {
+            if (blob == nullptr || blob->data == nullptr || blob->size == 0)
+            {
+                text = L"<empty>";
+                break;
+            }
+
+            if ((blob->size % sizeof(wchar_t)) == 0)
+            {
+                size_t charCount = blob->size / sizeof(wchar_t);
+                std::wstring candidate(
+                    reinterpret_cast<const wchar_t*>(blob->data),
+                    reinterpret_cast<const wchar_t*>(blob->data) + charCount);
+
+                while (!candidate.empty() && candidate.back() == L'\0')
+                {
+                    candidate.pop_back();
+                }
+
+                size_t printable = 0;
+                for (wchar_t ch : candidate)
+                {
+                    if (ch == L'\\' ||
+                        ch == L'/' ||
+                        ch == L':' ||
+                        ch == L'.' ||
+                        ch == L'_' ||
+                        ch == L'-' ||
+                        std::iswalnum(ch) != 0 ||
+                        std::iswspace(ch) != 0)
+                    {
+                        ++printable;
+                    }
+                }
+
+                if (!candidate.empty() && printable * 2 >= candidate.size())
+                {
+                    text = candidate;
+                    break;
+                }
+            }
+
+            text = FormatByteArrayHex(blob->data, blob->size, 48);
+        } while (false);
+
+        return text;
+    }
+
+    std::wstring FormatFwpConditionValueText(const FWP_CONDITION_VALUE0& value)
+    {
+        std::wstringstream stream;
+
+        switch (value.type)
+        {
+        case FWP_EMPTY:
+            stream << L"empty";
+            break;
+        case FWP_UINT8:
+            stream << L"0x" << std::hex << static_cast<unsigned int>(value.uint8) << std::dec;
+            break;
+        case FWP_UINT16:
+            stream << L"0x" << std::hex << static_cast<unsigned int>(value.uint16) << std::dec;
+            break;
+        case FWP_UINT32:
+            stream << L"0x" << std::hex << static_cast<unsigned long>(value.uint32) << std::dec;
+            break;
+        case FWP_UINT64:
+            if (value.uint64 != nullptr)
+            {
+                stream << L"0x" << std::hex << *value.uint64 << std::dec;
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        case FWP_INT8:
+            stream << static_cast<int>(value.int8);
+            break;
+        case FWP_INT16:
+            stream << static_cast<int>(value.int16);
+            break;
+        case FWP_INT32:
+            stream << static_cast<long>(value.int32);
+            break;
+        case FWP_INT64:
+            if (value.int64 != nullptr)
+            {
+                stream << *value.int64;
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        case FWP_BYTE_BLOB_TYPE:
+            stream << FormatByteBlobText(value.byteBlob);
+            break;
+        case FWP_UNICODE_STRING_TYPE:
+            if (value.unicodeString != nullptr)
+            {
+                stream << value.unicodeString;
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        case FWP_BYTE_ARRAY16_TYPE:
+            if (value.byteArray16 != nullptr)
+            {
+                stream << FormatByteArrayHex(value.byteArray16->byteArray16, 16, 16);
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        case FWP_BYTE_ARRAY6_TYPE:
+            if (value.byteArray6 != nullptr)
+            {
+                stream << FormatByteArrayHex(value.byteArray6->byteArray6, 6, 6);
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        case FWP_V4_ADDR_MASK:
+            if (value.v4AddrMask != nullptr)
+            {
+                stream << L"addr=0x" << std::hex << value.v4AddrMask->addr
+                       << L"/mask=0x" << value.v4AddrMask->mask << std::dec;
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        case FWP_V6_ADDR_MASK:
+            if (value.v6AddrMask != nullptr)
+            {
+                stream << FormatByteArrayHex(value.v6AddrMask->addr, 16, 16)
+                       << L"/prefix=" << static_cast<unsigned int>(value.v6AddrMask->prefixLength);
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        case FWP_RANGE_TYPE:
+            if (value.rangeValue != nullptr)
+            {
+                stream << L"range";
+            }
+            else
+            {
+                stream << L"<null>";
+            }
+            break;
+        default:
+            stream << L"type=" << static_cast<unsigned int>(value.type);
+            break;
+        }
+
+        return stream.str();
+    }
+
+    void AppendLimitedConditionText(
+        std::wstring* text,
+        const std::wstring& part,
+        size_t maxChars)
+    {
+        do
+        {
+            if (text == nullptr || part.empty() || text->size() >= maxChars)
+            {
+                break;
+            }
+
+            if (!text->empty())
+            {
+                text->append(L"; ");
+            }
+
+            size_t remaining = maxChars - text->size();
+            if (part.size() <= remaining)
+            {
+                text->append(part);
+            }
+            else if (remaining > 3)
+            {
+                text->append(part.substr(0, remaining - 3));
+                text->append(L"...");
+            }
+        } while (false);
+    }
+
+    std::wstring FormatFilterConditionsText(
+        const FWPM_FILTER0& filter,
+        std::wstring* appIdText,
+        bool* hasAppIdCondition)
+    {
+        constexpr size_t kMaxConditionText = 4096;
+        std::wstring text;
+
+        do
+        {
+            if (appIdText != nullptr)
+            {
+                appIdText->clear();
+            }
+            if (hasAppIdCondition != nullptr)
+            {
+                *hasAppIdCondition = false;
+            }
+
+            if (filter.filterCondition == nullptr || filter.numFilterConditions == 0)
+            {
+                break;
+            }
+
+            for (UINT32 index = 0; index < filter.numFilterConditions; ++index)
+            {
+                const FWPM_FILTER_CONDITION0& condition = filter.filterCondition[index];
+                std::wstring field = FormatConditionFieldKeyText(condition.fieldKey);
+                std::wstring value = FormatFwpConditionValueText(condition.conditionValue);
+                std::wstring part = field;
+                part += L" ";
+                part += FwpMatchTypeText(condition.matchType);
+                part += L" ";
+                part += value;
+                AppendLimitedConditionText(&text, part, kMaxConditionText);
+
+                if (GuidsEqual(condition.fieldKey, FWPM_CONDITION_ALE_APP_ID))
+                {
+                    if (hasAppIdCondition != nullptr)
+                    {
+                        *hasAppIdCondition = true;
+                    }
+                    if (appIdText != nullptr && appIdText->empty())
+                    {
+                        *appIdText = value;
+                    }
+                }
+            }
+        } while (false);
+
+        return text;
+    }
+
     std::wstring DecodeFwpmError(DWORD status)
     {
         std::wstringstream stream;
@@ -1221,6 +1619,10 @@ bool WfpScanner::Scan(const Options& options, WfpScanResult* result, std::wstrin
                     }
                     record.WeightText = FormatFwpValueText(entries[i]->weight);
                     record.NumConditions = entries[i]->numFilterConditions;
+                    record.ConditionsText = FormatFilterConditionsText(
+                        *entries[i],
+                        &record.AppIdText,
+                        &record.HasAppIdCondition);
                     record.LayerKey = FormatGuidText(entries[i]->layerKey);
                     if (layer != nullptr)
                     {

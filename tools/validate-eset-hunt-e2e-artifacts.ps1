@@ -15,7 +15,8 @@ param(
 
     [int]$ExpectedEdrKillerDriverServices = 15,
 
-    [string]$RequiredHighSignalNeedle = "signal=known_defense_evasion_tool_name",
+    [Alias("RequiredHighSignalNeedle")]
+    [string]$RequiredAssessmentNeedle = "known defense-evasion tool name",
 
     [string[]]$RequiredReasons = @(
         "gentlemen_edr_killer_process_name",
@@ -439,26 +440,45 @@ if ([int]$huntDoc.summary.edr_killer_driver_services -ne $ExpectedEdrKillerDrive
 }
 Assert-HuntSummaryMatchesFindings -HuntDoc $huntDoc
 
+$expectedVerdict = "verdict=clean"
+if ([int]$huntDoc.summary.high -gt 0)
+{
+    $expectedVerdict = "verdict=alert"
+}
+elseif ([int]$huntDoc.summary.medium -gt 0)
+{
+    $expectedVerdict = "verdict=review"
+}
+elseif ([int]$huntDoc.summary.low -gt 0)
+{
+    $expectedVerdict = "verdict=low_signal"
+}
+
 Assert-TextFileContains -Path $stdoutPath -Needle "json written:" -Name "hunt JSON write confirmation"
 Assert-TextFileContains -Path $stdoutPath -Needle "[hunt.conclusion]" -Name "hunt conclusion line"
-Assert-TextFileContains -Path $stdoutPath -Needle "verdict=alert" -Name "hunt alert verdict"
+Assert-TextFileContains -Path $stdoutPath -Needle $expectedVerdict -Name "hunt risk verdict"
 Assert-TextFileContains -Path $stdoutPath -Needle "findings=$($huntDoc.summary.findings) high=$($huntDoc.summary.high) medium=$($huntDoc.summary.medium) low=$($huntDoc.summary.low)" -Name "hunt console risk summary counts"
 Assert-TextFileContains -Path $stdoutPath -Needle "[hunt.assessment]" -Name "hunt human assessment section"
-Assert-TextFileContains -Path $stdoutPath -Needle "who=" -Name "hunt human assessment subject"
-Assert-TextFileContains -Path $stdoutPath -Needle 'technique="' -Name "hunt human assessment technique"
-Assert-TextFileContains -Path $stdoutPath -Needle 'affected="' -Name "hunt human assessment affected surface"
+Assert-TextFileContains -Path $stdoutPath -Needle "subject=" -Name "hunt human assessment subject"
+Assert-TextFileContains -Path $stdoutPath -Needle 'what="' -Name "hunt human assessment action"
+Assert-TextFileContains -Path $stdoutPath -Needle 'why="' -Name "hunt human assessment evidence"
+Assert-TextFileContains -Path $stdoutPath -Needle 'next="' -Name "hunt human assessment followup"
 Assert-TextFileContains -Path $stdoutPath -Needle "[hunt.summary]" -Name "hunt summary line"
-Assert-TextFileContains -Path $stdoutPath -Needle "driver_service_iocs=" -Name "driver-service IOC count summary"
-Assert-TextFileContains -Path $stdoutPath -Needle "driver_service_iocs=$($huntDoc.summary.edr_killer_driver_services)" -Name "driver-service IOC exact count summary"
-if ($null -ne $huntDoc.summary.PSObject.Properties["threat_intel_correlations"])
+if ([int]$huntDoc.summary.edr_killer_driver_services -gt 0)
+{
+    Assert-TextFileContains -Path $stdoutPath -Needle "driver_service_iocs=" -Name "driver-service IOC count summary"
+    Assert-TextFileContains -Path $stdoutPath -Needle "driver_service_iocs=$($huntDoc.summary.edr_killer_driver_services)" -Name "driver-service IOC exact count summary"
+}
+if ($null -ne $huntDoc.summary.PSObject.Properties["threat_intel_correlations"] -and
+    [int]$huntDoc.summary.threat_intel_correlations -gt 0)
 {
     Assert-TextFileContains -Path $stdoutPath -Needle "ti_correlations=$($huntDoc.summary.threat_intel_correlations)" -Name "Threat-Intelligence correlation exact count summary"
 }
-Assert-TextFileContains -Path $stdoutPath -Needle "[hunt.high_signal]" -Name "hunt high-signal table"
-Assert-TextFileContains -Path $stdoutPath -Needle $RequiredHighSignalNeedle -Name "required high-signal entry"
-Assert-TextFileContains -Path $stdoutPath -Needle "[hunt.top_processes]" -Name "hunt top-process table"
-Assert-TextFileContains -Path $stdoutPath -Needle "[hunt.top_reasons]" -Name "hunt top-reason table"
+Assert-TextFileContains -Path $stdoutPath -Needle $RequiredAssessmentNeedle -Name "required assessment evidence entry"
 Assert-TextFileContains -Path $stdoutPath -Needle "[hunt.detail] suppressed=yes" -Name "summary-mode detail suppression"
+Assert-TextFileDoesNotContain -Path $stdoutPath -Needle "[hunt.high_signal]" -Name "summary-mode raw high-signal table"
+Assert-TextFileDoesNotContain -Path $stdoutPath -Needle "[hunt.top_processes]" -Name "summary-mode raw top-process table"
+Assert-TextFileDoesNotContain -Path $stdoutPath -Needle "[hunt.top_reasons]" -Name "summary-mode raw top-reason table"
 Assert-TextFileDoesNotContain -Path $stdoutPath -Needle "edr_killer_services=" -Name "legacy EDR-killer service summary field"
 Assert-TextFileDoesNotContain -Path $stdoutPath -Needle "signal=edr_killer" -Name "raw EDR-killer signal label"
 Assert-TextFileDoesNotContain -Path $stdoutPath -Needle "signal=eset_" -Name "raw ESET signal label"
@@ -572,20 +592,20 @@ if ($ExpectedScenarioCount -eq 35)
         -Reason "oxideharvest_cli_shape"
     Assert-TextFileContains `
         -Path $stdoutPath `
-        -Needle "signal=known_defense_evasion_driver_service" `
-        -Name "required defense-evasion driver-service high-signal entry"
+        -Needle "known defense-evasion driver service" `
+        -Name "required defense-evasion driver-service assessment evidence"
     Assert-TextFileContains `
         -Path $stdoutPath `
-        -Needle "signal=manipulated_version_info" `
-        -Name "required manipulated version-info high-signal entry"
+        -Needle "manipulated version information" `
+        -Name "required manipulated version-info assessment evidence"
     Assert-TextFileContains `
         -Path $stdoutPath `
-        -Needle "signal=packed_or_protected_section" `
-        -Name "required packed/protected section high-signal entry"
+        -Needle "packed or protected PE section" `
+        -Name "required packed/protected section assessment evidence"
     Assert-TextFileContains `
         -Path $stdoutPath `
-        -Needle "system_findings=$($huntDoc.summary.edr_killer_driver_services)" `
-        -Name "required driver-service IOC system-finding count"
+        -Needle "driver_service_iocs=$($huntDoc.summary.edr_killer_driver_services)" `
+        -Name "required driver-service IOC summary count"
 }
 elseif ($ExpectedScenarioCount -eq 15)
 {

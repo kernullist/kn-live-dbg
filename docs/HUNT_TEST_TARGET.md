@@ -25,6 +25,23 @@ x64\Release\tools\KnLiveDbgHuntTargetDll.dll
 Start the target in a normal console:
 
 ```powershell
+.\x64\Release\tools\KnLiveDbgHuntTarget.exe
+```
+
+Without a scenario flag, the target prints a numbered experiment menu and runs
+only the selected experiment set. Select one number for a focused repro, enter
+multiple numbers such as `2,7,12`, enter a range such as `10-13`, or enter
+`0`/`all` when you intentionally want every positive-control experiment.
+Each menu entry explains the category, the artifact that will be created, the
+expected `!hunt` conclusion, and any operational note such as admin-only
+behavior or negative-control scope.
+The target runs only the selected experiment set.
+`/baseline` is a negative-control mode and cannot be combined with positive
+experiments.
+
+For scripted validation, keep passing explicit scenario flags:
+
+```powershell
 .\x64\Release\tools\KnLiveDbgHuntTarget.exe /all /manifest .\hunt-target-manifest.json /seconds 300
 ```
 
@@ -40,17 +57,21 @@ Then run KnLiveDbg elevated in another console:
 ```
 
 In the console summary, target-specific defense-evasion and credential-tool
-detections should appear first in `[hunt.assessment]` and then in
-`[hunt.high_signal]` even when generic VAD, thread, or module anomaly findings
-dominate the count-based top tables. The assessment rows are intended to read as
-operator conclusions with `who=`, `technique=`, `affected=`, and `evidence=`
-fields, so a reviewer can see which process or system artifact used which
-technique and what surface was manipulated before expanding raw findings. The
-manifest and JSON validator use stable raw reason codes; console triage renders
-those codes as generic technique/evidence labels such as
-`known_defense_evasion_tool_name`, `known_defense_evasion_driver_service`,
-`manipulated_version_info`, `packed_or_protected_section`, and
-`credential_collection_cli_shape`.
+detections should appear first in `[hunt.assessment]` even when generic VAD,
+thread, or module anomaly findings dominate raw count-based tables. The default
+assessment rows are intended to read as operator conclusions with `subject=`,
+`what=`, `why=`, and `next=` fields, so a reviewer can see which process or
+system artifact performed which suspicious action and what evidence supports
+that conclusion before expanding raw findings. Raw `[hunt.high_signal]`,
+`[hunt.top_processes]`, `[hunt.top_reasons]`, and per-finding detail are hidden
+unless `/details` or `/limit` is supplied. The manifest and JSON validator use
+stable raw reason codes; console triage renders those codes as readable
+technique/evidence phrases such as `known defense-evasion tool name`, `known
+defense-evasion driver service`, `manipulated version information`, `packed or
+protected PE section`, and `credential-collection command-line shape`.
+The default assessment keeps process tampering, module stomping, mapped-code or
+loader-view evasion, WFP communication blocking, and identity/IoC detections as
+separate conclusion groups.
 
 `!hunt` also contains exact ESET SHA-1 IoCs for the public Gentlemen article.
 Those hash findings require real matching files and are not synthesized by this
@@ -94,8 +115,9 @@ The script starts the target with `/edr-killer-suffix-name`,
 `!hunt /deep /summary /json` plus `exit` to `KnLiveDbg.exe` through redirected
 stdin, then runs `tools\validate-hunt-target.ps1` against the generated
 manifest and hunt JSON. It also checks the `!hunt /summary` console contract:
-the conclusion, aggregate summary, high-signal table, top triage tables, and
-detail-suppression line must be visible in stdout. Add `-ArticleUrl <url>` or
+the conclusion, assessment evidence, aggregate summary, and detail-suppression
+line must be visible in stdout, while raw high-signal and top triage tables must
+stay hidden. Add `-ArticleUrl <url>` or
 `-ArticleHtml <path>` when the same elevated run should also compare the current
 ESET article tables against the pinned hunt IoCs; that check writes
 `.build\eset-hunt-e2e\article-validator.log`. With `-ArticleUrl`, the downloaded
@@ -148,14 +170,14 @@ When `-RunnerLog` is supplied, the same validator also requires the v2 runner
 contract, elevated execution, 35-scenario target-ready step, and scripted
 `KnLiveDbg` launch evidence. Add `-RequireRunnerPassed` for completed captured
 VM artifacts so the final `passed` marker is required as well.
-It also requires stdout to show both the process-profile high-signal entry and
-the system-scoped `known_defense_evasion_driver_service` console label with the
-expected `system_findings` count, so PID-less SCM findings do not disappear from
-the operator-facing summary. `tools\validate-hunt-readiness.ps1` also generates
-a synthetic 35-scenario artifact set so this contract is exercised on
-non-elevated development machines. The raw JSON reason remains
-`gentlemen_edr_killer_driver_service`; only the operator-facing console label is
-generalized.
+It also requires stdout to show both process-profile assessment evidence and
+the system-scoped `known defense-evasion driver service` evidence phrase with
+the expected `driver_service_iocs` summary count, so PID-less SCM findings do
+not disappear from the operator-facing summary.
+`tools\validate-hunt-readiness.ps1` also generates a synthetic 35-scenario
+artifact set so this contract is exercised on non-elevated development
+machines. The raw JSON reason remains `gentlemen_edr_killer_driver_service`;
+only the operator-facing console phrase is generalized.
 
 Validate the `!hunt` output against the target manifest:
 
@@ -194,10 +216,11 @@ operator-facing console labels.
 | `/manifest <path>` | Writes a machine-readable scenario manifest | `kn-live-dbg.hunt-target-manifest.v1` |
 
 `/all` enables every positive-control scenario, including the command-line
-gated lab built-in profile. If no scenario option is supplied, the target
-enables all memory/module/thread/APC/image-section scenarios but leaves the lab
-built-in profile disabled because that profile intentionally requires an
-explicit command-line marker. `/seconds 0` keeps the target alive until Ctrl+C.
+gated lab built-in profile. If no scenario option is supplied, the target opens
+an interactive numbered experiment menu instead of creating the default artifact
+set immediately. This keeps manual validation focused: the target creates only
+the selected feature or selected feature group, while automated E2E paths stay
+deterministic by passing explicit flags. `/seconds 0` keeps the target alive until Ctrl+C.
 `/manifest` creates missing parent directories before writing the JSON file.
 
 ## Manifest Validation
@@ -219,8 +242,8 @@ unless one finding satisfies all expected class/risk/confidence values, reason
 codes, expected evidence keys, and exact expected evidence values for that
 scenario. It also fails if a scenario-level `unexpected_reasons` entry appears
 for that PID.
-In console triage, `pid=0` service scenarios appear as system-scoped findings
-and the high-signal/top-reason tables expose them through `system_findings`.
+In console triage, `pid=0` service scenarios appear as system-scoped assessment
+entries and the summary exposes them through `driver_service_iocs`.
 The validator summary prints both `target_findings` and `system_findings`, then
 prints `matched_positive_scenarios` so PID-less SCM scenarios do not look empty
 when every scenario matched successfully.
@@ -359,8 +382,21 @@ because safely replacing or mutating the process main image without resembling
 an offensive hollowing/doppelganging sample needs a separate benign harness.
 `!hunt` still emits `section_path_mismatch`, `section_backing_inaccessible`,
 `disk_live_image_mismatch`, and `process_doppelganging_evidence` when live
-system evidence supports those invariants. The `SEC_IMAGE` fixtures above cover
-the same section/backing invariants for non-main image mappings.
+system evidence supports those invariants. It also cross-checks the EPROCESS
+main `SectionObject` backing against the main VAD backing and visible process
+image paths, emitting `kernel_main_section_swap_evidence` when a kernel-mode
+section swap leaves those views inconsistent, and it reports
+`process_tampering_primitive_evidence` when the live backing `FILE_OBJECT`
+shows delete-pending, write/delete access, or `SECTION_OBJECT_POINTERS`
+mismatch evidence. The `SEC_IMAGE` fixtures above cover the same
+section/backing invariants for non-main image mappings.
+
+The target also does not install WFP policy. `!hunt` still decodes current BFE
+filters and emits `security_tool_communication_blocking` when an enabled
+Block/BitmaskBlock filter targets a known security-product or anti-cheat
+process through `FWPM_CONDITION_ALE_APP_ID` or strong filter metadata. Validate
+that path with a controlled lab WFP policy or synthetic JSON artifact rather
+than by making this target change host firewall state.
 
 ## Operator Notes
 

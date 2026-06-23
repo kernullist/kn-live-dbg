@@ -64,6 +64,133 @@ function ConvertTo-ProcessArguments
     return ($escaped -join ' ')
 }
 
+function New-SyntheticHuntAssessment
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Severity,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Count,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Subject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$What,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Why,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Next
+    )
+
+    return [ordered]@{
+        severity = $Severity
+        count = $Count
+        subject = $Subject
+        what = $What
+        why = $Why
+        next = $Next
+    }
+}
+
+function Get-SyntheticHuntVerdict
+{
+    param(
+        [int]$High,
+        [int]$Medium,
+        [int]$Low
+    )
+
+    if ($High -gt 0)
+    {
+        return "alert"
+    }
+    if ($Medium -gt 0)
+    {
+        return "review"
+    }
+    if ($Low -gt 0)
+    {
+        return "low_signal"
+    }
+
+    return "clean"
+}
+
+function New-SyntheticHuntConsoleStdout
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HuntJson,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Findings,
+
+        [Parameter(Mandatory = $true)]
+        [int]$High,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Medium,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Low,
+
+        [int]$DriverServiceIocs = 0,
+
+        [int]$ThreatIntelCorrelations = 0,
+
+        [object[]]$Assessments = @()
+    )
+
+    $verdict = Get-SyntheticHuntVerdict -High $High -Medium $Medium -Low $Low
+    $assessmentList = @($Assessments)
+    $shownAssessments = @($assessmentList | Select-Object -First 4)
+    $summaryLine = "[hunt.summary] scanned=0 findings=$Findings high=$High medium=$Medium low=$Low"
+    if ($DriverServiceIocs -gt 0)
+    {
+        $summaryLine += " driver_service_iocs=$DriverServiceIocs"
+    }
+    if ($ThreatIntelCorrelations -gt 0)
+    {
+        $summaryLine += " ti_correlations=$ThreatIntelCorrelations"
+    }
+
+    $lines = @(
+        "json written: $HuntJson",
+        "!hunt mode=deep schema=kn-live-dbg.hunt.v1 timestamp=synthetic",
+        "[hunt.conclusion] verdict=$verdict findings=$Findings high=$High medium=$Medium low=$Low warnings=0",
+        "[hunt.assessment] showing=$($shownAssessments.Count) total_findings=$Findings"
+    )
+
+    if ($shownAssessments.Count -eq 0)
+    {
+        $lines += "  answer=`"no suspicious hunt findings were emitted for the scanned system view`""
+    }
+
+    for ($index = 0; $index -lt $shownAssessments.Count; ++$index)
+    {
+        $assessment = $shownAssessments[$index]
+        $row = $index + 1
+        $lines += "  #$row severity=$($assessment.severity) count=$($assessment.count) subject=`"$($assessment.subject)`""
+        $lines += "     what=`"$($assessment.what)`""
+        $lines += "     why=`"$($assessment.why)`""
+        $lines += "     next=`"$($assessment.next)`""
+    }
+
+    if ($assessmentList.Count -gt $shownAssessments.Count)
+    {
+        $lines += "  more_groups=$($assessmentList.Count - $shownAssessments.Count) use /details for raw triage tables or /json for full evidence"
+    }
+
+    $lines += $summaryLine
+    $lines += "[hunt.detail] suppressed=yes raw_tables=yes total_findings=$Findings use /details for raw triage tables or /json for full evidence"
+
+    return $lines
+}
+
 function Invoke-HuntTargetValidatorSummary
 {
     param(
@@ -622,26 +749,26 @@ function New-SyntheticEsetDriverServiceValidationFiles
 
     if (-not [string]::IsNullOrWhiteSpace($Stdout))
     {
-        Set-Content -LiteralPath $Stdout -Encoding UTF8 -Value @(
-            "json written: $HuntJson",
-            "!hunt mode=deep schema=kn-live-dbg.hunt.v1 timestamp=synthetic",
-            "[hunt.conclusion] verdict=alert findings=$($findings.Count) high=0 medium=$(@($findings | Where-Object { $_.risk -eq "medium" }).Count) low=$(@($findings | Where-Object { $_.risk -eq "low" }).Count) warnings=0",
-            "[hunt.assessment] showing=1 total=1",
-            "  #1 severity=medium scope=system findings=$($findings.Count) high=0 medium=$(@($findings | Where-Object { $_.risk -eq "medium" }).Count) low=$(@($findings | Where-Object { $_.risk -eq "low" }).Count) affected_processes=0 system_findings=$($findings.Count)",
-            "     who=system",
-            "     technique=`"installed or exposed a known defense-evasion driver artifact`"",
-            "     affected=`"SCM driver service, loaded driver, or driver image path`"",
-            "     evidence=`"known defense-evasion driver service; known driver-service binary name; known tool staging path`"",
-            "  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed",
-            "[hunt.summary] findings=$($findings.Count) high=0 medium=$(@($findings | Where-Object { $_.risk -eq "medium" }).Count) low=$(@($findings | Where-Object { $_.risk -eq "low" }).Count) driver_service_iocs=$($findings.Count)",
-            "[hunt.high_signal] showing=1 total=1",
-            "  #1 signal=known_defense_evasion_driver_service total=$($findings.Count) high=0 medium=$(@($findings | Where-Object { $_.risk -eq "medium" }).Count) low=$(@($findings | Where-Object { $_.risk -eq "low" }).Count) system_findings=$($findings.Count) processes=0 pids=-",
-            "[hunt.top_processes] showing=1 total=1",
-            "  #1 pid=0 scope=system total=$($findings.Count) high=0 medium=$(@($findings | Where-Object { $_.risk -eq "medium" }).Count) low=$(@($findings | Where-Object { $_.risk -eq "low" }).Count) top_reason=known_defense_evasion_driver_service",
-            "[hunt.top_reasons] showing=1 total=1",
-            "  #1 reason=known_defense_evasion_driver_service total=$($findings.Count) high=0 medium=$(@($findings | Where-Object { $_.risk -eq "medium" }).Count) low=$(@($findings | Where-Object { $_.risk -eq "low" }).Count) system_findings=$($findings.Count) processes=0",
-            "[hunt.detail] suppressed=yes total_findings=$($findings.Count) use /limit n for capped details or /json for full evidence"
-        )
+        $mediumCount = @($findings | Where-Object { $_.risk -eq "medium" }).Count
+        $lowCount = @($findings | Where-Object { $_.risk -eq "low" }).Count
+        $assessment = New-SyntheticHuntAssessment `
+            -Severity "medium" `
+            -Count $findings.Count `
+            -Subject "system" `
+            -What "SCM or loaded-driver state exposes a known defense-evasion driver artifact" `
+            -Why "known defense-evasion driver service; known driver-service binary name; known tool staging path" `
+            -Next "review the SCM service, loaded-driver path, and binary hash in /json"
+        Set-Content `
+            -LiteralPath $Stdout `
+            -Encoding UTF8 `
+            -Value (New-SyntheticHuntConsoleStdout `
+                -HuntJson $HuntJson `
+                -Findings $findings.Count `
+                -High 0 `
+                -Medium $mediumCount `
+                -Low $lowCount `
+                -DriverServiceIocs $findings.Count `
+                -Assessments @($assessment))
     }
 }
 
@@ -752,26 +879,24 @@ function New-SyntheticEsetRunningDriverServiceValidationFiles
 
     $manifestDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $Manifest -Encoding UTF8
     $huntDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $HuntJson -Encoding UTF8
-    Set-Content -LiteralPath $Stdout -Encoding UTF8 -Value @(
-        "json written: $HuntJson",
-        "!hunt mode=deep schema=kn-live-dbg.hunt.v1 timestamp=synthetic",
-        "[hunt.conclusion] verdict=alert findings=1 high=1 medium=0 low=0 warnings=0",
-        "[hunt.assessment] showing=1 total=1",
-        "  #1 severity=high scope=system findings=1 high=1 medium=0 low=0 affected_processes=0 system_findings=1",
-        "     who=system",
-        "     technique=`"installed or exposed a known defense-evasion driver artifact`"",
-        "     affected=`"SCM driver service, loaded driver, or driver image path`"",
-        "     evidence=`"known defense-evasion driver service; known driver-service binary name; known tool staging path`"",
-        "  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed",
-        "[hunt.summary] findings=1 high=1 medium=0 low=0 driver_service_iocs=1",
-        "[hunt.high_signal] showing=1 total=1",
-        "  #1 signal=known_defense_evasion_driver_service total=1 high=1 medium=0 low=0 system_findings=1 processes=0 pids=-",
-        "[hunt.top_processes] showing=1 total=1",
-        "  #1 pid=0 scope=system total=1 high=1 medium=0 low=0 top_reason=known_defense_evasion_driver_service",
-        "[hunt.top_reasons] showing=1 total=1",
-        "  #1 reason=known_defense_evasion_driver_service total=1 high=1 medium=0 low=0 system_findings=1 processes=0",
-        "[hunt.detail] suppressed=yes total_findings=1 use /limit n for capped details or /json for full evidence"
-    )
+    $assessment = New-SyntheticHuntAssessment `
+        -Severity "high" `
+        -Count 1 `
+        -Subject "system" `
+        -What "SCM or loaded-driver state exposes a known defense-evasion driver artifact" `
+        -Why "known defense-evasion driver service; known driver-service binary name; known tool staging path" `
+        -Next "review the SCM service, loaded-driver path, and binary hash in /json"
+    Set-Content `
+        -LiteralPath $Stdout `
+        -Encoding UTF8 `
+        -Value (New-SyntheticHuntConsoleStdout `
+            -HuntJson $HuntJson `
+            -Findings 1 `
+            -High 1 `
+            -Medium 0 `
+            -Low 0 `
+            -DriverServiceIocs 1 `
+            -Assessments @($assessment))
 }
 
 function New-SyntheticEsetExactHashValidationFiles
@@ -983,27 +1108,24 @@ function New-SyntheticEsetExactHashValidationFiles
 
     $manifestDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $Manifest -Encoding UTF8
     $huntDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $HuntJson -Encoding UTF8
-    Set-Content -LiteralPath $Stdout -Encoding UTF8 -Value @(
-        "json written: $HuntJson",
-        "!hunt mode=deep schema=kn-live-dbg.hunt.v1 timestamp=synthetic",
-        "[hunt.conclusion] verdict=alert findings=4 high=4 medium=0 low=0 warnings=0",
-        "[hunt.assessment] showing=1 total=1",
-        "  #1 severity=high scope=processes+system findings=4 high=4 medium=0 low=0 affected_processes=2 system_findings=2",
-        "     who=renamed-edr.exe(7101),renamed-credential.exe(7102),system",
-        "     technique=`"matched a published threat file hash`"",
-        "     affected=`"process image, loaded driver, or driver-service binary`"",
-        "     evidence=`"published file hash IOC; exact defense-evasion file hash; exact credential-tool file hash; known defense-evasion driver service`"",
-        "  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed",
-        "[hunt.summary] findings=4 high=4 medium=0 low=0 driver_service_iocs=1",
-        "[hunt.high_signal] showing=1 total=1",
-        "  #1 signal=published_file_hash_ioc total=4 high=4 medium=0 low=0 system_findings=2 processes=2 pids=7101,7102",
-        "[hunt.top_processes] showing=2 total=2",
-        "  #1 pid=7101 image=renamed-edr.exe total=1 high=1 medium=0 low=0 top_reason=published_file_hash_ioc",
-        "  #2 pid=7102 image=renamed-credential.exe total=1 high=1 medium=0 low=0 top_reason=published_file_hash_ioc",
-        "[hunt.top_reasons] showing=1 total=1",
-        "  #1 reason=published_file_hash_ioc total=4 high=4 medium=0 low=0 system_findings=2 processes=2",
-        "[hunt.detail] suppressed=yes total_findings=4 use /limit n for capped details or /json for full evidence"
-    )
+    $assessment = New-SyntheticHuntAssessment `
+        -Severity "high" `
+        -Count 4 `
+        -Subject "renamed-edr.exe(7101),renamed-credential.exe(7102),system" `
+        -What "process, driver, or service binary matches a published threat file hash" `
+        -Why "published file hash IOC; exact defense-evasion file hash; exact credential-tool file hash; known defense-evasion driver service" `
+        -Next "isolate the subject and review matched hash paths in /json"
+    Set-Content `
+        -LiteralPath $Stdout `
+        -Encoding UTF8 `
+        -Value (New-SyntheticHuntConsoleStdout `
+            -HuntJson $HuntJson `
+            -Findings 4 `
+            -High 4 `
+            -Medium 0 `
+            -Low 0 `
+            -DriverServiceIocs 1 `
+            -Assessments @($assessment))
 }
 
 function New-SyntheticEsetMetadataEvasionValidationFiles
@@ -1096,36 +1218,23 @@ function New-SyntheticEsetMetadataEvasionValidationFiles
 
     $manifestDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $Manifest -Encoding UTF8
     $huntDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $HuntJson -Encoding UTF8
-    Set-Content -LiteralPath $Stdout -Encoding UTF8 -Value @(
-        "json written: $HuntJson",
-        "!hunt mode=deep schema=kn-live-dbg.hunt.v1 timestamp=synthetic",
-        "[hunt.conclusion] verdict=alert findings=1 high=1 medium=0 low=0 warnings=0",
-        "[hunt.assessment] showing=1 total=1",
-        "  #1 severity=high scope=processes findings=1 high=1 medium=0 low=0 affected_processes=1 system_findings=0",
-        "     who=KaspsClear.exe(7201)",
-        "     technique=`"masqueraded as a known defense-evasion tool`"",
-        "     affected=`"process identity, file metadata, and staging path`"",
-        "     evidence=`"known defense-evasion tool name; known tool staging path; invalid code signature; manipulated version information; manipulated icon resource; packed or protected PE section`"",
-        "  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed",
-        "[hunt.summary] findings=1 high=1 medium=0 low=0 driver_service_iocs=0",
-        "[hunt.high_signal] showing=6 total=6",
-        "  #1 signal=known_defense_evasion_tool_name total=1 high=1 medium=0 low=0 system_findings=0 processes=1 pids=7201",
-        "  #2 signal=known_tool_staging_path total=1 high=1 medium=0 low=0 system_findings=0 processes=1 pids=7201",
-        "  #3 signal=invalid_code_signature total=1 high=1 medium=0 low=0 system_findings=0 processes=1 pids=7201",
-        "  #4 signal=manipulated_icon_resource total=1 high=1 medium=0 low=0 system_findings=0 processes=1 pids=7201",
-        "  #5 signal=manipulated_version_info total=1 high=1 medium=0 low=0 system_findings=0 processes=1 pids=7201",
-        "  #6 signal=packed_or_protected_section total=1 high=1 medium=0 low=0 system_findings=0 processes=1 pids=7201",
-        "[hunt.top_processes] showing=1 total=1",
-        "  #1 pid=7201 image=KaspsClear.exe total=1 high=1 medium=0 low=0 top_reason=known_defense_evasion_tool_name",
-        "[hunt.top_reasons] showing=6 total=6",
-        "  #1 reason=known_defense_evasion_tool_name total=1 high=1 medium=0 low=0 system_findings=0 processes=1",
-        "  #2 reason=known_tool_staging_path total=1 high=1 medium=0 low=0 system_findings=0 processes=1",
-        "  #3 reason=invalid_code_signature total=1 high=1 medium=0 low=0 system_findings=0 processes=1",
-        "  #4 reason=manipulated_icon_resource total=1 high=1 medium=0 low=0 system_findings=0 processes=1",
-        "  #5 reason=manipulated_version_info total=1 high=1 medium=0 low=0 system_findings=0 processes=1",
-        "  #6 reason=packed_or_protected_section total=1 high=1 medium=0 low=0 system_findings=0 processes=1",
-        "[hunt.detail] suppressed=yes total_findings=1 use /limit n for capped details or /json for full evidence"
-    )
+    $assessment = New-SyntheticHuntAssessment `
+        -Severity "high" `
+        -Count 1 `
+        -Subject "KaspsClear.exe(7201)" `
+        -What "process identity or metadata masquerades as a known defense-evasion tool" `
+        -Why "known defense-evasion tool name; known tool staging path; invalid code signature; manipulated version information; manipulated icon resource; packed or protected PE section" `
+        -Next "review image path, signature, version info, and staging path in /json"
+    Set-Content `
+        -LiteralPath $Stdout `
+        -Encoding UTF8 `
+        -Value (New-SyntheticHuntConsoleStdout `
+            -HuntJson $HuntJson `
+            -Findings 1 `
+            -High 1 `
+            -Medium 0 `
+            -Low 0 `
+            -Assessments @($assessment))
 }
 
 function New-SyntheticEsetSecurityProductTelemetryValidationFiles
@@ -1211,26 +1320,24 @@ function New-SyntheticEsetSecurityProductTelemetryValidationFiles
 
     $manifestDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $Manifest -Encoding UTF8
     $huntDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $HuntJson -Encoding UTF8
-    Set-Content -LiteralPath $Stdout -Encoding UTF8 -Value @(
-        "json written: $HuntJson",
-        "!hunt mode=deep schema=kn-live-dbg.hunt.v1 timestamp=synthetic",
-        "[hunt.conclusion] verdict=alert findings=1 high=0 medium=1 low=0 warnings=0",
-        "[hunt.assessment] showing=1 total=1",
-        "  #1 severity=medium scope=processes findings=1 high=0 medium=1 low=0 affected_processes=1 system_findings=0",
-        "     who=renamed-tool.exe(6101)",
-        "     technique=`"repeatedly controlled known security-product processes`"",
-        "     affected=`"security-product process list and cross-process control surface`"",
-        "     evidence=`"security-product process targeting; known security-product target list`"",
-        "  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed",
-        "[hunt.summary] findings=1 high=0 medium=1 low=0 driver_service_iocs=0 ti_correlations=1",
-        "[hunt.high_signal] showing=1 total=1",
-        "  #1 signal=security_product_process_targeting total=1 high=0 medium=1 low=0 system_findings=0 processes=1 pids=6101",
-        "[hunt.top_processes] showing=1 total=1",
-        "  #1 pid=6101 image=renamed-tool.exe total=1 high=0 medium=1 low=0 top_reason=security_product_process_targeting",
-        "[hunt.top_reasons] showing=1 total=1",
-        "  #1 reason=security_product_process_targeting total=1 high=0 medium=1 low=0 system_findings=0 processes=1",
-        "[hunt.detail] suppressed=yes total_findings=1 use /limit n for capped details or /json for full evidence"
-    )
+    $assessment = New-SyntheticHuntAssessment `
+        -Severity "medium" `
+        -Count 1 `
+        -Subject "renamed-tool.exe(6101)" `
+        -What "process repeatedly controlled known security-product processes" `
+        -Why "security-product process targeting; known security-product target list" `
+        -Next "review recent !ti events and the target process list in /json"
+    Set-Content `
+        -LiteralPath $Stdout `
+        -Encoding UTF8 `
+        -Value (New-SyntheticHuntConsoleStdout `
+            -HuntJson $HuntJson `
+            -Findings 1 `
+            -High 0 `
+            -Medium 1 `
+            -Low 0 `
+            -ThreatIntelCorrelations 1 `
+            -Assessments @($assessment))
 }
 
 function Add-SyntheticEsetProcessScenario
@@ -1578,55 +1685,48 @@ function New-SyntheticEsetFullValidationFiles
 
     $manifestDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $Manifest -Encoding UTF8
     $huntDoc | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $HuntJson -Encoding UTF8
-    Set-Content -LiteralPath $Stdout -Encoding UTF8 -Value @(
-        "json written: $HuntJson",
-        "!hunt mode=deep schema=kn-live-dbg.hunt.v1 timestamp=synthetic",
-        "[hunt.conclusion] verdict=alert findings=$($findings.Count) high=$highCount medium=$mediumCount low=$lowCount warnings=0",
-        "[hunt.assessment] showing=4 total=4",
-        "  #1 severity=high scope=processes findings=$($suffixScenarios.Count + 2) high=$($suffixScenarios.Count + 2) medium=0 low=0 affected_processes=$($suffixScenarios.Count + 2) system_findings=0",
-        "     who=synthetic.exe(5001),synthetic.exe(5002)",
-        "     technique=`"masqueraded as a known defense-evasion tool`"",
-        "     affected=`"process identity, file metadata, and staging path`"",
-        "     evidence=`"known defense-evasion tool name; renamed or suffixed defense-evasion tool name; known tool staging path; manipulated version information; packed or protected PE section`"",
-        "  #2 severity=medium scope=system findings=$($fixtures.Count) high=0 medium=$driverMediumCount low=$driverLowCount affected_processes=0 system_findings=$($fixtures.Count)",
-        "     who=system",
-        "     technique=`"installed or exposed a known defense-evasion driver artifact`"",
-        "     affected=`"SCM driver service, loaded driver, or driver image path`"",
-        "     evidence=`"known defense-evasion driver service; known driver-service binary name; known tool staging path`"",
-        "  #3 severity=medium scope=processes findings=1 high=0 medium=1 low=0 affected_processes=1 system_findings=0",
-        "     who=synthetic.exe($oxidePid)",
-        "     technique=`"matched credential-collection tool behavior or identity`"",
-        "     affected=`"process identity and command-line collection surface`"",
-        "     evidence=`"credential-collection command-line shape; known credential-tool name`"",
-        "  #4 severity=medium scope=processes findings=1 high=0 medium=1 low=0 affected_processes=1 system_findings=0",
-        "     who=renamed-tool.exe(6101)",
-        "     technique=`"repeatedly controlled known security-product processes`"",
-        "     affected=`"security-product process list and cross-process control surface`"",
-        "     evidence=`"security-product process targeting; known security-product target list`"",
-        "  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed",
-        "[hunt.summary] findings=$($findings.Count) high=$highCount medium=$mediumCount low=$lowCount driver_service_iocs=$($fixtures.Count) ti_correlations=1",
-        "[hunt.high_signal] showing=8 total=8",
-        "  #1 signal=known_defense_evasion_tool_name total=$($suffixScenarios.Count + 2) high=$($suffixScenarios.Count + 2) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count + 2) pids=5001,5002",
-        "  #2 signal=known_defense_evasion_driver_service total=$($fixtures.Count) high=0 medium=$driverMediumCount low=$driverLowCount system_findings=$($fixtures.Count) processes=0 pids=-",
-        "  #3 signal=credential_collection_cli_shape total=1 high=0 medium=1 low=0 system_findings=0 processes=1 pids=$oxidePid",
-        "  #4 signal=security_product_process_targeting total=1 high=0 medium=1 low=0 system_findings=0 processes=1 pids=6101",
-        "  #5 signal=renamed_defense_evasion_tool_name total=$($suffixScenarios.Count) high=$($suffixScenarios.Count) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count) pids=5001,5002",
-        "  #6 signal=known_tool_staging_path total=$($suffixScenarios.Count + 2 + $fixtures.Count) high=$($suffixScenarios.Count + 2) medium=$driverMediumCount low=$driverLowCount system_findings=$($fixtures.Count) processes=$($suffixScenarios.Count + 2) pids=5001,5002",
-        "  #7 signal=manipulated_version_info total=$($suffixScenarios.Count + 2) high=$($suffixScenarios.Count + 2) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count + 2) pids=5001,5002",
-        "  #8 signal=packed_or_protected_section total=$($suffixScenarios.Count + 2) high=$($suffixScenarios.Count + 2) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count + 2) pids=5001,5002",
-        "[hunt.top_processes] showing=1 total=1",
-        "  #1 pid=5001 image=synthetic.exe total=1 high=1 medium=0 low=0 top_reason=known_defense_evasion_tool_name",
-        "[hunt.top_reasons] showing=8 total=8",
-        "  #1 reason=known_defense_evasion_tool_name total=$($suffixScenarios.Count + 2) high=$($suffixScenarios.Count + 2) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count + 2)",
-        "  #2 reason=known_defense_evasion_driver_service total=$($fixtures.Count) high=0 medium=$driverMediumCount low=$driverLowCount system_findings=$($fixtures.Count) processes=0",
-        "  #3 reason=credential_collection_cli_shape total=1 high=0 medium=1 low=0 system_findings=0 processes=1",
-        "  #4 reason=security_product_process_targeting total=1 high=0 medium=1 low=0 system_findings=0 processes=1",
-        "  #5 reason=renamed_defense_evasion_tool_name total=$($suffixScenarios.Count) high=$($suffixScenarios.Count) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count)",
-        "  #6 reason=known_tool_staging_path total=$($suffixScenarios.Count + 2 + $fixtures.Count) high=$($suffixScenarios.Count + 2) medium=$driverMediumCount low=$driverLowCount system_findings=$($fixtures.Count) processes=$($suffixScenarios.Count + 2)",
-        "  #7 reason=manipulated_version_info total=$($suffixScenarios.Count + 2) high=$($suffixScenarios.Count + 2) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count + 2)",
-        "  #8 reason=packed_or_protected_section total=$($suffixScenarios.Count + 2) high=$($suffixScenarios.Count + 2) medium=0 low=0 system_findings=0 processes=$($suffixScenarios.Count + 2)",
-        "[hunt.detail] suppressed=yes total_findings=$($findings.Count) use /limit n for capped details or /json for full evidence"
+    $assessments = @(
+        (New-SyntheticHuntAssessment `
+            -Severity "high" `
+            -Count ($suffixScenarios.Count + 2) `
+            -Subject "synthetic.exe(5001),synthetic.exe(5002)" `
+            -What "process identity or metadata masquerades as a known defense-evasion tool" `
+            -Why "known defense-evasion tool name; renamed or suffixed defense-evasion tool name; known tool staging path; manipulated version information; packed or protected PE section" `
+            -Next "review image path, signature, version info, and staging path in /json"),
+        (New-SyntheticHuntAssessment `
+            -Severity "medium" `
+            -Count $fixtures.Count `
+            -Subject "system" `
+            -What "SCM or loaded-driver state exposes a known defense-evasion driver artifact" `
+            -Why "known defense-evasion driver service; known driver-service binary name; known tool staging path" `
+            -Next "review the SCM service, loaded-driver path, and binary hash in /json"),
+        (New-SyntheticHuntAssessment `
+            -Severity "medium" `
+            -Count 1 `
+            -Subject "synthetic.exe($oxidePid)" `
+            -What "process identity or command line matches credential-collection tooling" `
+            -Why "credential-collection command-line shape; known credential-tool name" `
+            -Next "review command line, image path, and file identity in /json"),
+        (New-SyntheticHuntAssessment `
+            -Severity "medium" `
+            -Count 1 `
+            -Subject "renamed-tool.exe(6101)" `
+            -What "process repeatedly controlled known security-product processes" `
+            -Why "security-product process targeting; known security-product target list" `
+            -Next "review recent !ti events and the target process list in /json")
     )
+    Set-Content `
+        -LiteralPath $Stdout `
+        -Encoding UTF8 `
+        -Value (New-SyntheticHuntConsoleStdout `
+            -HuntJson $HuntJson `
+            -Findings $findings.Count `
+            -High $highCount `
+            -Medium $mediumCount `
+            -Low $lowCount `
+            -DriverServiceIocs $fixtures.Count `
+            -ThreatIntelCorrelations 1 `
+            -Assessments $assessments)
 }
 
 $rootPath = (Resolve-Path -LiteralPath $Root).Path
@@ -1692,7 +1792,7 @@ Invoke-Step -Name "synthetic ESET driver-service validator" -Script {
         -ValidatorLog ".build\hunt-readiness-service-artifact-validator.log" `
         -ExpectedScenarioCount 15 `
         -ExpectedEdrKillerDriverServices 15 `
-        -RequiredHighSignalNeedle "signal=known_defense_evasion_driver_service" `
+        -RequiredAssessmentNeedle "known defense-evasion driver service" `
         -RequiredReasons @("gentlemen_edr_killer_driver_service", "driver_service_binary_name_ioc", "driver_service_not_running") `
         -AllowNoHighRisk
     if ($LASTEXITCODE -ne 0)
@@ -1733,7 +1833,7 @@ Invoke-Step -Name "synthetic ESET driver-service validator" -Script {
         -Root $defaultRoot `
         -ExpectedScenarioCount 15 `
         -ExpectedEdrKillerDriverServices 15 `
-        -RequiredHighSignalNeedle "signal=known_defense_evasion_driver_service" `
+        -RequiredAssessmentNeedle "known defense-evasion driver service" `
         -RequiredReasons @("gentlemen_edr_killer_driver_service", "driver_service_binary_name_ioc", "driver_service_not_running") `
         -AllowNoHighRisk
     if ($LASTEXITCODE -ne 0)
@@ -1757,7 +1857,7 @@ Invoke-Step -Name "synthetic ESET driver-service validator" -Script {
         -ValidatorLog ".build\hunt-readiness-service-running-synthetic-validator.log" `
         -ExpectedScenarioCount 1 `
         -ExpectedEdrKillerDriverServices 1 `
-        -RequiredHighSignalNeedle "signal=known_defense_evasion_driver_service" `
+        -RequiredAssessmentNeedle "known defense-evasion driver service" `
         -RequiredReasons @("gentlemen_edr_killer_driver_service", "driver_service_binary_name_ioc", "driver_service_running")
     if ($LASTEXITCODE -ne 0)
     {
@@ -1781,7 +1881,7 @@ Invoke-Step -Name "synthetic ESET driver-service validator" -Script {
         -ValidatorLog ".build\hunt-readiness-exact-hash-synthetic-validator.log" `
         -ExpectedScenarioCount 4 `
         -ExpectedEdrKillerDriverServices 1 `
-        -RequiredHighSignalNeedle "signal=published_file_hash_ioc" `
+        -RequiredAssessmentNeedle "published file hash IOC" `
         -RequiredReasons @("eset_exact_file_sha1_ioc", "edr_killer_exact_file_sha1_ioc", "oxideharvest_exact_file_sha1_ioc", "loaded_driver_file_hash_ioc", "driver_service_file_hash_ioc")
     if ($LASTEXITCODE -ne 0)
     {
@@ -1805,7 +1905,7 @@ Invoke-Step -Name "synthetic ESET driver-service validator" -Script {
         -ValidatorLog ".build\hunt-readiness-metadata-evasion-synthetic-validator.log" `
         -ExpectedScenarioCount 1 `
         -ExpectedEdrKillerDriverServices 0 `
-        -RequiredHighSignalNeedle "signal=packed_or_protected_section" `
+        -RequiredAssessmentNeedle "packed or protected PE section" `
         -RequiredReasons @("edr_killer_invalid_code_signature", "edr_killer_version_info_impersonation_evidence", "edr_killer_icon_impersonation_evidence", "edr_killer_packer_section_evidence")
     if ($LASTEXITCODE -ne 0)
     {
@@ -1829,7 +1929,7 @@ Invoke-Step -Name "synthetic ESET driver-service validator" -Script {
         -ValidatorLog ".build\hunt-readiness-security-product-telemetry-synthetic-validator.log" `
         -ExpectedScenarioCount 1 `
         -ExpectedEdrKillerDriverServices 0 `
-        -RequiredHighSignalNeedle "signal=security_product_process_targeting" `
+        -RequiredAssessmentNeedle "security-product process targeting" `
         -RequiredReasons @("known_security_product_process_target", "gentlekiller_security_target_list", "defense_impairment_telemetry") `
         -AllowNoHighRisk
     if ($LASTEXITCODE -ne 0)
@@ -1893,7 +1993,7 @@ Invoke-Step -Name "synthetic ESET full artifact validator" -Script {
         -HuntJson ".build\hunt-readiness-full-synthetic.json" `
         -Stdout ".build\hunt-readiness-full-synthetic-stdout.log" `
         -ValidatorLog ".build\hunt-readiness-full-synthetic-security-target-validator.log" `
-        -RequiredHighSignalNeedle "signal=security_product_process_targeting" `
+        -RequiredAssessmentNeedle "security-product process targeting" `
         -RequiredReasons @("known_security_product_process_target", "gentlekiller_security_target_list", "defense_impairment_telemetry")
     if ($LASTEXITCODE -ne 0)
     {
@@ -1991,18 +2091,18 @@ Invoke-Step -Name "synthetic ESET full artifact validator" -Script {
     }
     Write-Host "[hunt-readiness] artifact mutation rejected unexpected_negative_reason=yes"
 
-    $mutatedHighSignalStdout = Join-Path $rootPath ".build\hunt-readiness-full-synthetic-mutated-high-signal-driver-service.log"
+    $mutatedAssessmentStdout = Join-Path $rootPath ".build\hunt-readiness-full-synthetic-mutated-assessment-driver-service.log"
     Get-Content -LiteralPath $fullStdout |
-        Where-Object { $_ -notmatch "signal=known_defense_evasion_driver_service" } |
-        Set-Content -LiteralPath $mutatedHighSignalStdout -Encoding UTF8
+        Where-Object { $_ -notmatch "known defense-evasion driver service" } |
+        Set-Content -LiteralPath $mutatedAssessmentStdout -Encoding UTF8
     Invoke-EsetArtifactValidatorExpectedFailure `
-        -Name "synthetic ESET full high-signal driver-service mutation" `
+        -Name "synthetic ESET full assessment driver-service mutation" `
         -Manifest ".build\hunt-readiness-full-synthetic-manifest.json" `
         -HuntJson ".build\hunt-readiness-full-synthetic.json" `
-        -Stdout ".build\hunt-readiness-full-synthetic-mutated-high-signal-driver-service.log" `
-        -ValidatorLog ".build\hunt-readiness-full-synthetic-mutated-high-signal-driver-service-validator.log" `
-        -OuterLog (Join-Path $rootPath ".build\hunt-readiness-full-synthetic-mutated-high-signal-driver-service-validator-output.log")
-    Write-Host "[hunt-readiness] artifact mutation rejected high_signal_driver_service=yes"
+        -Stdout ".build\hunt-readiness-full-synthetic-mutated-assessment-driver-service.log" `
+        -ValidatorLog ".build\hunt-readiness-full-synthetic-mutated-assessment-driver-service-validator.log" `
+        -OuterLog (Join-Path $rootPath ".build\hunt-readiness-full-synthetic-mutated-assessment-driver-service-validator-output.log")
+    Write-Host "[hunt-readiness] artifact mutation rejected assessment_driver_service=yes"
 
     $mutatedRunnerLog = Join-Path $rootPath ".build\hunt-readiness-full-synthetic-mutated-runner-elevation.log"
     Get-Content -LiteralPath $fullRunnerLog |
@@ -2117,6 +2217,43 @@ else
     if (-not (Test-Path -LiteralPath $releaseTarget))
     {
         throw "release hunt target not found: $releaseTarget"
+    }
+
+    Invoke-Step -Name "interactive menu baseline smoke" -Script {
+        $manifest = Join-Path $rootPath ".build\hunt-readiness-menu-baseline-manifest.json"
+        $log = Join-Path $rootPath ".build\hunt-readiness-menu-baseline.log"
+        Remove-Item -LiteralPath $manifest, $log -Force -ErrorAction SilentlyContinue
+        $cmdLine = "echo 1| `"$releaseTarget`" /seconds 1 /manifest `"$manifest`""
+        & $env:ComSpec /d /c $cmdLine *> $log
+
+        if ($LASTEXITCODE -ne 0)
+        {
+            Get-Content -LiteralPath $log | Select-Object -Last 80 | Out-Host
+            throw "interactive menu baseline smoke failed with exit code $LASTEXITCODE"
+        }
+        if (-not (Test-Path -LiteralPath $manifest))
+        {
+            throw "interactive menu baseline manifest missing: $manifest"
+        }
+
+        $stdout = Get-Content -LiteralPath $log -Raw
+        if ($stdout.IndexOf("Available hunt target experiments:", [System.StringComparison]::OrdinalIgnoreCase) -lt 0)
+        {
+            throw "interactive menu smoke did not print experiment menu"
+        }
+        if ($stdout.IndexOf("/baseline - baseline negative control", [System.StringComparison]::OrdinalIgnoreCase) -lt 0)
+        {
+            throw "interactive menu smoke did not select baseline"
+        }
+
+        $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+        $count = @($doc.scenarios).Count
+        if ($count -ne 0)
+        {
+            throw "expected 0 scenarios for interactive baseline, got $count"
+        }
+
+        Write-Host "[hunt-readiness] interactive menu baseline scenarios=$count"
     }
 
     Invoke-Step -Name "stop-event target cleanup smoke" -Script {

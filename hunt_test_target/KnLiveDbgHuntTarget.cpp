@@ -1,6 +1,7 @@
 #include <Windows.h>
 
 #include <cstdint>
+#include <cwctype>
 #include <cwchar>
 #include <cstring>
 #include <iomanip>
@@ -62,6 +63,7 @@ namespace
         bool EdrKillerDriverService = false;
         bool Baseline = false;
         bool Help = false;
+        bool Interactive = false;
         DWORD ChildWaitParentPid = 0;
         DWORD RunSeconds = kDefaultRunSeconds;
         std::wstring ManifestPath;
@@ -91,6 +93,17 @@ namespace
         std::wstring ExpectedRisk;
         std::wstring ExpectedConfidence;
         std::wstring Notes;
+    };
+
+    struct ScenarioMenuItem
+    {
+        const wchar_t* OptionName;
+        const wchar_t* Title;
+        const wchar_t* Category;
+        const wchar_t* Creates;
+        const wchar_t* HuntExpectation;
+        const wchar_t* OperatorNote;
+        bool Options::* Flag;
     };
 
     struct MappedImageInfo
@@ -126,6 +139,202 @@ namespace
     bool g_LateExportPatched = false;
     uint64_t g_DefaultPatchAddress = 0;
     uint64_t g_LatePatchAddress = 0;
+
+    const ScenarioMenuItem g_ScenarioMenuItems[] =
+    {
+        {
+            L"/baseline",
+            L"baseline negative control",
+            L"baseline / negative control",
+            L"no suspicious artifact",
+            L"target should have no target-specific findings",
+            L"use this before positive controls to check local noise",
+            &Options::Baseline
+        },
+        {
+            L"/private-exec",
+            L"private executable VAD",
+            L"mapped code / injection primitive",
+            L"a private RX page owned by this process",
+            L"hunt should report private executable memory",
+            L"focused test for mapped code without thread evidence",
+            &Options::PrivateExec
+        },
+        {
+            L"/rwx",
+            L"writable executable VAD",
+            L"mapped code / injection primitive",
+            L"a private RWX page owned by this process",
+            L"hunt should report writable executable private memory",
+            L"stronger than RX because write and execute are both present",
+            &Options::Rwx
+        },
+        {
+            L"/large-private-exec",
+            L"large private executable VAD",
+            L"mapped code / injection primitive",
+            L"a large private RX region",
+            L"hunt should report a large private executable region",
+            L"useful for unpacker or manual-map staging heuristics",
+            &Options::LargePrivateExec
+        },
+        {
+            L"/pe-like",
+            L"private PE-like mapping",
+            L"mapped code / loader evasion",
+            L"a private executable page that looks like a PE image",
+            L"hunt should report a private PE mapping without loader state",
+            L"does not create a real loader module entry",
+            &Options::PeLike
+        },
+        {
+            L"/wiped-pe",
+            L"wiped private PE mapping",
+            L"mapped code / loader evasion",
+            L"a private PE-like page with wiped MZ and PE signatures",
+            L"hunt should still recover PE-like evidence after header wiping",
+            L"tests weak-header evasion, not another process",
+            &Options::WipedPe
+        },
+        {
+            L"/thread",
+            L"thread start in private executable memory",
+            L"execution from injected code",
+            L"a live thread whose start address is private executable memory",
+            L"hunt should connect the suspicious thread start to private code",
+            L"use when validating thread-start correlation",
+            &Options::Thread
+        },
+        {
+            L"/apc",
+            L"APC routine in private executable memory",
+            L"execution from injected code",
+            L"an APC normal routine pointing at private executable memory",
+            L"hunt should connect APC target evidence to private code",
+            L"use when validating queued APC correlation",
+            &Options::Apc
+        },
+        {
+            L"/threadless-stack",
+            L"threadless stack reference",
+            L"threadless mapped-code evidence",
+            L"a normal thread stack that references private executable memory",
+            L"hunt should report stack references to user executable memory",
+            L"no suspicious thread start is required for this one",
+            &Options::ThreadlessStack
+        },
+        {
+            L"/module-patch",
+            L"module text patch",
+            L"module integrity / module stomping",
+            L"a loaded fixture DLL export patched in memory",
+            L"hunt should report live-vs-disk executable page mismatch",
+            L"basic module text integrity positive control",
+            &Options::ModulePatch
+        },
+        {
+            L"/module-patch-late",
+            L"late-section module text patch",
+            L"module integrity / module stomping",
+            L"a later executable section in the fixture DLL patched in memory",
+            L"hunt should report module text mismatch and stomping evidence",
+            L"targets non-entry executable section coverage",
+            &Options::ModulePatchLate
+        },
+        {
+            L"/stomp-thread",
+            L"module stomping with thread start",
+            L"module stomping execution",
+            L"a modified module page used as a thread start address",
+            L"hunt should connect thread execution to modified module code",
+            L"good focused test for stomped module thread starts",
+            &Options::StompThread
+        },
+        {
+            L"/stomp-apc",
+            L"module stomping with APC target",
+            L"module stomping execution",
+            L"an APC target inside a modified module executable page",
+            L"hunt should connect APC execution to modified module code",
+            L"good focused test for stomped module APC targets",
+            &Options::StompApc
+        },
+        {
+            L"/section-image-map",
+            L"loader-invisible SEC_IMAGE mapping",
+            L"loader-view evasion",
+            L"a copied DLL mapped as SEC_IMAGE without LoadLibrary",
+            L"hunt should report an image VAD missing from the loader list",
+            L"tests cross-view module enumeration",
+            &Options::SectionImageMap
+        },
+        {
+            L"/locked-backed-image",
+            L"locked backing file image mapping",
+            L"loader-view evasion",
+            L"a loader-invisible SEC_IMAGE whose backing file blocks read reopen",
+            L"hunt should report missing loader entry and inaccessible backing",
+            L"models anti-inspection file sharing tricks",
+            &Options::LockedBackedImage
+        },
+        {
+            L"/section-image-stomp",
+            L"stomped loader-invisible SEC_IMAGE mapping",
+            L"loader-view evasion + module stomping",
+            L"a loader-invisible SEC_IMAGE mapping with modified executable code",
+            L"hunt should report both loader-view evasion and module stomping",
+            L"higher-signal than a clean SEC_IMAGE map",
+            &Options::SectionImageStomp
+        },
+        {
+            L"/image-rwx-section",
+            L"image RWX section",
+            L"module permission anomaly",
+            L"a loaded image section with writable executable protection",
+            L"hunt should report image RWX section evidence",
+            L"models Mockingjay-style writable executable image sections",
+            &Options::ImageRwxSection
+        },
+        {
+            L"/edr-killer-suffix-name",
+            L"known defense-evasion process-name fixtures",
+            L"process identity / defense-evasion profile",
+            L"benign child copies with Gentlemen-style process names and metadata",
+            L"hunt should explain process masquerading and staging evidence",
+            L"also creates negative-control child processes",
+            &Options::EdrKillerSuffixName
+        },
+        {
+            L"/oxideharvest-cli",
+            L"credential-tool command-line fixture",
+            L"process identity / credential-tool profile",
+            L"a benign child copy with OxideHarvest-style command-line shape",
+            L"hunt should explain credential-collection CLI evidence",
+            L"also creates a name-only negative-control child process",
+            &Options::OxideHarvestCli
+        },
+        {
+            L"/edr-killer-driver-service",
+            L"known defense-evasion driver-service fixtures",
+            L"system artifact / driver-service IOC",
+            L"temporary non-started SCM kernel-driver service entries",
+            L"hunt should explain system-scoped driver-service IOC evidence",
+            L"requires admin; non-admin readiness smoke expects this to skip",
+            &Options::EdrKillerDriverService
+        },
+        {
+            L"/lab-builtin-profile",
+            L"built-in process impersonation lab profile",
+            L"built-in process impersonation",
+            L"an explicit lab-only built-in process profile violation",
+            L"hunt should explain path and non-Windows module identity mismatch",
+            L"intentionally gated by an explicit scenario selection",
+            &Options::LabBuiltinProfile
+        }
+    };
+
+    constexpr size_t kScenarioMenuItemCount =
+        sizeof(g_ScenarioMenuItems) / sizeof(g_ScenarioMenuItems[0]);
 
     void TouchPackerSectionMarker()
     {
@@ -593,18 +802,124 @@ namespace
         return json.str();
     }
 
+    void ClearScenarioOptions(Options* options)
+    {
+        if (options == nullptr)
+        {
+            return;
+        }
+
+        options->PrivateExec = false;
+        options->Rwx = false;
+        options->LargePrivateExec = false;
+        options->PeLike = false;
+        options->WipedPe = false;
+        options->Thread = false;
+        options->Apc = false;
+        options->ThreadlessStack = false;
+        options->ModulePatch = false;
+        options->ModulePatchLate = false;
+        options->StompThread = false;
+        options->StompApc = false;
+        options->SectionImageMap = false;
+        options->LockedBackedImage = false;
+        options->SectionImageStomp = false;
+        options->ImageRwxSection = false;
+        options->EdrKillerSuffixName = false;
+        options->OxideHarvestCli = false;
+        options->EdrKillerDriverService = false;
+        options->LabBuiltinProfile = false;
+        options->Baseline = false;
+    }
+
+    void EnableAllScenarioOptions(Options* options)
+    {
+        if (options == nullptr)
+        {
+            return;
+        }
+
+        ClearScenarioOptions(options);
+        options->PrivateExec = true;
+        options->Rwx = true;
+        options->LargePrivateExec = true;
+        options->PeLike = true;
+        options->WipedPe = true;
+        options->Thread = true;
+        options->Apc = true;
+        options->ThreadlessStack = true;
+        options->ModulePatch = true;
+        options->ModulePatchLate = true;
+        options->StompThread = true;
+        options->StompApc = true;
+        options->SectionImageMap = true;
+        options->LockedBackedImage = true;
+        options->SectionImageStomp = true;
+        options->ImageRwxSection = true;
+        options->EdrKillerSuffixName = true;
+        options->OxideHarvestCli = true;
+        options->EdrKillerDriverService = true;
+        options->LabBuiltinProfile = true;
+    }
+
+    bool EnableScenarioByMenuIndex(size_t menuIndex, Options* options)
+    {
+        bool ok = true;
+
+        do
+        {
+            if (options == nullptr || menuIndex == 0 || menuIndex > kScenarioMenuItemCount)
+            {
+                ok = false;
+                break;
+            }
+
+            const ScenarioMenuItem& item = g_ScenarioMenuItems[menuIndex - 1];
+            (options->*(item.Flag)) = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void PrintScenarioMenu()
+    {
+        std::wcout << L"\nAvailable hunt target experiments:\n";
+        std::wcout << L"  Select a focused experiment. Each item explains what the target creates\n";
+        std::wcout << L"  and what a successful !hunt run should conclude.\n\n";
+        std::wcout << L"  0. /all - all positive-control experiments\n";
+        std::wcout << L"     category: full sweep\n";
+        std::wcout << L"     creates : every positive-control artifact listed below\n";
+        std::wcout << L"     hunt    : broad validation across memory, module, identity, and service evidence\n";
+        std::wcout << L"     note    : intentionally noisy; driver-service items require admin\n";
+        for (size_t index = 0; index < kScenarioMenuItemCount; ++index)
+        {
+            const ScenarioMenuItem& item = g_ScenarioMenuItems[index];
+            std::wcout << L"  " << (index + 1) << L". "
+                       << item.Title << L" (" << item.OptionName << L")\n";
+            std::wcout << L"     category: " << item.Category << L"\n";
+            std::wcout << L"     creates : " << item.Creates << L"\n";
+            std::wcout << L"     hunt    : " << item.HuntExpectation << L"\n";
+            std::wcout << L"     note    : " << item.OperatorNote << L"\n";
+        }
+        std::wcout << L"\n";
+    }
+
     void PrintUsage()
     {
         std::wcout << L"KnLiveDbgHuntTarget command:\n";
         std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/edr-killer-suffix-name] [/oxideharvest-cli] [/edr-killer-driver-service] [/lab-builtin-profile] [/manifest path] [/seconds n] [/stop-event name]\n";
+        std::wcout << L"  KnLiveDbgHuntTarget.exe\n";
         std::wcout << L"\n";
         std::wcout << L"notes:\n";
         std::wcout << L"  This is a lab-only positive-control target for !hunt.\n";
         std::wcout << L"  It mutates only its own process and never injects into another process.\n";
+        std::wcout << L"  Without a scenario flag, it opens the numbered experiment menu below.\n";
+        std::wcout << L"  Menu selections accept one number, comma/space separated numbers, or ranges such as 2-6.\n";
         std::wcout << L"  /seconds 0 keeps the target alive until Ctrl+C.\n";
         std::wcout << L"  /stop-event waits for a named manual-reset event and exits cleanly when it is signaled.\n";
         std::wcout << L"  /manifest creates parent directories when needed.\n";
         std::wcout << L"  Run KnLiveDbg elevated in another console and execute: !hunt /deep /summary /json .\\hunt-target.json\n";
+        PrintScenarioMenu();
     }
 
     bool ParseUInt32(const wchar_t* text, DWORD* value)
@@ -655,26 +970,7 @@ namespace
                 }
                 else if (arg == L"/all")
                 {
-                    options->PrivateExec = true;
-                    options->Rwx = true;
-                    options->LargePrivateExec = true;
-                    options->PeLike = true;
-                    options->WipedPe = true;
-                    options->Thread = true;
-                    options->Apc = true;
-                    options->ThreadlessStack = true;
-                    options->ModulePatch = true;
-                    options->ModulePatchLate = true;
-                    options->StompThread = true;
-                    options->StompApc = true;
-                    options->SectionImageMap = true;
-                    options->LockedBackedImage = true;
-                    options->SectionImageStomp = true;
-                    options->ImageRwxSection = true;
-                    options->EdrKillerSuffixName = true;
-                    options->OxideHarvestCli = true;
-                    options->EdrKillerDriverService = true;
-                    options->LabBuiltinProfile = true;
+                    EnableAllScenarioOptions(options);
                     sawScenario = true;
                 }
                 else if (arg == L"/baseline")
@@ -858,50 +1154,276 @@ namespace
 
             if (!sawScenario && options->ChildWaitParentPid == 0)
             {
-                options->PrivateExec = true;
-                options->Rwx = true;
-                options->LargePrivateExec = true;
-                options->PeLike = true;
-                options->WipedPe = true;
-                options->Thread = true;
-                options->Apc = true;
-                options->ThreadlessStack = true;
-                options->ModulePatch = true;
-                options->ModulePatchLate = true;
-                options->StompThread = true;
-                options->StompApc = true;
-                options->SectionImageMap = true;
-                options->LockedBackedImage = true;
-                options->SectionImageStomp = true;
-                options->ImageRwxSection = true;
-                options->EdrKillerSuffixName = false;
-                options->OxideHarvestCli = false;
-                options->EdrKillerDriverService = false;
-                options->LabBuiltinProfile = false;
+                options->Interactive = true;
             }
 
             if (options->Baseline)
             {
-                options->PrivateExec = false;
-                options->Rwx = false;
-                options->LargePrivateExec = false;
-                options->PeLike = false;
-                options->WipedPe = false;
-                options->Thread = false;
-                options->Apc = false;
-                options->ThreadlessStack = false;
-                options->ModulePatch = false;
-                options->ModulePatchLate = false;
-                options->StompThread = false;
-                options->StompApc = false;
-                options->SectionImageMap = false;
-                options->LockedBackedImage = false;
-                options->SectionImageStomp = false;
-                options->ImageRwxSection = false;
-                options->EdrKillerSuffixName = false;
-                options->OxideHarvestCli = false;
-                options->EdrKillerDriverService = false;
-                options->LabBuiltinProfile = false;
+                ClearScenarioOptions(options);
+                options->Baseline = true;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool ParseMenuSelection(
+        const std::wstring& line,
+        std::vector<size_t>* selections,
+        bool* quit)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (selections == nullptr || quit == nullptr)
+            {
+                break;
+            }
+
+            selections->clear();
+            *quit = false;
+
+            std::wstring normalized = line;
+            for (wchar_t& ch : normalized)
+            {
+                if (ch == L',' ||
+                    ch == L';' ||
+                    ch == L'\t' ||
+                    ch == L'\r' ||
+                    ch == L'\n' ||
+                    ch == L'\0' ||
+                    ch == static_cast<wchar_t>(0xfeff))
+                {
+                    ch = L' ';
+                }
+            }
+
+            std::wistringstream stream(normalized);
+            std::wstring token;
+            bool parseFailure = false;
+            while (stream >> token)
+            {
+                std::wstring lowerToken;
+                for (wchar_t ch : token)
+                {
+                    lowerToken.push_back(static_cast<wchar_t>(std::towlower(ch)));
+                }
+
+                if (lowerToken == L"q" || lowerToken == L"quit" || lowerToken == L"exit")
+                {
+                    *quit = true;
+                    selections->clear();
+                    ok = true;
+                    break;
+                }
+                if (lowerToken == L"all")
+                {
+                    selections->push_back(0);
+                    continue;
+                }
+
+                size_t dash = lowerToken.find(L'-');
+                if (dash != std::wstring::npos)
+                {
+                    if (dash == 0 || dash + 1 == lowerToken.size())
+                    {
+                        parseFailure = true;
+                        break;
+                    }
+
+                    std::wstring firstText = lowerToken.substr(0, dash);
+                    std::wstring lastText = lowerToken.substr(dash + 1);
+                    DWORD first = 0;
+                    DWORD last = 0;
+                    if (!ParseUInt32(firstText.c_str(), &first) ||
+                        !ParseUInt32(lastText.c_str(), &last) ||
+                        first > last ||
+                        last > static_cast<DWORD>(kScenarioMenuItemCount))
+                    {
+                        parseFailure = true;
+                        break;
+                    }
+
+                    for (DWORD value = first; value <= last; ++value)
+                    {
+                        selections->push_back(static_cast<size_t>(value));
+                    }
+                    continue;
+                }
+
+                DWORD value = 0;
+                if (!ParseUInt32(lowerToken.c_str(), &value) ||
+                    value > static_cast<DWORD>(kScenarioMenuItemCount))
+                {
+                    parseFailure = true;
+                    break;
+                }
+
+                selections->push_back(static_cast<size_t>(value));
+            }
+
+            if (*quit)
+            {
+                break;
+            }
+
+            if (parseFailure)
+            {
+                selections->clear();
+                break;
+            }
+
+            ok = !selections->empty();
+        } while (false);
+
+        return ok;
+    }
+
+    bool IsMenuIndexSelected(const std::vector<size_t>& selections, size_t menuIndex)
+    {
+        bool selected = false;
+
+        for (size_t selection : selections)
+        {
+            if (selection == menuIndex)
+            {
+                selected = true;
+                break;
+            }
+        }
+
+        return selected;
+    }
+
+    bool IsScenarioMenuIndexEnabled(const Options& options, size_t menuIndex)
+    {
+        bool enabled = false;
+
+        do
+        {
+            if (menuIndex == 0 || menuIndex > kScenarioMenuItemCount)
+            {
+                break;
+            }
+
+            const ScenarioMenuItem& item = g_ScenarioMenuItems[menuIndex - 1];
+            enabled = (options.*(item.Flag));
+        } while (false);
+
+        return enabled;
+    }
+
+    void PrintSelectedScenarioOptions(const Options& options)
+    {
+        std::wcout << L"\nselected experiments:\n";
+        for (size_t index = 1; index <= kScenarioMenuItemCount; ++index)
+        {
+            if (IsScenarioMenuIndexEnabled(options, index))
+            {
+                const ScenarioMenuItem& item = g_ScenarioMenuItems[index - 1];
+                std::wcout << L"  " << index << L". "
+                           << item.OptionName << L" - "
+                           << item.Title << L"\n";
+                std::wcout << L"     creates: " << item.Creates << L"\n";
+                std::wcout << L"     hunt   : " << item.HuntExpectation << L"\n";
+            }
+        }
+        std::wcout << L"\n";
+    }
+
+    bool PromptScenarioMenuSelection(Options* options, bool* canceled)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (options == nullptr || canceled == nullptr)
+            {
+                break;
+            }
+
+            *canceled = false;
+            ClearScenarioOptions(options);
+            PrintScenarioMenu();
+
+            for (;;)
+            {
+                std::wcout << L"Select experiment number(s), 0/all for all, or q to exit: ";
+                std::wcout.flush();
+
+                std::wstring line;
+                if (!std::getline(std::wcin, line))
+                {
+                    std::wcout << L"\nno selection; exiting\n";
+                    *canceled = true;
+                    ok = true;
+                    break;
+                }
+
+                std::vector<size_t> selections;
+                bool quit = false;
+                if (!ParseMenuSelection(line, &selections, &quit))
+                {
+                    std::wcerr << L"invalid selection. Enter one number, comma/space separated numbers, a range, or q.\n";
+                    continue;
+                }
+
+                if (quit)
+                {
+                    *canceled = true;
+                    ok = true;
+                    break;
+                }
+
+                bool allSelected = IsMenuIndexSelected(selections, 0);
+                if (allSelected)
+                {
+                    EnableAllScenarioOptions(options);
+                    PrintSelectedScenarioOptions(*options);
+                    ok = true;
+                    break;
+                }
+
+                bool baselineSelected = IsMenuIndexSelected(selections, 1);
+                bool baselineCombined = false;
+                if (baselineSelected)
+                {
+                    for (size_t selection : selections)
+                    {
+                        if (selection != 1)
+                        {
+                            baselineCombined = true;
+                            break;
+                        }
+                    }
+                }
+                if (baselineCombined)
+                {
+                    std::wcerr << L"baseline cannot be combined with positive-control experiments.\n";
+                    continue;
+                }
+
+                ClearScenarioOptions(options);
+                bool enableFailure = false;
+                for (size_t menuIndex : selections)
+                {
+                    if (!EnableScenarioByMenuIndex(menuIndex, options))
+                    {
+                        enableFailure = true;
+                        break;
+                    }
+                }
+
+                if (enableFailure)
+                {
+                    std::wcerr << L"invalid selection index.\n";
+                    continue;
+                }
+
+                PrintSelectedScenarioOptions(*options);
+                ok = true;
+                break;
             }
         } while (false);
 
@@ -3831,6 +4353,19 @@ int wmain(int argc, wchar_t** argv)
             PrintUsage();
             exitCode = 0;
             break;
+        }
+        if (options.Interactive)
+        {
+            bool canceled = false;
+            if (!PromptScenarioMenuSelection(&options, &canceled))
+            {
+                break;
+            }
+            if (canceled)
+            {
+                exitCode = 0;
+                break;
+            }
         }
 
         g_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
