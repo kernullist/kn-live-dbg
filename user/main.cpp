@@ -26020,6 +26020,25 @@ static std::wstring HuntAssessmentSeverityText(const HuntConsoleAssessmentSummar
     return severity;
 }
 
+static bool IsHighSignalHuntAssessment(const HuntConsoleAssessmentSummary& summary)
+{
+    return summary.High != 0;
+}
+
+static void PrintHuntAssessmentLine(
+    const HuntConsoleAssessmentSummary& summary,
+    const std::wstring& line)
+{
+    if (IsHighSignalHuntAssessment(summary))
+    {
+        PrintColoredText(line, KNDBG_COLOR_FAIL);
+    }
+    else
+    {
+        std::wcout << line;
+    }
+}
+
 static std::wstring HuntAssessmentScopeText(const HuntConsoleAssessmentSummary& summary)
 {
     std::wstring scope = L"processes";
@@ -26791,23 +26810,26 @@ static void PrintHuntAssessment(const HuntResult& result)
     for (size_t index = 0; index < summaries.size() && index < maxRows; ++index)
     {
         const HuntConsoleAssessmentSummary& summary = summaries[index];
-        std::wcout << L"  #" << (index + 1)
-                   << L" severity=" << HuntAssessmentSeverityText(summary)
-                   << L" scope=" << HuntAssessmentScopeText(summary)
-                   << L" findings=" << summary.Total
-                   << L" high=" << summary.High
-                   << L" medium=" << summary.Medium
-                   << L" low=" << summary.Low
-                   << L" affected_processes=" << summary.ProcessIds.size()
-                   << L" system_findings=" << summary.SystemFindings
-                   << L"\n";
+        std::wstringstream row;
+        row << L"  #" << (index + 1)
+            << L" severity=" << HuntAssessmentSeverityText(summary)
+            << L" scope=" << HuntAssessmentScopeText(summary)
+            << L" findings=" << summary.Total
+            << L" high=" << summary.High
+            << L" medium=" << summary.Medium
+            << L" low=" << summary.Low
+            << L" affected_processes=" << summary.ProcessIds.size()
+            << L" system_findings=" << summary.SystemFindings
+            << L"\n";
+        PrintHuntAssessmentLine(summary, row.str());
+
         if (!summary.Samples.empty())
         {
-            std::wcout << L"     who=" << JoinHuntValues(summary.Samples) << L"\n";
+            PrintHuntAssessmentLine(summary, L"     who=" + JoinHuntValues(summary.Samples) + L"\n");
         }
-        std::wcout << L"     technique=\"" << HuntAssessmentTechniqueText(summary.Kind) << L"\"\n";
-        std::wcout << L"     affected=\"" << HuntAssessmentAffectedText(summary.Kind) << L"\"\n";
-        std::wcout << L"     evidence=\"" << HuntAssessmentEvidenceText(summary) << L"\"\n";
+        PrintHuntAssessmentLine(summary, L"     technique=\"" + HuntAssessmentTechniqueText(summary.Kind) + L"\"\n");
+        PrintHuntAssessmentLine(summary, L"     affected=\"" + HuntAssessmentAffectedText(summary.Kind) + L"\"\n");
+        PrintHuntAssessmentLine(summary, L"     evidence=\"" + HuntAssessmentEvidenceText(summary) + L"\"\n");
     }
 
     if (!summaries.empty())
