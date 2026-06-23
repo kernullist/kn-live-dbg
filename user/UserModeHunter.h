@@ -87,6 +87,11 @@ struct HuntProcessRecord
     uint64_t MainImageBase = 0;
     uint64_t MainImageSize = 0;
     uint64_t MainImageVad = 0;
+    uint64_t MainSectionObject = 0;
+    uint64_t MainSectionSegment = 0;
+    uint64_t MainSectionControlArea = 0;
+    std::wstring MainSectionBackingPath;
+    std::wstring MainSectionBackingState;
     std::wstring SectionBackingPath;
     std::wstring SectionBackingState;
     std::wstring DiskPath;
@@ -159,6 +164,8 @@ struct HuntResult
     uint64_t SuspiciousDriverObjectCount = 0;
     uint64_t DriverServiceCount = 0;
     uint64_t EdrKillerDriverServiceCount = 0;
+    uint64_t WfpFilterCount = 0;
+    uint64_t SuspiciousWfpFilterCount = 0;
     bool ThreatIntelActive = false;
     bool ThreatIntelAvailable = false;
     uint64_t ThreatIntelEventCount = 0;

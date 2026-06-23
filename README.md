@@ -524,7 +524,8 @@ The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.
 `!hunt` scans visible live user processes without requiring a target PID. The
 default mode correlates process cross-view state, image path/profile evidence,
 VAD-backed mapped code, module loader/VAD cross-view mismatches, thread/APC
-execution provenance, and bounded stack references into suspicious executable
+execution provenance, WFP block filters that target security or anti-cheat
+AppId conditions, and bounded stack references into suspicious executable
 memory. `/quick` keeps the scan to cheaper process/VAD/module/thread signals,
 while `/deep` adds executable live-vs-disk page comparison, hidden executable PTE
 checks when VAD coverage is reliable, modified-page execution correlation, local
@@ -536,6 +537,17 @@ Gentlemen process/staging indicators that performed driver I/O or repeated
 process-impairment activity. The TI correlation path also raises a behavioral
 finding when one caller repeatedly controls or terminates known security-product
 processes from the GentleKiller target list, even if the caller name was changed.
+Main-image integrity also cross-checks the EPROCESS main `SectionObject` backing
+through `_SECTION_OBJECT.Segment -> _SEGMENT.ControlArea -> FilePointer` against
+the main VAD section backing, Toolhelp main module path, PEB image path, and API
+image path. If a kernel driver swaps the process main section to a different
+normal image, the mismatch is reported as `kernel_main_section_swap_evidence`
+instead of relying only on live-vs-disk page differences. The same resolver
+reads backing `FILE_OBJECT` state (`DeletePending`, write/delete access, file
+flags) and `SECTION_OBJECT_POINTERS.ImageSectionObject`, so primitive process
+tampering evidence such as delete-pending image files, write/delete-capable main
+image file objects, or file section-object pointer mismatches is surfaced as
+`process_tampering_primitive_evidence`.
 The ESET prose says the private GentleKiller list exceeds 400 processes; the
 public Table 2 HTML currently exposes 274 unique lower-case image names, and the
 validator pins that public, independently auditable set.
@@ -622,37 +634,54 @@ raw JSON reasons `known_security_product_process_target` and
 codes as the generic high-signal label `security_product_process_targeting`, so
 behavior-only target-list activity is visible even when the caller filename is
 not one of the published EDR-killer names.
-Console output is conclusion-first: `!hunt` prints `[hunt.conclusion]`,
-`[hunt.assessment]`, `[hunt.summary]`, `[hunt.high_signal]`,
-`[hunt.top_processes]`, and `[hunt.top_reasons]`. Per-finding detail is hidden
-by default and appears only with `/details` or `/limit n`. The assessment section
-prints the operator answer first: which process or system scope was observed,
-what technique it indicates, which surface was affected, and the readable
-evidence phrases supporting that conclusion. The high-signal table is
-reserved for decisive technique/evidence labels such as
+The WFP communication-blocking path is current-state based rather than
+history-based. It enumerates BFE filters, decodes condition text and
+`FWPM_CONDITION_ALE_APP_ID` byte blobs, and emits
+`security_tool_communication_blocking` only when an enabled Block/BitmaskBlock
+filter targets a known security-product or anti-cheat process through AppId or
+strong filter metadata. Persistent, clear-action-right, and high-weight block
+filters are preserved as supporting evidence in the same finding.
+Console output is conclusion-first and short by default: `!hunt` prints
+`[hunt.conclusion]`, `[hunt.assessment]`, and `[hunt.summary]`, then suppresses
+raw detail. The assessment section prints the operator answer as
+`subject`, `what`, `why`, and `next` for the highest-priority finding groups,
+so the default screen explains which process or system surface did what and
+which evidence supports that conclusion. Raw high-signal, top-process,
+top-reason, and per-finding tables are hidden by default and appear only with
+`/details` or `/limit n`. The high-signal table is reserved for decisive technique/evidence
+labels such as
 `known_defense_evasion_tool_name`, `known_defense_evasion_driver_service`,
 `manipulated_version_info`, `packed_or_protected_section`,
-`credential_collection_cli_shape`, and published file-hash IOC labels, so rare
+`credential_collection_cli_shape`, `process_tampering_primitive_evidence`,
+`module_stomping_permission_evidence`,
+`security_tool_communication_blocking`, and published file-hash IOC labels, so rare
 target-specific detections do not disappear behind generic anomaly counts. JSON
 output still preserves the stable raw reason codes for validators and evidence
 correlation. High-signal rows are ordered by operator triage priority before raw
 frequency, so primary technique/IOC labels stay above supporting metadata
 signals such as version-info manipulation or packer-section evidence.
+The assessment grouping keeps process tampering, module stomping, mapped-code or
+loader-view evasion, WFP communication blocking, and EDR/credential-tool
+identity findings as separate operator conclusions instead of collapsing them
+under one generic code-provenance bucket.
 SCM and driver-service IOC findings are system-scoped rather than process-scoped;
 the triage tables show them with `system_findings` so PID-less service evidence
 is visible without expanding per-finding detail.
-Use `/summary` when the console should force the concise conclusion and aggregate
-triage tables, while `/json` still preserves the full finding set. `/details`
+Use `/summary` when the console should force the concise answer-only view, while
+`/json` still preserves the full finding set. `/details`
 renders per-finding detail with the default cap, and `/limit` is parsed as a
-decimal count and also enables detail rendering; `/limit 0` renders every
-finding. Console warnings are capped as
+decimal count and also enables raw triage tables plus detail rendering;
+`/limit 0` renders every finding. Console warnings are capped as
 well, and `/summary` suppresses repetitive per-process warning detail; use
 `/json` for the full warning set. Normal image-backed
 `EXECUTE_WRITECOPY` VADs are tracked as copy-on-write executable mappings, not
 as generic W+X evidence; W+X hunt findings require actual writable executable
 permission or disk PE section evidence that the image exposes a writable
-executable section. Generic W+X, weak private executable, and PE-like private
-VAD-only findings are kept as low-confidence leads and capped per process
+executable section. Loader-owned image VADs are compared against disk PE section
+characteristics, so execute/write permission drift over non-writable executable
+sections, entrypoint write-capability, and Mockingjay-style writable executable
+image sections are reported as module-stomping permission evidence. Generic W+X,
+weak private executable, and PE-like private VAD-only findings are kept as low-confidence leads and capped per process
 unless they are corroborated by large private executable regions, image-section
 permission drift, loader/module cross-view evidence, or execution provenance.
 Built-in Windows process injection context is added only for those stronger
@@ -677,9 +706,9 @@ one-command path.
 The runner starts the EDR-killer/OxideHarvest and driver-service target
 fixtures, drives `KnLiveDbg.exe` through redirected stdin, writes the hunt JSON,
 validates the manifest with `tools\validate-hunt-target.ps1`, and gates the
-console contract so the run must print `[hunt.conclusion]`, `[hunt.summary]`,
-`[hunt.high_signal]`, the top triage tables, and summary-mode detail
-suppression. Pass `-ArticleUrl <url>` or `-ArticleHtml <path>` to the same
+console contract so the run must print `[hunt.conclusion]`, `[hunt.assessment]`,
+the concise `[hunt.summary]`, and summary-mode detail suppression
+notice. Pass `-ArticleUrl <url>` or `-ArticleHtml <path>` to the same
 runner when the live proof should also refresh the current ESET article IoC
 table and write `.build\eset-hunt-e2e\article-validator.log`; with
 `-ArticleUrl`, the fetched HTML is kept in the same E2E artifact directory
@@ -729,15 +758,14 @@ contract has exactly 32 positive class/risk/confidence scenario contracts plus
 three negative-control scenarios; the driver-service-only contract has exactly 15
 positive contracts. The JSON summary must also report exactly 15 EDR-killer
 driver-service findings.
-For the full E2E contract, stdout must expose both the process-profile
-high-signal entry and the system-scoped
-`known_defense_evasion_driver_service` console label with the expected
-`system_findings` count, so PID-less SCM findings remain visible to the
-operator. The readiness validator also builds a synthetic
+For the full E2E contract, stdout must expose both process-profile assessment
+evidence and the system-scoped `known defense-evasion driver service` evidence
+phrase with the expected `driver_service_iocs` summary count, so PID-less SCM
+findings remain visible to the operator. The readiness validator also builds a synthetic
 35-scenario artifact set so this full contract is exercised even on non-elevated
 development machines where SCM driver-service fixtures cannot be created live.
 The raw JSON reason remains `gentlemen_edr_killer_driver_service`; only the
-operator-facing console label is generalized.
+operator-facing console phrase is generalized.
 
 ## Native VAD And Thread Triage
 

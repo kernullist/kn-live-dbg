@@ -283,6 +283,8 @@ function Get-EsetArticleTable34DriverIndicators
 
 $hunterPath = Join-Path $Root "user\UserModeHunter.cpp"
 $mainPath = Join-Path $Root "user\main.cpp"
+$wfpScannerPath = Join-Path $Root "user\WfpScanner.cpp"
+$wfpScannerHeaderPath = Join-Path $Root "user\WfpScanner.h"
 $targetPath = Join-Path $Root "hunt_test_target\KnLiveDbgHuntTarget.cpp"
 $readmePath = Join-Path $Root "README.md"
 $testDocPath = Join-Path $Root "docs\HUNT_TEST_TARGET.md"
@@ -317,6 +319,8 @@ if (-not [string]::IsNullOrWhiteSpace($ArticleUrl))
 
 $hunter = Read-TextFile -Path $hunterPath
 $main = Read-TextFile -Path $mainPath
+$wfpScanner = Read-TextFile -Path $wfpScannerPath
+$wfpScannerHeader = Read-TextFile -Path $wfpScannerHeaderPath
 $targetSource = Read-TextFile -Path $targetPath
 $readme = Read-TextFile -Path $readmePath
 $testDoc = Read-TextFile -Path $testDocPath
@@ -938,27 +942,82 @@ Test-RequiredText -Text $main -Needle 'StartsWithNoCase(lowered, L"eset_")' -Nam
 Test-RequiredText -Text $main -Needle 'StartsWithNoCase(lowered, L"gentlekiller_")' -Name "console high-signal GentleKiller prefix" -Failures $failures
 Test-RequiredText -Text $main -Needle 'lowered == L"known_security_product_process_target"' -Name "console high-signal security-product target reason" -Failures $failures
 Test-RequiredText -Text $main -Needle 'PrintHuntConclusion(result, warningCount);' -Name "console hunt conclusion renderer" -Failures $failures
+Test-RequiredText -Text $main -Needle 'PrintHuntAssessment(result);' -Name "console hunt assessment renderer" -Failures $failures
 Test-RequiredText -Text $main -Needle 'PrintHuntSummaryLine(result);' -Name "console hunt summary renderer" -Failures $failures
 Test-RequiredText -Text $main -Needle 'PrintHuntHighSignalTable(result);' -Name "console hunt high-signal renderer" -Failures $failures
 Test-RequiredText -Text $main -Needle 'PrintHuntTriageTables(result);' -Name "console hunt top triage renderer" -Failures $failures
 Test-RequiredText -Text $main -Needle 'verdict = result.Findings.size() >= 1000 ? L"alert_noisy" : L"alert";' -Name "console noisy alert verdict" -Failures $failures
 Test-RequiredText -Text $hunter -Needle '\"edr_killer_driver_services\"' -Name "hunt JSON EDR-killer driver-service summary" -Failures $failures
 Test-RequiredText -Text $hunter -Needle '\"threat_intel_correlations\"' -Name "hunt JSON threat-intel correlation summary" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "ResolveEprocessMainSectionBackingPath" -Name "hunt EPROCESS main section resolver" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "main_section_object_vad_backing_mismatch" -Name "hunt main section object VAD mismatch reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "kernel_main_section_swap_evidence" -Name "hunt kernel main section swap reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle '"main_section_backing_path"' -Name "hunt JSON main section backing path" -Failures $failures
+Test-RequiredText -Text $main -Needle "main_section_object_vs_vad_backing_mismatch" -Name "console main section object mismatch label" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "ControlAreaBackingDetails" -Name "hunt control-area backing detail resolver" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "process_tampering_primitive_evidence" -Name "hunt process tampering primitive reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "main_image_vad_file_delete_pending" -Name "hunt main image delete-pending reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "main_section_object_file_section_object_pointer_mismatch" -Name "hunt section-object-pointer mismatch reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "module_stomping_permission_evidence" -Name "hunt module-stomping permission evidence reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "module_entrypoint_write_permission_drift" -Name "hunt module entrypoint write drift reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "AddWfpHuntFindings" -Name "hunt WFP integration" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "security_tool_communication_blocking" -Name "hunt WFP communication-blocking reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "wfp_security_product_block_filter" -Name "hunt WFP security-product block reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "wfp_anticheat_block_filter" -Name "hunt WFP anti-cheat block reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "wfp_appid_block_condition" -Name "hunt WFP AppId block reason" -Failures $failures
+Test-RequiredText -Text $hunter -Needle '\"suspicious_wfp_filters\"' -Name "hunt JSON suspicious WFP summary" -Failures $failures
+Test-RequiredText -Text $wfpScannerHeader -Needle "AppIdText" -Name "WFP record AppId field" -Failures $failures
+Test-RequiredText -Text $wfpScannerHeader -Needle "ConditionsText" -Name "WFP record condition text field" -Failures $failures
+Test-RequiredText -Text $wfpScanner -Needle "FWPM_CONDITION_ALE_APP_ID" -Name "WFP ALE AppId condition decoder" -Failures $failures
+Test-RequiredText -Text $wfpScanner -Needle "FormatFilterConditionsText" -Name "WFP filter condition formatter" -Failures $failures
+Test-RequiredText -Text $main -Needle "process_tampering_primitive_evidence" -Name "console process tampering primitive label" -Failures $failures
+Test-RequiredText -Text $main -Needle "module_stomping_permission_evidence" -Name "console module-stomping permission label" -Failures $failures
+Test-RequiredText -Text $main -Needle "security_tool_communication_blocking" -Name "console WFP communication-blocking label" -Failures $failures
+Test-RequiredText -Text $main -Needle "security_communication_blocking" -Name "console WFP assessment kind" -Failures $failures
+Test-RequiredText -Text $main -Needle 'kind = L"process_tampering"' -Name "console process tampering assessment kind" -Failures $failures
+Test-RequiredText -Text $main -Needle 'kind = L"module_stomping"' -Name "console module-stomping assessment kind" -Failures $failures
+Test-RequiredText -Text $main -Needle 'kind = L"mapped_code_or_loader_evasion"' -Name "console mapped-code assessment kind" -Failures $failures
+Test-RequiredText -Text $main -Needle "process main image or section backing was swapped" -Name "console process tampering assessment text" -Failures $failures
+Test-RequiredText -Text $main -Needle "loaded module code or section permissions indicate module stomping" -Name "console module-stomping assessment text" -Failures $failures
+Test-RequiredText -Text $readme -Needle "kernel_main_section_swap_evidence" -Name "README main section swap documentation" -Failures $failures
+Test-RequiredText -Text $readme -Needle "process_tampering_primitive_evidence" -Name "README process tampering primitive documentation" -Failures $failures
+Test-RequiredText -Text $readme -Needle "module_stomping_permission_evidence" -Name "README module stomping permission documentation" -Failures $failures
+Test-RequiredText -Text $readme -Needle "security_tool_communication_blocking" -Name "README WFP communication-blocking documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "kernel_main_section_swap_evidence" -Name "hunt target main section swap documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "process_tampering_primitive_evidence" -Name "hunt target process tampering primitive documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "security_tool_communication_blocking" -Name "hunt target WFP communication-blocking documentation" -Failures $failures
+Test-RequiredText -Text $coverage -Needle "kernel_main_section_swap_evidence" -Name "command coverage main section swap documentation" -Failures $failures
+Test-RequiredText -Text $coverage -Needle "process_tampering_primitive_evidence" -Name "command coverage process tampering primitive documentation" -Failures $failures
+Test-RequiredText -Text $coverage -Needle "module_stomping_permission_evidence" -Name "command coverage module stomping permission documentation" -Failures $failures
+Test-RequiredText -Text $coverage -Needle "security_tool_communication_blocking" -Name "command coverage WFP communication-blocking documentation" -Failures $failures
 Test-OrderedText `
     -Text $main `
     -Needles @(
         'PrintHuntConclusion(result, warningCount);',
+        'PrintHuntAssessment(result);',
         'PrintHuntSummaryLine(result);',
+        'if (summaryOnly)',
         'PrintHuntHighSignalTable(result);',
-        'PrintHuntTriageTables(result);',
-        'if (summaryOnly)'
+        'PrintHuntTriageTables(result);'
     ) `
-    -Name "hunt console triage-before-detail render order" `
+    -Name "hunt console answer-before-raw-table render order" `
     -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "/hunt-parser-check" -Name "quoted SCM ImagePath test fixture" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "/hunt-parser-check-unquoted-extensionless" -Name "unquoted extensionless SCM ImagePath test fixture" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "/stop-event" -Name "hunt target graceful stop-event option" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "WaitForMultipleObjects(waitCount, waitHandles, FALSE, waitMs)" -Name "hunt target external stop-event wait" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "Available hunt target experiments:" -Name "hunt target interactive experiment menu" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "Select a focused experiment. Each item explains what the target creates" -Name "hunt target operator-readable menu intro" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "category: " -Name "hunt target menu category field" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "creates : " -Name "hunt target menu artifact field" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "hunt    : " -Name "hunt target menu hunt expectation field" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "should explain process masquerading and staging evidence" -Name "hunt target readable process-profile expectation" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "should report both loader-view evasion and module stomping" -Name "hunt target readable complex-scenario expectation" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "Without a scenario flag, it opens the numbered experiment menu below." -Name "hunt target no-flag interactive contract" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "PromptScenarioMenuSelection" -Name "hunt target interactive selection parser" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "the target prints a numbered experiment menu" -Name "hunt target interactive menu documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "Each menu entry explains the category" -Name "hunt target readable menu documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "runs only the selected experiment set" -Name "hunt target selected-only documentation" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "expected_class" -Name "hunt target expected class manifest field" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "expected_risk" -Name "hunt target expected risk manifest field" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "expected_confidence" -Name "hunt target expected confidence manifest field" -Failures $failures
@@ -978,6 +1037,8 @@ Test-RequiredText -Text $readiness -Needle 'expected_risk = $risk' -Name "readin
 Test-RequiredText -Text $readiness -Needle 'expected_confidence = $confidence' -Name "readiness confidence contract" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "Invoke-HuntTargetValidatorExpectedFailure" -Name "readiness validator mutated-negative helper" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "Invoke-EsetArtifactValidatorExpectedFailure" -Name "readiness artifact validator mutated-negative helper" -Failures $failures
+Test-RequiredText -Text $readiness -Needle "interactive menu baseline smoke" -Name "readiness hunt target interactive menu smoke" -Failures $failures
+Test-RequiredText -Text $readiness -Needle 'echo 1| `"$releaseTarget`" /seconds 1 /manifest `"$manifest`"' -Name "readiness hunt target interactive baseline selection" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "stop-event target cleanup smoke" -Name "readiness stop-event target cleanup smoke" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "hunt-readiness-service-synthetic-mutated-class" -Name "readiness class mutation negative" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "hunt-readiness-service-synthetic-mutated-risk" -Name "readiness risk mutation negative" -Failures $failures
@@ -1065,14 +1126,14 @@ Test-RequiredText -Text $e2eArtifactValidator -Needle "Assert-ManifestScenarioUn
 Test-RequiredText -Text $e2eArtifactValidator -Needle 'if ($ExpectedScenarioCount -eq 35)' -Name "ESET artifact full E2E scenario gate condition" -Failures $failures
 Test-RequiredText -Text $e2eArtifactValidator -Needle "edr-killer-gentlemen-staging-only-negative" -Name "ESET artifact staging-only negative scenario gate" -Failures $failures
 Test-RequiredText -Text $e2eArtifactValidator -Needle 'elseif ($ExpectedScenarioCount -eq 15)' -Name "ESET artifact driver-service scenario gate condition" -Failures $failures
-Test-RequiredText -Text $e2eArtifactValidator -Needle "required defense-evasion driver-service high-signal entry" -Name "ESET artifact full E2E driver-service high-signal gate" -Failures $failures
-Test-RequiredText -Text $e2eArtifactValidator -Needle 'system_findings=$($huntDoc.summary.edr_killer_driver_services)' -Name "ESET artifact driver-service system-finding count gate" -Failures $failures
+Test-RequiredText -Text $e2eArtifactValidator -Needle "required defense-evasion driver-service assessment evidence" -Name "ESET artifact full E2E driver-service assessment gate" -Failures $failures
+Test-RequiredText -Text $e2eArtifactValidator -Needle 'driver_service_iocs=$($huntDoc.summary.edr_killer_driver_services)' -Name "ESET artifact driver-service summary count gate" -Failures $failures
 Test-RequiredText -Text $e2eArtifactValidator -Needle "edr-killer-suffix-name-easolo-2light" -Name "ESET artifact actual EASolo2Light scenario name" -Failures $failures
 Test-RequiredText -Text $e2eArtifactValidator -Needle "[hunt.conclusion]" -Name "ESET artifact conclusion output gate" -Failures $failures
-Test-RequiredText -Text $e2eArtifactValidator -Needle "signal=known_defense_evasion_tool_name" -Name "ESET artifact high-signal output gate" -Failures $failures
-Test-RequiredText -Text $e2eArtifactValidator -Needle "signal=known_defense_evasion_driver_service" -Name "ESET artifact driver-service high-signal output gate" -Failures $failures
-Test-RequiredText -Text $e2eArtifactValidator -Needle "signal=manipulated_version_info" -Name "ESET artifact metadata-evasion high-signal output gate" -Failures $failures
-Test-RequiredText -Text $e2eArtifactValidator -Needle "signal=packed_or_protected_section" -Name "ESET artifact packer high-signal output gate" -Failures $failures
+Test-RequiredText -Text $e2eArtifactValidator -Needle "known defense-evasion tool name" -Name "ESET artifact assessment evidence gate" -Failures $failures
+Test-RequiredText -Text $e2eArtifactValidator -Needle "known defense-evasion driver service" -Name "ESET artifact driver-service assessment evidence gate" -Failures $failures
+Test-RequiredText -Text $e2eArtifactValidator -Needle "manipulated version information" -Name "ESET artifact metadata-evasion assessment evidence gate" -Failures $failures
+Test-RequiredText -Text $e2eArtifactValidator -Needle "packed or protected PE section" -Name "ESET artifact packer assessment evidence gate" -Failures $failures
 Test-RequiredText -Text $e2eArtifactValidator -Needle "[hunt.detail] suppressed=yes" -Name "ESET artifact summary-mode suppression gate" -Failures $failures
 Test-RequiredText -Text $e2eArtifactValidator -Needle "gentlemen_related_credential_tool_name" -Name "ESET artifact OxideHarvest reason gate" -Failures $failures
 Test-RequiredText -Text $e2eArtifactValidator -Needle "driver_service_binary_name_ioc" -Name "ESET artifact driver-service reason gate" -Failures $failures
@@ -1109,7 +1170,7 @@ Test-RequiredText -Text $readiness -Needle "hunt-readiness-default-root" -Name "
 Test-RequiredText -Text $readiness -Needle "refusing to clean default artifact smoke root outside .build" -Name "readiness default artifact cleanup guard" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "artifact mutation rejected class_contract_count=yes" -Name "readiness class-contract-count mutation rejection" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "artifact mutation rejected driver_service_count=yes" -Name "readiness driver-service-count mutation rejection" -Failures $failures
-Test-RequiredText -Text $readiness -Needle "artifact mutation rejected high_signal_driver_service=yes" -Name "readiness high-signal driver-service mutation rejection" -Failures $failures
+Test-RequiredText -Text $readiness -Needle "artifact mutation rejected assessment_driver_service=yes" -Name "readiness assessment driver-service mutation rejection" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "artifact mutation rejected unexpected_negative_reason=yes" -Name "readiness unexpected negative reason mutation rejection" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "artifact mutation rejected runner_log_elevated=yes" -Name "readiness runner-log elevation mutation rejection" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "artifact mutation rejected runner_log_manifest=yes" -Name "readiness runner-log manifest-path mutation rejection" -Failures $failures
@@ -1118,7 +1179,7 @@ Test-RequiredText -Text $readiness -Needle "artifact mutation rejected runner_lo
 Test-RequiredText -Text $readiness -Needle "synthetic ESET full dot-relative artifact validator=yes" -Name "readiness dot-relative artifact validator smoke" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "git diff whitespace skipped: no .git directory in root" -Name "readiness staged bundle no-git whitespace skip" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "synthetic ESET full security-product telemetry validator" -Name "readiness security-product telemetry validator" -Failures $failures
-Test-RequiredText -Text $readiness -Needle "signal=security_product_process_targeting" -Name "readiness security-product high-signal output" -Failures $failures
+Test-RequiredText -Text $readiness -Needle "security-product process targeting" -Name "readiness security-product assessment output" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "gentlekiller_security_target_list" -Name "readiness GentleKiller target-list telemetry reason" -Failures $failures
 Test-RequiredText -Text $readiness -Needle "edr-killer-gentlemen-staging-only-negative" -Name "readiness staging-only negative scenario gate" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "StageOnlyBenign.exe" -Name "hunt target staging-only negative benign copy" -Failures $failures
@@ -1145,7 +1206,7 @@ Test-RequiredText -Text $readme -Needle "run-eset-hunt-e2e.ps1" -Name "README ES
 Test-RequiredText -Text $readme -Needle "-ArticleHtml <path>" -Name "README ESET article currentness validation documentation" -Failures $failures
 Test-RequiredText -Text $readme -Needle "-ArticleUrl <url>" -Name "README ESET article URL validation documentation" -Failures $failures
 Test-RequiredText -Text $readme -Needle "article-validator.log" -Name "README ESET E2E article validator log documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle '`known_defense_evasion_driver_service` console label' -Name "README ESET E2E system high-signal documentation" -Failures $failures
+Test-RequiredText -Text $readme -Needle "known defense-evasion driver service" -Name "README ESET E2E system assessment documentation" -Failures $failures
 Test-RequiredText -Text $readme -Needle "target-lifetime padding" -Name "README ESET E2E lifetime padding documentation" -Failures $failures
 Test-RequiredText -Text $readme -Needle "/stop-event" -Name "README ESET E2E stop-event documentation" -Failures $failures
 Test-RequiredText -Text $readme -Needle "validate-eset-hunt-e2e-artifacts.ps1" -Name "README ESET artifact validator documentation" -Failures $failures
@@ -1160,7 +1221,7 @@ Test-RequiredText -Text $testDoc -Needle "run-eset-hunt-e2e.ps1" -Name "hunt tar
 Test-RequiredText -Text $testDoc -Needle "-ArticleHtml <path>" -Name "hunt target ESET article currentness validation documentation" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "-ArticleUrl <url>" -Name "hunt target ESET article URL validation documentation" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "article-validator.log" -Name "hunt target ESET article validator log documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle '`known_defense_evasion_driver_service` console label' -Name "hunt target ESET system high-signal documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "known defense-evasion driver service" -Name "hunt target ESET system assessment documentation" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "slow deep hunt cannot race the fixture lifetime" -Name "hunt target ESET E2E lifetime padding documentation" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "/stop-event" -Name "hunt target ESET E2E stop-event documentation" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "validate-eset-hunt-e2e-artifacts.ps1" -Name "hunt target ESET artifact validator documentation" -Failures $failures

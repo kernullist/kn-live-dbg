@@ -23,6 +23,8 @@ struct WfpRecord
     std::wstring CalloutName;
     std::wstring FlagsText;
     std::wstring WeightText;
+    std::wstring ConditionsText;
+    std::wstring AppIdText;
     std::wstring Notes;
     uint64_t Id = 0;
     uint32_t Flags = 0;
@@ -37,6 +39,7 @@ struct WfpRecord
     bool HasLayerId = false;
     bool HasCalloutId = false;
     bool HasSubLayerWeight = false;
+    bool HasAppIdCondition = false;
 };
 
 struct WfpScanResult
