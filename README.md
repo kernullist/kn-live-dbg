@@ -191,7 +191,7 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 callbacks [scope] /module <module>
 !dml_proc [pid|name]
-!hunt [/quick] [/deep] [/limit <n>] [/json <path>]
+!hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|filters|layers]
@@ -536,13 +536,38 @@ Gentlemen process/staging indicators that performed driver I/O or repeated
 process-impairment activity. The TI correlation path also raises a behavioral
 finding when one caller repeatedly controls or terminates known security-product
 processes from the GentleKiller target list, even if the caller name was changed.
+The ESET prose says the private GentleKiller list exceeds 400 processes; the
+public Table 2 HTML currently exposes 274 unique lower-case image names, and the
+validator pins that public, independently auditable set.
+The hunt pass also carries the ESET-published SHA-1 file IoCs for GentleKiller,
+HexKiller, ThrottleBlood, HavocKiller, and OxideHarvest. Process main images,
+loaded driver images, and SCM driver-service binaries are hashed with caching
+and promoted to high-confidence `eset_exact_file_sha1_ioc` findings on exact
+matches, so renamed samples are still detected without relying on filename
+masquerade alone.
+Use `tools\validate-eset-hunt-iocs.ps1` to verify that the 27 public ESET file
+IoCs remain present in the hunt source and connected to process, loaded-driver,
+driver-service, high-signal, and documentation paths. The same check also
+covers the ESET Table 3/4 process-profile suffix bases and driver-profile leaves.
+When refreshing against the live article, save the ESET HTML and pass
+`-ArticleHtml <path>`; the validator reconstructs split SHA-1 values from Table 5,
+case-insensitive `.exe` process names from Table 2, and Table 3/4 process and driver indicators,
+then requires exact set parity with the pinned source lists.
+To fetch the current article directly, use `-ArticleUrl <url>`; by default it stores the HTML under
+`.build\eset-article-current.html` before applying the same checks.
 Process-profile findings include bounded on-disk metadata and suffix evidence
 for the ESET evasion layer: Authenticode trust state, version strings, original
 filename, file description, icon-resource presence, and the `1`/`2`/`Light`/
-`Clear` suffix tail. Known Enigma/Themida PE section-name hints are recorded as
-supporting packer evidence only after Gentlemen process/staging context already
-exists. Weak vendor-impersonation process names are not promoted as standalone
-findings unless stronger Gentlemen staging or telemetry context is present. The
+`Clear` suffix tail. Version-info and icon impersonation reason codes are gated
+by vendor-like version metadata so a generic icon resource does not become a
+standalone conclusion. Known Enigma/Themida PE section-name hints are recorded
+as supporting packer evidence only after Gentlemen process/staging context
+already exists. Weak vendor-impersonation process names are not promoted as
+standalone findings unless stronger Gentlemen staging or telemetry context is
+present. A `GentlemenCollection` path by itself is treated as supporting
+staging context, not a standalone process-profile conclusion; unknown process
+names in that path still need evasion metadata such as vendor-like version
+information, an invalid copied signature, or packer-section evidence. The
 related OxideHarvest credential-tool profile is gated by
 Gentlemen staging context or the `-i`/`-u`/`-p`/`-t`/`-o` command-line shape
 described by ESET when all required options have values.
@@ -553,17 +578,166 @@ evidence instead of rereading every stack for every mismatched page. The `/deep`
 BYOVD path is offline/reproducible and high-signal: it reuses the local catalog,
 never runs the updater script from inside `!hunt`, and suppresses name/version
 hints that require signer context. Weak ESET driver names are also suppressed in
-the loaded-module name-only sweep unless hash, service, or integrity evidence
-supplies stronger context. Run `byovd update` explicitly when fresh driver
-intelligence is needed, or `byovd scan` when broader hinting is desired.
+the loaded-module name-only sweep unless hash, Gentlemen-staged service, or
+integrity evidence supplies stronger context. Run `byovd update` explicitly
+when fresh driver intelligence is needed, or `byovd scan` when broader hinting
+is desired.
 The SCM scan is also read-only and surfaces installed or running driver services
-whose service name or configured binary path matches the EDR-killer driver IOC
-set, so a driver-service staging artifact can be found even before a module is
-successfully loaded.
+whose service name or configured binary path matches a strong EDR-killer driver
+IOC, so a driver-service staging artifact can be found even before a module is
+successfully loaded. Driver names that can collide with legitimate products are
+not promoted from SCM name-only evidence unless the service path/name also has
+Gentlemen staging context; hash, loaded-module, or driver-object evidence remain
+the stronger confirmation paths for those weak names. If a configured service
+binary hashes to an ESET file IoC, the service is reported even when its service
+name and binary leaf have been changed. SCM `ImagePath` values are normalized
+before hashing, including quoted paths, `\??\`/`\SystemRoot\` prefixes,
+environment variables, extensionless EDR-killer driver leaves, and benign
+trailing service arguments.
+The live E2E fixture keeps its temporary kernel-driver services non-started so
+it does not load throwaway drivers on the VM, but the readiness suite also
+validates a synthetic `driver_service_running` service artifact to keep the
+running-service high-risk branch covered.
+The same readiness path validates synthetic exact-hash artifacts for a renamed
+EDR-killer process, renamed OxideHarvest process, loaded driver, and driver
+service so filename changes cannot silently break SHA-1 IOC coverage.
+It also validates a synthetic metadata-evasion process-profile artifact for the
+invalid-signature, vendor-version, icon, and packer evidence that ESET calls out
+in the masquerading layer.
+The security-product behavior-only path has its own synthetic artifact with
+exact `security_product_target_count` and target-name evidence, so a renamed
+caller only passes the contract when repeated Table 2 target activity is visible.
 The TI correlation is best-effort and history-based: start `!ti` before the
 workload when you need DeviceIoControl or native-API behavior to appear in the
 same hunt report. Without a populated TI ring, `/deep` still runs the static and
-kernel-object evidence layers and reports `ti_events=0`.
+kernel-object evidence layers and reports `ti_events=0`. The native-API
+impairment path recognizes repeated `TerminateProcess`/`OpenProcess` activity
+and sensitive cross-process TI tasks such as `AllocVM`, `ProtectVM`, `ReadVM`,
+`WriteVM`, `MapView`, `QueueUserApc`, `SetThreadContext`, and
+`Suspend`/`Resume`, but still requires an EDR-killer profile/staging context or
+repeated hits against known GentleKiller security-product targets before it
+emits a hunt finding. The renamed-caller path emits
+raw JSON reasons `known_security_product_process_target` and
+`gentlekiller_security_target_list`. Console triage renders those raw machine
+codes as the generic high-signal label `security_product_process_targeting`, so
+behavior-only target-list activity is visible even when the caller filename is
+not one of the published EDR-killer names.
+Console output is conclusion-first: `!hunt` prints `[hunt.conclusion]`,
+`[hunt.assessment]`, `[hunt.summary]`, `[hunt.high_signal]`,
+`[hunt.top_processes]`, and `[hunt.top_reasons]`. Per-finding detail is hidden
+by default and appears only with `/details` or `/limit n`. The assessment section
+prints the operator answer first: which process or system scope was observed,
+what technique it indicates, which surface was affected, and the readable
+evidence phrases supporting that conclusion. The high-signal table is
+reserved for decisive technique/evidence labels such as
+`known_defense_evasion_tool_name`, `known_defense_evasion_driver_service`,
+`manipulated_version_info`, `packed_or_protected_section`,
+`credential_collection_cli_shape`, and published file-hash IOC labels, so rare
+target-specific detections do not disappear behind generic anomaly counts. JSON
+output still preserves the stable raw reason codes for validators and evidence
+correlation. High-signal rows are ordered by operator triage priority before raw
+frequency, so primary technique/IOC labels stay above supporting metadata
+signals such as version-info manipulation or packer-section evidence.
+SCM and driver-service IOC findings are system-scoped rather than process-scoped;
+the triage tables show them with `system_findings` so PID-less service evidence
+is visible without expanding per-finding detail.
+Use `/summary` when the console should force the concise conclusion and aggregate
+triage tables, while `/json` still preserves the full finding set. `/details`
+renders per-finding detail with the default cap, and `/limit` is parsed as a
+decimal count and also enables detail rendering; `/limit 0` renders every
+finding. Console warnings are capped as
+well, and `/summary` suppresses repetitive per-process warning detail; use
+`/json` for the full warning set. Normal image-backed
+`EXECUTE_WRITECOPY` VADs are tracked as copy-on-write executable mappings, not
+as generic W+X evidence; W+X hunt findings require actual writable executable
+permission or disk PE section evidence that the image exposes a writable
+executable section. Generic W+X, weak private executable, and PE-like private
+VAD-only findings are kept as low-confidence leads and capped per process
+unless they are corroborated by large private executable regions, image-section
+permission drift, loader/module cross-view evidence, or execution provenance.
+Built-in Windows process injection context is added only for those stronger
+code-provenance cases, not for baseline JIT or dynamic-code hygiene by itself.
+`/json` creates missing parent directories before writing, so paths such as
+`.build\hunt-live.json` work from a clean lab directory.
+For an elevated ESET/Gentlemen end-to-end lab run on a VM that does not have
+MSBuild or WDK installed, first create a prebuilt bundle from the development
+machine:
+
+```powershell
+tools\make-eset-hunt-e2e-vm-bundle.ps1
+```
+
+The bundle contains `BUNDLE-INFO.json` with
+`bundle_contract=eset-hunt-e2e-vm-bundle-v1`, the runner contract, file hashes,
+the source git status, and the expected VM startup needles. After copying and
+expanding `.build\eset-hunt-e2e-vm-bundle.zip` on the VM, run
+`tools\run-eset-hunt-e2e.ps1` without `-Build`. In a source checkout that has
+the full build toolchain, `tools\run-eset-hunt-e2e.ps1 -Build` is still the
+one-command path.
+The runner starts the EDR-killer/OxideHarvest and driver-service target
+fixtures, drives `KnLiveDbg.exe` through redirected stdin, writes the hunt JSON,
+validates the manifest with `tools\validate-hunt-target.ps1`, and gates the
+console contract so the run must print `[hunt.conclusion]`, `[hunt.summary]`,
+`[hunt.high_signal]`, the top triage tables, and summary-mode detail
+suppression. Pass `-ArticleUrl <url>` or `-ArticleHtml <path>` to the same
+runner when the live proof should also refresh the current ESET article IoC
+table and write `.build\eset-hunt-e2e\article-validator.log`; with
+`-ArticleUrl`, the fetched HTML is kept in the same E2E artifact directory
+unless an explicit `-ArticleOutPath` is supplied.
+The runner prints `runner_contract=e2e-auto-knlivedbg-article-currentness-v2`,
+`elevated=<bool>`, and `output_dir=<path>` near startup so copied VM bundles can
+be distinguished from older target-only wrappers and non-elevated runs leave a
+durable diagnostic in `runner.log`. The target fixture lifetime
+defaults to 300 seconds, with `KnLiveDbg` capped at 180 seconds and a required
+target-lifetime padding window, so the EDR-killer process and SCM service
+artifacts remain alive throughout the scripted deep hunt instead of racing the
+scanner timeout. After artifact validation, the runner signals a named
+`/stop-event` so the target exits through its normal cleanup path and removes
+temporary SCM services without waiting for the full target lifetime. The runner
+also writes `.build\eset-hunt-e2e\runner.log` with the exact target arguments,
+target PID, manifest-wait state, `KnLiveDbg` launch, validator step, and any
+caught exception so VM runs that exit early can be diagnosed without relying
+only on console scrollback. If the target exits before the 35-scenario manifest
+is ready, the runner reports that condition immediately instead of waiting for
+the manifest timeout. On any failure it prints the artifact paths and snapshots
+live `KnLiveDbg` and `KnLiveDbgHuntTarget` processes.
+It also prints the tails of the target, `KnLiveDbg`, and validator logs so the
+artifact directory is enough to identify the failing stage.
+If a VM run already produced the 35-scenario manifest but the wrapper exited
+before launching `KnLiveDbg`, rerun the same script with `-ReuseExistingTarget`.
+That mode preserves the existing manifest, regenerates only the hunt/console
+artifacts, and continues from the scripted `KnLiveDbg` plus validator stage. Add
+`-ExistingStopEventName <name>` when the original console printed the target's
+`Local\KnLiveDbgHuntE2E-...` event name so the runner can signal cleanup after
+validation.
+The same proof can be re-checked from captured artifacts without recreating the
+SCM services:
+
+```powershell
+tools\validate-eset-hunt-e2e-artifacts.ps1 -Manifest <manifest> -HuntJson <json> -Stdout <knlivedbg.stdout.log> -RunnerLog <runner.log> -RequireRunnerPassed
+```
+
+That validator checks the manifest, JSON summary, required
+ESET/Gentlemen/OxideHarvest reason codes, the full 35-scenario ESET fixture
+contract when validating end-to-end artifacts, negative controls for weak vendor
+name, GentlemenCollection path-only staging, and OxideHarvest name-only cases,
+console triage contract, and, when `-RunnerLog` is supplied, the live runner
+contract, elevated execution, 35-scenario target-ready step, and scripted
+`KnLiveDbg` launch. Add `-RequireRunnerPassed` when rechecking completed VM
+artifacts so the runner's final `passed` marker is required too. The full E2E
+contract has exactly 32 positive class/risk/confidence scenario contracts plus
+three negative-control scenarios; the driver-service-only contract has exactly 15
+positive contracts. The JSON summary must also report exactly 15 EDR-killer
+driver-service findings.
+For the full E2E contract, stdout must expose both the process-profile
+high-signal entry and the system-scoped
+`known_defense_evasion_driver_service` console label with the expected
+`system_findings` count, so PID-less SCM findings remain visible to the
+operator. The readiness validator also builds a synthetic
+35-scenario artifact set so this full contract is exercised even on non-elevated
+development machines where SCM driver-service fixtures cannot be created live.
+The raw JSON reason remains `gentlemen_edr_killer_driver_service`; only the
+operator-facing console label is generalized.
 
 ## Native VAD And Thread Triage
 

@@ -590,7 +590,13 @@ namespace
     bool ProtectionWritable(uint32_t protection)
     {
         uint32_t p = protection & 0x7u;
-        return p == 4 || p == 5 || p == 6 || p == 7;
+        return p == 4 || p == 6;
+    }
+
+    bool ProtectionCopyOnWrite(uint32_t protection)
+    {
+        uint32_t p = protection & 0x7u;
+        return p == 5 || p == 7;
     }
 
     bool ReadProcessMemoryByDtb(
@@ -1796,6 +1802,7 @@ namespace
                     record->ProtectionText = ProtectionText(record->Protection);
                     record->Executable = ProtectionExecutable(record->Protection);
                     record->Writable = ProtectionWritable(record->Protection);
+                    record->CopyOnWrite = ProtectionCopyOnWrite(record->Protection);
                     record->HasProtection = true;
                 }
             }
@@ -1902,6 +1909,10 @@ namespace
             if (record->Executable && record->Writable)
             {
                 tags.push_back(L"W+X");
+            }
+            if (record->Executable && record->CopyOnWrite)
+            {
+                tags.push_back(L"X+COW");
             }
             if (record->HasPrivateMemory && record->PrivateMemory)
             {
@@ -2798,6 +2809,7 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
              << L",\"protection\":\"" << JsonEscape(r.ProtectionText)
              << L"\",\"executable\":" << (r.Executable ? L"true" : L"false")
              << L",\"writable\":" << (r.Writable ? L"true" : L"false")
+             << L",\"copy_on_write\":" << (r.CopyOnWrite ? L"true" : L"false")
              << L",\"private\":" << (r.HasPrivateMemory && r.PrivateMemory ? L"true" : L"false")
              << L",\"commit_charge\":" << r.CommitCharge
              << L",\"pe_like\":" << (r.PeHeaderFound ? L"true" : L"false")
