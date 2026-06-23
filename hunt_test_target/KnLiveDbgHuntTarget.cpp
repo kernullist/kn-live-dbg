@@ -59,11 +59,13 @@ namespace
         bool LabBuiltinProfile = false;
         bool EdrKillerSuffixName = false;
         bool OxideHarvestCli = false;
+        bool EdrKillerDriverService = false;
         bool Baseline = false;
         bool Help = false;
         DWORD ChildWaitParentPid = 0;
         DWORD RunSeconds = kDefaultRunSeconds;
         std::wstring ManifestPath;
+        std::wstring StopEventName;
     };
 
     struct RegionRecord
@@ -80,10 +82,14 @@ namespace
         uint64_t Address = 0;
         uint64_t Size = 0;
         DWORD ProcessId = 0;
+        bool HasProcessId = false;
         std::vector<std::wstring> ExpectedReasons;
         std::vector<std::wstring> UnexpectedReasons;
         std::vector<std::wstring> ExpectedEvidenceKeys;
         std::vector<std::pair<std::wstring, std::wstring>> ExpectedEvidenceValues;
+        std::wstring ExpectedClass;
+        std::wstring ExpectedRisk;
+        std::wstring ExpectedConfidence;
         std::wstring Notes;
     };
 
@@ -110,6 +116,7 @@ namespace
     std::vector<RegionRecord> g_Regions;
     std::vector<HANDLE> g_Threads;
     std::vector<HANDLE> g_ChildProcesses;
+    std::vector<std::wstring> g_CreatedServices;
     std::vector<std::wstring> g_TempFiles;
     std::vector<std::wstring> g_TempDirectories;
     std::vector<ScenarioRecord> g_Scenarios;
@@ -465,7 +472,11 @@ namespace
         DWORD processId = 0,
         std::initializer_list<const wchar_t*> expectedEvidenceKeys = {},
         std::initializer_list<std::pair<const wchar_t*, const wchar_t*>> expectedEvidenceValues = {},
-        std::initializer_list<const wchar_t*> unexpectedReasons = {})
+        std::initializer_list<const wchar_t*> unexpectedReasons = {},
+        bool includeProcessId = false,
+        const wchar_t* expectedClass = nullptr,
+        const wchar_t* expectedRisk = nullptr,
+        const wchar_t* expectedConfidence = nullptr)
     {
         ScenarioRecord record = {};
         record.Name = name;
@@ -473,6 +484,7 @@ namespace
         record.Address = address;
         record.Size = size;
         record.ProcessId = processId;
+        record.HasProcessId = includeProcessId || processId != 0;
         record.Notes = notes;
 
         for (const wchar_t* reason : expectedReasons)
@@ -506,6 +518,18 @@ namespace
                 record.UnexpectedReasons.push_back(reason);
             }
         }
+        if (expectedClass != nullptr)
+        {
+            record.ExpectedClass = expectedClass;
+        }
+        if (expectedRisk != nullptr)
+        {
+            record.ExpectedRisk = expectedRisk;
+        }
+        if (expectedConfidence != nullptr)
+        {
+            record.ExpectedConfidence = expectedConfidence;
+        }
 
         g_Scenarios.push_back(record);
     }
@@ -529,7 +553,7 @@ namespace
             json << L"    {";
             json << L"\"name\":\"" << JsonEscape(scenario.Name) << L"\"";
             json << L",\"artifact\":\"" << JsonEscape(scenario.Artifact) << L"\"";
-            if (scenario.ProcessId != 0)
+            if (scenario.HasProcessId)
             {
                 json << L",\"pid\":" << scenario.ProcessId;
             }
@@ -543,6 +567,18 @@ namespace
             AppendJsonStringArray(json, scenario.ExpectedEvidenceKeys);
             json << L",\"expected_evidence\":";
             AppendJsonStringObject(json, scenario.ExpectedEvidenceValues);
+            if (!scenario.ExpectedClass.empty())
+            {
+                json << L",\"expected_class\":\"" << JsonEscape(scenario.ExpectedClass) << L"\"";
+            }
+            if (!scenario.ExpectedRisk.empty())
+            {
+                json << L",\"expected_risk\":\"" << JsonEscape(scenario.ExpectedRisk) << L"\"";
+            }
+            if (!scenario.ExpectedConfidence.empty())
+            {
+                json << L",\"expected_confidence\":\"" << JsonEscape(scenario.ExpectedConfidence) << L"\"";
+            }
             json << L",\"notes\":\"" << JsonEscape(scenario.Notes) << L"\"";
             json << L"}";
             if (index + 1 != g_Scenarios.size())
@@ -560,14 +596,15 @@ namespace
     void PrintUsage()
     {
         std::wcout << L"KnLiveDbgHuntTarget command:\n";
-        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/edr-killer-suffix-name] [/oxideharvest-cli] [/lab-builtin-profile] [/manifest path] [/seconds n]\n";
+        std::wcout << L"  KnLiveDbgHuntTarget.exe [/all] [/baseline] [/private-exec] [/rwx] [/large-private-exec] [/pe-like] [/wiped-pe] [/thread] [/apc] [/threadless-stack] [/module-patch] [/module-patch-late] [/stomp-thread] [/stomp-apc] [/section-image-map] [/locked-backed-image] [/section-image-stomp] [/image-rwx-section] [/edr-killer-suffix-name] [/oxideharvest-cli] [/edr-killer-driver-service] [/lab-builtin-profile] [/manifest path] [/seconds n] [/stop-event name]\n";
         std::wcout << L"\n";
         std::wcout << L"notes:\n";
         std::wcout << L"  This is a lab-only positive-control target for !hunt.\n";
         std::wcout << L"  It mutates only its own process and never injects into another process.\n";
         std::wcout << L"  /seconds 0 keeps the target alive until Ctrl+C.\n";
+        std::wcout << L"  /stop-event waits for a named manual-reset event and exits cleanly when it is signaled.\n";
         std::wcout << L"  /manifest creates parent directories when needed.\n";
-        std::wcout << L"  Run KnLiveDbg elevated in another console and execute: !hunt /deep /limit 120 /json .\\hunt-target.json\n";
+        std::wcout << L"  Run KnLiveDbg elevated in another console and execute: !hunt /deep /summary /json .\\hunt-target.json\n";
     }
 
     bool ParseUInt32(const wchar_t* text, DWORD* value)
@@ -636,6 +673,7 @@ namespace
                     options->ImageRwxSection = true;
                     options->EdrKillerSuffixName = true;
                     options->OxideHarvestCli = true;
+                    options->EdrKillerDriverService = true;
                     options->LabBuiltinProfile = true;
                     sawScenario = true;
                 }
@@ -734,6 +772,11 @@ namespace
                     options->OxideHarvestCli = true;
                     sawScenario = true;
                 }
+                else if (arg == L"/edr-killer-driver-service")
+                {
+                    options->EdrKillerDriverService = true;
+                    sawScenario = true;
+                }
                 else if (arg == L"/lab-builtin-profile")
                 {
                     options->LabBuiltinProfile = true;
@@ -765,6 +808,16 @@ namespace
                         std::wcerr << L"invalid /seconds value\n";
                         break;
                     }
+                    ++index;
+                }
+                else if (arg == L"/stop-event")
+                {
+                    if (index + 1 >= argc || argv[index + 1][0] == L'\0')
+                    {
+                        std::wcerr << L"invalid /stop-event value\n";
+                        break;
+                    }
+                    options->StopEventName = argv[index + 1];
                     ++index;
                 }
                 else if (arg == L"-i" || arg == L"-u" || arg == L"-p" || arg == L"-t" || arg == L"-o")
@@ -823,6 +876,7 @@ namespace
                 options->ImageRwxSection = true;
                 options->EdrKillerSuffixName = false;
                 options->OxideHarvestCli = false;
+                options->EdrKillerDriverService = false;
                 options->LabBuiltinProfile = false;
             }
 
@@ -846,6 +900,7 @@ namespace
                 options->ImageRwxSection = false;
                 options->EdrKillerSuffixName = false;
                 options->OxideHarvestCli = false;
+                options->EdrKillerDriverService = false;
                 options->LabBuiltinProfile = false;
             }
         } while (false);
@@ -1010,6 +1065,70 @@ namespace
         return ok;
     }
 
+    bool MakeTempSystem32Copy(
+        const wchar_t* sourceFileName,
+        const wchar_t* fileName,
+        std::wstring* path,
+        bool gentlemenCollection = true)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (sourceFileName == nullptr ||
+                fileName == nullptr ||
+                path == nullptr)
+            {
+                break;
+            }
+
+            wchar_t systemDirectory[MAX_PATH + 1] = {};
+            UINT systemLength = GetSystemDirectoryW(systemDirectory, static_cast<UINT>(_countof(systemDirectory)));
+            if (systemLength == 0 || systemLength >= _countof(systemDirectory))
+            {
+                std::wcerr << Win32ErrorText(L"GetSystemDirectoryW failed") << L"\n";
+                break;
+            }
+
+            std::wstring sourcePath = std::wstring(systemDirectory) + L"\\" + sourceFileName;
+
+            wchar_t tempPath[MAX_PATH + 1] = {};
+            DWORD tempLength = GetTempPathW(static_cast<DWORD>(_countof(tempPath)), tempPath);
+            if (tempLength == 0 || tempLength >= _countof(tempPath))
+            {
+                std::wcerr << Win32ErrorText(L"GetTempPathW failed") << L"\n";
+                break;
+            }
+
+            std::wstringstream directoryStream;
+            directoryStream << tempPath
+                            << L"knhunt-"
+                            << GetCurrentProcessId()
+                            << (gentlemenCollection ? L"-GentlemenCollection" : L"-SystemCopyControl");
+            std::wstring directory = directoryStream.str();
+            if (!CreateDirectoryW(directory.c_str(), nullptr) &&
+                GetLastError() != ERROR_ALREADY_EXISTS)
+            {
+                std::wcerr << Win32ErrorText(L"CreateDirectoryW temp system copy directory failed") << L"\n";
+                break;
+            }
+
+            std::wstring candidate = directory + L"\\" + fileName;
+            if (!CopyFileW(sourcePath.c_str(), candidate.c_str(), FALSE))
+            {
+                std::wcerr << Win32ErrorText(L"CopyFileW system temp copy failed") << L"\n";
+                break;
+            }
+
+            g_TempDirectories.push_back(directory);
+            g_TempFiles.push_back(candidate);
+            *path = candidate;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     bool WaitAsChildProcess(const Options& options)
     {
         bool ok = false;
@@ -1042,6 +1161,49 @@ namespace
         }
 
         return ok;
+    }
+
+    void DeleteCreatedDriverServices()
+    {
+        SC_HANDLE scm = nullptr;
+
+        do
+        {
+            if (g_CreatedServices.empty())
+            {
+                break;
+            }
+
+            scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            if (scm == nullptr)
+            {
+                break;
+            }
+
+            for (const std::wstring& serviceName : g_CreatedServices)
+            {
+                SC_HANDLE service = OpenServiceW(
+                    scm,
+                    serviceName.c_str(),
+                    SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
+                if (service == nullptr)
+                {
+                    continue;
+                }
+
+                SERVICE_STATUS status = {};
+                ControlService(service, SERVICE_CONTROL_STOP, &status);
+                DeleteService(service);
+                CloseServiceHandle(service);
+            }
+        } while (false);
+
+        if (scm != nullptr)
+        {
+            CloseServiceHandle(scm);
+        }
+
+        g_CreatedServices.clear();
     }
 
     bool ResolveFixtureDllPath(std::wstring* path)
@@ -2356,7 +2518,7 @@ namespace
                 std::wstring(L"benign child process named ") + fileName + L" like a Gentlemen suffix-normalized EDR-killer IOC",
                 0,
                 0,
-                {L"gentlemen_edr_killer_process_name", L"gentlemen_suffix_normalized_process_name", L"gentlemen_collection_staging_path", L"edr_killer_packer_section_evidence"},
+                {L"gentlemen_edr_killer_process_name", L"gentlemen_suffix_normalized_process_name", L"gentlemen_collection_staging_path", L"edr_killer_version_info_impersonation_evidence", L"edr_killer_packer_section_evidence"},
                 notes,
                 processInfo.dwProcessId,
                 {
@@ -2367,6 +2529,7 @@ namespace
                     L"image_product_name",
                     L"image_original_filename",
                     L"image_file_description",
+                    L"image_version_info_impersonation_match",
                     L"image_signature_checked",
                     L"image_pe_metadata_read",
                     L"image_pe_section_count",
@@ -2386,6 +2549,7 @@ namespace
                     { L"image_product_name", L"Kaspersky Anti-Virus" },
                     { L"image_original_filename", L"Kasps.exe" },
                     { L"image_file_description", L"KnLiveDbg hunt EDR-killer metadata fixture" },
+                    { L"image_version_info_impersonation_match", L"kaspersky" },
                     { L"image_pe_metadata_read", L"true" },
                     { L"image_packer_section_hint", L"enigma" },
                     { L"image_packer_section_names", L".enigma" },
@@ -2394,7 +2558,133 @@ namespace
                     { L"gentlemen_suffix_protection_hint", expectedProtectionHint },
                     { L"gentlemen_suffix_fake_signature_expected", expectedFakeSignature },
                     { L"gentlemen_suffix_fake_version_expected", expectedFakeVersion }
-                });
+                },
+                {},
+                false,
+                L"edr_killer_process_profile",
+                L"high",
+                L"high");
+            ok = true;
+        } while (false);
+
+        if (processInfo.hThread != nullptr)
+        {
+            CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != nullptr)
+        {
+            CloseHandle(processInfo.hProcess);
+        }
+
+        return ok;
+    }
+
+    bool CreateEdrKillerExactNameChild(
+        const Options& options,
+        const wchar_t* fileName,
+        const wchar_t* scenarioName,
+        const wchar_t* notes)
+    {
+        bool ok = false;
+        PROCESS_INFORMATION processInfo = {};
+
+        do
+        {
+            if (fileName == nullptr ||
+                scenarioName == nullptr ||
+                notes == nullptr)
+            {
+                break;
+            }
+
+            std::wstring childPath;
+            if (!MakeTempSelfCopy(fileName, &childPath))
+            {
+                break;
+            }
+
+            std::wstringstream command;
+            command << L"\""
+                    << childPath
+                    << L"\" /baseline /child-wait-parent "
+                    << GetCurrentProcessId()
+                    << L" /seconds "
+                    << options.RunSeconds;
+            std::wstring commandLine = command.str();
+
+            STARTUPINFOW startup = {};
+            startup.cb = sizeof(startup);
+            if (!CreateProcessW(
+                    childPath.c_str(),
+                    commandLine.data(),
+                    nullptr,
+                    nullptr,
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    nullptr,
+                    nullptr,
+                    &startup,
+                    &processInfo))
+            {
+                std::wcerr << Win32ErrorText(L"CreateProcessW EDR-killer exact-name child failed") << L"\n";
+                break;
+            }
+
+            if (processInfo.hThread != nullptr)
+            {
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = nullptr;
+            }
+
+            g_ChildProcesses.push_back(processInfo.hProcess);
+            processInfo.hProcess = nullptr;
+
+            std::wcout << L"edr-killer-exact-name child="
+                       << childPath
+                       << L" pid="
+                       << processInfo.dwProcessId
+                       << L"\n";
+            AddScenario(
+                scenarioName,
+                std::wstring(L"benign child process named ") + fileName + L" like an exact Gentlemen EDR-killer IOC",
+                0,
+                0,
+                {L"gentlemen_edr_killer_process_name", L"gentlemen_collection_staging_path", L"edr_killer_version_info_impersonation_evidence", L"edr_killer_packer_section_evidence"},
+                notes,
+                processInfo.dwProcessId,
+                {
+                    L"image_metadata_path",
+                    L"image_version_info_present",
+                    L"image_file_version",
+                    L"image_company_name",
+                    L"image_product_name",
+                    L"image_original_filename",
+                    L"image_file_description",
+                    L"image_version_info_impersonation_match",
+                    L"image_signature_checked",
+                    L"image_pe_metadata_read",
+                    L"image_pe_section_count",
+                    L"image_executable_section_names",
+                    L"image_packer_section_hint",
+                    L"image_packer_section_names"
+                },
+                {
+                    { L"image_version_info_present", L"true" },
+                    { L"image_file_version", L"1.2.3.4" },
+                    { L"image_company_name", L"Kaspersky Lab" },
+                    { L"image_product_name", L"Kaspersky Anti-Virus" },
+                    { L"image_original_filename", L"Kasps.exe" },
+                    { L"image_file_description", L"KnLiveDbg hunt EDR-killer metadata fixture" },
+                    { L"image_version_info_impersonation_match", L"kaspersky" },
+                    { L"image_pe_metadata_read", L"true" },
+                    { L"image_packer_section_hint", L"enigma" },
+                    { L"image_packer_section_names", L".enigma" }
+                },
+                {},
+                false,
+                L"edr_killer_process_profile",
+                L"high",
+                L"high");
             ok = true;
         } while (false);
 
@@ -2494,6 +2784,101 @@ namespace
         return ok;
     }
 
+    bool CreateGentlemenStagingOnlyNegativeChild(const Options& options)
+    {
+        bool ok = false;
+        PROCESS_INFORMATION processInfo = {};
+
+        do
+        {
+            std::wstring childPath;
+            if (!MakeTempSystem32Copy(L"cmd.exe", L"StageOnlyBenign.exe", &childPath, true))
+            {
+                break;
+            }
+
+            uint32_t pingCount = options.RunSeconds;
+            if (pingCount < 2)
+            {
+                pingCount = 2;
+            }
+
+            std::wstringstream command;
+            command << L"\""
+                    << childPath
+                    << L"\" /d /c \"ping 127.0.0.1 -n "
+                    << pingCount
+                    << L" > nul\"";
+            std::wstring commandLine = command.str();
+
+            STARTUPINFOW startup = {};
+            startup.cb = sizeof(startup);
+            if (!CreateProcessW(
+                    childPath.c_str(),
+                    commandLine.data(),
+                    nullptr,
+                    nullptr,
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    nullptr,
+                    nullptr,
+                    &startup,
+                    &processInfo))
+            {
+                std::wcerr << Win32ErrorText(L"CreateProcessW Gentlemen staging-only negative child failed") << L"\n";
+                break;
+            }
+
+            if (processInfo.hThread != nullptr)
+            {
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = nullptr;
+            }
+
+            g_ChildProcesses.push_back(processInfo.hProcess);
+            processInfo.hProcess = nullptr;
+
+            std::wcout << L"edr-killer-staging-only-negative child="
+                       << childPath
+                       << L" pid="
+                       << processInfo.dwProcessId
+                       << L"\n";
+            AddScenario(
+                L"edr-killer-gentlemen-staging-only-negative",
+                L"benign cmd.exe copy launched from GentlemenCollection with an unknown filename",
+                0,
+                0,
+                {},
+                L"validates that GentlemenCollection staging alone does not create a process-profile finding without profile, metadata, or telemetry evidence",
+                processInfo.dwProcessId,
+                {},
+                {},
+                {
+                    L"gentlemen_collection_staging_path",
+                    L"gentlemen_edr_killer_process_name",
+                    L"gentlemen_suffix_normalized_process_name",
+                    L"security_vendor_impersonation_name",
+                    L"edr_killer_version_info_impersonation_evidence",
+                    L"edr_killer_icon_impersonation_evidence",
+                    L"edr_killer_packer_section_evidence",
+                    L"gentlemen_related_credential_tool_name",
+                    L"oxideharvest_cli_shape"
+                });
+            ok = true;
+        } while (false);
+
+        if (processInfo.hThread != nullptr)
+        {
+            CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != nullptr)
+        {
+            CloseHandle(processInfo.hProcess);
+        }
+
+        return ok;
+    }
+
     bool CreateOxideHarvestCliProcess(const Options& options)
     {
         bool ok = false;
@@ -2565,7 +2950,12 @@ namespace
                 },
                 {
                     { L"oxideharvest_cli_options", L"-i;-u;-p;-t;-o" }
-                });
+                },
+                {},
+                false,
+                L"gentlemen_related_tool",
+                L"medium",
+                L"high");
             ok = true;
         } while (false);
 
@@ -2664,6 +3054,319 @@ namespace
         return ok;
     }
 
+    bool CreateEdrKillerDriverServiceIoc()
+    {
+        bool ok = false;
+        SC_HANDLE scm = nullptr;
+
+        do
+        {
+            struct DriverServiceFixture
+            {
+                const wchar_t* FileName;
+                const wchar_t* ExpectedLeaf;
+                const wchar_t* ScenarioName;
+                const wchar_t* Notes;
+                const wchar_t* Family;
+                const wchar_t* Tool;
+                const wchar_t* StrongNameSignal;
+            };
+
+            static const DriverServiceFixture kFixtures[] =
+            {
+                {
+                    L"eb.sys",
+                    L"eb.sys",
+                    L"edr-killer-driver-service-eb",
+                    L"validates the GentleKiller Kaspersky custom rootkit driver IOC",
+                    L"GentleKiller",
+                    L"Kaspersky variant custom rootkit",
+                    L"true"
+                },
+                {
+                    L"NSecKrnl.sys",
+                    L"nseckrnl.sys",
+                    L"edr-killer-driver-service-nseckrnl",
+                    L"validates the GentleKiller FACEIT NSecKrnl driver IOC",
+                    L"GentleKiller",
+                    L"NSecsoft NSecKrnl driver",
+                    L"true"
+                },
+                {
+                    L"VGK.sys",
+                    L"vgk.sys",
+                    L"edr-killer-driver-service-vgk",
+                    L"validates the GentleKiller Valorant VGK driver IOC with staging context",
+                    L"GentleKiller",
+                    L"Tower of Fantasy AntiCheat driver",
+                    L"false"
+                },
+                {
+                    L"GameDriverX64.sys",
+                    L"gamedriverx64.sys",
+                    L"edr-killer-driver-service-gamedriverx64",
+                    L"validates the GentleKiller Valorant GameDriverX64 driver IOC with staging context",
+                    L"GentleKiller",
+                    L"Tower of Fantasy AntiCheat driver",
+                    L"false"
+                },
+                {
+                    L"stpm_old.sys",
+                    L"stpm_old.sys",
+                    L"edr-killer-driver-service-stpm-old",
+                    L"validates the GentleKiller Javelin old Safetica Process Monitor driver IOC",
+                    L"GentleKiller",
+                    L"Safetica Process Monitor driver",
+                    L"true"
+                },
+                {
+                    L"stpm_new.sys",
+                    L"stpm_new.sys",
+                    L"edr-killer-driver-service-stpm-new",
+                    L"validates the GentleKiller Javelin Safetica Process Monitor driver IOC",
+                    L"GentleKiller",
+                    L"Safetica Process Monitor driver",
+                    L"true"
+                },
+                {
+                    L"dmx.sys",
+                    L"dmx.sys",
+                    L"edr-killer-driver-service-dmx",
+                    L"validates the GentleKiller WatchDog Zemana driver IOC",
+                    L"GentleKiller",
+                    L"Zemana WatchDog driver",
+                    L"true"
+                },
+                {
+                    L"360NetMon_WFP.sys",
+                    L"360netmon_wfp.sys",
+                    L"edr-killer-driver-service-360netmon-wfp",
+                    L"validates the GentleKiller Network Blocker Qihoo 360 WFP driver IOC with staging context",
+                    L"GentleKiller",
+                    L"Qihoo 360 network monitor driver",
+                    L"false"
+                },
+                {
+                    L"360NetMon.sys",
+                    L"360netmon.sys",
+                    L"edr-killer-driver-service-360netmon",
+                    L"validates the GentleKiller Network Blocker Qihoo 360 driver IOC with staging context",
+                    L"GentleKiller",
+                    L"Qihoo 360 network monitor driver",
+                    L"false"
+                },
+                {
+                    L"IMFForceDelete",
+                    L"imfforcedelete",
+                    L"edr-killer-driver-service-imfforcedelete",
+                    L"validates the GentleKiller Cleaner extensionless IMFForceDelete driver IOC",
+                    L"GentleKiller",
+                    L"IObit IMF ForceDelete filter driver",
+                    L"true"
+                },
+                {
+                    L"PoisonX",
+                    L"poisonx",
+                    L"edr-killer-driver-service-poisonx",
+                    L"validates the GentleKiller G11 PoisonX extensionless rootkit IOC",
+                    L"GentleKiller",
+                    L"PoisonX rootkit",
+                    L"true"
+                },
+                {
+                    L"G11.sys",
+                    L"g11.sys",
+                    L"edr-killer-driver-service-g11",
+                    L"validates the GentleKiller G11 PoisonX rootkit driver leaf",
+                    L"GentleKiller",
+                    L"PoisonX rootkit",
+                    L"true"
+                },
+                {
+                    L"googleApiUtil64.sys",
+                    L"googleapiutil64.sys",
+                    L"edr-killer-driver-service-googleapiutil64",
+                    L"validates the HexKiller Baidu Antivirus BdApi driver IOC",
+                    L"HexKiller",
+                    L"Baidu Antivirus BdApi driver",
+                    L"true"
+                },
+                {
+                    L"ThrottleBlood.sys",
+                    L"throttleblood.sys",
+                    L"edr-killer-driver-service-throttleblood",
+                    L"validates the ThrottleBlood TechPowerUp driver IOC",
+                    L"ThrottleBlood",
+                    L"ThrottleStop driver",
+                    L"true"
+                },
+                {
+                    L"havoc.sys",
+                    L"havoc.sys",
+                    L"edr-killer-driver-service-havoc",
+                    L"validates the HavocKiller Huawei vulnerable driver IOC",
+                    L"HavocKiller",
+                    L"Huawei vulnerable driver",
+                    L"true"
+                }
+            };
+
+            scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT);
+            if (scm == nullptr)
+            {
+                DWORD lastError = GetLastError();
+                if (lastError == ERROR_ACCESS_DENIED)
+                {
+                    std::wcout << L"edr-killer-driver-service skipped: administrator rights required\n";
+                    ok = true;
+                }
+                else
+                {
+                    std::wcerr << Win32ErrorText(L"OpenSCManagerW EDR-killer driver service failed", lastError) << L"\n";
+                }
+                break;
+            }
+
+            bool anyFailure = false;
+            for (size_t index = 0; index < _countof(kFixtures); ++index)
+            {
+                const DriverServiceFixture& fixture = kFixtures[index];
+                std::wstring strongNameSignal = fixture.StrongNameSignal != nullptr
+                    ? fixture.StrongNameSignal
+                    : L"false";
+                bool strongName = strongNameSignal == L"true";
+                const wchar_t* expectedRisk = strongName ? L"medium" : L"low";
+                const wchar_t* expectedConfidence = strongName ? L"high" : L"medium";
+                std::wstring driverPath;
+                if (!MakeTempSelfCopy(fixture.FileName, &driverPath))
+                {
+                    anyFailure = true;
+                    continue;
+                }
+                std::wstring serviceBinaryPath = driverPath;
+                bool extensionlessDriverName = std::wcschr(fixture.FileName, L'.') == nullptr;
+                if (extensionlessDriverName && ((index % 2) == 1))
+                {
+                    serviceBinaryPath = driverPath + L" /hunt-parser-check-unquoted-extensionless";
+                }
+                else if ((index % 2) == 0)
+                {
+                    serviceBinaryPath = L"\"" + driverPath + L"\" /hunt-parser-check";
+                }
+
+                std::wstringstream serviceNameStream;
+                serviceNameStream << L"KnLiveDbgHuntTargetEdrSvc"
+                                  << GetCurrentProcessId()
+                                  << L"_"
+                                  << index;
+                std::wstring serviceName = serviceNameStream.str();
+                std::wstring displayName = std::wstring(L"KnLiveDbg Hunt Target ") +
+                    fixture.FileName +
+                    L" IOC";
+
+                SC_HANDLE service = CreateServiceW(
+                    scm,
+                    serviceName.c_str(),
+                    displayName.c_str(),
+                    SERVICE_QUERY_STATUS | DELETE,
+                    SERVICE_KERNEL_DRIVER,
+                    SERVICE_DEMAND_START,
+                    SERVICE_ERROR_IGNORE,
+                    serviceBinaryPath.c_str(),
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr);
+                if (service == nullptr)
+                {
+                    DWORD lastError = GetLastError();
+                    if (lastError == ERROR_ACCESS_DENIED)
+                    {
+                        std::wcout << L"edr-killer-driver-service skipped: administrator rights required\n";
+                        ok = true;
+                        break;
+                    }
+                    else
+                    {
+                        std::wcerr << Win32ErrorText(L"CreateServiceW EDR-killer driver service failed", lastError) << L"\n";
+                    }
+                    anyFailure = true;
+                    continue;
+                }
+
+                g_CreatedServices.push_back(serviceName);
+
+                std::wcout << L"edr-killer-driver-service service="
+                           << serviceName
+                           << L" binary="
+                           << serviceBinaryPath
+                           << L"\n";
+                AddScenario(
+                    fixture.ScenarioName,
+                    std::wstring(L"non-started kernel-driver service configured with an ESET EDR-killer binary leaf ") + fixture.FileName,
+                    0,
+                    0,
+                    {
+                        L"driver_service_installed",
+                        L"driver_service_binary_name_ioc",
+                        L"gentlemen_edr_killer_driver_service",
+                        L"driver_service_not_running",
+                        L"gentlemen_collection_staging_path"
+                    },
+                    fixture.Notes,
+                    0,
+                    {
+                        L"service_name",
+                        L"binary_path",
+                        L"expanded_binary_path",
+                        L"binary_leaf",
+                        L"matched_driver_leaf",
+                        L"gentlemen_family",
+                        L"gentlemen_tool",
+                        L"gentlemen_ioc_driver",
+                        L"strong_name_signal",
+                        L"gentlemen_collection_path"
+                    },
+                    {
+                        { L"binary_leaf", fixture.ExpectedLeaf },
+                        { L"matched_driver_leaf", fixture.ExpectedLeaf },
+                        { L"gentlemen_family", fixture.Family },
+                        { L"gentlemen_tool", fixture.Tool },
+                        { L"gentlemen_ioc_driver", fixture.ExpectedLeaf },
+                        { L"strong_name_signal", strongNameSignal.c_str() },
+                        { L"gentlemen_collection_path", L"true" }
+                    },
+                    {},
+                    true,
+                    L"edr_killer_driver_service",
+                    expectedRisk,
+                    expectedConfidence);
+                if (!g_Scenarios.empty())
+                {
+                    g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"service_name", serviceName);
+                    g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"binary_path", serviceBinaryPath);
+                    g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"expanded_binary_path", serviceBinaryPath);
+                    if (!strongName)
+                    {
+                        g_Scenarios.back().ExpectedReasons.push_back(L"name_only_requires_hash_or_staging_correlation");
+                    }
+                }
+
+                CloseServiceHandle(service);
+            }
+
+            ok = !anyFailure;
+        } while (false);
+
+        if (scm != nullptr)
+        {
+            CloseServiceHandle(scm);
+        }
+
+        return ok;
+    }
+
     bool CreateEdrKillerSuffixNameProcess(const Options& options)
     {
         bool ok = false;
@@ -2738,6 +3441,16 @@ namespace
                 L"validates combined EASolo<suffix> tail handling",
                 L"1clear",
                 L"1;clear",
+                L"mixed",
+                L"mixed",
+                L"mixed"
+            },
+            {
+                L"EASolo2Light.exe",
+                L"edr-killer-suffix-name-easolo-2light",
+                L"validates combined EASolo<suffix> tail handling with Themida plus Light",
+                L"2light",
+                L"2;light",
                 L"mixed",
                 L"mixed",
                 L"mixed"
@@ -2838,6 +3551,26 @@ namespace
             {
                 anyFailure = true;
             }
+            if (!CreateGentlemenStagingOnlyNegativeChild(options))
+            {
+                anyFailure = true;
+            }
+            if (!CreateEdrKillerExactNameChild(
+                    options,
+                    L"Deletor.exe",
+                    L"edr-killer-exact-name-deletor",
+                    L"validates the GentleKiller Cleaner exact Deletor.exe IOC"))
+            {
+                anyFailure = true;
+            }
+            if (!CreateEdrKillerExactNameChild(
+                    options,
+                    L"HwAudKiller.exe",
+                    L"edr-killer-exact-name-hwaudkiller",
+                    L"validates the HavocKiller exact HwAudKiller.exe IOC"))
+            {
+                anyFailure = true;
+            }
 
             ok = !anyFailure;
         } while (false);
@@ -2921,11 +3654,18 @@ namespace
         if (options.EdrKillerSuffixName)
         {
             std::wcout << L"  gentlemen_edr_killer_process_name, gentlemen_suffix_normalized_process_name, "
-                       << L"gentlemen_collection_staging_path\n";
+                       << L"gentlemen_collection_staging_path, edr_killer_version_info_impersonation_evidence, "
+                       << L"edr_killer_packer_section_evidence\n";
+            std::wcout << L"  negative: GentlemenCollection path-only process has no EDR-killer process-profile reason\n";
         }
         if (options.OxideHarvestCli)
         {
             std::wcout << L"  gentlemen_related_credential_tool_name, oxideharvest_cli_shape\n";
+        }
+        if (options.EdrKillerDriverService)
+        {
+            std::wcout << L"  driver_service_installed, driver_service_binary_name_ioc, "
+                       << L"gentlemen_edr_killer_driver_service, gentlemen_collection_staging_path\n";
         }
         if (options.LabBuiltinProfile)
         {
@@ -3024,6 +3764,10 @@ namespace
             {
                 anyFailure = true;
             }
+            if (options.EdrKillerDriverService && !CreateEdrKillerDriverServiceIoc())
+            {
+                anyFailure = true;
+            }
             if (options.LabBuiltinProfile)
             {
                 HMODULE module = nullptr;
@@ -3053,9 +3797,12 @@ namespace
         std::wcout << L"\ncreated scenarios=" << g_Scenarios.size() << L"\n";
         for (const ScenarioRecord& scenario : g_Scenarios)
         {
+            DWORD displayPid = scenario.HasProcessId
+                ? scenario.ProcessId
+                : GetCurrentProcessId();
             std::wcout << L"  " << scenario.Name
                        << L" artifact=\"" << scenario.Artifact << L"\""
-                       << L" pid=" << (scenario.ProcessId == 0 ? GetCurrentProcessId() : scenario.ProcessId)
+                       << L" pid=" << displayPid
                        << L" address=" << Hex(scenario.Address)
                        << L" size=" << scenario.Size
                        << L"\n";
@@ -3067,6 +3814,7 @@ namespace
 int wmain(int argc, wchar_t** argv)
 {
     int exitCode = 1;
+    HANDLE externalStopEvent = nullptr;
 
     do
     {
@@ -3093,9 +3841,26 @@ int wmain(int argc, wchar_t** argv)
         }
 
         SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+        if (!options.StopEventName.empty())
+        {
+            externalStopEvent = CreateEventW(
+                nullptr,
+                TRUE,
+                FALSE,
+                options.StopEventName.c_str());
+            if (externalStopEvent == nullptr)
+            {
+                std::wcerr << Win32ErrorText(L"CreateEventW stop-event failed") << L"\n";
+                break;
+            }
+        }
 
         std::wcout << L"KnLiveDbgHuntTarget pid=" << GetCurrentProcessId() << L"\n";
         std::wcout << L"run_seconds=" << options.RunSeconds << L"\n";
+        if (!options.StopEventName.empty())
+        {
+            std::wcout << L"stop_event=" << options.StopEventName << L"\n";
+        }
         if (options.ChildWaitParentPid != 0)
         {
             std::wcout << L"child_wait_parent=" << options.ChildWaitParentPid << L"\n";
@@ -3137,7 +3902,7 @@ int wmain(int argc, wchar_t** argv)
         }
 
         std::wcout << L"target is ready\n";
-        std::wcout << L"run: !hunt /deep /limit 120 /json .\\hunt-target.json\n";
+        std::wcout << L"run: !hunt /deep /summary /json .\\hunt-target.json\n";
         std::wcout << L"press Ctrl+C to stop this target\n";
 
         DWORD waitMs = INFINITE;
@@ -3145,7 +3910,13 @@ int wmain(int argc, wchar_t** argv)
         {
             waitMs = options.RunSeconds * 1000u;
         }
-        WaitForSingleObject(g_StopEvent, waitMs);
+        HANDLE waitHandles[2] =
+        {
+            g_StopEvent,
+            externalStopEvent
+        };
+        DWORD waitCount = externalStopEvent != nullptr ? 2u : 1u;
+        WaitForMultipleObjects(waitCount, waitHandles, FALSE, waitMs);
         exitCode = 0;
     } while (false);
 
@@ -3184,6 +3955,8 @@ int wmain(int argc, wchar_t** argv)
     }
     g_ChildProcesses.clear();
 
+    DeleteCreatedDriverServices();
+
     for (const std::wstring& path : g_TempFiles)
     {
         DeleteFileW(path.c_str());
@@ -3200,6 +3973,11 @@ int wmain(int argc, wchar_t** argv)
     {
         CloseHandle(g_StopEvent);
         g_StopEvent = nullptr;
+    }
+    if (externalStopEvent != nullptr)
+    {
+        CloseHandle(externalStopEvent);
+        externalStopEvent = nullptr;
     }
 
     return exitCode;

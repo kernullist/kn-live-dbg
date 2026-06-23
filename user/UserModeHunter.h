@@ -41,7 +41,7 @@ struct HuntTelemetryEvent
 struct HuntOptions
 {
     HuntMode Mode = HuntMode::Default;
-    uint32_t RenderLimit = 200;
+    uint32_t RenderLimit = 40;
     std::vector<SnapshotProcessRecord> Processes;
     bool ThreatIntelActive = false;
     bool ThreatIntelAvailable = false;

@@ -1749,7 +1749,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  memory        procctx <pid> | vtop /process <pid> <user-address> | pdb <pa> 80\n";
     std::wcout << L"  types/code    dt nt!_EPROCESS <address> | u nt!KiSystemCall64 8 | uf nt!KiSystemCall64 512\n";
     std::wcout << L"  callbacks     callbacks all | callbacks imageload | callbacks process WdFilter.sys\n";
-    std::wcout << L"  process       !hunt /deep | !dml_proc [pid|name] | !vad <pid> /exec /private | !threads <pid> /apc\n";
+    std::wcout << L"  process       !hunt /deep /summary | !dml_proc [pid|name] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
     std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
@@ -3083,6 +3083,7 @@ static void AddHuntOptionCompletionCandidates(std::vector<std::wstring>* candida
     {
         L"/quick",
         L"/deep",
+        L"/summary",
         L"/limit",
         L"/json",
         L"help"
@@ -18619,14 +18620,16 @@ static void PrintDmlProcHelp()
 static void PrintHuntHelp()
 {
     std::wcout << L"!hunt command:\n";
-    std::wcout << L"  !hunt [/quick] [/deep] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /quick    skip hidden-PTE and disk-vs-live page comparison\n";
     std::wcout << L"  /deep     include hidden-PTE, PEB LDR, module stomping, live-vs-disk executable page,\n";
     std::wcout << L"            local BYOVD exact-hash catalog, EDR-killer driver-name/service,\n";
     std::wcout << L"            driver-object integrity checks, and existing !ti ring correlation\n";
-    std::wcout << L"  /limit n  cap rendered findings only (default 200; 0 renders all); JSON keeps the full scan result\n";
+    std::wcout << L"  /summary  print conclusion, assessment, aggregate counts, high-signal IOC, and top triage tables only\n";
+    std::wcout << L"  /details  render per-finding detail after the triage summary\n";
+    std::wcout << L"  /limit n  render and cap per-finding detail (0 renders all); JSON keeps the full scan result\n";
     std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
@@ -18634,6 +18637,8 @@ static void PrintHuntHelp()
     std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, APC,\n";
     std::wcout << L"  and kernel-driver evidence. The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
     std::wcout << L"  /deep reuses recent !ti events if the Threat-Intelligence subscriber has captured any.\n";
+    std::wcout << L"  Console output is concise by default: conclusion, assessment, summary, high-signal IOC, and top tables.\n";
+    std::wcout << L"  Per-finding detail is hidden unless /details or /limit is supplied.\n";
     std::wcout << L"  Evidence is a lead with risk and confidence; use printed !vad, !threads, and !address follow-ups for triage.\n";
 }
 
@@ -20030,28 +20035,45 @@ static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text
             break;
         }
 
+        if (!EnsureSnapshotDirectoryForFile(path, error))
+        {
+            break;
+        }
+
         file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE)
         {
             if (error != nullptr)
             {
-                *error = L"open output file failed";
+                *error = FormatWin32Error(L"CreateFileW output file failed", GetLastError());
             }
             break;
         }
 
         std::string bytes = WideToUtf8ForLog(text);
-        DWORD written = 0;
-        if (!bytes.empty() && !WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr))
+        size_t totalWritten = 0;
+        while (totalWritten < bytes.size())
         {
-            if (error != nullptr)
+            size_t remaining = bytes.size() - totalWritten;
+            DWORD chunk = remaining > 0x100000u
+                ? 0x100000u
+                : static_cast<DWORD>(remaining);
+            DWORD written = 0;
+            if (!WriteFile(file, bytes.data() + totalWritten, chunk, &written, nullptr) ||
+                written == 0 ||
+                written > chunk)
             {
-                *error = L"write output file failed";
+                if (error != nullptr)
+                {
+                    *error = FormatWin32Error(L"WriteFile output file failed", GetLastError());
+                }
+                break;
             }
-            break;
+
+            totalWritten += written;
         }
 
-        ok = written == bytes.size();
+        ok = totalWritten == bytes.size();
     } while (false);
 
     if (file != INVALID_HANDLE_VALUE)
@@ -21881,7 +21903,8 @@ static bool ValidateHuntCommandArgumentShape(
             std::wstring option = ToLower(args[index]);
             if (IsHelpToken(option) ||
                 option == L"/quick" ||
-                option == L"/deep")
+                option == L"/deep" ||
+                option == L"/summary")
             {
                 ++index;
                 continue;
@@ -21915,7 +21938,7 @@ static bool ValidateHuntCommandArgumentShape(
 
             if (reason != nullptr)
             {
-                *reason = L"!hunt supports /quick, /deep, /limit, and /json options";
+                *reason = L"!hunt supports /quick, /deep, /summary, /limit, and /json options";
             }
             shapeOk = false;
             break;
@@ -24926,6 +24949,7 @@ static bool ResolveProcessTriageTarget(
 static bool ParseProcessTriageLimit(const std::wstring& value, uint32_t numberBase, uint32_t* limit, std::wstring* error)
 {
     bool ok = false;
+    (void)numberBase;
 
     do
     {
@@ -24935,11 +24959,11 @@ static bool ParseProcessTriageLimit(const std::wstring& value, uint32_t numberBa
         }
 
         uint64_t parsed = 0;
-        if (!ParseUnsigned(value, numberBase, &parsed) || parsed > 0xffffffffull)
+        if (!ParseUnsigned(value, 10, &parsed) || parsed > 0xffffffffull)
         {
             if (error != nullptr)
             {
-                *error = L"invalid limit: " + value;
+                *error = L"invalid decimal limit: " + value;
             }
             break;
         }
@@ -24971,6 +24995,10 @@ static void PrintVadRecord(const ProcessVadRecord& record)
     if (record.HasPrivateMemory)
     {
         std::wcout << L" private=" << (record.PrivateMemory ? L"yes" : L"no");
+    }
+    if (record.CopyOnWrite)
+    {
+        std::wcout << L" cow=yes";
     }
     if (record.PeProbeAttempted)
     {
@@ -25228,13 +25256,85 @@ static std::wstring JoinHuntValues(const std::vector<std::wstring>& values)
     return stream.str();
 }
 
+static std::wstring JoinHuntValues(const std::vector<std::wstring>& values, const std::wstring& separator)
+{
+    std::wstringstream stream;
+
+    for (size_t index = 0; index < values.size(); ++index)
+    {
+        if (index != 0)
+        {
+            stream << separator;
+        }
+        stream << values[index];
+    }
+
+    return stream.str();
+}
+
+static std::wstring HuntConsoleReasonLabel(const std::wstring& reason);
+static std::vector<std::wstring> BuildHuntConsoleReasonLabels(const std::vector<std::wstring>& reasons);
+
+static std::wstring HuntConsoleClassLabel(const std::wstring& className)
+{
+    std::wstring label = className;
+    std::wstring lowered = ToLower(className);
+
+    if (lowered == L"edr_killer_process_profile")
+    {
+        label = L"defense_evasion_process_profile";
+    }
+    else if (lowered == L"gentlemen_related_tool")
+    {
+        label = L"credential_collection_tool_profile";
+    }
+    else if (lowered == L"edr_killer_file_ioc")
+    {
+        label = L"defense_evasion_file_hash_ioc";
+    }
+    else if (lowered == L"oxideharvest_file_ioc")
+    {
+        label = L"credential_collection_file_hash_ioc";
+    }
+    else if (lowered == L"edr_killer_driver_file_ioc")
+    {
+        label = L"driver_file_hash_ioc";
+    }
+    else if (lowered == L"edr_killer_driver_io_telemetry")
+    {
+        label = L"defense_evasion_driver_io_telemetry";
+    }
+    else if (lowered == L"edr_killer_process_impairment_telemetry")
+    {
+        label = L"process_impairment_telemetry";
+    }
+    else if (lowered == L"edr_killer_security_product_impairment_telemetry")
+    {
+        label = L"security_product_impairment_telemetry";
+    }
+    else if (lowered == L"edr_killer_driver")
+    {
+        label = L"known_defense_evasion_driver";
+    }
+    else if (lowered == L"edr_killer_driver_profile")
+    {
+        label = L"defense_evasion_driver_profile";
+    }
+    else if (lowered == L"edr_killer_driver_service")
+    {
+        label = L"defense_evasion_driver_service";
+    }
+
+    return label;
+}
+
 static void PrintHuntFinding(const HuntFinding& finding, size_t index)
 {
     PrintColoredText(L"[hunt.finding] ", HuntRiskColor(finding.Risk));
     std::wcout << L"#" << std::dec << (index + 1)
                << L" risk=" << finding.Risk
                << L" confidence=" << finding.Confidence
-               << L" class=" << finding.ClassName
+               << L" class=" << HuntConsoleClassLabel(finding.ClassName)
                << L" pid=" << finding.ProcessId;
 
     if (finding.Eprocess != 0)
@@ -25262,7 +25362,8 @@ static void PrintHuntFinding(const HuntFinding& finding, size_t index)
 
     if (!finding.ReasonCodes.empty())
     {
-        std::wcout << L"  reasons: " << JoinHuntValues(finding.ReasonCodes) << L"\n";
+        std::vector<std::wstring> reasonLabels = BuildHuntConsoleReasonLabels(finding.ReasonCodes);
+        std::wcout << L"  reasons: " << JoinHuntValues(reasonLabels) << L"\n";
     }
 
     if (!finding.Evidence.empty())
@@ -25289,8 +25390,11 @@ static void PrintHuntFinding(const HuntFinding& finding, size_t index)
     }
 }
 
-static void PrintHuntWarnings(const HuntResult& result)
+static void PrintHuntWarnings(const HuntResult& result, bool summaryOnly)
 {
+    constexpr uint32_t maxGlobalWarnings = 16;
+    constexpr uint32_t maxProcessWarnings = 16;
+    constexpr uint32_t maxSummaryGlobalWarnings = 4;
     uint64_t processWarnings = 0;
 
     for (const HuntProcessRecord& process : result.Processes)
@@ -25306,11 +25410,31 @@ static void PrintHuntWarnings(const HuntResult& result)
     PrintColoredText(L"[hunt.warnings]", KNDBG_COLOR_WARN);
     std::wcout << L" global=" << result.Warnings.size()
                << L" process=" << processWarnings
+               << (summaryOnly && processWarnings != 0 ? L" process_suppressed=yes" : L"")
                << L"\n";
 
+    uint32_t globalLimit = summaryOnly ? maxSummaryGlobalWarnings : maxGlobalWarnings;
+
+    uint32_t printedGlobal = 0;
     for (const std::wstring& warning : result.Warnings)
     {
+        if (printedGlobal >= globalLimit)
+        {
+            std::wcerr << L"!hunt warning: additional global warnings suppressed in console; use /json for all warnings\n";
+            break;
+        }
+
         std::wcerr << L"!hunt warning: " << warning << L"\n";
+        ++printedGlobal;
+    }
+
+    if (summaryOnly)
+    {
+        if (processWarnings != 0)
+        {
+            std::wcerr << L"!hunt warning: process warning details suppressed in /summary; use /json or omit /summary for all warnings\n";
+        }
+        return;
     }
 
     uint32_t printed = 0;
@@ -25318,7 +25442,7 @@ static void PrintHuntWarnings(const HuntResult& result)
     {
         for (const std::wstring& warning : process.Warnings)
         {
-            if (printed >= 32)
+            if (printed >= maxProcessWarnings)
             {
                 std::wcerr << L"!hunt warning: additional process warnings suppressed in console; use /json for all warnings\n";
                 return;
@@ -25332,30 +25456,1228 @@ static void PrintHuntWarnings(const HuntResult& result)
     }
 }
 
-static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit)
+struct HuntConsoleProcessSummary
 {
-    PrintColoredText(L"!hunt", KNDBG_COLOR_TITLE);
-    std::wcout << L" mode=" << result.ModeText
-               << L" schema=" << result.Schema
-               << L" timestamp=" << result.TimestampUtc
-               << L"\n";
+    uint32_t ProcessId = 0;
+    uint64_t Eprocess = 0;
+    std::wstring ImageName;
+    uint32_t Priority = 900;
+    uint64_t Total = 0;
+    uint64_t High = 0;
+    uint64_t Medium = 0;
+    uint64_t Low = 0;
+    std::map<std::wstring, uint64_t> Reasons;
+};
 
-    size_t rendered = 0;
-    size_t findingLimit = renderLimit != 0 ? renderLimit : result.Findings.size();
-    for (size_t index = 0; index < result.Findings.size() && rendered < findingLimit; ++index)
+struct HuntConsoleReasonSummary
+{
+    std::wstring Reason;
+    uint32_t Priority = 900;
+    uint64_t Total = 0;
+    uint64_t High = 0;
+    uint64_t Medium = 0;
+    uint64_t Low = 0;
+    uint64_t SystemFindings = 0;
+    std::vector<uint32_t> ProcessIds;
+};
+
+struct HuntConsoleHighSignalSummary
+{
+    std::wstring Signal;
+    uint64_t Total = 0;
+    uint64_t High = 0;
+    uint64_t Medium = 0;
+    uint64_t Low = 0;
+    uint64_t SystemFindings = 0;
+    std::vector<uint32_t> ProcessIds;
+};
+
+struct HuntConsoleAssessmentSummary
+{
+    std::wstring Kind;
+    uint32_t Priority = 900;
+    uint64_t Total = 0;
+    uint64_t High = 0;
+    uint64_t Medium = 0;
+    uint64_t Low = 0;
+    uint64_t SystemFindings = 0;
+    std::vector<uint32_t> ProcessIds;
+    std::vector<std::wstring> Samples;
+    std::vector<std::wstring> Evidence;
+};
+
+static uint64_t CountHuntWarnings(const HuntResult& result)
+{
+    uint64_t warnings = result.Warnings.size();
+
+    for (const HuntProcessRecord& process : result.Processes)
     {
-        PrintHuntFinding(result.Findings[index], index);
-        ++rendered;
+        warnings += process.Warnings.size();
     }
 
-    if (rendered < result.Findings.size())
+    return warnings;
+}
+
+static void AddHuntRiskCount(
+    const std::wstring& risk,
+    uint64_t* high,
+    uint64_t* medium,
+    uint64_t* low)
+{
+    std::wstring normalized = SnapshotRiskNormalize(risk);
+
+    if (normalized == L"high")
     {
-        PrintColoredText(L"[hunt.render]", KNDBG_COLOR_ACCENT);
-        std::wcout << L" rendered=" << rendered
-                   << L" total_findings=" << result.Findings.size()
-                   << L" use /json for the full finding set\n";
+        ++(*high);
+    }
+    else if (normalized == L"medium")
+    {
+        ++(*medium);
+    }
+    else
+    {
+        ++(*low);
+    }
+}
+
+static void AddUniqueHuntProcessId(std::vector<uint32_t>* processIds, uint32_t processId)
+{
+    do
+    {
+        if (processIds == nullptr)
+        {
+            break;
+        }
+
+        if (processId == 0)
+        {
+            break;
+        }
+
+        for (uint32_t existing : *processIds)
+        {
+            if (existing == processId)
+            {
+                return;
+            }
+        }
+
+        processIds->push_back(processId);
+    } while (false);
+}
+
+static std::wstring BuildHuntProcessKey(const HuntFinding& finding)
+{
+    std::wstringstream stream;
+    stream << finding.ProcessId
+           << L"|"
+           << finding.Eprocess
+           << L"|"
+           << finding.ImageName;
+    return stream.str();
+}
+
+static std::wstring HuntConsoleReasonLabel(const std::wstring& reason)
+{
+    std::wstring label = reason;
+    std::wstring lowered = ToLower(reason);
+
+    if (lowered == L"gentlemen_edr_killer_process_name")
+    {
+        label = L"known_defense_evasion_tool_name";
+    }
+    else if (lowered == L"gentlemen_suffix_normalized_process_name")
+    {
+        label = L"renamed_defense_evasion_tool_name";
+    }
+    else if (lowered == L"gentlemen_collection_staging_path")
+    {
+        label = L"known_tool_staging_path";
+    }
+    else if (lowered == L"gentlemen_related_credential_tool_name")
+    {
+        label = L"known_credential_tool_name";
+    }
+    else if (lowered == L"gentlemen_edr_killer_driver_service")
+    {
+        label = L"known_defense_evasion_driver_service";
+    }
+    else if (lowered == L"oxideharvest_cli_shape")
+    {
+        label = L"credential_collection_cli_shape";
+    }
+    else if (lowered == L"oxideharvest_exact_file_sha1_ioc")
+    {
+        label = L"exact_credential_tool_file_hash";
+    }
+    else if (lowered == L"edr_killer_invalid_code_signature")
+    {
+        label = L"invalid_code_signature";
+    }
+    else if (lowered == L"edr_killer_version_info_impersonation_evidence")
+    {
+        label = L"manipulated_version_info";
+    }
+    else if (lowered == L"edr_killer_icon_impersonation_evidence")
+    {
+        label = L"manipulated_icon_resource";
+    }
+    else if (lowered == L"edr_killer_packer_section_evidence")
+    {
+        label = L"packed_or_protected_section";
+    }
+    else if (lowered == L"edr_killer_exact_file_sha1_ioc")
+    {
+        label = L"exact_defense_evasion_file_hash";
+    }
+    else if (lowered == L"eset_exact_file_sha1_ioc")
+    {
+        label = L"published_file_hash_ioc";
+    }
+    else if (lowered == L"gentlekiller_security_target_list")
+    {
+        label = L"security_product_target_list";
+    }
+    else if (lowered == L"known_security_product_process_target")
+    {
+        label = L"security_product_process_targeting";
+    }
+    else if (lowered == L"driver_service_binary_name_ioc")
+    {
+        label = L"known_driver_service_binary_name";
+    }
+    else if (lowered == L"loaded_driver_name_ioc")
+    {
+        label = L"known_loaded_driver_name";
+    }
+    else if (lowered == L"process_doppelganging_evidence")
+    {
+        label = L"main_image_backing_mismatch";
+    }
+    else if (lowered == L"module_stomping_evidence")
+    {
+        label = L"live_module_page_modified";
+    }
+    else if (lowered == L"disk_live_image_mismatch")
+    {
+        label = L"live_main_image_differs_from_disk";
+    }
+    else if (lowered == L"main_image_entrypoint_mismatch")
+    {
+        label = L"main_image_entrypoint_modified";
+    }
+    else if (lowered == L"main_image_hash_mismatch")
+    {
+        label = L"main_image_hash_modified";
+    }
+    else if (lowered == L"section_path_mismatch")
+    {
+        label = L"main_image_section_path_mismatch";
+    }
+    else if (lowered == L"live_disk_exec_page_mismatch")
+    {
+        label = L"live_executable_page_differs_from_disk";
+    }
+    else if (lowered == L"module_entrypoint_mismatch")
+    {
+        label = L"module_entrypoint_modified";
+    }
+    else if (lowered == L"module_text_mismatch")
+    {
+        label = L"module_text_modified";
+    }
+    else if (lowered == L"thread_start_in_modified_module_page")
+    {
+        label = L"thread_started_in_modified_module_page";
+    }
+    else if (lowered == L"apc_target_in_modified_module_page")
+    {
+        label = L"apc_targeted_modified_module_page";
+    }
+    else if (lowered == L"thread_stack_references_modified_module_page")
+    {
+        label = L"stack_referenced_modified_module_page";
+    }
+    else if (lowered == L"private_executable_vad")
+    {
+        label = L"private_executable_memory";
+    }
+    else if (lowered == L"wx_user_vad")
+    {
+        label = L"writable_executable_memory";
+    }
+    else if (lowered == L"large_private_executable_vad")
+    {
+        label = L"large_private_executable_memory";
+    }
+    else if (lowered == L"private_pe_mapping")
+    {
+        label = L"private_pe_mapping";
+    }
+    else if (lowered == L"wiped_pe_header")
+    {
+        label = L"wiped_pe_header";
+    }
+    else if (lowered == L"vadless_executable_pte")
+    {
+        label = L"hidden_executable_page";
+    }
+    else if (lowered == L"vadless_wx_pte")
+    {
+        label = L"hidden_writable_executable_page";
+    }
+    else if (lowered == L"section_image_without_loader_entry")
+    {
+        label = L"image_mapping_without_loader_entry";
+    }
+    else if (lowered == L"vad_image_not_in_loader")
+    {
+        label = L"image_vad_hidden_from_loader";
+    }
+    else if (lowered == L"section_backing_inaccessible")
+    {
+        label = L"image_section_backing_inaccessible";
+    }
+    else if (lowered == L"section_backing_missing")
+    {
+        label = L"image_section_backing_missing";
+    }
+    else if (lowered == L"private_pe_without_loader_entry")
+    {
+        label = L"manual_mapped_private_pe";
+    }
+    else if (lowered == L"partial_ldr_unlink")
+    {
+        label = L"partial_loader_unlink";
+    }
+    else if (lowered == L"module_view_mismatch")
+    {
+        label = L"module_view_mismatch";
+    }
+    else if (lowered == L"builtin_process_injection_evidence")
+    {
+        label = L"builtin_process_injection_context";
     }
 
+    return label;
+}
+
+static std::vector<std::wstring> BuildHuntConsoleReasonLabels(const std::vector<std::wstring>& reasons)
+{
+    std::vector<std::wstring> labels;
+
+    for (const std::wstring& reason : reasons)
+    {
+        std::wstring label = HuntConsoleReasonLabel(reason);
+        if (std::find(labels.begin(), labels.end(), label) == labels.end())
+        {
+            labels.push_back(label);
+        }
+    }
+
+    return labels;
+}
+
+static uint32_t HuntConsoleSignalPriority(const std::wstring& signal)
+{
+    std::wstring lowered = ToLower(signal);
+    uint32_t priority = 900;
+
+    if (lowered == L"published_file_hash_ioc" ||
+        lowered == L"exact_defense_evasion_file_hash" ||
+        lowered == L"exact_credential_tool_file_hash")
+    {
+        priority = 10;
+    }
+    else if (lowered == L"known_defense_evasion_tool_name" ||
+             lowered == L"known_defense_evasion_driver_service" ||
+             lowered == L"known_loaded_driver_name")
+    {
+        priority = 20;
+    }
+    else if (lowered == L"credential_collection_cli_shape" ||
+             lowered == L"known_credential_tool_name")
+    {
+        priority = 30;
+    }
+    else if (lowered == L"security_product_process_targeting" ||
+             lowered == L"security_product_target_list")
+    {
+        priority = 40;
+    }
+    else if (lowered == L"renamed_defense_evasion_tool_name")
+    {
+        priority = 50;
+    }
+    else if (lowered == L"known_tool_staging_path" ||
+             lowered == L"known_driver_service_binary_name")
+    {
+        priority = 60;
+    }
+    else if (lowered == L"invalid_code_signature" ||
+             lowered == L"manipulated_version_info" ||
+             lowered == L"manipulated_icon_resource" ||
+             lowered == L"packed_or_protected_section")
+    {
+        priority = 70;
+    }
+    else if (lowered == L"main_image_backing_mismatch" ||
+             lowered == L"live_main_image_differs_from_disk" ||
+             lowered == L"main_image_entrypoint_modified" ||
+             lowered == L"main_image_hash_modified" ||
+             lowered == L"main_image_section_path_mismatch" ||
+             lowered == L"live_module_page_modified" ||
+             lowered == L"live_executable_page_differs_from_disk" ||
+             lowered == L"module_entrypoint_modified" ||
+             lowered == L"module_text_modified" ||
+             lowered == L"thread_started_in_modified_module_page" ||
+             lowered == L"apc_targeted_modified_module_page" ||
+             lowered == L"stack_referenced_modified_module_page" ||
+             lowered == L"image_mapping_without_loader_entry" ||
+             lowered == L"image_vad_hidden_from_loader" ||
+             lowered == L"manual_mapped_private_pe" ||
+             lowered == L"builtin_process_injection_context")
+    {
+        priority = 80;
+    }
+    else if (lowered == L"private_executable_memory" ||
+             lowered == L"writable_executable_memory" ||
+             lowered == L"large_private_executable_memory" ||
+             lowered == L"private_pe_mapping" ||
+             lowered == L"wiped_pe_header" ||
+             lowered == L"hidden_executable_page" ||
+             lowered == L"hidden_writable_executable_page" ||
+             lowered == L"image_section_backing_inaccessible" ||
+             lowered == L"image_section_backing_missing" ||
+             lowered == L"partial_loader_unlink" ||
+             lowered == L"module_view_mismatch")
+    {
+        priority = 90;
+    }
+
+    return priority;
+}
+
+static bool HuntLabelsContain(const std::vector<std::wstring>& labels, const std::wstring& value)
+{
+    return std::find(labels.begin(), labels.end(), value) != labels.end();
+}
+
+static void AddUniqueHuntText(std::vector<std::wstring>* values, const std::wstring& value, size_t maxCount)
+{
+    do
+    {
+        if (values == nullptr || value.empty())
+        {
+            break;
+        }
+
+        if (std::find(values->begin(), values->end(), value) != values->end())
+        {
+            break;
+        }
+
+        if (values->size() >= maxCount)
+        {
+            break;
+        }
+
+        values->push_back(value);
+    } while (false);
+}
+
+static std::wstring HuntFindingSampleText(const HuntFinding& finding)
+{
+    std::wstringstream stream;
+
+    if (!finding.ImageName.empty())
+    {
+        stream << finding.ImageName;
+    }
+    else if (!finding.ModuleName.empty())
+    {
+        stream << finding.ModuleName;
+    }
+    else if (finding.ProcessId == 0)
+    {
+        stream << L"system";
+    }
+    else
+    {
+        stream << L"pid";
+    }
+
+    if (finding.ProcessId != 0)
+    {
+        stream << L"(" << finding.ProcessId << L")";
+    }
+
+    return stream.str();
+}
+
+static std::wstring HuntAssessmentKindForFinding(
+    const HuntFinding& finding,
+    const std::vector<std::wstring>& labels)
+{
+    std::wstring classLabel = HuntConsoleClassLabel(finding.ClassName);
+    std::wstring kind;
+
+    if (HuntLabelsContain(labels, L"published_file_hash_ioc") ||
+        HuntLabelsContain(labels, L"exact_defense_evasion_file_hash") ||
+        HuntLabelsContain(labels, L"exact_credential_tool_file_hash"))
+    {
+        kind = L"published_file_hash_ioc";
+    }
+    else if (classLabel == L"defense_evasion_driver_service" ||
+             classLabel == L"defense_evasion_driver_profile" ||
+             classLabel == L"known_defense_evasion_driver" ||
+             classLabel == L"driver_file_hash_ioc" ||
+             HuntLabelsContain(labels, L"known_defense_evasion_driver_service") ||
+             HuntLabelsContain(labels, L"known_loaded_driver_name"))
+    {
+        kind = L"defense_evasion_driver_artifact";
+    }
+    else if (classLabel == L"credential_collection_tool_profile" ||
+             classLabel == L"credential_collection_file_hash_ioc" ||
+             HuntLabelsContain(labels, L"credential_collection_cli_shape") ||
+             HuntLabelsContain(labels, L"known_credential_tool_name"))
+    {
+        kind = L"credential_collection_tool";
+    }
+    else if (classLabel == L"security_product_impairment_telemetry" ||
+             HuntLabelsContain(labels, L"security_product_process_targeting") ||
+             HuntLabelsContain(labels, L"security_product_target_list"))
+    {
+        kind = L"security_product_targeting";
+    }
+    else if (classLabel == L"defense_evasion_process_profile" ||
+             HuntLabelsContain(labels, L"known_defense_evasion_tool_name") ||
+             HuntLabelsContain(labels, L"renamed_defense_evasion_tool_name"))
+    {
+        kind = L"defense_evasion_process_profile";
+    }
+    else if (classLabel == L"process_doppelganging" ||
+             classLabel == L"process_image_integrity" ||
+             classLabel == L"module_stomping" ||
+             classLabel == L"module_cross_view" ||
+             classLabel == L"mapped_code" ||
+             classLabel == L"manual_map" ||
+             classLabel == L"vad_dkom" ||
+             classLabel == L"builtin_module_provenance")
+    {
+        kind = L"code_provenance_anomaly";
+    }
+    else
+    {
+        kind = classLabel.empty() ? L"other_hunt_finding" : classLabel;
+    }
+
+    return kind;
+}
+
+static uint32_t HuntAssessmentPriority(const std::wstring& kind)
+{
+    uint32_t priority = 900;
+
+    if (kind == L"published_file_hash_ioc")
+    {
+        priority = 10;
+    }
+    else if (kind == L"defense_evasion_process_profile" ||
+             kind == L"defense_evasion_driver_artifact")
+    {
+        priority = 20;
+    }
+    else if (kind == L"credential_collection_tool")
+    {
+        priority = 30;
+    }
+    else if (kind == L"security_product_targeting")
+    {
+        priority = 40;
+    }
+    else if (kind == L"code_provenance_anomaly")
+    {
+        priority = 80;
+    }
+
+    return priority;
+}
+
+static std::wstring HuntAssessmentSeverityText(const HuntConsoleAssessmentSummary& summary)
+{
+    std::wstring severity = L"low";
+
+    if (summary.High != 0)
+    {
+        severity = L"high";
+    }
+    else if (summary.Medium != 0)
+    {
+        severity = L"medium";
+    }
+
+    return severity;
+}
+
+static std::wstring HuntAssessmentScopeText(const HuntConsoleAssessmentSummary& summary)
+{
+    std::wstring scope = L"processes";
+
+    if (summary.ProcessIds.empty() && summary.SystemFindings != 0)
+    {
+        scope = L"system";
+    }
+    else if (!summary.ProcessIds.empty() && summary.SystemFindings != 0)
+    {
+        scope = L"processes+system";
+    }
+
+    return scope;
+}
+
+static std::wstring HuntAssessmentTechniqueText(const std::wstring& kind)
+{
+    std::wstring technique;
+
+    if (kind == L"published_file_hash_ioc")
+    {
+        technique = L"matched a published threat file hash";
+    }
+    else if (kind == L"defense_evasion_driver_artifact")
+    {
+        technique = L"installed or exposed a known defense-evasion driver artifact";
+    }
+    else if (kind == L"credential_collection_tool")
+    {
+        technique = L"matched credential-collection tool behavior or identity";
+    }
+    else if (kind == L"security_product_targeting")
+    {
+        technique = L"repeatedly controlled known security-product processes";
+    }
+    else if (kind == L"defense_evasion_process_profile")
+    {
+        technique = L"masqueraded as a known defense-evasion tool";
+    }
+    else if (kind == L"code_provenance_anomaly")
+    {
+        technique = L"hid or replaced executable code outside the normal loader view";
+    }
+    else
+    {
+        technique = L"matched a hunt anomaly";
+    }
+
+    return technique;
+}
+
+static std::wstring HuntAssessmentAffectedText(const std::wstring& kind)
+{
+    std::wstring affected;
+
+    if (kind == L"published_file_hash_ioc")
+    {
+        affected = L"process image, loaded driver, or driver-service binary";
+    }
+    else if (kind == L"defense_evasion_driver_artifact")
+    {
+        affected = L"SCM driver service, loaded driver, or driver image path";
+    }
+    else if (kind == L"credential_collection_tool")
+    {
+        affected = L"process identity and command-line collection surface";
+    }
+    else if (kind == L"security_product_targeting")
+    {
+        affected = L"security-product process list and cross-process control surface";
+    }
+    else if (kind == L"defense_evasion_process_profile")
+    {
+        affected = L"process identity, file metadata, and staging path";
+    }
+    else if (kind == L"code_provenance_anomaly")
+    {
+        affected = L"main image, module pages, loader views, VADs, or thread provenance";
+    }
+    else
+    {
+        affected = L"hunt evidence surface";
+    }
+
+    return affected;
+}
+
+static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
+{
+    std::wstring phrase;
+    std::wstring lowered = ToLower(label);
+
+    if (lowered == L"published_file_hash_ioc")
+    {
+        phrase = L"published file hash IOC";
+    }
+    else if (lowered == L"exact_defense_evasion_file_hash")
+    {
+        phrase = L"exact defense-evasion file hash";
+    }
+    else if (lowered == L"exact_credential_tool_file_hash")
+    {
+        phrase = L"exact credential-tool file hash";
+    }
+    else if (lowered == L"known_defense_evasion_tool_name")
+    {
+        phrase = L"known defense-evasion tool name";
+    }
+    else if (lowered == L"renamed_defense_evasion_tool_name")
+    {
+        phrase = L"renamed or suffixed defense-evasion tool name";
+    }
+    else if (lowered == L"known_tool_staging_path")
+    {
+        phrase = L"known tool staging path";
+    }
+    else if (lowered == L"known_defense_evasion_driver_service")
+    {
+        phrase = L"known defense-evasion driver service";
+    }
+    else if (lowered == L"known_driver_service_binary_name")
+    {
+        phrase = L"known driver-service binary name";
+    }
+    else if (lowered == L"known_loaded_driver_name")
+    {
+        phrase = L"known loaded-driver name";
+    }
+    else if (lowered == L"credential_collection_cli_shape")
+    {
+        phrase = L"credential-collection command-line shape";
+    }
+    else if (lowered == L"known_credential_tool_name")
+    {
+        phrase = L"known credential-tool name";
+    }
+    else if (lowered == L"security_product_process_targeting")
+    {
+        phrase = L"security-product process targeting";
+    }
+    else if (lowered == L"security_product_target_list")
+    {
+        phrase = L"known security-product target list";
+    }
+    else if (lowered == L"invalid_code_signature")
+    {
+        phrase = L"invalid code signature";
+    }
+    else if (lowered == L"manipulated_version_info")
+    {
+        phrase = L"manipulated version information";
+    }
+    else if (lowered == L"manipulated_icon_resource")
+    {
+        phrase = L"manipulated icon resource";
+    }
+    else if (lowered == L"packed_or_protected_section")
+    {
+        phrase = L"packed or protected PE section";
+    }
+    else if (lowered == L"main_image_backing_mismatch")
+    {
+        phrase = L"main image backing mismatch";
+    }
+    else if (lowered == L"live_main_image_differs_from_disk")
+    {
+        phrase = L"live main image differs from disk";
+    }
+    else if (lowered == L"main_image_entrypoint_modified")
+    {
+        phrase = L"main image entrypoint modified";
+    }
+    else if (lowered == L"main_image_hash_modified")
+    {
+        phrase = L"main image executable page modified";
+    }
+    else if (lowered == L"main_image_section_path_mismatch")
+    {
+        phrase = L"main image section path mismatch";
+    }
+    else if (lowered == L"live_module_page_modified")
+    {
+        phrase = L"live module executable page modified";
+    }
+    else if (lowered == L"live_executable_page_differs_from_disk")
+    {
+        phrase = L"live executable page differs from disk";
+    }
+    else if (lowered == L"module_entrypoint_modified")
+    {
+        phrase = L"module entrypoint modified";
+    }
+    else if (lowered == L"module_text_modified")
+    {
+        phrase = L"module text page modified";
+    }
+    else if (lowered == L"thread_started_in_modified_module_page")
+    {
+        phrase = L"thread started in modified module page";
+    }
+    else if (lowered == L"apc_targeted_modified_module_page")
+    {
+        phrase = L"APC targeted a modified module page";
+    }
+    else if (lowered == L"stack_referenced_modified_module_page")
+    {
+        phrase = L"thread stack referenced a modified module page";
+    }
+    else if (lowered == L"private_executable_memory")
+    {
+        phrase = L"private executable memory";
+    }
+    else if (lowered == L"writable_executable_memory")
+    {
+        phrase = L"writable executable memory";
+    }
+    else if (lowered == L"large_private_executable_memory")
+    {
+        phrase = L"large private executable memory";
+    }
+    else if (lowered == L"private_pe_mapping")
+    {
+        phrase = L"private PE-like mapping";
+    }
+    else if (lowered == L"wiped_pe_header")
+    {
+        phrase = L"wiped PE header";
+    }
+    else if (lowered == L"hidden_executable_page")
+    {
+        phrase = L"executable page hidden from VAD";
+    }
+    else if (lowered == L"hidden_writable_executable_page")
+    {
+        phrase = L"writable executable page hidden from VAD";
+    }
+    else if (lowered == L"image_mapping_without_loader_entry")
+    {
+        phrase = L"image mapping missing from loader entries";
+    }
+    else if (lowered == L"image_vad_hidden_from_loader")
+    {
+        phrase = L"image VAD hidden from loader views";
+    }
+    else if (lowered == L"image_section_backing_inaccessible")
+    {
+        phrase = L"image section backing inaccessible";
+    }
+    else if (lowered == L"image_section_backing_missing")
+    {
+        phrase = L"image section backing missing";
+    }
+    else if (lowered == L"manual_mapped_private_pe")
+    {
+        phrase = L"manual-mapped private PE";
+    }
+    else if (lowered == L"partial_loader_unlink")
+    {
+        phrase = L"partial PEB loader unlink";
+    }
+    else if (lowered == L"module_view_mismatch")
+    {
+        phrase = L"Toolhelp and PEB loader module views disagree";
+    }
+    else if (lowered == L"builtin_process_injection_context")
+    {
+        phrase = L"built-in Windows process injection context";
+    }
+    else
+    {
+        phrase = label;
+        std::replace(phrase.begin(), phrase.end(), L'_', L' ');
+    }
+
+    return phrase;
+}
+
+static std::wstring HuntAssessmentEvidenceText(const HuntConsoleAssessmentSummary& summary)
+{
+    std::vector<std::wstring> phrases;
+
+    for (const std::wstring& label : summary.Evidence)
+    {
+        AddUniqueHuntText(&phrases, HuntAssessmentEvidencePhrase(label), 8);
+    }
+
+    if (phrases.empty())
+    {
+        return L"-";
+    }
+
+    return JoinHuntValues(phrases, L"; ");
+}
+
+static std::wstring HuntDominantReasonText(const std::map<std::wstring, uint64_t>& reasons)
+{
+    std::wstring reason;
+    uint64_t count = 0;
+    uint32_t priority = 1000;
+
+    auto selectReason =
+        [&reason, &count, &priority](const std::map<std::wstring, uint64_t>& source, bool skipContext)
+        {
+            for (const auto& item : source)
+            {
+                if (skipContext && item.first == L"builtin_process_injection_evidence")
+                {
+                    continue;
+                }
+
+                uint32_t itemPriority = HuntConsoleSignalPriority(item.first);
+                if (itemPriority < priority ||
+                    (itemPriority == priority && item.second > count))
+                {
+                    reason = item.first;
+                    count = item.second;
+                    priority = itemPriority;
+                }
+            }
+        };
+
+    selectReason(reasons, true);
+    if (reason.empty())
+    {
+        selectReason(reasons, false);
+    }
+
+    return reason;
+}
+
+static bool IsHuntHighSignalReason(const std::wstring& reason)
+{
+    bool matched = false;
+    std::wstring lowered = ToLower(reason);
+
+    do
+    {
+        if (StartsWithNoCase(lowered, L"gentlemen_") ||
+            StartsWithNoCase(lowered, L"gentlekiller_") ||
+            StartsWithNoCase(lowered, L"oxideharvest_") ||
+            StartsWithNoCase(lowered, L"edr_killer_") ||
+            StartsWithNoCase(lowered, L"eset_") ||
+            StartsWithNoCase(lowered, L"byovd_"))
+        {
+            matched = true;
+            break;
+        }
+
+        if (lowered == L"driver_service_binary_name_ioc" ||
+            lowered == L"driver_service_installed" ||
+            lowered == L"driver_service_running" ||
+            lowered == L"known_security_product_process_target" ||
+            lowered == L"loaded_driver_name_ioc")
+        {
+            matched = true;
+            break;
+        }
+    } while (false);
+
+    return matched;
+}
+
+static std::wstring FormatHuntPidList(const std::vector<uint32_t>& processIds, size_t maxCount)
+{
+    std::wstringstream stream;
+
+    if (processIds.empty())
+    {
+        return L"-";
+    }
+
+    size_t printed = std::min(maxCount, processIds.size());
+    for (size_t index = 0; index < printed; ++index)
+    {
+        if (index != 0)
+        {
+            stream << L",";
+        }
+
+        stream << processIds[index];
+    }
+
+    if (printed < processIds.size())
+    {
+        stream << L",...(+" << (processIds.size() - printed) << L")";
+    }
+
+    return stream.str();
+}
+
+static std::vector<HuntConsoleProcessSummary> BuildHuntProcessSummaries(const HuntResult& result)
+{
+    std::map<std::wstring, HuntConsoleProcessSummary> byProcess;
+
+    for (const HuntFinding& finding : result.Findings)
+    {
+        std::wstring key = BuildHuntProcessKey(finding);
+        HuntConsoleProcessSummary& summary = byProcess[key];
+        if (summary.Total == 0)
+        {
+            summary.ProcessId = finding.ProcessId;
+            summary.Eprocess = finding.Eprocess;
+            summary.ImageName = finding.ImageName;
+        }
+
+        ++summary.Total;
+        AddHuntRiskCount(finding.Risk, &summary.High, &summary.Medium, &summary.Low);
+        for (const std::wstring& reason : finding.ReasonCodes)
+        {
+            std::wstring label = HuntConsoleReasonLabel(reason);
+            summary.Priority = std::min(summary.Priority, HuntConsoleSignalPriority(label));
+            ++summary.Reasons[label];
+        }
+    }
+
+    std::vector<HuntConsoleProcessSummary> summaries;
+    summaries.reserve(byProcess.size());
+    for (const auto& item : byProcess)
+    {
+        summaries.push_back(item.second);
+    }
+
+    std::sort(
+        summaries.begin(),
+        summaries.end(),
+        [](const HuntConsoleProcessSummary& left, const HuntConsoleProcessSummary& right)
+        {
+            if (left.Priority != right.Priority)
+            {
+                return left.Priority < right.Priority;
+            }
+            if (left.High != right.High)
+            {
+                return left.High > right.High;
+            }
+            if (left.Medium != right.Medium)
+            {
+                return left.Medium > right.Medium;
+            }
+            if (left.Total != right.Total)
+            {
+                return left.Total > right.Total;
+            }
+            if (left.ImageName != right.ImageName)
+            {
+                return left.ImageName < right.ImageName;
+            }
+            return left.ProcessId < right.ProcessId;
+        });
+
+    return summaries;
+}
+
+static std::vector<HuntConsoleReasonSummary> BuildHuntReasonSummaries(const HuntResult& result)
+{
+    std::map<std::wstring, HuntConsoleReasonSummary> byReason;
+
+    for (const HuntFinding& finding : result.Findings)
+    {
+        for (const std::wstring& reason : finding.ReasonCodes)
+        {
+            std::wstring label = HuntConsoleReasonLabel(reason);
+            HuntConsoleReasonSummary& summary = byReason[label];
+            if (summary.Reason.empty())
+            {
+                summary.Reason = label;
+                summary.Priority = HuntConsoleSignalPriority(label);
+            }
+
+            ++summary.Total;
+            AddHuntRiskCount(finding.Risk, &summary.High, &summary.Medium, &summary.Low);
+            if (finding.ProcessId != 0)
+            {
+                AddUniqueHuntProcessId(&summary.ProcessIds, finding.ProcessId);
+            }
+            else
+            {
+                ++summary.SystemFindings;
+            }
+        }
+    }
+
+    std::vector<HuntConsoleReasonSummary> summaries;
+    summaries.reserve(byReason.size());
+    for (const auto& item : byReason)
+    {
+        summaries.push_back(item.second);
+    }
+
+    std::sort(
+        summaries.begin(),
+        summaries.end(),
+        [](const HuntConsoleReasonSummary& left, const HuntConsoleReasonSummary& right)
+        {
+            if (left.Priority != right.Priority)
+            {
+                return left.Priority < right.Priority;
+            }
+            if (left.High != right.High)
+            {
+                return left.High > right.High;
+            }
+            if (left.Medium != right.Medium)
+            {
+                return left.Medium > right.Medium;
+            }
+            if (left.Total != right.Total)
+            {
+                return left.Total > right.Total;
+            }
+            return left.Reason < right.Reason;
+        });
+
+    return summaries;
+}
+
+static std::vector<HuntConsoleHighSignalSummary> BuildHuntHighSignalSummaries(const HuntResult& result)
+{
+    std::map<std::wstring, HuntConsoleHighSignalSummary> bySignal;
+
+    for (const HuntFinding& finding : result.Findings)
+    {
+        for (const std::wstring& reason : finding.ReasonCodes)
+        {
+            if (!IsHuntHighSignalReason(reason))
+            {
+                continue;
+            }
+
+            std::wstring label = HuntConsoleReasonLabel(reason);
+            HuntConsoleHighSignalSummary& summary = bySignal[label];
+            if (summary.Signal.empty())
+            {
+                summary.Signal = label;
+            }
+
+            ++summary.Total;
+            AddHuntRiskCount(finding.Risk, &summary.High, &summary.Medium, &summary.Low);
+            if (finding.ProcessId != 0)
+            {
+                AddUniqueHuntProcessId(&summary.ProcessIds, finding.ProcessId);
+            }
+            else
+            {
+                ++summary.SystemFindings;
+            }
+        }
+    }
+
+    std::vector<HuntConsoleHighSignalSummary> summaries;
+    summaries.reserve(bySignal.size());
+    for (const auto& item : bySignal)
+    {
+        summaries.push_back(item.second);
+    }
+
+    std::sort(
+        summaries.begin(),
+        summaries.end(),
+        [](const HuntConsoleHighSignalSummary& left, const HuntConsoleHighSignalSummary& right)
+        {
+            uint32_t leftPriority = HuntConsoleSignalPriority(left.Signal);
+            uint32_t rightPriority = HuntConsoleSignalPriority(right.Signal);
+            if (leftPriority != rightPriority)
+            {
+                return leftPriority < rightPriority;
+            }
+            if (left.High != right.High)
+            {
+                return left.High > right.High;
+            }
+            if (left.Medium != right.Medium)
+            {
+                return left.Medium > right.Medium;
+            }
+            if (left.Total != right.Total)
+            {
+                return left.Total > right.Total;
+            }
+            return left.Signal < right.Signal;
+        });
+
+    return summaries;
+}
+
+static std::vector<HuntConsoleAssessmentSummary> BuildHuntAssessmentSummaries(const HuntResult& result)
+{
+    std::map<std::wstring, HuntConsoleAssessmentSummary> byKind;
+
+    for (const HuntFinding& finding : result.Findings)
+    {
+        std::vector<std::wstring> labels = BuildHuntConsoleReasonLabels(finding.ReasonCodes);
+        std::wstring kind = HuntAssessmentKindForFinding(finding, labels);
+        HuntConsoleAssessmentSummary& summary = byKind[kind];
+        if (summary.Kind.empty())
+        {
+            summary.Kind = kind;
+            summary.Priority = HuntAssessmentPriority(kind);
+        }
+
+        ++summary.Total;
+        AddHuntRiskCount(finding.Risk, &summary.High, &summary.Medium, &summary.Low);
+        if (finding.ProcessId != 0)
+        {
+            AddUniqueHuntProcessId(&summary.ProcessIds, finding.ProcessId);
+        }
+        else
+        {
+            ++summary.SystemFindings;
+        }
+
+        AddUniqueHuntText(&summary.Samples, HuntFindingSampleText(finding), 6);
+        for (const std::wstring& label : labels)
+        {
+            if (HuntConsoleSignalPriority(label) <= 90)
+            {
+                AddUniqueHuntText(&summary.Evidence, label, 8);
+            }
+        }
+    }
+
+    std::vector<HuntConsoleAssessmentSummary> summaries;
+    summaries.reserve(byKind.size());
+    for (const auto& item : byKind)
+    {
+        summaries.push_back(item.second);
+    }
+
+    std::sort(
+        summaries.begin(),
+        summaries.end(),
+        [](const HuntConsoleAssessmentSummary& left, const HuntConsoleAssessmentSummary& right)
+        {
+            if (left.Priority != right.Priority)
+            {
+                return left.Priority < right.Priority;
+            }
+            if (left.High != right.High)
+            {
+                return left.High > right.High;
+            }
+            if (left.Medium != right.Medium)
+            {
+                return left.Medium > right.Medium;
+            }
+            if (left.Total != right.Total)
+            {
+                return left.Total > right.Total;
+            }
+            return left.Kind < right.Kind;
+        });
+
+    return summaries;
+}
+
+static void PrintHuntSummaryLine(const HuntResult& result)
+{
     PrintColoredText(L"[hunt.summary]", KNDBG_COLOR_TITLE);
     std::wcout << L" kernel_processes=" << result.KernelProcessCount
                << L" spi_processes=" << result.SystemProcessInfoCount
@@ -25374,14 +26696,238 @@ static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit)
                << L" driver_objects=" << result.DriverObjectCount
                << L" suspicious_drivers=" << result.SuspiciousDriverObjectCount
                << L" driver_services=" << result.DriverServiceCount
-               << L" edr_killer_services=" << result.EdrKillerDriverServiceCount
+               << L" driver_service_iocs=" << result.EdrKillerDriverServiceCount
                << L" ti_active=" << (result.ThreatIntelActive ? L"yes" : L"no")
                << L" ti_available=" << (result.ThreatIntelAvailable ? L"yes" : L"no")
                << L" ti_events=" << result.ThreatIntelEventCount
                << L" ti_correlations=" << result.ThreatIntelCorrelationCount
                << L"\n";
+}
 
-    PrintHuntWarnings(result);
+static void PrintHuntConclusion(const HuntResult& result, uint64_t warningCount)
+{
+    std::wstring verdict = L"clean";
+    WORD color = KNDBG_COLOR_OK;
+    std::wstring action = L"no hunt findings were emitted for the scanned system view";
+    bool hasHighSignal = !BuildHuntHighSignalSummaries(result).empty();
+
+    if (result.HighFindings != 0)
+    {
+        verdict = result.Findings.size() >= 1000 ? L"alert_noisy" : L"alert";
+        color = KNDBG_COLOR_WARN;
+        action = hasHighSignal
+            ? L"read the assessment first, then confirm the high-signal process examples; use /json for full evidence"
+            : L"read the assessment first, then triage high-risk process/reason clusters; use /json for full evidence";
+    }
+    else if (result.MediumFindings != 0)
+    {
+        verdict = L"review";
+        color = KNDBG_COLOR_TITLE;
+        action = L"review medium-risk clusters and confirm with the printed follow-up commands";
+    }
+    else if (result.LowFindings != 0)
+    {
+        verdict = L"low_signal";
+        color = KNDBG_COLOR_ACCENT;
+        action = L"low-risk leads only; preserve JSON if this is a baseline capture";
+    }
+
+    PrintColoredText(L"[hunt.conclusion]", color);
+    std::wcout << L" verdict=" << verdict
+               << L" findings=" << result.Findings.size()
+               << L" high=" << result.HighFindings
+               << L" medium=" << result.MediumFindings
+               << L" low=" << result.LowFindings
+               << L" warnings=" << warningCount
+               << L"\n";
+    std::wcout << L"  action: " << action << L"\n";
+}
+
+static void PrintHuntHighSignalTable(const HuntResult& result)
+{
+    constexpr size_t maxRows = 12;
+    constexpr size_t maxPids = 10;
+
+    std::vector<HuntConsoleHighSignalSummary> signalSummaries = BuildHuntHighSignalSummaries(result);
+    PrintColoredText(L"[hunt.high_signal]", signalSummaries.empty() ? KNDBG_COLOR_TITLE : KNDBG_COLOR_WARN);
+    std::wcout << L" showing=" << std::min(maxRows, signalSummaries.size())
+               << L" total=" << signalSummaries.size();
+    if (signalSummaries.empty())
+    {
+        std::wcout << L" none=yes";
+    }
+    std::wcout << L"\n";
+
+    for (size_t index = 0; index < signalSummaries.size() && index < maxRows; ++index)
+    {
+        const HuntConsoleHighSignalSummary& summary = signalSummaries[index];
+        std::wcout << L"  #" << (index + 1)
+                   << L" signal=" << summary.Signal
+                   << L" total=" << summary.Total
+                   << L" high=" << summary.High
+                   << L" medium=" << summary.Medium
+                   << L" low=" << summary.Low
+                   << L" system_findings=" << summary.SystemFindings
+                   << L" processes=" << summary.ProcessIds.size()
+                   << L" pids=" << FormatHuntPidList(summary.ProcessIds, maxPids)
+                   << L"\n";
+    }
+}
+
+static void PrintHuntAssessment(const HuntResult& result)
+{
+    constexpr size_t maxRows = 5;
+
+    std::vector<HuntConsoleAssessmentSummary> summaries = BuildHuntAssessmentSummaries(result);
+    PrintColoredText(L"[hunt.assessment]", summaries.empty() ? KNDBG_COLOR_TITLE : KNDBG_COLOR_WARN);
+    std::wcout << L" showing=" << std::min(maxRows, summaries.size())
+               << L" total=" << summaries.size();
+    if (summaries.empty())
+    {
+        std::wcout << L" none=yes";
+    }
+    std::wcout << L"\n";
+
+    for (size_t index = 0; index < summaries.size() && index < maxRows; ++index)
+    {
+        const HuntConsoleAssessmentSummary& summary = summaries[index];
+        std::wcout << L"  #" << (index + 1)
+                   << L" severity=" << HuntAssessmentSeverityText(summary)
+                   << L" scope=" << HuntAssessmentScopeText(summary)
+                   << L" findings=" << summary.Total
+                   << L" high=" << summary.High
+                   << L" medium=" << summary.Medium
+                   << L" low=" << summary.Low
+                   << L" affected_processes=" << summary.ProcessIds.size()
+                   << L" system_findings=" << summary.SystemFindings
+                   << L"\n";
+        if (!summary.Samples.empty())
+        {
+            std::wcout << L"     who=" << JoinHuntValues(summary.Samples) << L"\n";
+        }
+        std::wcout << L"     technique=\"" << HuntAssessmentTechniqueText(summary.Kind) << L"\"\n";
+        std::wcout << L"     affected=\"" << HuntAssessmentAffectedText(summary.Kind) << L"\"\n";
+        std::wcout << L"     evidence=\"" << HuntAssessmentEvidenceText(summary) << L"\"\n";
+    }
+
+    if (!summaries.empty())
+    {
+        std::wcout << L"  next: use /json for full evidence; add /limit n or /details only when raw finding detail is needed\n";
+    }
+}
+
+static void PrintHuntTriageTables(const HuntResult& result)
+{
+    constexpr size_t maxRows = 8;
+
+    std::vector<HuntConsoleProcessSummary> processSummaries = BuildHuntProcessSummaries(result);
+    PrintColoredText(L"[hunt.top_processes]", KNDBG_COLOR_TITLE);
+    std::wcout << L" showing=" << std::min(maxRows, processSummaries.size())
+               << L" total=" << processSummaries.size()
+               << L"\n";
+    for (size_t index = 0; index < processSummaries.size() && index < maxRows; ++index)
+    {
+        const HuntConsoleProcessSummary& summary = processSummaries[index];
+        std::wstring topReason = HuntDominantReasonText(summary.Reasons);
+        std::wcout << L"  #" << (index + 1)
+                   << L" pid=" << summary.ProcessId;
+        if (summary.ProcessId == 0 && summary.Eprocess == 0 && summary.ImageName.empty())
+        {
+            std::wcout << L" scope=system";
+        }
+        if (summary.Eprocess != 0)
+        {
+            std::wcout << L" eprocess=" << HexTextWidth(summary.Eprocess, 16, true);
+        }
+        if (!summary.ImageName.empty())
+        {
+            std::wcout << L" image=" << summary.ImageName;
+        }
+        std::wcout << L" total=" << summary.Total
+                   << L" high=" << summary.High
+                   << L" medium=" << summary.Medium
+                   << L" low=" << summary.Low;
+        if (!topReason.empty())
+        {
+            std::wcout << L" top_reason=" << topReason;
+        }
+        std::wcout << L"\n";
+    }
+
+    std::vector<HuntConsoleReasonSummary> reasonSummaries = BuildHuntReasonSummaries(result);
+    PrintColoredText(L"[hunt.top_reasons]", KNDBG_COLOR_TITLE);
+    std::wcout << L" showing=" << std::min(maxRows, reasonSummaries.size())
+               << L" total=" << reasonSummaries.size()
+               << L"\n";
+    for (size_t index = 0; index < reasonSummaries.size() && index < maxRows; ++index)
+    {
+        const HuntConsoleReasonSummary& summary = reasonSummaries[index];
+        std::wcout << L"  #" << (index + 1)
+                   << L" reason=" << summary.Reason
+                   << L" total=" << summary.Total
+                   << L" high=" << summary.High
+                   << L" medium=" << summary.Medium
+                   << L" low=" << summary.Low
+                   << L" system_findings=" << summary.SystemFindings
+                   << L" processes=" << summary.ProcessIds.size()
+                   << L"\n";
+    }
+}
+
+static void PrintHuntResult(const HuntResult& result, uint32_t renderLimit, bool summaryOnly)
+{
+    PrintColoredText(L"!hunt", KNDBG_COLOR_TITLE);
+    std::wcout << L" mode=" << result.ModeText
+               << L" schema=" << result.Schema
+               << L" timestamp=" << result.TimestampUtc
+               << L"\n";
+
+    uint64_t warningCount = CountHuntWarnings(result);
+    PrintHuntConclusion(result, warningCount);
+    PrintHuntAssessment(result);
+    PrintHuntSummaryLine(result);
+    PrintHuntHighSignalTable(result);
+    PrintHuntTriageTables(result);
+
+    if (summaryOnly)
+    {
+        PrintColoredText(L"[hunt.detail]", KNDBG_COLOR_ACCENT);
+        std::wcout << L" suppressed=yes total_findings=" << result.Findings.size()
+                   << L" use /limit n for capped details or /json for full evidence\n";
+        PrintHuntWarnings(result, true);
+        return;
+    }
+
+    size_t rendered = 0;
+    size_t findingLimit = renderLimit != 0 ? renderLimit : result.Findings.size();
+    PrintColoredText(L"[hunt.detail]", KNDBG_COLOR_ACCENT);
+    std::wcout << L" showing=" << std::min(findingLimit, result.Findings.size())
+               << L" total_findings=" << result.Findings.size();
+    if (renderLimit == 0)
+    {
+        std::wcout << L" limit=all";
+    }
+    else
+    {
+        std::wcout << L" limit=" << renderLimit;
+    }
+    std::wcout << L"\n";
+
+    for (size_t index = 0; index < result.Findings.size() && rendered < findingLimit; ++index)
+    {
+        PrintHuntFinding(result.Findings[index], index);
+        ++rendered;
+    }
+
+    if (rendered < result.Findings.size())
+    {
+        PrintColoredText(L"[hunt.render]", KNDBG_COLOR_ACCENT);
+        std::wcout << L" rendered=" << rendered
+                   << L" total_findings=" << result.Findings.size()
+                   << L" use /json for the full finding set\n";
+    }
+
+    PrintHuntWarnings(result, false);
 }
 
 static void HandleHuntCommand(
@@ -25408,6 +26954,8 @@ static void HandleHuntCommand(
 
         HuntOptions options = {};
         std::wstring jsonPath;
+        bool summaryOnly = false;
+        bool renderDetails = false;
         bool parseOk = true;
         for (size_t index = 1; index < args.size(); ++index)
         {
@@ -25419,6 +26967,14 @@ static void HandleHuntCommand(
             else if (option == L"/deep")
             {
                 options.Mode = HuntMode::Deep;
+            }
+            else if (option == L"/summary")
+            {
+                summaryOnly = true;
+            }
+            else if (option == L"/details")
+            {
+                renderDetails = true;
             }
             else if (option == L"/limit")
             {
@@ -25434,6 +26990,7 @@ static void HandleHuntCommand(
                     parseOk = false;
                     break;
                 }
+                renderDetails = true;
                 ++index;
             }
             else if (option == L"/json")
@@ -25525,7 +27082,7 @@ static void HandleHuntCommand(
             }
         }
 
-        PrintHuntResult(result, options.RenderLimit);
+        PrintHuntResult(result, options.RenderLimit, summaryOnly || !renderDetails);
     } while (false);
 }
 

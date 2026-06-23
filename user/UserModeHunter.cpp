@@ -6,6 +6,7 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <WinTrust.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -25,6 +26,8 @@ namespace
     constexpr uint64_t kPageSize = 0x1000ull;
     constexpr uint64_t kLargePrivateExecThreshold = 64ull * 1024ull * 1024ull;
     constexpr uint32_t kMaxWeakPrivateExecFindingsPerProcess = 8;
+    constexpr uint32_t kMaxGenericWxFindingsPerProcess = 8;
+    constexpr size_t kEprocessImageNameMaxChars = 15;
     constexpr size_t kMaxPebStringBytes = 32768;
     constexpr size_t kMaxLdrModules = 1024;
     constexpr uint32_t kHuntHiddenPteRecordLimitPerProcess = 64;
@@ -149,6 +152,25 @@ namespace
         const wchar_t* Family;
         const wchar_t* Tool;
         bool StrongNameSignal;
+    };
+
+    struct EsetFileSha1Ioc
+    {
+        const wchar_t* Sha1;
+        const wchar_t* FileName;
+        const wchar_t* Family;
+        const wchar_t* Tool;
+        bool ProcessImage;
+        bool DriverImage;
+        bool CredentialTool;
+    };
+
+    struct FileSha1CacheEntry
+    {
+        bool Success = false;
+        std::wstring Path;
+        std::wstring Sha1;
+        std::wstring Error;
     };
 
     struct DriverServiceRecord
@@ -338,6 +360,71 @@ namespace
             }
 
             same = leftLeaf == rightLeaf;
+        } while (false);
+
+        return same;
+    }
+
+    std::wstring StripExeExtensionFromLeaf(const std::wstring& leaf)
+    {
+        std::wstring stripped = leaf;
+
+        do
+        {
+            constexpr size_t extensionLength = 4;
+            if (stripped.size() <= extensionLength)
+            {
+                break;
+            }
+
+            if (stripped.compare(stripped.size() - extensionLength, extensionLength, L".exe") == 0)
+            {
+                stripped.resize(stripped.size() - extensionLength);
+            }
+        } while (false);
+
+        return stripped;
+    }
+
+    bool SameLeafOrEprocessImageNamePrefix(const std::wstring& eprocessImageName, const std::wstring& imagePath)
+    {
+        bool same = false;
+
+        do
+        {
+            std::wstring eprocessLeaf = LeafName(eprocessImageName);
+            std::wstring pathLeaf = LeafName(imagePath);
+            if (eprocessLeaf.empty() || pathLeaf.empty())
+            {
+                break;
+            }
+
+            if (eprocessLeaf == pathLeaf)
+            {
+                same = true;
+                break;
+            }
+
+            std::wstring pathStem = StripExeExtensionFromLeaf(pathLeaf);
+            if (eprocessLeaf == pathStem)
+            {
+                same = true;
+                break;
+            }
+
+            bool plausibleTruncatedEprocessName =
+                eprocessLeaf.size() >= 12 ||
+                eprocessLeaf.size() == kEprocessImageNameMaxChars ||
+                eprocessLeaf.back() == L'.';
+            if (plausibleTruncatedEprocessName &&
+                ((pathLeaf.size() > eprocessLeaf.size() &&
+                  pathLeaf.compare(0, eprocessLeaf.size(), eprocessLeaf) == 0) ||
+                 (pathStem.size() > eprocessLeaf.size() &&
+                  pathStem.compare(0, eprocessLeaf.size(), eprocessLeaf) == 0)))
+            {
+                same = true;
+                break;
+            }
         } while (false);
 
         return same;
@@ -635,7 +722,7 @@ namespace
             { L"avast.exe", L"avast", L"HexKiller", L"HexKiller with Gentlemen evasion layer", false, false, false },
             { L"sent.exe", L"sent", L"ThrottleBlood", L"ThrottleBlood with Gentlemen evasion layer", true, false, false },
             { L"sophos.exe", L"sophos", L"HavocKiller", L"HavocKiller with Gentlemen evasion layer", false, false, false },
-            { L"hwaudkiller.exe", L"hwaudkiller", L"HavocKiller", L"HavocKiller", true, false, false },
+            { L"hwaudkiller.exe", nullptr, L"HavocKiller", L"HavocKiller", true, false, false },
             { L"buildx641.exe", nullptr, L"OxideHarvest", L"credential stealer", true, true, false },
             { L"buildx64.exe", nullptr, L"OxideHarvest", L"credential stealer", true, true, false }
         };
@@ -735,10 +822,8 @@ namespace
         return profile;
     }
 
-    const EdrKillerDriverProfile* FindEdrKillerDriverProfileByLeaf(const std::wstring& leaf)
+    const EdrKillerDriverProfile* EdrKillerDriverProfiles(size_t* count)
     {
-        const EdrKillerDriverProfile* profile = nullptr;
-
         static const EdrKillerDriverProfile kProfiles[] =
         {
             { L"eb.sys", L"GentleKiller", L"Kaspersky variant custom rootkit", true },
@@ -751,11 +836,25 @@ namespace
             { L"360netmon_wfp.sys", L"GentleKiller", L"Qihoo 360 network monitor driver", false },
             { L"360netmon.sys", L"GentleKiller", L"Qihoo 360 network monitor driver", false },
             { L"imfforcedelete", L"GentleKiller", L"IObit IMF ForceDelete filter driver", true },
+            { L"poisonx", L"GentleKiller", L"PoisonX rootkit", true },
+            { L"poisonx.sys", L"GentleKiller", L"PoisonX rootkit", true },
             { L"g11.sys", L"GentleKiller", L"PoisonX rootkit", true },
             { L"googleapiutil64.sys", L"HexKiller", L"Baidu Antivirus BdApi driver", true },
             { L"throttleblood.sys", L"ThrottleBlood", L"ThrottleStop driver", true },
             { L"havoc.sys", L"HavocKiller", L"Huawei vulnerable driver", true }
         };
+
+        if (count != nullptr)
+        {
+            *count = _countof(kProfiles);
+        }
+
+        return kProfiles;
+    }
+
+    const EdrKillerDriverProfile* FindEdrKillerDriverProfileByLeaf(const std::wstring& leaf)
+    {
+        const EdrKillerDriverProfile* profile = nullptr;
 
         do
         {
@@ -764,8 +863,11 @@ namespace
                 break;
             }
 
-            for (const EdrKillerDriverProfile& item : kProfiles)
+            size_t profileCount = 0;
+            const EdrKillerDriverProfile* profiles = EdrKillerDriverProfiles(&profileCount);
+            for (size_t index = 0; index < profileCount; ++index)
             {
+                const EdrKillerDriverProfile& item = profiles[index];
                 if (leaf == item.ImageName)
                 {
                     profile = &item;
@@ -775,6 +877,75 @@ namespace
         } while (false);
 
         return profile;
+    }
+
+    const EsetFileSha1Ioc* FindEsetFileSha1Ioc(
+        const std::wstring& sha1,
+        bool processImage,
+        bool driverImage)
+    {
+        const EsetFileSha1Ioc* ioc = nullptr;
+
+        static const EsetFileSha1Ioc kIocs[] =
+        {
+            { L"8ae6bd18b129061f63642531f1b684cf0383c75d", L"Kasps.exe", L"GentleKiller", L"Kaspersky variant", true, false, false },
+            { L"ba914fe77b177b45799403b16dd14765c510a074", L"eb.sys", L"GentleKiller", L"Kaspersky variant custom rootkit", false, true, false },
+            { L"d605994fc72a2bb59b5cfb1624a1b9170eca73a2", L"FaceIT1.exe", L"GentleKiller", L"FACEIT Anti-Cheat variant", true, false, false },
+            { L"b0b912a3fd1c05d72080848ec4c92880004021a1", L"nseckrnl.sys", L"GentleKiller", L"NSecsoft NSecKrnl driver", false, true, false },
+            { L"5aa3124e5c4921e5edfc60133b5d71da21b07da3", L"Valorant2.exe", L"GentleKiller", L"Valorant variant", true, false, false },
+            { L"7556ae58c215b8245a43f764f0676c7a8f0fdd1a", L"vgk.sys", L"GentleKiller", L"Tower of Fantasy AntiCheat driver", false, true, false },
+            { L"331879f5eec8892bbd896f90bdbb1bad0bf63bd6", L"EASolo2Light.exe", L"GentleKiller", L"Javelin variant", true, false, false },
+            { L"f11aebccb9a86a7e2e653f90baec697f233c255f", L"EASOLO1clear.exe", L"GentleKiller", L"Javelin variant", true, false, false },
+            { L"ef9cd06683159397f099caa244e94e6eaad96eba", L"EAAntiCheatLight.exe", L"GentleKiller", L"Javelin variant", true, false, false },
+            { L"711ef221526997039e804a18db9647c91680bbe2", L"stpm_old.sys", L"GentleKiller", L"Safetica Process Monitor driver", false, true, false },
+            { L"68fec379f2ae76c3d2ce913f7be650cea1d06990", L"stpm_new.sys", L"GentleKiller", L"Safetica Process Monitor driver", false, true, false },
+            { L"a11ee9cdc59e5caa59aefd27b30d104f3ad68e62", L"BitD1.exe", L"GentleKiller", L"WatchDog variant", true, false, false },
+            { L"96f0dbf52aed0afd43e44500116b04b674f7358e", L"dmx.sys", L"GentleKiller", L"Zemana WatchDog driver", false, true, false },
+            { L"2f86898528c6cab3540c486a9bfaa0c029b73950", L"MB2.exe", L"GentleKiller", L"Network Blocker variant", true, false, false },
+            { L"9ad51ad97c01e97ab59214116740785e0f6320a8", L"360netmon_wfp.sys", L"GentleKiller", L"Qihoo 360 network monitor driver", false, true, false },
+            { L"a19117175dbc9ba4d23b5dce8415e299a2e32192", L"Deletor.exe", L"GentleKiller", L"Cleaner variant", true, false, false },
+            { L"12500f6c87ce62712a0ed6652c57468d15c14223", L"IMFForceDelete", L"GentleKiller", L"IObit IMF ForceDelete filter driver", false, true, false },
+            { L"d29670e684e40ddc89b47010c37cbc96737035b6", L"Symantec.exe", L"GentleKiller", L"G11 variant", true, false, false },
+            { L"56bee9df5833a637f5c54d5911df98b0812fe643", L"G11.sys", L"GentleKiller", L"PoisonX rootkit", false, true, false },
+            { L"cf4d74df17a91b4a36a2911b22afec5d8fa93a01", L"Avast.exe", L"HexKiller", L"HexKiller with Gentlemen evasion layer", true, false, false },
+            { L"ec296f9501ad71e430810cb5cdc38d954d4ba536", L"googleApiUtil64.sys", L"HexKiller", L"Baidu Antivirus BdApi driver", false, true, false },
+            { L"7131b377e96016dc1911020c9f95b1b4d042d7b4", L"Sent.exe", L"ThrottleBlood", L"ThrottleBlood with Gentlemen evasion layer", true, false, false },
+            { L"82ed942a52cdcf120a8919730e00ba37619661a3", L"ThrottleBlood.sys", L"ThrottleBlood", L"ThrottleStop driver", false, true, false },
+            { L"f0537cbb773ae12100b36731e7c39f5a9d852b14", L"Sophos.exe", L"HavocKiller", L"HavocKiller with Gentlemen evasion layer", true, false, false },
+            { L"1fa071303fb846308571e64727501fb98b1c2be6", L"havoc.sys", L"HavocKiller", L"Huawei vulnerable driver", false, true, false },
+            { L"a5cf917ec4a7dfbdfa43621398604805d860c718", L"buildx641.exe", L"OxideHarvest", L"credential stealer", true, false, true },
+            { L"d4b19141102015d436321e6f26976e98183cfd27", L"buildx64.exe", L"OxideHarvest", L"credential stealer", true, false, true }
+        };
+
+        do
+        {
+            std::wstring normalizedSha1 = HuntToLower(sha1);
+            if (normalizedSha1.empty())
+            {
+                break;
+            }
+
+            for (const EsetFileSha1Ioc& item : kIocs)
+            {
+                if (normalizedSha1 != item.Sha1)
+                {
+                    continue;
+                }
+                if (processImage && !item.ProcessImage)
+                {
+                    continue;
+                }
+                if (driverImage && !item.DriverImage)
+                {
+                    continue;
+                }
+
+                ioc = &item;
+                break;
+            }
+        } while (false);
+
+        return ioc;
     }
 
     bool PathContainsGentlemenCollection(const std::wstring& path)
@@ -1187,7 +1358,7 @@ namespace
     std::wstring Win32FilePathFromMaybeNtPath(const std::wstring& path);
     std::wstring DosPathFromDevicePath(const std::wstring& path);
 
-    std::wstring TrimServiceImagePathToken(std::wstring value)
+    std::wstring TrimServiceImagePathWhitespace(std::wstring value)
     {
         do
         {
@@ -1200,14 +1371,110 @@ namespace
 
             size_t end = value.find_last_not_of(L" \t\r\n");
             value = value.substr(begin, end - begin + 1);
+        } while (false);
 
-            if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"')
+        return value;
+    }
+
+    std::wstring TrimServiceImagePathToken(std::wstring value)
+    {
+        do
+        {
+            value = TrimServiceImagePathWhitespace(value);
+            if (value.empty())
             {
-                value = value.substr(1, value.size() - 2);
+                break;
+            }
+
+            if (!value.empty() && value.front() == L'"')
+            {
+                value.erase(value.begin());
+            }
+            if (!value.empty() && value.back() == L'"')
+            {
+                value.pop_back();
             }
         } while (false);
 
         return value;
+    }
+
+    bool IsServiceImagePathLeafPrefixBoundary(wchar_t value)
+    {
+        return value == L'\\' ||
+            value == L'/' ||
+            value == L'"' ||
+            value == L' ' ||
+            value == L'\t' ||
+            value == L'\r' ||
+            value == L'\n';
+    }
+
+    bool IsServiceImagePathLeafSuffixBoundary(wchar_t value)
+    {
+        return value == L'"' ||
+            value == L' ' ||
+            value == L'\t' ||
+            value == L'\r' ||
+            value == L'\n';
+    }
+
+    std::wstring DriverServiceKnownExtensionlessImagePath(const std::wstring& value)
+    {
+        std::wstring path;
+
+        do
+        {
+            std::wstring trimmed = TrimServiceImagePathWhitespace(value);
+            if (trimmed.empty())
+            {
+                break;
+            }
+
+            std::wstring lowered = HuntToLower(trimmed);
+            size_t profileCount = 0;
+            const EdrKillerDriverProfile* profiles = EdrKillerDriverProfiles(&profileCount);
+            for (size_t index = 0; index < profileCount; ++index)
+            {
+                const EdrKillerDriverProfile& profile = profiles[index];
+                std::wstring leaf = HuntToLower(profile.ImageName != nullptr ? profile.ImageName : L"");
+                if (leaf.empty() ||
+                    leaf.find(L'.') != std::wstring::npos)
+                {
+                    continue;
+                }
+
+                size_t searchOffset = 0;
+                while (searchOffset < lowered.size())
+                {
+                    size_t match = lowered.find(leaf, searchOffset);
+                    if (match == std::wstring::npos)
+                    {
+                        break;
+                    }
+
+                    size_t after = match + leaf.size();
+                    bool prefixOk = match == 0 ||
+                        IsServiceImagePathLeafPrefixBoundary(lowered[match - 1]);
+                    bool suffixOk = after >= lowered.size() ||
+                        IsServiceImagePathLeafSuffixBoundary(lowered[after]);
+                    if (prefixOk && suffixOk)
+                    {
+                        path = TrimServiceImagePathToken(trimmed.substr(0, after));
+                        break;
+                    }
+
+                    searchOffset = match + 1;
+                }
+
+                if (!path.empty())
+                {
+                    break;
+                }
+            }
+        } while (false);
+
+        return path;
     }
 
     std::wstring DriverServiceBinaryImagePath(const std::wstring& binaryPath)
@@ -1216,17 +1483,41 @@ namespace
 
         do
         {
-            std::wstring trimmed = TrimServiceImagePathToken(binaryPath);
+            std::wstring trimmed = TrimServiceImagePathWhitespace(binaryPath);
             if (trimmed.empty())
             {
                 break;
             }
 
+            if (trimmed.front() == L'"')
+            {
+                size_t endQuote = trimmed.find(L'"', 1);
+                if (endQuote != std::wstring::npos)
+                {
+                    path = TrimServiceImagePathToken(trimmed.substr(1, endQuote - 1));
+                    break;
+                }
+
+                trimmed.erase(trimmed.begin());
+                trimmed = TrimServiceImagePathWhitespace(trimmed);
+                if (trimmed.empty())
+                {
+                    break;
+                }
+            }
+
+            trimmed = TrimServiceImagePathToken(trimmed);
             std::wstring lowered = HuntToLower(trimmed);
             size_t sys = lowered.find(L".sys");
             if (sys != std::wstring::npos)
             {
                 path = TrimServiceImagePathToken(trimmed.substr(0, sys + 4));
+                break;
+            }
+
+            path = DriverServiceKnownExtensionlessImagePath(trimmed);
+            if (!path.empty())
+            {
                 break;
             }
 
@@ -1507,6 +1798,11 @@ namespace
         } while (false);
 
         return added;
+    }
+
+    bool ContainsWideValue(const std::vector<std::wstring>& values, const std::wstring& value)
+    {
+        return std::find(values.begin(), values.end(), value) != values.end();
     }
 
     std::wstring JoinWideValues(const std::vector<std::wstring>& values, const std::wstring& delimiter)
@@ -2056,6 +2352,16 @@ namespace
         return EnsureTrailingSlash(WindowsDirectory()) + L"SysWOW64\\" + imageName;
     }
 
+    std::wstring ExpectedSystem32SubdirPath(const std::wstring& subdir, const std::wstring& imageName)
+    {
+        return EnsureTrailingSlash(WindowsDirectory()) + L"System32\\" + EnsureTrailingSlash(subdir) + imageName;
+    }
+
+    std::wstring ExpectedSysWow64SubdirPath(const std::wstring& subdir, const std::wstring& imageName)
+    {
+        return EnsureTrailingSlash(WindowsDirectory()) + L"SysWOW64\\" + EnsureTrailingSlash(subdir) + imageName;
+    }
+
     std::wstring ExpectedWindowsRootPath(const std::wstring& imageName)
     {
         return EnsureTrailingSlash(WindowsDirectory()) + imageName;
@@ -2153,6 +2459,23 @@ namespace
         return profile;
     }
 
+    void AddSpecialBuiltinExpectedPaths(const std::wstring& leaf, std::vector<std::wstring>* expected)
+    {
+        do
+        {
+            if (expected == nullptr)
+            {
+                break;
+            }
+
+            if (leaf == L"wmiprvse.exe")
+            {
+                expected->push_back(ExpectedSystem32SubdirPath(L"wbem", leaf));
+                expected->push_back(ExpectedSysWow64SubdirPath(L"wbem", leaf));
+            }
+        } while (false);
+    }
+
     bool IsHuntLabBuiltinProfile(const HuntProcessRecord& process)
     {
         bool matched = false;
@@ -2208,6 +2531,7 @@ namespace
             {
                 expected.push_back(ExpectedWindowsRootPath(leaf));
             }
+            AddSpecialBuiltinExpectedPaths(leaf, &expected);
 
             suspicious = !MatchesAnyCanonicalPath(imagePath, expected);
         } while (false);
@@ -3974,6 +4298,22 @@ namespace
     {
         std::wstring image = process.KernelImageName;
 
+        if (!image.empty())
+        {
+            std::wstring apiLeaf = LeafName(process.ApiImagePath);
+            if (!apiLeaf.empty() && SameLeafOrEprocessImageNamePrefix(image, apiLeaf))
+            {
+                image = apiLeaf;
+            }
+            else
+            {
+                std::wstring pebLeaf = LeafName(process.PebImagePath);
+                if (!pebLeaf.empty() && SameLeafOrEprocessImageNamePrefix(image, pebLeaf))
+                {
+                    image = pebLeaf;
+                }
+            }
+        }
         if (image.empty())
         {
             image = process.ToolhelpImageName;
@@ -4008,6 +4348,224 @@ namespace
         }
 
         return path;
+    }
+
+    std::wstring HuntHexBytesLower(const BYTE* bytes, DWORD count)
+    {
+        std::wstringstream stream;
+        stream << std::hex << std::setfill(L'0');
+
+        for (DWORD index = 0; index < count; ++index)
+        {
+            stream << std::setw(2) << static_cast<unsigned int>(bytes[index]);
+        }
+
+        return stream.str();
+    }
+
+    bool ComputeFileSha1ForPath(
+        const std::wstring& rawPath,
+        FileSha1CacheEntry* entry)
+    {
+        bool ok = false;
+        HANDLE file = INVALID_HANDLE_VALUE;
+        HCRYPTPROV provider = 0;
+        HCRYPTHASH hash = 0;
+
+        do
+        {
+            if (entry == nullptr || rawPath.empty())
+            {
+                break;
+            }
+
+            std::wstring path = DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(rawPath));
+            if (path.empty())
+            {
+                entry->Error = L"path normalization failed";
+                break;
+            }
+
+            DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES ||
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                entry->Error = L"file is not accessible";
+                break;
+            }
+
+            file = CreateFileW(
+                path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                entry->Error = L"CreateFileW failed gle=" + std::to_wstring(GetLastError());
+                break;
+            }
+
+            if (!CryptAcquireContextW(
+                    &provider,
+                    nullptr,
+                    nullptr,
+                    PROV_RSA_AES,
+                    CRYPT_VERIFYCONTEXT))
+            {
+                entry->Error = L"CryptAcquireContextW failed gle=" + std::to_wstring(GetLastError());
+                break;
+            }
+
+            if (!CryptCreateHash(provider, CALG_SHA1, 0, 0, &hash))
+            {
+                entry->Error = L"CryptCreateHash failed gle=" + std::to_wstring(GetLastError());
+                break;
+            }
+
+            std::vector<BYTE> buffer(1024 * 1024);
+            for (;;)
+            {
+                DWORD read = 0;
+                if (!ReadFile(
+                        file,
+                        buffer.data(),
+                        static_cast<DWORD>(buffer.size()),
+                        &read,
+                        nullptr))
+                {
+                    entry->Error = L"ReadFile failed gle=" + std::to_wstring(GetLastError());
+                    break;
+                }
+
+                if (read == 0)
+                {
+                    ok = true;
+                    break;
+                }
+
+                if (!CryptHashData(hash, buffer.data(), read, 0))
+                {
+                    entry->Error = L"CryptHashData failed gle=" + std::to_wstring(GetLastError());
+                    break;
+                }
+            }
+
+            if (!ok)
+            {
+                break;
+            }
+
+            BYTE sha1[20] = {};
+            DWORD sha1Size = sizeof(sha1);
+            if (!CryptGetHashParam(hash, HP_HASHVAL, sha1, &sha1Size, 0))
+            {
+                entry->Error = L"CryptGetHashParam failed gle=" + std::to_wstring(GetLastError());
+                ok = false;
+                break;
+            }
+
+            entry->Path = path;
+            entry->Sha1 = HuntHexBytesLower(sha1, sha1Size);
+            entry->Success = true;
+        } while (false);
+
+        if (hash != 0)
+        {
+            CryptDestroyHash(hash);
+        }
+        if (provider != 0)
+        {
+            CryptReleaseContext(provider, 0);
+        }
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(file);
+        }
+
+        return ok && entry->Success;
+    }
+
+    bool GetCachedFileSha1(
+        const std::wstring& rawPath,
+        std::map<std::wstring, FileSha1CacheEntry>* cache,
+        FileSha1CacheEntry* entry)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (entry == nullptr || rawPath.empty())
+            {
+                break;
+            }
+
+            std::wstring normalizedPath =
+                NormalizePathText(DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(rawPath)));
+            if (normalizedPath.empty())
+            {
+                break;
+            }
+
+            if (cache != nullptr)
+            {
+                auto existing = cache->find(normalizedPath);
+                if (existing != cache->end())
+                {
+                    *entry = existing->second;
+                    ok = entry->Success;
+                    break;
+                }
+            }
+
+            FileSha1CacheEntry computed = {};
+            ComputeFileSha1ForPath(rawPath, &computed);
+            if (cache != nullptr)
+            {
+                (*cache)[normalizedPath] = computed;
+            }
+
+            *entry = computed;
+            ok = entry->Success;
+        } while (false);
+
+        return ok;
+    }
+
+    void AddEsetFileHashEvidence(
+        const EsetFileSha1Ioc& ioc,
+        const std::wstring& filePath,
+        const std::wstring& sha1,
+        std::vector<std::wstring>* reasons,
+        std::map<std::wstring, std::wstring>* evidence)
+    {
+        do
+        {
+            if (reasons == nullptr || evidence == nullptr)
+            {
+                break;
+            }
+
+            AddUnique(reasons, L"eset_exact_file_sha1_ioc");
+            if (ioc.CredentialTool)
+            {
+                AddUnique(reasons, L"oxideharvest_exact_file_sha1_ioc");
+            }
+            else
+            {
+                AddUnique(reasons, L"edr_killer_exact_file_sha1_ioc");
+            }
+
+            (*evidence)[L"file_hash_path"] = filePath;
+            (*evidence)[L"file_sha1"] = sha1;
+            (*evidence)[L"eset_ioc_sha1"] = ioc.Sha1;
+            (*evidence)[L"eset_ioc_filename"] = ioc.FileName;
+            (*evidence)[L"eset_ioc_family"] = ioc.Family;
+            (*evidence)[L"eset_ioc_tool"] = ioc.Tool;
+            (*evidence)[L"eset_ioc_credential_tool"] = ioc.CredentialTool ? L"true" : L"false";
+        } while (false);
     }
 
     bool QueryVersionString(
@@ -4169,6 +4727,80 @@ namespace
         } while (false);
 
         return ok;
+    }
+
+    bool ImageVersionInfoLooksLikeSecurityVendorImpersonation(
+        const ImageMetadataRecord& metadata,
+        std::wstring* matchedNeedle)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (matchedNeedle != nullptr)
+            {
+                matchedNeedle->clear();
+            }
+
+            std::wstring text = HuntToLower(
+                metadata.CompanyName +
+                L" " +
+                metadata.ProductName +
+                L" " +
+                metadata.OriginalFilename +
+                L" " +
+                metadata.FileDescription);
+            if (text.empty())
+            {
+                break;
+            }
+
+            static const wchar_t* kSecurityVendorNeedles[] =
+            {
+                L"kaspersky",
+                L"faceit",
+                L"valorant",
+                L"riot",
+                L"ea anti-cheat",
+                L"ea anticheat",
+                L"electronic arts",
+                L"bitdefender",
+                L"malwarebytes",
+                L"symantec",
+                L"norton",
+                L"broadcom",
+                L"avast",
+                L"avg antivirus",
+                L"sentinelone",
+                L"sentinel agent",
+                L"sophos",
+                L"anti-virus",
+                L"antivirus",
+                L"anti-cheat",
+                L"anticheat",
+                L"endpoint protection"
+            };
+
+            for (const wchar_t* needle : kSecurityVendorNeedles)
+            {
+                if (needle == nullptr || needle[0] == L'\0')
+                {
+                    continue;
+                }
+
+                if (text.find(needle) != std::wstring::npos)
+                {
+                    matched = true;
+                    if (matchedNeedle != nullptr)
+                    {
+                        *matchedNeedle = needle;
+                    }
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
     }
 
     BOOL CALLBACK HuntIconResourceNameCallback(HMODULE, LPCWSTR, LPWSTR, LONG_PTR parameter)
@@ -4399,7 +5031,7 @@ namespace
 
     void AddImageMetadataEvidence(
         const std::wstring& rawPath,
-        bool addVersionIconReasons,
+        bool addEvasionReasons,
         std::vector<std::wstring>* reasons,
         std::map<std::wstring, std::wstring>* evidence)
     {
@@ -4434,19 +5066,26 @@ namespace
             (*evidence)[L"image_packer_section_hint"] = metadata.PackerSectionHint;
             (*evidence)[L"image_packer_section_names"] = metadata.PackerSectionNames;
 
-            if (metadata.SignaturePresent && !metadata.SignatureValid)
+            if (addEvasionReasons && metadata.SignaturePresent && !metadata.SignatureValid)
             {
                 AddUnique(reasons, L"edr_killer_invalid_code_signature");
             }
-            if (addVersionIconReasons && metadata.VersionInfoPresent)
+            std::wstring versionImpersonationMatch;
+            bool versionImpersonation =
+                addEvasionReasons &&
+                metadata.VersionInfoPresent &&
+                ImageVersionInfoLooksLikeSecurityVendorImpersonation(metadata, &versionImpersonationMatch);
+            if (addEvasionReasons &&
+                versionImpersonation)
             {
                 AddUnique(reasons, L"edr_killer_version_info_impersonation_evidence");
+                (*evidence)[L"image_version_info_impersonation_match"] = versionImpersonationMatch;
             }
-            if (addVersionIconReasons && metadata.IconResourcePresent)
+            if (addEvasionReasons && metadata.IconResourcePresent && versionImpersonation)
             {
                 AddUnique(reasons, L"edr_killer_icon_impersonation_evidence");
             }
-            if (addVersionIconReasons && !metadata.PackerSectionNames.empty())
+            if (addEvasionReasons && !metadata.PackerSectionNames.empty())
             {
                 AddUnique(reasons, L"edr_killer_packer_section_evidence");
             }
@@ -4471,6 +5110,7 @@ namespace
         {
             expected.push_back(ExpectedWindowsRootPath(leaf));
         }
+        AddSpecialBuiltinExpectedPaths(leaf, &expected);
 
         return expected;
     }
@@ -4584,11 +5224,12 @@ namespace
     void AddBuiltinInjectionReasonIfNeeded(
         const HuntProcessRecord& process,
         std::vector<std::wstring>* reasons,
-        std::map<std::wstring, std::wstring>* evidence)
+        std::map<std::wstring, std::wstring>* evidence,
+        bool strongCodeEvidence = true)
     {
         do
         {
-            if (!process.BuiltinProfileMatched || reasons == nullptr)
+            if (!strongCodeEvidence || !process.BuiltinProfileMatched || reasons == nullptr)
             {
                 break;
             }
@@ -4625,7 +5266,7 @@ namespace
             finding.ProcessId = process.ProcessId;
             finding.Eprocess = process.Kernel.Eprocess;
             finding.Address = address;
-            finding.ImageName = !process.KernelImageName.empty() ? process.KernelImageName : process.ToolhelpImageName;
+            finding.ImageName = BestProcessImageName(process);
             finding.ModuleName = moduleName;
             finding.ReasonCodes = reasons;
             finding.Evidence = evidence;
@@ -4757,11 +5398,20 @@ namespace
                 !process.SystemProcessInformationSeen &&
                 !process.ToolhelpProcessSeen)
             {
+                bool cidTableConfirmsHidden =
+                    process.HasCidTableView &&
+                    process.CidTableSeen;
+                evidence[L"snapshot_race_possible"] = cidTableConfirmsHidden ? L"false" : L"true";
+                if (!cidTableConfirmsHidden)
+                {
+                    evidence[L"weak_cross_view_only"] = L"true";
+                }
+
                 AddFinding(
                     result,
                     process,
-                    L"medium",
-                    L"medium",
+                    cidTableConfirmsHidden ? L"medium" : L"low",
+                    cidTableConfirmsHidden ? L"medium" : L"low",
                     L"process_cross_view",
                     L"process is visible in ActiveProcessLinks but missing from user API views",
                     0,
@@ -4843,7 +5493,7 @@ namespace
 
             if (!process.KernelImageName.empty() &&
                 !process.ApiImagePath.empty() &&
-                !SameNonEmptyLeaf(process.KernelImageName, process.ApiImagePath))
+                !SameLeafOrEprocessImageNamePrefix(process.KernelImageName, process.ApiImagePath))
             {
                 AddFinding(
                     result,
@@ -4860,7 +5510,7 @@ namespace
 
             if (!process.KernelImageName.empty() &&
                 !process.PebImagePath.empty() &&
-                !SameNonEmptyLeaf(process.KernelImageName, process.PebImagePath))
+                !SameLeafOrEprocessImageNamePrefix(process.KernelImageName, process.PebImagePath))
             {
                 AddFinding(
                     result,
@@ -5040,17 +5690,33 @@ namespace
                 }
             }
 
+            std::vector<std::wstring> metadataReasons;
+            AddImageMetadataEvidence(
+                imagePath,
+                profile != nullptr || gentlemenStagingPath,
+                &metadataReasons,
+                &evidence);
+            bool metadataEvasionEvidence =
+                ContainsWideValue(metadataReasons, L"edr_killer_invalid_code_signature") ||
+                ContainsWideValue(metadataReasons, L"edr_killer_version_info_impersonation_evidence") ||
+                ContainsWideValue(metadataReasons, L"edr_killer_icon_impersonation_evidence") ||
+                ContainsWideValue(metadataReasons, L"edr_killer_packer_section_evidence");
+            if (profile == nullptr &&
+                gentlemenStagingPath &&
+                !metadataEvasionEvidence)
+            {
+                break;
+            }
+            for (const std::wstring& metadataReason : metadataReasons)
+            {
+                AddUnique(&reasons, metadataReason);
+            }
+
             if (gentlemenStagingPath)
             {
                 AddUnique(&reasons, L"gentlemen_collection_staging_path");
                 evidence[L"gentlemen_collection_path"] = L"true";
             }
-
-            AddImageMetadataEvidence(
-                imagePath,
-                profile != nullptr || gentlemenStagingPath,
-                &reasons,
-                &evidence);
 
             if (reasons.empty())
             {
@@ -5089,6 +5755,67 @@ namespace
                 profile != nullptr && profile->CredentialTool
                     ? L"process name matches Gentlemen-related credential tooling"
                     : L"process matches Gentlemen EDR-killer masquerade profile",
+                0,
+                L"",
+                reasons,
+                evidence);
+        } while (false);
+    }
+
+    void AddEsetFileHashProcessFinding(
+        HuntResult* result,
+        const HuntProcessRecord& process,
+        std::map<std::wstring, FileSha1CacheEntry>* fileSha1Cache)
+    {
+        do
+        {
+            if (result == nullptr || process.ProcessId <= 4)
+            {
+                break;
+            }
+
+            std::wstring imagePath = BestProcessImagePath(process);
+            if (imagePath.empty())
+            {
+                break;
+            }
+
+            FileSha1CacheEntry hash = {};
+            if (!GetCachedFileSha1(imagePath, fileSha1Cache, &hash))
+            {
+                break;
+            }
+
+            const EsetFileSha1Ioc* ioc = FindEsetFileSha1Ioc(hash.Sha1, true, false);
+            if (ioc == nullptr)
+            {
+                break;
+            }
+
+            std::vector<std::wstring> reasons;
+            std::map<std::wstring, std::wstring> evidence;
+            evidence[L"image_name"] = BestProcessImageName(process);
+            evidence[L"image_path"] = imagePath;
+            evidence[L"peb_image_path"] = process.PebImagePath;
+            evidence[L"peb_command_line"] = process.PebCommandLine;
+            AddEsetFileHashEvidence(*ioc, hash.Path, hash.Sha1, &reasons, &evidence);
+
+            if (PathContainsGentlemenCollection(imagePath) ||
+                PathContainsGentlemenCollection(process.PebCommandLine))
+            {
+                AddUnique(&reasons, L"gentlemen_collection_staging_path");
+                evidence[L"gentlemen_collection_path"] = L"true";
+            }
+
+            AddFinding(
+                result,
+                process,
+                L"high",
+                L"high",
+                ioc->CredentialTool ? L"oxideharvest_file_ioc" : L"edr_killer_file_ioc",
+                ioc->CredentialTool
+                    ? L"process image matches ESET OxideHarvest SHA1 IOC"
+                    : L"process image matches ESET Gentlemen EDR-killer SHA1 IOC",
                 0,
                 L"",
                 reasons,
@@ -5390,7 +6117,31 @@ namespace
                         L"processdelete",
                         L"process delete",
                         L"processstop",
-                        L"process stop"
+                        L"process stop",
+                        L"allocvm",
+                        L"allocatevirtualmemory",
+                        L"ntallocatevirtualmemory",
+                        L"protectvm",
+                        L"protectvirtualmemory",
+                        L"ntprotectvirtualmemory",
+                        L"writevm",
+                        L"writevirtualmemory",
+                        L"ntwritevirtualmemory",
+                        L"readvm",
+                        L"readvirtualmemory",
+                        L"ntreadvirtualmemory",
+                        L"mapview",
+                        L"mapviewofsection",
+                        L"ntmapviewofsection",
+                        L"queueuserapc",
+                        L"ntqueueapcthread",
+                        L"setthreadcontext",
+                        L"ntsetcontextthread",
+                        L"createremotethread",
+                        L"suspend",
+                        L"resume",
+                        L"thread control",
+                        L"thread_control"
                     }))
             {
                 matched = true;
@@ -5829,6 +6580,74 @@ namespace
         return openable;
     }
 
+    bool AddressInsideInclusiveRange(uint64_t address, uint64_t start, uint64_t end)
+    {
+        return address != 0 && end >= start && address >= start && address <= end;
+    }
+
+    bool VadHasExecutionEvidence(const HuntProcessRecord& process, const ProcessVadRecord& vad)
+    {
+        bool observed = false;
+
+        do
+        {
+            for (const ProcessThreadRecord& thread : process.ThreadRecords)
+            {
+                if (thread.HasStartAddress &&
+                    AddressInsideInclusiveRange(thread.StartAddress, vad.StartAddress, vad.EndAddress))
+                {
+                    observed = true;
+                    break;
+                }
+                if (thread.HasWin32StartAddress &&
+                    AddressInsideInclusiveRange(thread.Win32StartAddress, vad.StartAddress, vad.EndAddress))
+                {
+                    observed = true;
+                    break;
+                }
+
+                for (const ProcessApcQueueRecord& queue : thread.ApcQueues)
+                {
+                    for (const ProcessApcEntryRecord& apc : queue.Entries)
+                    {
+                        if (AddressInsideInclusiveRange(apc.NormalRoutine, vad.StartAddress, vad.EndAddress) ||
+                            AddressInsideInclusiveRange(apc.KernelRoutine, vad.StartAddress, vad.EndAddress))
+                        {
+                            observed = true;
+                            break;
+                        }
+                    }
+
+                    if (observed)
+                    {
+                        break;
+                    }
+                }
+
+                if (observed)
+                {
+                    break;
+                }
+
+                for (const ProcessStackReferenceRecord& ref : thread.StackReferences)
+                {
+                    if (AddressInsideInclusiveRange(ref.Value, vad.StartAddress, vad.EndAddress))
+                    {
+                        observed = true;
+                        break;
+                    }
+                }
+
+                if (observed)
+                {
+                    break;
+                }
+            }
+        } while (false);
+
+        return observed;
+    }
+
     void AddVadFindings(DeviceClient& device, SymbolEngine& symbols, HuntResult* result, HuntProcessRecord* process)
     {
         do
@@ -5840,12 +6659,15 @@ namespace
 
             uint32_t weakPrivateExecFindings = 0;
             bool weakPrivateExecLimitWarned = false;
+            uint32_t genericWxFindings = 0;
+            bool genericWxLimitWarned = false;
             std::map<std::wstring, DiskPeMetadata> diskMetadataCache;
             for (const ProcessVadRecord& vad : process->VadRecords)
             {
                 bool privateMemory = vad.HasPrivateMemory && vad.PrivateMemory;
                 bool privateExecutable = vad.Executable && privateMemory;
                 bool wx = vad.Executable && vad.Writable;
+                bool executableCopyOnWrite = vad.Executable && vad.CopyOnWrite;
                 bool largePrivateExecutable = privateExecutable && vad.Size >= kLargePrivateExecThreshold;
                 bool privatePe = privateMemory && vad.PeHeaderFound;
                 bool sectionBackedExecutable = vad.Executable &&
@@ -5896,9 +6718,10 @@ namespace
                         if (section != nullptr)
                         {
                             bool liveWritableExecutable = vad.Executable && vad.Writable;
+                            bool liveWriteCapableExecutable = vad.Executable && (vad.Writable || vad.CopyOnWrite);
                             bool executePermissionDrift = vad.Executable && !section->Executable;
                             bool writePermissionDrift = liveWritableExecutable && section->Executable && !section->Writable;
-                            bool defaultWritableExecutableSection = liveWritableExecutable && section->Executable && section->Writable;
+                            bool defaultWritableExecutableSection = liveWriteCapableExecutable && section->Executable && section->Writable;
 
                             if (executePermissionDrift)
                             {
@@ -5926,6 +6749,7 @@ namespace
                                 imageSectionEvidence[L"vad_rva"] = HuntHex(rva, 8);
                                 imageSectionEvidence[L"vad_executable"] = vad.Executable ? L"true" : L"false";
                                 imageSectionEvidence[L"vad_writable"] = vad.Writable ? L"true" : L"false";
+                                imageSectionEvidence[L"vad_copy_on_write"] = vad.CopyOnWrite ? L"true" : L"false";
                             }
                         }
                     }
@@ -5984,6 +6808,31 @@ namespace
                 }
 
                 bool imageSectionPermissionSuspicious = !imageSectionReasons.empty();
+                bool imageExecutePermissionDrift =
+                    std::find(
+                        imageSectionReasons.begin(),
+                        imageSectionReasons.end(),
+                        L"image_section_execute_permission_drift") != imageSectionReasons.end();
+                bool imageWritePermissionDrift =
+                    std::find(
+                        imageSectionReasons.begin(),
+                        imageSectionReasons.end(),
+                        L"image_section_write_permission_drift") != imageSectionReasons.end();
+                bool defaultImageRwxSection =
+                    std::find(
+                        imageSectionReasons.begin(),
+                        imageSectionReasons.end(),
+                        L"image_rwx_section_vad") != imageSectionReasons.end();
+                bool strongVadEvidence =
+                    largePrivateExecutable ||
+                    privatePe ||
+                    vad.PeHeaderSuspicious ||
+                    imageExecutePermissionDrift ||
+                    imageWritePermissionDrift ||
+                    defaultImageRwxSection;
+                bool executionObserved = VadHasExecutionEvidence(*process, vad);
+                bool genericWxOnly = wx && !strongVadEvidence;
+                bool weakPrivateExecutableOnly = privateExecutable && !wx && !strongVadEvidence;
                 if (!privateExecutable &&
                     !wx &&
                     !largePrivateExecutable &&
@@ -6029,13 +6878,11 @@ namespace
                 {
                     AddUnique(&reasons, reason);
                 }
+                if (defaultImageRwxSection)
+                {
+                    AddUnique(&reasons, L"wx_user_vad");
+                }
 
-                bool weakPrivateExecutableOnly = privateExecutable &&
-                    !wx &&
-                    !largePrivateExecutable &&
-                    !privatePe &&
-                    !vad.PeHeaderSuspicious &&
-                    !process->BuiltinProfileMatched;
                 if (weakPrivateExecutableOnly &&
                     weakPrivateExecFindings >= kMaxWeakPrivateExecFindingsPerProcess)
                 {
@@ -6043,6 +6890,16 @@ namespace
                     {
                         AddUnique(&process->Warnings, L"weak private executable VAD findings were capped");
                         weakPrivateExecLimitWarned = true;
+                    }
+                    continue;
+                }
+                if (genericWxOnly &&
+                    genericWxFindings >= kMaxGenericWxFindingsPerProcess)
+                {
+                    if (!genericWxLimitWarned)
+                    {
+                        AddUnique(&process->Warnings, L"generic W+X executable VAD findings were capped");
+                        genericWxLimitWarned = true;
                     }
                     continue;
                 }
@@ -6054,6 +6911,7 @@ namespace
                 evidence[L"size"] = std::to_wstring(vad.Size);
                 evidence[L"protection"] = vad.ProtectionText;
                 evidence[L"private"] = privateMemory ? L"true" : L"false";
+                evidence[L"copy_on_write"] = executableCopyOnWrite ? L"true" : L"false";
                 evidence[L"pe_like"] = vad.PeHeaderFound ? L"true" : L"false";
                 evidence[L"pe_suspicious"] = vad.PeHeaderSuspicious ? L"true" : L"false";
                 evidence[L"classification"] = vad.Classification;
@@ -6061,6 +6919,8 @@ namespace
                 {
                     evidence[item.first] = item.second;
                 }
+                evidence[L"strong_code_provenance"] = strongVadEvidence ? L"true" : L"false";
+                evidence[L"execution_observed"] = executionObserved ? L"true" : L"false";
                 if (vad.PeProbeAttempted)
                 {
                     evidence[L"pe_mz_wiped"] = vad.PeProbe.MzWiped ? L"true" : L"false";
@@ -6068,21 +6928,30 @@ namespace
                     evidence[L"pe_elfanew_mismatch"] = vad.PeProbe.ELfanewMismatch ? L"true" : L"false";
                     evidence[L"pe_size_of_image"] = std::to_wstring(vad.PeProbe.SizeOfImage);
                 }
-                AddBuiltinInjectionReasonIfNeeded(*process, &reasons, &evidence);
+                AddBuiltinInjectionReasonIfNeeded(*process, &reasons, &evidence, strongVadEvidence);
 
-                std::wstring risk = wx || vad.PeHeaderSuspicious || privatePe || process->BuiltinProfileMatched ? L"high" : L"medium";
-                std::wstring confidence = privatePe || wx ? L"high" : L"medium";
+                std::wstring risk = L"medium";
+                std::wstring confidence = L"medium";
+                bool peBackedPrivateCode = privatePe || vad.PeHeaderSuspicious;
+                if (largePrivateExecutable ||
+                    imageExecutePermissionDrift ||
+                    imageWritePermissionDrift ||
+                    (peBackedPrivateCode && executionObserved))
+                {
+                    risk = L"high";
+                    confidence = L"high";
+                }
+                else if (peBackedPrivateCode)
+                {
+                    risk = L"low";
+                    confidence = L"medium";
+                    evidence[L"private_pe_without_execution_observed"] = L"true";
+                }
                 if (imageSectionPermissionSuspicious)
                 {
-                    if (std::find(
-                            imageSectionReasons.begin(),
-                            imageSectionReasons.end(),
-                            L"image_section_execute_permission_drift") != imageSectionReasons.end() ||
-                        std::find(
-                            imageSectionReasons.begin(),
-                            imageSectionReasons.end(),
-                            L"image_section_write_permission_drift") != imageSectionReasons.end() ||
-                        process->BuiltinProfileMatched)
+                    if (imageExecutePermissionDrift ||
+                        imageWritePermissionDrift ||
+                        (process->BuiltinProfileMatched && !process->BuiltinProfileViolations.empty()))
                     {
                         risk = L"high";
                     }
@@ -6096,8 +6965,17 @@ namespace
                 {
                     risk = L"low";
                     confidence = L"low";
+                    evidence[L"generic_executable_memory_only"] = L"true";
                     evidence[L"weak_private_exec_only"] = L"true";
                     ++weakPrivateExecFindings;
+                }
+                if (genericWxOnly)
+                {
+                    risk = L"low";
+                    confidence = L"low";
+                    evidence[L"generic_executable_memory_only"] = L"true";
+                    evidence[L"generic_wx_only"] = L"true";
+                    ++genericWxFindings;
                 }
 
                 AddFinding(
@@ -6159,6 +7037,23 @@ namespace
         } while (false);
     }
 
+    bool VadClassificationHasStrongCodeEvidence(const std::wstring& classification)
+    {
+        bool strong = false;
+
+        do
+        {
+            if (classification.find(L"PE") != std::wstring::npos ||
+                classification.find(L"large-private-exec") != std::wstring::npos)
+            {
+                strong = true;
+                break;
+            }
+        } while (false);
+
+        return strong;
+    }
+
     void AddThreadFindings(HuntResult* result, const HuntProcessRecord& process)
     {
         do
@@ -6193,14 +7088,16 @@ namespace
                     evidence[L"notes"] = thread.Notes;
 
                     std::vector<std::wstring> reasons = {L"suspicious_thread_start"};
-                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
+                    bool strongThreadEvidence = VadClassificationHasStrongCodeEvidence(thread.VadClassification);
+                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, strongThreadEvidence);
 
-                    std::wstring risk = thread.StartInPrivateExecVad || thread.StartInWxVad || process.BuiltinProfileMatched ? L"high" : L"medium";
+                    std::wstring risk = strongThreadEvidence ? L"high" : L"low";
+                    std::wstring confidence = strongThreadEvidence ? L"high" : L"low";
                     AddFinding(
                         result,
                         process,
                         risk,
-                        L"high",
+                        confidence,
                         L"thread_provenance",
                         L"thread start address is outside expected user module ownership",
                         findingAddress,
@@ -6252,14 +7149,16 @@ namespace
                     {
                         AddUnique(&reasons, L"stack_reference_to_user_executable_outside_module");
                     }
-                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
+                    bool strongStackEvidence = VadClassificationHasStrongCodeEvidence(ref.VadClassification);
+                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, strongStackEvidence);
 
-                    std::wstring risk = ref.ValueInPrivateExecVad || ref.ValueInWxVad || process.BuiltinProfileMatched ? L"high" : L"medium";
+                    std::wstring risk = strongStackEvidence ? L"high" : L"low";
+                    std::wstring confidence = strongStackEvidence ? L"high" : L"low";
                     AddFinding(
                         result,
                         process,
                         risk,
-                        L"medium",
+                        confidence,
                         L"thread_stack_provenance",
                         L"thread stack references suspicious executable memory",
                         ref.Value,
@@ -6421,11 +7320,12 @@ namespace
                     !(module.LdrLoadSeen && module.LdrMemorySeen))
                 {
                     std::vector<std::wstring> reasons = {L"partial_ldr_unlink"};
-                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
+                    bool builtinProfileViolated = process.BuiltinProfileMatched && !process.BuiltinProfileViolations.empty();
+                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, builtinProfileViolated);
                     AddFinding(
                         result,
                         process,
-                        process.BuiltinProfileMatched ? L"high" : L"medium",
+                        builtinProfileViolated ? L"high" : L"medium",
                         L"medium",
                         L"module_cross_view",
                         L"module is only partially present across PEB LDR lists",
@@ -6440,14 +7340,15 @@ namespace
                     reliableCoreLdr &&
                     module.ToolhelpSeen != coreLdrSeen &&
                     !module.PrivatePeVadSeen &&
-                    (process.BuiltinProfileMatched || module.VadImageSeen))
+                    (module.VadImageSeen || !process.BuiltinProfileViolations.empty()))
                 {
                     std::vector<std::wstring> reasons = {L"module_view_mismatch"};
-                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
+                    bool builtinProfileViolated = process.BuiltinProfileMatched && !process.BuiltinProfileViolations.empty();
+                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, builtinProfileViolated || module.VadImageSeen);
                     AddFinding(
                         result,
                         process,
-                        process.BuiltinProfileMatched ? L"high" : L"medium",
+                        builtinProfileViolated ? L"high" : L"medium",
                         L"medium",
                         L"module_cross_view",
                         L"module differs between Toolhelp and PEB loader views",
@@ -6546,13 +7447,16 @@ namespace
                 {
                     AddUnique(&reasons, L"lab_builtin_profile_non_windows_module");
                 }
-                AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
+                bool builtinProfileViolated =
+                    process.BuiltinProfileMatched &&
+                    !process.BuiltinProfileViolations.empty();
+                AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, builtinProfileViolated);
 
                 AddFinding(
                     result,
                     process,
-                    process.BuiltinProfileViolations.empty() ? L"medium" : L"high",
-                    L"medium",
+                    builtinProfileViolated ? L"high" : L"low",
+                    builtinProfileViolated ? L"medium" : L"low",
                     L"builtin_module_provenance",
                     L"built-in Windows process loaded a module from a non-Windows path",
                     module.Base,
@@ -7143,12 +8047,13 @@ namespace
             {
                 AddUnique(&reasons, L"thread_stack_references_modified_module_page");
             }
-            AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
 
             bool executionOnPage = !threadIds.empty() || !apcThreadIds.empty() || !stackReferences.empty();
             bool doppelganging = mainImage &&
                 std::find(reasons.begin(), reasons.end(), L"process_doppelganging_evidence") != reasons.end();
-            std::wstring risk = mainImage || executionOnPage || process.BuiltinProfileMatched ? L"high" : L"medium";
+            bool builtinProfileViolated = process.BuiltinProfileMatched && !process.BuiltinProfileViolations.empty();
+            AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, executionOnPage || doppelganging || builtinProfileViolated);
+            std::wstring risk = mainImage || executionOnPage || builtinProfileViolated ? L"high" : L"medium";
             std::wstring confidence = executionOnPage || doppelganging ? L"high" : L"medium";
 
             AddFinding(
@@ -7334,7 +8239,7 @@ namespace
                 }
 
                 bool mainImage = IsMainImageModule(*process, module);
-                bool compareFullExecutableSections = process->BuiltinProfileMatched || mainImage;
+                bool compareFullExecutableSections = mainImage || !process->BuiltinProfileViolations.empty();
                 std::set<uint32_t> comparedPageRvas;
                 if (metadata.HasEntryPoint)
                 {
@@ -7621,6 +8526,61 @@ namespace
         } while (false);
     }
 
+    void AddEsetLoadedDriverHashHuntFindings(HuntResult* result, const ByovdScanResult& byovd)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            for (const ByovdModuleRecord& record : byovd.Records)
+            {
+                if (!record.FileHashed || record.Sha1.empty())
+                {
+                    continue;
+                }
+
+                const EsetFileSha1Ioc* ioc = FindEsetFileSha1Ioc(record.Sha1, false, true);
+                if (ioc == nullptr)
+                {
+                    continue;
+                }
+
+                std::vector<std::wstring> reasons =
+                {
+                    L"loaded_driver_file_hash_ioc"
+                };
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"driver_image_name"] = record.ImageName;
+                evidence[L"driver_image_path"] = record.ImagePath;
+                evidence[L"driver_disk_path"] = record.DiskPath;
+                evidence[L"driver_base"] = HuntHex(record.Base, 16);
+                evidence[L"driver_size"] = std::to_wstring(record.Size);
+                AddEsetFileHashEvidence(*ioc, record.DiskPath, record.Sha1, &reasons, &evidence);
+
+                std::vector<std::wstring> followups =
+                {
+                    L"!byovd scan /no-update /exact /limit 40",
+                    L"!driver integrity all /limit 200"
+                };
+
+                AddSystemFinding(
+                    result,
+                    L"high",
+                    L"high",
+                    L"edr_killer_driver_file_ioc",
+                    L"loaded kernel driver matches ESET Gentlemen EDR-killer SHA1 IOC",
+                    record.Base,
+                    !record.ImageName.empty() ? record.ImageName : ioc->FileName,
+                    reasons,
+                    evidence,
+                    followups);
+            }
+        } while (false);
+    }
+
     void AddGentlemenDriverNameFindings(
         HuntResult* result,
         const std::vector<KernelModuleInfo>& modules,
@@ -7728,6 +8688,14 @@ namespace
         return profile;
     }
 
+    bool DriverServiceHasGentlemenStagingContext(const DriverServiceRecord& record)
+    {
+        return PathContainsGentlemenCollection(record.BinaryPath) ||
+            PathContainsGentlemenCollection(record.ExpandedBinaryPath) ||
+            PathContainsGentlemenCollection(record.ServiceName) ||
+            PathContainsGentlemenCollection(record.DisplayName);
+    }
+
     void AddDriverServiceHuntFindings(HuntResult* result)
     {
         do
@@ -7747,12 +8715,33 @@ namespace
                 AddUnique(&result->Warnings, L"driver service scan warning: " + warning);
             }
 
+            std::map<std::wstring, FileSha1CacheEntry> serviceSha1Cache;
             for (const DriverServiceRecord& service : services)
             {
                 std::wstring matchedLeaf;
                 const EdrKillerDriverProfile* profile =
                     FindDriverProfileForServiceRecord(service, &matchedLeaf);
-                if (profile == nullptr)
+
+                FileSha1CacheEntry serviceHash = {};
+                const EsetFileSha1Ioc* hashIoc = nullptr;
+                std::wstring serviceImagePath = DriverServiceBinaryImagePath(
+                    !service.ExpandedBinaryPath.empty() ? service.ExpandedBinaryPath : service.BinaryPath);
+                if (!serviceImagePath.empty() &&
+                    GetCachedFileSha1(serviceImagePath, &serviceSha1Cache, &serviceHash))
+                {
+                    hashIoc = FindEsetFileSha1Ioc(serviceHash.Sha1, false, true);
+                }
+
+                if (profile == nullptr && hashIoc == nullptr)
+                {
+                    continue;
+                }
+
+                bool gentlemenStagingPath = DriverServiceHasGentlemenStagingContext(service);
+                if (profile != nullptr &&
+                    !profile->StrongNameSignal &&
+                    !gentlemenStagingPath &&
+                    hashIoc == nullptr)
                 {
                     continue;
                 }
@@ -7761,10 +8750,13 @@ namespace
 
                 std::vector<std::wstring> reasons =
                 {
-                    L"driver_service_installed",
-                    L"driver_service_binary_name_ioc",
-                    L"gentlemen_edr_killer_driver_service"
+                    L"driver_service_installed"
                 };
+                if (profile != nullptr)
+                {
+                    AddUnique(&reasons, L"driver_service_binary_name_ioc");
+                    AddUnique(&reasons, L"gentlemen_edr_killer_driver_service");
+                }
                 if (service.Running)
                 {
                     AddUnique(&reasons, L"driver_service_running");
@@ -7773,9 +8765,13 @@ namespace
                 {
                     AddUnique(&reasons, L"driver_service_not_running");
                 }
-                if (!profile->StrongNameSignal)
+                if (profile != nullptr && !profile->StrongNameSignal)
                 {
-                    AddUnique(&reasons, L"name_only_requires_hash_or_service_correlation");
+                    AddUnique(&reasons, L"name_only_requires_hash_or_staging_correlation");
+                }
+                if (gentlemenStagingPath)
+                {
+                    AddUnique(&reasons, L"gentlemen_collection_staging_path");
                 }
 
                 std::map<std::wstring, std::wstring> evidence;
@@ -7789,10 +8785,20 @@ namespace
                 evidence[L"binary_leaf"] = service.BinaryLeaf;
                 evidence[L"matched_driver_leaf"] = matchedLeaf;
                 evidence[L"has_config"] = service.HasConfig ? L"true" : L"false";
-                evidence[L"gentlemen_family"] = profile->Family;
-                evidence[L"gentlemen_tool"] = profile->Tool;
-                evidence[L"gentlemen_ioc_driver"] = profile->ImageName;
-                evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+                evidence[L"gentlemen_collection_path"] = gentlemenStagingPath ? L"true" : L"false";
+                if (profile != nullptr)
+                {
+                    evidence[L"gentlemen_family"] = profile->Family;
+                    evidence[L"gentlemen_tool"] = profile->Tool;
+                    evidence[L"gentlemen_ioc_driver"] = profile->ImageName;
+                    evidence[L"strong_name_signal"] = profile->StrongNameSignal ? L"true" : L"false";
+                }
+                if (hashIoc != nullptr)
+                {
+                    AddUnique(&reasons, L"gentlemen_edr_killer_driver_service");
+                    AddUnique(&reasons, L"driver_service_file_hash_ioc");
+                    AddEsetFileHashEvidence(*hashIoc, serviceHash.Path, serviceHash.Sha1, &reasons, &evidence);
+                }
 
                 std::vector<std::wstring> followups =
                 {
@@ -7804,19 +8810,29 @@ namespace
 
                 std::wstring risk = L"low";
                 std::wstring confidence = L"low";
-                if (profile->StrongNameSignal && service.Running)
+                if (hashIoc != nullptr)
                 {
                     risk = L"high";
                     confidence = L"high";
                 }
-                else if (profile->StrongNameSignal)
+                else if (profile != nullptr && profile->StrongNameSignal && service.Running)
+                {
+                    risk = L"high";
+                    confidence = L"high";
+                }
+                else if (profile != nullptr && profile->StrongNameSignal)
                 {
                     risk = L"medium";
                     confidence = L"high";
                 }
-                else if (service.Running)
+                else if (gentlemenStagingPath && service.Running)
                 {
                     risk = L"medium";
+                    confidence = L"medium";
+                }
+                else if (gentlemenStagingPath)
+                {
+                    risk = L"low";
                     confidence = L"medium";
                 }
 
@@ -7827,7 +8843,7 @@ namespace
                     L"edr_killer_driver_service",
                     L"driver service matches Gentlemen EDR-killer driver IOC",
                     0,
-                    matchedLeaf,
+                    !matchedLeaf.empty() ? matchedLeaf : service.BinaryLeaf,
                     reasons,
                     evidence,
                     followups);
@@ -7987,6 +9003,7 @@ namespace
                     AddUnique(&result->Warnings, L"BYOVD scan warning: " + warning);
                 }
                 AddByovdHuntFindings(result, byovd, &emittedLeaves);
+                AddEsetLoadedDriverHashHuntFindings(result, byovd);
             }
             else
             {
@@ -8036,6 +9053,59 @@ namespace
         } while (false);
     }
 
+    bool HuntReasonStartsWith(const std::wstring& reason, const std::wstring& prefix)
+    {
+        return reason.rfind(prefix, 0) == 0;
+    }
+
+    bool IsOperatorHighSignalReason(const std::wstring& reason)
+    {
+        bool matched = false;
+        std::wstring lowered = HuntToLower(reason);
+
+        do
+        {
+            if (HuntReasonStartsWith(lowered, L"gentlemen_") ||
+                HuntReasonStartsWith(lowered, L"gentlekiller_") ||
+                HuntReasonStartsWith(lowered, L"oxideharvest_") ||
+                HuntReasonStartsWith(lowered, L"edr_killer_") ||
+                HuntReasonStartsWith(lowered, L"eset_") ||
+                HuntReasonStartsWith(lowered, L"byovd_"))
+            {
+                matched = true;
+                break;
+            }
+
+            if (lowered == L"driver_service_binary_name_ioc" ||
+                lowered == L"driver_service_installed" ||
+                lowered == L"driver_service_running" ||
+                lowered == L"known_security_product_process_target" ||
+                lowered == L"loaded_driver_name_ioc")
+            {
+                matched = true;
+                break;
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool HasOperatorHighSignalReason(const HuntFinding& finding)
+    {
+        bool matched = false;
+
+        for (const std::wstring& reason : finding.ReasonCodes)
+        {
+            if (IsOperatorHighSignalReason(reason))
+            {
+                matched = true;
+                break;
+            }
+        }
+
+        return matched;
+    }
+
     void SortAndCountFindings(HuntResult* result)
     {
         do
@@ -8050,6 +9120,13 @@ namespace
                 result->Findings.end(),
                 [](const HuntFinding& left, const HuntFinding& right)
                 {
+                    bool leftHighSignal = HasOperatorHighSignalReason(left);
+                    bool rightHighSignal = HasOperatorHighSignalReason(right);
+                    if (leftHighSignal != rightHighSignal)
+                    {
+                        return leftHighSignal;
+                    }
+
                     uint32_t leftRisk = SnapshotRiskRank(left.Risk);
                     uint32_t rightRisk = SnapshotRiskRank(right.Risk);
                     if (leftRisk != rightRisk)
@@ -8237,6 +9314,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         }
 
         ProcessTriageScanner triage(device_, symbols_);
+        std::map<std::wstring, FileSha1CacheEntry> processSha1Cache;
 
         for (auto& item : processes)
         {
@@ -8321,6 +9399,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
 
                 AddIdentityFindings(result, process);
                 AddEdrKillerProcessProfileFindings(result, process);
+                AddEsetFileHashProcessFinding(result, process, &processSha1Cache);
                 AddVadFindings(device_, symbols_, result, &process);
                 AddThreadFindings(result, process);
                 AddModuleCrossViewFindings(result, process);
@@ -8339,6 +9418,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 ApplyBuiltinProfile(&process);
                 AddIdentityFindings(result, process);
                 AddEdrKillerProcessProfileFindings(result, process);
+                AddEsetFileHashProcessFinding(result, process, &processSha1Cache);
             }
 
             result->ModuleRecordCount += process.Modules.size();

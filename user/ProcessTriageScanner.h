@@ -44,6 +44,7 @@ struct ProcessVadRecord
     bool HasProtection = false;
     bool Executable = false;
     bool Writable = false;
+    bool CopyOnWrite = false;
     bool HasPrivateMemory = false;
     bool PrivateMemory = false;
     bool HasNoChange = false;
