@@ -69,9 +69,8 @@ namespace
     const McpToolArg kArgsFill[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"pattern", L"string", true} };
     const McpToolArg kArgsMove[] = { {L"source", L"string", true}, {L"dest", L"string", true}, {L"length", L"string", true} };
     const McpToolArg kArgsSetField[] = { {L"address", L"string", true}, {L"type", L"string", true}, {L"field", L"string", true}, {L"value", L"string", true} };
-    // PPL set is self-only (set-ppl-antimalware) in this build; there is no
-    // arbitrary-target pid, so the schema does not advertise one.
-    const McpToolArg kArgsSetProtection[] = { {L"level", L"string", true} };
+    // Arbitrary-target PS_PROTECTION: pid (optional, defaults to self) + level.
+    const McpToolArg kArgsSetProtection[] = { {L"pid", L"string", false}, {L"level", L"string", true} };
     // path is required: the handler has no default-path synthesis, so the schema
     // must demand it (matches DispatchMcpWriteTool, which errors without it).
     const McpToolArg kArgsDumpRaw[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"path", L"string", true} };
@@ -91,6 +90,9 @@ namespace
     const McpToolArg kArgsMemorySearch[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"value", L"string", true}, {L"width", L"string", false} };
     const McpToolArg kArgsMemoryTranslate[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false}, {L"process", L"string", false}, {L"cr3", L"string", false}, {L"length", L"string", false} };
     const McpToolArg kArgsMemoryProbe[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false}, {L"length", L"string", false} };
+    const McpToolArg kArgsMemoryReadPointers[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false}, {L"width", L"string", false}, {L"count", L"string", false} };
+    const McpToolArg kArgsMemoryCompare[] = { {L"address1", L"string", true}, {L"address2", L"string", true}, {L"length", L"string", true} };
+    const McpToolArg kArgsTiSubscribe[] = { {L"action", L"string", false} };
     const McpToolArg kArgsSnapshotDiff[] = { {L"old", L"string", false}, {L"new", L"string", false}, {L"domain", L"string", false}, {L"risk", L"string", false}, {L"limit", L"string", false}, {L"summary", L"boolean", false} };
 
 #define MCP_ARG_TABLE(arr) arr, (sizeof(arr) / sizeof((arr)[0]))
@@ -131,8 +133,11 @@ namespace
         { L"memory.search", L"Search a virtual range for an integer value/pattern (s). width=1|2|4|8; returns match addresses (text).", true, MCP_ARG_TABLE(kArgsMemorySearch) },
         { L"memory.translate", L"Translate a virtual address to physical with page-table walk (vtop); supports per-process DTB (text).", true, MCP_ARG_TABLE(kArgsMemoryTranslate) },
         { L"memory.probe", L"Probe whether a virtual address is readable/writable (query) (text).", true, MCP_ARG_TABLE(kArgsMemoryProbe) },
+        { L"memory.read_pointers", L"Dump a pointer table (dps/dds/dqs) with each slot resolved to its nearest symbol; for call tables/vtables/IAT (text). width=4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadPointers) },
+        { L"memory.compare", L"Compare two virtual ranges and report mismatch offsets (c); for inline-hook/patch detection (text).", true, MCP_ARG_TABLE(kArgsMemoryCompare) },
         { L"code.disasm", L"Disassemble instructions at an address or function (u/uf) (text).", true, MCP_ARG_TABLE(kArgsCodeDisasm) },
         { L"symbol.search", L"Enumerate symbols by wildcard (x module!mask) to resolve names to addresses.", true, MCP_ARG_TABLE(kArgsSymbolSearch) },
+        { L"ti.subscribe", L"Control the Threat-Intelligence ETW subscription (action=start|stop|status); start/stop need --allow-write.", true, MCP_ARG_TABLE(kArgsTiSubscribe) },
         { L"snapshot.diff", L"Diff the in-memory baseline against a fresh live capture, or two snapshot files (!diff) (text).", true, MCP_ARG_TABLE(kArgsSnapshotDiff) },
 
         { L"memory.write_virtual", L"[WRITE] Write bytes to a kernel virtual address (e*).", false, MCP_ARG_TABLE(kArgsWriteVirtual) },
@@ -140,7 +145,7 @@ namespace
         { L"memory.fill", L"[WRITE] Fill a kernel range with a byte pattern.", false, MCP_ARG_TABLE(kArgsFill) },
         { L"memory.move", L"[WRITE] Copy a kernel range from source to dest.", false, MCP_ARG_TABLE(kArgsMove) },
         { L"type.set_field", L"[WRITE] Set a struct field at an address (setfield).", false, MCP_ARG_TABLE(kArgsSetField) },
-        { L"process.set_protection", L"[WRITE] Set the controller process PPL (self antimalware-light): level=on|off|status.", false, MCP_ARG_TABLE(kArgsSetProtection) },
+        { L"process.set_protection", L"[WRITE] Set a process PS_PROTECTION. pid (optional, defaults to self); level=none|ppl-antimalware|ppl-lsa|ppl-windows|ppl-wintcb|pp-windows|pp-wintcb|pp-winsystem.", false, MCP_ARG_TABLE(kArgsSetProtection) },
         { L"dump.raw", L"[WRITE] Dump a kernel range to the given file path (path required; no traversal).", false, MCP_ARG_TABLE(kArgsDumpRaw) },
         { L"dump.pe", L"[WRITE] Reconstruct an on-disk PE image from memory to the given file path (path required).", false, MCP_ARG_TABLE(kArgsDumpPe) },
     };

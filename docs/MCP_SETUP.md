@@ -243,7 +243,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 ## 6. 제공 기능 카탈로그
 
-### 6.1 읽기 툴 (35종, `--allow-write` 불필요)
+### 6.1 읽기 툴 (38종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
 
 | 툴 | 설명 | 주요 인자 (별도 표기 외 모두 선택) |
 |-----|------|----------------------|
@@ -282,8 +282,11 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `memory.probe` | 주소 readable/writable 점검(query) | `address`/`va`/`symbol`, `length` |
 | `code.disasm` | 주소/함수 디스어셈블(u/uf) | `address`/`symbol`, `count`, `function`(bool) |
 | `symbol.search` | 와일드카드 심볼→주소 열거(x `mod!mask`) | `mask`(필수), `limit` |
+| `memory.read_pointers` | 포인터 테이블 슬롯을 최근접 심볼로 해석(dps/dds/dqs) — 콜테이블/vtable/IAT 훅 헌팅 | `address`/`va`/`symbol`, `width`(4/8), `count` |
+| `memory.compare` | 두 가상 범위 byte 비교 + 불일치 오프셋(c) — 인라인 훅/패치 탐지 | `address1`(필수), `address2`(필수), `length`(필수) |
+| `ti.subscribe` | TI ETW 구독 제어(`action`=start/stop/status) — **start/stop은 `--allow-write` 필요** | `action` |
 
-> `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽는다. `memory.read_virtual`/`read_physical`/`symbol.search`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다.
+> `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽는다. `memory.read_virtual`/`read_physical`/`symbol.search`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다. `ti.subscribe`는 읽기 카테고리지만 ETW 세션을 시작/중지하는 부수효과 때문에 start/stop만 write 모드를 요구한다(status는 항상 가능, `kn://ti/stats`와 동일 데이터).
 
 ### 6.2 Write 툴 (8종, `--allow-write` 필수)
 
@@ -294,9 +297,11 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `memory.fill` | 커널 범위를 패턴으로 채움 | `address`, `length`, `pattern` | — |
 | `memory.move` | 커널 범위 복사(src->dest) | `source`, `dest`, `length` | — |
 | `type.set_field` | 주소의 구조체 필드 설정(setfield) | `address`, `type`, `field`, `value` | — |
-| `process.set_protection` | 컨트롤러(self) PPL 설정 (antimalware-light) | `level`(on/off/status) | — |
+| `process.set_protection` | 임의 타깃 PS_PROTECTION 설정 (PPL/PP) | `level`(none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid`(미지정=self) |
 | `dump.raw` | 커널 범위를 지정 파일 경로로 덤프 | `address`, `length`, `path` | — |
 | `dump.pe` | 메모리에서 온디스크 PE 이미지 재구성 | `address`, `path` | — |
+
+> **주의 — `process.set_protection` 임의 타깃**: `pid`로 임의 프로세스의 PPL/PP를 올리거나(예: 프로세스를 un-killable PP로 승격) 벗길 수 있다(예: PPL 안티치트/AV 무력화). 드라이버 IOCTL은 임의 타깃을 지원하며(write-ack + write 모드로만 게이트), `--allow-write` lab 모드 전용이다. 변경 전 대상 프로세스 baseline·VM 스냅샷을 권장한다. 응답에 before/after/requested 바이트 + 검증(readback) 결과가 포함된다.
 
 ### 6.3 리소스 (8종)
 
