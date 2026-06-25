@@ -53,3 +53,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildFirmwareTableJson(const FirmwareTableScanResult& result);

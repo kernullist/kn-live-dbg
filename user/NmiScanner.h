@@ -41,3 +41,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildNmiJson(const NmiScanResult& result);

@@ -1,8 +1,10 @@
 #include "PoolScanner.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
+#include "McpJson.h"
 
 #include <Windows.h>
+#include <cstdio>
 #include <sstream>
 #include <iomanip>
 
@@ -584,4 +586,84 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
     }
 
     return ok;
+}
+
+namespace
+{
+    std::wstring PoolJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildPoolJson(const PoolScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.pool.v1\",\"count\":";
+    out += std::to_wstring(result.Entries.size());
+    out += L",\"totalEntries\":" + std::to_wstring(result.TotalEntries);
+    out += L",\"nonPagedCount\":" + std::to_wstring(result.NonPagedCount);
+    out += L",\"pagedCount\":" + std::to_wstring(result.PagedCount);
+    out += L",\"matchingCount\":" + std::to_wstring(result.MatchingCount);
+    out += L",\"attributesAttempted\":";
+    out += result.AttributesAttempted ? L"true" : L"false";
+    out += L",\"records\":[";
+
+    for (size_t index = 0; index < result.Entries.size(); ++index)
+    {
+        const BigPoolEntryRecord& entry = result.Entries[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"virtualAddress\":" + mcpjson::Quote(PoolJsonHex(entry.VirtualAddress));
+        out += L",\"sizeInBytes\":" + std::to_wstring(entry.SizeInBytes);
+        out += L",\"tag\":" + mcpjson::Quote(entry.TagText);
+        out += L",\"nonPaged\":";
+        out += entry.NonPaged ? L"true" : L"false";
+        if (entry.AttributesQueried)
+        {
+            out += L",\"isReadable\":";
+            out += entry.IsReadable ? L"true" : L"false";
+            out += L",\"isWritable\":";
+            out += entry.IsWritable ? L"true" : L"false";
+            out += L",\"isExecutable\":";
+            out += entry.IsExecutable ? L"true" : L"false";
+            out += L",\"isLargePage\":";
+            out += entry.IsLargePage ? L"true" : L"false";
+            out += L",\"pagingLevels\":" + std::to_wstring(entry.PagingLevels);
+            out += L",\"pte\":" + mcpjson::Quote(PoolJsonHex(entry.Pte));
+            // Effective writable-and-executable is the primary triage signal:
+            // a W+X big pool allocation is a classic manual-mapper / shellcode
+            // staging surface, so surface it as its own boolean.
+            out += L",\"wx\":";
+            out += (entry.IsWritable && entry.IsExecutable) ? L"true" : L"false";
+        }
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+
+    out += L"],\"diagnostics\":[";
+    for (size_t index = 0; index < result.Diagnostics.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Diagnostics[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

@@ -75,3 +75,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildAlpcJson(const AlpcScanResult& result);

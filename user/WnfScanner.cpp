@@ -1,8 +1,10 @@
 #include "WnfScanner.h"
+#include "McpJson.h"
 
 #include <Zydis.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <iomanip>
 #include <sstream>
@@ -3061,4 +3063,100 @@ bool WnfScanner::Scan(const Options& options, WnfScanResult* result, std::wstrin
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring WnfJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildWnfInstancesJson(const WnfScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.wnf.v1\",\"count\":";
+    out += std::to_wstring(result.Instances.size());
+    out += L",\"siloStateAddress\":" + mcpjson::Quote(WnfJsonHex(result.SiloStateAddress));
+    out += L",\"tableAddress\":" + mcpjson::Quote(WnfJsonHex(result.TableAddress));
+    out += L",\"nodesVisited\":" + std::to_wstring(result.NodesVisited);
+    out += L",\"instances\":[";
+
+    for (size_t index = 0; index < result.Instances.size(); ++index)
+    {
+        const WnfInstanceRecord& record = result.Instances[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"address\":" + mcpjson::Quote(WnfJsonHex(record.Address));
+        out += L",\"stateName\":" + mcpjson::Quote(WnfJsonHex(record.StateName));
+
+        const WnfStateNameDecoded& decoded = record.Decoded;
+        out += L",\"decoded\":{";
+        out += L"\"version\":" + std::to_wstring(decoded.Version);
+        out += L",\"lifetime\":" + std::to_wstring(decoded.Lifetime);
+        out += L",\"lifetimeText\":" + mcpjson::Quote(decoded.LifetimeText);
+        out += L",\"dataScope\":" + std::to_wstring(decoded.DataScope);
+        out += L",\"dataScopeText\":" + mcpjson::Quote(decoded.DataScopeText);
+        out += L",\"isPermanent\":";
+        out += decoded.IsPermanent ? L"true" : L"false";
+        out += L",\"sequence\":" + std::to_wstring(decoded.Sequence);
+        out += L",\"ownerTag\":" + mcpjson::Quote(WnfJsonHex(decoded.OwnerTag));
+        out += L",\"ownerTagText\":" + mcpjson::Quote(decoded.OwnerTagText);
+        out += L"}";
+
+        if (record.HasChangeStamp)
+        {
+            out += L",\"changeStamp\":" + mcpjson::Quote(WnfJsonHex(record.ChangeStamp));
+        }
+        if (record.HasDataSize)
+        {
+            out += L",\"dataSize\":" + std::to_wstring(record.DataSize);
+        }
+        if (record.HasLastDataBlock)
+        {
+            out += L",\"lastDataBlock\":" + mcpjson::Quote(WnfJsonHex(record.LastDataBlock));
+        }
+        if (record.HasOwningProcess)
+        {
+            out += L",\"owningProcessAddress\":" + mcpjson::Quote(WnfJsonHex(record.OwningProcessAddress));
+        }
+        if (record.HasOwningPid)
+        {
+            out += L",\"owningPid\":" + std::to_wstring(record.OwningPid);
+        }
+        if (record.HasOwningImageName)
+        {
+            out += L",\"owningImageName\":" + mcpjson::Quote(record.OwningImageName);
+        }
+
+        out += L",\"subscriberCount\":" + std::to_wstring(static_cast<uint32_t>(record.Subscribers.size()));
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"],\"diagnostics\":[";
+    for (size_t index = 0; index < result.Diagnostics.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Diagnostics[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

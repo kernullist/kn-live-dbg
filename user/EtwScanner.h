@@ -104,3 +104,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildEtwIntegrityJson(const EtwIntegrityResult& result);

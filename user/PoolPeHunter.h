@@ -68,3 +68,5 @@ public:
 private:
     DeviceClient& device_;
 };
+
+std::wstring BuildPoolPeJson(const PoolPeHunterResult& result);

@@ -6,7 +6,10 @@
 #include <ws2ipdef.h>
 #include <fwpmu.h>
 
+#include "McpJson.h"
+
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <sstream>
 #include <utility>
@@ -1705,4 +1708,125 @@ bool WfpScanner::Scan(const Options& options, WfpScanResult* result, std::wstrin
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring WfpJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildWfpJson(const WfpScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.wfp.v1\",\"scope\":";
+    out += mcpjson::Quote(result.Scope);
+    out += L",\"engineOpened\":";
+    out += result.EngineOpened ? L"true" : L"false";
+    out += L",\"count\":";
+    out += std::to_wstring(result.Records.size());
+    out += L",\"records\":[";
+
+    for (size_t index = 0; index < result.Records.size(); ++index)
+    {
+        const WfpRecord& record = result.Records[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"kind\":" + mcpjson::Quote(record.Kind);
+        if (!record.Name.empty())
+        {
+            out += L",\"name\":" + mcpjson::Quote(record.Name);
+        }
+        if (!record.Description.empty())
+        {
+            out += L",\"description\":" + mcpjson::Quote(record.Description);
+        }
+        if (!record.Key.empty())
+        {
+            out += L",\"key\":" + mcpjson::Quote(record.Key);
+        }
+        if (record.HasId)
+        {
+            out += L",\"id\":" + mcpjson::Quote(WfpJsonHex(record.Id));
+        }
+        if (!record.LayerName.empty())
+        {
+            out += L",\"layerName\":" + mcpjson::Quote(record.LayerName);
+        }
+        if (record.HasLayerId)
+        {
+            out += L",\"layerId\":" + std::to_wstring(record.LayerId);
+        }
+        if (!record.SubLayerName.empty())
+        {
+            out += L",\"subLayerName\":" + mcpjson::Quote(record.SubLayerName);
+        }
+        if (record.HasSubLayerWeight)
+        {
+            out += L",\"subLayerWeight\":" + std::to_wstring(record.SubLayerWeight);
+        }
+        if (!record.ProviderName.empty())
+        {
+            out += L",\"providerName\":" + mcpjson::Quote(record.ProviderName);
+        }
+        if (!record.ProviderService.empty())
+        {
+            out += L",\"providerService\":" + mcpjson::Quote(record.ProviderService);
+        }
+        if (!record.ActionText.empty())
+        {
+            out += L",\"actionText\":" + mcpjson::Quote(record.ActionText);
+        }
+        out += L",\"action\":" + std::to_wstring(record.Action);
+        if (!record.CalloutName.empty())
+        {
+            out += L",\"calloutName\":" + mcpjson::Quote(record.CalloutName);
+        }
+        if (record.HasCalloutId)
+        {
+            out += L",\"calloutId\":" + std::to_wstring(record.CalloutId);
+        }
+        if (!record.FlagsText.empty())
+        {
+            out += L",\"flagsText\":" + mcpjson::Quote(record.FlagsText);
+        }
+        out += L",\"flags\":" + std::to_wstring(record.Flags);
+        if (!record.WeightText.empty())
+        {
+            out += L",\"weightText\":" + mcpjson::Quote(record.WeightText);
+        }
+        out += L",\"numConditions\":" + std::to_wstring(record.NumConditions);
+        if (!record.ConditionsText.empty())
+        {
+            out += L",\"conditionsText\":" + mcpjson::Quote(record.ConditionsText);
+        }
+        if (!record.AppIdText.empty())
+        {
+            out += L",\"appIdText\":" + mcpjson::Quote(record.AppIdText);
+        }
+        if (!record.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(record.Notes);
+        }
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

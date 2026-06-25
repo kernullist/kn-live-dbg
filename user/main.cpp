@@ -10,6 +10,8 @@
 #include "EtwScanner.h"
 #include "FirmwareTableScanner.h"
 #include "IntegrityScanner.h"
+#include "McpJson.h"
+#include "McpServer.h"
 #include "MemoryDumper.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
@@ -68,6 +70,11 @@ static std::atomic<TiSubscriber*> g_TiSubscriberForShutdown{nullptr};
 static bool g_InstanceMutexOwned = false;
 static std::recursive_mutex g_ConsoleOutputMutex;
 static std::atomic_uint64_t g_CommandStreamOutputSerial = 0;
+
+// The single in-process MCP server instance. Dormant until "mcp on". Its
+// listener thread only enqueues jobs; the wmain engine thread drains and
+// dispatches them (see RunMcpEngineLoop / DispatchMcpRequest below).
+static McpServer g_McpServer;
 
 static constexpr WORD KNDBG_COLOR_TEXT = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
 static constexpr WORD KNDBG_COLOR_DIM = FOREGROUND_BLUE | FOREGROUND_GREEN;
@@ -7471,7 +7478,8 @@ static void HandleSnapshotCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     std::wstring error;
 
@@ -7575,6 +7583,11 @@ static void HandleSnapshotCommand(
             state.HasSnapshotBaseline = true;
             state.SnapshotBaselineJsonPath = jsonPath;
             state.SnapshotBaselineReportPath = reportPath;
+
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildSnapshotJson(document);
+            }
             break;
         }
 
@@ -11221,7 +11234,8 @@ static void PrintCallbackContext(const KernelCallbackRecord& record)
 static void HandleCallbacksCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     std::wstring error;
 
@@ -11319,6 +11333,11 @@ static void HandleCallbacksCommand(
         }
 
         ApplyCallbackModuleFilter(moduleFilter, &result);
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildCallbacksJson(result);
+        }
 
         for (const std::wstring& warning : result.Warnings)
         {
@@ -11800,7 +11819,7 @@ static void HandleWfpKernelCalloutsCommand(
     } while (false);
 }
 
-static void HandleWfpCommand(const std::vector<std::wstring>& args)
+static void HandleWfpCommand(const std::vector<std::wstring>& args, std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -11905,6 +11924,11 @@ static void HandleWfpCommand(const std::vector<std::wstring>& args)
                 std::wcerr << L"!wfp warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildWfpJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -12160,7 +12184,8 @@ static void HandleAlpcCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -12295,6 +12320,11 @@ static void HandleAlpcCommand(
                 std::wcerr << L"!alpc warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildAlpcJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -12589,7 +12619,8 @@ static bool PrepareVbsScan(
 static void HandleVbsCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -12619,6 +12650,11 @@ static void HandleVbsCommand(
         }
 
         EmitVbsWarnings(result);
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildVbsJson(result);
+        }
 
         PrintVbsCoreBlock(result);
         PrintCiOptionsBlock(result.CiOptions);
@@ -12991,7 +13027,8 @@ static void PrintEtwIntegrityRecord(const EtwIntegrityRecord& record)
 static void HandleEtwCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -13092,6 +13129,11 @@ static void HandleEtwCommand(
                 break;
             }
 
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildEtwIntegrityJson(integrityResult);
+            }
+
             for (const std::wstring& warning : integrityResult.Warnings)
             {
                 std::wcerr << L"!etw warning: " << warning << L"\n";
@@ -13176,7 +13218,8 @@ static void HandleEtwCommand(
 static void HandleNmiCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -13231,6 +13274,11 @@ static void HandleNmiCommand(
                 std::wcerr << L"!nmi warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildNmiJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -13346,7 +13394,8 @@ static void PrintMsrReadingRecord(const MsrReading& reading)
 static void HandleMsrCheckCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -13390,6 +13439,11 @@ static void HandleMsrCheckCommand(
                 std::wcerr << L"!msrcheck warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildMsrJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -13485,7 +13539,8 @@ static void PrintCrReadingRecord(const CrReading& reading)
 
 static void HandleCrCommand(
     const std::vector<std::wstring>& args,
-    DeviceClient& device)
+    DeviceClient& device,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -13519,6 +13574,11 @@ static void HandleCrCommand(
                 std::wcerr << L"!cr warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildCrJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -13633,7 +13693,8 @@ static void PrintSsdtTable(const SsdtTable& table)
 static void HandleSsdtCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -13679,6 +13740,11 @@ static void HandleSsdtCommand(
             break;
         }
 
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildSsdtJson(result);
+        }
+
         for (const std::wstring& warning : result.Warnings)
         {
             std::wcerr << L"!ssdt warning: " << warning << L"\n";
@@ -13721,7 +13787,8 @@ static void PrintIdtHelp()
 static void HandleIdtCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -13765,6 +13832,11 @@ static void HandleIdtCommand(
                 std::wcerr << L"!idt warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildIdtJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -14071,7 +14143,8 @@ static void HandleFirmwareTableCommand(
     const std::vector<std::wstring>& args,
     const DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -14181,6 +14254,11 @@ static void HandleFirmwareTableCommand(
                 std::wcerr << L"!fwtable warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildFirmwareTableJson(result);
         }
 
         ApplyFirmwareTableFilters(moduleFilter, hasProviderFilter, providerFilter, &result);
@@ -14959,7 +15037,8 @@ static void PrintByovdRecord(const ByovdModuleRecord& record)
 static void HandleByovdCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -15186,6 +15265,11 @@ static void HandleByovdCommand(
                 std::wcerr << L"byovd warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildByovdScanJson(result);
         }
 
         for (const std::wstring& message : result.Messages)
@@ -15499,7 +15583,8 @@ static void HandleModuleIntegrityCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -15634,6 +15719,11 @@ static void HandleModuleIntegrityCommand(
             std::wcerr << L"!module integrity warning: " << warning << L"\n";
         }
 
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildModuleIntegrityJson(result);
+        }
+
         if (!jsonPath.empty())
         {
             if (WriteUtf8TextFile(jsonPath, BuildModuleIntegrityJson(result), &error))
@@ -15669,7 +15759,8 @@ static void HandleDriverIntegrityCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -15766,6 +15857,11 @@ static void HandleDriverIntegrityCommand(
         for (const std::wstring& warning : result.Warnings)
         {
             std::wcerr << L"!driver integrity warning: " << warning << L"\n";
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildDriverIntegrityJson(result);
         }
 
         if (!jsonPath.empty())
@@ -16752,7 +16848,8 @@ static void HandleAddressCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -16795,6 +16892,11 @@ static void HandleAddressCommand(
         {
             std::wcerr << L"!address failed: " << inspectError << L"\n";
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildAddressInspectJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -16912,7 +17014,8 @@ static void HandlePoolScanPeCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     (void)symbols;
 
@@ -17058,6 +17161,11 @@ static void HandlePoolScanPeCommand(
                 std::wcerr << L"pool-scan-pe warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildPoolPeJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -17348,7 +17456,8 @@ static void HandlePoolCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -17526,6 +17635,11 @@ static void HandlePoolCommand(
                 std::wcerr << L"!pool warning: " << warning << L"\n";
             }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildPoolJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -18121,7 +18235,8 @@ static void HandleWnfCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
@@ -18251,6 +18366,12 @@ static void HandleWnfCommand(
         {
             std::wcerr << L"!wnf warning: " << warning << L"\n";
         }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildWnfInstancesJson(result);
+        }
+
         if (options.Target != WnfScanner::Scope::Decode &&
             (result.Diagnostics.size() > 0 || result.WnfRelatedAvlsObserved == 0))
         {
@@ -23194,6 +23315,8 @@ static bool HandleCommand(
     AiProviderRuntime& ai,
     AiPlanState& aiState);
 
+static void HandleMcpCommand(const std::vector<std::wstring>& args);
+
 static CommandExecutionResult ExecuteCommandWithTranscript(
     const std::vector<std::wstring>& args,
     const std::wstring& originalLine,
@@ -27370,7 +27493,8 @@ static void HandleHuntCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     std::wstring error;
 
@@ -27506,6 +27630,12 @@ static void HandleHuntCommand(
         }
 
         result.Warnings.insert(result.Warnings.begin(), processWarnings.begin(), processWarnings.end());
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildHuntJson(result);
+        }
+
         if (!jsonPath.empty())
         {
             if (WriteUtf8TextFile(jsonPath, BuildHuntJson(result), &error))
@@ -27526,7 +27656,8 @@ static void HandleVadCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     std::wstring error;
 
@@ -27629,6 +27760,11 @@ static void HandleVadCommand(
         PrintVadScanResult(result, options.SummaryOnly);
         PrintProcessTriageWarnings(L"!vad", result.Warnings);
 
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildProcessVadJson(result);
+        }
+
         if (!jsonPath.empty())
         {
             if (WriteUtf8TextFile(jsonPath, BuildProcessVadJson(result), &error))
@@ -27647,7 +27783,8 @@ static void HandleThreadsCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     std::wstring error;
 
@@ -27732,6 +27869,11 @@ static void HandleThreadsCommand(
         result.Warnings.insert(result.Warnings.begin(), targetWarnings.begin(), targetWarnings.end());
         PrintThreadScanResult(result, options.IncludeStacks, options.IncludeApc);
         PrintProcessTriageWarnings(L"!threads", result.Warnings);
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildProcessThreadsJson(result);
+        }
 
         if (!jsonPath.empty())
         {
@@ -28635,6 +28777,15 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"ti.query" ||
         tool == L"module.integrity" ||
         tool == L"driver.integrity" ||
+        tool == L"ssdt.scan" ||
+        tool == L"idt.scan" ||
+        tool == L"cr.scan" ||
+        tool == L"msr.check" ||
+        tool == L"vbs.scan" ||
+        tool == L"byovd.scan" ||
+        tool == L"pool.scan_pe" ||
+        tool == L"hunt.run" ||
+        tool == L"snapshot.capture" ||
         tool == L"assistant.answer")
     {
         supported = true;
@@ -28721,6 +28872,27 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"driver.integrity")
     {
         allowed = {L"driver", L"name", L"target", L"limit"};
+    }
+    else if (tool == L"ssdt.scan" ||
+             tool == L"idt.scan" ||
+             tool == L"cr.scan" ||
+             tool == L"msr.check" ||
+             tool == L"vbs.scan" ||
+             tool == L"byovd.scan")
+    {
+        allowed = {};
+    }
+    else if (tool == L"pool.scan_pe")
+    {
+        allowed = {L"tag", L"limit", L"suspicious"};
+    }
+    else if (tool == L"hunt.run")
+    {
+        allowed = {L"mode"};
+    }
+    else if (tool == L"snapshot.capture")
+    {
+        allowed = {L"name"};
     }
 
     return ValidateJsonObjectKeys(argsJson, allowed, tool + L" args", error);
@@ -28857,7 +29029,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|pool.scan_pe|hunt.run|snapshot.capture|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -28878,6 +29050,15 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- ti.query: query the Threat Intelligence ring. Args: action recent|stats|by|grep; optional count, pid, task, pattern strings.\n";
     stream << L"- module.integrity: inspect loaded module PE headers, sections, and runtime page permissions. Args: optional module/name/target string, optional limit string, optional booleans summary, verbose, headers, sections, wx, mismatch.\n";
     stream << L"- driver.integrity: inspect DRIVER_OBJECT dispatch targets. Args: optional driver/name/target string and optional limit string.\n";
+    stream << L"- ssdt.scan: detect SSDT and win32k shadow-SSDT syscall hooks (routines outside the expected kernel image). Args: {}.\n";
+    stream << L"- idt.scan: detect IDT interrupt-gate hooks and per-CPU handler divergence. Args: {}.\n";
+    stream << L"- cr.scan: check control registers for CR0.WP=0, SMEP/SMAP disablement, and per-CPU divergence. Args: {}.\n";
+    stream << L"- msr.check: check SYSCALL MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) for hooked entry pointers and per-CPU divergence. Args: {}.\n";
+    stream << L"- vbs.scan: report VBS/HVCI, Code Integrity options, hypervisor, Secure Kernel modules, and trustlets. Args: {}.\n";
+    stream << L"- byovd.scan: scan loaded kernel modules against the local BYOVD/LOLDrivers catalog (no network). Args: {}.\n";
+    stream << L"- pool.scan_pe: hunt PE images (intact or signature-wiped) staged in kernel big pool. Args: optional tag, limit strings; optional boolean suspicious.\n";
+    stream << L"- hunt.run: whole-system user-mode anomaly hunt. Args: optional mode string quick or deep.\n";
+    stream << L"- snapshot.capture: capture a same-boot evidence baseline. Args: optional name string.\n";
     stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
     stream << L"Rules:\n";
     stream << L"- Use only these tools. Do not emit debugger commands.\n";
@@ -28924,13 +29105,57 @@ static bool IsAiCapabilityAssistantAnswerPlan(const AiCapabilityPlan& plan)
     return plan.Steps.size() == 1 && plan.Steps[0].Tool == L"assistant.answer";
 }
 
+static std::wstring BuildMcpProcessListJson(const std::vector<DmlProcessRecord>& records, bool truncated)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.process-list.v1\",\"count\":" + std::to_wstring(records.size());
+    out += L",\"truncated\":";
+    out += truncated ? L"true" : L"false";
+    out += L",\"processes\":[";
+    for (size_t i = 0; i < records.size(); ++i)
+    {
+        const DmlProcessRecord& r = records[i];
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += L"{\"pid\":" + std::to_wstring(r.ProcessId);
+        out += L",\"eprocess\":" + mcpjson::Quote(HexTextWidth(r.Eprocess, 16, true));
+        out += L",\"image\":" + mcpjson::Quote(r.ImageName);
+        if (r.HasParentProcessId)
+        {
+            out += L",\"parentPid\":" + std::to_wstring(r.ParentProcessId);
+        }
+        out += L",\"dtb\":" + mcpjson::Quote(HexTextWidth(r.DirectoryTableBase, 16, true));
+        if (r.UserDirectoryTableBase != 0)
+        {
+            out += L",\"userDtb\":" + mcpjson::Quote(HexTextWidth(r.UserDirectoryTableBase, 16, true));
+        }
+        if (r.HasPeb)
+        {
+            out += L",\"peb\":" + mcpjson::Quote(HexTextWidth(r.Peb, 16, true));
+        }
+        if (r.HasActiveThreads)
+        {
+            out += L",\"threads\":" + std::to_wstring(r.ActiveThreads);
+        }
+        if (r.HasCreateTime)
+        {
+            out += L",\"createTime\":" + std::to_wstring(r.CreateTime);
+        }
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}
+
 static bool ExecuteAiCapabilityProcessFind(
     const AiCapabilityStep& step,
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
     AiCapabilityStepResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -28945,6 +29170,11 @@ static bool ExecuteAiCapabilityProcessFind(
         if (!CollectAiCapabilityProcessMatches(step.ArgsJson, state, device, symbols, &result->Processes, &truncated, error))
         {
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildMcpProcessListJson(result->Processes, truncated);
         }
 
         result->HasProcesses = true;
@@ -28976,7 +29206,8 @@ static bool ExecuteAiCapabilityProcessDescribe(
     DeviceClient& device,
     SymbolEngine& symbols,
     AiCapabilityStepResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -28991,6 +29222,11 @@ static bool ExecuteAiCapabilityProcessDescribe(
         if (!ResolveAiCapabilityProcessInput(step.ArgsJson, results, state, device, symbols, &result->Processes, &truncated, error))
         {
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildMcpProcessListJson(result->Processes, truncated);
         }
 
         result->HasProcesses = true;
@@ -29017,6 +29253,86 @@ static bool ValidateAiCapabilityScalarText(
     const std::wstring& label,
     std::wstring* error);
 
+// Parses captured dt output into a structured field list. Each "+0x<off>
+// <name> : <value>" line becomes a {offset,name,value} record; the raw dt text
+// is preserved for fidelity. Lines that do not match are skipped.
+static std::wstring BuildMcpTypeDumpJson(const std::wstring& typeName, const std::wstring& address, const std::wstring& dtText)
+{
+    std::wstring out = L"{\"type\":" + mcpjson::Quote(typeName);
+    out += L",\"address\":" + mcpjson::Quote(address);
+    out += L",\"fields\":[";
+
+    bool first = true;
+    size_t pos = 0;
+    while (pos < dtText.size())
+    {
+        size_t eol = dtText.find(L'\n', pos);
+        size_t lineEnd = (eol == std::wstring::npos) ? dtText.size() : eol;
+        std::wstring line = dtText.substr(pos, lineEnd - pos);
+        pos = (eol == std::wstring::npos) ? dtText.size() : eol + 1;
+
+        size_t plus = line.find(L"+0x");
+        if (plus == std::wstring::npos)
+        {
+            continue;
+        }
+
+        size_t hexStart = plus + 3;
+        size_t hexEnd = hexStart;
+        while (hexEnd < line.size())
+        {
+            wchar_t c = line[hexEnd];
+            bool isHex = (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F');
+            if (!isHex)
+            {
+                break;
+            }
+            ++hexEnd;
+        }
+        if (hexEnd == hexStart)
+        {
+            continue;
+        }
+        std::wstring offset = L"0x" + line.substr(hexStart, hexEnd - hexStart);
+
+        size_t nameStart = hexEnd;
+        while (nameStart < line.size() && (line[nameStart] == L' ' || line[nameStart] == L'\t'))
+        {
+            ++nameStart;
+        }
+        size_t nameEnd = nameStart;
+        while (nameEnd < line.size() && line[nameEnd] != L' ' && line[nameEnd] != L'\t' && line[nameEnd] != L':')
+        {
+            ++nameEnd;
+        }
+        if (nameEnd == nameStart)
+        {
+            continue;
+        }
+        std::wstring name = line.substr(nameStart, nameEnd - nameStart);
+
+        std::wstring value;
+        size_t colon = line.find(L':', nameEnd);
+        if (colon != std::wstring::npos)
+        {
+            value = TrimWhitespace(line.substr(colon + 1));
+        }
+
+        if (!first)
+        {
+            out += L",";
+        }
+        first = false;
+        out += L"{\"offset\":" + mcpjson::Quote(offset);
+        out += L",\"name\":" + mcpjson::Quote(name);
+        out += L",\"value\":" + mcpjson::Quote(value);
+        out += L"}";
+    }
+
+    out += L"],\"text\":" + mcpjson::Quote(dtText) + L"}";
+    return out;
+}
+
 static bool ExecuteAiCapabilityTypeDescribeForAddress(
     const std::wstring& typeName,
     const std::wstring& addressText,
@@ -29024,7 +29340,8 @@ static bool ExecuteAiCapabilityTypeDescribeForAddress(
     const DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* dumpJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -29083,7 +29400,22 @@ static bool ExecuteAiCapabilityTypeDescribeForAddress(
         }
 
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleDtCommand(args, state, device, symbols);
+        if (dumpJsonOut != nullptr)
+        {
+            std::wstring dtText;
+            std::wstring dtErr;
+            {
+                // Nested capture on the engine thread (LIFO restore is safe);
+                // the dt text still tees out to the operator console.
+                ScopedWideStreamCapture dtCapture(&dtText, &dtErr);
+                HandleDtCommand(args, state, device, symbols);
+            }
+            *dumpJsonOut = BuildMcpTypeDumpJson(trimmedType, trimmedAddress, dtText);
+        }
+        else
+        {
+            HandleDtCommand(args, state, device, symbols);
+        }
         ok = true;
     } while (false);
 
@@ -29097,9 +29429,11 @@ static bool ExecuteAiCapabilityTypeDescribe(
     DeviceClient& device,
     SymbolEngine& symbols,
     AiCapabilityStepResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
+    std::vector<std::wstring> typeDumps;
 
     do
     {
@@ -29128,7 +29462,8 @@ static bool ExecuteAiCapabilityTypeDescribe(
 
         if (!TrimWhitespace(addressText).empty())
         {
-            if (!ExecuteAiCapabilityTypeDescribeForAddress(typeName, TrimWhitespace(addressText), fields, state, device, symbols, error))
+            std::wstring dumpJson;
+            if (!ExecuteAiCapabilityTypeDescribeForAddress(typeName, TrimWhitespace(addressText), fields, state, device, symbols, error, structuredJsonOut != nullptr ? &dumpJson : nullptr))
             {
                 if (error != nullptr)
                 {
@@ -29138,6 +29473,11 @@ static bool ExecuteAiCapabilityTypeDescribe(
                     }
                 }
                 break;
+            }
+
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = L"{\"schema\":\"kn-live-dbg.type.v1\",\"dumps\":[" + dumpJson + L"]}";
             }
 
             ok = true;
@@ -29156,6 +29496,10 @@ static bool ExecuteAiCapabilityTypeDescribe(
         if (records.empty())
         {
             std::wcout << L"records=0\n";
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = L"{\"schema\":\"kn-live-dbg.type.v1\",\"dumps\":[]}";
+            }
             ok = true;
             break;
         }
@@ -29163,6 +29507,7 @@ static bool ExecuteAiCapabilityTypeDescribe(
         bool dumpOk = true;
         for (const DmlProcessRecord& record : records)
         {
+            std::wstring dumpJson;
             if (!ExecuteAiCapabilityTypeDescribeForAddress(
                     typeName,
                     HexTextWidth(record.Eprocess, 16, true),
@@ -29170,16 +29515,36 @@ static bool ExecuteAiCapabilityTypeDescribe(
                     state,
                     device,
                     symbols,
-                    error))
+                    error,
+                    structuredJsonOut != nullptr ? &dumpJson : nullptr))
             {
                 dumpOk = false;
                 break;
+            }
+            if (structuredJsonOut != nullptr && !dumpJson.empty())
+            {
+                typeDumps.push_back(dumpJson);
             }
         }
 
         if (!dumpOk)
         {
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            std::wstring agg = L"{\"schema\":\"kn-live-dbg.type.v1\",\"dumps\":[";
+            for (size_t i = 0; i < typeDumps.size(); ++i)
+            {
+                if (i > 0)
+                {
+                    agg += L",";
+                }
+                agg += typeDumps[i];
+            }
+            agg += L"]}";
+            *structuredJsonOut = agg;
         }
 
         if (truncated)
@@ -29275,7 +29640,8 @@ static bool ExecuteAiCapabilityAlpcList(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -29356,7 +29722,7 @@ static bool ExecuteAiCapabilityAlpcList(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": alpc.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleAlpcCommand(args, state, device, symbols);
+        HandleAlpcCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -29365,7 +29731,8 @@ static bool ExecuteAiCapabilityAlpcList(
 
 static bool ExecuteAiCapabilityWfpList(
     const AiCapabilityStep& step,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -29446,7 +29813,7 @@ static bool ExecuteAiCapabilityWfpList(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": wfp.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleWfpCommand(args);
+        HandleWfpCommand(args, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -29457,7 +29824,8 @@ static bool ExecuteAiCapabilityCallbacksList(
     const AiCapabilityStep& step,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -29506,7 +29874,7 @@ static bool ExecuteAiCapabilityCallbacksList(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": callbacks.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleCallbacksCommand(args, device, symbols);
+        HandleCallbacksCommand(args, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -29739,9 +30107,11 @@ static bool ExecuteAiCapabilityVadList(
     DeviceClient& device,
     SymbolEngine& symbols,
     AiCapabilityStepResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
+    std::vector<std::wstring> perProcessJson;
 
     do
     {
@@ -29812,12 +30182,32 @@ static bool ExecuteAiCapabilityVadList(
             }
 
             std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-            HandleVadCommand(args, state, device, symbols);
+            std::wstring recordJson;
+            HandleVadCommand(args, state, device, symbols, structuredJsonOut != nullptr ? &recordJson : nullptr);
+            if (structuredJsonOut != nullptr && !recordJson.empty())
+            {
+                perProcessJson.push_back(recordJson);
+            }
         }
 
         if (error != nullptr && !error->empty())
         {
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            std::wstring aggregate = L"{\"processes\":[";
+            for (size_t index = 0; index < perProcessJson.size(); ++index)
+            {
+                if (index > 0)
+                {
+                    aggregate += L",";
+                }
+                aggregate += perProcessJson[index];
+            }
+            aggregate += L"]}";
+            *structuredJsonOut = aggregate;
         }
 
         result->HasProcesses = true;
@@ -29835,9 +30225,11 @@ static bool ExecuteAiCapabilityThreadsList(
     DeviceClient& device,
     SymbolEngine& symbols,
     AiCapabilityStepResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
+    std::vector<std::wstring> perProcessJson;
 
     do
     {
@@ -29882,12 +30274,32 @@ static bool ExecuteAiCapabilityThreadsList(
             }
 
             std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-            HandleThreadsCommand(args, state, device, symbols);
+            std::wstring recordJson;
+            HandleThreadsCommand(args, state, device, symbols, structuredJsonOut != nullptr ? &recordJson : nullptr);
+            if (structuredJsonOut != nullptr && !recordJson.empty())
+            {
+                perProcessJson.push_back(recordJson);
+            }
         }
 
         if (error != nullptr && !error->empty())
         {
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            std::wstring aggregate = L"{\"processes\":[";
+            for (size_t index = 0; index < perProcessJson.size(); ++index)
+            {
+                if (index > 0)
+                {
+                    aggregate += L",";
+                }
+                aggregate += perProcessJson[index];
+            }
+            aggregate += L"]}";
+            *structuredJsonOut = aggregate;
         }
 
         result->HasProcesses = true;
@@ -29957,7 +30369,8 @@ static bool ExecuteAiCapabilityEtwIntegrity(
     const AiCapabilityStep& step,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -29981,7 +30394,7 @@ static bool ExecuteAiCapabilityEtwIntegrity(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": etw.integrity\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleEtwCommand(args, device, symbols);
+        HandleEtwCommand(args, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -29992,7 +30405,8 @@ static bool ExecuteAiCapabilityNmiList(
     const AiCapabilityStep& step,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30029,7 +30443,7 @@ static bool ExecuteAiCapabilityNmiList(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": nmi.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleNmiCommand(args, device, symbols);
+        HandleNmiCommand(args, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -30041,7 +30455,8 @@ static bool ExecuteAiCapabilityFirmwareTableList(
     const DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30142,7 +30557,7 @@ static bool ExecuteAiCapabilityFirmwareTableList(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": fwtable.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleFirmwareTableCommand(args, state, device, symbols);
+        HandleFirmwareTableCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -30154,7 +30569,8 @@ static bool ExecuteAiCapabilityPoolFind(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30314,7 +30730,7 @@ static bool ExecuteAiCapabilityPoolFind(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": pool.find\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandlePoolCommand(args, state, device, symbols);
+        HandlePoolCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -30326,7 +30742,8 @@ static bool ExecuteAiCapabilityAddressInspect(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30362,11 +30779,39 @@ static bool ExecuteAiCapabilityAddressInspect(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": address.inspect\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleAddressCommand(args, state, device, symbols);
+        HandleAddressCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
     return ok;
+}
+
+static std::wstring BuildMcpWnfDecodedJson(const WnfStateNameDecoded& d)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.wnf-decode.v1\"";
+    out += L",\"raw\":" + mcpjson::Quote(HexTextWidth(d.Raw, 16, true));
+    out += L",\"decoded\":" + mcpjson::Quote(HexTextWidth(d.Decoded, 16, true));
+    out += L",\"version\":" + std::to_wstring(d.Version);
+    out += L",\"lifetime\":" + std::to_wstring(d.Lifetime);
+    if (!d.LifetimeText.empty())
+    {
+        out += L",\"lifetimeText\":" + mcpjson::Quote(d.LifetimeText);
+    }
+    out += L",\"dataScope\":" + std::to_wstring(d.DataScope);
+    if (!d.DataScopeText.empty())
+    {
+        out += L",\"dataScopeText\":" + mcpjson::Quote(d.DataScopeText);
+    }
+    out += L",\"isPermanent\":";
+    out += d.IsPermanent ? L"true" : L"false";
+    out += L",\"sequence\":" + std::to_wstring(d.Sequence);
+    out += L",\"ownerTag\":" + mcpjson::Quote(HexTextWidth(d.OwnerTag, 16, true));
+    if (!d.OwnerTagText.empty())
+    {
+        out += L",\"ownerTagText\":" + mcpjson::Quote(d.OwnerTagText);
+    }
+    out += L"}";
+    return out;
 }
 
 static bool ExecuteAiCapabilityWnfDecode(
@@ -30374,7 +30819,8 @@ static bool ExecuteAiCapabilityWnfDecode(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30412,6 +30858,12 @@ static bool ExecuteAiCapabilityWnfDecode(
         std::wcout << L": wnf.decode\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
         HandleWnfCommand(args, state, device, symbols);
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildMcpWnfDecodedJson(DecodeWnfStateName(parsed));
+        }
+
         ok = true;
     } while (false);
 
@@ -30423,7 +30875,8 @@ static bool ExecuteAiCapabilityWnfList(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30461,11 +30914,99 @@ static bool ExecuteAiCapabilityWnfList(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": wnf.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleWnfCommand(args, state, device, symbols);
+        HandleWnfCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
     return ok;
+}
+
+static std::wstring BuildMcpTiEventsJson(const std::vector<TiEventRecord>& events, const std::wstring& action, bool active)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.ti.v1\",\"action\":" + mcpjson::Quote(action);
+    out += L",\"active\":";
+    out += active ? L"true" : L"false";
+    out += L",\"count\":" + std::to_wstring(events.size());
+    out += L",\"events\":[";
+    for (size_t i = 0; i < events.size(); ++i)
+    {
+        const TiEventRecord& e = events[i];
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += L"{\"timestamp\":" + std::to_wstring(e.Timestamp);
+        out += L",\"pid\":" + std::to_wstring(e.ProcessId);
+        out += L",\"tid\":" + std::to_wstring(e.ThreadId);
+        out += L",\"taskId\":" + std::to_wstring(static_cast<uint32_t>(e.TaskId));
+        if (!e.TaskName.empty())
+        {
+            out += L",\"task\":" + mcpjson::Quote(e.TaskName);
+        }
+        if (!e.OpcodeName.empty())
+        {
+            out += L",\"opcode\":" + mcpjson::Quote(e.OpcodeName);
+        }
+        out += L",\"level\":" + std::to_wstring(static_cast<uint32_t>(e.Level));
+        out += L",\"channel\":" + std::to_wstring(static_cast<uint32_t>(e.Channel));
+        if (e.Keyword != 0)
+        {
+            out += L",\"keyword\":" + mcpjson::Quote(HexTextWidth(e.Keyword, 16, true));
+        }
+        if (!e.ImagePath.empty())
+        {
+            out += L",\"image\":" + mcpjson::Quote(e.ImagePath);
+        }
+        if (e.TargetProcessId != 0)
+        {
+            out += L",\"targetPid\":" + std::to_wstring(e.TargetProcessId);
+        }
+        if (!e.TargetImageBase.empty())
+        {
+            out += L",\"targetImage\":" + mcpjson::Quote(e.TargetImageBase);
+        }
+        out += L",\"decodedByTdh\":";
+        out += e.DecodedByTdh ? L"true" : L"false";
+        out += L",\"payload\":[";
+        for (size_t p = 0; p < e.Payload.size(); ++p)
+        {
+            if (p > 0)
+            {
+                out += L",";
+            }
+            out += L"{\"name\":" + mcpjson::Quote(e.Payload[p].Name);
+            out += L",\"value\":" + mcpjson::Quote(e.Payload[p].Value);
+            if (!e.Payload[p].TypeName.empty())
+            {
+                out += L",\"type\":" + mcpjson::Quote(e.Payload[p].TypeName);
+            }
+            out += L"}";
+        }
+        out += L"]";
+        if (e.Payload.empty() && !e.RawPayloadHex.empty())
+        {
+            out += L",\"rawPayloadHex\":" + mcpjson::Quote(e.RawPayloadHex);
+        }
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}
+
+static std::wstring BuildMcpTiStatsJson(const TiSubscriberStats& stats, bool active)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.ti-stats.v1\",\"active\":";
+    out += active ? L"true" : L"false";
+    out += L",\"eventsReceived\":" + std::to_wstring(stats.EventsReceived);
+    out += L",\"eventsKept\":" + std::to_wstring(stats.EventsKept);
+    out += L",\"eventsDropped\":" + std::to_wstring(stats.EventsDropped);
+    out += L",\"eventsSelfExcluded\":" + std::to_wstring(stats.EventsSelfExcluded);
+    out += L",\"eventsWatchMatched\":" + std::to_wstring(stats.EventsWatchMatched);
+    out += L",\"eventsLogged\":" + std::to_wstring(stats.EventsLogged);
+    out += L",\"logBytesWritten\":" + std::to_wstring(stats.LogBytesWritten);
+    out += L",\"logRotations\":" + std::to_wstring(stats.LogRotations);
+    out += L"}";
+    return out;
 }
 
 static bool ExecuteAiCapabilityTiQuery(
@@ -30473,7 +31014,8 @@ static bool ExecuteAiCapabilityTiQuery(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30602,6 +31144,52 @@ static bool ExecuteAiCapabilityTiQuery(
         std::wcout << L": ti.query\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
         HandleTiCommand(args, state, device, symbols);
+
+        if (structuredJsonOut != nullptr)
+        {
+            // Serve structured output directly off the thread-safe TI ring
+            // query API rather than scraping the handler's text. The ring
+            // mutex makes these reads safe on the engine thread.
+            TiSubscriber& ti = GetTiSubscriberInstance();
+            size_t cap = 200;
+            if (!count.empty())
+            {
+                uint64_t parsedCap = 0;
+                if (ParseUnsigned(count, 10, &parsedCap) && parsedCap > 0 && parsedCap <= 5000)
+                {
+                    cap = static_cast<size_t>(parsedCap);
+                }
+            }
+
+            if (action == L"stats")
+            {
+                *structuredJsonOut = BuildMcpTiStatsJson(ti.SnapshotStats(), ti.IsActive());
+            }
+            else
+            {
+                std::vector<TiEventRecord> events;
+                if (action == L"by" && !pidText.empty())
+                {
+                    uint64_t pid = 0;
+                    ParseUnsigned(pidText, 0, &pid);
+                    events = ti.FilterByPid(static_cast<uint32_t>(pid), cap);
+                }
+                else if (action == L"by")
+                {
+                    events = ti.FilterByTask(task, cap);
+                }
+                else if (action == L"grep")
+                {
+                    events = ti.Grep(pattern, cap);
+                }
+                else
+                {
+                    events = ti.Recent(cap, true);
+                }
+                *structuredJsonOut = BuildMcpTiEventsJson(events, action, ti.IsActive());
+            }
+        }
+
         ok = true;
     } while (false);
 
@@ -30613,7 +31201,8 @@ static bool ExecuteAiCapabilityModuleIntegrity(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30698,7 +31287,7 @@ static bool ExecuteAiCapabilityModuleIntegrity(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": module.integrity\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleModuleIntegrityCommand(args, state, device, symbols);
+        HandleModuleIntegrityCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -30710,7 +31299,8 @@ static bool ExecuteAiCapabilityDriverIntegrity(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
 
@@ -30755,7 +31345,370 @@ static bool ExecuteAiCapabilityDriverIntegrity(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": driver.integrity\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleDriverIntegrityCommand(args, state, device, symbols);
+        HandleDriverIntegrityCommand(args, state, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilitySsdtScan(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"ssdt.scan requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!ssdt");
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": ssdt.scan\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleSsdtCommand(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityIdtScan(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"idt.scan requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!idt");
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": idt.scan\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleIdtCommand(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityCrScan(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"cr.scan requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!cr");
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": cr.scan\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleCrCommand(args, device, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityMsrCheck(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"msr.check requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!msrcheck");
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": msr.check\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleMsrCheckCommand(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityVbsScan(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"vbs.scan requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!vbs");
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": vbs.scan\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleVbsCommand(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityByovdScan(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        (void)error;
+        // Force /no-update so an MCP-triggered scan never fetches intel over
+        // the network or runs a subprocess; it scans loaded modules against
+        // the existing local catalog only.
+        std::vector<std::wstring> args;
+        args.push_back(L"byovd");
+        args.push_back(L"scan");
+        args.push_back(L"/no-update");
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": byovd.scan\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleByovdCommand(args, state, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityPoolScanPe(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"pool.scan_pe requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"pool-scan-pe");
+
+        std::wstring tag;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"tag"}, &tag))
+        {
+            if (!ValidateAiCapabilityScalarText(tag, L"pool tag", error))
+            {
+                break;
+            }
+            args.push_back(L"/tag");
+            args.push_back(tag);
+        }
+
+        std::wstring limit;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"limit"}, &limit))
+        {
+            if (!ValidateAiCapabilityScalarText(limit, L"pool limit", error))
+            {
+                break;
+            }
+            args.push_back(L"/limit");
+            args.push_back(limit);
+        }
+
+        bool suspicious = false;
+        if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"suspicious", &suspicious, error))
+        {
+            break;
+        }
+        if (suspicious)
+        {
+            args.push_back(L"/suspicious");
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": pool.scan_pe\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandlePoolScanPeCommand(args, state, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityHuntRun(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"hunt.run requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring mode;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"mode"}, &mode);
+        mode = ToLower(TrimWhitespace(mode));
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!hunt");
+        if (mode == L"quick")
+        {
+            args.push_back(L"/quick");
+        }
+        else if (mode == L"deep")
+        {
+            args.push_back(L"/deep");
+        }
+        else if (!mode.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"hunt.run mode must be quick or deep";
+            }
+            break;
+        }
+        // Suppress raw per-finding detail over MCP; structuredContent carries
+        // the full HuntResult regardless.
+        args.push_back(L"/summary");
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": hunt.run\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleHuntCommand(args, state, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilitySnapshotCapture(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"snapshot.capture requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!snapshot");
+        args.push_back(L"baseline");
+
+        std::wstring name;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"name"}, &name))
+        {
+            if (!ValidateAiCapabilityScalarText(name, L"snapshot name", error))
+            {
+                break;
+            }
+            args.push_back(L"/name");
+            args.push_back(name);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": snapshot.capture\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleSnapshotCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -30767,7 +31720,8 @@ static bool ExecuteAiCapabilityPlan(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* error)
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
 {
     bool ok = false;
     std::vector<AiCapabilityStepResult> results;
@@ -30787,75 +31741,111 @@ static bool ExecuteAiCapabilityPlan(
 
             if (step.Tool == L"process.find")
             {
-                stepOk = ExecuteAiCapabilityProcessFind(step, state, device, symbols, &result, error);
+                stepOk = ExecuteAiCapabilityProcessFind(step, state, device, symbols, &result, error, structuredJsonOut);
             }
             else if (step.Tool == L"process.describe")
             {
-                stepOk = ExecuteAiCapabilityProcessDescribe(step, results, state, device, symbols, &result, error);
+                stepOk = ExecuteAiCapabilityProcessDescribe(step, results, state, device, symbols, &result, error, structuredJsonOut);
             }
             else if (step.Tool == L"type.describe")
             {
-                stepOk = ExecuteAiCapabilityTypeDescribe(step, results, state, device, symbols, &result, error);
+                stepOk = ExecuteAiCapabilityTypeDescribe(step, results, state, device, symbols, &result, error, structuredJsonOut);
             }
             else if (step.Tool == L"callbacks.list")
             {
-                stepOk = ExecuteAiCapabilityCallbacksList(step, device, symbols, error);
+                stepOk = ExecuteAiCapabilityCallbacksList(step, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"wfp.list")
             {
-                stepOk = ExecuteAiCapabilityWfpList(step, error);
+                stepOk = ExecuteAiCapabilityWfpList(step, error, structuredJsonOut);
             }
             else if (step.Tool == L"alpc.list")
             {
-                stepOk = ExecuteAiCapabilityAlpcList(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityAlpcList(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"vad.list")
             {
-                stepOk = ExecuteAiCapabilityVadList(step, results, state, device, symbols, &result, error);
+                stepOk = ExecuteAiCapabilityVadList(step, results, state, device, symbols, &result, error, structuredJsonOut);
             }
             else if (step.Tool == L"threads.list")
             {
-                stepOk = ExecuteAiCapabilityThreadsList(step, results, state, device, symbols, &result, error);
+                stepOk = ExecuteAiCapabilityThreadsList(step, results, state, device, symbols, &result, error, structuredJsonOut);
             }
             else if (step.Tool == L"etw.integrity")
             {
-                stepOk = ExecuteAiCapabilityEtwIntegrity(step, device, symbols, error);
+                stepOk = ExecuteAiCapabilityEtwIntegrity(step, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"nmi.list")
             {
-                stepOk = ExecuteAiCapabilityNmiList(step, device, symbols, error);
+                stepOk = ExecuteAiCapabilityNmiList(step, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"fwtable.list" || step.Tool == L"firmwaretable.list")
             {
-                stepOk = ExecuteAiCapabilityFirmwareTableList(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityFirmwareTableList(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"pool.find")
             {
-                stepOk = ExecuteAiCapabilityPoolFind(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityPoolFind(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"address.inspect")
             {
-                stepOk = ExecuteAiCapabilityAddressInspect(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityAddressInspect(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"wnf.decode")
             {
-                stepOk = ExecuteAiCapabilityWnfDecode(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityWnfDecode(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"wnf.list")
             {
-                stepOk = ExecuteAiCapabilityWnfList(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityWnfList(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"ti.query")
             {
-                stepOk = ExecuteAiCapabilityTiQuery(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityTiQuery(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"module.integrity")
             {
-                stepOk = ExecuteAiCapabilityModuleIntegrity(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityModuleIntegrity(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"driver.integrity")
             {
-                stepOk = ExecuteAiCapabilityDriverIntegrity(step, state, device, symbols, error);
+                stepOk = ExecuteAiCapabilityDriverIntegrity(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"ssdt.scan")
+            {
+                stepOk = ExecuteAiCapabilitySsdtScan(step, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"idt.scan")
+            {
+                stepOk = ExecuteAiCapabilityIdtScan(step, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"cr.scan")
+            {
+                stepOk = ExecuteAiCapabilityCrScan(step, device, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"msr.check")
+            {
+                stepOk = ExecuteAiCapabilityMsrCheck(step, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"vbs.scan")
+            {
+                stepOk = ExecuteAiCapabilityVbsScan(step, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"byovd.scan")
+            {
+                stepOk = ExecuteAiCapabilityByovdScan(step, state, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"pool.scan_pe")
+            {
+                stepOk = ExecuteAiCapabilityPoolScanPe(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"hunt.run")
+            {
+                stepOk = ExecuteAiCapabilityHuntRun(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"snapshot.capture")
+            {
+                stepOk = ExecuteAiCapabilitySnapshotCapture(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"assistant.answer")
             {
@@ -32393,6 +33383,10 @@ static bool HandleCommand(
                 std::wcerr << L"driver service query failed: " << error << L"\n";
             }
         }
+        else if (command == L"mcp")
+        {
+            HandleMcpCommand(args);
+        }
         else if (command == L"||" || command == L"||s")
         {
             std::wcout << L"0: kd> local live-memory system\n";
@@ -32507,6 +33501,875 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     } while (false);
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// MCP engine-thread integration. These run on the single engine thread (the
+// wmain thread) so DeviceClient and DbgHelp/DIA stay strictly serialized.
+// ---------------------------------------------------------------------------
+
+static bool IsMcpWriteToolName(const std::wstring& name)
+{
+    return name == L"memory.write_virtual" ||
+        name == L"memory.write_physical" ||
+        name == L"memory.fill" ||
+        name == L"memory.move" ||
+        name == L"type.set_field" ||
+        name == L"process.set_protection" ||
+        name == L"dump.raw" ||
+        name == L"dump.pe";
+}
+
+static bool McpGetArg(const std::wstring& argsJson, const wchar_t* key, std::wstring* value)
+{
+    return ExtractJsonStringValue(argsJson, key, value);
+}
+
+// Validates a single-token argument (address, length, type, field, value).
+static bool McpValidateToken(const std::wstring& value, std::wstring* error)
+{
+    bool ok = false;
+    do
+    {
+        if (value.empty())
+        {
+            *error = L"empty argument";
+            break;
+        }
+
+        std::wstring reason;
+        if (ContainsUnsafeAiCommandCharacters(value, &reason))
+        {
+            *error = reason;
+            break;
+        }
+
+        bool hasSpace = false;
+        for (wchar_t ch : value)
+        {
+            if (ch == L' ' || ch == L'\t')
+            {
+                hasSpace = true;
+                break;
+            }
+        }
+        if (hasSpace)
+        {
+            *error = L"argument must not contain whitespace";
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+// Validates a hex byte list ("90 90 90" or "0x90 0x90"). Spaces separate bytes.
+static bool McpValidateByteList(const std::wstring& value, std::wstring* error)
+{
+    bool ok = false;
+    do
+    {
+        if (value.empty())
+        {
+            *error = L"empty bytes";
+            break;
+        }
+
+        bool valid = true;
+        for (wchar_t ch : value)
+        {
+            bool isHex = (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F');
+            if (!isHex && ch != L' ' && ch != L'x' && ch != L'X')
+            {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid)
+        {
+            *error = L"bytes must be space-separated hex values";
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool McpValidatePath(const std::wstring& value, std::wstring* error)
+{
+    bool ok = false;
+    do
+    {
+        if (value.empty())
+        {
+            *error = L"empty path";
+            break;
+        }
+
+        std::wstring reason;
+        if (ContainsUnsafeAiCommandCharacters(value, &reason))
+        {
+            *error = reason;
+            break;
+        }
+
+        if (value.find(L"..") != std::wstring::npos)
+        {
+            *error = L"path traversal is not allowed";
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static McpEngineResult DispatchMcpWriteTool(
+    const std::wstring& tool,
+    const std::wstring& argsJson,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    McpEngineResult result;
+    std::wstring command;
+    std::wstring argError;
+
+    do
+    {
+        if (tool == L"memory.write_virtual")
+        {
+            std::wstring address;
+            std::wstring bytes;
+            std::wstring width;
+            std::wstring process;
+            if (!McpGetArg(argsJson, L"address", &address) || !McpGetArg(argsJson, L"bytes", &bytes))
+            {
+                result.IsError = true;
+                result.Text = L"memory.write_virtual requires string args 'address' and 'bytes'";
+                break;
+            }
+            McpGetArg(argsJson, L"width", &width);
+            McpGetArg(argsJson, L"process", &process);
+            if (!McpValidateToken(address, &argError) || !McpValidateByteList(bytes, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+
+            std::wstring enter = L"eb";
+            if (width == L"2")
+            {
+                enter = L"ew";
+            }
+            else if (width == L"4")
+            {
+                enter = L"ed";
+            }
+            else if (width == L"8")
+            {
+                enter = L"eq";
+            }
+
+            command = enter;
+            if (!process.empty())
+            {
+                if (!McpValidateToken(process, &argError))
+                {
+                    result.IsError = true;
+                    result.Text = L"invalid process: " + argError;
+                    break;
+                }
+                command += L" /process " + process;
+            }
+            command += L" " + address + L" " + bytes;
+        }
+        else if (tool == L"memory.write_physical")
+        {
+            std::wstring address;
+            std::wstring bytes;
+            if (!McpGetArg(argsJson, L"physical_address", &address) || !McpGetArg(argsJson, L"bytes", &bytes))
+            {
+                result.IsError = true;
+                result.Text = L"memory.write_physical requires 'physical_address' and 'bytes'";
+                break;
+            }
+            if (!McpValidateToken(address, &argError) || !McpValidateByteList(bytes, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            command = L"peb " + address + L" " + bytes;
+        }
+        else if (tool == L"memory.fill")
+        {
+            std::wstring address;
+            std::wstring length;
+            std::wstring pattern;
+            if (!McpGetArg(argsJson, L"address", &address) || !McpGetArg(argsJson, L"length", &length) || !McpGetArg(argsJson, L"pattern", &pattern))
+            {
+                result.IsError = true;
+                result.Text = L"memory.fill requires 'address', 'length', 'pattern'";
+                break;
+            }
+            if (!McpValidateToken(address, &argError) || !McpValidateToken(length, &argError) || !McpValidateByteList(pattern, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            command = L"f " + address + L" " + length + L" " + pattern;
+        }
+        else if (tool == L"memory.move")
+        {
+            std::wstring source;
+            std::wstring dest;
+            std::wstring length;
+            if (!McpGetArg(argsJson, L"source", &source) || !McpGetArg(argsJson, L"dest", &dest) || !McpGetArg(argsJson, L"length", &length))
+            {
+                result.IsError = true;
+                result.Text = L"memory.move requires 'source', 'dest', 'length'";
+                break;
+            }
+            if (!McpValidateToken(source, &argError) || !McpValidateToken(dest, &argError) || !McpValidateToken(length, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            command = L"m " + source + L" " + dest + L" " + length;
+        }
+        else if (tool == L"type.set_field")
+        {
+            std::wstring address;
+            std::wstring type;
+            std::wstring field;
+            std::wstring value;
+            if (!McpGetArg(argsJson, L"address", &address) || !McpGetArg(argsJson, L"type", &type) ||
+                !McpGetArg(argsJson, L"field", &field) || !McpGetArg(argsJson, L"value", &value))
+            {
+                result.IsError = true;
+                result.Text = L"type.set_field requires 'address', 'type', 'field', 'value'";
+                break;
+            }
+            if (!McpValidateToken(address, &argError) || !McpValidateToken(type, &argError) ||
+                !McpValidateToken(field, &argError) || !McpValidateToken(value, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            command = L"setfield " + address + L" " + type + L" " + field + L" " + value;
+        }
+        else if (tool == L"process.set_protection")
+        {
+            // The TUI exposes self-only PPL via set-ppl-antimalware. Arbitrary
+            // target PPL is not wired in this build.
+            std::wstring level;
+            if (!McpGetArg(argsJson, L"level", &level))
+            {
+                result.IsError = true;
+                result.Text = L"process.set_protection requires 'level' (on|off|status)";
+                break;
+            }
+            std::wstring sub;
+            std::wstring levelLower = ToLower(level);
+            if (levelLower == L"on" || levelLower == L"antimalware")
+            {
+                sub = L"on";
+            }
+            else if (levelLower == L"off" || levelLower == L"none")
+            {
+                sub = L"off";
+            }
+            else if (levelLower == L"status")
+            {
+                sub = L"status";
+            }
+            else
+            {
+                result.IsError = true;
+                result.Text = L"level must be on|off|status";
+                break;
+            }
+            command = L"set-ppl-antimalware " + sub;
+        }
+        else if (tool == L"dump.raw")
+        {
+            std::wstring address;
+            std::wstring length;
+            std::wstring path;
+            if (!McpGetArg(argsJson, L"address", &address) || !McpGetArg(argsJson, L"length", &length) || !McpGetArg(argsJson, L"path", &path))
+            {
+                result.IsError = true;
+                result.Text = L"dump.raw requires 'address', 'length', 'path'";
+                break;
+            }
+            if (!McpValidateToken(address, &argError) || !McpValidateToken(length, &argError) || !McpValidatePath(path, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            command = L"dump-raw " + address + L" " + length + L" \"" + path + L"\"";
+        }
+        else if (tool == L"dump.pe")
+        {
+            std::wstring address;
+            std::wstring path;
+            if (!McpGetArg(argsJson, L"address", &address) || !McpGetArg(argsJson, L"path", &path))
+            {
+                result.IsError = true;
+                result.Text = L"dump.pe requires 'address', 'path'";
+                break;
+            }
+            if (!McpValidateToken(address, &argError) || !McpValidatePath(path, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            command = L"dump-pe " + address + L" \"" + path + L"\"";
+        }
+        else
+        {
+            result.IsError = true;
+            result.Text = L"unknown write tool: " + tool;
+            break;
+        }
+
+        // Build the deterministic safety plan, then run backup -> write ->
+        // verify through the normal dispatcher (which captures output and
+        // writes the write-audit JSONL automatically for write-like lines).
+        AiWriteSafetyPlan safety = BuildWriteSafetyPlan(command, state, symbols);
+        std::wstring text;
+
+        if (!safety.BackupCommand.empty())
+        {
+            CommandExecutionResult before = ExecuteCommandWithTranscript(
+                Split(safety.BackupCommand), safety.BackupCommand, L"mcp",
+                state, dbgeng, device, service, symbols, ai, aiState);
+            text += L"[backup] " + safety.BackupCommand + L"\n" + before.Output;
+        }
+
+        CommandExecutionResult wrote = ExecuteCommandWithTranscript(
+            Split(command), command, L"mcp",
+            state, dbgeng, device, service, symbols, ai, aiState);
+        text += L"[write] " + command + L"\n" + wrote.Output;
+        if (!wrote.Error.empty())
+        {
+            text += wrote.Error;
+            result.IsError = true;
+        }
+
+        if (!safety.VerifyCommand.empty())
+        {
+            CommandExecutionResult after = ExecuteCommandWithTranscript(
+                Split(safety.VerifyCommand), safety.VerifyCommand, L"mcp",
+                state, dbgeng, device, service, symbols, ai, aiState);
+            text += L"[verify] " + safety.VerifyCommand + L"\n" + after.Output;
+        }
+
+        if (!safety.Warning.empty())
+        {
+            text += L"[warning] " + safety.Warning + L"\n";
+        }
+
+        result.Text = text;
+    } while (false);
+
+    return result;
+}
+
+static std::wstring BuildMcpModulesJson(SymbolEngine& symbols)
+{
+    const std::vector<KernelModuleInfo>& modules = symbols.Modules();
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.modules.v1\",\"count\":" + std::to_wstring(modules.size());
+    out += L",\"modules\":[";
+    for (size_t i = 0; i < modules.size(); ++i)
+    {
+        const KernelModuleInfo& m = modules[i];
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += L"{\"name\":" + mcpjson::Quote(m.ImageName);
+        out += L",\"base\":" + mcpjson::Quote(HexTextWidth(m.Base, 16, true));
+        out += L",\"size\":" + std::to_wstring(m.Size);
+        if (!m.ImagePath.empty())
+        {
+            out += L",\"path\":" + mcpjson::Quote(m.ImagePath);
+        }
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}
+
+static std::wstring BuildMcpDriversJson(DriverService& service, DeviceClient& device)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.drivers.v1\"";
+
+    DriverStatus status = {};
+    std::wstring serviceError;
+    if (service.Query(&status, &serviceError))
+    {
+        out += L",\"service\":{\"installed\":";
+        out += status.Installed ? L"true" : L"false";
+        out += L",\"state\":" + std::to_wstring(status.CurrentState);
+        if (!status.StateText.empty())
+        {
+            out += L",\"stateText\":" + mcpjson::Quote(status.StateText);
+        }
+        out += L"}";
+    }
+    else
+    {
+        out += L",\"serviceError\":" + mcpjson::Quote(serviceError);
+    }
+
+    DriverSessionStatus session = {};
+    std::wstring sessionError;
+    if (device.IsOpen() && device.QuerySessionStatus(&session, &sessionError))
+    {
+        out += L",\"session\":{\"ownerPid\":" + std::to_wstring(session.OwnerPid);
+        out += L",\"currentPid\":" + std::to_wstring(session.CurrentPid);
+        out += L",\"openHandles\":" + std::to_wstring(session.OpenHandleCount);
+        out += L",\"writeEnabled\":";
+        out += ((session.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) != 0) ? L"true" : L"false";
+        out += L"}";
+    }
+
+    out += L"}";
+    return out;
+}
+
+static std::wstring BuildMcpSymbolsJson(SymbolEngine& symbols)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.symbols.v1\"";
+    out += L",\"symbolPath\":" + mcpjson::Quote(symbols.SymbolPath());
+    out += L",\"moduleCount\":" + std::to_wstring(symbols.Modules().size());
+    out += L",\"ready\":";
+    out += symbols.IsReady() ? L"true" : L"false";
+    out += L"}";
+    return out;
+}
+
+static std::wstring BuildMcpAuditTailJson()
+{
+    // The MCP server owns a dedicated always-on forensic log (independent of
+    // the operator's `ai audit` setting); tail the last N lines of it.
+    std::wstring auditPath = g_McpServer.AuditPath();
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.audit-tail.v1\",\"enabled\":";
+    out += auditPath.empty() ? L"false" : L"true";
+    if (!auditPath.empty())
+    {
+        out += L",\"path\":" + mcpjson::Quote(auditPath);
+    }
+    out += L",\"entries\":[";
+
+    if (!auditPath.empty())
+    {
+        std::ifstream file(auditPath.c_str(), std::ios::binary);
+        if (file)
+        {
+            file.seekg(0, std::ios::end);
+            std::streamoff length = file.tellg();
+            file.seekg(0, std::ios::beg);
+            std::string bytes;
+            if (length > 0)
+            {
+                bytes.resize(static_cast<size_t>(length));
+                file.read(&bytes[0], length);
+            }
+
+            std::wstring text = mcpjson::Utf8ToWide(bytes);
+            std::vector<std::wstring> lines;
+            size_t pos = 0;
+            while (pos < text.size())
+            {
+                size_t eol = text.find(L'\n', pos);
+                size_t end = (eol == std::wstring::npos) ? text.size() : eol;
+                std::wstring line = text.substr(pos, end - pos);
+                while (!line.empty() && line.back() == L'\r')
+                {
+                    line.pop_back();
+                }
+                if (!line.empty())
+                {
+                    lines.push_back(line);
+                }
+                pos = (eol == std::wstring::npos) ? text.size() : eol + 1;
+            }
+
+            const size_t maxLines = 50;
+            size_t start = lines.size() > maxLines ? lines.size() - maxLines : 0;
+            bool first = true;
+            for (size_t i = start; i < lines.size(); ++i)
+            {
+                if (!first)
+                {
+                    out += L",";
+                }
+                first = false;
+                out += mcpjson::Quote(lines[i]);
+            }
+        }
+    }
+
+    out += L"]}";
+    return out;
+}
+
+static McpEngineResult DispatchMcpRequest(
+    const McpEngineRequest& request,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    McpEngineResult result;
+
+    if (request.Kind == McpRequestKind::ResourceRead)
+    {
+        if (request.Name == L"kn://session/info")
+        {
+            DriverSessionStatus session = {};
+            std::wstring queryError;
+            std::wstring json = L"{\"server\":\"knlivedbg\",\"abiVersion\":" + std::to_wstring(KNDBG_ABI_VERSION);
+            if (device.IsOpen() && device.QuerySessionStatus(&session, &queryError))
+            {
+                json += L",\"ownerPid\":" + std::to_wstring(session.OwnerPid);
+                json += L",\"currentPid\":" + std::to_wstring(session.CurrentPid);
+                json += L",\"openHandles\":" + std::to_wstring(session.OpenHandleCount);
+                json += L",\"writeEnabled\":";
+                json += ((session.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) != 0) ? L"true" : L"false";
+            }
+            else
+            {
+                json += L",\"error\":" + mcpjson::Quote(queryError);
+                result.IsError = true;
+            }
+            json += L",\"mcpWriteArmed\":";
+            json += g_McpServer.AllowWrite() ? L"true" : L"false";
+            json += L",\"maxTransfer\":" + std::to_wstring(KNDBG_MAX_TRANSFER_SIZE);
+            json += L"}";
+            result.StructuredJson = json;
+        }
+        else if (request.Name == L"kn://modules/kernel")
+        {
+            result.StructuredJson = BuildMcpModulesJson(symbols);
+        }
+        else if (request.Name == L"kn://drivers/status")
+        {
+            result.StructuredJson = BuildMcpDriversJson(service, device);
+        }
+        else if (request.Name == L"kn://session/symbols")
+        {
+            result.StructuredJson = BuildMcpSymbolsJson(symbols);
+        }
+        else if (request.Name == L"kn://ti/stats")
+        {
+            TiSubscriber& ti = GetTiSubscriberInstance();
+            result.StructuredJson = BuildMcpTiStatsJson(ti.SnapshotStats(), ti.IsActive());
+        }
+        else if (request.Name == L"kn://snapshot/current")
+        {
+            if (state.HasSnapshotBaseline)
+            {
+                result.StructuredJson = BuildSnapshotJson(state.SnapshotBaseline);
+            }
+            else
+            {
+                result.StructuredJson = L"{\"schema\":\"kn-live-dbg.snapshot.v1\",\"present\":false,\"note\":\"no baseline captured; call snapshot.capture first\"}";
+            }
+        }
+        else if (request.Name == L"kn://audit/tail")
+        {
+            result.StructuredJson = BuildMcpAuditTailJson();
+        }
+        else
+        {
+            result.IsError = true;
+            result.Text = L"unknown resource: " + request.Name;
+        }
+        return result;
+    }
+
+    // Tool call.
+    const std::wstring& tool = request.Name;
+    if (IsMcpWriteToolName(tool))
+    {
+        if (!g_McpServer.AllowWrite())
+        {
+            result.IsError = true;
+            result.Text = L"writes are disabled; restart with 'mcp on <port> --allow-write'";
+            return result;
+        }
+        return DispatchMcpWriteTool(tool, request.ArgumentsJson, state, dbgeng, device, service, symbols, ai, aiState);
+    }
+
+    // Read-only tool: reuse the capability validator + executor verbatim by
+    // building a single-step synthetic plan. The tool name is a known catalog
+    // entry (the listener rejected unknown names before enqueue).
+    std::wstring args = request.ArgumentsJson.empty() ? std::wstring(L"{}") : request.ArgumentsJson;
+    std::wstring planText =
+        L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"mcp\",\"steps\":[{\"tool\":\"" +
+        tool + L"\",\"args\":" + args + L"}]}";
+
+    AiCapabilityPlan plan;
+    std::wstring parseError;
+    if (!ParseAiCapabilityPlanResponse(planText, &plan, &parseError))
+    {
+        result.IsError = true;
+        result.Text = L"invalid tool arguments: " + parseError;
+        return result;
+    }
+
+    std::wstring captured;
+    std::wstring capturedErr;
+    std::wstring execError;
+    std::wstring structuredJson;
+    bool ok = false;
+    {
+        ScopedWideStreamCapture capture(&captured, &capturedErr);
+        // Tier-B: tools whose scanner has a JSON builder fill structuredJson;
+        // the rest leave it empty and fall back to Tier-A captured text.
+        ok = ExecuteAiCapabilityPlan(plan, state, device, symbols, &execError, &structuredJson);
+    }
+
+    if (!structuredJson.empty())
+    {
+        // Tier-B: the serialized JSON is the payload (BuildToolResult puts it in
+        // both content[0].text and structuredContent). The TUI text was already
+        // teed to the operator console; do not also ship it to the model.
+        result.StructuredJson = structuredJson;
+    }
+    else
+    {
+        result.Text = captured;
+        if (!capturedErr.empty())
+        {
+            result.Text += capturedErr;
+        }
+    }
+    if (!ok)
+    {
+        result.IsError = true;
+        if (result.Text.empty() && result.StructuredJson.empty())
+        {
+            result.Text = execError;
+        }
+    }
+
+    return result;
+}
+
+static bool McpReadConsoleLine(std::wstring* line)
+{
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    wchar_t buffer[512];
+    DWORD read = 0;
+    if (!ReadConsoleW(input, buffer, 511, &read, nullptr))
+    {
+        return false;
+    }
+
+    std::wstring text(buffer, read);
+    while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ' || text.back() == L'\t'))
+    {
+        text.pop_back();
+    }
+    size_t start = 0;
+    while (start < text.size() && (text[start] == L' ' || text[start] == L'\t'))
+    {
+        ++start;
+    }
+    *line = text.substr(start);
+    return true;
+}
+
+static void RunMcpEngineLoop(
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    std::wstring writeModeError;
+    if (g_McpServer.AllowWrite())
+    {
+        device.SetWriteMode(true, &writeModeError);
+    }
+    else
+    {
+        device.SetWriteMode(false, &writeModeError);
+    }
+
+    std::wcout << L"[mcp] engine active: 127.0.0.1:" << g_McpServer.Port()
+               << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off")
+               << L"  -- type 'off' then Enter to stop\n";
+
+    std::atomic<bool> controlStop{ false };
+    std::atomic<bool> statusRequested{ false };
+    std::thread reader([&controlStop, &statusRequested]()
+    {
+        while (!controlStop.load())
+        {
+            std::wstring line;
+            if (!McpReadConsoleLine(&line))
+            {
+                break;
+            }
+
+            std::wstring lowered = ToLower(line);
+            if (lowered == L"off" || lowered == L"mcp off" || lowered == L"q" || lowered == L"quit" || lowered == L"exit")
+            {
+                // Lightweight request; the engine thread performs the full
+                // Stop() (join + handle close) after it exits the loop.
+                g_McpServer.RequestStop();
+                break;
+            }
+            else if (lowered == L"status" || lowered == L"mcp status")
+            {
+                statusRequested.store(true);
+            }
+        }
+    });
+
+    while (g_McpServer.IsRunning() && !g_StopRequested)
+    {
+        WaitForSingleObject(g_McpServer.JobReadyEvent(), 200);
+
+        if (statusRequested.exchange(false))
+        {
+            std::wcout << L"[mcp] running port=" << g_McpServer.Port()
+                       << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off") << L"\n";
+        }
+
+        std::shared_ptr<McpJob> job;
+        while ((job = g_McpServer.TryPopJob()) != nullptr)
+        {
+            McpEngineResult dispatchResult = DispatchMcpRequest(
+                job->Request, state, dbgeng, device, service, symbols, ai, aiState);
+            try
+            {
+                job->ResultPromise.set_value(dispatchResult);
+            }
+            catch (...)
+            {
+            }
+        }
+    }
+
+    controlStop.store(true);
+    CancelSynchronousIo(reader.native_handle());
+    if (reader.joinable())
+    {
+        reader.join();
+    }
+
+    g_McpServer.Stop();
+
+    // Restore the interactive session's default write mode.
+    device.SetWriteMode(true, &writeModeError);
+    std::wcout << L"[mcp] engine stopped\n";
+}
+
+static void HandleMcpCommand(const std::vector<std::wstring>& args)
+{
+    std::wstring sub = args.size() >= 2 ? ToLower(args[1]) : L"status";
+
+    if (sub == L"on" || sub == L"start")
+    {
+        if (g_McpServer.IsRunning())
+        {
+            std::wcout << L"MCP server is already running on port " << g_McpServer.Port() << L"\n";
+            return;
+        }
+
+        McpServerConfig config;
+        for (size_t i = 2; i < args.size(); ++i)
+        {
+            if (args[i] == L"--allow-write" || args[i] == L"allow-write")
+            {
+                config.AllowWrite = true;
+            }
+            else
+            {
+                unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
+                if (parsed > 0 && parsed < 65536)
+                {
+                    config.Port = static_cast<uint16_t>(parsed);
+                }
+            }
+        }
+
+        // Always-on forensic log of every MCP request (independent of `ai audit`).
+        config.AuditPath = GetExecutableDirectory() + L"\\.kn-live-dbg\\mcp-audit-" +
+                           std::to_wstring(config.Port) + L".jsonl";
+
+        std::wstring startError;
+        if (!g_McpServer.Start(config, &startError))
+        {
+            std::wcerr << L"mcp start failed: " << startError << L"\n";
+            return;
+        }
+
+        std::wstring url = L"http://127.0.0.1:" + std::to_wstring(g_McpServer.Port()) + L"/mcp";
+        std::wcout << L"MCP server started (loopback Streamable HTTP).\n";
+        std::wcout << L"  url   : " << url << L"\n";
+        std::wcout << L"  token : " << g_McpServer.Token() << L"\n";
+        std::wcout << L"  write : " << (config.AllowWrite ? L"ENABLED (lab mode)" : L"disabled (read-only)") << L"\n";
+        std::wcout << L"  audit : " << g_McpServer.AuditPath() << L"\n";
+        std::wcout << L"  claude code: claude mcp add --transport http knlivedbg " << url
+                   << L" --header \"Authorization: Bearer " << g_McpServer.Token() << L"\"\n";
+        if (config.AllowWrite)
+        {
+            std::wcout << L"  WARNING: write tools are open. Take a VM snapshot before LLM-driven write sessions.\n";
+        }
+        std::wcout << L"  the engine loop starts now; type 'off' + Enter here to stop.\n";
+        return;
+    }
+
+    if (sub == L"off" || sub == L"stop")
+    {
+        if (!g_McpServer.IsRunning())
+        {
+            std::wcout << L"MCP server is not running\n";
+            return;
+        }
+        g_McpServer.Stop();
+        std::wcout << L"MCP server stopped\n";
+        return;
+    }
+
+    // status
+    if (g_McpServer.IsRunning())
+    {
+        std::wcout << L"MCP server: running port=" << g_McpServer.Port()
+                   << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off") << L"\n";
+    }
+    else
+    {
+        std::wcout << L"MCP server: stopped. usage: mcp on [port] [--allow-write] | mcp off | mcp status\n";
+    }
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -32706,6 +34569,12 @@ int wmain(int argc, wchar_t** argv)
 
         while (!g_StopRequested)
         {
+            if (g_McpServer.IsRunning())
+            {
+                RunMcpEngineLoop(state, dbgeng, device, service, symbols, ai, aiState);
+                continue;
+            }
+
             std::wstring line;
             if (!ReadInteractiveCommandLine(L"knkd> ", state.CommandHistory, &line))
             {
@@ -32740,6 +34609,7 @@ int wmain(int argc, wchar_t** argv)
         exitCode = 0;
     } while (false);
 
+    g_McpServer.Stop();
     dbgeng.Shutdown();
     bool cleanupOk = true;
     if (!CleanupByovdFixtureDriverOnExit(state))

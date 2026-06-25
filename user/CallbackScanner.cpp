@@ -1,6 +1,8 @@
 #include "CallbackScanner.h"
+#include "McpJson.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <map>
 #include <sstream>
@@ -3062,6 +3064,114 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring CallbacksJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.callbacks.v1\",\"count\":";
+    out += std::to_wstring(result.Records.size());
+    out += L",\"records\":[";
+
+    for (size_t index = 0; index < result.Records.size(); ++index)
+    {
+        const KernelCallbackRecord& record = result.Records[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"kind\":" + mcpjson::Quote(record.Kind);
+        out += L",\"target\":" + mcpjson::Quote(record.Target);
+        if (!record.Altitude.empty())
+        {
+            out += L",\"altitude\":" + mcpjson::Quote(record.Altitude);
+        }
+        if (!record.CallbackName.empty())
+        {
+            out += L",\"callbackName\":" + mcpjson::Quote(record.CallbackName);
+        }
+        if (!record.FilterName.empty())
+        {
+            out += L",\"filterName\":" + mcpjson::Quote(record.FilterName);
+        }
+        out += L",\"function\":" + mcpjson::Quote(CallbacksJsonHex(record.Function));
+        out += L",\"functionModule\":" + mcpjson::Quote(record.FunctionModule);
+        out += L",\"functionSymbol\":" + mcpjson::Quote(record.FunctionSymbol);
+        if (record.PostFunction != 0)
+        {
+            out += L",\"postFunction\":" + mcpjson::Quote(CallbacksJsonHex(record.PostFunction));
+            out += L",\"postFunctionModule\":" + mcpjson::Quote(record.PostFunctionModule);
+            out += L",\"postFunctionSymbol\":" + mcpjson::Quote(record.PostFunctionSymbol);
+        }
+        if (record.Context != 0)
+        {
+            out += L",\"context\":" + mcpjson::Quote(CallbacksJsonHex(record.Context));
+            out += L",\"contextModule\":" + mcpjson::Quote(record.ContextModule);
+            out += L",\"contextSymbol\":" + mcpjson::Quote(record.ContextSymbol);
+        }
+        if (record.DriverObject != 0)
+        {
+            out += L",\"driverObject\":" + mcpjson::Quote(CallbacksJsonHex(record.DriverObject));
+        }
+        if (record.ObjectType != 0)
+        {
+            out += L",\"objectType\":" + mcpjson::Quote(CallbacksJsonHex(record.ObjectType));
+            out += L",\"objectTypeSource\":" + mcpjson::Quote(record.ObjectTypeSource);
+        }
+        if (!record.RootSource.empty())
+        {
+            out += L",\"rootSource\":" + mcpjson::Quote(record.RootSource);
+        }
+        if (record.RootAddress != 0)
+        {
+            out += L",\"rootAddress\":" + mcpjson::Quote(CallbacksJsonHex(record.RootAddress));
+        }
+        if (record.Filter != 0)
+        {
+            out += L",\"filter\":" + mcpjson::Quote(CallbacksJsonHex(record.Filter));
+        }
+        if (record.MajorFunction != 0xffffffffu)
+        {
+            out += L",\"majorFunction\":" + std::to_wstring(record.MajorFunction);
+        }
+        if (record.Operations != 0)
+        {
+            out += L",\"operations\":" + std::to_wstring(record.Operations);
+        }
+        if (!record.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(record.Notes);
+        }
+        // The owning function lands outside every loaded kernel module: the
+        // primary hook signal for the model to triage.
+        bool unbacked = record.Function != 0 && record.FunctionModule.empty();
+        out += L",\"functionUnbacked\":";
+        out += unbacked ? L"true" : L"false";
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }
 
 bool KernelCallbackScanner::ScanProcessCallbacks(KernelCallbackScanResult* result, std::wstring* error)

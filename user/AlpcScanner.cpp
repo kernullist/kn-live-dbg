@@ -1,6 +1,8 @@
 #include "AlpcScanner.h"
+#include "McpJson.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <map>
 #include <sstream>
@@ -1874,4 +1876,96 @@ bool AlpcScanner::Scan(const Options& options, AlpcScanResult* result, std::wstr
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring AlpcJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildAlpcJson(const AlpcScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.alpc.v1\",\"count\":";
+    out += std::to_wstring(result.Records.size());
+    out += L",\"records\":[";
+
+    for (size_t index = 0; index < result.Records.size(); ++index)
+    {
+        const AlpcPortRecord& record = result.Records[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"address\":" + mcpjson::Quote(AlpcJsonHex(record.Address));
+        if (!record.Name.empty())
+        {
+            out += L",\"name\":" + mcpjson::Quote(record.Name);
+        }
+        if (!record.DirectoryPath.empty())
+        {
+            out += L",\"directoryPath\":" + mcpjson::Quote(record.DirectoryPath);
+        }
+        if (!record.OwnerImageName.empty())
+        {
+            out += L",\"ownerImageName\":" + mcpjson::Quote(record.OwnerImageName);
+        }
+        if (record.HasOwnerProcess)
+        {
+            out += L",\"ownerProcess\":" + mcpjson::Quote(AlpcJsonHex(record.OwnerProcess));
+        }
+        out += L",\"ownerProcessId\":" + std::to_wstring(record.OwnerProcessId);
+        if (record.HasConnectionPort)
+        {
+            out += L",\"connectionPort\":" + mcpjson::Quote(AlpcJsonHex(record.ConnectionPort));
+        }
+        out += L",\"serverCommunicationPort\":" + mcpjson::Quote(AlpcJsonHex(record.ServerCommunicationPort));
+        out += L",\"clientCommunicationPort\":" + mcpjson::Quote(AlpcJsonHex(record.ClientCommunicationPort));
+        if (record.HasQueueData)
+        {
+            out += L",\"mainQueueLength\":" + std::to_wstring(record.MainQueueLength);
+            out += L",\"pendingQueueLength\":" + std::to_wstring(record.PendingQueueLength);
+            out += L",\"largeMessageQueueLength\":" + std::to_wstring(record.LargeMessageQueueLength);
+            out += L",\"canceledQueueLength\":" + std::to_wstring(record.CanceledQueueLength);
+            out += L",\"waitQueueLength\":" + std::to_wstring(record.WaitQueueLength);
+        }
+        out += L",\"flags\":" + std::to_wstring(record.Flags);
+        out += L",\"typeIndex\":" + std::to_wstring(static_cast<uint32_t>(record.TypeIndex));
+        out += L",\"isConnectionPort\":";
+        out += record.IsConnectionPort ? L"true" : L"false";
+        out += L",\"isServerCommunicationPort\":";
+        out += record.IsServerCommunicationPort ? L"true" : L"false";
+        out += L",\"isClientCommunicationPort\":";
+        out += record.IsClientCommunicationPort ? L"true" : L"false";
+        out += L",\"isNamedDirectoryPort\":";
+        out += record.IsNamedDirectoryPort ? L"true" : L"false";
+        if (!record.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(record.Notes);
+        }
+        out += L"}";
+    }
+
+    out += L"],\"alpcPortTypeAddress\":" + mcpjson::Quote(AlpcJsonHex(result.AlpcPortTypeAddress));
+    out += L",\"alpcPortTypeIndex\":" + std::to_wstring(result.AlpcPortTypeIndex);
+    out += L",\"typeIndexResolved\":";
+    out += result.TypeIndexResolved ? L"true" : L"false";
+
+    out += L",\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

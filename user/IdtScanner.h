@@ -57,3 +57,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildIdtJson(const IdtScanResult& result);

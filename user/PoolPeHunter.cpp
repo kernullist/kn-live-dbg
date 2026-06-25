@@ -1,8 +1,10 @@
 #include "PoolPeHunter.h"
+#include "McpJson.h"
 
 #include <Windows.h>
 #include <sstream>
 #include <iomanip>
+#include <cstdio>
 
 constexpr ULONG kSystemBigPoolInformation = 0x42;
 constexpr ULONG kInitialQueryBytes = 0x10000;
@@ -483,4 +485,86 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
         HeapFree(GetProcessHeap(), 0, buffer);
     }
     return ok;
+}
+
+namespace
+{
+    std::wstring PoolPeJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildPoolPeJson(const PoolPeHunterResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.pool-pe.v1\",\"count\":";
+    out += std::to_wstring(result.Hits.size());
+    out += L",\"totalEntries\":" + std::to_wstring(result.TotalEntries);
+    out += L",\"scanned\":" + std::to_wstring(result.Scanned);
+    out += L",\"suspiciousWipes\":" + std::to_wstring(result.SuspiciousWipes);
+    out += L",\"hits\":[";
+
+    for (size_t index = 0; index < result.Hits.size(); ++index)
+    {
+        const PoolPeHit& hit = result.Hits[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"address\":" + mcpjson::Quote(PoolPeJsonHex(hit.Address));
+        out += L",\"sizeInBytes\":" + std::to_wstring(hit.SizeInBytes);
+        out += L",\"tag\":" + mcpjson::Quote(hit.TagText);
+        out += L",\"nonPaged\":";
+        out += hit.NonPaged ? L"true" : L"false";
+
+        const PeHeaderProbe& probe = hit.Probe;
+        out += L",\"probe\":{\"isPe\":";
+        out += probe.IsPe ? L"true" : L"false";
+        out += L",\"mzWiped\":";
+        out += probe.MzWiped ? L"true" : L"false";
+        out += L",\"peSignatureWiped\":";
+        out += probe.PeSignatureWiped ? L"true" : L"false";
+        out += L",\"eLfanewMismatch\":";
+        out += probe.ELfanewMismatch ? L"true" : L"false";
+        out += L",\"is64Bit\":";
+        out += probe.Is64Bit ? L"true" : L"false";
+        out += L",\"machine\":" + std::to_wstring(static_cast<uint32_t>(probe.Machine));
+        out += L",\"numberOfSections\":" + std::to_wstring(static_cast<uint32_t>(probe.NumberOfSections));
+        out += L",\"sizeOfImage\":" + std::to_wstring(probe.SizeOfImage);
+        out += L"}";
+
+        if (!hit.DumpedPath.empty())
+        {
+            out += L",\"dumpedPath\":" + mcpjson::Quote(hit.DumpedPath);
+        }
+        out += L",\"dumpSucceeded\":";
+        out += hit.DumpSucceeded ? L"true" : L"false";
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+
+    out += L"],\"diagnostics\":[";
+    for (size_t index = 0; index < result.Diagnostics.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Diagnostics[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

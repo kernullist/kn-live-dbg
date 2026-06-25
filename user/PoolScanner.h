@@ -83,6 +83,8 @@ private:
     SymbolEngine& symbols_;
 };
 
+std::wstring BuildPoolJson(const PoolScanResult& result);
+
 // Helpers reused from main.cpp printer.
 std::wstring FormatPoolTag(uint32_t tagRaw);
 bool ParsePoolTagText(const std::wstring& text, uint32_t* tagOut);
