@@ -77,3 +77,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result);

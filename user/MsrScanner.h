@@ -50,3 +50,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildMsrJson(const MsrScanResult& result);

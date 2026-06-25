@@ -1,6 +1,8 @@
 #include "FirmwareTableScanner.h"
+#include "McpJson.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <iomanip>
 #include <map>
@@ -1420,4 +1422,101 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring FwTableJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildFirmwareTableJson(const FirmwareTableScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.fwtable.v1\",\"count\":";
+    out += std::to_wstring(result.Records.size());
+    out += L",\"listHeadAddress\":" + mcpjson::Quote(FwTableJsonHex(result.ListHeadAddress));
+    if (!result.ListHeadSymbol.empty())
+    {
+        out += L",\"listHeadSymbol\":" + mcpjson::Quote(result.ListHeadSymbol);
+    }
+    if (!result.LayoutName.empty())
+    {
+        out += L",\"layoutName\":" + mcpjson::Quote(result.LayoutName);
+    }
+    out += L",\"usedFallbackLayout\":";
+    out += result.UsedFallbackLayout ? L"true" : L"false";
+    out += L",\"records\":[";
+
+    for (size_t index = 0; index < result.Records.size(); ++index)
+    {
+        const FirmwareTableProviderRecord& record = result.Records[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"slot\":" + std::to_wstring(record.Slot);
+        out += L",\"providerSignature\":" + mcpjson::Quote(FwTableJsonHex(record.ProviderSignature));
+        if (!record.ProviderText.empty())
+        {
+            out += L",\"providerText\":" + mcpjson::Quote(record.ProviderText);
+        }
+        out += L",\"registerFlag\":" + std::to_wstring(record.RegisterFlag);
+        out += L",\"nodeAddress\":" + mcpjson::Quote(FwTableJsonHex(record.NodeAddress));
+        out += L",\"firmwareTableHandler\":" + mcpjson::Quote(FwTableJsonHex(record.FirmwareTableHandler));
+        if (!record.HandlerModule.empty())
+        {
+            out += L",\"handlerModule\":" + mcpjson::Quote(record.HandlerModule);
+        }
+        if (!record.HandlerSymbol.empty())
+        {
+            out += L",\"handlerSymbol\":" + mcpjson::Quote(record.HandlerSymbol);
+        }
+        if (record.DriverObject != 0)
+        {
+            out += L",\"driverObject\":" + mcpjson::Quote(FwTableJsonHex(record.DriverObject));
+        }
+        if (record.DriverStart != 0)
+        {
+            out += L",\"driverStart\":" + mcpjson::Quote(FwTableJsonHex(record.DriverStart));
+        }
+        if (record.DriverSize != 0)
+        {
+            out += L",\"driverSize\":" + std::to_wstring(record.DriverSize);
+        }
+        if (!record.DriverModule.empty())
+        {
+            out += L",\"driverModule\":" + mcpjson::Quote(record.DriverModule);
+        }
+        if (!record.DriverName.empty())
+        {
+            out += L",\"driverName\":" + mcpjson::Quote(record.DriverName);
+        }
+        if (!record.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(record.Notes);
+        }
+        out += L",\"standardProvider\":";
+        out += record.StandardProvider ? L"true" : L"false";
+        out += L",\"suspicious\":";
+        out += record.Suspicious ? L"true" : L"false";
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

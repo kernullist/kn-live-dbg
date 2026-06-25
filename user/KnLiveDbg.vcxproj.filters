@@ -34,6 +34,9 @@
     <ClCompile Include="CommandRegistry.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="McpServer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="DbgEngBackend.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -142,6 +145,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CommandRegistry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="McpServer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="McpJson.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="DbgEngBackend.h">

@@ -40,3 +40,5 @@ public:
 private:
     DeviceClient& device_;
 };
+
+std::wstring BuildCrJson(const CrScanResult& result);

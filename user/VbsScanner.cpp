@@ -1,9 +1,11 @@
 #include "VbsScanner.h"
+#include "McpJson.h"
 
 #include <Windows.h>
 #include <intrin.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <sstream>
 #include <utility>
@@ -662,4 +664,122 @@ bool VbsScanner::Scan(const Options& options, VbsScanResult* result, std::wstrin
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring VbsJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildVbsJson(const VbsScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.vbs.v1\",\"vbsActive\":";
+    out += result.VbsActive ? L"true" : L"false";
+
+    // CodeIntegrity options block. Raw is emitted as a quoted hex string so the
+    // model sees the actual nt!g_CiOptions bitmask alongside the decoded bools.
+    out += L",\"ciOptions\":{\"raw\":" + mcpjson::Quote(VbsJsonHex(result.CiOptions.Raw));
+    out += L",\"resolved\":";
+    out += result.CiOptions.Resolved ? L"true" : L"false";
+    if (!result.CiOptions.SymbolSource.empty())
+    {
+        out += L",\"symbolSource\":" + mcpjson::Quote(result.CiOptions.SymbolSource);
+    }
+    out += L",\"codeIntegrityEnabled\":";
+    out += result.CiOptions.CodeIntegrityEnabled ? L"true" : L"false";
+    out += L",\"testSign\":";
+    out += result.CiOptions.TestSign ? L"true" : L"false";
+    out += L",\"umciEnabled\":";
+    out += result.CiOptions.UmciEnabled ? L"true" : L"false";
+    out += L",\"umciAuditMode\":";
+    out += result.CiOptions.UmciAuditMode ? L"true" : L"false";
+    out += L",\"hvciEnforced\":";
+    out += result.CiOptions.HvciEnforced ? L"true" : L"false";
+    out += L",\"hvciStrictMode\":";
+    out += result.CiOptions.HvciStrictMode ? L"true" : L"false";
+    out += L",\"hvciDebugMode\":";
+    out += result.CiOptions.HvciDebugMode ? L"true" : L"false";
+    out += L"}";
+
+    // Hypervisor presence and CPUID-derived vendor signature.
+    out += L",\"hypervisor\":{\"present\":";
+    out += result.Hypervisor.HypervisorPresent ? L"true" : L"false";
+    if (!result.Hypervisor.VendorSignature.empty())
+    {
+        out += L",\"vendor\":" + mcpjson::Quote(result.Hypervisor.VendorSignature);
+    }
+    out += L",\"featuresValid\":";
+    out += result.Hypervisor.HvFeaturesValid ? L"true" : L"false";
+    out += L"}";
+
+    out += L",\"secureKernelLoaded\":";
+    out += result.SecureKernelLoaded ? L"true" : L"false";
+    out += L",\"skciLoaded\":";
+    out += result.SkciLoaded ? L"true" : L"false";
+
+    out += L",\"secureKernelModules\":[";
+    for (size_t index = 0; index < result.SecureKernelModules.size(); ++index)
+    {
+        const VbsModuleHit& module = result.SecureKernelModules[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"imageName\":" + mcpjson::Quote(module.ImageName);
+        if (!module.ImagePath.empty())
+        {
+            out += L",\"imagePath\":" + mcpjson::Quote(module.ImagePath);
+        }
+        out += L",\"base\":" + mcpjson::Quote(VbsJsonHex(module.Base));
+        out += L",\"size\":" + std::to_wstring(module.Size);
+        out += L"}";
+    }
+    out += L"]";
+
+    out += L",\"trustletEnumerationOk\":";
+    out += result.TrustletEnumerationOk ? L"true" : L"false";
+
+    out += L",\"trustlets\":[";
+    for (size_t index = 0; index < result.Trustlets.size(); ++index)
+    {
+        const VbsTrustletInfo& trustlet = result.Trustlets[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"eprocess\":" + mcpjson::Quote(VbsJsonHex(trustlet.Eprocess));
+        out += L",\"processId\":" + std::to_wstring(trustlet.ProcessId);
+        if (!trustlet.ImageName.empty())
+        {
+            out += L",\"imageName\":" + mcpjson::Quote(trustlet.ImageName);
+        }
+        if (trustlet.HasSecureState)
+        {
+            out += L",\"secureState\":" + std::to_wstring(trustlet.SecureState);
+        }
+        out += L",\"secureKernelInProcess\":";
+        out += trustlet.SecureKernelInProcess ? L"true" : L"false";
+        out += L"}";
+    }
+    out += L"]";
+
+    out += L",\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

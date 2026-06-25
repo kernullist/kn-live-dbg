@@ -63,3 +63,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildSsdtJson(const SsdtScanResult& result);

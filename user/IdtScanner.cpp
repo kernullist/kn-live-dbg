@@ -1,5 +1,7 @@
 #include "IdtScanner.h"
+#include "McpJson.h"
 
+#include <cstdio>
 #include <sstream>
 
 namespace
@@ -280,4 +282,79 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring IdtJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildIdtJson(const IdtScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.idt.v1\",\"processorNumber\":";
+    out += std::to_wstring(result.ProcessorNumber);
+    out += L",\"idtBase\":" + mcpjson::Quote(IdtJsonHex(result.IdtBase));
+    out += L",\"idtLimit\":" + std::to_wstring(result.IdtLimit);
+    out += L",\"entryCount\":" + std::to_wstring(result.EntryCount);
+    out += L",\"processorsCompared\":" + std::to_wstring(result.ProcessorsCompared);
+    out += L",\"divergentCount\":" + std::to_wstring(result.DivergentCount);
+    out += L",\"anySuspicious\":";
+    out += result.AnySuspicious ? L"true" : L"false";
+    out += L",\"suspiciousCount\":" + std::to_wstring(result.SuspiciousCount);
+    out += L",\"entries\":[";
+
+    for (size_t index = 0; index < result.Entries.size(); ++index)
+    {
+        const IdtEntry& entry = result.Entries[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"vector\":" + std::to_wstring(entry.Vector);
+        out += L",\"handler\":" + mcpjson::Quote(IdtJsonHex(entry.Handler));
+        out += L",\"selector\":" + std::to_wstring(entry.Selector);
+        out += L",\"ist\":" + std::to_wstring(static_cast<uint32_t>(entry.Ist));
+        out += L",\"gateType\":" + std::to_wstring(static_cast<uint32_t>(entry.GateType));
+        out += L",\"dpl\":" + std::to_wstring(static_cast<uint32_t>(entry.Dpl));
+        out += L",\"present\":";
+        out += entry.Present ? L"true" : L"false";
+        out += L",\"inKernelModule\":";
+        out += entry.InKernelModule ? L"true" : L"false";
+        out += L",\"suspicious\":";
+        out += entry.Suspicious ? L"true" : L"false";
+        out += L",\"divergent\":";
+        out += entry.Divergent ? L"true" : L"false";
+        if (!entry.Module.empty())
+        {
+            out += L",\"module\":" + mcpjson::Quote(entry.Module);
+        }
+        if (!entry.Symbol.empty())
+        {
+            out += L",\"symbol\":" + mcpjson::Quote(entry.Symbol);
+        }
+        if (!entry.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(entry.Notes);
+        }
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

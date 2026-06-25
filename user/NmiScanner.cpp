@@ -1,8 +1,10 @@
 #include "NmiScanner.h"
 
 #include "LayoutResolver.h"
+#include "McpJson.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <sstream>
 
 namespace
@@ -378,4 +380,81 @@ bool NmiScanner::Scan(NmiScanResult* result, std::wstring* error)
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring NmiJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildNmiJson(const NmiScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.nmi.v1\",\"count\":";
+    out += std::to_wstring(result.Callbacks.size());
+    out += L",\"listHeadAddress\":" + mcpjson::Quote(NmiJsonHex(result.ListHeadAddress));
+    if (!result.ListHeadSymbol.empty())
+    {
+        out += L",\"listHeadSymbol\":" + mcpjson::Quote(result.ListHeadSymbol);
+    }
+    out += L",\"listHeadResolved\":";
+    out += result.ListHeadResolved ? L"true" : L"false";
+    if (result.FirstNodeAddress != 0)
+    {
+        out += L",\"firstNodeAddress\":" + mcpjson::Quote(NmiJsonHex(result.FirstNodeAddress));
+    }
+    out += L",\"records\":[";
+
+    for (size_t index = 0; index < result.Callbacks.size(); ++index)
+    {
+        const NmiCallbackRecord& record = result.Callbacks[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"slot\":" + std::to_wstring(record.Slot);
+        out += L",\"nodeAddress\":" + mcpjson::Quote(NmiJsonHex(record.NodeAddress));
+        out += L",\"callback\":" + mcpjson::Quote(NmiJsonHex(record.Callback));
+        if (record.Context != 0)
+        {
+            out += L",\"context\":" + mcpjson::Quote(NmiJsonHex(record.Context));
+        }
+        if (record.Handle != 0)
+        {
+            out += L",\"handle\":" + mcpjson::Quote(NmiJsonHex(record.Handle));
+        }
+        if (!record.CallbackModule.empty())
+        {
+            out += L",\"callbackModule\":" + mcpjson::Quote(record.CallbackModule);
+        }
+        if (!record.CallbackSymbol.empty())
+        {
+            out += L",\"callbackSymbol\":" + mcpjson::Quote(record.CallbackSymbol);
+        }
+        if (!record.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(record.Notes);
+        }
+        out += L",\"suspicious\":";
+        out += record.Suspicious ? L"true" : L"false";
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

@@ -1,8 +1,10 @@
 #include "SsdtScanner.h"
 
+#include <cstdio>
 #include <sstream>
 
 #include "LayoutResolver.h"
+#include "McpJson.h"
 
 namespace
 {
@@ -339,4 +341,96 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring SsdtJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildSsdtJson(const SsdtScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.ssdt.v1\",\"anySuspicious\":";
+    out += result.AnySuspicious ? L"true" : L"false";
+    out += L",\"suspiciousCount\":" + std::to_wstring(result.SuspiciousCount);
+    out += L",\"tableCount\":" + std::to_wstring(result.Tables.size());
+    out += L",\"tables\":[";
+
+    for (size_t tableIndex = 0; tableIndex < result.Tables.size(); ++tableIndex)
+    {
+        const SsdtTable& table = result.Tables[tableIndex];
+        if (tableIndex > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"name\":" + mcpjson::Quote(table.Name);
+        if (!table.DescriptorSymbol.empty())
+        {
+            out += L",\"descriptorSymbol\":" + mcpjson::Quote(table.DescriptorSymbol);
+        }
+        out += L",\"tableBase\":" + mcpjson::Quote(SsdtJsonHex(table.TableBase));
+        out += L",\"limit\":" + std::to_wstring(table.Limit);
+        out += L",\"expectedModule\":" + mcpjson::Quote(table.ExpectedModule);
+        out += L",\"resolved\":";
+        out += table.Resolved ? L"true" : L"false";
+        out += L",\"suspiciousCount\":" + std::to_wstring(table.SuspiciousCount);
+        if (!table.Warning.empty())
+        {
+            out += L",\"warning\":" + mcpjson::Quote(table.Warning);
+        }
+
+        out += L",\"entries\":[";
+        for (size_t entryIndex = 0; entryIndex < table.Entries.size(); ++entryIndex)
+        {
+            const SsdtEntry& entry = table.Entries[entryIndex];
+            if (entryIndex > 0)
+            {
+                out += L",";
+            }
+
+            out += L"{\"index\":" + std::to_wstring(entry.Index);
+            out += L",\"rawValue\":" + std::to_wstring(entry.RawValue);
+            out += L",\"argBytes\":" + std::to_wstring(static_cast<uint32_t>(entry.ArgBytes));
+            out += L",\"routine\":" + mcpjson::Quote(SsdtJsonHex(entry.Routine));
+            if (!entry.Module.empty())
+            {
+                out += L",\"module\":" + mcpjson::Quote(entry.Module);
+            }
+            if (!entry.Symbol.empty())
+            {
+                out += L",\"symbol\":" + mcpjson::Quote(entry.Symbol);
+            }
+            out += L",\"inExpectedModule\":";
+            out += entry.InExpectedModule ? L"true" : L"false";
+            out += L",\"suspicious\":";
+            out += entry.Suspicious ? L"true" : L"false";
+            if (!entry.Notes.empty())
+            {
+                out += L",\"notes\":" + mcpjson::Quote(entry.Notes);
+            }
+            out += L"}";
+        }
+        out += L"]";
+
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

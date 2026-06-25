@@ -100,3 +100,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildVbsJson(const VbsScanResult& result);

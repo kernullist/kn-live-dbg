@@ -1,5 +1,7 @@
 #include "MsrScanner.h"
+#include "McpJson.h"
 
+#include <cstdio>
 #include <sstream>
 
 #include "../shared/KnLiveDbgIoctl.h"
@@ -266,4 +268,81 @@ bool MsrScanner::Scan(MsrScanResult* result, std::wstring* error)
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring MsrJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildMsrJson(const MsrScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.msr.v1\",\"processorCount\":";
+    out += std::to_wstring(result.ProcessorCount);
+    out += L",\"anySuspicious\":";
+    out += result.AnySuspicious ? L"true" : L"false";
+    out += L",\"readings\":[";
+
+    for (size_t index = 0; index < result.Readings.size(); ++index)
+    {
+        const MsrReading& reading = result.Readings[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"msrIndex\":" + mcpjson::Quote(MsrJsonHex(reading.MsrIndex));
+        out += L",\"msrName\":" + mcpjson::Quote(reading.MsrName);
+        out += L",\"perCpuValues\":[";
+        for (size_t valueIndex = 0; valueIndex < reading.PerCpuValues.size(); ++valueIndex)
+        {
+            if (valueIndex > 0)
+            {
+                out += L",";
+            }
+            out += mcpjson::Quote(MsrJsonHex(reading.PerCpuValues[valueIndex]));
+        }
+        out += L"]";
+        out += L",\"isPointer\":";
+        out += reading.IsPointer ? L"true" : L"false";
+        out += L",\"divergent\":";
+        out += reading.Divergent ? L"true" : L"false";
+        out += L",\"readFailed\":";
+        out += reading.ReadFailed ? L"true" : L"false";
+        out += L",\"pointsIntoKernelModule\":";
+        out += reading.PointsIntoKernelModule ? L"true" : L"false";
+        out += L",\"suspicious\":";
+        out += reading.Suspicious ? L"true" : L"false";
+        if (!reading.OwningModule.empty())
+        {
+            out += L",\"owningModule\":" + mcpjson::Quote(reading.OwningModule);
+        }
+        if (!reading.NearestSymbol.empty())
+        {
+            out += L",\"nearestSymbol\":" + mcpjson::Quote(reading.NearestSymbol);
+        }
+        if (!reading.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(reading.Notes);
+        }
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

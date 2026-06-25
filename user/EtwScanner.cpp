@@ -1,8 +1,10 @@
 #include "EtwScanner.h"
+#include "McpJson.h"
 
 #include <Zydis.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <iomanip>
 #include <sstream>
@@ -1512,4 +1514,99 @@ bool EtwScanner::ScanIntegrity(EtwIntegrityResult* result, std::wstring* error)
     } while (false);
 
     return ok;
+}
+
+namespace
+{
+    std::wstring EtwIntegrityJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildEtwIntegrityJson(const EtwIntegrityResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.etw-integrity.v1\",\"count\":";
+    out += std::to_wstring(result.Records.size());
+    out += L",\"records\":[";
+
+    for (size_t index = 0; index < result.Records.size(); ++index)
+    {
+        const EtwIntegrityRecord& record = result.Records[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"symbol\":" + mcpjson::Quote(record.Symbol);
+        out += L",\"description\":" + mcpjson::Quote(record.Description);
+        out += L",\"address\":" + mcpjson::Quote(EtwIntegrityJsonHex(record.Address));
+        if (!record.OwningModule.empty())
+        {
+            out += L",\"owningModule\":" + mcpjson::Quote(record.OwningModule);
+        }
+        out += L",\"symbolResolved\":";
+        out += record.SymbolResolved ? L"true" : L"false";
+        out += L",\"bytesRead\":";
+        out += record.BytesRead ? L"true" : L"false";
+        out += L",\"decodeOk\":";
+        out += record.DecodeOk ? L"true" : L"false";
+        out += L",\"instructionsAnalyzed\":" + std::to_wstring(record.InstructionsAnalyzed);
+        if (!record.HeadBytesHex.empty())
+        {
+            out += L",\"headBytesHex\":" + mcpjson::Quote(record.HeadBytesHex);
+        }
+        if (!record.DisassemblySummary.empty())
+        {
+            out += L",\"disassemblySummary\":" + mcpjson::Quote(record.DisassemblySummary);
+        }
+
+        out += L",\"findings\":[";
+        for (size_t findingIndex = 0; findingIndex < record.Findings.size(); ++findingIndex)
+        {
+            const EtwIntegrityFinding& finding = record.Findings[findingIndex];
+            if (findingIndex > 0)
+            {
+                out += L",";
+            }
+
+            out += L"{\"instructionIndex\":" + std::to_wstring(finding.InstructionIndex);
+            out += L",\"instructionOffset\":" + std::to_wstring(finding.InstructionOffset);
+            out += L",\"mnemonic\":" + mcpjson::Quote(finding.Mnemonic);
+            if (finding.HasTarget)
+            {
+                out += L",\"target\":" + mcpjson::Quote(EtwIntegrityJsonHex(finding.Target));
+            }
+            if (!finding.TargetModule.empty())
+            {
+                out += L",\"targetModule\":" + mcpjson::Quote(finding.TargetModule);
+            }
+            if (!finding.TargetSymbol.empty())
+            {
+                out += L",\"targetSymbol\":" + mcpjson::Quote(finding.TargetSymbol);
+            }
+            out += L",\"reason\":" + mcpjson::Quote(finding.Reason);
+            out += L",\"targetInLoadedModule\":";
+            out += finding.TargetInLoadedModule ? L"true" : L"false";
+            out += L"}";
+        }
+        out += L"]";
+
+        out += L"}";
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

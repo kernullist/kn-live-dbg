@@ -164,3 +164,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+std::wstring BuildWnfInstancesJson(const WnfScanResult& result);

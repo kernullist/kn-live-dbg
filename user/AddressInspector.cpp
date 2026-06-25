@@ -1,8 +1,10 @@
 #include "AddressInspector.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
+#include "McpJson.h"
 
 #include <Windows.h>
+#include <cstdio>
 
 namespace
 {
@@ -216,4 +218,140 @@ bool InspectAddress(
 
     (void)error;
     return true;
+}
+
+namespace
+{
+    std::wstring AddressJsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+}
+
+std::wstring BuildAddressInspectJson(const AddressInspectResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.address.v1\"";
+
+    // Identity: always emit the inspected virtual address.
+    out += L",\"virtualAddress\":" + mcpjson::Quote(AddressJsonHex(result.VirtualAddress));
+
+    // Canonicality / half-space classification.
+    out += L",\"isCanonical\":";
+    out += result.IsCanonical ? L"true" : L"false";
+    out += L",\"isKernelSpace\":";
+    out += result.IsKernelSpace ? L"true" : L"false";
+    out += L",\"isUserSpace\":";
+    out += result.IsUserSpace ? L"true" : L"false";
+    out += L",\"isZeroPage\":";
+    out += result.IsZeroPage ? L"true" : L"false";
+    out += L",\"la57Active\":";
+    out += result.La57Active ? L"true" : L"false";
+
+    // Module containing the address (if any kernel module spans it).
+    if (result.HasModule)
+    {
+        out += L",\"moduleName\":" + mcpjson::Quote(result.ModuleName);
+        out += L",\"modulePath\":" + mcpjson::Quote(result.ModulePath);
+        out += L",\"moduleBase\":" + mcpjson::Quote(AddressJsonHex(result.ModuleBase));
+        out += L",\"moduleSize\":" + std::to_wstring(result.ModuleSize);
+        out += L",\"offsetInModule\":" + mcpjson::Quote(AddressJsonHex(result.OffsetInModule));
+    }
+
+    // Nearest symbol (may span the module boundary).
+    if (result.HasSymbol)
+    {
+        out += L",\"symbolName\":" + mcpjson::Quote(result.SymbolName);
+        out += L",\"symbolDisplacement\":" + mcpjson::Quote(AddressJsonHex(result.SymbolDisplacement));
+    }
+
+    // Page-table walk state.
+    out += L",\"translationAttempted\":";
+    out += result.TranslationAttempted ? L"true" : L"false";
+    out += L",\"translationSucceeded\":";
+    out += result.TranslationSucceeded ? L"true" : L"false";
+    if (!result.TranslationError.empty())
+    {
+        out += L",\"translationError\":" + mcpjson::Quote(result.TranslationError);
+    }
+
+    if (result.TranslationSucceeded)
+    {
+        out += L",\"directoryTableBase\":" + mcpjson::Quote(AddressJsonHex(result.DirectoryTableBase));
+        out += L",\"physicalAddress\":" + mcpjson::Quote(AddressJsonHex(result.PhysicalAddress));
+        out += L",\"pageSize\":" + std::to_wstring(result.PageSize);
+        out += L",\"pageOffset\":" + std::to_wstring(result.PageOffset);
+        out += L",\"pageBytes\":" + std::to_wstring(result.PageBytes);
+        out += L",\"pagingLevels\":" + std::to_wstring(result.PagingLevels);
+        out += L",\"largePage\":";
+        out += result.LargePage ? L"true" : L"false";
+
+        // Walk entries plus their slot addresses. Each is emitted only when
+        // non-zero so unused levels (e.g. PML5E without LA57) stay out of the
+        // record and the leaf large-page level does not advertise a stale PTE.
+        if (result.Pml5e != 0)
+        {
+            out += L",\"pml5e\":" + mcpjson::Quote(AddressJsonHex(result.Pml5e));
+        }
+        if (result.Pml4e != 0)
+        {
+            out += L",\"pml4e\":" + mcpjson::Quote(AddressJsonHex(result.Pml4e));
+        }
+        if (result.Pdpte != 0)
+        {
+            out += L",\"pdpte\":" + mcpjson::Quote(AddressJsonHex(result.Pdpte));
+        }
+        if (result.Pde != 0)
+        {
+            out += L",\"pde\":" + mcpjson::Quote(AddressJsonHex(result.Pde));
+        }
+        if (result.Pte != 0)
+        {
+            out += L",\"pte\":" + mcpjson::Quote(AddressJsonHex(result.Pte));
+        }
+        if (result.Pml5eAddress != 0)
+        {
+            out += L",\"pml5eAddress\":" + mcpjson::Quote(AddressJsonHex(result.Pml5eAddress));
+        }
+        if (result.Pml4eAddress != 0)
+        {
+            out += L",\"pml4eAddress\":" + mcpjson::Quote(AddressJsonHex(result.Pml4eAddress));
+        }
+        if (result.PdpteAddress != 0)
+        {
+            out += L",\"pdpteAddress\":" + mcpjson::Quote(AddressJsonHex(result.PdpteAddress));
+        }
+        if (result.PdeAddress != 0)
+        {
+            out += L",\"pdeAddress\":" + mcpjson::Quote(AddressJsonHex(result.PdeAddress));
+        }
+        if (result.PteAddress != 0)
+        {
+            out += L",\"pteAddress\":" + mcpjson::Quote(AddressJsonHex(result.PteAddress));
+        }
+
+        // Effective permissions after combining all walked levels.
+        out += L",\"effectivePresent\":";
+        out += result.EffectivePresent ? L"true" : L"false";
+        out += L",\"effectiveWritable\":";
+        out += result.EffectiveWritable ? L"true" : L"false";
+        out += L",\"effectiveExecutable\":";
+        out += result.EffectiveExecutable ? L"true" : L"false";
+        out += L",\"effectiveUserAccessible\":";
+        out += result.EffectiveUserAccessible ? L"true" : L"false";
+    }
+
+    out += L",\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+    out += L"]}";
+
+    return out;
 }

@@ -71,3 +71,5 @@ bool InspectAddress(
     uint64_t address,
     AddressInspectResult* result,
     std::wstring* error);
+
+std::wstring BuildAddressInspectJson(const AddressInspectResult& result);

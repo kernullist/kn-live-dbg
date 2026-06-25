@@ -74,3 +74,5 @@ public:
 
     bool Scan(const Options& options, WfpScanResult* result, std::wstring* error);
 };
+
+std::wstring BuildWfpJson(const WfpScanResult& result);
