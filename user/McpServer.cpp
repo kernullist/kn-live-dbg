@@ -44,8 +44,8 @@ namespace
     // validator + executor, so these can never reach a command the planner
     // cannot. Arg names mirror the per-tool arg-key whitelist verbatim.
     const McpToolArg kArgsProcessFind[] = { {L"image", L"string", false}, {L"pid", L"string", false}, {L"eprocess", L"string", false} };
-    const McpToolArg kArgsProcessDescribe[] = { {L"source", L"string", false}, {L"pid", L"string", false}, {L"eprocess", L"string", false}, {L"fields", L"string", false} };
-    const McpToolArg kArgsTypeDescribe[] = { {L"source", L"string", false}, {L"address", L"string", false}, {L"type", L"string", false}, {L"fields", L"string", false} };
+    const McpToolArg kArgsProcessDescribe[] = { {L"source", L"string", false}, {L"pid", L"string", false}, {L"eprocess", L"string", false}, {L"fields", L"array", false} };
+    const McpToolArg kArgsTypeDescribe[] = { {L"source", L"string", false}, {L"address", L"string", false}, {L"type", L"string", false}, {L"fields", L"array", false} };
     const McpToolArg kArgsCallbacks[] = { {L"scope", L"string", false}, {L"module", L"string", false} };
     const McpToolArg kArgsWfp[] = { {L"scope", L"string", false}, {L"module", L"string", false}, {L"provider", L"string", false}, {L"layer", L"string", false} };
     const McpToolArg kArgsAlpc[] = { {L"scope", L"string", false}, {L"name", L"string", false}, {L"pid", L"string", false} };
@@ -69,14 +69,29 @@ namespace
     const McpToolArg kArgsFill[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"pattern", L"string", true} };
     const McpToolArg kArgsMove[] = { {L"source", L"string", true}, {L"dest", L"string", true}, {L"length", L"string", true} };
     const McpToolArg kArgsSetField[] = { {L"address", L"string", true}, {L"type", L"string", true}, {L"field", L"string", true}, {L"value", L"string", true} };
-    const McpToolArg kArgsSetProtection[] = { {L"pid", L"string", true}, {L"level", L"string", true} };
-    const McpToolArg kArgsDumpRaw[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"path", L"string", false} };
-    const McpToolArg kArgsDumpPe[] = { {L"address", L"string", true}, {L"path", L"string", false} };
+    // PPL set is self-only (set-ppl-antimalware) in this build; there is no
+    // arbitrary-target pid, so the schema does not advertise one.
+    const McpToolArg kArgsSetProtection[] = { {L"level", L"string", true} };
+    // path is required: the handler has no default-path synthesis, so the schema
+    // must demand it (matches DispatchMcpWriteTool, which errors without it).
+    const McpToolArg kArgsDumpRaw[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"path", L"string", true} };
+    const McpToolArg kArgsDumpPe[] = { {L"address", L"string", true}, {L"path", L"string", true} };
 
     // Read-only detection tools added by the catalog expansion (anti-cheat surface).
     const McpToolArg kArgsPoolScanPe[] = { {L"tag", L"string", false}, {L"limit", L"string", false}, {L"suspicious", L"boolean", false} };
     const McpToolArg kArgsHuntRun[] = { {L"mode", L"string", false} };
     const McpToolArg kArgsSnapshotCapture[] = { {L"name", L"string", false} };
+
+    // Read-only memory / code / symbol inspection tools (close the read surface
+    // so a model can confirm bytes and instructions without the WRITE dump.*).
+    const McpToolArg kArgsMemoryReadVirtual[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false}, {L"width", L"string", false}, {L"count", L"string", false}, {L"process", L"string", false} };
+    const McpToolArg kArgsMemoryReadPhysical[] = { {L"physical_address", L"string", true}, {L"width", L"string", false}, {L"count", L"string", false} };
+    const McpToolArg kArgsSymbolSearch[] = { {L"mask", L"string", true}, {L"limit", L"string", false} };
+    const McpToolArg kArgsCodeDisasm[] = { {L"address", L"string", false}, {L"symbol", L"string", false}, {L"count", L"string", false}, {L"function", L"boolean", false} };
+    const McpToolArg kArgsMemorySearch[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"value", L"string", true}, {L"width", L"string", false} };
+    const McpToolArg kArgsMemoryTranslate[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false}, {L"process", L"string", false}, {L"cr3", L"string", false}, {L"length", L"string", false} };
+    const McpToolArg kArgsMemoryProbe[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false}, {L"length", L"string", false} };
+    const McpToolArg kArgsSnapshotDiff[] = { {L"old", L"string", false}, {L"new", L"string", false}, {L"domain", L"string", false}, {L"risk", L"string", false}, {L"limit", L"string", false}, {L"summary", L"boolean", false} };
 
 #define MCP_ARG_TABLE(arr) arr, (sizeof(arr) / sizeof((arr)[0]))
 
@@ -109,16 +124,25 @@ namespace
         { L"byovd.scan", L"Scan loaded kernel modules against the local BYOVD/LOLDrivers catalog (no network/subprocess).", true, nullptr, 0 },
         { L"pool.scan_pe", L"Hunt PE images (intact or signature-wiped) staged in kernel big pool.", true, MCP_ARG_TABLE(kArgsPoolScanPe) },
         { L"hunt.run", L"Whole-system user-mode anomaly hunt (injection, VAD/PTE, threads, APC, driver/WFP/TI).", true, MCP_ARG_TABLE(kArgsHuntRun) },
-        { L"snapshot.capture", L"Capture a same-boot evidence baseline (writes a baseline file under .kn-live-dbg).", true, MCP_ARG_TABLE(kArgsSnapshotCapture) },
+        { L"snapshot.capture", L"Capture a same-boot evidence baseline in memory (read kn://snapshot/current; no disk writes).", true, MCP_ARG_TABLE(kArgsSnapshotCapture) },
+
+        { L"memory.read_virtual", L"Read bytes at a kernel/user virtual address (db/dq); returns hex with an unreadable-byte mask. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadVirtual) },
+        { L"memory.read_physical", L"Read bytes at a physical address (!db/!dq); bypasses VA mappings. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadPhysical) },
+        { L"memory.search", L"Search a virtual range for an integer value/pattern (s). width=1|2|4|8; returns match addresses (text).", true, MCP_ARG_TABLE(kArgsMemorySearch) },
+        { L"memory.translate", L"Translate a virtual address to physical with page-table walk (vtop); supports per-process DTB (text).", true, MCP_ARG_TABLE(kArgsMemoryTranslate) },
+        { L"memory.probe", L"Probe whether a virtual address is readable/writable (query) (text).", true, MCP_ARG_TABLE(kArgsMemoryProbe) },
+        { L"code.disasm", L"Disassemble instructions at an address or function (u/uf) (text).", true, MCP_ARG_TABLE(kArgsCodeDisasm) },
+        { L"symbol.search", L"Enumerate symbols by wildcard (x module!mask) to resolve names to addresses.", true, MCP_ARG_TABLE(kArgsSymbolSearch) },
+        { L"snapshot.diff", L"Diff the in-memory baseline against a fresh live capture, or two snapshot files (!diff) (text).", true, MCP_ARG_TABLE(kArgsSnapshotDiff) },
 
         { L"memory.write_virtual", L"[WRITE] Write bytes to a kernel virtual address (e*).", false, MCP_ARG_TABLE(kArgsWriteVirtual) },
         { L"memory.write_physical", L"[WRITE] Write bytes to a physical address (pe*).", false, MCP_ARG_TABLE(kArgsWritePhysical) },
         { L"memory.fill", L"[WRITE] Fill a kernel range with a byte pattern.", false, MCP_ARG_TABLE(kArgsFill) },
         { L"memory.move", L"[WRITE] Copy a kernel range from source to dest.", false, MCP_ARG_TABLE(kArgsMove) },
         { L"type.set_field", L"[WRITE] Set a struct field at an address (setfield).", false, MCP_ARG_TABLE(kArgsSetField) },
-        { L"process.set_protection", L"[WRITE] Set a process PS_PROTECTION level.", false, MCP_ARG_TABLE(kArgsSetProtection) },
-        { L"dump.raw", L"[WRITE] Dump a kernel range to a file under the output directory.", false, MCP_ARG_TABLE(kArgsDumpRaw) },
-        { L"dump.pe", L"[WRITE] Reconstruct an on-disk PE image from memory to a file.", false, MCP_ARG_TABLE(kArgsDumpPe) },
+        { L"process.set_protection", L"[WRITE] Set the controller process PPL (self antimalware-light): level=on|off|status.", false, MCP_ARG_TABLE(kArgsSetProtection) },
+        { L"dump.raw", L"[WRITE] Dump a kernel range to the given file path (path required; no traversal).", false, MCP_ARG_TABLE(kArgsDumpRaw) },
+        { L"dump.pe", L"[WRITE] Reconstruct an on-disk PE image from memory to the given file path (path required).", false, MCP_ARG_TABLE(kArgsDumpPe) },
     };
 
     const size_t kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -297,9 +321,19 @@ namespace
                 schema += L",";
             }
             schema += mcpjson::Quote(arg.Name);
-            schema += L":{\"type\":";
-            schema += mcpjson::Quote(arg.Type);
-            schema += L"}";
+            if (wcscmp(arg.Type, L"array") == 0)
+            {
+                // Array-of-string parameter (e.g. a multi-field selector). The
+                // engine parses it with ExtractJsonStringArrayValues, so the
+                // advertised JSON Schema must say array, not string.
+                schema += L":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}";
+            }
+            else
+            {
+                schema += L":{\"type\":";
+                schema += mcpjson::Quote(arg.Type);
+                schema += L"}";
+            }
             if (arg.Required)
             {
                 if (!required.empty())
@@ -523,6 +557,12 @@ bool McpServer::AllowWrite() const
     return config_.AllowWrite;
 }
 
+bool McpServer::IsWriteTool(const std::wstring& name) const
+{
+    const McpToolDef* tool = FindTool(name);
+    return tool != nullptr && !tool->ReadOnly;
+}
+
 uint16_t McpServer::Port() const
 {
     return config_.Port;
@@ -716,6 +756,29 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         // IPv6 loopback is best-effort; ignore failure so IPv4-only hosts work.
         std::wstring url6 = L"http://[::1]:" + std::to_wstring(config_.Port) + L"/mcp/";
         HttpAddUrlToUrlGroup(urlGroup, url6.c_str(), 0, 0);
+
+        // Opt-in NETWORK exposure: also register the requested address so a
+        // remote client (reachable IP) can connect directly over HTTP. Loopback
+        // stays registered for local use. "0.0.0.0"/"*"/"+" => all interfaces.
+        if (!config_.BindAddress.empty())
+        {
+            std::wstring host = config_.BindAddress;
+            if (host == L"0.0.0.0" || host == L"*" || host == L"+")
+            {
+                host = L"+";
+            }
+            std::wstring urlRemote = L"http://" + host + L":" + std::to_wstring(config_.Port) + L"/mcp/";
+            status = HttpAddUrlToUrlGroup(urlGroup, urlRemote.c_str(), 0, 0);
+            if (status != NO_ERROR)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"HttpAddUrlToUrlGroup(" + config_.BindAddress + L") failed: " + std::to_wstring(status) +
+                             L" (port in use, address not local, or insufficient rights)";
+                }
+                break;
+            }
+        }
 
         running_.store(true);
         listener_ = std::thread(&McpServer::ListenerThreadMain, this);
@@ -950,8 +1013,12 @@ void McpServer::ListenerThreadMain()
             return;
         }
 
+        // Loopback-only mode enforces a strict loopback Host (DNS-rebinding
+        // defense). When network exposure is opted in (--bind), any Host is
+        // accepted; the bearer token plus the Origin rejection below remain the
+        // barrier (non-browser MCP clients send no Origin).
         std::string host = KnownHeader(request, HttpHeaderHost);
-        if (!IsLoopbackHost(host))
+        if (config_.BindAddress.empty() && !IsLoopbackHost(host))
         {
             sendResponse(requestId, 403, "Forbidden", L"");
             return;

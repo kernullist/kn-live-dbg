@@ -192,6 +192,16 @@ elevated 커널 RW 도구를 잠재적으로 적대적/인젝션된 LLM에 노�
 3. **Origin 검증**: Origin이 **존재하고** 화이트리스트에 없으면 403. (주의: Origin 부재는 정상 비브라우저 클라이언트이므로 허용. "Origin 있으면 무조건 거부"는 적합 클라이언트를 깨뜨린다.)
 4. loopback은 인증 경계가 아니다(멀티유저/RDP 호스트에서 다른 로컬 사용자가 도달 가능). 실제 인증은 토큰이 담당.
 
+#### 5.1.1 옵트인 네트워크 바인드 (`--bind <addr>`, lab 전용)
+
+실무 제약: lab 테스트 VM이 **물리적으로 분리된 PC**에 있으면 loopback-only 리스너에 외부 Claude 호스트가 도달할 수 없다. 이를 위해 **명시 옵트인** 네트워크 노출을 둔다 — 기본값은 바뀌지 않는다.
+
+1. **기본은 그대로 loopback-only**(`BindAddress` 비어 있음): `127.0.0.1`+`[::1]`만 등록, Host 화이트리스트 엄격 적용. 안전 기본값 유지.
+2. **`mcp on <port> --bind <addr>`**: loopback URL은 그대로 두고 요청한 주소(`http://<addr>:<port>/mcp/`)를 **추가** 등록한다. `<addr>`는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0`/`*`/`+`(http.sys 강한 와일드카드 `+`로 매핑). http.sys가 비-loopback prefix를 예약하므로 **elevated/SYSTEM이면 별도 `netsh urlacl` 불필요**(loopback과 동일).
+3. **Host 검사 완화 + Origin 방어 유지**: 원격 모드에서는 임의 Host를 수용(원격 클라이언트의 Host가 곧 lab IP)하되, **Origin 거부(존재하는데 loopback authority가 아니면 403)는 그대로 둔다** → DNS-rebinding 방어는 바인드 모드와 무관하게 유효(비브라우저 MCP 클라이언트는 Origin 미전송이라 통과).
+4. **bearer 토큰이 유일한 장벽**이 된다(§5.2). 따라서 원격 노출 시 **방화벽으로 클라이언트 IP만 인바운드 허용**하고 **신뢰된 lab 세그먼트**에서만 쓰도록 콘솔에 경고를 출력한다. `0.0.0.0` 바인드 시 클라이언트가 어느 인터페이스 IP로 접속해야 하는지는 알 수 없어 URL에 `<this-host-ip>` 플레이스홀더를 찍는다.
+5. **위협 모델 변화**: loopback-only에서는 같은 호스트의 로컬 사용자만 도달 가능했으나, 원격 노출은 lab 세그먼트의 임의 호스트가 토큰만 알면 elevated 커널 RW에 도달 가능해진다. lab/격리망 외 사용 금지(라이브 EDR/AC 박스 절대 금지).
+
 ### 5.2 인증과 토큰 취급
 
 1. `mcp on`마다 **256-bit 랜덤 bearer 토큰**을 새로 발급, **상수 시간 비교**, 불일치 시 401+연결 종료.
@@ -380,6 +390,8 @@ Claude Code에서 `/mcp__knlivedbg__<prompt>` 슬래시 명령으로 노출. 읽
 
 ## 8. 클라이언트 설정
 
+> 실전 운영 절차(서버 기동, 원격 `--bind`, Claude 연결, 방화벽, 전체 툴/리소스/프롬프트 카탈로그, 트러블슈팅)는 별도 운영자 가이드 [`MCP_SETUP.md`](./MCP_SETUP.md)에 정리돼 있다. 아래는 설계 관점의 요약이다.
+
 ### 8.1 프로토콜 버전
 
 - baseline **2025-06-18**(structuredContent, elicitation, tool annotations, resource_link 모두 포함, Claude Code/Desktop 광범위 지원). 클라이언트가 제시하면 **2025-11-25**까지 negotiate. 실험적 async Tasks에 의존 금지.
@@ -389,13 +401,20 @@ Claude Code에서 `/mcp__knlivedbg__<prompt>` 슬래시 명령으로 노출. 읽
 
 ```bash
 # 권장: HTTP + 정적 토큰(이미 실행 중인 서버에 연결)
-claude mcp add --transport http knlivedbg http://127.0.0.1:8765/mcp \
+claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
+  --header "Authorization: Bearer YOUR_TOKEN"
+
+# 원격(분리된 PC의 lab VM): lab 호스트에서 `mcp on 51766 --bind 192.168.56.10`로 띄운 뒤
+# 클라이언트 PC에서 lab IP로 연결. `mcp on`이 찍어주는 정확한 url/token을 그대로 사용.
+claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
   --header "Authorization: Bearer YOUR_TOKEN"
 
 # stdio 전용 호스트용 별도 무상태 브리지(라이브 프로세스를 직접 노출하지 않음)
 claude mcp add --transport stdio knlivedbg-bridge -- \
-  npx -y mcp-remote http://127.0.0.1:8765/mcp --header "Authorization: Bearer YOUR_TOKEN"
+  npx -y mcp-remote http://127.0.0.1:51766/mcp --header "Authorization: Bearer YOUR_TOKEN"
 ```
+
+원격 바인드 시(§5.1.1): bearer 토큰이 유일한 장벽이므로 **방화벽에서 클라이언트 IP만 인바운드 허용**하고 신뢰된 lab 세그먼트에서만 사용. `--bind 0.0.0.0`은 모든 인터페이스에 열리니 가능하면 구체 IP를 지정.
 
 `.mcp.json` (단, 토큰은 env 인다이렉션 — committable 파일에 평문 금지):
 
@@ -404,7 +423,7 @@ claude mcp add --transport stdio knlivedbg-bridge -- \
   "mcpServers": {
     "knlivedbg": {
       "type": "http",
-      "url": "http://127.0.0.1:8765/mcp",
+      "url": "http://127.0.0.1:51766/mcp",
       "headers": { "Authorization": "Bearer ${KNLIVEDBG_TOKEN}" }
     }
   }
