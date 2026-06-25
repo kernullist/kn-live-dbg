@@ -6133,11 +6133,79 @@ static bool ReadSparsePhysicalMemory(
     return ok;
 }
 
+// Serialize a sparse memory read (virtual or physical) for MCP structuredContent.
+// Unknown/unreadable bytes are emitted as "??" in the hex string and coalesced
+// into {offset,length} ranges so a model can tell holes from real zero bytes.
+static std::wstring BuildMcpMemoryReadJson(
+    const wchar_t* space,
+    uint64_t address,
+    uint64_t unit,
+    const MemoryReadView& view)
+{
+    static const wchar_t kMemHexDigits[] = L"0123456789abcdef";
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.memory-read.v1\"";
+    out += L",\"space\":" + mcpjson::Quote(space);
+    out += L",\"address\":" + mcpjson::Quote(HexTextWidth(address, 16, true));
+    out += L",\"unit\":" + std::to_wstring(unit);
+    out += L",\"length\":" + std::to_wstring(view.Bytes.size());
+    out += L",\"anyValid\":";
+    out += view.AnyValid ? L"true" : L"false";
+
+    size_t validCount = 0;
+    std::wstring hex;
+    hex.reserve(view.Bytes.size() * 2);
+    for (size_t i = 0; i < view.Bytes.size(); ++i)
+    {
+        bool known = (i < view.Valid.size()) && (view.Valid[i] != 0);
+        if (known)
+        {
+            hex.push_back(kMemHexDigits[(view.Bytes[i] >> 4) & 0xF]);
+            hex.push_back(kMemHexDigits[view.Bytes[i] & 0xF]);
+            ++validCount;
+        }
+        else
+        {
+            hex += L"??";
+        }
+    }
+    out += L",\"validBytes\":" + std::to_wstring(validCount);
+    out += L",\"bytes\":" + mcpjson::Quote(hex);
+
+    out += L",\"unreadable\":[";
+    bool firstRange = true;
+    size_t runStart = 0;
+    bool inRun = false;
+    for (size_t i = 0; i <= view.Bytes.size(); ++i)
+    {
+        bool known = (i < view.Bytes.size()) && (i < view.Valid.size()) && (view.Valid[i] != 0);
+        bool unknown = (i < view.Bytes.size()) && !known;
+        if (unknown && !inRun)
+        {
+            inRun = true;
+            runStart = i;
+        }
+        else if (!unknown && inRun)
+        {
+            if (!firstRange)
+            {
+                out += L",";
+            }
+            firstRange = false;
+            out += L"{\"offset\":" + std::to_wstring(runStart) +
+                   L",\"length\":" + std::to_wstring(i - runStart) + L"}";
+            inRun = false;
+        }
+    }
+    out += L"]}";
+    return out;
+}
+
 static void HandleDisplayCommand(
     const std::vector<std::wstring>& args,
     const DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     std::wstring error;
     std::wstring command = NormalizeInputCommand(args[0]);
@@ -6309,6 +6377,11 @@ static void HandleDisplayCommand(
         else
         {
             UnitDump(address, memory, unit, nullptr);
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildMcpMemoryReadJson(L"virtual", address, unit, memory);
         }
     } while (false);
 }
@@ -7387,7 +7460,8 @@ static bool ParseSnapshotNameOption(
     const std::vector<std::wstring>& args,
     size_t start,
     std::wstring* label,
-    bool* parseError)
+    bool* parseError,
+    bool* inMemoryOnly = nullptr)
 {
     bool ok = false;
 
@@ -7398,6 +7472,11 @@ static bool ParseSnapshotNameOption(
             break;
         }
 
+        if (inMemoryOnly != nullptr)
+        {
+            *inMemoryOnly = false;
+        }
+
         *parseError = false;
         size_t index = start;
         while (index < args.size())
@@ -7405,6 +7484,17 @@ static bool ParseSnapshotNameOption(
             std::wstring option = ToLower(args[index]);
             if (option == L"/all")
             {
+                ++index;
+                continue;
+            }
+            if (option == L"/memory")
+            {
+                // In-memory baseline only: skip the .json/.md disk writes so the
+                // MCP snapshot.capture stays genuinely read-only.
+                if (inMemoryOnly != nullptr)
+                {
+                    *inMemoryOnly = true;
+                }
                 ++index;
                 continue;
             }
@@ -7560,7 +7650,8 @@ static void HandleSnapshotCommand(
         {
             std::wstring label = L"baseline";
             bool parseError = false;
-            if (!ParseSnapshotNameOption(args, 2, &label, &parseError) || parseError)
+            bool inMemoryOnly = false;
+            if (!ParseSnapshotNameOption(args, 2, &label, &parseError, &inMemoryOnly) || parseError)
             {
                 break;
             }
@@ -7572,17 +7663,30 @@ static void HandleSnapshotCommand(
                 break;
             }
 
-            std::wstring jsonPath = BuildSnapshotDefaultPath(L"snapshots", document.TimestampUtc, label, L".json");
-            std::wstring reportPath = BuildSnapshotDefaultPath(L"reports", document.TimestampUtc, label + L"-baseline", L".md");
-            if (!FinalizeAndWriteSnapshot(&document, jsonPath, reportPath, true))
+            if (inMemoryOnly)
             {
-                break;
+                // Side-effect-free path: keep the baseline only in memory (used
+                // by kn://snapshot/current and snapshot.diff baseline mode).
+                PrintSnapshotSummary(document, true, false);
+                state.SnapshotBaseline = document;
+                state.HasSnapshotBaseline = true;
+                state.SnapshotBaselineJsonPath.clear();
+                state.SnapshotBaselineReportPath.clear();
             }
+            else
+            {
+                std::wstring jsonPath = BuildSnapshotDefaultPath(L"snapshots", document.TimestampUtc, label, L".json");
+                std::wstring reportPath = BuildSnapshotDefaultPath(L"reports", document.TimestampUtc, label + L"-baseline", L".md");
+                if (!FinalizeAndWriteSnapshot(&document, jsonPath, reportPath, true))
+                {
+                    break;
+                }
 
-            state.SnapshotBaseline = document;
-            state.HasSnapshotBaseline = true;
-            state.SnapshotBaselineJsonPath = jsonPath;
-            state.SnapshotBaselineReportPath = reportPath;
+                state.SnapshotBaseline = document;
+                state.HasSnapshotBaseline = true;
+                state.SnapshotBaselineJsonPath = jsonPath;
+                state.SnapshotBaselineReportPath = reportPath;
+            }
 
             if (structuredJsonOut != nullptr)
             {
@@ -7631,7 +7735,8 @@ static bool ParseDiffOptions(
     size_t start,
     DebuggerState& state,
     SnapshotDiffOptions* options,
-    std::wstring* error)
+    std::wstring* error,
+    bool* inMemoryOnly = nullptr)
 {
     bool ok = false;
 
@@ -7646,12 +7751,28 @@ static bool ParseDiffOptions(
             break;
         }
 
+        if (inMemoryOnly != nullptr)
+        {
+            *inMemoryOnly = false;
+        }
+
         *options = SnapshotDiffOptions{};
         size_t index = start;
         bool parseError = false;
         while (index < args.size())
         {
             std::wstring option = ToLower(args[index]);
+            if (option == L"/memory")
+            {
+                // In-memory diff: skip the current-snapshot and diff report
+                // file writes so the MCP snapshot.diff path stays read-only.
+                if (inMemoryOnly != nullptr)
+                {
+                    *inMemoryOnly = true;
+                }
+                ++index;
+                continue;
+            }
             if (option == L"/summary")
             {
                 options->SummaryOnly = true;
@@ -7772,6 +7893,7 @@ static void HandleDiffCommand(
         SnapshotDocument oldSnapshot = {};
         SnapshotDocument newSnapshot = {};
         SnapshotDiffOptions options = {};
+        bool inMemoryOnly = false;
         size_t optionStart = 0;
 
         if (target == L"baseline")
@@ -7787,7 +7909,7 @@ static void HandleDiffCommand(
                 break;
             }
 
-            if (!ParseDiffOptions(args, 2, state, &options, &error))
+            if (!ParseDiffOptions(args, 2, state, &options, &error, &inMemoryOnly))
             {
                 std::wcerr << L"!diff baseline failed: " << error << L"\n";
                 break;
@@ -7802,17 +7924,20 @@ static void HandleDiffCommand(
                 break;
             }
 
-            newSnapshot.JsonPath = BuildSnapshotDefaultPath(L"snapshots", newSnapshot.TimestampUtc, label, L".json");
-            newSnapshot.ReportPath = BuildSnapshotDefaultPath(L"reports", newSnapshot.TimestampUtc, label + L"-snapshot", L".md");
-            if (!WriteSnapshotJsonFile(newSnapshot.JsonPath, newSnapshot, &error))
+            if (!inMemoryOnly)
             {
-                std::wcerr << L"!diff current json failed: " << error << L"\n";
-                break;
-            }
-            if (!WriteSnapshotTextFile(newSnapshot.ReportPath, BuildSnapshotBaselineMarkdown(newSnapshot), &error))
-            {
-                std::wcerr << L"!diff current report failed: " << error << L"\n";
-                break;
+                newSnapshot.JsonPath = BuildSnapshotDefaultPath(L"snapshots", newSnapshot.TimestampUtc, label, L".json");
+                newSnapshot.ReportPath = BuildSnapshotDefaultPath(L"reports", newSnapshot.TimestampUtc, label + L"-snapshot", L".md");
+                if (!WriteSnapshotJsonFile(newSnapshot.JsonPath, newSnapshot, &error))
+                {
+                    std::wcerr << L"!diff current json failed: " << error << L"\n";
+                    break;
+                }
+                if (!WriteSnapshotTextFile(newSnapshot.ReportPath, BuildSnapshotBaselineMarkdown(newSnapshot), &error))
+                {
+                    std::wcerr << L"!diff current report failed: " << error << L"\n";
+                    break;
+                }
             }
         }
         else
@@ -7834,7 +7959,7 @@ static void HandleDiffCommand(
                 break;
             }
             optionStart = 3;
-            if (!ParseDiffOptions(args, optionStart, state, &options, &error))
+            if (!ParseDiffOptions(args, optionStart, state, &options, &error, &inMemoryOnly))
             {
                 std::wcerr << L"!diff failed: " << error << L"\n";
                 break;
@@ -7848,12 +7973,15 @@ static void HandleDiffCommand(
             break;
         }
 
-        std::wstring reportPath = BuildSnapshotDefaultPath(L"reports", SnapshotCurrentUtcTimestamp(), newSnapshot.Label + L"-diff", L".md");
-        diff.ReportPath = reportPath;
-        if (!WriteSnapshotTextFile(reportPath, BuildSnapshotDiffMarkdown(diff, options), &error))
+        if (!inMemoryOnly)
         {
-            std::wcerr << L"!diff report failed: " << error << L"\n";
-            break;
+            std::wstring reportPath = BuildSnapshotDefaultPath(L"reports", SnapshotCurrentUtcTimestamp(), newSnapshot.Label + L"-diff", L".md");
+            diff.ReportPath = reportPath;
+            if (!WriteSnapshotTextFile(reportPath, BuildSnapshotDiffMarkdown(diff, options), &error))
+            {
+                std::wcerr << L"!diff report failed: " << error << L"\n";
+                break;
+            }
         }
 
         PrintSnapshotDiff(diff, options);
@@ -8811,7 +8939,8 @@ static void HandleProcessContextCommand(
 static void HandlePhysicalDisplayCommand(
     const std::vector<std::wstring>& args,
     const DebuggerState& state,
-    DeviceClient& device)
+    DeviceClient& device,
+    std::wstring* structuredJsonOut = nullptr)
 {
     std::wstring error;
     std::wstring command = NormalizeInputCommand(args[0]);
@@ -8861,6 +8990,11 @@ static void HandlePhysicalDisplayCommand(
         else
         {
             UnitDump(physicalAddress, memory, unit, nullptr);
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildMcpMemoryReadJson(L"physical", physicalAddress, unit, memory);
         }
     } while (false);
 }
@@ -28769,6 +28903,10 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"etw.integrity" ||
         tool == L"nmi.list" ||
         tool == L"fwtable.list" ||
+        // firmwaretable.list is an internal AI-planner alias only; it is NOT an
+        // MCP tool name (kTools advertises just fwtable.list, and FindTool only
+        // matches kTools), so MCP clients cannot reach it. Same intent as the
+        // assistant.answer planner verb being excluded from kTools.
         tool == L"firmwaretable.list" ||
         tool == L"pool.find" ||
         tool == L"address.inspect" ||
@@ -28786,6 +28924,14 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"pool.scan_pe" ||
         tool == L"hunt.run" ||
         tool == L"snapshot.capture" ||
+        tool == L"snapshot.diff" ||
+        tool == L"memory.read_virtual" ||
+        tool == L"memory.read_physical" ||
+        tool == L"memory.search" ||
+        tool == L"memory.translate" ||
+        tool == L"memory.probe" ||
+        tool == L"code.disasm" ||
+        tool == L"symbol.search" ||
         tool == L"assistant.answer")
     {
         supported = true;
@@ -28893,6 +29039,38 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"snapshot.capture")
     {
         allowed = {L"name"};
+    }
+    else if (tool == L"snapshot.diff")
+    {
+        allowed = {L"old", L"new", L"domain", L"risk", L"limit", L"summary"};
+    }
+    else if (tool == L"memory.read_virtual")
+    {
+        allowed = {L"address", L"va", L"symbol", L"width", L"unit", L"count", L"length", L"len", L"process", L"pid"};
+    }
+    else if (tool == L"memory.read_physical")
+    {
+        allowed = {L"physical_address", L"address", L"phys", L"width", L"unit", L"count", L"length", L"len"};
+    }
+    else if (tool == L"memory.search")
+    {
+        allowed = {L"address", L"va", L"symbol", L"length", L"len", L"range", L"width", L"value", L"values", L"pattern"};
+    }
+    else if (tool == L"memory.translate")
+    {
+        allowed = {L"address", L"va", L"symbol", L"process", L"pid", L"cr3", L"dtb", L"directory_table_base", L"length", L"len"};
+    }
+    else if (tool == L"memory.probe")
+    {
+        allowed = {L"address", L"va", L"symbol", L"length", L"len", L"range"};
+    }
+    else if (tool == L"code.disasm")
+    {
+        allowed = {L"address", L"va", L"symbol", L"count", L"function"};
+    }
+    else if (tool == L"symbol.search")
+    {
+        allowed = {L"mask", L"pattern", L"symbol", L"module", L"limit", L"max"};
     }
 
     return ValidateJsonObjectKeys(argsJson, allowed, tool + L" args", error);
@@ -29029,7 +29207,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|pool.scan_pe|hunt.run|snapshot.capture|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|pool.scan_pe|hunt.run|snapshot.capture|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -29059,6 +29237,13 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- pool.scan_pe: hunt PE images (intact or signature-wiped) staged in kernel big pool. Args: optional tag, limit strings; optional boolean suspicious.\n";
     stream << L"- hunt.run: whole-system user-mode anomaly hunt. Args: optional mode string quick or deep.\n";
     stream << L"- snapshot.capture: capture a same-boot evidence baseline. Args: optional name string.\n";
+    stream << L"- snapshot.diff: diff the session baseline against a fresh live capture (or two snapshot files). Args: optional old, new, domain, risk, limit.\n";
+    stream << L"- memory.read_virtual: read bytes at a virtual address. Args: address|va|symbol, optional width (1|2|4|8), count, process.\n";
+    stream << L"- memory.read_physical: read bytes at a physical address. Args: physical_address, optional width (1|2|4|8), count.\n";
+    stream << L"- memory.search: search a virtual range for an integer value. Args: address, length, value, optional width (1|2|4|8).\n";
+    stream << L"- memory.translate: translate a virtual address to physical (vtop). Args: address|va|symbol, optional process/pid or cr3, length.\n";
+    stream << L"- memory.probe: test whether an address is readable/writable. Args: address|va|symbol, optional length.\n";
+    stream << L"- symbol.search: enumerate symbols by wildcard. Args: mask (e.g. nt!Etw*), optional limit.\n";
     stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
     stream << L"Rules:\n";
     stream << L"- Use only these tools. Do not emit debugger commands.\n";
@@ -29142,6 +29327,29 @@ static std::wstring BuildMcpProcessListJson(const std::vector<DmlProcessRecord>&
         {
             out += L",\"createTime\":" + std::to_wstring(r.CreateTime);
         }
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}
+
+// Serialize wildcard symbol-search matches for MCP structuredContent.
+static std::wstring BuildMcpSymbolListJson(const std::vector<SymbolMatchInfo>& matches, bool truncated)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.symbol-list.v1\",\"count\":" + std::to_wstring(matches.size());
+    out += L",\"truncated\":";
+    out += truncated ? L"true" : L"false";
+    out += L",\"symbols\":[";
+    for (size_t i = 0; i < matches.size(); ++i)
+    {
+        const SymbolMatchInfo& m = matches[i];
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += L"{\"address\":" + mcpjson::Quote(HexTextWidth(m.Address, 16, true));
+        out += L",\"size\":" + std::to_wstring(m.Size);
+        out += L",\"name\":" + mcpjson::Quote(m.Name);
         out += L"}";
     }
     out += L"]}";
@@ -30786,6 +30994,600 @@ static bool ExecuteAiCapabilityAddressInspect(
     return ok;
 }
 
+// Maps a width arg (1/2/4/8 or b/w/d/q) to the native display token. Returns
+// nullptr for an unrecognized width. virtualSpace selects d* vs !d* tokens.
+static const wchar_t* MemoryReadWidthToken(const std::wstring& widthText, bool virtualSpace)
+{
+    if (widthText.empty() || widthText == L"1" || widthText == L"b")
+    {
+        return virtualSpace ? L"db" : L"!db";
+    }
+    if (widthText == L"2" || widthText == L"w")
+    {
+        return virtualSpace ? L"dw" : L"!dw";
+    }
+    if (widthText == L"4" || widthText == L"d")
+    {
+        return virtualSpace ? L"dd" : L"!dd";
+    }
+    if (widthText == L"8" || widthText == L"q")
+    {
+        return virtualSpace ? L"dq" : L"!dq";
+    }
+    return nullptr;
+}
+
+static bool ExecuteAiCapabilityMemoryReadVirtual(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_virtual requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &address))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_virtual requires address, va, or symbol";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"address", error))
+        {
+            break;
+        }
+
+        std::wstring widthText;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"width", L"unit"}, &widthText);
+        const wchar_t* token = MemoryReadWidthToken(widthText, true);
+        if (token == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_virtual width must be 1, 2, 4, or 8";
+            }
+            break;
+        }
+
+        std::wstring pid;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"process", L"pid"}, &pid))
+        {
+            if (!ValidateAiCapabilityScalarText(pid, L"process", error))
+            {
+                break;
+            }
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(token);
+        if (!pid.empty())
+        {
+            args.push_back(L"/process");
+            args.push_back(pid);
+        }
+        args.push_back(address);
+
+        std::wstring countText;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"count", L"length", L"len"}, &countText))
+        {
+            if (!ValidateAiCapabilityScalarText(countText, L"count", error))
+            {
+                break;
+            }
+            args.push_back(countText);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": memory.read_virtual\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleDisplayCommand(args, state, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityMemoryReadPhysical(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_physical requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"physical_address", L"address", L"phys"}, &address))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_physical requires physical_address";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"physical_address", error))
+        {
+            break;
+        }
+
+        std::wstring widthText;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"width", L"unit"}, &widthText);
+        const wchar_t* token = MemoryReadWidthToken(widthText, false);
+        if (token == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_physical width must be 1, 2, 4, or 8";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(token);
+        args.push_back(address);
+
+        std::wstring countText;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"count", L"length", L"len"}, &countText))
+        {
+            if (!ValidateAiCapabilityScalarText(countText, L"count", error))
+            {
+                break;
+            }
+            args.push_back(countText);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": memory.read_physical\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandlePhysicalDisplayCommand(args, state, device, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilitySymbolSearch(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring mask;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"mask", L"pattern", L"symbol"}, &mask))
+        {
+            if (error != nullptr)
+            {
+                *error = L"symbol.search requires mask, pattern, or symbol";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(mask, L"mask", error))
+        {
+            break;
+        }
+
+        size_t limit = 512;
+        std::wstring limitText;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"limit", L"max"}, &limitText))
+        {
+            uint64_t parsed = 0;
+            if (ParseUnsigned(limitText, state.NumberBase, &parsed) && parsed > 0 && parsed <= 100000)
+            {
+                limit = static_cast<size_t>(parsed);
+            }
+        }
+
+        std::vector<SymbolMatchInfo> matches;
+        if (!symbols.EnumerateSymbols(mask, limit, &matches, error))
+        {
+            break;
+        }
+        bool truncated = (limit != 0 && matches.size() >= limit);
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": symbol.search\n";
+        std::wcout << L"tool> x " << mask << L"\n";
+        for (const SymbolMatchInfo& m : matches)
+        {
+            std::wcout << HexTextWidth(m.Address, 16, true) << L" " << m.Name << L"\n";
+        }
+        std::wcout << L"symbols=" << matches.size() << (truncated ? L" truncated=yes" : L"") << L"\n";
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildMcpSymbolListJson(matches, truncated);
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+// memory.search / memory.translate / memory.probe / snapshot.diff are Tier-A:
+// they reuse the native handler's textual output as MCP content (no structured
+// builder yet). Failures surface via isError (device pre-check -> ok=false, or
+// handler stderr captured by DispatchMcpRequest).
+
+static bool ExecuteAiCapabilityMemorySearch(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    (void)structuredJsonOut;
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.search requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address;
+        std::wstring length;
+        std::wstring value;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &address) ||
+            !ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"length", L"len", L"range"}, &length) ||
+            !ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"value", L"values", L"pattern"}, &value))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.search requires address, length, and value";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"address", error) ||
+            !ValidateAiCapabilityScalarText(length, L"length", error) ||
+            !ValidateAiCapabilityScalarText(value, L"value", error))
+        {
+            break;
+        }
+
+        std::wstring widthFlag;
+        std::wstring widthText;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"width", L"unit"}, &widthText))
+        {
+            if (widthText == L"1" || widthText == L"b")
+            {
+                widthFlag = L"-b";
+            }
+            else if (widthText == L"2" || widthText == L"w")
+            {
+                widthFlag = L"-w";
+            }
+            else if (widthText == L"4" || widthText == L"d")
+            {
+                widthFlag = L"-d";
+            }
+            else if (widthText == L"8" || widthText == L"q")
+            {
+                widthFlag = L"-q";
+            }
+            else
+            {
+                if (error != nullptr)
+                {
+                    *error = L"memory.search width must be 1, 2, 4, or 8";
+                }
+                break;
+            }
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"s");
+        if (!widthFlag.empty())
+        {
+            args.push_back(widthFlag);
+        }
+        args.push_back(address);
+        args.push_back(length);
+        args.push_back(value);
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": memory.search\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleSearch(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityMemoryTranslate(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    (void)structuredJsonOut;
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.translate requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &address))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.translate requires address, va, or symbol";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"address", error))
+        {
+            break;
+        }
+
+        std::wstring cr3;
+        std::wstring pid;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"cr3", L"dtb", L"directory_table_base"}, &cr3);
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"process", L"pid"}, &pid);
+        if (!cr3.empty() && !ValidateAiCapabilityScalarText(cr3, L"cr3", error))
+        {
+            break;
+        }
+        if (!pid.empty() && !ValidateAiCapabilityScalarText(pid, L"process", error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"vtop");
+        if (!cr3.empty())
+        {
+            args.push_back(L"/cr3");
+            args.push_back(cr3);
+        }
+        else if (!pid.empty())
+        {
+            args.push_back(L"/process");
+            args.push_back(pid);
+        }
+        args.push_back(address);
+
+        std::wstring length;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"length", L"len"}, &length))
+        {
+            if (!ValidateAiCapabilityScalarText(length, L"length", error))
+            {
+                break;
+            }
+            args.push_back(length);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": memory.translate\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleTranslateVirtualCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityMemoryProbe(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    (void)structuredJsonOut;
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.probe requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring addrText;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &addrText))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.probe requires address, va, or symbol";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(addrText, L"address", error))
+        {
+            break;
+        }
+
+        uint64_t address = 0;
+        if (!ParseAddressOrSymbol(symbols, state, addrText, &address, error))
+        {
+            break;
+        }
+
+        uint64_t length = 1;
+        std::wstring lengthText;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"length", L"len", L"range"}, &lengthText))
+        {
+            if (!ParseUnsigned(lengthText, state.NumberBase, &length))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid memory.probe length";
+                }
+                break;
+            }
+        }
+        if (!IsSafeTransferSize(length))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.probe size exceeds native transfer limit";
+            }
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": memory.probe\n";
+        std::wcout << L"tool> query " << addrText << L" " << length << L"\n";
+        std::wstring summary;
+        if (!device.QueryAddress(address, static_cast<uint32_t>(length), &summary, error))
+        {
+            break;
+        }
+        std::wcout << summary << L"\n";
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilitySnapshotDiff(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    (void)structuredJsonOut;
+    bool ok = false;
+
+    do
+    {
+        std::wstring oldPath;
+        std::wstring newPath;
+        bool fileMode = ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"old"}, &oldPath) &&
+                        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"new"}, &newPath);
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!diff");
+        if (fileMode)
+        {
+            if (!ValidateAiCapabilityScalarText(oldPath, L"old", error) ||
+                !ValidateAiCapabilityScalarText(newPath, L"new", error))
+            {
+                break;
+            }
+            args.push_back(oldPath);
+            args.push_back(newPath);
+        }
+        else
+        {
+            if (!device.IsOpen())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"snapshot.diff baseline mode requires the KnLiveDbg.sys driver device to be open";
+                }
+                break;
+            }
+            if (!state.HasSnapshotBaseline)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"snapshot.diff has no session baseline; call snapshot.capture first (or pass old/new files)";
+                }
+                break;
+            }
+            args.push_back(L"baseline");
+        }
+
+        std::wstring domain;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"domain"}, &domain) &&
+            ValidateAiCapabilityScalarText(domain, L"domain", error))
+        {
+            args.push_back(L"/domain");
+            args.push_back(domain);
+        }
+        std::wstring risk;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"risk"}, &risk) &&
+            ValidateAiCapabilityScalarText(risk, L"risk", error))
+        {
+            args.push_back(L"/risk");
+            args.push_back(risk);
+        }
+        std::wstring limit;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"limit"}, &limit) &&
+            ValidateAiCapabilityScalarText(limit, L"limit", error))
+        {
+            args.push_back(L"/limit");
+            args.push_back(limit);
+        }
+        std::wstring summaryText;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"summary"}, &summaryText))
+        {
+            std::wstring lowered = ToLower(summaryText);
+            if (lowered == L"true" || lowered == L"1" || lowered == L"yes")
+            {
+                args.push_back(L"/summary");
+            }
+        }
+
+        // MCP path is read-only: compute the diff in memory, no disk artifacts.
+        args.push_back(L"/memory");
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": snapshot.diff\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleDiffCommand(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static std::wstring BuildMcpWnfDecodedJson(const WnfStateNameDecoded& d)
 {
     std::wstring out = L"{\"schema\":\"kn-live-dbg.wnf-decode.v1\"";
@@ -31693,6 +32495,9 @@ static bool ExecuteAiCapabilitySnapshotCapture(
         std::vector<std::wstring> args;
         args.push_back(L"!snapshot");
         args.push_back(L"baseline");
+        // MCP path is read-only: capture the baseline in memory only (no disk
+        // writes), so the readOnlyHint annotation is honest.
+        args.push_back(L"/memory");
 
         std::wstring name;
         if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"name"}, &name))
@@ -31846,6 +32651,34 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"snapshot.capture")
             {
                 stepOk = ExecuteAiCapabilitySnapshotCapture(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"memory.read_virtual")
+            {
+                stepOk = ExecuteAiCapabilityMemoryReadVirtual(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"memory.read_physical")
+            {
+                stepOk = ExecuteAiCapabilityMemoryReadPhysical(step, state, device, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"symbol.search")
+            {
+                stepOk = ExecuteAiCapabilitySymbolSearch(step, state, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"memory.search")
+            {
+                stepOk = ExecuteAiCapabilityMemorySearch(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"memory.translate")
+            {
+                stepOk = ExecuteAiCapabilityMemoryTranslate(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"memory.probe")
+            {
+                stepOk = ExecuteAiCapabilityMemoryProbe(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"snapshot.diff")
+            {
+                stepOk = ExecuteAiCapabilitySnapshotDiff(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"assistant.answer")
             {
@@ -33508,18 +34341,6 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
 // wmain thread) so DeviceClient and DbgHelp/DIA stay strictly serialized.
 // ---------------------------------------------------------------------------
 
-static bool IsMcpWriteToolName(const std::wstring& name)
-{
-    return name == L"memory.write_virtual" ||
-        name == L"memory.write_physical" ||
-        name == L"memory.fill" ||
-        name == L"memory.move" ||
-        name == L"type.set_field" ||
-        name == L"process.set_protection" ||
-        name == L"dump.raw" ||
-        name == L"dump.pe";
-}
-
 static bool McpGetArg(const std::wstring& argsJson, const wchar_t* key, std::wstring* value)
 {
     return ExtractJsonStringValue(argsJson, key, value);
@@ -34110,9 +34931,10 @@ static McpEngineResult DispatchMcpRequest(
         return result;
     }
 
-    // Tool call.
+    // Tool call. Write-ness is decided by the kTools table (single source of
+    // truth) via the server, not a parallel hardcoded list.
     const std::wstring& tool = request.Name;
-    if (IsMcpWriteToolName(tool))
+    if (g_McpServer.IsWriteTool(tool))
     {
         if (!g_McpServer.AllowWrite())
         {
@@ -34121,6 +34943,71 @@ static McpEngineResult DispatchMcpRequest(
             return result;
         }
         return DispatchMcpWriteTool(tool, request.ArgumentsJson, state, dbgeng, device, service, symbols, ai, aiState);
+    }
+
+    if (tool == L"code.disasm")
+    {
+        // Disassembly needs the DbgEng backend handle, which the read-only
+        // capability executor path does not carry; handle it here where dbgeng
+        // is in scope. Output is Tier-A captured text (no structured builder).
+        std::wstring argsJson = request.ArgumentsJson.empty() ? std::wstring(L"{}") : request.ArgumentsJson;
+        std::wstring argErr;
+        if (!ValidateAiCapabilityToolArgKeys(L"code.disasm", argsJson, &argErr))
+        {
+            result.IsError = true;
+            result.Text = L"invalid tool arguments: " + argErr;
+            return result;
+        }
+
+        std::wstring address;
+        if (!ExtractAiCapabilityScalarAlias(argsJson, {L"address", L"symbol", L"va"}, &address))
+        {
+            result.IsError = true;
+            result.Text = L"code.disasm requires address or symbol";
+            return result;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"address", &argErr))
+        {
+            result.IsError = true;
+            result.Text = argErr;
+            return result;
+        }
+
+        std::wstring funcText;
+        bool isFunction = false;
+        if (ExtractAiCapabilityScalarAlias(argsJson, {L"function"}, &funcText))
+        {
+            std::wstring lowered = ToLower(funcText);
+            isFunction = (lowered == L"true" || lowered == L"1" || lowered == L"yes");
+        }
+
+        std::vector<std::wstring> dargs;
+        dargs.push_back(isFunction ? L"uf" : L"u");
+        dargs.push_back(address);
+        std::wstring countText;
+        if (ExtractAiCapabilityScalarAlias(argsJson, {L"count"}, &countText) &&
+            ValidateAiCapabilityScalarText(countText, L"count", &argErr))
+        {
+            dargs.push_back(countText);
+        }
+
+        std::wstring line = JoinArgs(dargs, 0);
+        std::wstring captured;
+        std::wstring capturedErr;
+        {
+            ScopedWideStreamCapture capture(&captured, &capturedErr);
+            PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+            std::wcout << L": code.disasm\n";
+            std::wcout << L"tool> " << line << L"\n";
+            HandleUnassembleCommand(dargs, line, state, device, dbgeng, symbols);
+        }
+        result.Text = captured;
+        if (!capturedErr.empty())
+        {
+            result.Text += capturedErr;
+            result.IsError = true;
+        }
+        return result;
     }
 
     // Read-only tool: reuse the capability validator + executor verbatim by
@@ -34161,10 +35048,16 @@ static McpEngineResult DispatchMcpRequest(
     }
     else
     {
+        // No structuredContent. Every read tool emits structured JSON on
+        // success, so an empty structured result with captured stderr means the
+        // underlying handler failed internally (device not open, scanner error)
+        // even if the executor returned ok. Surface that as an MCP error so a
+        // client keying on isError does not treat a failed scan as success.
         result.Text = captured;
         if (!capturedErr.empty())
         {
             result.Text += capturedErr;
+            result.IsError = true;
         }
     }
     if (!ok)
@@ -34311,6 +35204,18 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             {
                 config.AllowWrite = true;
             }
+            else if (args[i] == L"--bind")
+            {
+                if (i + 1 < args.size())
+                {
+                    config.BindAddress = args[i + 1];
+                    ++i;
+                }
+            }
+            else if (args[i].rfind(L"--bind=", 0) == 0)
+            {
+                config.BindAddress = args[i].substr(7);
+            }
             else
             {
                 unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
@@ -34332,14 +35237,41 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             return;
         }
 
-        std::wstring url = L"http://127.0.0.1:" + std::to_wstring(g_McpServer.Port()) + L"/mcp";
-        std::wcout << L"MCP server started (loopback Streamable HTTP).\n";
-        std::wcout << L"  url   : " << url << L"\n";
+        bool remoteBind = !config.BindAddress.empty();
+        bool wildcardBind = remoteBind && (config.BindAddress == L"0.0.0.0" ||
+                                           config.BindAddress == L"*" ||
+                                           config.BindAddress == L"+");
+
+        // Loopback URL stays valid for local use. For a remote client, build a
+        // reachable URL from the bound address; for a wildcard bind we cannot
+        // know which interface IP the client should use, so emit a placeholder.
+        std::wstring loopUrl = L"http://127.0.0.1:" + std::to_wstring(g_McpServer.Port()) + L"/mcp";
+        std::wstring remoteHost = wildcardBind ? L"<this-host-ip>" : config.BindAddress;
+        std::wstring remoteUrl = L"http://" + remoteHost + L":" + std::to_wstring(g_McpServer.Port()) + L"/mcp";
+        std::wstring clientUrl = remoteBind ? remoteUrl : loopUrl;
+
+        std::wcout << L"MCP server started (" << (remoteBind ? L"NETWORK" : L"loopback")
+                   << L" Streamable HTTP).\n";
+        std::wcout << L"  url   : " << loopUrl << L"\n";
+        if (remoteBind)
+        {
+            std::wcout << L"  remote: " << remoteUrl << L"\n";
+        }
         std::wcout << L"  token : " << g_McpServer.Token() << L"\n";
         std::wcout << L"  write : " << (config.AllowWrite ? L"ENABLED (lab mode)" : L"disabled (read-only)") << L"\n";
         std::wcout << L"  audit : " << g_McpServer.AuditPath() << L"\n";
-        std::wcout << L"  claude code: claude mcp add --transport http knlivedbg " << url
+        std::wcout << L"  claude code: claude mcp add --transport http knlivedbg " << clientUrl
                    << L" --header \"Authorization: Bearer " << g_McpServer.Token() << L"\"\n";
+        if (remoteBind)
+        {
+            std::wcout << L"  WARNING: this elevated kernel read/write endpoint is now reachable over the\n";
+            std::wcout << L"           network. The bearer token is the ONLY barrier. Restrict access with a\n";
+            std::wcout << L"           firewall rule (allow only the client IP) and use a trusted lab segment.\n";
+            if (wildcardBind)
+            {
+                std::wcout << L"           bound to ALL interfaces; replace <this-host-ip> with this PC's LAN IP.\n";
+            }
+        }
         if (config.AllowWrite)
         {
             std::wcout << L"  WARNING: write tools are open. Take a VM snapshot before LLM-driven write sessions.\n";
@@ -34368,7 +35300,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     }
     else
     {
-        std::wcout << L"MCP server: stopped. usage: mcp on [port] [--allow-write] | mcp off | mcp status\n";
+        std::wcout << L"MCP server: stopped. usage: mcp on [port] [--allow-write] [--bind <addr>] | mcp off | mcp status\n";
     }
 }
 

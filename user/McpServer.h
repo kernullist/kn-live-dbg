@@ -65,6 +65,12 @@ struct McpServerConfig
     // at "mcp on"; logging is always on while the server runs (independent of
     // the operator's `ai audit` setting).
     std::wstring AuditPath;
+    // Empty = loopback-only (127.0.0.1/[::1]) and strict loopback Host check
+    // (the secure default). A concrete IP, or "0.0.0.0"/"+"/"*" for all
+    // interfaces, opts into NETWORK exposure: the URL is also registered on
+    // that address and the Host check is relaxed (the bearer token + Origin
+    // rejection remain the barrier). Use only on a trusted lab segment.
+    std::wstring BindAddress;
 };
 
 class McpServer
@@ -91,6 +97,9 @@ public:
 
     bool IsRunning() const;
     bool AllowWrite() const;
+    // True if name is an advertised non-read-only (write) tool. The kTools table
+    // is the single source of truth for write-ness; the engine routes by this.
+    bool IsWriteTool(const std::wstring& name) const;
     uint16_t Port() const;
     std::wstring Token() const;
     std::wstring AuditPath() const;
