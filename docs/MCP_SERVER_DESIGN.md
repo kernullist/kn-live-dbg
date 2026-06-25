@@ -395,7 +395,7 @@ Claude Code에서 `/mcp__knlivedbg__<prompt>` 슬래시 명령으로 노출. 읽
 ### 8.1 프로토콜 버전
 
 - baseline **2025-06-18**(structuredContent, elicitation, tool annotations, resource_link 모두 포함, Claude Code/Desktop 광범위 지원). 클라이언트가 제시하면 **2025-11-25**까지 negotiate. 실험적 async Tasks에 의존 금지.
-- HTTP에서 init 이후 모든 요청에 `MCP-Protocol-Version` 헤더 요구: 없으면 서버가 2025-03-26으로 가정(structured/elicitation 상실), 미지원 값이면 **HTTP 400**.
+- HTTP에서 init 이후 모든 요청에 `MCP-Protocol-Version` 헤더 요구: 없으면 서버가 2025-03-26으로 가정(structured/elicitation 상실), 미지원 값이면 **HTTP 400**. *(계획 — 현재 v0 스캐폴드는 이 헤더를 검증하지 않음, §11.1 ④ 후속.)*
 
 ### 8.2 Claude Code
 

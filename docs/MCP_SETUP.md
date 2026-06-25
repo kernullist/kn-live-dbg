@@ -143,6 +143,7 @@ knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 
 - 읽기 전용(기본): 엔진 진입 시 `SetWriteMode(false)`로 **커널 write 플래그 자체를 비무장**한다. write 툴은 등록되지 않으며, 호출 시 `writes are disabled; start the MCP server with --allow-write (lab mode)`로 거부된다.
 - `--allow-write`: write 툴 8종이 노출되고 `SetWriteMode(true)`로 무장된다. 모든 write는 preflight/backup/verify-diff/audit 레일을 거친다(인터랙티브 확인은 생략).
+- **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. **토큰이 새로 발급되므로 클라이언트 헤더도 갱신**해야 한다.
 - **권고**: write 세션 전 VM 스냅샷을 찍고, 분석 baseline(`snapshot.capture`)을 캡처하라. 격리 VM 전용이며 라이브 EDR/AC 박스에서는 절대 쓰지 않는다.
 
 ---
@@ -244,7 +245,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 ### 6.1 읽기 툴 (35종, `--allow-write` 불필요)
 
-| 툴 | 설명 | 주요 인자(모두 선택) |
+| 툴 | 설명 | 주요 인자 (별도 표기 외 모두 선택) |
 |-----|------|----------------------|
 | `process.find` | 이미지명/PID/EPROCESS로 프로세스 찾기 | `image`, `pid`, `eprocess` |
 | `process.describe` | `_EPROCESS` 기술(PID/DTB/PEB/threads/parent) | `source`, `pid`, `eprocess`, `fields` |
@@ -252,8 +253,8 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `callbacks.list` | 커널 콜백 열거(object/registry/process/thread/imageload/minifilter) | `scope`, `module` |
 | `wfp.list` | WFP provider/sublayer/callout/filter/layer 열거 | `scope`, `module`, `provider`, `layer` |
 | `alpc.list` | ALPC 포트/연결 열거 | `scope`, `name`, `pid` |
-| `vad.list` | VAD 열거(W+X/private/hidden-PTE/DKOM 체크) | `pid`, `image`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
-| `threads.list` | 스레드/시작주소/APC/스택 증거 | `pid`, `image`, `apc`, `stacks`, `limit` |
+| `vad.list` | VAD 열거(W+X/private/hidden-PTE/DKOM 체크) | `pid`, `image`, `eprocess`, `exec`, `private`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
+| `threads.list` | 스레드/시작주소/APC/스택 증거 | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
 | `etw.integrity` | ETW logger/GetCpuClock 무결성(InfinityHook) | (없음) |
 | `nmi.list` | 등록된 NMI 콜백 열거 | `scope` |
 | `fwtable.list` | 펌웨어 테이블 provider 열거 | `scope`, `module`, `provider`, `signature` |
@@ -275,12 +276,12 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `snapshot.capture` | 동일 부팅 증거 baseline 캡처(in-memory, 디스크 미기록) | `name` |
 | `snapshot.diff` | 세션 baseline과 라이브 캡처 비교(또는 두 스냅샷 파일) | `old`, `new`, `domain`, `risk`, `limit`, `summary` |
 | `memory.read_virtual` | 가상주소 바이트 읽기(db/dq) — hex + unreadable 마스크(structured) | `address`/`va`/`symbol`, `width`(1/2/4/8), `count`, `process` |
-| `memory.read_physical` | 물리주소 바이트 읽기(!db/!dq) — 후킹된 VA 매핑 우회(structured) | `physical_address`, `width`, `count` |
-| `memory.search` | VA 범위에서 정수 값/패턴 검색(s) | `address`, `length`, `value`, `width` |
+| `memory.read_physical` | 물리주소 바이트 읽기(!db/!dq) — 후킹된 VA 매핑 우회(structured) | `physical_address`(필수), `width`, `count` |
+| `memory.search` | VA 범위에서 정수 값/패턴 검색(s) | `address`(필수), `length`(필수), `value`(필수), `width` |
 | `memory.translate` | VA→PA 변환 + 페이지테이블 워크(vtop), 프로세스별 DTB | `address`/`va`/`symbol`, `process`/`cr3`, `length` |
 | `memory.probe` | 주소 readable/writable 점검(query) | `address`/`va`/`symbol`, `length` |
 | `code.disasm` | 주소/함수 디스어셈블(u/uf) | `address`/`symbol`, `count`, `function`(bool) |
-| `symbol.search` | 와일드카드 심볼→주소 열거(x `mod!mask`) | `mask`, `limit` |
+| `symbol.search` | 와일드카드 심볼→주소 열거(x `mod!mask`) | `mask`(필수), `limit` |
 
 > `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽는다. `memory.read_virtual`/`read_physical`/`symbol.search`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다.
 
@@ -340,8 +341,8 @@ claude mcp list                      # connected 확인
 | 연결이 401 | 토큰 불일치. 서버가 새로 찍은 토큰으로 클라이언트 헤더 갱신 |
 | 연결이 403 | (로컬) loopback이 아닌 Host로 접속 → 원격이면 `--bind` 필요 / (양쪽) Origin이 비-loopback인 브라우저 컨텍스트 |
 | 원격에서 접속 불가(타임아웃) | 방화벽 인바운드 차단. `New-NetFirewallRule`로 포트/클라이언트 IP 허용. 서버가 `--bind <IP>`로 떴는지 확인 |
-| `writes are disabled` | 읽기 전용 모드. `mcp on ... --allow-write`로 재기동 |
-| `engine busy` (-32603) | 30초 내 엔진 응답 없음(긴 스캔). 클라이언트 `timeout` 상향 |
+| `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write [--bind <addr>]`로 재기동. 토큰이 새로 발급되니 클라이언트 헤더도 갱신 |
+| `engine busy; retry shortly` 또는 `engine timeout` | tools/call은 JSON-RPC 에러코드가 아니라 `isError:true` CallToolResult로 옴. 대기 큐(8개) 포화 시 `engine busy`(audit `engine-busy`), 30초 요청 타임아웃 초과(긴 스캔) 시 `engine timeout`(audit `tool-error`). 클라이언트 per-server `timeout` 상향 또는 `limit`/`count`로 스캔 단축. (`-32603`은 `resources/read` 혼잡 경로에서만 발생) |
 | 드라이버 로드 실패 | 테스트 서명 미활성 → `bcdedit /set testsigning on` 후 재부팅 / 비-elevated 실행 |
 | `symType=0 (SymNone)` | 심볼 DLL 묶음을 EXE 옆에 두지 않음(2.1 참고) |
 
