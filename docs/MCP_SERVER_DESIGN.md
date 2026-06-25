@@ -306,12 +306,13 @@ v1 툴(18종)과 인자 스키마(= 기존 화이트리스트, `additionalProper
 | `memory.fill` | address, length, pattern(hex) | `fill` |
 | `memory.move` | source, dest, length | `move` |
 | `type.set_field` | address, type, field, value | `setfield` (PDB 오프셋 + width 자동) |
-| `process.set_protection` | pid\|self, level | `set-protection` (lab: 임의 타깃 허용) |
-| `dump.raw` | address, length, path? | `dump-raw` (path 미지정 시 설정된 출력 디렉터리, traversal 방지) |
-| `dump.pe` | address, path? | `dump-pe` (동상) |
+| `process.set_protection` | pid?(기본 self), level | `IOCTL_KNDBG_SET_PROCESS_PROTECTION` 직접 호출(임의 타깃; level→raw 바이트 매핑, PDB 오프셋 해석) |
+| `dump.raw` | address, length, path | `dump-raw` (path **필수**, traversal 방지) |
+| `dump.pe` | address, path | `dump-pe` (path **필수**) |
 
 - `bytes`/`pattern`은 hex 문자열로 받아 길이·범위 검증(드라이버 1MB 캡). raw 명령 문자열 불가.
-- `dump.*`의 path는 lab이라도 설정된 출력 루트로 제한(host-wide traversal 방지); 루트 밖이면 `isError`.
+- `dump.*`의 path는 **필수**이고 traversal(`..`)·불안전 문자를 거부한다(구현이 기본 경로를 합성하지 않으므로 스키마가 path를 required로 광고).
+- `process.set_protection`은 `set-ppl-antimalware`(self 전용 TUI 명령)을 거치지 않고 `DeviceClient::SetProcessProtection(pid, offset, byte)`를 직접 호출한다. level은 `ParseProtectionByte`로 raw PS_PROTECTION 바이트(none/ppl-*/pp-*)에 매핑되고, 응답의 old/readback 바이트가 인라인 backup/verify가 된다.
 - `idempotentHint`: write_virtual/physical/fill/move/set_field=false, set_protection=true(이미 해당 level이면 no-op).
 
 ### 6.2 Resources (값싸고 부수효과 없는 컨텍스트)

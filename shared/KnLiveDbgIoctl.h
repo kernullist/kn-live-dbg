@@ -121,6 +121,11 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_PROTECTION_PPL_LSA           0x41
 #define KNDBG_PROTECTION_PPL_WINDOWS       0x51
 #define KNDBG_PROTECTION_PPL_WINTCB        0x61
+// Full Protected (PP, Type=2) variants. Carried in the same NewProtection byte,
+// so these are byte literals only -- no ABI change.
+#define KNDBG_PROTECTION_PP_WINDOWS        0x52
+#define KNDBG_PROTECTION_PP_WINTCB         0x62
+#define KNDBG_PROTECTION_PP_WINSYSTEM      0x72
 
 #pragma pack(push, 8)
 

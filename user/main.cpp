@@ -16096,6 +16096,83 @@ static std::wstring DescribeProtectionByte(uint8_t value)
     return ss.str();
 }
 
+// Map a human PS_PROTECTION level keyword to its raw byte. Used by the MCP
+// process.set_protection write tool for arbitrary-target PPL/PP. Accepts named
+// levels, on/off aliases, or a raw hex byte. Returns false (with a listing
+// error) for an unknown level.
+static bool ParseProtectionByte(const std::wstring& levelText, uint8_t* outByte, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (outByte == nullptr)
+        {
+            break;
+        }
+
+        std::wstring level = ToLower(TrimWhitespace(levelText));
+        uint8_t byte = 0;
+        bool matched = true;
+        if (level == L"none" || level == L"off" || level == L"0")
+        {
+            byte = KNDBG_PROTECTION_NONE;
+        }
+        else if (level == L"on" || level == L"antimalware" || level == L"ppl-antimalware")
+        {
+            byte = KNDBG_PROTECTION_PPL_ANTIMALWARE;
+        }
+        else if (level == L"ppl-lsa")
+        {
+            byte = KNDBG_PROTECTION_PPL_LSA;
+        }
+        else if (level == L"ppl-windows")
+        {
+            byte = KNDBG_PROTECTION_PPL_WINDOWS;
+        }
+        else if (level == L"ppl-wintcb")
+        {
+            byte = KNDBG_PROTECTION_PPL_WINTCB;
+        }
+        else if (level == L"pp-windows")
+        {
+            byte = KNDBG_PROTECTION_PP_WINDOWS;
+        }
+        else if (level == L"pp-wintcb")
+        {
+            byte = KNDBG_PROTECTION_PP_WINTCB;
+        }
+        else if (level == L"pp-winsystem")
+        {
+            byte = KNDBG_PROTECTION_PP_WINSYSTEM;
+        }
+        else
+        {
+            matched = false;
+            uint64_t parsed = 0;
+            if (ParseUnsigned(level, 16, &parsed) && parsed <= 0xff)
+            {
+                byte = static_cast<uint8_t>(parsed);
+                matched = true;
+            }
+        }
+
+        if (!matched)
+        {
+            if (error != nullptr)
+            {
+                *error = L"level must be none|ppl-antimalware|ppl-lsa|ppl-windows|ppl-wintcb|pp-windows|pp-wintcb|pp-winsystem or a raw hex byte";
+            }
+            break;
+        }
+
+        *outByte = byte;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static void HandleSetPplAntimalwareCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -28930,8 +29007,11 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"memory.search" ||
         tool == L"memory.translate" ||
         tool == L"memory.probe" ||
+        tool == L"memory.read_pointers" ||
+        tool == L"memory.compare" ||
         tool == L"code.disasm" ||
         tool == L"symbol.search" ||
+        tool == L"ti.subscribe" ||
         tool == L"assistant.answer")
     {
         supported = true;
@@ -29064,6 +29144,14 @@ static bool ValidateAiCapabilityToolArgKeys(
     {
         allowed = {L"address", L"va", L"symbol", L"length", L"len", L"range"};
     }
+    else if (tool == L"memory.read_pointers")
+    {
+        allowed = {L"address", L"va", L"symbol", L"width", L"unit", L"count", L"length", L"len"};
+    }
+    else if (tool == L"memory.compare")
+    {
+        allowed = {L"address1", L"a", L"va1", L"symbol1", L"address2", L"b", L"va2", L"symbol2", L"length", L"len", L"range", L"size"};
+    }
     else if (tool == L"code.disasm")
     {
         allowed = {L"address", L"va", L"symbol", L"count", L"function"};
@@ -29071,6 +29159,10 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"symbol.search")
     {
         allowed = {L"mask", L"pattern", L"symbol", L"module", L"limit", L"max"};
+    }
+    else if (tool == L"ti.subscribe")
+    {
+        allowed = {L"action"};
     }
 
     return ValidateJsonObjectKeys(argsJson, allowed, tool + L" args", error);
@@ -29207,7 +29299,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|pool.scan_pe|hunt.run|snapshot.capture|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|symbol.search|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|pool.scan_pe|hunt.run|snapshot.capture|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -29243,6 +29335,8 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- memory.search: search a virtual range for an integer value. Args: address, length, value, optional width (1|2|4|8).\n";
     stream << L"- memory.translate: translate a virtual address to physical (vtop). Args: address|va|symbol, optional process/pid or cr3, length.\n";
     stream << L"- memory.probe: test whether an address is readable/writable. Args: address|va|symbol, optional length.\n";
+    stream << L"- memory.read_pointers: dump a pointer table with each slot resolved to its nearest symbol. Args: address|va|symbol, optional width (4|8), count.\n";
+    stream << L"- memory.compare: compare two virtual ranges and report mismatch offsets. Args: address1, address2, length.\n";
     stream << L"- symbol.search: enumerate symbols by wildcard. Args: mask (e.g. nt!Etw*), optional limit.\n";
     stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
     stream << L"Rules:\n";
@@ -31588,6 +31682,151 @@ static bool ExecuteAiCapabilitySnapshotDiff(
     return ok;
 }
 
+static bool ExecuteAiCapabilityMemoryReadPointers(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_pointers requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &address))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.read_pointers requires address, va, or symbol";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"address", error))
+        {
+            break;
+        }
+
+        // Symbolized slot dump: dword+symbol (dds), qword+symbol (dqs), or the
+        // pointer-sized default (dps). Each slot is resolved to its nearest
+        // symbol, which is what makes call tables / vtables / IAT readable.
+        std::wstring widthText;
+        std::wstring token = L"dps";
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"width", L"unit"}, &widthText))
+        {
+            if (widthText == L"4" || widthText == L"d" || widthText == L"dword")
+            {
+                token = L"dds";
+            }
+            else if (widthText == L"8" || widthText == L"q" || widthText == L"qword" || widthText == L"pointer")
+            {
+                token = L"dqs";
+            }
+            else
+            {
+                if (error != nullptr)
+                {
+                    *error = L"memory.read_pointers width must be 4 (dword) or 8 (qword/pointer)";
+                }
+                break;
+            }
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(token);
+        args.push_back(address);
+
+        std::wstring countText;
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"count", L"length", L"len"}, &countText))
+        {
+            if (!ValidateAiCapabilityScalarText(countText, L"count", error))
+            {
+                break;
+            }
+            args.push_back(countText);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": memory.read_pointers\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        // Tier-A: the symbolized text is the payload; do not request the
+        // raw-bytes structured sink (it would shadow the symbol resolution).
+        HandleDisplayCommand(args, state, device, symbols);
+        (void)structuredJsonOut;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityMemoryCompare(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    (void)structuredJsonOut;
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.compare requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address1;
+        std::wstring address2;
+        std::wstring length;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address1", L"a", L"va1", L"symbol1"}, &address1) ||
+            !ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address2", L"b", L"va2", L"symbol2"}, &address2) ||
+            !ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"length", L"len", L"range", L"size"}, &length))
+        {
+            if (error != nullptr)
+            {
+                *error = L"memory.compare requires address1, address2, and length";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address1, L"address1", error) ||
+            !ValidateAiCapabilityScalarText(address2, L"address2", error) ||
+            !ValidateAiCapabilityScalarText(length, L"length", error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"c");
+        args.push_back(address1);
+        args.push_back(address2);
+        args.push_back(length);
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": memory.compare\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleCompare(args, state, device, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static std::wstring BuildMcpWnfDecodedJson(const WnfStateNameDecoded& d)
 {
     std::wstring out = L"{\"schema\":\"kn-live-dbg.wnf-decode.v1\"";
@@ -31992,6 +32231,69 @@ static bool ExecuteAiCapabilityTiQuery(
             }
         }
 
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+// ti.subscribe controls the Threat-Intelligence ETW subscription lifecycle
+// (start/stop/status). start/stop create/tear down a system-global ETW session
+// and lazily write a log file, so they are gated behind --allow-write; status
+// is a read. Reuses HandleTiCommand so the PPL self-gate and shutdown-hook
+// registration are inherited verbatim.
+static bool ExecuteAiCapabilityTiSubscribe(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring action;
+        ExtractJsonStringValue(step.ArgsJson, L"action", &action);
+        action = ToLower(TrimWhitespace(action));
+        if (action.empty())
+        {
+            action = L"status";
+        }
+        if (action != L"start" && action != L"stop" && action != L"status")
+        {
+            if (error != nullptr)
+            {
+                *error = L"ti.subscribe action must be start, stop, or status";
+            }
+            break;
+        }
+
+        if ((action == L"start" || action == L"stop") && !g_McpServer.AllowWrite())
+        {
+            if (error != nullptr)
+            {
+                *error = L"ti.subscribe " + action +
+                         L" mutates capture state (system ETW session); start the MCP server with --allow-write";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!ti");
+        args.push_back(action);
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": ti.subscribe\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleTiCommand(args, state, device, symbols);
+
+        if (structuredJsonOut != nullptr)
+        {
+            TiSubscriber& ti = GetTiSubscriberInstance();
+            *structuredJsonOut = BuildMcpTiStatsJson(ti.SnapshotStats(), ti.IsActive());
+        }
         ok = true;
     } while (false);
 
@@ -32675,6 +32977,18 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"memory.probe")
             {
                 stepOk = ExecuteAiCapabilityMemoryProbe(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"memory.read_pointers")
+            {
+                stepOk = ExecuteAiCapabilityMemoryReadPointers(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"memory.compare")
+            {
+                stepOk = ExecuteAiCapabilityMemoryCompare(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"ti.subscribe")
+            {
+                stepOk = ExecuteAiCapabilityTiSubscribe(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"snapshot.diff")
             {
@@ -34595,36 +34909,113 @@ static McpEngineResult DispatchMcpWriteTool(
         }
         else if (tool == L"process.set_protection")
         {
-            // The TUI exposes self-only PPL via set-ppl-antimalware. Arbitrary
-            // target PPL is not wired in this build.
+            // Arbitrary-target PS_PROTECTION. The driver IOCTL already looks up
+            // any PID and writes any protection byte (gated by the write-ack
+            // magic + --allow-write), so this is wired inline straight to
+            // DeviceClient::SetProcessProtection. pid defaults to self.
             std::wstring level;
             if (!McpGetArg(argsJson, L"level", &level))
             {
                 result.IsError = true;
-                result.Text = L"process.set_protection requires 'level' (on|off|status)";
+                result.Text = L"process.set_protection requires 'level' (none|ppl-antimalware|ppl-lsa|ppl-windows|ppl-wintcb|pp-windows|pp-wintcb|pp-winsystem)";
                 break;
             }
-            std::wstring sub;
-            std::wstring levelLower = ToLower(level);
-            if (levelLower == L"on" || levelLower == L"antimalware")
+            if (!McpValidateToken(level, &argError))
             {
-                sub = L"on";
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
             }
-            else if (levelLower == L"off" || levelLower == L"none")
+            uint8_t newByte = 0;
+            std::wstring levelError;
+            if (!ParseProtectionByte(level, &newByte, &levelError))
             {
-                sub = L"off";
+                result.IsError = true;
+                result.Text = levelError;
+                break;
             }
-            else if (levelLower == L"status")
+
+            uint32_t targetPid = static_cast<uint32_t>(GetCurrentProcessId());
+            std::wstring pidText;
+            if (McpGetArg(argsJson, L"pid", &pidText) && ToLower(pidText) != L"self")
             {
-                sub = L"status";
+                if (!McpValidateToken(pidText, &argError))
+                {
+                    result.IsError = true;
+                    result.Text = L"invalid argument: " + argError;
+                    break;
+                }
+                uint64_t parsedPid = 0;
+                if (!ParseUnsigned(pidText, 10, &parsedPid) || parsedPid == 0 || parsedPid > 0xffffffffull)
+                {
+                    result.IsError = true;
+                    result.Text = L"process.set_protection pid must be a positive PID or 'self'";
+                    break;
+                }
+                targetPid = static_cast<uint32_t>(parsedPid);
+            }
+
+            // Resolve _EPROCESS.Protection offset from the kernel PDB (same path
+            // the self-only set-ppl-antimalware command uses).
+            if (symbols.Modules().empty())
+            {
+                std::wstring loadError;
+                if (!symbols.LoadKernelModules(&loadError))
+                {
+                    result.IsError = true;
+                    result.Text = L"process.set_protection: failed to load kernel modules: " + loadError;
+                    break;
+                }
+            }
+            TypeFieldInfo protectionField = {};
+            std::wstring fieldError;
+            if (!symbols.FindField(L"nt!_EPROCESS", L"Protection", &protectionField, &fieldError))
+            {
+                result.IsError = true;
+                result.Text = L"process.set_protection: could not resolve _EPROCESS.Protection: " + fieldError;
+                break;
+            }
+            if (protectionField.Offset == 0 || protectionField.Offset > 0x2000)
+            {
+                result.IsError = true;
+                result.Text = L"process.set_protection: _EPROCESS.Protection offset out of plausible range";
+                break;
+            }
+
+            uint8_t oldByte = 0;
+            uint8_t readBack = 0;
+            uint64_t eprocessAddress = 0;
+            std::wstring ioctlError;
+            if (!device.SetProcessProtection(targetPid, static_cast<uint32_t>(protectionField.Offset),
+                    newByte, &oldByte, &readBack, &eprocessAddress, &ioctlError))
+            {
+                result.IsError = true;
+                result.Text = L"process.set_protection failed: " + ioctlError +
+                              L" (driver write mode must be armed; start with --allow-write)";
+                break;
+            }
+
+            std::wstring text = L"[process.set_protection] pid=" + std::to_wstring(targetPid);
+            text += L" eprocess=" + HexTextWidth(eprocessAddress, 16, true);
+            text += L" offset=" + HexTextWidth(protectionField.Offset, 0, true) + L"\n";
+            text += L"  before=" + HexTextWidth(oldByte, 2, true) + L" (" + DescribeProtectionByte(oldByte) + L")\n";
+            text += L"  after =" + HexTextWidth(readBack, 2, true) + L" (" + DescribeProtectionByte(readBack) + L")\n";
+            text += L"  requested=" + HexTextWidth(newByte, 2, true) + L" (" + DescribeProtectionByte(newByte) + L")\n";
+            if (readBack != newByte)
+            {
+                text += L"  verdict: write rejected (readback != requested)\n";
+                result.IsError = true;
+            }
+            else if (oldByte == newByte)
+            {
+                text += L"  verdict: no change (already set)\n";
             }
             else
             {
-                result.IsError = true;
-                result.Text = L"level must be on|off|status";
-                break;
+                text += L"  verdict: ok\n";
             }
-            command = L"set-ppl-antimalware " + sub;
+            result.Text = text;
+            break;
         }
         else if (tool == L"dump.raw")
         {
