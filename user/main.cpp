@@ -29009,7 +29009,12 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"memory.probe" ||
         tool == L"memory.read_pointers" ||
         tool == L"memory.compare" ||
-        tool == L"code.disasm" ||
+        // code.disasm is intentionally NOT here: it has no ExecuteAiCapabilityPlan
+        // branch (it needs the DbgEng handle, which that path does not carry) and
+        // is handled MCP-only inline in DispatchMcpRequest. Listing it here would
+        // let an NL-planner plan reach the dispatch chain and fail with an empty
+        // error. Its ValidateAiCapabilityToolArgKeys branch stays (the inline
+        // DispatchMcpRequest path reuses it).
         tool == L"symbol.search" ||
         tool == L"ti.subscribe" ||
         tool == L"assistant.answer")
@@ -31600,10 +31605,21 @@ static bool ExecuteAiCapabilitySnapshotDiff(
 
     do
     {
+        // File mode needs BOTH old and new; a lone old/new is a malformed request,
+        // not a silent fall-back to baseline mode.
         std::wstring oldPath;
         std::wstring newPath;
-        bool fileMode = ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"old"}, &oldPath) &&
-                        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"new"}, &newPath);
+        bool hasOld = ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"old"}, &oldPath);
+        bool hasNew = ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"new"}, &newPath);
+        if (hasOld != hasNew)
+        {
+            if (error != nullptr)
+            {
+                *error = L"snapshot.diff file mode requires both 'old' and 'new'";
+            }
+            break;
+        }
+        bool fileMode = hasOld && hasNew;
 
         std::vector<std::wstring> args;
         args.push_back(L"!diff");
@@ -31638,24 +31654,35 @@ static bool ExecuteAiCapabilitySnapshotDiff(
             args.push_back(L"baseline");
         }
 
+        // Present-but-invalid optional values are fatal (matches the other
+        // executors); folding validate into && would silently drop them.
         std::wstring domain;
-        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"domain"}, &domain) &&
-            ValidateAiCapabilityScalarText(domain, L"domain", error))
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"domain"}, &domain))
         {
+            if (!ValidateAiCapabilityScalarText(domain, L"domain", error))
+            {
+                break;
+            }
             args.push_back(L"/domain");
             args.push_back(domain);
         }
         std::wstring risk;
-        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"risk"}, &risk) &&
-            ValidateAiCapabilityScalarText(risk, L"risk", error))
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"risk"}, &risk))
         {
+            if (!ValidateAiCapabilityScalarText(risk, L"risk", error))
+            {
+                break;
+            }
             args.push_back(L"/risk");
             args.push_back(risk);
         }
         std::wstring limit;
-        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"limit"}, &limit) &&
-            ValidateAiCapabilityScalarText(limit, L"limit", error))
+        if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"limit"}, &limit))
         {
+            if (!ValidateAiCapabilityScalarText(limit, L"limit", error))
+            {
+                break;
+            }
             args.push_back(L"/limit");
             args.push_back(limit);
         }
@@ -35015,6 +35042,25 @@ static McpEngineResult DispatchMcpWriteTool(
                 text += L"  verdict: ok\n";
             }
             result.Text = text;
+
+            // This branch returns inline (no command string for the shared tail),
+            // so emit the write-audit JSONL here too -- otherwise this write tool
+            // would be the only one missing from the operator's `ai audit`
+            // transcript (no-op unless `ai audit` is enabled).
+            {
+                CommandExecutionResult auditResult = {};
+                auditResult.KeepRunning = true;
+                auditResult.Output = text;
+                WriteCommandAuditEvent(
+                    aiState,
+                    L"mcp",
+                    BackendModeText(state.Backend),
+                    L"process.set-protection",
+                    L"set-protection pid=" + std::to_wstring(targetPid) +
+                        L" level=" + HexTextWidth(newByte, 2, true) +
+                        L" offset=" + HexTextWidth(protectionField.Offset, 0, true),
+                    auditResult);
+            }
             break;
         }
         else if (tool == L"dump.raw")
@@ -35439,11 +35485,17 @@ static McpEngineResult DispatchMcpRequest(
     }
     else
     {
-        // No structuredContent. Every read tool emits structured JSON on
-        // success, so an empty structured result with captured stderr means the
-        // underlying handler failed internally (device not open, scanner error)
-        // even if the executor returned ok. Surface that as an MCP error so a
-        // client keying on isError does not treat a failed scan as success.
+        // No structuredContent. Two kinds of tool land here: Tier-B tools that
+        // failed before building their JSON, and Tier-A tools (memory.search/
+        // translate/probe/compare/read_pointers, snapshot.diff, code.disasm) that
+        // intentionally have no JSON builder and return captured text. The Tier-A
+        // wrappers reuse a native void handler and force ok=true after their
+        // pre-checks, so an internal handler failure is NOT reflected in ok --
+        // captured stderr is the only remaining failure signal. Those handlers
+        // write success to stdout and reserve stderr for genuine failures, so a
+        // non-empty stderr here means the operation failed; surface it as an MCP
+        // error. (If a future Tier-A handler ever emits a benign stderr warning
+        // on success, drive isError off the executor's ok instead.)
         result.Text = captured;
         if (!capturedErr.empty())
         {
