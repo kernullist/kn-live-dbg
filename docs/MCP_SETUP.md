@@ -246,7 +246,127 @@ Notes:
 - Timeouts: `startup_timeout_sec` (default 10s), `tool_timeout_sec` (default 60s). The server caps a single request at 30s internally, but a whole-system `hunt.run` can still exceed the Codex tool timeout — raise `tool_timeout_sec`.
 - Codex is a non-browser client (sends no `Origin`) and connects on the bound host, so the bearer token is the only barrier — same as Claude (§5).
 
-### 4.4 Token handling caveats
+> All clients below are non-browser MCP clients, so the bearer token is the only barrier (§5). Watch the **field-name traps**: Gemini uses `httpUrl`, Cline uses `type: "streamableHttp"`, Goose uses `uri` + `streamable_http`, Windsurf uses `serverUrl`. The endpoint is plain `http://` — the token crosses the wire unencrypted, so keep it on a trusted LAN/loopback or front it with TLS / an SSH tunnel.
+
+### 4.4 Cursor
+
+Config: `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project — never commit the token; use env interpolation). Also addable via Settings → MCP → "Add new MCP server".
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "url": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${env:KNLIVEDBG_TOKEN}" }
+    }
+  }
+}
+```
+
+- `${env:KNLIVEDBG_TOKEN}` is interpolated; export the variable in the environment Cursor inherits, then restart Cursor (it reads env at launch). After editing, toggle the server off/on in Settings → MCP. No remote-HTTP CLI add command. Source: [cursor.com/docs/mcp](https://cursor.com/docs/mcp).
+
+### 4.5 VS Code (GitHub Copilot agent mode)
+
+Config: `.vscode/mcp.json` (workspace) or Command Palette → "MCP: Open User Configuration". Top-level `servers` key, `type: "http"`. Surfaces in Copilot Chat **agent mode**.
+
+```jsonc
+{
+  "inputs": [
+    { "type": "promptString", "id": "knlivedbg-token", "description": "knlivedbg bearer token", "password": true }
+  ],
+  "servers": {
+    "knlivedbg": {
+      "type": "http",
+      "url": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${input:knlivedbg-token}" }
+    }
+  }
+}
+```
+
+- `${input:...}` prompts once and stores the token encrypted; `${env:KNLIVEDBG_TOKEN}` is also supported. CLI add: `code --add-mcp "{\"name\":\"knlivedbg\",\"type\":\"http\",\"url\":\"http://<server-ip>:51766/mcp\",\"headers\":{\"Authorization\":\"Bearer ${env:KNLIVEDBG_TOKEN}\"}}"`. Start/restart from the CodeLens above the entry. Source: [code.visualstudio.com MCP docs](https://code.visualstudio.com/docs/copilot/customization/mcp-servers).
+
+### 4.6 Gemini CLI
+
+```bash
+gemini mcp add --transport http --scope user \
+  --header "Authorization: Bearer $KNLIVEDBG_TOKEN" \
+  knlivedbg http://<server-ip>:51766/mcp
+```
+
+Or edit `~/.gemini/settings.json` — use **`httpUrl`** (NOT `url`; `url` is the legacy SSE transport):
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "httpUrl": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${KNLIVEDBG_TOKEN}" },
+      "timeout": 600000
+    }
+  }
+}
+```
+
+- `--transport http` is required (otherwise stdio is assumed and `--header` is ignored). The CLI bakes the shell-resolved token literally into settings.json; hand-edit to keep a live `${KNLIVEDBG_TOKEN}` placeholder. No trailing commas in settings.json. Verify with the `/mcp` command in a session. Source: [gemini-cli MCP docs](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md).
+
+### 4.7 Cline
+
+Config via the Cline panel → MCP Servers → "Remote Servers" tab, or edit `cline_mcp_settings.json` (VS Code: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`). **`type` must be `"streamableHttp"` (camelCase)** — omitting it or using `"streamable-http"` falls back to SSE and 405s a streamable endpoint.
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "type": "streamableHttp",
+      "url": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer <paste-token>" },
+      "disabled": false,
+      "autoApprove": [],
+      "timeout": 60
+    }
+  }
+}
+```
+
+- Env-var interpolation is **not** supported for remote header values — paste the literal token and treat the file as a secret. Raise `timeout` (seconds) for slow scans. Source: [docs.cline.bot](https://docs.cline.bot/mcp/connecting-to-a-remote-server).
+
+### 4.8 Goose (Block)
+
+Run `goose configure` → Add Extension → "Remote Extension (Streamable HTTP)" → name `knlivedbg`, URI `http://<server-ip>:51766/mcp`, add header `Authorization: Bearer ${KNLIVEDBG_TOKEN}`. Or edit `~/.config/goose/config.yaml` (Windows: `%APPDATA%\Block\goose\config\config.yaml`) — **field is `uri` (not `url`), type is `streamable_http`**:
+
+```yaml
+extensions:
+  knlivedbg:
+    type: streamable_http
+    name: knlivedbg
+    enabled: true
+    uri: http://<server-ip>:51766/mcp
+    headers:
+      Authorization: "Bearer ${KNLIVEDBG_TOKEN}"
+    timeout: 300
+```
+
+- `${KNLIVEDBG_TOKEN}` is interpolated from the environment Goose was launched with (export it first); restart the session after editing. `timeout` is in seconds. Source: [block.github.io/goose](https://block.github.io/goose/).
+
+### 4.9 Windsurf (Cascade)
+
+Config: `~/.codeium/windsurf/mcp_config.json` (user scope only) or Settings → Cascade → MCP Servers → "Add custom server". **Field is `serverUrl` (not `url`)** for streamable HTTP.
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "serverUrl": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${env:KNLIVEDBG_TOKEN}" }
+    }
+  }
+}
+```
+
+- `${env:KNLIVEDBG_TOKEN}` is interpolated (restart Windsurf so it inherits the variable). Click the refresh button in the MCP panel after editing. Cascade caps active MCP tools at 100 total — disable unneeded tools to stay under budget. Source: [docs.windsurf.com](https://docs.windsurf.com/plugins/cascade/mcp).
+
+### 4.10 Token handling caveats
 
 - The token authenticates the kernel RW endpoint. **Do not paste it in plaintext into a project-scope `.mcp.json` and commit it.** Use user-scope settings + the `${KNLIVEDBG_TOKEN}` environment variable.
 - The token changes on every `mcp on`. If you restart the server, you must also refresh the client token.

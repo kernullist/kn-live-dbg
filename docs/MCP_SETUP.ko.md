@@ -246,7 +246,127 @@ env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
 - 타임아웃: `startup_timeout_sec`(기본 10s), `tool_timeout_sec`(기본 60s). 서버는 단일 요청을 내부적으로 30s로 제한하지만 전체 시스템 `hunt.run`은 Codex tool 타임아웃을 넘길 수 있으니 `tool_timeout_sec`를 올린다.
 - Codex는 비브라우저 클라이언트(`Origin` 미전송)이고 바인드 호스트로 접속하므로 bearer 토큰이 유일한 장벽 — Claude와 동일(§5).
 
-### 4.4 토큰 취급 주의
+> 아래 클라이언트는 모두 비브라우저 MCP 클라이언트라 bearer 토큰이 유일한 장벽(§5). **필드명 함정** 주의: Gemini는 `httpUrl`, Cline은 `type: "streamableHttp"`, Goose는 `uri` + `streamable_http`, Windsurf는 `serverUrl`을 쓴다. 엔드포인트는 평문 `http://`라 토큰이 암호화 없이 전송되니, 신뢰된 LAN/loopback에서만 쓰거나 TLS/SSH 터널로 감싼다.
+
+### 4.4 Cursor
+
+설정: `~/.cursor/mcp.json`(전역) 또는 `.cursor/mcp.json`(프로젝트 — 토큰 커밋 금지, env 보간 사용). Settings → MCP → "Add new MCP server"로도 추가 가능.
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "url": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${env:KNLIVEDBG_TOKEN}" }
+    }
+  }
+}
+```
+
+- `${env:KNLIVEDBG_TOKEN}`이 보간된다. Cursor가 상속하는 환경에 변수를 export한 뒤 Cursor를 재시작(기동 시 env를 읽음). 편집 후 Settings → MCP에서 서버 off/on 토글. 원격 HTTP용 CLI add 명령은 없음. 출처: [cursor.com/docs/mcp](https://cursor.com/docs/mcp).
+
+### 4.5 VS Code (GitHub Copilot agent mode)
+
+설정: `.vscode/mcp.json`(워크스페이스) 또는 Command Palette → "MCP: Open User Configuration". 최상위 `servers` 키, `type: "http"`. Copilot Chat **agent mode**에 노출.
+
+```jsonc
+{
+  "inputs": [
+    { "type": "promptString", "id": "knlivedbg-token", "description": "knlivedbg bearer token", "password": true }
+  ],
+  "servers": {
+    "knlivedbg": {
+      "type": "http",
+      "url": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${input:knlivedbg-token}" }
+    }
+  }
+}
+```
+
+- `${input:...}`은 한 번 묻고 토큰을 암호화 저장한다. `${env:KNLIVEDBG_TOKEN}`도 지원. CLI: `code --add-mcp "{\"name\":\"knlivedbg\",\"type\":\"http\",\"url\":\"http://<server-ip>:51766/mcp\",\"headers\":{\"Authorization\":\"Bearer ${env:KNLIVEDBG_TOKEN}\"}}"`. 항목 위 CodeLens에서 Start/Restart. 출처: [code.visualstudio.com MCP 문서](https://code.visualstudio.com/docs/copilot/customization/mcp-servers).
+
+### 4.6 Gemini CLI
+
+```bash
+gemini mcp add --transport http --scope user \
+  --header "Authorization: Bearer $KNLIVEDBG_TOKEN" \
+  knlivedbg http://<server-ip>:51766/mcp
+```
+
+또는 `~/.gemini/settings.json` 편집 — **`httpUrl`** 사용(`url` 아님; `url`은 레거시 SSE 전송):
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "httpUrl": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${KNLIVEDBG_TOKEN}" },
+      "timeout": 600000
+    }
+  }
+}
+```
+
+- `--transport http`는 필수(없으면 stdio로 간주되어 `--header` 무시). CLI는 셸에서 해석된 토큰을 settings.json에 그대로 박으니, 살아있는 `${KNLIVEDBG_TOKEN}` 플레이스홀더를 원하면 직접 편집. settings.json에 trailing comma 금지. 세션 내 `/mcp` 명령으로 확인. 출처: [gemini-cli MCP 문서](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md).
+
+### 4.7 Cline
+
+Cline 패널 → MCP Servers → "Remote Servers" 탭, 또는 `cline_mcp_settings.json` 편집(VS Code: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`). **`type`은 반드시 `"streamableHttp"`(camelCase)** — 누락하거나 `"streamable-http"`로 쓰면 SSE로 폴백되어 streamable 엔드포인트에 405가 난다.
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "type": "streamableHttp",
+      "url": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer <paste-token>" },
+      "disabled": false,
+      "autoApprove": [],
+      "timeout": 60
+    }
+  }
+}
+```
+
+- 원격 헤더 값에는 env 보간이 **지원되지 않으니** 리터럴 토큰을 붙여넣고 파일을 비밀로 취급. 느린 스캔용으로 `timeout`(초) 상향. 출처: [docs.cline.bot](https://docs.cline.bot/mcp/connecting-to-a-remote-server).
+
+### 4.8 Goose (Block)
+
+`goose configure` → Add Extension → "Remote Extension (Streamable HTTP)" → 이름 `knlivedbg`, URI `http://<server-ip>:51766/mcp`, 헤더 `Authorization: Bearer ${KNLIVEDBG_TOKEN}` 추가. 또는 `~/.config/goose/config.yaml`(Windows: `%APPDATA%\Block\goose\config\config.yaml`) 편집 — **필드는 `uri`(`url` 아님), 타입은 `streamable_http`**:
+
+```yaml
+extensions:
+  knlivedbg:
+    type: streamable_http
+    name: knlivedbg
+    enabled: true
+    uri: http://<server-ip>:51766/mcp
+    headers:
+      Authorization: "Bearer ${KNLIVEDBG_TOKEN}"
+    timeout: 300
+```
+
+- `${KNLIVEDBG_TOKEN}`은 Goose가 기동된 환경에서 보간된다(먼저 export). 편집 후 세션 재시작. `timeout`은 초 단위. 출처: [block.github.io/goose](https://block.github.io/goose/).
+
+### 4.9 Windsurf (Cascade)
+
+설정: `~/.codeium/windsurf/mcp_config.json`(유저 스코프 전용) 또는 Settings → Cascade → MCP Servers → "Add custom server". streamable HTTP는 **필드가 `serverUrl`(`url` 아님)**.
+
+```jsonc
+{
+  "mcpServers": {
+    "knlivedbg": {
+      "serverUrl": "http://<server-ip>:51766/mcp",
+      "headers": { "Authorization": "Bearer ${env:KNLIVEDBG_TOKEN}" }
+    }
+  }
+}
+```
+
+- `${env:KNLIVEDBG_TOKEN}`이 보간된다(변수 상속 위해 Windsurf 재시작). 편집 후 MCP 패널의 refresh 버튼 클릭. Cascade는 활성 MCP 툴을 총 100개로 제한 — 불필요한 툴은 비활성화. 출처: [docs.windsurf.com](https://docs.windsurf.com/plugins/cascade/mcp).
+
+### 4.10 토큰 취급 주의
 
 - 토큰은 커널 RW 엔드포인트를 인증한다. **project-scope `.mcp.json`에 평문으로 붙여넣어 커밋하지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수를 쓴다.
 - 토큰은 매 `mcp on`마다 바뀐다. 서버를 재기동하면 클라이언트 토큰도 갱신해야 한다.
