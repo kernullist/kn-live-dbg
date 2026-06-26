@@ -85,8 +85,12 @@ mcp status     # 현재 상태
 | `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 8종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
 | `--bind <addr>` | 네트워크 노출. `<addr>`에 추가로 바인드 | 없음 = loopback 전용 |
 | `--bind=<addr>` | 위와 동일(붙여 쓰는 형태) | 없음 |
+| `--token <t>` | 고정 bearer 토큰 사용(영속), 자동 관리 토큰 대신 | auto |
+| `--new-token` | 회전: 영속 토큰 폐기 후 새 랜덤 토큰 발급 | off |
 
 `<addr>`에는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0` / `*` / `+`(http.sys 강한 와일드카드 `+`로 매핑)를 줄 수 있다.
+
+**토큰 안정성.** bearer 토큰은 **재기동해도 유지**되므로 클라이언트는 한 번만 등록하면 된다 — 매 `mcp on`마다 다시 추가할 필요 없음. 결정 순서: `--token <t>` > `KNLIVEDBG_TOKEN` 환경변수 > 영속 파일(`<exeDir>\.kn-live-dbg\mcp-token-<port>`) > 새 랜덤 발급(발급 후 재사용을 위해 영속화). 기동 배너가 어느 출처인지 표시한다. 회전은 `--new-token`(이후 클라이언트 갱신). 영속 토큰은 (격리 lab) 박스에 operator-readable 파일로 남으니, 걱정되면 `--new-token` 또는 strict-ACL `KNLIVEDBG_TOKEN`을 쓴다.
 
 ### 3.2 로컬(loopback) — 같은 PC
 
@@ -369,7 +373,8 @@ extensions:
 ### 4.10 토큰 취급 주의
 
 - 토큰은 커널 RW 엔드포인트를 인증한다. **project-scope `.mcp.json`에 평문으로 붙여넣어 커밋하지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수를 쓴다.
-- 토큰은 매 `mcp on`마다 바뀐다. 서버를 재기동하면 클라이언트 토큰도 갱신해야 한다.
+- 토큰은 **재기동해도 유지**된다(§3.1): 클라이언트를 한 번 등록하면 매 `mcp on`마다 다시 추가할 필요 없다. `--new-token`(회전) 또는 다른 `--token`/`KNLIVEDBG_TOKEN`을 줄 때만 바뀌므로, 그때만 클라이언트를 갱신한다.
+- env 기반 end-to-end 안정성을 원하면 **서버 호스트(서버가 읽음, 우선순위 #2)와 클라이언트 양쪽에** 동일한 `KNLIVEDBG_TOKEN`을 설정한다 — 그러면 토큰이 디스크에 전혀 남지 않는다.
 
 ---
 

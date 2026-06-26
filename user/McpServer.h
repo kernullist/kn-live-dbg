@@ -71,6 +71,14 @@ struct McpServerConfig
     // that address and the Host check is relaxed (the bearer token + Origin
     // rejection remain the barrier). Use only on a trusted lab segment.
     std::wstring BindAddress;
+    // Bearer-token stability so a client registered once keeps working across
+    // restarts. Resolution order in Start(): TokenOverride (--token) >
+    // KNLIVEDBG_TOKEN env > persisted TokenPath file > freshly minted (then
+    // persisted). RotateToken (--new-token) forces a fresh random token,
+    // overwriting the persisted file.
+    std::wstring TokenPath;      // persisted token file (<.kn-live-dbg>\mcp-token-<port>)
+    std::wstring TokenOverride;  // explicit --token value; empty = none
+    bool RotateToken = false;    // --new-token
 };
 
 class McpServer
@@ -102,6 +110,8 @@ public:
     bool IsWriteTool(const std::wstring& name) const;
     uint16_t Port() const;
     std::wstring Token() const;
+    // How the active token was obtained: "override" | "env" | "reused" | "new".
+    std::wstring TokenSource() const;
     std::wstring AuditPath() const;
 
     // Engine-thread interface. The engine waits on JobReadyEvent(), then drains
@@ -114,11 +124,15 @@ private:
     void ListenerThreadMain();
     bool EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result);
     void AppendAuditLine(const std::wstring& line);
+    // Resolves the bearer token per the config precedence (see McpServerConfig)
+    // and records how it was obtained in tokenSource_.
+    std::wstring ResolveToken();
 
     std::mutex auditMutex_;
 
     McpServerConfig config_;
     std::wstring token_;
+    std::wstring tokenSource_;
     std::wstring sessionId_;
 
     // http.sys handles.

@@ -35659,6 +35659,22 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             {
                 config.BindAddress = args[i].substr(7);
             }
+            else if (args[i] == L"--token")
+            {
+                if (i + 1 < args.size())
+                {
+                    config.TokenOverride = args[i + 1];
+                    ++i;
+                }
+            }
+            else if (args[i].rfind(L"--token=", 0) == 0)
+            {
+                config.TokenOverride = args[i].substr(8);
+            }
+            else if (args[i] == L"--new-token")
+            {
+                config.RotateToken = true;
+            }
             else
             {
                 unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
@@ -35672,6 +35688,10 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         // Always-on forensic log of every MCP request (independent of `ai audit`).
         config.AuditPath = GetExecutableDirectory() + L"\\.kn-live-dbg\\mcp-audit-" +
                            std::to_wstring(config.Port) + L".jsonl";
+        // Persisted bearer token so a client registered once keeps working
+        // across restarts (resolution order resolved in McpServer::Start).
+        config.TokenPath = GetExecutableDirectory() + L"\\.kn-live-dbg\\mcp-token-" +
+                           std::to_wstring(config.Port);
 
         std::wstring startError;
         if (!g_McpServer.Start(config, &startError))
@@ -35700,7 +35720,13 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         {
             std::wcout << L"  remote: " << remoteUrl << L"\n";
         }
-        std::wcout << L"  token : " << g_McpServer.Token() << L"\n";
+        std::wstring tokenSource = g_McpServer.TokenSource();
+        std::wstring tokenSourceNote =
+            tokenSource == L"reused" ? L" (reused; client stays registered)" :
+            tokenSource == L"env"    ? L" (from KNLIVEDBG_TOKEN env)" :
+            tokenSource == L"override" ? L" (from --token; persisted)" :
+                                       L" (new; persisted for reuse, --new-token to rotate)";
+        std::wcout << L"  token : " << g_McpServer.Token() << tokenSourceNote << L"\n";
         std::wcout << L"  write : " << (config.AllowWrite ? L"ENABLED (lab mode)" : L"disabled (read-only)") << L"\n";
         std::wcout << L"  audit : " << g_McpServer.AuditPath() << L"\n";
         std::wcout << L"  claude code: claude mcp add --transport http knlivedbg " << clientUrl
@@ -35743,7 +35769,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     }
     else
     {
-        std::wcout << L"MCP server: stopped. usage: mcp on [port] [--allow-write] [--bind <addr>] | mcp off | mcp status\n";
+        std::wcout << L"MCP server: stopped. usage: mcp on [port] [--allow-write] [--bind <addr>] [--token <t>] [--new-token] | mcp off | mcp status\n";
     }
 }
 
