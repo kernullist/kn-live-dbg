@@ -81,7 +81,7 @@ kn-live-dbg/
 - `docs/WINDBG_COMMAND_COVERAGE.md` tracks native and DbgEng-routed WinDbg command coverage.
 - `docs/AI_ASSISTED_WORKFLOWS.md` documents the implemented AI intent router, evidence analysis, command planning, write safety, playbooks, reporting, and operator examples.
 - `docs/FEATURE_PLAN.md` tracks completed feature slices and remaining high-value work such as richer driver-object/device-stack inspection (`!drvobj`/`!devstack`), WNF stabilization, and probe fixtures.
-- `docs/MCP_SERVER_DESIGN.md` covers the in-process MCP server design and security rationale; `docs/MCP_SETUP.md` is the operator guide for starting the server (`mcp on`), remote `--bind` exposure, and connecting Claude Code/Desktop.
+- `docs/MCP_SERVER_DESIGN.md` covers the in-process MCP server design and security rationale; `docs/MCP_SETUP.md` is the operator guide for starting the server (`mcp on`), remote `--bind` exposure, and connecting Claude Code/Desktop. Docs are English-first; Korean translations are the sibling `*.ko.md` files.
 
 ## Build
 

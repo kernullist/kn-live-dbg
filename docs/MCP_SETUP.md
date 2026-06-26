@@ -1,98 +1,100 @@
-# KnLiveDbg MCP 서버 설정 및 연결 가이드
+> Korean version: [MCP_SETUP.ko.md](./MCP_SETUP.ko.md)
 
-이 문서는 KnLiveDbg의 MCP(Model Context Protocol) 서버를 **실제로 띄우고 Claude(Claude Code / Claude Desktop)에서 연결하는 운영 절차**를 다룬다. 설계 근거와 위협 모델은 [`MCP_SERVER_DESIGN.md`](./MCP_SERVER_DESIGN.md)를 참고한다.
+# KnLiveDbg MCP Server Setup and Connection Guide
 
-- 서버 이름: `knlivedbg`  ·  서버 버전: `0.1.0`  ·  MCP 프로토콜: `2025-06-18`
-- 전송: 인프로세스 Streamable HTTP(`http.sys`), 엔드포인트 경로 `/mcp`
-- 기본 포트: `51766`  ·  인증: 기동 시마다 새로 발급되는 256-bit bearer 토큰
-- 기본 노출: **loopback 전용**(`127.0.0.1` + `[::1]`). 네트워크 노출은 `--bind`로만 옵트인.
+This document covers the **operational procedure for actually launching KnLiveDbg's MCP (Model Context Protocol) server and connecting to it from Claude (Claude Code / Claude Desktop)**. For the design rationale and threat model, see [`MCP_SERVER_DESIGN.md`](./MCP_SERVER_DESIGN.md).
+
+- Server name: `knlivedbg`  ·  Server version: `0.1.0`  ·  MCP protocol: `2025-06-18`
+- Transport: in-process Streamable HTTP (`http.sys`), endpoint path `/mcp`
+- Default port: `51766`  ·  Authentication: a fresh 256-bit bearer token issued on every startup
+- Default exposure: **loopback only** (`127.0.0.1` + `[::1]`). Network exposure is opt-in via `--bind` only.
 
 ---
 
-## 1. 핵심 개념: 어디서 무엇을 실행하나
+## 1. Core Concept: Where to Run What
 
-MCP 서버는 **드라이버를 소유한 elevated KnLiveDbg.exe 안에 인프로세스로** 떠 있다. 따라서:
+The MCP server runs **in-process inside the elevated KnLiveDbg.exe that owns the driver**. Therefore:
 
-| 명령 | 실행 위치 | 형태 |
+| Command | Where it runs | Form |
 |------|-----------|------|
-| `mcp on ...` | **분석 대상 PC/VM**(커널 RW가 일어나는 곳) | KnLiveDbg.exe의 `knkd>` 프롬프트 안 콘솔 명령 |
-| `claude mcp add ...` | **클라이언트 PC**(Claude Code를 돌리는 곳) | 일반 셸 명령 (KnLiveDbg 밖) |
+| `mcp on ...` | **Analysis target PC/VM** (where kernel RW happens) | Console command inside KnLiveDbg.exe's `knkd>` prompt |
+| `claude mcp add ...` | **Client PC** (where Claude Code runs) | Regular shell command (outside KnLiveDbg) |
 
-> 서버 PC와 클라이언트 PC가 같으면 loopback으로, 물리적으로 다른 PC면 `--bind`로 네트워크 노출 후 서버 PC의 IP로 연결한다.
+> If the server PC and client PC are the same, connect over loopback; if they are physically different machines, expose over the network with `--bind` and connect to the server PC's IP.
 
 ---
 
-## 2. 사전 준비 (서버 PC / VM)
+## 2. Prerequisites (server PC / VM)
 
-### 2.1 산출물 묶음 복사
+### 2.1 Copy the artifact bundle
 
-KnLiveDbg.exe는 **자신 옆의 파일들에 의존**한다. 다른 PC/VM으로 옮길 때는 다음을 같은 폴더에 둔다.
+KnLiveDbg.exe **depends on the files next to it**. When moving it to another PC/VM, place the following in the same folder.
 
 ```text
-KnLiveDbg.exe            <- 실행 파일
-KnLiveDbg.sys            <- 메인 드라이버 (EXE 옆 필수)
-KnLiveDbgProbe.sys       <- 선택: probe load 용 양성 대조 드라이버
+KnLiveDbg.exe            <- executable
+KnLiveDbg.sys            <- main driver (required next to the EXE)
+KnLiveDbgProbe.sys       <- optional: benign control driver for probe load
 dbghelp.dll, dbgeng.dll, dbgcore.dll, DbgModel.dll
-msdia140.dll, symsrv.dll, srcsrv.dll, symsrv.yes   <- 심볼 런타임
+msdia140.dll, symsrv.dll, srcsrv.dll, symsrv.yes   <- symbol runtime
 ```
 
-가장 간단한 방법은 릴리스 zip을 통째로 옮기는 것이다(서버 PC가 아니라 빌드 PC에서):
+The simplest approach is to move the entire release zip (from the build PC, not the server PC):
 
 ```powershell
 .\tools\release.ps1 -Configuration Release
-# release\KnLiveDbg-<version>-Release-x64.zip 를 대상 PC로 복사해 압축 해제
+# copy release\KnLiveDbg-<version>-Release-x64.zip to the target PC and extract it
 ```
 
-> 심볼 DLL을 빠뜨리면 시작 시 `symType=0 (SymNone)`으로 떨어지며 커널 PDB 다운로드가 막힐 수 있다.
+> If you omit the symbol DLLs, startup falls back to `symType=0 (SymNone)` and kernel PDB downloads may be blocked.
 
-### 2.2 테스트 서명 활성화 (드라이버 로드용)
+### 2.2 Enable test signing (for driver load)
 
-드라이버는 WDK `TestSign`으로 서명되므로, 대상 PC/VM에서 테스트 서명을 켜야 로드된다(관리자 콘솔, 1회):
+The driver is signed with the WDK `TestSign`, so test signing must be enabled on the target PC/VM for it to load (admin console, one-time):
 
 ```powershell
 bcdedit /set testsigning on
-# 재부팅 필요
+# reboot required
 ```
 
-### 2.3 관리자(elevated) 실행
+### 2.3 Run elevated
 
 ```powershell
 cd .\x64\Release
 .\KnLiveDbg.exe
 ```
 
-부팅 단계가 `[ OK ]`로 진행되고(elevation -> 단일 인스턴스 -> 심볼/DIA -> 드라이버 로드 -> device open -> ABI verify -> 심볼 초기화), 대시보드와 함께 `knkd>` 프롬프트가 뜬다.
+The boot stages proceed with `[ OK ]` (elevation -> single instance -> symbols/DIA -> driver load -> device open -> ABI verify -> symbol init), and the dashboard appears along with the `knkd>` prompt.
 
 ---
 
-## 3. 서버 띄우기 (`mcp on`)
+## 3. Launching the Server (`mcp on`)
 
-`knkd>` 프롬프트에서 입력한다. 인자 순서는 자유다.
+Type this at the `knkd>` prompt. Argument order is free.
 
 ```text
 mcp on [port] [--allow-write] [--bind <addr>]
-mcp off        # 서버 중지 (엔진 루프 안에서는 off + Enter)
-mcp status     # 현재 상태
+mcp off        # stop the server (inside the engine loop: off + Enter)
+mcp status     # current state
 ```
 
-### 3.1 옵션
+### 3.1 Options
 
-| 옵션 | 의미 | 기본값 |
+| Option | Meaning | Default |
 |------|------|--------|
-| `<port>` (위치 인자) | 리스닝 포트. `0 < port < 65536`만 적용, 그 외는 무시 | `51766` |
-| `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 8종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
-| `--bind <addr>` | 네트워크 노출. `<addr>`에 추가로 바인드 | 없음 = loopback 전용 |
-| `--bind=<addr>` | 위와 동일(붙여 쓰는 형태) | 없음 |
+| `<port>` (positional arg) | Listening port. Only `0 < port < 65536` applies; anything else is ignored | `51766` |
+| `--allow-write` (or `allow-write`) | Lab write mode. Registers the 8 write tools + arms kernel write | none = read-only |
+| `--bind <addr>` | Network exposure. Additionally binds to `<addr>` | none = loopback only |
+| `--bind=<addr>` | Same as above (joined form) | none |
 
-`<addr>`에는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0` / `*` / `+`(http.sys 강한 와일드카드 `+`로 매핑)를 줄 수 있다.
+For `<addr>` you can give a concrete IP (e.g. `192.168.56.10`) or, for all interfaces, `0.0.0.0` / `*` / `+` (mapped to the http.sys strong wildcard `+`).
 
-### 3.2 로컬(loopback) — 같은 PC
+### 3.2 Local (loopback) — same PC
 
 ```text
 knkd> mcp on
 ```
 
-출력 예:
+Example output:
 
 ```text
 MCP server started (loopback Streamable HTTP).
@@ -104,74 +106,74 @@ MCP server started (loopback Streamable HTTP).
   the engine loop starts now; type 'off' + Enter here to stop.
 ```
 
-이 시점부터 콘솔은 **MCP 엔진 루프**다. 중지하려면 `off` + Enter.
+From this point the console is the **MCP engine loop**. To stop, type `off` + Enter.
 
-### 3.3 원격(`--bind`) — 분리된 PC/VM
+### 3.3 Remote (`--bind`) — separate PC/VM
 
-서버 PC에서 LAN IP를 먼저 확인한다:
+On the server PC, first find the LAN IP:
 
 ```powershell
-ipconfig    # 예: 192.168.56.10
+ipconfig    # e.g. 192.168.56.10
 ```
 
-그 IP로 바인드:
+Bind to that IP:
 
 ```text
 knkd> mcp on 51766 --bind 192.168.56.10
 ```
 
-출력에 `remote:` 줄과 네트워크 노출 경고가 추가로 찍힌다. 클라이언트는 이 `remote:` URL과 토큰을 쓴다.
+The output adds a `remote:` line and a network-exposure warning. The client uses this `remote:` URL and token.
 
 ```text
 MCP server started (NETWORK Streamable HTTP).
   url   : http://127.0.0.1:51766/mcp
   remote: http://192.168.56.10:51766/mcp
-  token : <복사해서 클라이언트에 사용>
+  token : <copy-to-client>
   ...
   WARNING: this elevated kernel read/write endpoint is now reachable over the
            network. The bearer token is the ONLY barrier. Restrict access with a
            firewall rule (allow only the client IP) and use a trusted lab segment.
 ```
 
-> `--bind 0.0.0.0`(전체 인터페이스)을 쓰면 어느 인터페이스 IP로 접속할지 도구가 알 수 없어 URL에 `<this-host-ip>` 플레이스홀더를 찍는다. 가능하면 **구체 IP를 지정**하라.
+> If you use `--bind 0.0.0.0` (all interfaces), the tool cannot know which interface IP will be used to connect, so it prints a `<this-host-ip>` placeholder in the URL. When possible, **specify a concrete IP**.
 
-### 3.4 Write 모드
+### 3.4 Write mode
 
 ```text
 knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 ```
 
-- 읽기 전용(기본): 엔진 진입 시 `SetWriteMode(false)`로 **커널 write 플래그 자체를 비무장**한다. write 툴은 등록되지 않으며, 호출 시 `writes are disabled; start the MCP server with --allow-write (lab mode)`로 거부된다.
-- `--allow-write`: write 툴 8종이 노출되고 `SetWriteMode(true)`로 무장된다. 모든 write는 preflight/backup/verify-diff/audit 레일을 거친다(인터랙티브 확인은 생략).
-- **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. **토큰이 새로 발급되므로 클라이언트 헤더도 갱신**해야 한다.
-- **권고**: write 세션 전 VM 스냅샷을 찍고, 분석 baseline(`snapshot.capture`)을 캡처하라. 격리 VM 전용이며 라이브 EDR/AC 박스에서는 절대 쓰지 않는다.
+- Read-only (default): on engine entry, `SetWriteMode(false)` **disarms the kernel write flag itself**. The write tools are not registered, and when called they are rejected with `writes are disabled; start the MCP server with --allow-write (lab mode)`.
+- `--allow-write`: the 8 write tools are exposed and `SetWriteMode(true)` arms them. Every write goes through the preflight/backup/verify-diff/audit rails (interactive confirmation is skipped).
+- **Mode-switch caveat**: if the server is already running, `mcp on --allow-write` (or `--bind`/port change) is **ignored** (it only prints `MCP server is already running on port N`). To change flags, first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch. **A new token is issued, so the client header must also be updated.**
+- **Recommendation**: take a VM snapshot before a write session, and capture an analysis baseline (`snapshot.capture`). It is for isolated VMs only; never use it on a live EDR/AC box.
 
 ---
 
-## 4. Claude 연결 (클라이언트 PC)
+## 4. Connecting Claude (client PC)
 
-서버 콘솔이 출력한 **정확한 url/token**을 사용한다.
+Use the **exact url/token** printed by the server console.
 
 ### 4.1 Claude Code
 
 ```bash
-# 로컬(같은 PC)
+# local (same PC)
 claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
-  --header "Authorization: Bearer <서버가_찍어준_token>"
+  --header "Authorization: Bearer <token-from-server>"
 
-# 원격(분리된 PC/VM) - 서버 PC의 IP 사용
+# remote (separate PC/VM) - use the server PC's IP
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
-  --header "Authorization: Bearer <서버가_찍어준_token>"
+  --header "Authorization: Bearer <token-from-server>"
 ```
 
-연결 확인:
+Verify the connection:
 
 ```bash
 claude mcp list
-# knlivedbg 가 connected 로 보이면 성공
+# success if knlivedbg shows as connected
 ```
 
-`.mcp.json`을 직접 쓸 경우(토큰은 **env 인다이렉션**, 평문 커밋 금지):
+If you write `.mcp.json` directly (token via **env indirection**, never commit in plaintext):
 
 ```jsonc
 {
@@ -185,13 +187,13 @@ claude mcp list
 }
 ```
 
-> `${KNLIVEDBG_TOKEN}`은 **클라이언트 측 권장 관례**다(서버가 이 환경변수를 읽지는 않는다 — 토큰은 서버가 매 `mcp on`마다 새로 발급). 클라이언트 셸에서 `export KNLIVEDBG_TOKEN=<token>`(PowerShell은 `$env:KNLIVEDBG_TOKEN="<token>"`)로 주입한다.
+> `${KNLIVEDBG_TOKEN}` is a **client-side recommended convention** (the server does not read this environment variable — the token is freshly issued by the server on every `mcp on`). Inject it in the client shell with `export KNLIVEDBG_TOKEN=<token>` (PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`).
 
-유용한 노브: per-server `timeout`(ms, 느린 스캔용 상향 — 진행 알림으로 연장되지 않음), `headersHelper`(접속 시 회전 토큰 발급), `alwaysLoad`.
+Useful knobs: per-server `timeout` (ms, raise it for slow scans — it is not extended by progress notifications), `headersHelper` (issue a rotating token on connect), `alwaysLoad`.
 
 ### 4.2 Claude Desktop
 
-`%APPDATA%\Claude\claude_desktop_config.json`에 동일한 `type: http` 항목을 넣는다. 네이티브 http를 미지원하는 빌드면 stdio 브리지를 쓴다:
+Put the same `type: http` entry in `%APPDATA%\Claude\claude_desktop_config.json`. If the build does not support native http, use a stdio bridge:
 
 ```jsonc
 {
@@ -205,166 +207,330 @@ claude mcp list
 }
 ```
 
-편집 후 Desktop을 완전히 재시작한다.
+After editing, fully restart Desktop.
 
-### 4.3 토큰 취급 주의
+### 4.3 Token handling caveats
 
-- 토큰은 커널 RW 엔드포인트를 인증한다. **project-scope `.mcp.json`에 평문으로 붙여넣어 커밋하지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수를 쓴다.
-- 토큰은 매 `mcp on`마다 바뀐다. 서버를 재기동하면 클라이언트 토큰도 갱신해야 한다.
+- The token authenticates the kernel RW endpoint. **Do not paste it in plaintext into a project-scope `.mcp.json` and commit it.** Use user-scope settings + the `${KNLIVEDBG_TOKEN}` environment variable.
+- The token changes on every `mcp on`. If you restart the server, you must also refresh the client token.
 
 ---
 
-## 5. 보안 모델 (연결이 막힐 때 이해용)
+## 5. Security Model (for understanding when a connection is blocked)
 
-서버는 JSON-RPC 처리 전에 다음 전송 게이트를 통과시킨다:
+Before processing JSON-RPC, the server passes the request through these transport gates:
 
-1. **Bearer 토큰**(상수 시간 비교): `Authorization: Bearer <token>` 불일치 시 401. 실제 인증 경계.
-2. **Host 검사**: loopback 전용 모드(기본)에서는 Host가 `127.0.0.1`/`localhost`/`[::1]`/`::1`이 아니면 403(DNS-rebinding 방어). `--bind` 원격 모드에서는 이 검사를 건너뛴다(원격 Host 수용).
-3. **Origin 검사**: Origin 헤더가 **존재하는데** loopback authority가 아니면 403. 부재/빈 Origin은 허용(비브라우저 MCP 클라이언트는 Origin 미전송). **이 검사는 바인드 모드와 무관하게 항상 적용**되어 DNS-rebinding을 막는다.
-4. **Write 게이트**: `--allow-write` 없이는 write 툴 미노출 + 커널 플래그 비무장.
+1. **Bearer token** (constant-time comparison): on `Authorization: Bearer <token>` mismatch, 401. This is the real authentication boundary.
+2. **Host check**: in loopback-only mode (default), if Host is not `127.0.0.1`/`localhost`/`[::1]`/`::1`, 403 (DNS-rebinding defense). In `--bind` remote mode, this check is skipped (remote Host accepted).
+3. **Origin check**: if the Origin header **is present** but is not a loopback authority, 403. Absent/empty Origin is allowed (non-browser MCP clients do not send Origin). **This check is always applied regardless of bind mode** and stops DNS-rebinding.
+4. **Write gate**: without `--allow-write`, the write tools are not exposed and the kernel flag is not armed.
 
-원격 노출 시 토큰이 유일한 장벽이므로, 서버 PC 방화벽에서 **클라이언트 IP만 인바운드 허용**을 권장한다(관리자 PowerShell):
+Since the token is the only barrier when exposed remotely, on the server PC firewall it is recommended to **allow inbound only from the client IP** (admin PowerShell):
 
 ```powershell
 New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
-  -Protocol TCP -LocalPort 51766 -RemoteAddress <클라이언트IP> -Action Allow
+  -Protocol TCP -LocalPort 51766 -RemoteAddress <client-ip> -Action Allow
 ```
 
-### 5.1 감사 로그(audit)
+### 5.1 Audit log (audit)
 
-`mcp on` 동안 항상 켜진다(`ai audit` 토글과 독립). 모든 요청을 append-only JSONL 한 줄로 기록:
+Always on while `mcp on` (independent of the `ai audit` toggle). It records every request as a single append-only JSONL line:
 
-- 경로: `<exeDir>\.kn-live-dbg\mcp-audit-<port>.jsonl`
-- 필드: `ts`(UTC), `session`, `peerPort`, `method`, `tool`, `args`(512자 절단), `decision`, `isError`, `resultBytes`, `writeArmed`
-- `decision` 값: `ok` / `unknown-tool` / `writes-disabled` / `engine-busy` / `tool-error` / `unknown-resource` / `session-open`
-- 마지막 50줄은 리소스 `kn://audit/tail`로도 노출된다.
+- Path: `<exeDir>\.kn-live-dbg\mcp-audit-<port>.jsonl`
+- Fields: `ts` (UTC), `session`, `peerPort`, `method`, `tool`, `args` (truncated to 512 chars), `decision`, `isError`, `resultBytes`, `writeArmed`
+- `decision` values: `ok` / `unknown-tool` / `writes-disabled` / `engine-busy` / `tool-error` / `unknown-resource` / `session-open`
+- The last 50 lines are also exposed via the resource `kn://audit/tail`.
 
 ---
 
-## 6. 제공 기능 카탈로그
+## 6. Capability Catalog
 
-### 6.1 읽기 툴 (38종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
+### 6.1 Read tools (38, no `--allow-write` needed — except `ti.subscribe` start/stop)
 
-| 툴 | 설명 | 주요 인자 (별도 표기 외 모두 선택) |
+| Tool | Description | Key args (all optional unless noted otherwise) |
 |-----|------|----------------------|
-| `process.find` | 이미지명/PID/EPROCESS로 프로세스 찾기 | `image`, `pid`, `eprocess` |
-| `process.describe` | `_EPROCESS` 기술(PID/DTB/PEB/threads/parent) | `source`, `pid`, `eprocess`, `fields` |
-| `type.describe` | 주소/프로세스에서 커널 구조 덤프(dt) | `source`, `address`, `type`, `fields` |
-| `callbacks.list` | 커널 콜백 열거(object/registry/process/thread/imageload/minifilter) | `scope`, `module` |
-| `wfp.list` | WFP provider/sublayer/callout/filter/layer 열거 | `scope`, `module`, `provider`, `layer` |
-| `alpc.list` | ALPC 포트/연결 열거 | `scope`, `name`, `pid` |
-| `vad.list` | VAD 열거(W+X/private/hidden-PTE/DKOM 체크) | `pid`, `image`, `eprocess`, `exec`, `private`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
-| `threads.list` | 스레드/시작주소/APC/스택 증거 | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
-| `etw.integrity` | ETW logger/GetCpuClock 무결성(InfinityHook) | (없음) |
-| `nmi.list` | 등록된 NMI 콜백 열거 | `scope` |
-| `fwtable.list` | 펌웨어 테이블 provider 열거 | `scope`, `module`, `provider`, `signature` |
-| `pool.find` | 커널 big pool 할당 열거(tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
-| `address.inspect` | 가상주소 검사(페이지테이블 워크/권한/소유 모듈) | `address`, `va`, `symbol` |
-| `wnf.decode` | WNF state-name 해시 디코드 | `hash`, `state`, `state_name` |
-| `wnf.list` | 라이브 WNF 인스턴스/후보/리스트 열거 | `scope` |
-| `ti.query` | Threat-Intelligence ETW 링 질의(recent/stats/by/grep) | `action`, `count`, `pid`, `task`, `pattern` |
-| `module.integrity` | 로드 모듈 PE/섹션 무결성 + W+X | `module`, `target`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch` |
-| `driver.integrity` | `DRIVER_OBJECT` 디스패치 테이블 무결성 | `driver`, `target`, `limit` |
-| `ssdt.scan` | SSDT/shadow-SSDT 시스템콜 훅 탐지 | (없음) |
-| `idt.scan` | IDT 인터럽트 게이트 훅/CPU별 divergence | (없음) |
-| `cr.scan` | 컨트롤 레지스터 검사(CR0.WP/SMEP/SMAP/CPU별) | (없음) |
-| `msr.check` | SYSCALL MSR(LSTAR/CSTAR/STAR/FMASK/EFER) 훅 | (없음) |
-| `vbs.scan` | VBS/HVCI/CI/하이퍼바이저/Secure Kernel/trustlet | (없음) |
-| `byovd.scan` | 로드 모듈을 로컬 BYOVD/LOLDrivers 카탈로그와 대조(네트워크/서브프로세스 없음) | (없음) |
-| `pool.scan_pe` | 커널 big pool에 스테이징된 PE 헌팅(서명 wipe 포함) | `tag`, `limit`, `suspicious` |
-| `hunt.run` | 전체 시스템 유저모드 이상 헌트(인젝션/VAD/PTE/threads/APC/driver/WFP/TI) | `mode` |
-| `snapshot.capture` | 동일 부팅 증거 baseline 캡처(in-memory, 디스크 미기록) | `name` |
-| `snapshot.diff` | 세션 baseline과 라이브 캡처 비교(또는 두 스냅샷 파일) | `old`, `new`, `domain`, `risk`, `limit`, `summary` |
-| `memory.read_virtual` | 가상주소 바이트 읽기(db/dq) — hex + unreadable 마스크(structured) | `address`/`va`/`symbol`, `width`(1/2/4/8), `count`, `process` |
-| `memory.read_physical` | 물리주소 바이트 읽기(!db/!dq) — 후킹된 VA 매핑 우회(structured) | `physical_address`(필수), `width`, `count` |
-| `memory.search` | VA 범위에서 정수 값/패턴 검색(s) | `address`(필수), `length`(필수), `value`(필수), `width` |
-| `memory.translate` | VA→PA 변환 + 페이지테이블 워크(vtop), 프로세스별 DTB | `address`/`va`/`symbol`, `process`/`cr3`, `length` |
-| `memory.probe` | 주소 readable/writable 점검(query) | `address`/`va`/`symbol`, `length` |
-| `code.disasm` | 주소/함수 디스어셈블(u/uf) | `address`/`symbol`, `count`, `function`(bool) |
-| `symbol.search` | 와일드카드 심볼→주소 열거(x `mod!mask`) | `mask`(필수), `limit` |
-| `memory.read_pointers` | 포인터 테이블 슬롯을 최근접 심볼로 해석(dps/dds/dqs) — 콜테이블/vtable/IAT 훅 헌팅 | `address`/`va`/`symbol`, `width`(4/8), `count` |
-| `memory.compare` | 두 가상 범위 byte 비교 + 불일치 오프셋(c) — 인라인 훅/패치 탐지 | `address1`(필수), `address2`(필수), `length`(필수) |
-| `ti.subscribe` | TI ETW 구독 제어(`action`=start/stop/status) — **start/stop은 `--allow-write` 필요** | `action` |
+| `process.find` | Find a process by image name/PID/EPROCESS | `image`, `pid`, `eprocess` |
+| `process.describe` | Describe `_EPROCESS` (PID/DTB/PEB/threads/parent) | `source`, `pid`, `eprocess`, `fields` |
+| `type.describe` | Dump a kernel structure from an address/process (dt) | `source`, `address`, `type`, `fields` |
+| `callbacks.list` | Enumerate kernel callbacks (object/registry/process/thread/imageload/minifilter) | `scope`, `module` |
+| `wfp.list` | Enumerate WFP provider/sublayer/callout/filter/layer | `scope`, `module`, `provider`, `layer` |
+| `alpc.list` | Enumerate ALPC ports/connections | `scope`, `name`, `pid` |
+| `vad.list` | Enumerate VADs (W+X/private/hidden-PTE/DKOM checks) | `pid`, `image`, `eprocess`, `exec`, `private`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
+| `threads.list` | Thread/start-address/APC/stack evidence | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
+| `etw.integrity` | ETW logger/GetCpuClock integrity (InfinityHook) | (none) |
+| `nmi.list` | Enumerate registered NMI callbacks | `scope` |
+| `fwtable.list` | Enumerate firmware-table providers | `scope`, `module`, `provider`, `signature` |
+| `pool.find` | Enumerate kernel big pool allocations (tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
+| `address.inspect` | Inspect a virtual address (page-table walk/permissions/owning module) | `address`, `va`, `symbol` |
+| `wnf.decode` | Decode a WNF state-name hash | `hash`, `state`, `state_name` |
+| `wnf.list` | Enumerate live WNF instances/candidates/lists | `scope` |
+| `ti.query` | Query the Threat-Intelligence ETW ring (recent/stats/by/grep) | `action`, `count`, `pid`, `task`, `pattern` |
+| `module.integrity` | Loaded-module PE/section integrity + W+X | `module`, `target`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch` |
+| `driver.integrity` | `DRIVER_OBJECT` dispatch-table integrity | `driver`, `target`, `limit` |
+| `ssdt.scan` | Detect SSDT/shadow-SSDT syscall hooks | (none) |
+| `idt.scan` | IDT interrupt-gate hooks/per-CPU divergence | (none) |
+| `cr.scan` | Inspect control registers (CR0.WP/SMEP/SMAP/per-CPU) | (none) |
+| `msr.check` | SYSCALL MSR (LSTAR/CSTAR/STAR/FMASK/EFER) hooks | (none) |
+| `vbs.scan` | VBS/HVCI/CI/hypervisor/Secure Kernel/trustlet | (none) |
+| `byovd.scan` | Compare loaded modules against the local BYOVD/LOLDrivers catalog (no network/subprocess) | (none) |
+| `pool.scan_pe` | Hunt PEs staged in kernel big pool (including signature wipe) | `tag`, `limit`, `suspicious` |
+| `hunt.run` | Whole-system user-mode anomaly hunt (injection/VAD/PTE/threads/APC/driver/WFP/TI) | `mode` |
+| `snapshot.capture` | Capture a same-boot evidence baseline (in-memory, not written to disk) | `name` |
+| `snapshot.diff` | Compare the session baseline with a live capture (or two snapshot files) | `old`, `new`, `domain`, `risk`, `limit`, `summary` |
+| `memory.read_virtual` | Read bytes at a virtual address (db/dq) — hex + unreadable mask (structured) | `address`/`va`/`symbol`, `width` (1/2/4/8), `count`, `process` |
+| `memory.read_physical` | Read bytes at a physical address (!db/!dq) — bypasses hooked VA mappings (structured) | `physical_address` (required), `width`, `count` |
+| `memory.search` | Search for an integer value/pattern in a VA range (s) | `address` (required), `length` (required), `value` (required), `width` |
+| `memory.translate` | VA->PA translation + page-table walk (vtop), per-process DTB | `address`/`va`/`symbol`, `process`/`cr3`, `length` |
+| `memory.probe` | Check whether an address is readable/writable (query) | `address`/`va`/`symbol`, `length` |
+| `code.disasm` | Disassemble an address/function (u/uf) | `address`/`symbol`, `count`, `function` (bool) |
+| `symbol.search` | Enumerate wildcard symbols->addresses (x `mod!mask`) | `mask` (required), `limit` |
+| `memory.read_pointers` | Resolve pointer-table slots to nearest symbols (dps/dds/dqs) — hunt call-table/vtable/IAT hooks | `address`/`va`/`symbol`, `width` (4/8), `count` |
+| `memory.compare` | Byte-compare two virtual ranges + mismatch offsets (c) — detect inline hooks/patches | `address1` (required), `address2` (required), `length` (required) |
+| `ti.subscribe` | Control TI ETW subscription (`action`=start/stop/status) — **start/stop require `--allow-write`** | `action` |
 
-> `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽는다. `memory.read_virtual`/`read_physical`/`symbol.search`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다. `ti.subscribe`는 읽기 카테고리지만 ETW 세션을 시작/중지하는 부수효과 때문에 start/stop만 write 모드를 요구한다(status는 항상 가능, `kn://ti/stats`와 동일 데이터).
+> `snapshot.capture`/`snapshot.diff` **do not write files to disk** on the MCP path (in-memory). Read the baseline via `kn://snapshot/current`. `memory.read_virtual`/`read_physical`/`symbol.search` return structuredContent (JSON), and the remaining new tools return text content. `ti.subscribe` is a read category, but because of the side effect of starting/stopping the ETW session, only start/stop require write mode (status is always available, the same data as `kn://ti/stats`).
 
-### 6.2 Write 툴 (8종, `--allow-write` 필수)
+### 6.2 Write tools (8, `--allow-write` required)
 
-| 툴 | 설명 | 필수 인자 | 선택 인자 |
+| Tool | Description | Required args | Optional args |
 |-----|------|-----------|-----------|
-| `memory.write_virtual` | 커널 가상주소에 바이트 쓰기(e*) | `address`, `bytes` | `width`, `process` |
-| `memory.write_physical` | 물리주소에 바이트 쓰기(pe*) | `physical_address`, `bytes` | — |
-| `memory.fill` | 커널 범위를 패턴으로 채움 | `address`, `length`, `pattern` | — |
-| `memory.move` | 커널 범위 복사(src->dest) | `source`, `dest`, `length` | — |
-| `type.set_field` | 주소의 구조체 필드 설정(setfield) | `address`, `type`, `field`, `value` | — |
-| `process.set_protection` | 임의 타깃 PS_PROTECTION 설정 (PPL/PP) | `level`(none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid`(미지정=self) |
-| `dump.raw` | 커널 범위를 지정 파일 경로로 덤프 | `address`, `length`, `path` | — |
-| `dump.pe` | 메모리에서 온디스크 PE 이미지 재구성 | `address`, `path` | — |
+| `memory.write_virtual` | Write bytes to a kernel virtual address (e*) | `address`, `bytes` | `width`, `process` |
+| `memory.write_physical` | Write bytes to a physical address (pe*) | `physical_address`, `bytes` | — |
+| `memory.fill` | Fill a kernel range with a pattern | `address`, `length`, `pattern` | — |
+| `memory.move` | Copy a kernel range (src->dest) | `source`, `dest`, `length` | — |
+| `type.set_field` | Set a struct field at an address (setfield) | `address`, `type`, `field`, `value` | — |
+| `process.set_protection` | Set PS_PROTECTION on an arbitrary target (PPL/PP) | `level` (none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid` (unspecified=self) |
+| `dump.raw` | Dump a kernel range to a given file path | `address`, `length`, `path` | — |
+| `dump.pe` | Reconstruct an on-disk PE image from memory | `address`, `path` | — |
 
-> **주의 — `process.set_protection` 임의 타깃**: `pid`로 임의 프로세스의 PPL/PP를 올리거나(예: 프로세스를 un-killable PP로 승격) 벗길 수 있다(예: PPL 안티치트/AV 무력화). 드라이버 IOCTL은 임의 타깃을 지원하며(write-ack + write 모드로만 게이트), `--allow-write` lab 모드 전용이다. 변경 전 대상 프로세스 baseline·VM 스냅샷을 권장한다. 응답에 before/after/requested 바이트 + 검증(readback) 결과가 포함된다.
+> **Caution — `process.set_protection` arbitrary target**: with `pid` you can raise the PPL/PP of an arbitrary process (e.g. promote a process to un-killable PP) or strip it (e.g. neutralize a PPL anti-cheat/AV). The driver IOCTL supports arbitrary targets (gated only by write-ack + write mode) and is for `--allow-write` lab mode only. Capturing a target-process baseline and a VM snapshot before the change is recommended. The response includes the before/after/requested bytes + the verification (readback) result.
 
-### 6.3 리소스 (8종)
+### 6.3 Resources (8)
 
-| URI | 내용 |
+| URI | Content |
 |-----|------|
-| `kn://session/info` | 드라이버 세션/ABI/소유권/write-arm 상태 |
-| `kn://capabilities` | 활성 MCP 툴과 인자 스키마(전송 측에서 직접 제공) |
-| `kn://modules/kernel` | 로드 커널 모듈 목록(name/base/size) — name->address 맵 |
-| `kn://drivers/status` | 드라이버 서비스 상태 + 단일 컨트롤러 세션 소유권 |
-| `kn://session/symbols` | 심볼 검색 경로/로드 모듈 수/엔진 ready 상태 |
-| `kn://ti/stats` | TI ETW 링 통계와 활성 상태 |
-| `kn://snapshot/current` | 현재 인메모리 snapshot baseline(있을 때) |
-| `kn://audit/tail` | write-audit JSONL 마지막 50줄 |
+| `kn://session/info` | Driver session/ABI/ownership/write-arm state |
+| `kn://capabilities` | Active MCP tools and argument schemas (provided directly by the transport side) |
+| `kn://modules/kernel` | List of loaded kernel modules (name/base/size) — name->address map |
+| `kn://drivers/status` | Driver service status + single-controller session ownership |
+| `kn://session/symbols` | Symbol search path/number of loaded modules/engine ready state |
+| `kn://ti/stats` | TI ETW ring statistics and active state |
+| `kn://snapshot/current` | Current in-memory snapshot baseline (when present) |
+| `kn://audit/tail` | Last 50 lines of the write-audit JSONL |
 
-모든 리소스는 `application/json`으로 반환된다.
+All resources are returned as `application/json`.
 
-### 6.4 프롬프트 (7종)
+### 6.4 Prompts (7)
 
-| 이름 | 설명 | 인자 |
+| Name | Description | Args |
 |------|------|------|
-| `callback-audit` | 커널 콜백 표면 감사 + 모듈 외 타깃 플래그 | `module` |
-| `driver-surface-map` | 단일 드라이버의 커널 footprint/공격 표면 매핑 | `driver` |
-| `address-provenance` | 커널 포인터의 정체와 정당성 판정 | `address` |
-| `minifilter-review` | minifilter 콜백에서 악성 필터 검토 | (없음) |
-| `hunt-triage` | 프로세스의 유저모드 인젝션/회피 분류 | `pid` |
-| `etw-infinityhook-check` | ETW/시스템콜 변조 스윕 | (없음) |
-| `wfp-surface` | Windows Filtering Platform 표면 매핑 | (없음) |
+| `callback-audit` | Audit the kernel callback surface + flag off-module targets | `module` |
+| `driver-surface-map` | Map a single driver's kernel footprint/attack surface | `driver` |
+| `address-provenance` | Determine the identity and legitimacy of a kernel pointer | `address` |
+| `minifilter-review` | Review minifilter callbacks for malicious filters | (none) |
+| `hunt-triage` | Triage a process's user-mode injection/evasion | `pid` |
+| `etw-infinityhook-check` | ETW/syscall tampering sweep | (none) |
+| `wfp-surface` | Map the Windows Filtering Platform surface | (none) |
 
 ---
 
-## 7. 동작 확인 / 트러블슈팅
+## 7. Functional Verification / Troubleshooting
 
-빠른 왕복 점검(클라이언트):
+Quick round-trip check (client):
 
 ```bash
-claude mcp list                      # connected 확인
-# Claude 세션에서: tools 목록 -> callbacks.list 호출 -> 결과 구조화 JSON 확인
+claude mcp list                      # confirm connected
+# in a Claude session: list tools -> call callbacks.list -> confirm the structured JSON result
 ```
 
-| 증상 | 원인 / 해결 |
+| Symptom | Cause / Fix |
 |------|-------------|
-| 연결이 401 | 토큰 불일치. 서버가 새로 찍은 토큰으로 클라이언트 헤더 갱신 |
-| 연결이 403 | (로컬) loopback이 아닌 Host로 접속 → 원격이면 `--bind` 필요 / (양쪽) Origin이 비-loopback인 브라우저 컨텍스트 |
-| 원격에서 접속 불가(타임아웃) | 방화벽 인바운드 차단. `New-NetFirewallRule`로 포트/클라이언트 IP 허용. 서버가 `--bind <IP>`로 떴는지 확인 |
-| `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write [--bind <addr>]`로 재기동. 토큰이 새로 발급되니 클라이언트 헤더도 갱신 |
-| `engine busy; retry shortly` 또는 `engine timeout` | tools/call은 JSON-RPC 에러코드가 아니라 `isError:true` CallToolResult로 옴. 대기 큐(8개) 포화 시 `engine busy`(audit `engine-busy`), 30초 요청 타임아웃 초과(긴 스캔) 시 `engine timeout`(audit `tool-error`). 클라이언트 per-server `timeout` 상향 또는 `limit`/`count`로 스캔 단축. (`-32603`은 `resources/read` 혼잡 경로에서만 발생) |
-| 드라이버 로드 실패 | 테스트 서명 미활성 → `bcdedit /set testsigning on` 후 재부팅 / 비-elevated 실행 |
-| `symType=0 (SymNone)` | 심볼 DLL 묶음을 EXE 옆에 두지 않음(2.1 참고) |
+| Connection 401 | Token mismatch. Refresh the client header with the token freshly printed by the server |
+| Connection 403 | (local) Connected with a non-loopback Host -> if remote, `--bind` is needed / (both) Browser context where Origin is non-loopback |
+| Cannot connect from remote (timeout) | Firewall inbound blocked. Allow the port/client IP with `New-NetFirewallRule`. Confirm the server came up with `--bind <IP>` |
+| `writes are disabled` | Read-only mode. **If already running, `mcp on --allow-write` is ignored** (prints `MCP server is already running`) -> first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch with `mcp on <port> --allow-write [--bind <addr>]`. A new token is issued, so refresh the client header too |
+| `engine busy; retry shortly` or `engine timeout` | tools/call arrives not as a JSON-RPC error code but as an `isError:true` CallToolResult. On wait-queue (8) saturation, `engine busy` (audit `engine-busy`); on exceeding the 30s request timeout (long scans), `engine timeout` (audit `tool-error`). Raise the client per-server `timeout`, or shorten the scan with `limit`/`count`. (`-32603` occurs only on the congested `resources/read` path) |
+| Driver load failure | Test signing not enabled -> reboot after `bcdedit /set testsigning on` / running non-elevated |
+| `symType=0 (SymNone)` | The symbol DLL bundle was not placed next to the EXE (see 2.1) |
 
 ---
 
-## 8. 빠른 참조
+## 8. Quick Reference
 
 ```text
-# 서버(VM/대상 PC, knkd> 프롬프트)
-mcp on                                   # 로컬, 읽기 전용
-mcp on 51766 --bind 192.168.56.10        # 원격, 읽기 전용
-mcp on 51766 --allow-write --bind 192.168.56.10   # 원격, write (VM 스냅샷 권장)
+# server (VM/target PC, knkd> prompt)
+mcp on                                   # local, read-only
+mcp on 51766 --bind 192.168.56.10        # remote, read-only
+mcp on 51766 --allow-write --bind 192.168.56.10   # remote, write (VM snapshot recommended)
 mcp status
-mcp off                                  # 또는 엔진 루프에서 off + Enter
+mcp off                                  # or off + Enter in the engine loop
 
-# 클라이언트(Claude Code)
+# client (Claude Code)
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
   --header "Authorization: Bearer $KNLIVEDBG_TOKEN"
 claude mcp list
 ```
+
+---
+
+## 9. Prompt Recipes
+
+Once connected, Claude auto-discovers the tools. **Just state your intent in natural language** and Claude picks and chains the tools — the real value is not in listing single tools but in the **correlation analysis** that weaves several tools together. Below are practical prompts per anti-cheat/kernel-forensics workflow and the tools brought to bear in each.
+
+### 9.1 Orientation (inject context via resources)
+
+```
+I'm connected to the knlivedbg MCP. Read kn://session/info, kn://drivers/status, kn://modules/kernel,
+and kn://session/symbols, then summarize the current driver session/ABI/write-arm state, the number of
+loaded kernel modules, and whether symbols are ready, and classify the detection tools you can use by
+purpose.
+```
+-> 4 resources + `tools/list`.
+
+### 9.2 Process injection hunt
+
+```
+Investigate whether PID 4567 (the game client) shows traces of code injection. Cross-reference W+X /
+private executable VADs, threads starting outside any module, queued APCs, and TI events, and lay out
+the suspicious regions with their evidence, ordered by severity.
+```
+-> `process.find` -> `vad.list {wx,private,hiddenpte}` + `threads.list {apc,stacks}` + `ti.query {action:by, pid}`. (Or the `/mcp__knlivedbg__hunt-triage` prompt.)
+
+### 9.3 Full kernel-hook scan
+
+```
+Scan SSDT/shadow-SSDT, the IDT, the SYSCALL MSRs (LSTAR etc.), and the control registers
+(CR0.WP/SMEP/SMAP) for any hooking or per-CPU divergence, then narrow it down to only the entries
+pointing outside the kernel image and attach which module each target belongs to.
+```
+-> `ssdt.scan` + `idt.scan` + `msr.check` + `cr.scan`, with `address.inspect` for each flagged address.
+
+### 9.4 Callback target verification (down to the code)
+
+```
+Enumerate the Ob callbacks with callbacks.list object, confirm each callback target address's module
+with address.inspect, and if it is off-module or suspicious, decode the instructions at that address
+with code.disasm to judge whether it is a normal callback prologue or a trampoline/hook.
+```
+-> `callbacks.list {scope:object}` -> `address.inspect` -> `code.disasm {address}`. (The earlier UCPD.sys case is now resolved read-only.)
+
+### 9.5 Inline hook / patch detection (live vs clean)
+
+```
+Dump the first 32 bytes of nt!NtCreateFile with memory.read_virtual, and compare against the bytes of
+the same function in a clean ntoskrnl copy of the same build to judge whether there is an inline hook
+(jmp/patch). If both regions are in memory, pull only the mismatch offsets with memory.compare.
+```
+-> `symbol.search {mask:"nt!NtCreateFile"}` -> `memory.read_virtual` / `memory.compare`.
+
+### 9.6 Call-table / IAT / vtable symbolization
+
+```
+From this driver's DRIVER_OBJECT dispatch-table address, resolve each slot to a symbol with
+memory.read_pointers. If any slot points outside the nt module, combine it with the driver.integrity
+result to judge dispatch hooking.
+```
+-> `driver.integrity {driver}` + `memory.read_pointers {address, width:8}`.
+
+### 9.7 Locate globals by symbol -> inspect
+
+```
+Find the callback-list globals with symbol.search, e.g. x nt!*CallbackList*, then read each global with
+memory.read_pointers to resolve the registered callback chain into symbols.
+```
+-> `symbol.search {mask:"nt!*CallbackList*"}` -> `memory.read_pointers`.
+
+### 9.8 Manually-mapped driver / pool-staged PE
+
+```
+Hunt PEs staged in kernel big pool (including signature wipe), and compare loaded modules against the
+LOLDrivers catalog with byovd.scan. For suspicious PEs, confirm the allocation context with pool.find,
+the permissions with address.inspect, and even the entry bytes with code.disasm.
+```
+-> `pool.scan_pe {suspicious:true}` + `byovd.scan` + `pool.find` + `address.inspect` + `code.disasm`.
+
+### 9.9 Physical memory / VA aliasing (bypass hooked mappings)
+
+```
+Translate this virtual address to a physical address with memory.translate (specify the process
+context), then read that physical frame directly with memory.read_physical and compare whether the bytes
+match the read via the VA. A mismatch suggests page remapping/copy-on-write evasion.
+```
+-> `memory.translate {address, pid}` -> compare `memory.read_physical` + `memory.read_virtual`.
+
+### 9.10 EDR/AC callback/minifilter tampering
+
+```
+Audit the process/thread/image-load callbacks and minifilters, and flag callbacks not mapped to a
+module, callbacks registered by suspicious modules, and abnormal altitudes.
+```
+-> `/mcp__knlivedbg__minifilter-review` or `callbacks.list` + `module.integrity`.
+
+### 9.11 ETW/InfinityHook + WFP/ALPC/WNF surface
+
+```
+Sweep ETW logger/GetCpuClock tampering with etw.integrity and nmi.list, and also look at non-MS-owned
+callouts with wfp.list, csrss/lsass pairings with alpc.list, and suspicious WNF instances with wnf.list.
+```
+-> `etw.integrity` + `nmi.list` + `wfp.list` + `alpc.list` + `wnf.list`.
+
+### 9.12 Threat-intel capture (TI subscription)
+
+```
+Start the Threat-Intelligence ETW subscription with ti.subscribe start (requires --allow-write), then
+after a moment filter recent events by PID/pattern with ti.query and summarize the suspicious behavior.
+When done, ti.subscribe stop.
+```
+-> `ti.subscribe {action:start}` -> `ti.query {action:recent/by/grep}` -> `ti.subscribe {action:stop}`. (start/stop require write mode; the controller must be PPL Antimalware for the ETW provider to open.)
+
+### 9.13 Baseline -> delta detection
+
+```
+Take a clean baseline now with snapshot.capture. (After running the game/cheat) show the callbacks/
+threads/VADs/pool allocations newly created relative to the baseline with snapshot.diff, ordered by risk.
+```
+-> `snapshot.capture` -> (time passes) -> `snapshot.diff {risk:high}` or compare `kn://snapshot/current`.
+
+### 9.14 Invoke an MCP prompt (playbook) directly
+
+In Claude Code they appear as slash commands, or name them directly:
+```
+/mcp__knlivedbg__address-provenance   (address)
+/mcp__knlivedbg__driver-surface-map   (driver)
+/mcp__knlivedbg__hunt-triage          (pid)
+/mcp__knlivedbg__callback-audit       (module)
+/mcp__knlivedbg__etw-infinityhook-check
+/mcp__knlivedbg__wfp-surface
+/mcp__knlivedbg__minifilter-review
+```
+Or: "run the address-provenance prompt on 0xffff...".
+
+### 9.15 Write mode (lab only, caution)
+
+Exposed only when launched with `--allow-write`. **Opening writes while reading untrusted memory is a
+confused-deputy risk — a VM snapshot before a write session is mandatory.**
+
+```
+# memory patch (analysis purpose)
+Patch the 2 bytes at address 0xffff... to 90 90. Back up the original bytes before the change, and after
+writing verify with a read-back.
+-> memory.write_virtual {address, bytes}
+
+# arbitrary-target PPL manipulation (e.g. PPL anti-cheat analysis)
+Promote PID 1234 to ppl-wintcb. Record the PS_PROTECTION before the change and confirm with a readback.
+-> process.set_protection {pid:1234, level:"ppl-wintcb"}   # returns before/after/verdict
+Strip PID 1234's protection to none.
+-> process.set_protection {pid:1234, level:"none"}
+
+# memory dump
+Dump 0x1000 bytes starting at 0xffff... to C:\lab\dump.bin.
+-> dump.raw {address, length, path}
+```
+
+### 9.16 Tips for getting the most out of Claude
+
+- **Give concrete values**: specifying PID/module name/address makes the arguments precise. If you don't know them, resolve first with `process.find`/`symbol.search`.
+- **Ask for cross-correlation**: "combine the VADs, threads, and TI and pull only the evidence pointing at the same region" — you get analysis, not a single listing.
+- **Go read->confirm->code**: narrow down with `address.inspect` (identity) -> `memory.read_virtual` (bytes) -> `code.disasm` (instructions).
+- **Slow scans**: `hunt.run`/full scans can exceed the 30s request timeout — raise the client `timeout` or narrow the scope with `limit`/`count`.
+- **Audit trail**: check what the model called via `kn://audit/tail` or `mcp-audit-<port>.jsonl`.
