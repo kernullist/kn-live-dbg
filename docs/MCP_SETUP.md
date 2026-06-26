@@ -85,8 +85,12 @@ mcp status     # current state
 | `--allow-write` (or `allow-write`) | Lab write mode. Registers the 8 write tools + arms kernel write | none = read-only |
 | `--bind <addr>` | Network exposure. Additionally binds to `<addr>` | none = loopback only |
 | `--bind=<addr>` | Same as above (joined form) | none |
+| `--token <t>` | Use a fixed bearer token (persisted), instead of the auto-managed one | auto |
+| `--new-token` | Rotate: discard the persisted token and mint a fresh random one | off |
 
 For `<addr>` you can give a concrete IP (e.g. `192.168.56.10`) or, for all interfaces, `0.0.0.0` / `*` / `+` (mapped to the http.sys strong wildcard `+`).
+
+**Token stability.** The bearer token is **stable across restarts** so a client registered once keeps working — you do not re-add it on every `mcp on`. Resolution order: `--token <t>` > the `KNLIVEDBG_TOKEN` environment variable > a persisted file (`<exeDir>\.kn-live-dbg\mcp-token-<port>`) > a freshly minted random token (which is then persisted for reuse). The startup banner notes which source was used. Use `--new-token` to rotate (then refresh the client). The persisted token sits in an operator-readable file on the (isolated lab) box — use `--new-token` or set a strict-ACL `KNLIVEDBG_TOKEN` if that is a concern.
 
 ### 3.2 Local (loopback) — same PC
 
@@ -369,7 +373,8 @@ Config: `~/.codeium/windsurf/mcp_config.json` (user scope only) or Settings → 
 ### 4.10 Token handling caveats
 
 - The token authenticates the kernel RW endpoint. **Do not paste it in plaintext into a project-scope `.mcp.json` and commit it.** Use user-scope settings + the `${KNLIVEDBG_TOKEN}` environment variable.
-- The token changes on every `mcp on`. If you restart the server, you must also refresh the client token.
+- The token is **stable across restarts** (§3.1): a client registered once keeps working, so you do not re-add the server on every `mcp on`. It changes only when you pass `--new-token` (rotation) or supply a different `--token`/`KNLIVEDBG_TOKEN` — refresh the client only then.
+- For end-to-end env-driven stability, set the same `KNLIVEDBG_TOKEN` on **both** the server host (the server reads it, precedence #2) and the client (via `${KNLIVEDBG_TOKEN}`); then no token ever lands on disk.
 
 ---
 

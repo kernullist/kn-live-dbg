@@ -198,6 +198,111 @@ namespace
         return out;
     }
 
+    // Trim surrounding whitespace and reject a token that is empty or carries
+    // whitespace/control characters (which could corrupt the Authorization
+    // header comparison). Returns the sanitized token, or empty if invalid.
+    std::wstring SanitizeToken(const std::wstring& raw)
+    {
+        size_t begin = 0;
+        size_t end = raw.size();
+        while (begin < end && (raw[begin] == L' ' || raw[begin] == L'\t' || raw[begin] == L'\r' || raw[begin] == L'\n'))
+        {
+            ++begin;
+        }
+        while (end > begin && (raw[end - 1] == L' ' || raw[end - 1] == L'\t' || raw[end - 1] == L'\r' || raw[end - 1] == L'\n'))
+        {
+            --end;
+        }
+        std::wstring token = raw.substr(begin, end - begin);
+        if (token.empty() || token.size() > 512)
+        {
+            return std::wstring();
+        }
+        for (wchar_t ch : token)
+        {
+            if (ch < 0x21 || ch > 0x7e)
+            {
+                // Restrict to printable ASCII without spaces; the minted token
+                // is lowercase hex, and an operator-supplied token must be a
+                // single safe header value.
+                return std::wstring();
+            }
+        }
+        return token;
+    }
+
+    std::wstring ReadEnvToken()
+    {
+        wchar_t buffer[1024];
+        DWORD len = GetEnvironmentVariableW(L"KNLIVEDBG_TOKEN", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+        if (len == 0 || len >= sizeof(buffer) / sizeof(buffer[0]))
+        {
+            return std::wstring();
+        }
+        return SanitizeToken(std::wstring(buffer, len));
+    }
+
+    std::wstring ReadTokenFile(const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return std::wstring();
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return std::wstring();
+        }
+        char bytes[1024];
+        DWORD read = 0;
+        std::wstring token;
+        if (ReadFile(file, bytes, sizeof(bytes) - 1, &read, nullptr) && read > 0)
+        {
+            bytes[read] = '\0';
+            // The token is ASCII hex (or a printable ASCII operator token), so a
+            // direct widen is sufficient.
+            std::wstring wide;
+            wide.reserve(read);
+            for (DWORD i = 0; i < read; ++i)
+            {
+                wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(bytes[i])));
+            }
+            token = SanitizeToken(wide);
+        }
+        CloseHandle(file);
+        return token;
+    }
+
+    bool WriteTokenFile(const std::wstring& path, const std::wstring& token)
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+        size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+        {
+            CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        std::string ascii;
+        ascii.reserve(token.size());
+        for (wchar_t ch : token)
+        {
+            ascii.push_back(static_cast<char>(ch & 0x7f));
+        }
+        DWORD written = 0;
+        bool ok = WriteFile(file, ascii.data(), static_cast<DWORD>(ascii.size()), &written, nullptr) != 0;
+        CloseHandle(file);
+        return ok && written == ascii.size();
+    }
+
     bool ConstantTimeEqual(const std::string& a, const std::string& b)
     {
         // Length difference is itself a signal, but we still iterate over the
@@ -578,6 +683,49 @@ std::wstring McpServer::Token() const
     return token_;
 }
 
+std::wstring McpServer::TokenSource() const
+{
+    return tokenSource_;
+}
+
+std::wstring McpServer::ResolveToken()
+{
+    // 1) explicit --token: use and persist (so later restarts without --token,
+    //    and without an env var, reuse it from the file).
+    std::wstring explicitToken = SanitizeToken(config_.TokenOverride);
+    if (!explicitToken.empty())
+    {
+        WriteTokenFile(config_.TokenPath, explicitToken);
+        tokenSource_ = L"override";
+        return explicitToken;
+    }
+
+    // 2) KNLIVEDBG_TOKEN env: authoritative each run, not persisted (env wins).
+    std::wstring envToken = ReadEnvToken();
+    if (!envToken.empty())
+    {
+        tokenSource_ = L"env";
+        return envToken;
+    }
+
+    // 3) persisted file: reuse unless an explicit rotation was requested.
+    if (!config_.RotateToken)
+    {
+        std::wstring saved = ReadTokenFile(config_.TokenPath);
+        if (!saved.empty())
+        {
+            tokenSource_ = L"reused";
+            return saved;
+        }
+    }
+
+    // 4) mint a fresh random token and persist it for the next restart.
+    std::wstring fresh = RandomHex(32);
+    WriteTokenFile(config_.TokenPath, fresh);
+    tokenSource_ = L"new";
+    return fresh;
+}
+
 std::wstring McpServer::AuditPath() const
 {
     return config_.AuditPath;
@@ -665,11 +813,11 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         }
 
         config_ = config;
-        token_ = RandomHex(32);
         sessionId_.clear();
         stopRequested_.store(false);
 
-        // Ensure the audit directory exists (best-effort; logging is non-fatal).
+        // Ensure the .kn-live-dbg directory exists (audit log + persisted token);
+        // best-effort, logging/persistence are non-fatal.
         if (!config_.AuditPath.empty())
         {
             size_t slash = config_.AuditPath.find_last_of(L"\\/");
@@ -678,6 +826,11 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
                 CreateDirectoryW(config_.AuditPath.substr(0, slash).c_str(), nullptr);
             }
         }
+
+        // Resolve a STABLE bearer token so a client registered once keeps
+        // working across restarts (the dir above must exist first so a freshly
+        // minted token can be persisted).
+        token_ = ResolveToken();
 
         jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
