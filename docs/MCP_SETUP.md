@@ -150,9 +150,9 @@ knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 
 ---
 
-## 4. Connecting Claude (client PC)
+## 4. Connecting an MCP client (client PC)
 
-Use the **exact url/token** printed by the server console.
+Use the **exact url/token** printed by the server console. The server speaks streamable HTTP, so any MCP client that supports the `http` transport connects directly; clients limited to stdio use the `mcp-remote` bridge.
 
 ### 4.1 Claude Code
 
@@ -209,7 +209,44 @@ Put the same `type: http` entry in `%APPDATA%\Claude\claude_desktop_config.json`
 
 After editing, fully restart Desktop.
 
-### 4.3 Token handling caveats
+### 4.3 Codex CLI
+
+Codex reads MCP config from `~/.codex/config.toml` (or a trusted project `.codex/config.toml`) and supports streamable-HTTP MCP servers directly.
+
+**HTTP (recommended).** Token via env indirection (sent as `Authorization: Bearer <env value>`):
+
+```toml
+[mcp_servers.knlivedbg]
+url = "http://192.168.56.10:51766/mcp"
+bearer_token_env_var = "KNLIVEDBG_TOKEN"
+tool_timeout_sec = 120   # raise above the 60s default for slow scans (hunt.run, etc.)
+```
+
+Then `export KNLIVEDBG_TOKEN=<token>` (PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`) in the shell that launches Codex. A static header works too:
+
+```toml
+[mcp_servers.knlivedbg]
+url = "http://192.168.56.10:51766/mcp"
+http_headers = { "Authorization" = "Bearer <token-from-server>" }
+```
+
+> If your Codex build does not connect over HTTP, enable the experimental Rust MCP client by adding the top-level key `experimental_use_rmcp_client = true` to `~/.codex/config.toml`.
+
+**stdio bridge (universal fallback).** If HTTP is unavailable, bridge through `mcp-remote`:
+
+```toml
+[mcp_servers.knlivedbg]
+command = "npx"
+args = ["-y", "mcp-remote", "http://192.168.56.10:51766/mcp", "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
+env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
+```
+
+Notes:
+- `codex mcp add <name> --env VAR=VALUE -- <command>` registers a **stdio** server from the CLI; HTTP/`url` servers are configured by editing `config.toml` directly.
+- Timeouts: `startup_timeout_sec` (default 10s), `tool_timeout_sec` (default 60s). The server caps a single request at 30s internally, but a whole-system `hunt.run` can still exceed the Codex tool timeout — raise `tool_timeout_sec`.
+- Codex is a non-browser client (sends no `Origin`) and connects on the bound host, so the bearer token is the only barrier — same as Claude (§5).
+
+### 4.4 Token handling caveats
 
 - The token authenticates the kernel RW endpoint. **Do not paste it in plaintext into a project-scope `.mcp.json` and commit it.** Use user-scope settings + the `${KNLIVEDBG_TOKEN}` environment variable.
 - The token changes on every `mcp on`. If you restart the server, you must also refresh the client token.

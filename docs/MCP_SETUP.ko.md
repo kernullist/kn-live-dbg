@@ -150,9 +150,9 @@ knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 
 ---
 
-## 4. Claude 연결 (클라이언트 PC)
+## 4. MCP 클라이언트 연결 (클라이언트 PC)
 
-서버 콘솔이 출력한 **정확한 url/token**을 사용한다.
+서버 콘솔이 출력한 **정확한 url/token**을 사용한다. 서버는 streamable HTTP를 쓰므로 `http` 전송을 지원하는 MCP 클라이언트는 바로 붙고, stdio만 지원하는 클라이언트는 `mcp-remote` 브리지를 쓴다.
 
 ### 4.1 Claude Code
 
@@ -209,7 +209,44 @@ claude mcp list
 
 편집 후 Desktop을 완전히 재시작한다.
 
-### 4.3 토큰 취급 주의
+### 4.3 Codex CLI
+
+Codex는 `~/.codex/config.toml`(또는 신뢰된 프로젝트의 `.codex/config.toml`)에서 MCP 설정을 읽고 streamable-HTTP MCP 서버를 직접 지원한다.
+
+**HTTP (권장).** 토큰은 env 인다이렉션(`Authorization: Bearer <env 값>`으로 전송):
+
+```toml
+[mcp_servers.knlivedbg]
+url = "http://192.168.56.10:51766/mcp"
+bearer_token_env_var = "KNLIVEDBG_TOKEN"
+tool_timeout_sec = 120   # 느린 스캔(hunt.run 등)을 위해 기본 60s보다 상향
+```
+
+그다음 Codex를 띄우는 셸에서 `export KNLIVEDBG_TOKEN=<token>`(PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`). 정적 헤더도 가능:
+
+```toml
+[mcp_servers.knlivedbg]
+url = "http://192.168.56.10:51766/mcp"
+http_headers = { "Authorization" = "Bearer <token-from-server>" }
+```
+
+> Codex 빌드가 HTTP로 연결되지 않으면 `~/.codex/config.toml` 최상위에 `experimental_use_rmcp_client = true`를 추가해 실험적 Rust MCP 클라이언트를 활성화한다.
+
+**stdio 브리지 (범용 폴백).** HTTP를 못 쓰면 `mcp-remote`로 브리지:
+
+```toml
+[mcp_servers.knlivedbg]
+command = "npx"
+args = ["-y", "mcp-remote", "http://192.168.56.10:51766/mcp", "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
+env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
+```
+
+참고:
+- `codex mcp add <name> --env VAR=VALUE -- <command>`는 CLI에서 **stdio** 서버를 등록한다. HTTP/`url` 서버는 `config.toml`을 직접 편집해 설정한다.
+- 타임아웃: `startup_timeout_sec`(기본 10s), `tool_timeout_sec`(기본 60s). 서버는 단일 요청을 내부적으로 30s로 제한하지만 전체 시스템 `hunt.run`은 Codex tool 타임아웃을 넘길 수 있으니 `tool_timeout_sec`를 올린다.
+- Codex는 비브라우저 클라이언트(`Origin` 미전송)이고 바인드 호스트로 접속하므로 bearer 토큰이 유일한 장벽 — Claude와 동일(§5).
+
+### 4.4 토큰 취급 주의
 
 - 토큰은 커널 RW 엔드포인트를 인증한다. **project-scope `.mcp.json`에 평문으로 붙여넣어 커밋하지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수를 쓴다.
 - 토큰은 매 `mcp on`마다 바뀐다. 서버를 재기동하면 클라이언트 토큰도 갱신해야 한다.
