@@ -370,7 +370,44 @@ Config: `~/.codeium/windsurf/mcp_config.json` (user scope only) or Settings → 
 
 - `${env:KNLIVEDBG_TOKEN}` is interpolated (restart Windsurf so it inherits the variable). Click the refresh button in the MCP panel after editing. Cascade caps active MCP tools at 100 total — disable unneeded tools to stay under budget. Source: [docs.windsurf.com](https://docs.windsurf.com/plugins/cascade/mcp).
 
-### 4.10 Token handling caveats
+### 4.10 Hermes Agent (Nous Research)
+
+Hermes is configured by a single **YAML** file, not JSON — `config.yaml` under `$HERMES_HOME`. It supports HTTP transport natively (`url` + `headers`), so connect directly — **no `mcp-remote` bridge needed**. The `{command, args, env}` form some UIs show is only the *stdio* sub-schema; do not force our HTTP endpoint through it.
+
+Config locations:
+
+| Platform | Path |
+|------|------|
+| Windows (native installer) | `%LOCALAPPDATA%\hermes\config.yaml` (i.e. `$HERMES_HOME`) |
+| Linux / macOS / WSL | `~/.hermes/config.yaml` |
+
+> On Windows the installer sets `HERMES_HOME=%LOCALAPPDATA%\hermes`. The WebUI may instead look in `~/.hermes\` — if you edit one and Hermes reads the other, the server "is not found". Confirm the live path with `echo %HERMES_HOME%` (PowerShell: `$env:HERMES_HOME`).
+
+Add a top-level `mcp_servers` block. A fresh config ships it as `mcp_servers: {}` (empty mapping = zero servers) — replace the `{}` with an indented block:
+
+```yaml
+mcp_servers:
+  knlivedbg:
+    url: "http://127.0.0.1:51766/mcp"        # remote: http://<server-ip>:51766/mcp
+    headers:
+      Authorization: "Bearer <token-from-server>"
+    timeout: 300        # raise above the 120s default for slow scans (hunt.run, etc.)
+    connect_timeout: 60
+    # tools:            # optional: expose only what you need (38 read tools is a lot of context)
+    #   include: [process.find, vad.list, threads.list, callbacks.list, hunt.run]
+```
+
+CLI equivalent (use `--url`/`--header`, not the stdio `--command`/`--args`):
+
+```bash
+hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
+  --header "Authorization: Bearer <token-from-server>"
+```
+
+- Hermes reads `config.yaml` once at startup — **restart Hermes** after editing. Verify with `hermes mcp list` (should show `knlivedbg` connected). Header env interpolation is not guaranteed, so the literal token usually lands in the YAML — treat the file as a secret and do not commit it.
+- If your build is old enough that it rejects `url`, fall back to the stdio `mcp-remote` bridge (`command: npx`, `args: [-y, mcp-remote, <url>, --header, "Authorization: Bearer <token>"]`); on Windows that needs Node/`npx` on PATH and is the usual cause of "server not found". Source: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
+
+### 4.11 Token handling caveats
 
 - The token authenticates the kernel RW endpoint. **Do not paste it in plaintext into a project-scope `.mcp.json` and commit it.** Use user-scope settings + the `${KNLIVEDBG_TOKEN}` environment variable.
 - The token is **stable across restarts** (§3.1): a client registered once keeps working, so you do not re-add the server on every `mcp on`. It changes only when you pass `--new-token` (rotation) or supply a different `--token`/`KNLIVEDBG_TOKEN` — refresh the client only then.
