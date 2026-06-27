@@ -370,7 +370,44 @@ extensions:
 
 - `${env:KNLIVEDBG_TOKEN}`이 보간된다(변수 상속 위해 Windsurf 재시작). 편집 후 MCP 패널의 refresh 버튼 클릭. Cascade는 활성 MCP 툴을 총 100개로 제한 — 불필요한 툴은 비활성화. 출처: [docs.windsurf.com](https://docs.windsurf.com/plugins/cascade/mcp).
 
-### 4.10 토큰 취급 주의
+### 4.10 Hermes Agent (Nous Research)
+
+Hermes는 JSON이 아니라 **YAML** 파일 하나로 설정한다 — `$HERMES_HOME` 아래의 `config.yaml`. HTTP 전송을 네이티브 지원(`url` + `headers`)하므로 바로 붙는다 — **`mcp-remote` 브리지 불필요**. 일부 UI가 보여주는 `{command, args, env}` 폼은 *stdio 전용* 하위 스키마이므로, 우리 HTTP 엔드포인트를 거기 욱여넣지 말 것.
+
+설정 파일 위치:
+
+| 플랫폼 | 경로 |
+|------|------|
+| Windows (네이티브 설치본) | `%LOCALAPPDATA%\hermes\config.yaml` (= `$HERMES_HOME`) |
+| Linux / macOS / WSL | `~/.hermes/config.yaml` |
+
+> Windows 설치본은 `HERMES_HOME=%LOCALAPPDATA%\hermes`로 잡는다. WebUI는 `~/.hermes\`를 볼 수 있어, 한쪽을 편집했는데 Hermes가 다른 쪽을 읽으면 서버를 "못 찾는다". 실제 경로는 `echo %HERMES_HOME%`(PowerShell은 `$env:HERMES_HOME`)로 확인한다.
+
+최상위에 `mcp_servers` 블록을 추가한다. 갓 만든 config는 `mcp_servers: {}`(빈 매핑 = 서버 0개)로 시작하므로, `{}`를 들여쓴 블록으로 펼쳐서 채운다:
+
+```yaml
+mcp_servers:
+  knlivedbg:
+    url: "http://127.0.0.1:51766/mcp"        # 원격: http://<server-ip>:51766/mcp
+    headers:
+      Authorization: "Bearer <서버가_찍어준_token>"
+    timeout: 300        # 느린 스캔(hunt.run 등) 대비 기본 120초보다 상향
+    connect_timeout: 60
+    # tools:            # 선택: 필요한 것만 노출(read 툴 38개는 컨텍스트를 많이 먹음)
+    #   include: [process.find, vad.list, threads.list, callbacks.list, hunt.run]
+```
+
+CLI 등가(stdio용 `--command`/`--args`가 아니라 `--url`/`--header` 사용):
+
+```bash
+hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
+  --header "Authorization: Bearer <서버가_찍어준_token>"
+```
+
+- Hermes는 시작 시 `config.yaml`을 한 번만 읽으므로 편집 후 **Hermes 재시작**. `hermes mcp list`로 확인(`knlivedbg`가 connected). 헤더 env 보간은 보장되지 않아 보통 토큰 원문이 YAML에 들어가므로, 파일을 비밀로 다루고 커밋하지 말 것.
+- 빌드가 오래돼 `url`을 거부하면 stdio `mcp-remote` 브리지로 폴백한다(`command: npx`, `args: [-y, mcp-remote, <url>, --header, "Authorization: Bearer <token>"]`). Windows에서는 PATH에 Node/`npx`가 있어야 하며, 이게 없는 게 "서버 못 찾음"의 흔한 원인이다. 출처: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
+
+### 4.11 토큰 취급 주의
 
 - 토큰은 커널 RW 엔드포인트를 인증한다. **project-scope `.mcp.json`에 평문으로 붙여넣어 커밋하지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수를 쓴다.
 - 토큰은 **재기동해도 유지**된다(§3.1): 클라이언트를 한 번 등록하면 매 `mcp on`마다 다시 추가할 필요 없다. `--new-token`(회전) 또는 다른 `--token`/`KNLIVEDBG_TOKEN`을 줄 때만 바뀌므로, 그때만 클라이언트를 갱신한다.
