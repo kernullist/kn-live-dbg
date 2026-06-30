@@ -393,7 +393,7 @@ mcp_servers:
       Authorization: "Bearer <서버가_찍어준_token>"
     timeout: 300        # 느린 스캔(hunt.run 등) 대비 기본 120초보다 상향
     connect_timeout: 60
-    # tools:            # 선택: 필요한 것만 노출(read 툴 41개는 컨텍스트를 많이 먹음)
+    # tools:            # 선택: 필요한 것만 노출(read 툴 43개는 컨텍스트를 많이 먹음)
     #   include: [process.find, vad.list, threads.list, callbacks.list, hunt.run]
 ```
 
@@ -444,7 +444,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 ## 6. 제공 기능 카탈로그
 
-### 6.1 읽기 툴 (41종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
+### 6.1 읽기 툴 (43종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
 
 | 툴 | 설명 | 주요 인자 (별도 표기 외 모두 선택) |
 |-----|------|----------------------|
@@ -465,6 +465,8 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `wnf.decode` | WNF state-name 해시 디코드 | `hash`, `state`, `state_name` |
 | `wnf.list` | 라이브 WNF 인스턴스/후보/리스트 열거 | `scope` |
 | `ti.query` | Threat-Intelligence ETW 링 질의(recent/stats/by/grep) | `action`, `count`, `pid`, `task`, `pattern` |
+| `timeline.status` | in-memory evidence timeline 카운터와 용량 보고 | (없음) |
+| `timeline.query` | 수집된 timeline 이벤트를 source/domain/PID/limit/order로 질의 | `source`, `domain`, `pid`, `limit`, `order` |
 | `module.integrity` | 로드 모듈 PE/섹션 무결성 + W+X | `module`, `target`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch` |
 | `driver.integrity` | `DRIVER_OBJECT` 디스패치 테이블 무결성 | `driver`, `target`, `limit` |
 | `ssdt.scan` | SSDT/shadow-SSDT 시스템콜 훅 탐지 | (없음) |
@@ -490,7 +492,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `memory.compare` | 두 가상 범위 byte 비교 + 불일치 오프셋(c) — 인라인 훅/패치 탐지 | `address1`(필수), `address2`(필수), `length`(필수) |
 | `ti.subscribe` | TI ETW 구독 제어(`action`=start/stop/status) — **start/stop은 `--allow-write` 필요** | `action` |
 
-> `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽거나 `snapshot.show`로 summary + structuredContent를 받는다. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다. `ti.subscribe`는 읽기 카테고리지만 ETW 세션을 시작/중지하는 부수효과 때문에 start/stop만 write 모드를 요구한다(status는 항상 가능, `kn://ti/stats`와 동일 데이터).
+> `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽거나 `snapshot.show`로 summary + structuredContent를 받는다. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show`/`timeline.status`/`timeline.query`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다. `ti.subscribe`는 읽기 카테고리지만 ETW 세션을 시작/중지하는 부수효과 때문에 start/stop만 write 모드를 요구한다(status는 항상 가능, `kn://ti/stats`와 동일 데이터).
 
 ### 6.2 Write 툴 (10종, `--allow-write` 필수)
 
