@@ -304,7 +304,7 @@ Human-readable native command output uses scoped console attributes for high-sig
 6. After a successful build, the script verifies the stamped PE versions, verifies driver signatures, and stages Debugging Tools runtime DLLs beside the EXE.
 7. `tools\release.ps1` runs a version-bumped build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory. `-NoVersionBump` keeps the current version for ad hoc packages.
 8. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, README/runtime manifest metadata, and `kn-live-dbg-version.json`.
-9. `tools\validate-timeline-selftest.ps1` is a post-build driver-free regression gate for the timeline store, graph, and reconciliation path. It calls `KnLiveDbg.exe --self-test timeline`, which exits before any privileged driver lifecycle work.
+9. `tools\validate-timeline-selftest.ps1` and `tools\validate-mcp-tool-catalog.ps1` are post-build driver-free regression gates for the timeline store, graph, reconciliation path, and MCP tool catalog. They call `KnLiveDbg.exe --self-test timeline` and `KnLiveDbg.exe --self-test mcp-tools`, which exit before any privileged driver lifecycle work.
 
 ## AI Provider Flow
 

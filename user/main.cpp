@@ -12,6 +12,7 @@
 #include "IntegrityScanner.h"
 #include "McpJson.h"
 #include "McpServer.h"
+#include "McpSelfTest.h"
 #include "MemoryDumper.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
@@ -37767,8 +37768,18 @@ int wmain(int argc, wchar_t** argv)
         {
             return RunTimelineSelfTest();
         }
+        if (argc >= 3 && ToLower(argv[2]) == L"mcp-tools")
+        {
+            return RunMcpToolCatalogSelfTest();
+        }
+        if (argc >= 3 && ToLower(argv[2]) == L"all")
+        {
+            int timelineExit = RunTimelineSelfTest();
+            int mcpExit = RunMcpToolCatalogSelfTest();
+            return (timelineExit == 0 && mcpExit == 0) ? 0 : 1;
+        }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|all\n";
         return 2;
     }
 
