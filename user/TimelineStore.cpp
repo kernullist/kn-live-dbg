@@ -361,6 +361,192 @@ namespace
         return ok;
     }
 
+    bool SnapshotEvidenceValueByKey(
+        const SnapshotRecord& record,
+        const std::wstring& key,
+        std::wstring* value)
+    {
+        bool found = false;
+        std::wstring wanted = TimelineToLower(key);
+
+        for (const auto& item : record.Evidence)
+        {
+            if (TimelineToLower(item.first) == wanted)
+            {
+                if (value != nullptr)
+                {
+                    *value = item.second;
+                }
+                found = true;
+                break;
+            }
+        }
+
+        return found;
+    }
+
+    bool SnapshotRecordPid(const SnapshotRecord& record, const std::wstring& key, uint32_t* pid)
+    {
+        bool ok = false;
+        std::wstring value;
+
+        if (SnapshotEvidenceValueByKey(record, key, &value))
+        {
+            ok = ParsePidFromText(value, pid);
+        }
+
+        return ok;
+    }
+
+    uint32_t SnapshotRecordAnyPid(const SnapshotRecord& record)
+    {
+        uint32_t pid = 0;
+        static const wchar_t* kKeys[] =
+        {
+            L"pid",
+            L"process_id",
+            L"owner_pid",
+            L"target_pid",
+            L"source_pid"
+        };
+
+        for (const wchar_t* key : kKeys)
+        {
+            if (SnapshotRecordPid(record, key, &pid))
+            {
+                break;
+            }
+        }
+
+        return pid;
+    }
+
+    void AddLowerNonEmpty(std::set<std::wstring>* values, const std::wstring& value)
+    {
+        if (values != nullptr && !value.empty())
+        {
+            values->insert(TimelineToLower(value));
+        }
+    }
+
+    void AddLowerImageVariants(std::set<std::wstring>* values, const std::wstring& value)
+    {
+        if (values != nullptr && !value.empty())
+        {
+            std::wstring lowered = TimelineToLower(value);
+            values->insert(lowered);
+
+            size_t slash = lowered.find_last_of(L"\\/");
+            if (slash != std::wstring::npos && slash + 1 < lowered.size())
+            {
+                values->insert(lowered.substr(slash + 1));
+            }
+        }
+    }
+
+    void AddSnapshotRecordImages(const SnapshotRecord& record, std::set<std::wstring>* images)
+    {
+        std::wstring value;
+        if (SnapshotEvidenceValueByKey(record, L"image", &value))
+        {
+            AddLowerImageVariants(images, value);
+        }
+        if (SnapshotEvidenceValueByKey(record, L"image_path", &value))
+        {
+            AddLowerImageVariants(images, value);
+        }
+        if (SnapshotEvidenceValueByKey(record, L"target_image", &value))
+        {
+            AddLowerImageVariants(images, value);
+        }
+        if (SnapshotEvidenceValueByKey(record, L"path", &value))
+        {
+            AddLowerImageVariants(images, value);
+        }
+    }
+
+    bool TimelineEventMatchesReconcile(
+        const TimelineEvent& event,
+        const TimelineReconcileOptions& options)
+    {
+        bool matched = true;
+        if (!options.Source.empty() &&
+            TimelineToLower(event.Source) != TimelineToLower(options.Source))
+        {
+            matched = false;
+        }
+        if (matched &&
+            !options.Domain.empty() &&
+            TimelineToLower(event.Domain) != TimelineToLower(options.Domain))
+        {
+            matched = false;
+        }
+        if (matched &&
+            options.HasProcessId &&
+            event.ProcessId != options.ProcessId &&
+            event.TargetProcessId != options.ProcessId)
+        {
+            matched = false;
+        }
+        return matched;
+    }
+
+    uint32_t ReconcileRiskRank(const std::wstring& risk)
+    {
+        uint32_t rank = 0;
+        std::wstring lowered = TimelineToLower(risk);
+        if (lowered == L"critical" || lowered == L"high")
+        {
+            rank = 3;
+        }
+        else if (lowered == L"medium")
+        {
+            rank = 2;
+        }
+        else if (lowered == L"low")
+        {
+            rank = 1;
+        }
+        return rank;
+    }
+
+    void AddReconcileFinding(
+        std::vector<TimelineReconcileFinding>* findings,
+        TimelineReconcileFinding finding,
+        uint64_t liveDropped)
+    {
+        if (findings != nullptr)
+        {
+            if (liveDropped != 0 && finding.Confidence != L"event-backed")
+            {
+                finding.Confidence = L"loss-limited";
+                finding.Evidence[L"live_dropped"] = std::to_wstring(liveDropped);
+            }
+            findings->push_back(std::move(finding));
+        }
+    }
+
+    bool ReconcileFindingLess(
+        const TimelineReconcileFinding& a,
+        const TimelineReconcileFinding& b)
+    {
+        uint32_t ra = ReconcileRiskRank(a.Risk);
+        uint32_t rb = ReconcileRiskRank(b.Risk);
+        if (ra != rb)
+        {
+            return ra > rb;
+        }
+        if (a.Kind != b.Kind)
+        {
+            return a.Kind < b.Kind;
+        }
+        if (a.Domain != b.Domain)
+        {
+            return a.Domain < b.Domain;
+        }
+        return a.Subject < b.Subject;
+    }
+
     void AddTimelineGraphEvent(
         const TimelineEvent& event,
         std::map<std::wstring, TimelineGraphNode>* nodes,
@@ -807,6 +993,170 @@ TimelineGraphResult TimelineStore::BuildGraph(const TimelineGraphQueryOptions& o
     for (const auto& item : edges)
     {
         result.Edges.push_back(item.second);
+    }
+
+    return result;
+}
+
+TimelineReconcileResult TimelineStore::ReconcileSnapshot(
+    const SnapshotDocument& document,
+    const TimelineReconcileOptions& options) const
+{
+    TimelineReconcileResult result = {};
+    result.Options = options;
+    result.SnapshotLabel = document.Label.empty() ? L"<snapshot>" : document.Label;
+    result.SnapshotProcesses = document.Processes.size();
+    result.SnapshotRecords = document.Records.size();
+    result.LiveDropped = options.LiveDropped;
+
+    std::set<uint32_t> snapshotPids;
+    std::set<std::wstring> snapshotImages;
+    for (const SnapshotProcessRecord& process : document.Processes)
+    {
+        if (process.ProcessId != 0)
+        {
+            snapshotPids.insert(process.ProcessId);
+        }
+        AddLowerImageVariants(&snapshotImages, process.ImageName);
+    }
+    for (const SnapshotRecord& record : document.Records)
+    {
+        uint32_t pid = SnapshotRecordAnyPid(record);
+        if (pid != 0)
+        {
+            snapshotPids.insert(pid);
+        }
+        AddSnapshotRecordImages(record, &snapshotImages);
+    }
+
+    std::vector<TimelineEvent> events = AllEvents();
+    result.TimelineEvents = events.size();
+    std::set<uint32_t> eventPids;
+    std::set<std::wstring> eventImages;
+    for (const TimelineEvent& event : events)
+    {
+        if (!TimelineEventMatchesReconcile(event, options))
+        {
+            continue;
+        }
+        if (event.ProcessId != 0)
+        {
+            eventPids.insert(event.ProcessId);
+        }
+        if (event.TargetProcessId != 0)
+        {
+            eventPids.insert(event.TargetProcessId);
+        }
+        std::vector<TimelineImageRef> images = TimelineEventImageRefs(event);
+        for (const TimelineImageRef& image : images)
+        {
+            AddLowerImageVariants(&eventImages, image.Value);
+        }
+
+        if (event.ProcessId != 0 &&
+            event.Action != L"process-exit" &&
+            snapshotPids.find(event.ProcessId) == snapshotPids.end())
+        {
+            TimelineReconcileFinding finding = {};
+            finding.Kind = L"event-without-snapshot-process";
+            finding.Domain = event.Domain;
+            finding.Subject = L"pid:" + std::to_wstring(event.ProcessId);
+            finding.Risk = event.Action == L"image-load" ? L"medium" : L"low";
+            finding.Confidence = L"event-backed";
+            finding.Summary = L"timeline event has no matching process in snapshot";
+            finding.EventId = event.EventId;
+            finding.ProcessId = event.ProcessId;
+            finding.Evidence[L"action"] = event.Action;
+            finding.Evidence[L"source"] = event.Source;
+            AddEvidenceIfPresent(&finding.Evidence, L"entity", event.Entity);
+            AddReconcileFinding(&result.Findings, std::move(finding), options.LiveDropped);
+        }
+
+        for (const TimelineImageRef& image : images)
+        {
+            if (!image.Value.empty() && snapshotImages.find(TimelineToLower(image.Value)) == snapshotImages.end())
+            {
+                TimelineReconcileFinding finding = {};
+                finding.Kind = L"event-without-snapshot-image";
+                finding.Domain = event.Domain;
+                finding.Subject = image.Value;
+                finding.Risk = event.Action == L"image-load" ? L"medium" : L"low";
+                finding.Confidence = L"event-backed";
+                finding.Summary = L"timeline image evidence has no matching image in snapshot";
+                finding.EventId = event.EventId;
+                finding.ProcessId = event.ProcessId;
+                finding.Evidence[L"action"] = event.Action;
+                finding.Evidence[L"source"] = event.Source;
+                AddReconcileFinding(&result.Findings, std::move(finding), options.LiveDropped);
+            }
+        }
+    }
+
+    for (const SnapshotRecord& record : document.Records)
+    {
+        if (!options.Domain.empty() &&
+            TimelineToLower(record.Domain) != TimelineToLower(options.Domain))
+        {
+            continue;
+        }
+        if (ReconcileRiskRank(record.Risk) < 2)
+        {
+            continue;
+        }
+
+        uint32_t pid = SnapshotRecordAnyPid(record);
+        if (options.HasProcessId && pid != options.ProcessId)
+        {
+            continue;
+        }
+
+        bool pidSeen = pid != 0 && eventPids.find(pid) != eventPids.end();
+        std::set<std::wstring> recordImages;
+        AddSnapshotRecordImages(record, &recordImages);
+        bool imageSeen = recordImages.empty();
+        for (const std::wstring& image : recordImages)
+        {
+            if (eventImages.find(image) != eventImages.end())
+            {
+                imageSeen = true;
+                break;
+            }
+        }
+
+        if (!pidSeen && !imageSeen)
+        {
+            TimelineReconcileFinding finding = {};
+            finding.Kind = L"snapshot-record-without-event";
+            finding.Domain = record.Domain;
+            finding.Subject = record.Identity.empty() ? record.Display : record.Identity;
+            finding.Risk = record.Risk.empty() ? L"medium" : record.Risk;
+            finding.Confidence = L"no-live-event";
+            finding.Summary = L"snapshot state has no matching timeline event";
+            finding.ProcessId = pid;
+            AddEvidenceIfPresent(&finding.Evidence, L"display", record.Display);
+            AddEvidenceIfPresent(&finding.Evidence, L"identity", record.Identity);
+            AddReconcileFinding(&result.Findings, std::move(finding), options.LiveDropped);
+        }
+    }
+
+    if (options.LiveDropped != 0)
+    {
+        result.Warnings.push_back(
+            L"live event ring reported dropped events; absence findings are confidence-limited");
+    }
+    for (const auto& item : document.DomainWarnings)
+    {
+        for (const std::wstring& warning : item.second)
+        {
+            result.Warnings.push_back(item.first + L": " + warning);
+        }
+    }
+
+    std::sort(result.Findings.begin(), result.Findings.end(), ReconcileFindingLess);
+    if (options.Limit != 0 && result.Findings.size() > options.Limit)
+    {
+        result.Findings.resize(options.Limit);
+        result.Truncated = true;
     }
 
     return result;
