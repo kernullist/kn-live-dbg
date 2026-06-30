@@ -124,6 +124,8 @@
     <ClCompile Include="ProcessTriageScanner.cpp" />
     <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
+    <ClCompile Include="TimelineModel.cpp" />
+    <ClCompile Include="TimelineStore.cpp" />
     <ClCompile Include="PoolScanner.cpp" />
     <ClCompile Include="SnapshotCollector.cpp" />
     <ClCompile Include="SnapshotDiff.cpp" />
@@ -171,6 +173,8 @@
     <ClInclude Include="ProcessTriageScanner.h" />
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
+    <ClInclude Include="TimelineModel.h" />
+    <ClInclude Include="TimelineStore.h" />
     <ClInclude Include="PoolScanner.h" />
     <ClInclude Include="SnapshotCollector.h" />
     <ClInclude Include="SnapshotDiff.h" />

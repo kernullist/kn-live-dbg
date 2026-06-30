@@ -393,7 +393,7 @@ mcp_servers:
       Authorization: "Bearer <token-from-server>"
     timeout: 300        # raise above the 120s default for slow scans (hunt.run, etc.)
     connect_timeout: 60
-    # tools:            # optional: expose only what you need (41 read tools is a lot of context)
+    # tools:            # optional: expose only what you need (43 read tools is a lot of context)
     #   include: [process.find, vad.list, threads.list, callbacks.list, hunt.run]
 ```
 
@@ -444,7 +444,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 
 ## 6. Capability Catalog
 
-### 6.1 Read tools (41, no `--allow-write` needed — except `ti.subscribe` start/stop)
+### 6.1 Read tools (43, no `--allow-write` needed — except `ti.subscribe` start/stop)
 
 | Tool | Description | Key args (all optional unless noted otherwise) |
 |-----|------|----------------------|
@@ -465,6 +465,8 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `wnf.decode` | Decode a WNF state-name hash | `hash`, `state`, `state_name` |
 | `wnf.list` | Enumerate live WNF instances/candidates/lists | `scope` |
 | `ti.query` | Query the Threat-Intelligence ETW ring (recent/stats/by/grep) | `action`, `count`, `pid`, `task`, `pattern` |
+| `timeline.status` | Report in-memory evidence timeline counters and capacity | (none) |
+| `timeline.query` | Query ingested timeline events by source/domain/PID/limit/order | `source`, `domain`, `pid`, `limit`, `order` |
 | `module.integrity` | Loaded-module PE/section integrity + W+X | `module`, `target`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch` |
 | `driver.integrity` | `DRIVER_OBJECT` dispatch-table integrity | `driver`, `target`, `limit` |
 | `ssdt.scan` | Detect SSDT/shadow-SSDT syscall hooks | (none) |
@@ -490,7 +492,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `memory.compare` | Byte-compare two virtual ranges + mismatch offsets (c) — detect inline hooks/patches | `address1` (required), `address2` (required), `length` (required) |
 | `ti.subscribe` | Control TI ETW subscription (`action`=start/stop/status) — **start/stop require `--allow-write`** | `action` |
 
-> `snapshot.capture`/`snapshot.diff` **do not write files to disk** on the MCP path (in-memory). Read the baseline via `kn://snapshot/current` or use `snapshot.show` for summary + structuredContent. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show` return structuredContent (JSON), and the remaining new tools return text content. `ti.subscribe` is a read category, but because of the side effect of starting/stopping the ETW session, only start/stop require write mode (status is always available, the same data as `kn://ti/stats`).
+> `snapshot.capture`/`snapshot.diff` **do not write files to disk** on the MCP path (in-memory). Read the baseline via `kn://snapshot/current` or use `snapshot.show` for summary + structuredContent. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show`/`timeline.status`/`timeline.query` return structuredContent (JSON), and the remaining new tools return text content. `ti.subscribe` is a read category, but because of the side effect of starting/stopping the ETW session, only start/stop require write mode (status is always available, the same data as `kn://ti/stats`).
 
 ### 6.2 Write tools (10, `--allow-write` required)
 

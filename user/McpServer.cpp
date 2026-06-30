@@ -81,6 +81,7 @@ namespace
     const McpToolArg kArgsHuntRun[] = { {L"mode", L"string", false} };
     const McpToolArg kArgsSnapshotCapture[] = { {L"name", L"string", false} };
     const McpToolArg kArgsSnapshotShow[] = { {L"source", L"string", false}, {L"path", L"string", false}, {L"domains", L"boolean", false}, {L"warnings", L"boolean", false} };
+    const McpToolArg kArgsTimelineQuery[] = { {L"source", L"string", false}, {L"domain", L"string", false}, {L"pid", L"string", false}, {L"limit", L"string", false}, {L"order", L"string", false} };
 
     // Read-only memory / code / symbol inspection tools (close the read surface
     // so a model can confirm bytes and instructions without the WRITE dump.*).
@@ -132,6 +133,8 @@ namespace
         { L"hunt.run", L"Whole-system user-mode anomaly hunt (injection, VAD/PTE, threads, APC, driver/WFP/TI).", true, MCP_ARG_TABLE(kArgsHuntRun) },
         { L"snapshot.capture", L"Capture a same-boot evidence baseline in memory (read kn://snapshot/current; no disk writes).", true, MCP_ARG_TABLE(kArgsSnapshotCapture) },
         { L"snapshot.show", L"Show the current snapshot baseline or a snapshot JSON file; returns summary text plus structured JSON.", true, MCP_ARG_TABLE(kArgsSnapshotShow) },
+        { L"timeline.status", L"Report the in-memory evidence timeline store status and counters.", true, nullptr, 0 },
+        { L"timeline.query", L"Query the in-memory evidence timeline by source/domain/PID/limit.", true, MCP_ARG_TABLE(kArgsTimelineQuery) },
 
         { L"memory.read_virtual", L"Read bytes at a kernel/user virtual address (db/dq); returns hex with an unreadable-byte mask. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadVirtual) },
         { L"memory.read_physical", L"Read bytes at a physical address (!db/!dq); bypasses VA mappings. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadPhysical) },

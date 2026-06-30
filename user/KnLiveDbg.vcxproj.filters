@@ -88,6 +88,12 @@
     <ClCompile Include="ThreatIntelSubscriber.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TimelineModel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TimelineStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PoolScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -205,6 +211,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ThreatIntelSubscriber.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TimelineModel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TimelineStore.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PoolScanner.h">
