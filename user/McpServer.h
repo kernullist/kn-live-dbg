@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 enum class McpRequestKind
 {
@@ -80,6 +81,16 @@ struct McpServerConfig
     std::wstring TokenOverride;  // explicit --token value; empty = none
     bool RotateToken = false;    // --new-token
 };
+
+struct McpToolCatalogEntry
+{
+    std::wstring Name;
+    bool ReadOnly = true;
+    std::vector<std::wstring> Arguments;
+};
+
+std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot();
+bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entry);
 
 class McpServer
 {

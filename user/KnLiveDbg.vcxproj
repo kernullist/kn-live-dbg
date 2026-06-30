@@ -119,6 +119,7 @@
     <ClCompile Include="SsdtScanner.cpp" />
     <ClCompile Include="IdtScanner.cpp" />
     <ClCompile Include="McpServer.cpp" />
+    <ClCompile Include="McpSelfTest.cpp" />
     <ClCompile Include="MemoryDumper.cpp" />
     <ClCompile Include="PoolPeHunter.cpp" />
     <ClCompile Include="ProcessTriageScanner.cpp" />
@@ -163,6 +164,7 @@
     <ClInclude Include="LayoutResolver.h" />
     <ClInclude Include="McpJson.h" />
     <ClInclude Include="McpServer.h" />
+    <ClInclude Include="McpSelfTest.h" />
     <ClInclude Include="MsrScanner.h" />
     <ClInclude Include="CrScanner.h" />
     <ClInclude Include="SsdtScanner.h" />

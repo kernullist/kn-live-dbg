@@ -37,6 +37,9 @@
     <ClCompile Include="McpServer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="McpSelfTest.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="DbgEngBackend.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -157,6 +160,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="McpServer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="McpSelfTest.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="McpJson.h">

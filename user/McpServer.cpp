@@ -663,6 +663,56 @@ namespace
 // and fulfills each job's promise. The listener thread only enqueues + waits.
 // ---------------------------------------------------------------------------
 
+std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot()
+{
+    std::vector<McpToolCatalogEntry> entries;
+    entries.reserve(kToolCount);
+
+    for (size_t index = 0; index < kToolCount; ++index)
+    {
+        const McpToolDef& tool = kTools[index];
+        McpToolCatalogEntry entry = {};
+        entry.Name = tool.Name;
+        entry.ReadOnly = tool.ReadOnly;
+        for (size_t argIndex = 0; argIndex < tool.ArgCount; ++argIndex)
+        {
+            entry.Arguments.push_back(tool.Args[argIndex].Name);
+        }
+        entries.push_back(entry);
+    }
+
+    return entries;
+}
+
+bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entry)
+{
+    bool found = false;
+
+    do
+    {
+        const McpToolDef* tool = FindTool(name);
+        if (tool == nullptr)
+        {
+            break;
+        }
+
+        if (entry != nullptr)
+        {
+            entry->Name = tool->Name;
+            entry->ReadOnly = tool->ReadOnly;
+            entry->Arguments.clear();
+            for (size_t index = 0; index < tool->ArgCount; ++index)
+            {
+                entry->Arguments.push_back(tool->Args[index].Name);
+            }
+        }
+
+        found = true;
+    } while (false);
+
+    return found;
+}
+
 McpServer::McpServer()
 {
 }

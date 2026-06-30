@@ -104,6 +104,7 @@ Driver-free timeline regression check after a build:
 
 ```powershell
 .\tools\validate-timeline-selftest.ps1 -Configuration Release
+.\tools\validate-mcp-tool-catalog.ps1 -Configuration Release
 ```
 
 Refresh the pinned Debugging Tools runtime from the newest complete local x64 set:
