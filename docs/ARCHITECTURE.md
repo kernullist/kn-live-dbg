@@ -260,12 +260,13 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 ## Timeline Flow
 
 1. `TimelineStore` is a bounded user-mode evidence store. It normalizes TI, snapshot, and live kernel events into `TimelineEvent` records with schema-versioned JSON output, event ids, source/domain/action, process ids, risk, confidence, and key/value evidence.
-2. `!timeline ingest ti` copies records out of the TI ring without clearing the subscriber ring or log. `!timeline ingest snapshot` copies process and domain records from the in-memory baseline or a snapshot JSON file.
-3. The live channel keeps kernel work intentionally thin: process/image callbacks only push minimal atoms into a bounded nonpaged ring. User mode controls `live start|stop|status|clear|drain`, drains in bounded batches, records drop counters, and performs enrichment after the event leaves the driver.
-4. `TimelineStore::BuildGraph` derives source/domain/process/image nodes and stable edge kinds such as `parent-child`, `process-loads-image`, `ti-targets-process`, and `snapshot-record`. Duplicate nodes/edges are suppressed by deterministic map keys.
-5. `TimelineStore::ReconcileSnapshot` compares filtered timeline events with a snapshot baseline or JSON file. It reports event-without-snapshot process/image findings, high-signal snapshot-without-event findings, snapshot warnings, and live-drop confidence caveats rather than claiming complete observation when the ring reported loss.
-6. MCP exposes read-only `timeline.status`, `timeline.query`, `timeline.export`, `timeline.reconcile`, and `graph.query`. Session mutations (`clear`, `ingest`, `live start`, `live stop`, `live drain`, file-writing CLI export) remain TUI-controlled.
-7. `KnLiveDbg.exe --self-test timeline` runs before elevation, SCM, device open, and symbol initialization. The fixture validates ingest counts, source/domain/PID query, graph nodes/edges, reconciliation miss types, live-drop confidence lowering, warning propagation, and reconcile JSON schema.
+2. `!timeline update` is the compact safe path: it copies recent TI ring records and the in-memory snapshot baseline when present, then prints the resulting status. `/live` may be added to drain queued kernel live events, but update never starts or stops callback collection.
+3. `!timeline ingest ti` copies records out of the TI ring without clearing the subscriber ring or log. `!timeline ingest snapshot` copies process and domain records from the in-memory baseline or a snapshot JSON file.
+4. The live channel keeps kernel work intentionally thin: process/image callbacks only push minimal atoms into a bounded nonpaged ring. User mode controls `live start|stop|status|clear|drain`, drains in bounded batches, records drop counters, and performs enrichment after the event leaves the driver.
+5. `TimelineStore::BuildGraph` derives source/domain/process/image nodes and stable edge kinds such as `parent-child`, `process-loads-image`, `ti-targets-process`, and `snapshot-record`. Duplicate nodes/edges are suppressed by deterministic map keys.
+6. `TimelineStore::ReconcileSnapshot` compares filtered timeline events with a snapshot baseline or JSON file. It reports event-without-snapshot process/image findings, high-signal snapshot-without-event findings, snapshot warnings, and live-drop confidence caveats rather than claiming complete observation when the ring reported loss.
+7. MCP exposes read-only `timeline.status`, `timeline.query`, `timeline.export`, `timeline.reconcile`, and `graph.query`. Session mutations (`update`, `clear`, `ingest`, `live start`, `live stop`, `live drain`, file-writing CLI export) remain TUI-controlled.
+8. `KnLiveDbg.exe --self-test timeline` runs before elevation, SCM, device open, and symbol initialization. The fixture validates ingest counts, source/domain/PID query, graph nodes/edges, reconciliation miss types, live-drop confidence lowering, warning propagation, and reconcile JSON schema.
 
 ## DbgEng Flow
 
@@ -304,7 +305,7 @@ Human-readable native command output uses scoped console attributes for high-sig
 6. After a successful build, the script verifies the stamped PE versions, verifies driver signatures, and stages Debugging Tools runtime DLLs beside the EXE.
 7. `tools\release.ps1` runs a version-bumped build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory. `-NoVersionBump` keeps the current version for ad hoc packages.
 8. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, README/runtime manifest metadata, and `kn-live-dbg-version.json`.
-9. `tools\validate-timeline-selftest.ps1` and `tools\validate-mcp-tool-catalog.ps1` are post-build driver-free regression gates for the timeline store, graph, reconciliation path, and MCP tool catalog. They call `KnLiveDbg.exe --self-test timeline` and `KnLiveDbg.exe --self-test mcp-tools`, which exit before any privileged driver lifecycle work.
+9. `tools\validate-timeline-selftest.ps1`, `tools\validate-mcp-tool-catalog.ps1`, and `tools\validate-console-surface.ps1` are post-build driver-free regression gates for the timeline store, graph, reconciliation path, MCP tool catalog, and interactive help/completion surface. They call `KnLiveDbg.exe --self-test timeline`, `KnLiveDbg.exe --self-test mcp-tools`, and `KnLiveDbg.exe --self-test console`, which exit before any privileged driver lifecycle work.
 
 ## AI Provider Flow
 

@@ -30,6 +30,7 @@ kn-live-dbg/
   tools/build.ps1               Release/Debug x64 build helper
   tools/release.ps1             build and zip release package helper
   tools/validate-timeline-selftest.ps1  driver-free timeline regression check
+  tools/validate-console-surface.ps1    driver-free help/completion regression check
 ```
 
 ## Current Capabilities
@@ -75,7 +76,7 @@ kn-live-dbg/
 39. Detects SSDT / shadow-SSDT syscall hooks with `!ssdt` -- walking the native `nt!KeServiceDescriptorTable` (`KiServiceTable`) and, when win32k modules are loaded, the win32k shadow table `nt!KeServiceDescriptorTableShadow[1]` from live kernel memory. Each service routine is decoded with the x64 encoding (`routine = KiServiceTable + (entry >> 4)`) and validated to reside in the expected kernel image -- ntoskrnl for the native table, a `win32k*` module for the shadow table. Routines outside the expected module, or outside every loaded kernel module, are flagged as syscall-hook evidence; clean tables print a one-line summary so only hooked entries are listed. No new driver IOCTL is required: the scanner reuses the existing memory-read primitive plus the PDB-first layout resolver for the `_KSERVICE_TABLE_DESCRIPTOR` Base/Limit fields.
 40. Detects IDT (interrupt descriptor table) hooks with `!idt` -- reading the boot processor IDTR through the read-only `IOCTL_KNDBG_READ_IDT` primitive (ABI version 10; `__sidt` under the same per-CPU affinity-pinned pattern), walking the gate descriptors from live kernel memory, rebuilding each handler from its split offset fields (`OffsetLow | OffsetMiddle << 16 | OffsetHigh << 32`), and flagging any present gate whose handler falls outside every loaded kernel module as interrupt-hook evidence. It also cross-checks every active processor's IDT against the boot processor and flags per-CPU handler divergence as a single-core interrupt-hook signal. Clean tables print a one-line summary. The MSR/CR/IDT primitives read across all processor groups, so machines with more than 64 logical processors are covered.
 41. Resolves kernel-mode WFP callout function pointers with `!wfp kernelcallouts` -- the user-mode Base Filtering Engine does not expose the classify/notify/flowDelete pointers, which are the actual hook surface for network filter drivers. The scanner anchors on the public symbol `netio!gWfpGlobal`, scores documented candidate callout-table layouts (e.g. array at `+0x198` with `0x50`-byte slots, or `+0x550` with `0x40`-byte slots; classify at `+0x10`) against live pointers -- the same guarded-fallback discipline used by the firmware-table and WNF scanners, with a bounded offset-scan fallback for build drift -- then walks the callout array, recovers each slot's classify/notify/flowDelete pointers, joins them to the user-mode callout metadata (name/layer/provider) by callout id, and flags any classify target outside every loaded kernel module. No new driver IOCTL is required (it reuses the existing memory-read primitive); netio.sys symbols and an open driver device are required, and the command reports cleanly when the layout cannot be located so offsets can be refined per build.
-42. Maintains a bounded evidence timeline with `!timeline` -- ingesting TI and snapshot evidence, draining optional kernel live process/image events, deriving graph nodes/edges, reconciling timeline evidence against snapshot baselines, exporting deterministic JSONL, and exposing read-only timeline/graph MCP tools. The driver live channel stays thin and bounded; enrichment, graphing, reconciliation, and JSON live in user mode.
+42. Maintains a bounded evidence timeline with `!timeline` -- `!timeline update` gives operators a compact safe path for copying recent TI and snapshot baseline evidence, while explicit advanced commands ingest TI/snapshots, drain optional kernel live process/image events, derive graph nodes/edges, reconcile against snapshot baselines, export deterministic JSONL, and expose read-only timeline/graph MCP tools. The driver live channel stays thin and bounded; enrichment, graphing, reconciliation, and JSON live in user mode.
 
 ## Design Notes
 
@@ -100,11 +101,12 @@ Build:
 .\tools\build.ps1 -Configuration Release
 ```
 
-Driver-free timeline regression check after a build:
+Driver-free regression checks after a build:
 
 ```powershell
 .\tools\validate-timeline-selftest.ps1 -Configuration Release
 .\tools\validate-mcp-tool-catalog.ps1 -Configuration Release
+.\tools\validate-console-surface.ps1 -Configuration Release
 ```
 
 Refresh the pinned Debugging Tools runtime from the newest complete local x64 set:
@@ -149,7 +151,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `!timeline live <Tab>` for timeline live actions, `!timeline reconcile <Tab>` for reconciliation options, `ai <Tab>` for primary AI actions, `ai explain callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `!timeline update <Tab>` for the compact timeline path, `!timeline live <Tab>` for timeline live actions, `!timeline reconcile <Tab>` for reconciliation options, `ai <Tab>` for primary AI actions, `ai explain callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
