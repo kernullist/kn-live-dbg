@@ -52,9 +52,28 @@ static const GUID KNDBG_DEVICE_CLASS_GUID =
 static FAST_MUTEX g_KnDbgOwnerLock;
 static ULONG g_KnDbgOwnerPid = 0;
 static ULONG g_KnDbgOwnerOpenCount = 0;
+static FAST_MUTEX g_KnDbgTimelineControlLock;
+static KSPIN_LOCK g_KnDbgTimelineLock;
+static volatile LONG g_KnDbgTimelineEnabled = 0;
+static BOOLEAN g_KnDbgTimelineProcessRegistered = FALSE;
+static BOOLEAN g_KnDbgTimelineImageRegistered = FALSE;
+static KNDBG_TIMELINE_EVENT_RECORD* g_KnDbgTimelineRing = nullptr;
+static ULONG g_KnDbgTimelineCapacity = 0;
+static ULONG g_KnDbgTimelineHead = 0;
+static ULONG g_KnDbgTimelineCount = 0;
+static ULONGLONG g_KnDbgTimelineDropped = 0;
+static ULONGLONG g_KnDbgTimelineNextSequence = 1;
 
 static bool KnDbgIsLa57Active();
 static bool KnDbgIsCanonicalAddress(ULONGLONG VirtualAddress, bool La57Active);
+static VOID KnDbgTimelineProcessNotify(
+    PEPROCESS Process,
+    HANDLE ProcessId,
+    PPS_CREATE_NOTIFY_INFO CreateInfo);
+static VOID KnDbgTimelineImageNotify(
+    PUNICODE_STRING FullImageName,
+    HANDLE ProcessId,
+    PIMAGE_INFO ImageInfo);
 
 typedef struct _KNDBG_TLB_FLUSH_CONTEXT
 {
@@ -229,6 +248,244 @@ static bool KnDbgPreflightResidentSystemRange(PVOID Address, SIZE_T Length)
     } while (false);
 
     return resident;
+}
+
+static ULONG KnDbgTimelineNormalizeCapacity(ULONG Capacity)
+{
+    ULONG value = Capacity;
+
+    if (value == 0)
+    {
+        value = KNDBG_TIMELINE_DEFAULT_CAPACITY;
+    }
+    if (value < KNDBG_TIMELINE_MIN_CAPACITY)
+    {
+        value = KNDBG_TIMELINE_MIN_CAPACITY;
+    }
+    if (value > KNDBG_TIMELINE_MAX_CAPACITY)
+    {
+        value = KNDBG_TIMELINE_MAX_CAPACITY;
+    }
+
+    return value;
+}
+
+static void KnDbgTimelineCopyPath(KNDBG_TIMELINE_EVENT_RECORD* Record, PCUNICODE_STRING Path)
+{
+    if (Record != nullptr && Path != nullptr && Path->Buffer != nullptr && Path->Length != 0)
+    {
+        USHORT chars = static_cast<USHORT>(Path->Length / sizeof(wchar_t));
+        if (chars >= KNDBG_TIMELINE_IMAGE_PATH_CHARS)
+        {
+            chars = KNDBG_TIMELINE_IMAGE_PATH_CHARS - 1;
+        }
+
+        RtlCopyMemory(Record->ImagePath, Path->Buffer, chars * sizeof(wchar_t));
+        Record->ImagePath[chars] = L'\0';
+        Record->ImagePathLength = chars;
+    }
+}
+
+static void KnDbgTimelinePushEvent(const KNDBG_TIMELINE_EVENT_RECORD* Event)
+{
+    KIRQL oldIrql = PASSIVE_LEVEL;
+
+    if (Event == nullptr || InterlockedCompareExchange(&g_KnDbgTimelineEnabled, 0, 0) == 0)
+    {
+        return;
+    }
+
+    KeAcquireSpinLock(&g_KnDbgTimelineLock, &oldIrql);
+    if (g_KnDbgTimelineRing != nullptr && g_KnDbgTimelineCapacity != 0)
+    {
+        KNDBG_TIMELINE_EVENT_RECORD* slot = &g_KnDbgTimelineRing[g_KnDbgTimelineHead];
+        RtlCopyMemory(slot, Event, sizeof(*slot));
+        slot->Size = sizeof(*slot);
+        slot->Sequence = g_KnDbgTimelineNextSequence;
+        ++g_KnDbgTimelineNextSequence;
+
+        ++g_KnDbgTimelineHead;
+        if (g_KnDbgTimelineHead >= g_KnDbgTimelineCapacity)
+        {
+            g_KnDbgTimelineHead = 0;
+        }
+
+        if (g_KnDbgTimelineCount < g_KnDbgTimelineCapacity)
+        {
+            ++g_KnDbgTimelineCount;
+        }
+        else
+        {
+            ++g_KnDbgTimelineDropped;
+        }
+    }
+    KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
+}
+
+static void KnDbgTimelineClearLocked()
+{
+    if (g_KnDbgTimelineRing != nullptr && g_KnDbgTimelineCapacity != 0)
+    {
+        RtlZeroMemory(g_KnDbgTimelineRing, sizeof(KNDBG_TIMELINE_EVENT_RECORD) * g_KnDbgTimelineCapacity);
+    }
+    g_KnDbgTimelineHead = 0;
+    g_KnDbgTimelineCount = 0;
+    g_KnDbgTimelineDropped = 0;
+    g_KnDbgTimelineNextSequence = 1;
+}
+
+static NTSTATUS KnDbgTimelineEnsureRing(ULONG Capacity)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    KNDBG_TIMELINE_EVENT_RECORD* newRing = nullptr;
+    ULONG normalized = KnDbgTimelineNormalizeCapacity(Capacity);
+    SIZE_T bytes = sizeof(KNDBG_TIMELINE_EVENT_RECORD) * static_cast<SIZE_T>(normalized);
+
+    do
+    {
+        if (g_KnDbgTimelineRing != nullptr && g_KnDbgTimelineCapacity == normalized)
+        {
+            KIRQL oldIrql = PASSIVE_LEVEL;
+            KeAcquireSpinLock(&g_KnDbgTimelineLock, &oldIrql);
+            KnDbgTimelineClearLocked();
+            KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        newRing = reinterpret_cast<KNDBG_TIMELINE_EVENT_RECORD*>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, bytes, 'tLnK'));
+        if (newRing == nullptr)
+        {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlZeroMemory(newRing, bytes);
+
+        KIRQL oldIrql = PASSIVE_LEVEL;
+        KeAcquireSpinLock(&g_KnDbgTimelineLock, &oldIrql);
+        KNDBG_TIMELINE_EVENT_RECORD* oldRing = g_KnDbgTimelineRing;
+        g_KnDbgTimelineRing = newRing;
+        g_KnDbgTimelineCapacity = normalized;
+        KnDbgTimelineClearLocked();
+        KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
+
+        if (oldRing != nullptr)
+        {
+            ExFreePoolWithTag(oldRing, 'tLnK');
+        }
+        newRing = nullptr;
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    if (newRing != nullptr)
+    {
+        ExFreePoolWithTag(newRing, 'tLnK');
+    }
+
+    return status;
+}
+
+static void KnDbgTimelineUnregisterCallbacks()
+{
+    InterlockedExchange(&g_KnDbgTimelineEnabled, 0);
+
+    if (g_KnDbgTimelineProcessRegistered != FALSE)
+    {
+        PsSetCreateProcessNotifyRoutineEx(KnDbgTimelineProcessNotify, TRUE);
+        g_KnDbgTimelineProcessRegistered = FALSE;
+    }
+    if (g_KnDbgTimelineImageRegistered != FALSE)
+    {
+        PsRemoveLoadImageNotifyRoutine(KnDbgTimelineImageNotify);
+        g_KnDbgTimelineImageRegistered = FALSE;
+    }
+}
+
+static NTSTATUS KnDbgTimelineRegisterCallbacks()
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    do
+    {
+        if (g_KnDbgTimelineProcessRegistered != FALSE || g_KnDbgTimelineImageRegistered != FALSE)
+        {
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        status = PsSetCreateProcessNotifyRoutineEx(KnDbgTimelineProcessNotify, FALSE);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+        g_KnDbgTimelineProcessRegistered = TRUE;
+
+        status = PsSetLoadImageNotifyRoutine(KnDbgTimelineImageNotify);
+        if (!NT_SUCCESS(status))
+        {
+            KnDbgTimelineUnregisterCallbacks();
+            break;
+        }
+        g_KnDbgTimelineImageRegistered = TRUE;
+        InterlockedExchange(&g_KnDbgTimelineEnabled, 1);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return status;
+}
+
+static VOID KnDbgTimelineProcessNotify(
+    PEPROCESS Process,
+    HANDLE ProcessId,
+    PPS_CREATE_NOTIFY_INFO CreateInfo)
+{
+    UNREFERENCED_PARAMETER(Process);
+
+    KNDBG_TIMELINE_EVENT_RECORD record = {};
+    LARGE_INTEGER now = {};
+    KeQuerySystemTime(&now);
+
+    record.Size = sizeof(record);
+    record.Timestamp100ns = static_cast<KNDBG_UINT64>(now.QuadPart);
+    record.ProcessId = HandleToULong(ProcessId);
+    record.ThreadId = HandleToULong(PsGetCurrentThreadId());
+    if (CreateInfo != nullptr)
+    {
+        record.Type = KNDBG_TIMELINE_EVENT_PROCESS_CREATE;
+        record.ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+        KnDbgTimelineCopyPath(&record, CreateInfo->ImageFileName);
+    }
+    else
+    {
+        record.Type = KNDBG_TIMELINE_EVENT_PROCESS_EXIT;
+    }
+
+    KnDbgTimelinePushEvent(&record);
+}
+
+static VOID KnDbgTimelineImageNotify(
+    PUNICODE_STRING FullImageName,
+    HANDLE ProcessId,
+    PIMAGE_INFO ImageInfo)
+{
+    KNDBG_TIMELINE_EVENT_RECORD record = {};
+    LARGE_INTEGER now = {};
+    KeQuerySystemTime(&now);
+
+    record.Size = sizeof(record);
+    record.Type = KNDBG_TIMELINE_EVENT_IMAGE_LOAD;
+    record.Timestamp100ns = static_cast<KNDBG_UINT64>(now.QuadPart);
+    record.ProcessId = HandleToULong(ProcessId);
+    record.ThreadId = HandleToULong(PsGetCurrentThreadId());
+    if (ImageInfo != nullptr)
+    {
+        record.ImageBase = reinterpret_cast<KNDBG_UINT64>(ImageInfo->ImageBase);
+        record.ImageSize = static_cast<KNDBG_UINT64>(ImageInfo->ImageSize);
+    }
+    KnDbgTimelineCopyPath(&record, FullImageName);
+
+    KnDbgTimelinePushEvent(&record);
 }
 
 // MDL-based read used only when the caller explicitly allows the fallback.
@@ -1041,6 +1298,195 @@ static NTSTATUS KnDbgHandleSessionStatus(PIRP Irp, PIO_STACK_LOCATION Stack, PVO
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+static NTSTATUS KnDbgHandleTimelineControl(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_TIMELINE_CONTROL_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        KNDBG_TIMELINE_CONTROL_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+        if (request.Acknowledge != KNDBG_WRITE_ACK_MAGIC)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        ExAcquireFastMutex(&g_KnDbgTimelineControlLock);
+        if (request.Action == KNDBG_TIMELINE_CONTROL_START)
+        {
+            status = KnDbgTimelineEnsureRing(request.Capacity);
+            if (NT_SUCCESS(status))
+            {
+                status = KnDbgTimelineRegisterCallbacks();
+            }
+        }
+        else if (request.Action == KNDBG_TIMELINE_CONTROL_STOP)
+        {
+            KnDbgTimelineUnregisterCallbacks();
+            status = STATUS_SUCCESS;
+        }
+        else if (request.Action == KNDBG_TIMELINE_CONTROL_CLEAR)
+        {
+            KIRQL oldIrql = PASSIVE_LEVEL;
+            KeAcquireSpinLock(&g_KnDbgTimelineLock, &oldIrql);
+            KnDbgTimelineClearLocked();
+            KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            status = STATUS_INVALID_PARAMETER;
+        }
+        ExReleaseFastMutex(&g_KnDbgTimelineControlLock);
+
+        if (NT_SUCCESS(status))
+        {
+            information = sizeof(KNDBG_TIMELINE_CONTROL_REQUEST);
+        }
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
+static NTSTATUS KnDbgHandleTimelineStatus(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        if (Buffer == nullptr || Stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(KNDBG_TIMELINE_STATUS_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, Stack->Parameters.DeviceIoControl.OutputBufferLength);
+
+        KNDBG_TIMELINE_STATUS_RESPONSE* response = reinterpret_cast<KNDBG_TIMELINE_STATUS_RESPONSE*>(Buffer);
+        response->Size = sizeof(*response);
+
+        KIRQL oldIrql = PASSIVE_LEVEL;
+        KeAcquireSpinLock(&g_KnDbgTimelineLock, &oldIrql);
+        response->Capacity = g_KnDbgTimelineCapacity;
+        response->Count = g_KnDbgTimelineCount;
+        response->Dropped = g_KnDbgTimelineDropped;
+        response->NextSequence = g_KnDbgTimelineNextSequence;
+        KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
+
+        if (InterlockedCompareExchange(&g_KnDbgTimelineEnabled, 0, 0) != 0)
+        {
+            response->Flags |= KNDBG_TIMELINE_STATUS_ACTIVE;
+        }
+        if (g_KnDbgTimelineProcessRegistered != FALSE)
+        {
+            response->Flags |= KNDBG_TIMELINE_STATUS_PROCESS_CALLBACK;
+        }
+        if (g_KnDbgTimelineImageRegistered != FALSE)
+        {
+            response->Flags |= KNDBG_TIMELINE_STATUS_IMAGE_CALLBACK;
+        }
+
+        information = sizeof(*response);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
+static NTSTATUS KnDbgHandleTimelineDrain(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+        ULONG headerLength = FIELD_OFFSET(KNDBG_TIMELINE_DRAIN_RESPONSE, Events);
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_TIMELINE_DRAIN_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (outputLength < headerLength)
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        KNDBG_TIMELINE_DRAIN_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+
+        ULONG maxByOutput = (outputLength - headerLength) / sizeof(KNDBG_TIMELINE_EVENT_RECORD);
+        ULONG maxEvents = request.MaxEvents;
+        if (maxEvents == 0 || maxEvents > maxByOutput)
+        {
+            maxEvents = maxByOutput;
+        }
+        if (maxEvents == 0)
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, outputLength);
+        KNDBG_TIMELINE_DRAIN_RESPONSE* response = reinterpret_cast<KNDBG_TIMELINE_DRAIN_RESPONSE*>(Buffer);
+        KIRQL oldIrql = PASSIVE_LEVEL;
+        KeAcquireSpinLock(&g_KnDbgTimelineLock, &oldIrql);
+        ULONG toCopy = g_KnDbgTimelineCount < maxEvents ? g_KnDbgTimelineCount : maxEvents;
+        if (g_KnDbgTimelineRing != nullptr && g_KnDbgTimelineCapacity != 0)
+        {
+            ULONG oldest = (g_KnDbgTimelineHead + g_KnDbgTimelineCapacity - g_KnDbgTimelineCount) % g_KnDbgTimelineCapacity;
+            for (ULONG index = 0; index < toCopy; ++index)
+            {
+                ULONG ringIndex = oldest + index;
+                if (ringIndex >= g_KnDbgTimelineCapacity)
+                {
+                    ringIndex -= g_KnDbgTimelineCapacity;
+                }
+                RtlCopyMemory(&response->Events[index], &g_KnDbgTimelineRing[ringIndex], sizeof(KNDBG_TIMELINE_EVENT_RECORD));
+            }
+            g_KnDbgTimelineCount -= toCopy;
+        }
+        response->Count = toCopy;
+        response->Remaining = g_KnDbgTimelineCount;
+        response->Dropped = g_KnDbgTimelineDropped;
+        response->NextSequence = g_KnDbgTimelineNextSequence;
+        KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
+
+        information = headerLength + static_cast<ULONG_PTR>(toCopy) * sizeof(KNDBG_TIMELINE_EVENT_RECORD);
+        response->Size = static_cast<KNDBG_UINT32>(information);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static NTSTATUS KnDbgHandleResolveProcess(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -1654,8 +2100,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     do
     {
         ExInitializeFastMutex(&g_KnDbgOwnerLock);
+        ExInitializeFastMutex(&g_KnDbgTimelineControlLock);
+        KeInitializeSpinLock(&g_KnDbgTimelineLock);
         g_KnDbgOwnerPid = 0;
         g_KnDbgOwnerOpenCount = 0;
+        g_KnDbgTimelineEnabled = 0;
+        g_KnDbgTimelineProcessRegistered = FALSE;
+        g_KnDbgTimelineImageRegistered = FALSE;
+        g_KnDbgTimelineRing = nullptr;
+        g_KnDbgTimelineCapacity = 0;
+        g_KnDbgTimelineHead = 0;
+        g_KnDbgTimelineCount = 0;
+        g_KnDbgTimelineDropped = 0;
+        g_KnDbgTimelineNextSequence = 1;
 
         for (ULONG index = 0; index <= IRP_MJ_MAXIMUM_FUNCTION; ++index)
         {
@@ -1715,6 +2172,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
 {
     UNICODE_STRING symbolicLinkName = RTL_CONSTANT_STRING(KNDBG_DOS_DEVICE_NAME);
+
+    ExAcquireFastMutex(&g_KnDbgTimelineControlLock);
+    KnDbgTimelineUnregisterCallbacks();
+    ExReleaseFastMutex(&g_KnDbgTimelineControlLock);
+
+    if (g_KnDbgTimelineRing != nullptr)
+    {
+        ExFreePoolWithTag(g_KnDbgTimelineRing, 'tLnK');
+        g_KnDbgTimelineRing = nullptr;
+    }
 
     IoDeleteSymbolicLink(&symbolicLinkName);
 
@@ -2083,6 +2550,15 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_READ_IDT:
         status = KnDbgHandleReadIdt(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_TIMELINE_CONTROL:
+        status = KnDbgHandleTimelineControl(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_TIMELINE_STATUS:
+        status = KnDbgHandleTimelineStatus(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_TIMELINE_DRAIN:
+        status = KnDbgHandleTimelineDrain(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

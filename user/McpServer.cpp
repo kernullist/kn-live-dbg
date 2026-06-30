@@ -82,6 +82,7 @@ namespace
     const McpToolArg kArgsSnapshotCapture[] = { {L"name", L"string", false} };
     const McpToolArg kArgsSnapshotShow[] = { {L"source", L"string", false}, {L"path", L"string", false}, {L"domains", L"boolean", false}, {L"warnings", L"boolean", false} };
     const McpToolArg kArgsTimelineQuery[] = { {L"source", L"string", false}, {L"domain", L"string", false}, {L"pid", L"string", false}, {L"limit", L"string", false}, {L"order", L"string", false} };
+    const McpToolArg kArgsGraphQuery[] = { {L"source", L"string", false}, {L"domain", L"string", false}, {L"image", L"string", false}, {L"pid", L"string", false}, {L"limit", L"string", false}, {L"order", L"string", false} };
 
     // Read-only memory / code / symbol inspection tools (close the read surface
     // so a model can confirm bytes and instructions without the WRITE dump.*).
@@ -135,6 +136,8 @@ namespace
         { L"snapshot.show", L"Show the current snapshot baseline or a snapshot JSON file; returns summary text plus structured JSON.", true, MCP_ARG_TABLE(kArgsSnapshotShow) },
         { L"timeline.status", L"Report the in-memory evidence timeline store status and counters.", true, nullptr, 0 },
         { L"timeline.query", L"Query the in-memory evidence timeline by source/domain/PID/limit.", true, MCP_ARG_TABLE(kArgsTimelineQuery) },
+        { L"timeline.export", L"Return in-memory timeline events as JSONL text without writing to disk.", true, MCP_ARG_TABLE(kArgsTimelineQuery) },
+        { L"graph.query", L"Derive a process/image/domain/source evidence graph from in-memory timeline events.", true, MCP_ARG_TABLE(kArgsGraphQuery) },
 
         { L"memory.read_virtual", L"Read bytes at a kernel/user virtual address (db/dq); returns hex with an unreadable-byte mask. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadVirtual) },
         { L"memory.read_physical", L"Read bytes at a physical address (!db/!dq); bypasses VA mappings. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadPhysical) },

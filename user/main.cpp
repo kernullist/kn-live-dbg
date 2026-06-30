@@ -3779,7 +3779,9 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                         L"status",
                         L"clear",
                         L"ingest",
+                        L"live",
                         L"query",
+                        L"graph",
                         L"export"
                     };
                     AddCompletionCandidates(&candidates, values);
@@ -4137,8 +4139,14 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"status",
                 L"clear",
                 L"ingest",
+                L"live",
                 L"query",
+                L"graph",
                 L"export",
+                L"start",
+                L"stop",
+                L"status",
+                L"drain",
                 L"ti",
                 L"snapshot",
                 L"recent",
@@ -4146,7 +4154,9 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"baseline",
                 L"/source",
                 L"/domain",
+                L"/image",
                 L"/pid",
+                L"/capacity",
                 L"/limit",
                 L"/oldest",
                 L"/newest",
@@ -17117,7 +17127,9 @@ static void PrintTimelineHelp()
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
+    std::wcout << L"  !timeline live start|stop|status|clear|drain [/capacity <n>] [/limit <n>]\n";
     std::wcout << L"  !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]\n";
+    std::wcout << L"  !timeline graph [/source <name>] [/domain <name>] [/pid <PID>] [/image <name>] [/limit <n>] [/oldest|/newest]\n";
     std::wcout << L"  !timeline export <path> [/jsonl]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
@@ -17257,6 +17269,115 @@ static void PrintTimelineIngestResult(const std::wstring& source, const Timeline
     }
 }
 
+static std::wstring TimelineLiveEventTypeText(uint32_t type)
+{
+    std::wstring text = L"unknown";
+    if (type == KNDBG_TIMELINE_EVENT_PROCESS_CREATE)
+    {
+        text = L"process-create";
+    }
+    else if (type == KNDBG_TIMELINE_EVENT_PROCESS_EXIT)
+    {
+        text = L"process-exit";
+    }
+    else if (type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
+    {
+        text = L"image-load";
+    }
+    return text;
+}
+
+static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& live)
+{
+    TimelineEvent event = {};
+    event.TimestampFileTime = live.Timestamp100ns;
+    event.Source = L"kernel-live";
+    event.Domain = live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD ? L"image" : L"process";
+    event.Action = TimelineLiveEventTypeText(live.Type);
+    event.ProcessId = live.ProcessId;
+    event.ThreadId = live.ThreadId;
+    event.Entity = live.ImagePath;
+    if (event.Entity.empty())
+    {
+        event.Entity = L"pid:" + std::to_wstring(live.ProcessId);
+    }
+    event.Summary = event.Action + L" pid=" + std::to_wstring(live.ProcessId);
+    if (live.ParentProcessId != 0)
+    {
+        event.Summary += L" parent_pid=" + std::to_wstring(live.ParentProcessId);
+        event.Evidence[L"parent_pid"] = std::to_wstring(live.ParentProcessId);
+    }
+    if (!live.ImagePath.empty())
+    {
+        event.Summary += L" image=" + live.ImagePath;
+        event.Evidence[L"image_path"] = live.ImagePath;
+    }
+    if (live.ImageBase != 0)
+    {
+        event.Evidence[L"image_base"] = HexTextWidth(live.ImageBase, 16, true);
+    }
+    if (live.ImageSize != 0)
+    {
+        event.Evidence[L"image_size"] = HexTextWidth(live.ImageSize, 16, true);
+    }
+    if (live.FileObject != 0)
+    {
+        event.Evidence[L"file_object"] = HexTextWidth(live.FileObject, 16, true);
+    }
+    event.Risk = L"info";
+    event.Confidence = L"kernel-callback";
+    event.Evidence[L"sequence"] = std::to_wstring(live.Sequence);
+    event.Evidence[L"type"] = std::to_wstring(live.Type);
+    return event;
+}
+
+static void PrintTimelineLiveStatus(const TimelineLiveStatus& status)
+{
+    PrintColoredText(L"[timeline.live]", KNDBG_COLOR_TITLE);
+    std::wcout << L" active=" << ((status.Flags & KNDBG_TIMELINE_STATUS_ACTIVE) != 0 ? L"yes" : L"no")
+               << L" process_cb=" << ((status.Flags & KNDBG_TIMELINE_STATUS_PROCESS_CALLBACK) != 0 ? L"yes" : L"no")
+               << L" image_cb=" << ((status.Flags & KNDBG_TIMELINE_STATUS_IMAGE_CALLBACK) != 0 ? L"yes" : L"no")
+               << L" capacity=" << status.Capacity
+               << L" queued=" << status.Count
+               << L" dropped=" << status.Dropped
+               << L" next_sequence=" << status.NextSequence << L"\n";
+}
+
+static void PrintTimelineGraph(const TimelineGraphResult& graph)
+{
+    PrintColoredText(L"[timeline.graph]", KNDBG_COLOR_TITLE);
+    std::wcout << L" total_events=" << graph.TotalEvents
+               << L" matched_events=" << graph.MatchedEvents
+               << L" nodes=" << graph.Nodes.size()
+               << L" edges=" << graph.Edges.size();
+    if (graph.Truncated)
+    {
+        std::wcout << L" truncated=true";
+    }
+    std::wcout << L"\n";
+
+    for (const TimelineGraphNode& node : graph.Nodes)
+    {
+        std::wcout << L"  node kind=" << node.Kind
+                   << L" label=" << node.Label
+                   << L" events=" << node.EventCount << L"\n";
+    }
+
+    for (const TimelineGraphEdge& edge : graph.Edges)
+    {
+        std::wcout << L"  edge kind=" << edge.Kind
+                   << L" from=" << edge.From
+                   << L" to=" << edge.To
+                   << L" events=" << edge.EventCount;
+        if (edge.FirstEventId != 0 || edge.LastEventId != 0)
+        {
+            std::wcout << L" first=" << edge.FirstEventId
+                       << L" last=" << edge.LastEventId;
+        }
+        std::wcout << L"\n";
+    }
+}
+
 static bool ParseTimelineQueryOptions(
     const std::vector<std::wstring>& args,
     size_t start,
@@ -17376,10 +17497,144 @@ static bool ParseTimelineQueryOptions(
     return ok;
 }
 
+static bool ParseTimelineGraphOptions(
+    const std::vector<std::wstring>& args,
+    size_t start,
+    uint32_t numberBase,
+    TimelineGraphQueryOptions* options,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (options == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid graph options output";
+            }
+            break;
+        }
+
+        size_t index = start;
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/source")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/source requires a value";
+                    }
+                    break;
+                }
+                options->Source = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (option == L"/domain")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/domain requires a value";
+                    }
+                    break;
+                }
+                options->Domain = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (option == L"/image")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/image requires a value";
+                    }
+                    break;
+                }
+                options->Image = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (option == L"/pid")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/pid requires a value";
+                    }
+                    break;
+                }
+                uint64_t pid = 0;
+                if (!ParseUnsigned(args[index + 1], numberBase, &pid) || pid == 0 || pid > 0xffffffffull)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"invalid PID: " + args[index + 1];
+                    }
+                    break;
+                }
+                options->HasProcessId = true;
+                options->ProcessId = static_cast<uint32_t>(pid);
+                index += 2;
+                continue;
+            }
+            if (option == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/limit requires a value";
+                    }
+                    break;
+                }
+                if (!ParseTimelineLimit(args[index + 1], 5000, &options->Limit, error))
+                {
+                    break;
+                }
+                index += 2;
+                continue;
+            }
+            if (option == L"/oldest")
+            {
+                options->NewestFirst = false;
+                ++index;
+                continue;
+            }
+            if (option == L"/newest")
+            {
+                options->NewestFirst = true;
+                ++index;
+                continue;
+            }
+
+            if (error != nullptr)
+            {
+                *error = L"unrecognised option: " + args[index];
+            }
+            break;
+        }
+
+        ok = (index >= args.size());
+    } while (false);
+
+    return ok;
+}
+
 static void HandleTimelineCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
-    std::wstring* structuredJsonOut = nullptr)
+    std::wstring* structuredJsonOut = nullptr,
+    DeviceClient* device = nullptr)
 {
     do
     {
@@ -17394,6 +17649,20 @@ static void HandleTimelineCommand(
         {
             TimelineStats stats = state.Timeline.GetStats();
             PrintTimelineStatus(stats);
+            if (device != nullptr && device->IsOpen())
+            {
+                TimelineLiveStatus live = {};
+                std::wstring liveError;
+                if (device->QueryTimelineStatus(&live, &liveError))
+                {
+                    PrintTimelineLiveStatus(live);
+                }
+                else
+                {
+                    PrintColoredText(L"[timeline.live]", KNDBG_COLOR_WARN);
+                    std::wcout << L" status failed: " << liveError << L"\n";
+                }
+            }
             if (structuredJsonOut != nullptr)
             {
                 *structuredJsonOut = BuildTimelineStatusJson(stats);
@@ -17409,6 +17678,155 @@ static void HandleTimelineCommand(
             {
                 *structuredJsonOut = BuildTimelineStatusJson(state.Timeline.GetStats());
             }
+            break;
+        }
+
+        if (action == L"live")
+        {
+            if (device == nullptr || !device->IsOpen())
+            {
+                std::wcerr << L"!timeline live requires an open KnLiveDbg.sys driver device\n";
+                break;
+            }
+            if (args.size() < 3)
+            {
+                std::wcerr << L"usage: !timeline live start|stop|status|clear|drain [/capacity <n>] [/limit <n>]\n";
+                break;
+            }
+
+            std::wstring liveAction = ToLower(args[2]);
+            if (liveAction == L"status")
+            {
+                TimelineLiveStatus live = {};
+                std::wstring liveError;
+                if (!device->QueryTimelineStatus(&live, &liveError))
+                {
+                    std::wcerr << L"!timeline live status failed: " << liveError << L"\n";
+                    break;
+                }
+                PrintTimelineLiveStatus(live);
+                break;
+            }
+
+            if (liveAction == L"start")
+            {
+                size_t capacity = KNDBG_TIMELINE_DEFAULT_CAPACITY;
+                size_t index = 3;
+                std::wstring parseError;
+                while (index < args.size())
+                {
+                    std::wstring option = ToLower(args[index]);
+                    if (option == L"/capacity")
+                    {
+                        if (index + 1 >= args.size())
+                        {
+                            std::wcerr << L"!timeline live start: /capacity requires a value\n";
+                            break;
+                        }
+                        if (!ParseTimelineLimit(args[index + 1], KNDBG_TIMELINE_MAX_CAPACITY, &capacity, &parseError) ||
+                            capacity < KNDBG_TIMELINE_MIN_CAPACITY)
+                        {
+                            std::wcerr << L"!timeline live start: capacity must be "
+                                       << KNDBG_TIMELINE_MIN_CAPACITY << L".."
+                                       << KNDBG_TIMELINE_MAX_CAPACITY << L"\n";
+                            break;
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    std::wcerr << L"!timeline live start: unrecognised option \"" << args[index] << L"\"\n";
+                    break;
+                }
+                if (index < args.size())
+                {
+                    break;
+                }
+
+                std::wstring liveError;
+                if (!device->ControlTimeline(KNDBG_TIMELINE_CONTROL_START, static_cast<uint32_t>(capacity), &liveError))
+                {
+                    std::wcerr << L"!timeline live start failed: " << liveError << L"\n";
+                    break;
+                }
+                std::wcout << L"[timeline.live] started capacity=" << capacity << L"\n";
+                break;
+            }
+
+            if (liveAction == L"stop" || liveAction == L"clear")
+            {
+                uint32_t control = liveAction == L"stop" ? KNDBG_TIMELINE_CONTROL_STOP : KNDBG_TIMELINE_CONTROL_CLEAR;
+                std::wstring liveError;
+                if (!device->ControlTimeline(control, 0, &liveError))
+                {
+                    std::wcerr << L"!timeline live " << liveAction << L" failed: " << liveError << L"\n";
+                    break;
+                }
+                std::wcout << L"[timeline.live] " << liveAction << L" ok\n";
+                break;
+            }
+
+            if (liveAction == L"drain")
+            {
+                size_t limit = 256;
+                size_t index = 3;
+                std::wstring parseError;
+                while (index < args.size())
+                {
+                    std::wstring option = ToLower(args[index]);
+                    if (option == L"/limit")
+                    {
+                        if (index + 1 >= args.size())
+                        {
+                            std::wcerr << L"!timeline live drain: /limit requires a value\n";
+                            break;
+                        }
+                        if (!ParseTimelineLimit(args[index + 1], 1024, &limit, &parseError))
+                        {
+                            std::wcerr << L"!timeline live drain: " << parseError << L"\n";
+                            break;
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    std::wcerr << L"!timeline live drain: unrecognised option \"" << args[index] << L"\"\n";
+                    break;
+                }
+                if (index < args.size())
+                {
+                    break;
+                }
+
+                std::vector<TimelineLiveEvent> liveEvents;
+                TimelineLiveStatus drainStatus = {};
+                std::wstring liveError;
+                if (!device->DrainTimelineEvents(static_cast<uint32_t>(limit), &liveEvents, &drainStatus, &liveError))
+                {
+                    std::wcerr << L"!timeline live drain failed: " << liveError << L"\n";
+                    break;
+                }
+
+                std::vector<TimelineEvent> events;
+                events.reserve(liveEvents.size());
+                for (const TimelineLiveEvent& item : liveEvents)
+                {
+                    events.push_back(BuildTimelineEventFromLiveEvent(item));
+                }
+                TimelineIngestResult result = state.Timeline.IngestEvents(events);
+                PrintTimelineIngestResult(L"kernel-live", result);
+                TimelineLiveStatus live = {};
+                if (device->QueryTimelineStatus(&live, &liveError))
+                {
+                    PrintTimelineLiveStatus(live);
+                }
+                else
+                {
+                    PrintColoredText(L"[timeline.live]", KNDBG_COLOR_WARN);
+                    std::wcout << L" status failed: " << liveError << L"\n";
+                }
+                break;
+            }
+
+            std::wcerr << L"!timeline live: unknown action \"" << args[2] << L"\"\n";
             break;
         }
 
@@ -17541,6 +17959,25 @@ static void HandleTimelineCommand(
             if (structuredJsonOut != nullptr)
             {
                 *structuredJsonOut = BuildTimelineEventsJson(events, options, state.Timeline.GetStats().Stored);
+            }
+            break;
+        }
+
+        if (action == L"graph")
+        {
+            TimelineGraphQueryOptions options = {};
+            std::wstring parseError;
+            if (!ParseTimelineGraphOptions(args, 2, state.NumberBase, &options, &parseError))
+            {
+                std::wcerr << L"!timeline graph: " << parseError << L"\n";
+                break;
+            }
+
+            TimelineGraphResult graph = state.Timeline.BuildGraph(options);
+            PrintTimelineGraph(graph);
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildTimelineGraphJson(graph);
             }
             break;
         }
@@ -22007,6 +22444,17 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             {
                 writeLike = true;
             }
+            else if (action == L"live" && args.size() >= 3)
+            {
+                std::wstring liveAction = ToLower(args[2]);
+                if (liveAction == L"start" ||
+                    liveAction == L"stop" ||
+                    liveAction == L"clear" ||
+                    liveAction == L"drain")
+                {
+                    writeLike = true;
+                }
+            }
             break;
         }
 
@@ -24413,7 +24861,32 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             plan.Target = L"!timeline " + action;
             plan.ByteCountText = L"n/a";
 
-            if (action == L"export")
+            if (action == L"live")
+            {
+                std::wstring liveAction = commandArgs.size() >= 3 ? ToLower(commandArgs[2]) : L"<missing>";
+                plan.Target += L" " + liveAction;
+                if (liveAction == L"start")
+                {
+                    plan.Warning = L"timeline live start registers kernel process/image callbacks and allocates a bounded nonpaged ring";
+                }
+                else if (liveAction == L"stop")
+                {
+                    plan.Warning = L"timeline live stop unregisters kernel callbacks and stops collecting live evidence";
+                }
+                else if (liveAction == L"clear")
+                {
+                    plan.Warning = L"timeline live clear drops queued kernel live-event evidence";
+                }
+                else if (liveAction == L"drain")
+                {
+                    plan.Warning = L"timeline live drain mutates the driver ring and copies events into the user-mode timeline store";
+                }
+                else
+                {
+                    plan.Warning = L"unrecognized !timeline live write-like action";
+                }
+            }
+            else if (action == L"export")
             {
                 if (commandArgs.size() >= 3)
                 {
@@ -29609,6 +30082,8 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"ti.query" ||
         tool == L"timeline.status" ||
         tool == L"timeline.query" ||
+        tool == L"timeline.export" ||
+        tool == L"graph.query" ||
         tool == L"module.integrity" ||
         tool == L"driver.integrity" ||
         tool == L"ssdt.scan" ||
@@ -29728,6 +30203,14 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"timeline.query")
     {
         allowed = {L"source", L"domain", L"pid", L"limit", L"order"};
+    }
+    else if (tool == L"timeline.export")
+    {
+        allowed = {L"source", L"domain", L"pid", L"limit", L"order"};
+    }
+    else if (tool == L"graph.query")
+    {
+        allowed = {L"source", L"domain", L"image", L"pid", L"limit", L"order"};
     }
     else if (tool == L"module.integrity")
     {
@@ -29942,7 +30425,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -29964,6 +30447,8 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- ti.query: query the Threat Intelligence ring. Args: action recent|stats|by|grep; optional count, pid, task, pattern strings.\n";
     stream << L"- timeline.status: report the in-memory evidence timeline status. Args: {}.\n";
     stream << L"- timeline.query: query events already ingested into the timeline. Args: optional source, domain, pid, limit, order strings. order is newest or oldest.\n";
+    stream << L"- timeline.export: return ingested timeline events as JSONL text without writing to disk. Args: optional source, domain, pid, limit, order strings.\n";
+    stream << L"- graph.query: derive a process/image/domain/source graph from ingested timeline events. Args: optional source, domain, image, pid, limit, order strings.\n";
     stream << L"- module.integrity: inspect loaded module PE headers, sections, and runtime page permissions. Args: optional module/name/target string, optional limit string, optional booleans summary, verbose, headers, sections, wx, mismatch.\n";
     stream << L"- driver.integrity: inspect DRIVER_OBJECT dispatch targets. Args: optional driver/name/target string and optional limit string.\n";
     stream << L"- ssdt.scan: detect SSDT and win32k shadow-SSDT syscall hooks (routines outside the expected kernel image). Args: {}.\n";
@@ -30006,7 +30491,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For address suspicion or page permission questions, use address.inspect.\n";
     stream << L"- For WNF decode questions, use wnf.decode; for live WNF instance/list questions, use wnf.list.\n";
     stream << L"- For recent Microsoft-Windows-Threat-Intelligence events, use ti.query with recent/stats/by/grep.\n";
-    stream << L"- For time-ordered evidence already ingested into !timeline, use timeline.status or timeline.query.\n";
+    stream << L"- For time-ordered evidence already ingested into !timeline, use timeline.status, timeline.query, timeline.export, or graph.query.\n";
     stream << L"- For driver dispatch integrity questions, use driver.integrity.\n";
     stream << L"- For module text or executable section integrity questions, use module.integrity. Use wx=true for W+X-only module triage, headers=true for PE header evidence, and sections=true for full section-table evidence.\n";
     stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
@@ -32972,22 +33457,38 @@ static bool ExecuteAiCapabilityTimelineStatus(
     return ok;
 }
 
-static bool ExecuteAiCapabilityTimelineQuery(
+static bool AppendAiTimelineCommonFilterArgs(
     const AiCapabilityStep& step,
-    DebuggerState& state,
-    std::wstring* error,
-    std::wstring* structuredJsonOut = nullptr)
+    bool allowImage,
+    const std::wstring& toolName,
+    std::vector<std::wstring>* args,
+    std::wstring* error)
 {
     bool ok = false;
 
     do
     {
+        if (args == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = toolName + L" internal argument vector is null";
+            }
+            break;
+        }
+
         std::wstring source;
         ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"source"}, &source);
         source = TrimWhitespace(source);
         std::wstring domain;
         ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"domain"}, &domain);
         domain = TrimWhitespace(domain);
+        std::wstring image;
+        if (allowImage)
+        {
+            ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"image"}, &image);
+            image = TrimWhitespace(image);
+        }
         std::wstring pid;
         ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pid"}, &pid);
         pid = TrimWhitespace(pid);
@@ -32998,84 +33499,177 @@ static bool ExecuteAiCapabilityTimelineQuery(
         ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"order"}, &order);
         order = ToLower(TrimWhitespace(order));
 
-        std::vector<std::wstring> args;
-        args.push_back(L"!timeline");
-        args.push_back(L"query");
-
         if (!source.empty())
         {
-            if (!ValidateAiCapabilityScalarText(source, L"timeline source", error))
+            if (!ValidateAiCapabilityScalarText(source, toolName + L" source", error))
             {
                 break;
             }
-            args.push_back(L"/source");
-            args.push_back(source);
+            args->push_back(L"/source");
+            args->push_back(source);
         }
         if (!domain.empty())
         {
-            if (!ValidateAiCapabilityScalarText(domain, L"timeline domain", error))
+            if (!ValidateAiCapabilityScalarText(domain, toolName + L" domain", error))
             {
                 break;
             }
-            args.push_back(L"/domain");
-            args.push_back(domain);
+            args->push_back(L"/domain");
+            args->push_back(domain);
+        }
+        if (!image.empty())
+        {
+            if (!ValidateAiCapabilityScalarText(image, toolName + L" image", error))
+            {
+                break;
+            }
+            args->push_back(L"/image");
+            args->push_back(image);
         }
         if (!pid.empty())
         {
             uint64_t parsed = 0;
-            if (!ValidateAiCapabilityScalarText(pid, L"timeline pid", error) ||
+            if (!ValidateAiCapabilityScalarText(pid, toolName + L" pid", error) ||
                 !ParseUnsigned(pid, 0, &parsed) ||
                 parsed == 0 ||
                 parsed > 0xffffffffull)
             {
                 if (error != nullptr && error->empty())
                 {
-                    *error = L"timeline.query pid must be a valid process id";
+                    *error = toolName + L" pid must be a valid process id";
                 }
                 break;
             }
-            args.push_back(L"/pid");
-            args.push_back(pid);
+            args->push_back(L"/pid");
+            args->push_back(L"0n" + std::to_wstring(parsed));
         }
         if (!limit.empty())
         {
             uint64_t parsed = 0;
-            if (!ValidateAiCapabilityScalarText(limit, L"timeline limit", error) ||
+            if (!ValidateAiCapabilityScalarText(limit, toolName + L" limit", error) ||
                 !ParseUnsigned(limit, 10, &parsed) ||
                 parsed == 0 ||
                 parsed > 5000)
             {
                 if (error != nullptr && error->empty())
                 {
-                    *error = L"timeline.query limit must be 1..5000";
+                    *error = toolName + L" limit must be 1..5000";
                 }
                 break;
             }
-            args.push_back(L"/limit");
-            args.push_back(limit);
+            args->push_back(L"/limit");
+            args->push_back(std::to_wstring(parsed));
         }
         if (!order.empty())
         {
             if (order == L"oldest" || order == L"oldest-first")
             {
-                args.push_back(L"/oldest");
+                args->push_back(L"/oldest");
             }
             else if (order == L"newest" || order == L"newest-first")
             {
-                args.push_back(L"/newest");
+                args->push_back(L"/newest");
             }
             else
             {
                 if (error != nullptr)
                 {
-                    *error = L"timeline.query order must be newest or oldest";
+                    *error = toolName + L" order must be newest or oldest";
                 }
                 break;
             }
         }
 
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityTimelineQuery(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        std::vector<std::wstring> args;
+        args.push_back(L"!timeline");
+        args.push_back(L"query");
+        if (!AppendAiTimelineCommonFilterArgs(step, false, L"timeline.query", &args, error))
+        {
+            break;
+        }
+
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": timeline.query\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleTimelineCommand(args, state, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityTimelineExport(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        std::vector<std::wstring> args;
+        args.push_back(L"!timeline");
+        args.push_back(L"query");
+        if (!AppendAiTimelineCommonFilterArgs(step, false, L"timeline.export", &args, error))
+        {
+            break;
+        }
+
+        TimelineQueryOptions options = {};
+        std::wstring parseError;
+        if (!ParseTimelineQueryOptions(args, 2, state.NumberBase, &options, &parseError))
+        {
+            if (error != nullptr)
+            {
+                *error = L"timeline.export: " + parseError;
+            }
+            break;
+        }
+
+        std::vector<TimelineEvent> events = state.Timeline.Query(options);
+        std::wcout << BuildTimelineJsonl(events);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityGraphQuery(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        std::vector<std::wstring> args;
+        args.push_back(L"!timeline");
+        args.push_back(L"graph");
+        if (!AppendAiTimelineCommonFilterArgs(step, true, L"graph.query", &args, error))
+        {
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": graph.query\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
         HandleTimelineCommand(args, state, structuredJsonOut);
         ok = true;
@@ -33875,6 +34469,14 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"timeline.query")
             {
                 stepOk = ExecuteAiCapabilityTimelineQuery(step, state, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"timeline.export")
+            {
+                stepOk = ExecuteAiCapabilityTimelineExport(step, state, error);
+            }
+            else if (step.Tool == L"graph.query")
+            {
+                stepOk = ExecuteAiCapabilityGraphQuery(step, state, error, structuredJsonOut);
             }
             else if (step.Tool == L"module.integrity")
             {
@@ -35316,7 +35918,7 @@ static bool HandleCommand(
         }
         else if (command == L"!timeline")
         {
-            HandleTimelineCommand(args, state);
+            HandleTimelineCommand(args, state, nullptr, &device);
         }
         else if (command == L"!wnf")
         {

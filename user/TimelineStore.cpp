@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cwchar>
 #include <map>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -106,6 +107,340 @@ namespace
         if (evidence != nullptr && !value.empty())
         {
             (*evidence)[key] = value;
+        }
+    }
+
+    std::wstring GraphNodeId(const std::wstring& kind, const std::wstring& label)
+    {
+        return TimelineToLower(kind) + L":" + TimelineToLower(label);
+    }
+
+    std::wstring ProcessLabel(uint32_t pid)
+    {
+        return std::to_wstring(pid);
+    }
+
+    struct TimelineImageRef
+    {
+        std::wstring Value;
+        bool LinkSourceProcess = false;
+        bool LinkTargetProcess = false;
+    };
+
+    bool EvidenceValueByKey(
+        const TimelineEvent& event,
+        const std::wstring& key,
+        std::wstring* value)
+    {
+        bool found = false;
+        std::wstring wanted = TimelineToLower(key);
+
+        for (const auto& item : event.Evidence)
+        {
+            if (TimelineToLower(item.first) == wanted)
+            {
+                if (value != nullptr)
+                {
+                    *value = item.second;
+                }
+                found = true;
+                break;
+            }
+        }
+
+        return found;
+    }
+
+    void AddImageRef(
+        std::map<std::wstring, TimelineImageRef>* refs,
+        const std::wstring& value,
+        bool linkSourceProcess,
+        bool linkTargetProcess)
+    {
+        if (refs != nullptr && !value.empty())
+        {
+            std::wstring key = TimelineToLower(value);
+            auto it = refs->find(key);
+            if (it == refs->end())
+            {
+                TimelineImageRef ref = {};
+                ref.Value = value;
+                it = refs->insert(std::make_pair(key, ref)).first;
+            }
+            it->second.LinkSourceProcess = it->second.LinkSourceProcess || linkSourceProcess;
+            it->second.LinkTargetProcess = it->second.LinkTargetProcess || linkTargetProcess;
+        }
+    }
+
+    std::vector<TimelineImageRef> TimelineEventImageRefs(const TimelineEvent& event)
+    {
+        std::map<std::wstring, TimelineImageRef> refs;
+        std::vector<TimelineImageRef> values;
+        std::wstring value;
+
+        if (EvidenceValueByKey(event, L"image", &value))
+        {
+            AddImageRef(&refs, value, true, false);
+        }
+        if (EvidenceValueByKey(event, L"image_path", &value))
+        {
+            AddImageRef(&refs, value, true, false);
+        }
+        if (EvidenceValueByKey(event, L"target_image", &value))
+        {
+            AddImageRef(&refs, value, false, true);
+        }
+        if (TimelineToLower(event.Domain) == L"process")
+        {
+            AddImageRef(&refs, event.Entity, true, false);
+        }
+
+        for (const auto& item : refs)
+        {
+            values.push_back(item.second);
+        }
+
+        return values;
+    }
+
+    bool TimelineEventMatchesImage(const TimelineEvent& event, const std::wstring& image)
+    {
+        bool matched = false;
+        std::wstring needle = TimelineToLower(image);
+
+        do
+        {
+            if (needle.empty())
+            {
+                matched = true;
+                break;
+            }
+
+            std::vector<TimelineImageRef> images = TimelineEventImageRefs(event);
+            for (const TimelineImageRef& imageRef : images)
+            {
+                if (TimelineToLower(imageRef.Value).find(needle) != std::wstring::npos)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched)
+            {
+                break;
+            }
+
+            if (TimelineToLower(event.Entity).find(needle) != std::wstring::npos ||
+                TimelineToLower(event.Summary).find(needle) != std::wstring::npos)
+            {
+                matched = true;
+                break;
+            }
+
+            for (const auto& item : event.Evidence)
+            {
+                if (TimelineToLower(item.second).find(needle) != std::wstring::npos)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool TimelineEventMatchesGraphQuery(
+        const TimelineEvent& event,
+        const TimelineGraphQueryOptions& options)
+    {
+        bool matched = true;
+
+        if (!options.Source.empty() &&
+            TimelineToLower(event.Source) != TimelineToLower(options.Source))
+        {
+            matched = false;
+        }
+        if (matched &&
+            !options.Domain.empty() &&
+            TimelineToLower(event.Domain) != TimelineToLower(options.Domain))
+        {
+            matched = false;
+        }
+        if (matched &&
+            options.HasProcessId &&
+            event.ProcessId != options.ProcessId &&
+            event.TargetProcessId != options.ProcessId)
+        {
+            matched = false;
+        }
+        if (matched &&
+            !options.Image.empty() &&
+            !TimelineEventMatchesImage(event, options.Image))
+        {
+            matched = false;
+        }
+
+        return matched;
+    }
+
+    void AddGraphNode(
+        std::map<std::wstring, TimelineGraphNode>* nodes,
+        std::set<std::wstring>* eventNodes,
+        const std::wstring& kind,
+        const std::wstring& label)
+    {
+        if (nodes != nullptr && eventNodes != nullptr && !label.empty())
+        {
+            std::wstring id = GraphNodeId(kind, label);
+            auto it = nodes->find(id);
+            if (it == nodes->end())
+            {
+                TimelineGraphNode node = {};
+                node.Id = id;
+                node.Kind = kind;
+                node.Label = label;
+                it = nodes->insert(std::make_pair(id, node)).first;
+            }
+            if (eventNodes->insert(id).second)
+            {
+                ++it->second.EventCount;
+            }
+        }
+    }
+
+    void AddGraphEdge(
+        std::map<std::wstring, TimelineGraphEdge>* edges,
+        std::set<std::wstring>* eventEdges,
+        const std::wstring& from,
+        const std::wstring& to,
+        const std::wstring& kind,
+        uint64_t eventId)
+    {
+        if (edges != nullptr &&
+            eventEdges != nullptr &&
+            !from.empty() &&
+            !to.empty() &&
+            from != to)
+        {
+            std::wstring key = from + L"\n" + to + L"\n" + kind;
+            auto it = edges->find(key);
+            if (it == edges->end())
+            {
+                TimelineGraphEdge edge = {};
+                edge.From = from;
+                edge.To = to;
+                edge.Kind = kind;
+                it = edges->insert(std::make_pair(key, edge)).first;
+            }
+            if (eventEdges->insert(key).second)
+            {
+                ++it->second.EventCount;
+                if (it->second.FirstEventId == 0 || eventId < it->second.FirstEventId)
+                {
+                    it->second.FirstEventId = eventId;
+                }
+                if (eventId > it->second.LastEventId)
+                {
+                    it->second.LastEventId = eventId;
+                }
+            }
+        }
+    }
+
+    bool TryGetEvidencePid(const TimelineEvent& event, const std::wstring& key, uint32_t* pid)
+    {
+        bool ok = false;
+        std::wstring value;
+
+        if (EvidenceValueByKey(event, key, &value))
+        {
+            ok = ParsePidFromText(value, pid);
+        }
+
+        return ok;
+    }
+
+    void AddTimelineGraphEvent(
+        const TimelineEvent& event,
+        std::map<std::wstring, TimelineGraphNode>* nodes,
+        std::map<std::wstring, TimelineGraphEdge>* edges)
+    {
+        std::set<std::wstring> eventNodes;
+        std::set<std::wstring> eventEdges;
+
+        std::wstring sourceLabel = event.Source.empty() ? L"<unknown>" : event.Source;
+        std::wstring domainLabel = event.Domain.empty() ? L"<unknown>" : event.Domain;
+        std::wstring sourceId = GraphNodeId(L"source", sourceLabel);
+        std::wstring domainId = GraphNodeId(L"domain", domainLabel);
+        AddGraphNode(nodes, &eventNodes, L"source", sourceLabel);
+        AddGraphNode(nodes, &eventNodes, L"domain", domainLabel);
+        AddGraphEdge(edges, &eventEdges, sourceId, domainId, L"source-domain", event.EventId);
+
+        std::wstring processId;
+        if (event.ProcessId != 0)
+        {
+            std::wstring label = ProcessLabel(event.ProcessId);
+            processId = GraphNodeId(L"process", label);
+            AddGraphNode(nodes, &eventNodes, L"process", label);
+            AddGraphEdge(edges, &eventEdges, sourceId, processId, L"source-observes-process", event.EventId);
+            AddGraphEdge(
+                edges,
+                &eventEdges,
+                processId,
+                domainId,
+                TimelineToLower(event.Source) == L"snapshot" ? L"snapshot-record" : L"process-domain",
+                event.EventId);
+        }
+
+        std::wstring targetProcessId;
+        if (event.TargetProcessId != 0)
+        {
+            std::wstring label = ProcessLabel(event.TargetProcessId);
+            targetProcessId = GraphNodeId(L"process", label);
+            AddGraphNode(nodes, &eventNodes, L"process", label);
+            AddGraphEdge(edges, &eventEdges, sourceId, targetProcessId, L"source-observes-process", event.EventId);
+            if (!processId.empty())
+            {
+                AddGraphEdge(
+                    edges,
+                    &eventEdges,
+                    processId,
+                    targetProcessId,
+                    TimelineToLower(event.Source) == L"ti" ? L"ti-targets-process" : L"targets-process",
+                    event.EventId);
+            }
+        }
+
+        uint32_t parentPid = 0;
+        if (event.ProcessId != 0 &&
+            (TryGetEvidencePid(event, L"parent_pid", &parentPid) ||
+             TryGetEvidencePid(event, L"ppid", &parentPid) ||
+             TryGetEvidencePid(event, L"parent_process_id", &parentPid) ||
+             TryGetEvidencePid(event, L"inherited_from_pid", &parentPid) ||
+             TryGetEvidencePid(event, L"creator_pid", &parentPid)) &&
+            parentPid != event.ProcessId)
+        {
+            std::wstring parentLabel = ProcessLabel(parentPid);
+            std::wstring parentId = GraphNodeId(L"process", parentLabel);
+            AddGraphNode(nodes, &eventNodes, L"process", parentLabel);
+            AddGraphEdge(edges, &eventEdges, parentId, processId, L"parent-child", event.EventId);
+        }
+
+        std::vector<TimelineImageRef> images = TimelineEventImageRefs(event);
+        for (const TimelineImageRef& imageRef : images)
+        {
+            std::wstring imageId = GraphNodeId(L"image", imageRef.Value);
+            AddGraphNode(nodes, &eventNodes, L"image", imageRef.Value);
+            AddGraphEdge(edges, &eventEdges, sourceId, imageId, L"source-observes-image", event.EventId);
+            if (!processId.empty() && imageRef.LinkSourceProcess)
+            {
+                AddGraphEdge(edges, &eventEdges, processId, imageId, L"process-loads-image", event.EventId);
+            }
+            if (!targetProcessId.empty() && imageRef.LinkTargetProcess)
+            {
+                AddGraphEdge(edges, &eventEdges, targetProcessId, imageId, L"process-loads-image", event.EventId);
+            }
         }
     }
 }
@@ -324,6 +659,25 @@ TimelineIngestResult TimelineStore::IngestSnapshot(
     return result;
 }
 
+TimelineIngestResult TimelineStore::IngestEvents(
+    const std::vector<TimelineEvent>& events)
+{
+    TimelineIngestResult result = {};
+    result.SourceRecords = events.size();
+
+    std::lock_guard<std::mutex> lock(Mutex);
+    uint64_t beforeDropped = DroppedEvents;
+    for (const TimelineEvent& item : events)
+    {
+        TimelineEvent event = item;
+        AddEventLocked(std::move(event));
+        ++result.Added;
+    }
+
+    result.Dropped = DroppedEvents - beforeDropped;
+    return result;
+}
+
 std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& options) const
 {
     std::vector<TimelineEvent> out;
@@ -390,6 +744,72 @@ std::vector<TimelineEvent> TimelineStore::AllEvents() const
 {
     std::lock_guard<std::mutex> lock(Mutex);
     return std::vector<TimelineEvent>(Events.begin(), Events.end());
+}
+
+TimelineGraphResult TimelineStore::BuildGraph(const TimelineGraphQueryOptions& options) const
+{
+    TimelineGraphResult result = {};
+    result.Options = options;
+    std::map<std::wstring, TimelineGraphNode> nodes;
+    std::map<std::wstring, TimelineGraphEdge> edges;
+    std::vector<TimelineEvent> events;
+
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        events.assign(Events.begin(), Events.end());
+    }
+    result.TotalEvents = events.size();
+
+    auto handleEvent = [&result, &nodes, &edges, &options](const TimelineEvent& event) -> bool
+    {
+        bool keepGoing = true;
+        if (TimelineEventMatchesGraphQuery(event, options))
+        {
+            if (options.Limit != 0 && result.MatchedEvents >= options.Limit)
+            {
+                result.Truncated = true;
+                keepGoing = false;
+            }
+            else
+            {
+                AddTimelineGraphEvent(event, &nodes, &edges);
+                ++result.MatchedEvents;
+            }
+        }
+        return keepGoing;
+    };
+
+    if (options.NewestFirst)
+    {
+        for (auto it = events.rbegin(); it != events.rend(); ++it)
+        {
+            if (!handleEvent(*it))
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        for (const TimelineEvent& event : events)
+        {
+            if (!handleEvent(event))
+            {
+                break;
+            }
+        }
+    }
+
+    for (const auto& item : nodes)
+    {
+        result.Nodes.push_back(item.second);
+    }
+    for (const auto& item : edges)
+    {
+        result.Edges.push_back(item.second);
+    }
+
+    return result;
 }
 
 TimelineStats TimelineStore::GetStats() const

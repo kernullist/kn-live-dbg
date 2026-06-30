@@ -346,6 +346,186 @@ bool DeviceClient::ReadIdt(
     return ok;
 }
 
+bool DeviceClient::ControlTimeline(
+    uint32_t action,
+    uint32_t capacity,
+    std::wstring* error)
+{
+    KNDBG_TIMELINE_CONTROL_REQUEST request = {};
+    request.Size = sizeof(request);
+    request.Action = action;
+    request.Capacity = capacity;
+    request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
+
+    DWORD returned = 0;
+    return Ioctl(
+        IOCTL_KNDBG_TIMELINE_CONTROL,
+        &request,
+        sizeof(request),
+        sizeof(request),
+        &returned,
+        error);
+}
+
+bool DeviceClient::QueryTimelineStatus(
+    TimelineLiveStatus* status,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (status == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid timeline status output";
+            }
+            break;
+        }
+
+        KNDBG_TIMELINE_STATUS_RESPONSE response = {};
+        DWORD returned = 0;
+        if (!Ioctl(IOCTL_KNDBG_TIMELINE_STATUS, &response, 0, sizeof(response), &returned, error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(response))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short timeline status response";
+            }
+            break;
+        }
+
+        status->Flags = response.Flags;
+        status->Capacity = response.Capacity;
+        status->Count = response.Count;
+        status->Dropped = response.Dropped;
+        status->NextSequence = response.NextSequence;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DeviceClient::DrainTimelineEvents(
+    uint32_t maxEvents,
+    std::vector<TimelineLiveEvent>* events,
+    TimelineLiveStatus* status,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (events == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid timeline event output";
+            }
+            break;
+        }
+
+        events->clear();
+        if (maxEvents == 0)
+        {
+            maxEvents = 256;
+        }
+        if (maxEvents > 1024)
+        {
+            maxEvents = 1024;
+        }
+
+        DWORD headerLength = FIELD_OFFSET(KNDBG_TIMELINE_DRAIN_RESPONSE, Events);
+        DWORD bufferLength = headerLength + maxEvents * sizeof(KNDBG_TIMELINE_EVENT_RECORD);
+        if (bufferLength > KNDBG_MAX_TRANSFER_SIZE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Timeline drain request is too large";
+            }
+            break;
+        }
+
+        std::vector<uint8_t> buffer(bufferLength);
+        KNDBG_TIMELINE_DRAIN_REQUEST* request = reinterpret_cast<KNDBG_TIMELINE_DRAIN_REQUEST*>(buffer.data());
+        request->Size = sizeof(*request);
+        request->MaxEvents = maxEvents;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_TIMELINE_DRAIN,
+                buffer.data(),
+                sizeof(*request),
+                bufferLength,
+                &returned,
+                error))
+        {
+            break;
+        }
+        if (returned < headerLength)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short timeline drain response";
+            }
+            break;
+        }
+
+        KNDBG_TIMELINE_DRAIN_RESPONSE* response =
+            reinterpret_cast<KNDBG_TIMELINE_DRAIN_RESPONSE*>(buffer.data());
+        if (response->Count > maxEvents ||
+            returned < headerLength + response->Count * sizeof(KNDBG_TIMELINE_EVENT_RECORD))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid timeline drain count";
+            }
+            break;
+        }
+
+        events->reserve(response->Count);
+        for (uint32_t index = 0; index < response->Count; ++index)
+        {
+            const KNDBG_TIMELINE_EVENT_RECORD& item = response->Events[index];
+            TimelineLiveEvent event = {};
+            event.Type = item.Type;
+            event.Flags = item.Flags;
+            event.ProcessId = item.ProcessId;
+            event.ParentProcessId = item.ParentProcessId;
+            event.ThreadId = item.ThreadId;
+            event.Sequence = item.Sequence;
+            event.Timestamp100ns = item.Timestamp100ns;
+            event.ImageBase = item.ImageBase;
+            event.ImageSize = item.ImageSize;
+            event.FileObject = item.FileObject;
+            uint32_t chars = item.ImagePathLength;
+            if (chars >= KNDBG_TIMELINE_IMAGE_PATH_CHARS)
+            {
+                chars = KNDBG_TIMELINE_IMAGE_PATH_CHARS - 1;
+            }
+            event.ImagePath.assign(item.ImagePath, item.ImagePath + chars);
+            events->push_back(event);
+        }
+
+        if (status != nullptr)
+        {
+            status->Flags = 0;
+            status->Capacity = 0;
+            status->Count = response->Remaining;
+            status->Dropped = response->Dropped;
+            status->NextSequence = response->NextSequence;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::ResolveProcess(
     uint32_t processId,
     uint32_t directoryTableBaseOffset,
