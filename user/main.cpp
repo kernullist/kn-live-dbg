@@ -3123,6 +3123,7 @@ static void AddSnapshotCompletionCandidates(std::vector<std::wstring>* candidate
         L"/all",
         L"/name",
         L"/domains",
+        L"/no-domains",
         L"/warnings",
         L"help"
     };
@@ -7424,7 +7425,7 @@ static void PrintSnapshotHelp()
     std::wcout << L"!snapshot command:\n";
     std::wcout << L"  !snapshot baseline [/all] [/name <label>]\n";
     std::wcout << L"  !snapshot save <path> [/all] [/name <label>]\n";
-    std::wcout << L"  !snapshot show [baseline|<path>] [/domains] [/warnings]\n";
+    std::wcout << L"  !snapshot show [baseline|<path>] [/domains|/no-domains] [/warnings]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Captures same-boot evidence snapshots over native scanners and stores a\n";
@@ -7601,6 +7602,10 @@ static void HandleSnapshotCommand(
                 {
                     domains = true;
                 }
+                else if (option == L"/no-domains")
+                {
+                    domains = false;
+                }
                 else if (option == L"/warnings")
                 {
                     warnings = true;
@@ -7626,6 +7631,10 @@ static void HandleSnapshotCommand(
                     break;
                 }
                 PrintSnapshotSummary(state.SnapshotBaseline, domains, warnings);
+                if (structuredJsonOut != nullptr)
+                {
+                    *structuredJsonOut = BuildSnapshotJson(state.SnapshotBaseline);
+                }
             }
             else
             {
@@ -7636,6 +7645,10 @@ static void HandleSnapshotCommand(
                     break;
                 }
                 PrintSnapshotSummary(document, domains, warnings);
+                if (structuredJsonOut != nullptr)
+                {
+                    *structuredJsonOut = BuildSnapshotJson(document);
+                }
             }
             break;
         }
@@ -21454,6 +21467,21 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             break;
         }
 
+        if (command == L"!ti" && args.size() >= 2)
+        {
+            std::wstring action = ToLower(args[1]);
+            if (action == L"start" ||
+                action == L"stop" ||
+                action == L"add" ||
+                action == L"remove" ||
+                action == L"save" ||
+                action == L"clear")
+            {
+                writeLike = true;
+            }
+            break;
+        }
+
         if (command == L"setfield" || command == L"write" || command == L"f" || command == L"fp" || command == L"m")
         {
             writeLike = true;
@@ -23817,6 +23845,38 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             plan.VerifyCommand = plan.BackupCommand;
             plan.TranslationCommand = L"vtop " + commandArgs[2] + L" " + std::to_wstring(length == 0 ? 1 : length);
             plan.Warning = L"move write: confirm source and destination do not overlap unexpectedly";
+        }
+        else if (command == L"!ti" && commandArgs.size() >= 2)
+        {
+            std::wstring action = ToLower(commandArgs[1]);
+            plan.TargetKind = L"threat-intelligence";
+            plan.Target = L"!ti " + action;
+            plan.ByteCountText = L"n/a";
+
+            if (action == L"save")
+            {
+                if (commandArgs.size() >= 3)
+                {
+                    plan.Target += L" " + commandArgs[2];
+                }
+                plan.Warning = L"ti save writes a host JSONL evidence file; confirm the path is intended and protected";
+            }
+            else if (action == L"clear")
+            {
+                plan.Warning = L"ti clear drops the in-memory ring; export first if the current evidence must be preserved";
+            }
+            else if (action == L"start" || action == L"stop")
+            {
+                plan.Warning = L"ti subscription lifecycle change: this starts or stops a system ETW capture session";
+            }
+            else if (action == L"add" || action == L"remove")
+            {
+                plan.Warning = L"ti watch-list change: this mutates the active capture filter state";
+            }
+            else
+            {
+                plan.Warning = L"unrecognized !ti write-like action";
+            }
         }
         else
         {
@@ -28974,6 +29034,7 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"type.describe" ||
         tool == L"callbacks.list" ||
         tool == L"wfp.list" ||
+        tool == L"wfp.kernel_callouts" ||
         tool == L"alpc.list" ||
         tool == L"vad.list" ||
         tool == L"threads.list" ||
@@ -28998,9 +29059,11 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"msr.check" ||
         tool == L"vbs.scan" ||
         tool == L"byovd.scan" ||
+        tool == L"byovd.status" ||
         tool == L"pool.scan_pe" ||
         tool == L"hunt.run" ||
         tool == L"snapshot.capture" ||
+        tool == L"snapshot.show" ||
         tool == L"snapshot.diff" ||
         tool == L"memory.read_virtual" ||
         tool == L"memory.read_physical" ||
@@ -29051,6 +29114,10 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"wfp.list")
     {
         allowed = {L"scope", L"module", L"provider", L"layer"};
+    }
+    else if (tool == L"wfp.kernel_callouts")
+    {
+        allowed = {};
     }
     else if (tool == L"alpc.list")
     {
@@ -29109,7 +29176,8 @@ static bool ValidateAiCapabilityToolArgKeys(
              tool == L"cr.scan" ||
              tool == L"msr.check" ||
              tool == L"vbs.scan" ||
-             tool == L"byovd.scan")
+             tool == L"byovd.scan" ||
+             tool == L"byovd.status")
     {
         allowed = {};
     }
@@ -29124,6 +29192,10 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"snapshot.capture")
     {
         allowed = {L"name"};
+    }
+    else if (tool == L"snapshot.show")
+    {
+        allowed = {L"source", L"path", L"domains", L"warnings"};
     }
     else if (tool == L"snapshot.diff")
     {
@@ -29304,7 +29376,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|pool.scan_pe|hunt.run|snapshot.capture|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -29312,6 +29384,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- type.describe: dump a structure with dt. Args: source like \"$0\" or address/eprocess, type string, fields array of type field names. For process source, use each record EPROCESS address.\n";
     stream << L"- callbacks.list: list kernel callbacks. Args: scope string and optional module string. Supported scopes: all,object,registry,process,thread,imageload,minifilter.\n";
     stream << L"- wfp.list: list Windows Filtering Platform objects via fwpuclnt.dll. Args: scope (providers,sublayers,callouts,filters,layers; defaults to callouts), optional module (callouts/filters provider name or GUID), optional layer (filters only).\n";
+    stream << L"- wfp.kernel_callouts: resolve kernel-mode WFP classify/notify/flowDelete pointers from netio.sys. Args: {}.\n";
     stream << L"- alpc.list: list ALPC ports discovered via Object Manager directory walk and CommunicationInfo links. Args: scope (ports,connections; defaults to ports), optional name substring, optional pid filter as decimal string.\n";
     stream << L"- vad.list: list target process VADs and optionally detect present PTE ranges missing from the VAD tree. Args: image, pid, eprocess, or source; optional booleans exec, private, wx, pe, hiddenpte, dkom, summary; optional limit string.\n";
     stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
@@ -29331,9 +29404,11 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- msr.check: check SYSCALL MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) for hooked entry pointers and per-CPU divergence. Args: {}.\n";
     stream << L"- vbs.scan: report VBS/HVCI, Code Integrity options, hypervisor, Secure Kernel modules, and trustlets. Args: {}.\n";
     stream << L"- byovd.scan: scan loaded kernel modules against the local BYOVD/LOLDrivers catalog (no network). Args: {}.\n";
+    stream << L"- byovd.status: show local BYOVD catalog age, source counts, and YARA rule availability. Args: {}.\n";
     stream << L"- pool.scan_pe: hunt PE images (intact or signature-wiped) staged in kernel big pool. Args: optional tag, limit strings; optional boolean suspicious.\n";
     stream << L"- hunt.run: whole-system user-mode anomaly hunt. Args: optional mode string quick or deep.\n";
     stream << L"- snapshot.capture: capture a same-boot evidence baseline. Args: optional name string.\n";
+    stream << L"- snapshot.show: show the current baseline or a snapshot JSON file. Args: optional source/path string, optional booleans domains, warnings.\n";
     stream << L"- snapshot.diff: diff the session baseline against a fresh live capture (or two snapshot files). Args: optional old, new, domain, risk, limit.\n";
     stream << L"- memory.read_virtual: read bytes at a virtual address. Args: address|va|symbol, optional width (1|2|4|8), count, process.\n";
     stream << L"- memory.read_physical: read bytes at a physical address. Args: physical_address, optional width (1|2|4|8), count.\n";
@@ -29352,7 +29427,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For PID/EPROCESS/DTB/PEB answers, prefer process.describe.\n";
     stream << L"- For full _EPROCESS layout at the found process, use type.describe with type \"nt!_EPROCESS\" and source \"$0\".\n";
     stream << L"- For callback requests such as object callbacks for WdFilter.sys, use callbacks.list with scope \"object\" and module \"WdFilter.sys\".\n";
-    stream << L"- For WFP questions such as callouts owned by tcpip or filters in the ALE auth connect layer, use wfp.list with the appropriate scope and module/layer.\n";
+    stream << L"- For WFP questions such as callouts owned by tcpip or filters in the ALE auth connect layer, use wfp.list with the appropriate scope and module/layer. For kernel callout function pointers, use wfp.kernel_callouts.\n";
     stream << L"- For ALPC questions such as listing named ports or pairing csrss/lsass connections, use alpc.list with scope ports or connections and optional name/pid filters.\n";
     stream << L"- For executable private memory, W+X, PE-like VADs, process memory region triage, or VAD DKOM/hidden PTE checks, use vad.list directly. Use hiddenpte=true for VAD DKOM checks.\n";
     stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
@@ -30121,6 +30196,43 @@ static bool ExecuteAiCapabilityWfpList(
         std::wcout << L": wfp.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
         HandleWfpCommand(args, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityWfpKernelCallouts(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        (void)structuredJsonOut;
+
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"wfp.kernel_callouts requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!wfp");
+        args.push_back(L"kernelcallouts");
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": wfp.kernel_callouts\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleWfpKernelCalloutsCommand(args, device, symbols);
         ok = true;
     } while (false);
 
@@ -32677,6 +32789,35 @@ static bool ExecuteAiCapabilityByovdScan(
     return ok;
 }
 
+static bool ExecuteAiCapabilityByovdStatus(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        (void)step;
+        (void)error;
+        (void)structuredJsonOut;
+
+        std::vector<std::wstring> args;
+        args.push_back(L"byovd");
+        args.push_back(L"status");
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": byovd.status\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleByovdCommand(args, state, symbols);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ExecuteAiCapabilityPoolScanPe(
     const AiCapabilityStep& step,
     DebuggerState& state,
@@ -32849,6 +32990,84 @@ static bool ExecuteAiCapabilitySnapshotCapture(
     return ok;
 }
 
+static bool ExecuteAiCapabilitySnapshotShow(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring source;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"source"}, &source);
+        source = TrimWhitespace(source);
+
+        std::wstring path;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"path"}, &path);
+        path = TrimWhitespace(path);
+
+        if (!path.empty())
+        {
+            if (!source.empty() && ToLower(source) != L"baseline" && source != path)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"snapshot.show accepts either source or path, not conflicting values";
+                }
+                break;
+            }
+            source = path;
+        }
+
+        if (source.empty())
+        {
+            source = L"baseline";
+        }
+
+        if (!ValidateAiCapabilityScalarText(source, L"snapshot source", error))
+        {
+            break;
+        }
+
+        bool domains = true;
+        bool warnings = false;
+        if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"domains", &domains, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"warnings", &warnings, error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!snapshot");
+        args.push_back(L"show");
+        args.push_back(source);
+        if (domains)
+        {
+            args.push_back(L"/domains");
+        }
+        else
+        {
+            args.push_back(L"/no-domains");
+        }
+        if (warnings)
+        {
+            args.push_back(L"/warnings");
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": snapshot.show\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleSnapshotCommand(args, state, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ExecuteAiCapabilityPlan(
     const AiCapabilityPlan& plan,
     DebuggerState& state,
@@ -32892,6 +33111,10 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"wfp.list")
             {
                 stepOk = ExecuteAiCapabilityWfpList(step, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"wfp.kernel_callouts")
+            {
+                stepOk = ExecuteAiCapabilityWfpKernelCallouts(step, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"alpc.list")
             {
@@ -32969,6 +33192,10 @@ static bool ExecuteAiCapabilityPlan(
             {
                 stepOk = ExecuteAiCapabilityByovdScan(step, state, symbols, error, structuredJsonOut);
             }
+            else if (step.Tool == L"byovd.status")
+            {
+                stepOk = ExecuteAiCapabilityByovdStatus(step, state, symbols, error, structuredJsonOut);
+            }
             else if (step.Tool == L"pool.scan_pe")
             {
                 stepOk = ExecuteAiCapabilityPoolScanPe(step, state, device, symbols, error, structuredJsonOut);
@@ -32980,6 +33207,10 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"snapshot.capture")
             {
                 stepOk = ExecuteAiCapabilitySnapshotCapture(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"snapshot.show")
+            {
+                stepOk = ExecuteAiCapabilitySnapshotShow(step, state, device, symbols, error, structuredJsonOut);
             }
             else if (step.Tool == L"memory.read_virtual")
             {
@@ -34687,6 +34918,15 @@ static bool McpGetArg(const std::wstring& argsJson, const wchar_t* key, std::wst
     return ExtractJsonStringValue(argsJson, key, value);
 }
 
+static bool McpGetBoolArg(
+    const std::wstring& argsJson,
+    const std::wstring& key,
+    bool* value,
+    std::wstring* error)
+{
+    return ExtractAiCapabilityBooleanArg(argsJson, key, value, error);
+}
+
 // Validates a single-token argument (address, length, type, field, value).
 static bool McpValidateToken(const std::wstring& value, std::wstring* error)
 {
@@ -34703,6 +34943,12 @@ static bool McpValidateToken(const std::wstring& value, std::wstring* error)
         if (ContainsUnsafeAiCommandCharacters(value, &reason))
         {
             *error = reason;
+            break;
+        }
+
+        if (value.find(L'"') != std::wstring::npos)
+        {
+            *error = L"argument must not contain double quotes";
             break;
         }
 
@@ -34776,6 +35022,12 @@ static bool McpValidatePath(const std::wstring& value, std::wstring* error)
         if (ContainsUnsafeAiCommandCharacters(value, &reason))
         {
             *error = reason;
+            break;
+        }
+
+        if (value.find(L'"') != std::wstring::npos)
+        {
+            *error = L"path must not contain double quotes";
             break;
         }
 
@@ -35068,10 +35320,17 @@ static McpEngineResult DispatchMcpWriteTool(
             std::wstring address;
             std::wstring length;
             std::wstring path;
+            bool zeroFill = false;
             if (!McpGetArg(argsJson, L"address", &address) || !McpGetArg(argsJson, L"length", &length) || !McpGetArg(argsJson, L"path", &path))
             {
                 result.IsError = true;
                 result.Text = L"dump.raw requires 'address', 'length', 'path'";
+                break;
+            }
+            if (!McpGetBoolArg(argsJson, L"zerofill", &zeroFill, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
                 break;
             }
             if (!McpValidateToken(address, &argError) || !McpValidateToken(length, &argError) || !McpValidatePath(path, &argError))
@@ -35081,6 +35340,31 @@ static McpEngineResult DispatchMcpWriteTool(
                 break;
             }
             command = L"dump-raw " + address + L" " + length + L" \"" + path + L"\"";
+            if (zeroFill)
+            {
+                command += L" /zerofill";
+            }
+        }
+        else if (tool == L"ti.export")
+        {
+            std::wstring path;
+            if (!McpGetArg(argsJson, L"path", &path))
+            {
+                result.IsError = true;
+                result.Text = L"ti.export requires 'path'";
+                break;
+            }
+            if (!McpValidatePath(path, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            command = L"!ti save \"" + path + L"\"";
+        }
+        else if (tool == L"ti.clear")
+        {
+            command = L"!ti clear";
         }
         else if (tool == L"dump.pe")
         {

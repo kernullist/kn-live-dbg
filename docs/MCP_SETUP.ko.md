@@ -82,7 +82,7 @@ mcp status     # 현재 상태
 | 옵션 | 의미 | 기본값 |
 |------|------|--------|
 | `<port>` (위치 인자) | 리스닝 포트. `0 < port < 65536`만 적용, 그 외는 무시 | `51766` |
-| `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 8종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
+| `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 10종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
 | `--bind <addr>` | 네트워크 노출. `<addr>`에 추가로 바인드 | 없음 = loopback 전용 |
 | `--bind=<addr>` | 위와 동일(붙여 쓰는 형태) | 없음 |
 | `--token <t>` | 고정 bearer 토큰 사용(영속), 자동 관리 토큰 대신 | auto |
@@ -148,7 +148,7 @@ knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 ```
 
 - 읽기 전용(기본): 엔진 진입 시 `SetWriteMode(false)`로 **커널 write 플래그 자체를 비무장**한다. write 툴은 등록되지 않으며, 호출 시 `writes are disabled; start the MCP server with --allow-write (lab mode)`로 거부된다.
-- `--allow-write`: write 툴 8종이 노출되고 `SetWriteMode(true)`로 무장된다. 모든 write는 preflight/backup/verify-diff/audit 레일을 거친다(인터랙티브 확인은 생략).
+- `--allow-write`: write 툴 10종이 노출되고 `SetWriteMode(true)`로 커널 write가 무장된다. 커널 메모리 write는 preflight/backup/verify-diff/audit 레일을 타고, 파일/링 작업은 backup/verify가 의미 없는 경우에도 게이트·감사·경고를 유지한다(인터랙티브 확인은 생략).
 - **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. **토큰이 새로 발급되므로 클라이언트 헤더도 갱신**해야 한다.
 - **권고**: write 세션 전 VM 스냅샷을 찍고, 분석 baseline(`snapshot.capture`)을 캡처하라. 격리 VM 전용이며 라이브 EDR/AC 박스에서는 절대 쓰지 않는다.
 
@@ -393,7 +393,7 @@ mcp_servers:
       Authorization: "Bearer <서버가_찍어준_token>"
     timeout: 300        # 느린 스캔(hunt.run 등) 대비 기본 120초보다 상향
     connect_timeout: 60
-    # tools:            # 선택: 필요한 것만 노출(read 툴 38개는 컨텍스트를 많이 먹음)
+    # tools:            # 선택: 필요한 것만 노출(read 툴 41개는 컨텍스트를 많이 먹음)
     #   include: [process.find, vad.list, threads.list, callbacks.list, hunt.run]
 ```
 
@@ -444,7 +444,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 ## 6. 제공 기능 카탈로그
 
-### 6.1 읽기 툴 (38종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
+### 6.1 읽기 툴 (41종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
 
 | 툴 | 설명 | 주요 인자 (별도 표기 외 모두 선택) |
 |-----|------|----------------------|
@@ -453,6 +453,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `type.describe` | 주소/프로세스에서 커널 구조 덤프(dt) | `source`, `address`, `type`, `fields` |
 | `callbacks.list` | 커널 콜백 열거(object/registry/process/thread/imageload/minifilter) | `scope`, `module` |
 | `wfp.list` | WFP provider/sublayer/callout/filter/layer 열거 | `scope`, `module`, `provider`, `layer` |
+| `wfp.kernel_callouts` | `netio.sys`에서 커널 WFP classify/notify/flowDelete 포인터 해석 | (없음) |
 | `alpc.list` | ALPC 포트/연결 열거 | `scope`, `name`, `pid` |
 | `vad.list` | VAD 열거(W+X/private/hidden-PTE/DKOM 체크) | `pid`, `image`, `eprocess`, `exec`, `private`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
 | `threads.list` | 스레드/시작주소/APC/스택 증거 | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
@@ -472,9 +473,11 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `msr.check` | SYSCALL MSR(LSTAR/CSTAR/STAR/FMASK/EFER) 훅 | (없음) |
 | `vbs.scan` | VBS/HVCI/CI/하이퍼바이저/Secure Kernel/trustlet | (없음) |
 | `byovd.scan` | 로드 모듈을 로컬 BYOVD/LOLDrivers 카탈로그와 대조(네트워크/서브프로세스 없음) | (없음) |
+| `byovd.status` | 로컬 BYOVD 카탈로그 age/source count/YARA rule 가용성 보고 | (없음) |
 | `pool.scan_pe` | 커널 big pool에 스테이징된 PE 헌팅(서명 wipe 포함) | `tag`, `limit`, `suspicious` |
 | `hunt.run` | 전체 시스템 유저모드 이상 헌트(인젝션/VAD/PTE/threads/APC/driver/WFP/TI) | `mode` |
 | `snapshot.capture` | 동일 부팅 증거 baseline 캡처(in-memory, 디스크 미기록) | `name` |
+| `snapshot.show` | 현재 snapshot baseline 또는 snapshot JSON 파일 표시(summary + structured JSON) | `source`, `path`, `domains`, `warnings` |
 | `snapshot.diff` | 세션 baseline과 라이브 캡처 비교(또는 두 스냅샷 파일) | `old`, `new`, `domain`, `risk`, `limit`, `summary` |
 | `memory.read_virtual` | 가상주소 바이트 읽기(db/dq) — hex + unreadable 마스크(structured) | `address`/`va`/`symbol`, `width`(1/2/4/8), `count`, `process` |
 | `memory.read_physical` | 물리주소 바이트 읽기(!db/!dq) — 후킹된 VA 매핑 우회(structured) | `physical_address`(필수), `width`, `count` |
@@ -487,9 +490,9 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `memory.compare` | 두 가상 범위 byte 비교 + 불일치 오프셋(c) — 인라인 훅/패치 탐지 | `address1`(필수), `address2`(필수), `length`(필수) |
 | `ti.subscribe` | TI ETW 구독 제어(`action`=start/stop/status) — **start/stop은 `--allow-write` 필요** | `action` |
 
-> `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽는다. `memory.read_virtual`/`read_physical`/`symbol.search`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다. `ti.subscribe`는 읽기 카테고리지만 ETW 세션을 시작/중지하는 부수효과 때문에 start/stop만 write 모드를 요구한다(status는 항상 가능, `kn://ti/stats`와 동일 데이터).
+> `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽거나 `snapshot.show`로 summary + structuredContent를 받는다. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다. `ti.subscribe`는 읽기 카테고리지만 ETW 세션을 시작/중지하는 부수효과 때문에 start/stop만 write 모드를 요구한다(status는 항상 가능, `kn://ti/stats`와 동일 데이터).
 
-### 6.2 Write 툴 (8종, `--allow-write` 필수)
+### 6.2 Write 툴 (10종, `--allow-write` 필수)
 
 | 툴 | 설명 | 필수 인자 | 선택 인자 |
 |-----|------|-----------|-----------|
@@ -499,7 +502,9 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `memory.move` | 커널 범위 복사(src->dest) | `source`, `dest`, `length` | — |
 | `type.set_field` | 주소의 구조체 필드 설정(setfield) | `address`, `type`, `field`, `value` | — |
 | `process.set_protection` | 임의 타깃 PS_PROTECTION 설정 (PPL/PP) | `level`(none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid`(미지정=self) |
-| `dump.raw` | 커널 범위를 지정 파일 경로로 덤프 | `address`, `length`, `path` | — |
+| `ti.export` | 현재 Threat-Intelligence ETW 링을 JSONL로 내보내기 | `path` | — |
+| `ti.clear` | 인메모리 Threat-Intelligence ETW 링 비우기 | — | — |
+| `dump.raw` | 커널 범위를 지정 파일 경로로 덤프 | `address`, `length`, `path` | `zerofill` |
 | `dump.pe` | 메모리에서 온디스크 PE 이미지 재구성 | `address`, `path` | — |
 
 > **주의 — `process.set_protection` 임의 타깃**: `pid`로 임의 프로세스의 PPL/PP를 올리거나(예: 프로세스를 un-killable PP로 승격) 벗길 수 있다(예: PPL 안티치트/AV 무력화). 드라이버 IOCTL은 임의 타깃을 지원하며(write-ack + write 모드로만 게이트), `--allow-write` lab 모드 전용이다. 변경 전 대상 프로세스 baseline·VM 스냅샷을 권장한다. 응답에 before/after/requested 바이트 + 검증(readback) 결과가 포함된다.
@@ -668,9 +673,10 @@ code.disasm 로 엔트리 바이트까지 확인.
 
 ```
 etw.integrity 와 nmi.list 로 ETW logger/GetCpuClock 변조를 스윕하고, wfp.list 로 비-MS
-소유 callout, alpc.list 로 csrss/lsass 페어링, wnf.list 로 의심 WNF 인스턴스를 함께 봐줘.
+소유 callout을 보고, wfp.kernel_callouts 로 커널 callout 함수 포인터를 해석하고,
+alpc.list 로 csrss/lsass 페어링, wnf.list 로 의심 WNF 인스턴스를 함께 봐줘.
 ```
-→ `etw.integrity` + `nmi.list` + `wfp.list` + `alpc.list` + `wnf.list`.
+→ `etw.integrity` + `nmi.list` + `wfp.list` + `wfp.kernel_callouts` + `alpc.list` + `wnf.list`.
 
 ### 9.12 위협 인텔 캡처 (TI 구독)
 
@@ -684,10 +690,11 @@ stop.
 ### 9.13 베이스라인 → 델타 탐지
 
 ```
-지금 snapshot.capture 로 클린 baseline을 잡아줘. (게임/치트 실행 후) snapshot.diff 로
-baseline 대비 새로 생긴 콜백/스레드/VAD/풀 할당을 risk 순으로 보여줘.
+지금 snapshot.capture 로 클린 baseline을 잡고 snapshot.show 로 현재 요약을 보여줘.
+(게임/치트 실행 후) snapshot.diff 로 baseline 대비 새로 생긴 콜백/스레드/VAD/풀 할당을
+risk 순으로 보여줘.
 ```
-→ `snapshot.capture` → (시간 경과) → `snapshot.diff {risk:high}` 또는 `kn://snapshot/current` 대조.
+→ `snapshot.capture` → `snapshot.show` → (시간 경과) → `snapshot.diff {risk:high}` 또는 `kn://snapshot/current` 대조.
 
 ### 9.14 MCP 프롬프트(플레이북) 직접 호출
 
@@ -721,8 +728,12 @@ PID 1234의 보호를 none 으로 벗겨줘.
 → process.set_protection {pid:1234, level:"none"}
 
 # 메모리 덤프
-0xffff... 부터 0x1000 바이트를 C:\lab\dump.bin 으로 떠줘.
-→ dump.raw {address, length, path}
+0xffff... 부터 0x1000 바이트를 C:\lab\dump.bin 으로 뜨고, 읽기 실패 chunk는 zero-fill 해줘.
+→ dump.raw {address, length, path, zerofill:true}
+
+# TI 링 export/clear
+현재 Threat-Intelligence 링을 C:\lab\ti.jsonl 로 내보낸 뒤 인메모리 링을 비워줘.
+→ ti.export {path:"C:\\lab\\ti.jsonl"} → ti.clear {}
 ```
 
 ### 9.16 Claude를 잘 끌어내는 팁

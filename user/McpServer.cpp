@@ -73,13 +73,14 @@ namespace
     const McpToolArg kArgsSetProtection[] = { {L"pid", L"string", false}, {L"level", L"string", true} };
     // path is required: the handler has no default-path synthesis, so the schema
     // must demand it (matches DispatchMcpWriteTool, which errors without it).
-    const McpToolArg kArgsDumpRaw[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"path", L"string", true} };
+    const McpToolArg kArgsDumpRaw[] = { {L"address", L"string", true}, {L"length", L"string", true}, {L"path", L"string", true}, {L"zerofill", L"boolean", false} };
     const McpToolArg kArgsDumpPe[] = { {L"address", L"string", true}, {L"path", L"string", true} };
 
     // Read-only detection tools added by the catalog expansion (anti-cheat surface).
     const McpToolArg kArgsPoolScanPe[] = { {L"tag", L"string", false}, {L"limit", L"string", false}, {L"suspicious", L"boolean", false} };
     const McpToolArg kArgsHuntRun[] = { {L"mode", L"string", false} };
     const McpToolArg kArgsSnapshotCapture[] = { {L"name", L"string", false} };
+    const McpToolArg kArgsSnapshotShow[] = { {L"source", L"string", false}, {L"path", L"string", false}, {L"domains", L"boolean", false}, {L"warnings", L"boolean", false} };
 
     // Read-only memory / code / symbol inspection tools (close the read surface
     // so a model can confirm bytes and instructions without the WRITE dump.*).
@@ -94,6 +95,7 @@ namespace
     const McpToolArg kArgsMemoryCompare[] = { {L"address1", L"string", true}, {L"address2", L"string", true}, {L"length", L"string", true} };
     const McpToolArg kArgsTiSubscribe[] = { {L"action", L"string", false} };
     const McpToolArg kArgsSnapshotDiff[] = { {L"old", L"string", false}, {L"new", L"string", false}, {L"domain", L"string", false}, {L"risk", L"string", false}, {L"limit", L"string", false}, {L"summary", L"boolean", false} };
+    const McpToolArg kArgsTiExport[] = { {L"path", L"string", true} };
 
 #define MCP_ARG_TABLE(arr) arr, (sizeof(arr) / sizeof((arr)[0]))
 
@@ -104,6 +106,7 @@ namespace
         { L"type.describe", L"Dump a kernel structure (dt) at an address or for a process.", true, MCP_ARG_TABLE(kArgsTypeDescribe) },
         { L"callbacks.list", L"Enumerate kernel callbacks (object/registry/process/thread/imageload/minifilter).", true, MCP_ARG_TABLE(kArgsCallbacks) },
         { L"wfp.list", L"Enumerate Windows Filtering Platform providers/sublayers/callouts/filters/layers.", true, MCP_ARG_TABLE(kArgsWfp) },
+        { L"wfp.kernel_callouts", L"Resolve kernel-mode WFP classify/notify/flowDelete callout pointers from netio.sys.", true, nullptr, 0 },
         { L"alpc.list", L"Enumerate ALPC ports and connections.", true, MCP_ARG_TABLE(kArgsAlpc) },
         { L"vad.list", L"Enumerate process VADs with optional W+X / private / hidden-PTE / DKOM checks.", true, MCP_ARG_TABLE(kArgsVad) },
         { L"threads.list", L"Enumerate process threads, start addresses, APC and stack evidence.", true, MCP_ARG_TABLE(kArgsThreads) },
@@ -124,9 +127,11 @@ namespace
         { L"msr.check", L"Check SYSCALL MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) for hooks and per-CPU divergence.", true, nullptr, 0 },
         { L"vbs.scan", L"Report VBS/HVCI, Code Integrity options, hypervisor, Secure Kernel, and trustlets.", true, nullptr, 0 },
         { L"byovd.scan", L"Scan loaded kernel modules against the local BYOVD/LOLDrivers catalog (no network/subprocess).", true, nullptr, 0 },
+        { L"byovd.status", L"Report local BYOVD catalog age, source counts, and YARA rule availability.", true, nullptr, 0 },
         { L"pool.scan_pe", L"Hunt PE images (intact or signature-wiped) staged in kernel big pool.", true, MCP_ARG_TABLE(kArgsPoolScanPe) },
         { L"hunt.run", L"Whole-system user-mode anomaly hunt (injection, VAD/PTE, threads, APC, driver/WFP/TI).", true, MCP_ARG_TABLE(kArgsHuntRun) },
         { L"snapshot.capture", L"Capture a same-boot evidence baseline in memory (read kn://snapshot/current; no disk writes).", true, MCP_ARG_TABLE(kArgsSnapshotCapture) },
+        { L"snapshot.show", L"Show the current snapshot baseline or a snapshot JSON file; returns summary text plus structured JSON.", true, MCP_ARG_TABLE(kArgsSnapshotShow) },
 
         { L"memory.read_virtual", L"Read bytes at a kernel/user virtual address (db/dq); returns hex with an unreadable-byte mask. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadVirtual) },
         { L"memory.read_physical", L"Read bytes at a physical address (!db/!dq); bypasses VA mappings. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadPhysical) },
@@ -146,6 +151,8 @@ namespace
         { L"memory.move", L"[WRITE] Copy a kernel range from source to dest.", false, MCP_ARG_TABLE(kArgsMove) },
         { L"type.set_field", L"[WRITE] Set a struct field at an address (setfield).", false, MCP_ARG_TABLE(kArgsSetField) },
         { L"process.set_protection", L"[WRITE] Set a process PS_PROTECTION. pid (optional, defaults to self); level=none|ppl-antimalware|ppl-lsa|ppl-windows|ppl-wintcb|pp-windows|pp-wintcb|pp-winsystem.", false, MCP_ARG_TABLE(kArgsSetProtection) },
+        { L"ti.export", L"[WRITE] Export the Threat-Intelligence ETW ring to a JSONL file.", false, MCP_ARG_TABLE(kArgsTiExport) },
+        { L"ti.clear", L"[WRITE] Clear the in-memory Threat-Intelligence ETW ring.", false, nullptr, 0 },
         { L"dump.raw", L"[WRITE] Dump a kernel range to the given file path (path required; no traversal).", false, MCP_ARG_TABLE(kArgsDumpRaw) },
         { L"dump.pe", L"[WRITE] Reconstruct an on-disk PE image from memory to the given file path (path required).", false, MCP_ARG_TABLE(kArgsDumpPe) },
     };
@@ -175,7 +182,7 @@ namespace
         { L"etw-infinityhook-check", L"Sweep for ETW/syscall tampering.", nullptr,
           L"Run etw.integrity and nmi.list. Correlate any flagged GetCpuClock or callback target with module ownership via address.inspect. Read-only." },
         { L"wfp-surface", L"Map the Windows Filtering Platform surface.", nullptr,
-          L"Run wfp.list for providers, sublayers, callouts, filters, and layers. For kernel callout pointers, run address.inspect to confirm module ownership. Flag non-Microsoft owners. Read-only." },
+          L"Run wfp.list for providers, sublayers, callouts, filters, and layers. Run wfp.kernel_callouts for kernel classify/notify/flowDelete pointers, then address.inspect to confirm module ownership. Flag non-Microsoft owners. Read-only." },
     };
 
     const size_t kPromptCount = sizeof(kPrompts) / sizeof(kPrompts[0]);
