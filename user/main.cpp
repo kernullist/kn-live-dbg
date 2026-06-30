@@ -21,6 +21,7 @@
 #include "SnapshotJson.h"
 #include "SnapshotPrinter.h"
 #include "ThreatIntelSubscriber.h"
+#include "TimelineSelfTest.h"
 #include "TimelineStore.h"
 #include "NmiScanner.h"
 #include "MsrScanner.h"
@@ -37751,9 +37752,6 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
 
 int wmain(int argc, wchar_t** argv)
 {
-    UNREFERENCED_PARAMETER(argc);
-    UNREFERENCED_PARAMETER(argv);
-
     // Permanently install the tee buffer in front of std::wcout. Must
     // happen before any ScopedWideStreamCapture (i.e. before any
     // command is dispatched) so that "log enable" only needs to
@@ -37762,6 +37760,17 @@ int wmain(int argc, wchar_t** argv)
     // capture's destructor).
     InstallOutputTee();
     CommandRegistry::SetColorPrinter(PrintCommandRegistryColoredText);
+
+    if (argc >= 2 && ToLower(argv[1]) == L"--self-test")
+    {
+        if (argc >= 3 && ToLower(argv[2]) == L"timeline")
+        {
+            return RunTimelineSelfTest();
+        }
+
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline\n";
+        return 2;
+    }
 
     int exitCode = 1;
     DebuggerState state = {};

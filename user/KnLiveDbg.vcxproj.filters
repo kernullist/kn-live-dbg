@@ -91,6 +91,9 @@
     <ClCompile Include="TimelineModel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TimelineSelfTest.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="TimelineStore.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -214,6 +217,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TimelineModel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TimelineSelfTest.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TimelineStore.h">
