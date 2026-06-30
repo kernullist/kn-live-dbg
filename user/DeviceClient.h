@@ -63,6 +63,30 @@ struct IdtInfo
     uint32_t Limit;
 };
 
+struct TimelineLiveStatus
+{
+    uint32_t Flags;
+    uint32_t Capacity;
+    uint32_t Count;
+    uint64_t Dropped;
+    uint64_t NextSequence;
+};
+
+struct TimelineLiveEvent
+{
+    uint32_t Type;
+    uint32_t Flags;
+    uint32_t ProcessId;
+    uint32_t ParentProcessId;
+    uint32_t ThreadId;
+    uint64_t Sequence;
+    uint64_t Timestamp100ns;
+    uint64_t ImageBase;
+    uint64_t ImageSize;
+    uint64_t FileObject;
+    std::wstring ImagePath;
+};
+
 class DeviceClient
 {
 public:
@@ -138,6 +162,21 @@ public:
     bool ReadIdt(
         uint32_t processorNumber,
         IdtInfo* info,
+        std::wstring* error);
+
+    bool ControlTimeline(
+        uint32_t action,
+        uint32_t capacity,
+        std::wstring* error);
+
+    bool QueryTimelineStatus(
+        TimelineLiveStatus* status,
+        std::wstring* error);
+
+    bool DrainTimelineEvents(
+        uint32_t maxEvents,
+        std::vector<TimelineLiveEvent>* events,
+        TimelineLiveStatus* status,
         std::wstring* error);
 
 private:

@@ -166,3 +166,72 @@ std::wstring BuildTimelineJsonl(const std::vector<TimelineEvent>& events)
     }
     return out;
 }
+
+std::wstring BuildTimelineGraphJson(const TimelineGraphResult& graph)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.timeline-graph.v1\"";
+    out += L",\"totalEvents\":" + std::to_wstring(graph.TotalEvents);
+    out += L",\"matchedEvents\":" + std::to_wstring(graph.MatchedEvents);
+    out += L",\"truncated\":";
+    out += graph.Truncated ? L"true" : L"false";
+    out += L",\"limit\":" + std::to_wstring(graph.Options.Limit);
+    if (!graph.Options.Source.empty())
+    {
+        out += L",\"source\":" + mcpjson::Quote(graph.Options.Source);
+    }
+    if (!graph.Options.Domain.empty())
+    {
+        out += L",\"domain\":" + mcpjson::Quote(graph.Options.Domain);
+    }
+    if (!graph.Options.Image.empty())
+    {
+        out += L",\"image\":" + mcpjson::Quote(graph.Options.Image);
+    }
+    if (graph.Options.HasProcessId)
+    {
+        out += L",\"pid\":" + std::to_wstring(graph.Options.ProcessId);
+    }
+    out += L",\"newestFirst\":";
+    out += graph.Options.NewestFirst ? L"true" : L"false";
+
+    out += L",\"nodes\":[";
+    for (size_t i = 0; i < graph.Nodes.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        const TimelineGraphNode& node = graph.Nodes[i];
+        out += L"{\"id\":" + mcpjson::Quote(node.Id);
+        out += L",\"kind\":" + mcpjson::Quote(node.Kind);
+        out += L",\"label\":" + mcpjson::Quote(node.Label);
+        out += L",\"eventCount\":" + std::to_wstring(node.EventCount);
+        out += L"}";
+    }
+    out += L"]";
+
+    out += L",\"edges\":[";
+    for (size_t i = 0; i < graph.Edges.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        const TimelineGraphEdge& edge = graph.Edges[i];
+        out += L"{\"from\":" + mcpjson::Quote(edge.From);
+        out += L",\"to\":" + mcpjson::Quote(edge.To);
+        out += L",\"kind\":" + mcpjson::Quote(edge.Kind);
+        out += L",\"eventCount\":" + std::to_wstring(edge.EventCount);
+        if (edge.FirstEventId != 0)
+        {
+            out += L",\"firstEventId\":" + std::to_wstring(edge.FirstEventId);
+        }
+        if (edge.LastEventId != 0)
+        {
+            out += L",\"lastEventId\":" + std::to_wstring(edge.LastEventId);
+        }
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}

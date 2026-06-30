@@ -30,9 +30,12 @@ public:
     TimelineIngestResult IngestSnapshot(
         const SnapshotDocument& document,
         const std::wstring& sourceName);
+    TimelineIngestResult IngestEvents(
+        const std::vector<TimelineEvent>& events);
 
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
     std::vector<TimelineEvent> AllEvents() const;
+    TimelineGraphResult BuildGraph(const TimelineGraphQueryOptions& options) const;
     TimelineStats GetStats() const;
     bool ExportJsonl(const std::wstring& path, std::wstring* error) const;
 
