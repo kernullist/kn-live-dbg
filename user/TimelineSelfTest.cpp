@@ -173,6 +173,15 @@ int RunTimelineSelfTest()
         TimelineStats stats = store.GetStats();
         Check(&context, ingest.Added == 2 && stats.Stored == 2, L"ingest-counts");
 
+        TimelineIngestResult duplicateIngest = store.IngestEvents(events);
+        stats = store.GetStats();
+        Check(
+            &context,
+            duplicateIngest.SourceRecords == 2 &&
+                duplicateIngest.Added == 0 &&
+                stats.Stored == 2,
+            L"ingest-deduplicates-repeat-events");
+
         TimelineQueryOptions query = {};
         query.Source = L"live";
         query.Domain = L"process";
