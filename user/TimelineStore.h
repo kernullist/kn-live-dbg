@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -43,11 +44,14 @@ public:
     bool ExportJsonl(const std::wstring& path, std::wstring* error) const;
 
 private:
-    void AddEventLocked(TimelineEvent event);
+    bool AddEventLocked(TimelineEvent event);
+    void DropOldestEventLocked();
     uint64_t NextEventIdLocked();
 
     mutable std::mutex Mutex;
     std::deque<TimelineEvent> Events;
+    std::deque<std::wstring> EventKeysInOrder;
+    std::set<std::wstring> EventKeys;
     uint64_t NextEventId = 1;
     uint64_t DroppedEvents = 0;
     size_t MaxEvents = 262144;

@@ -22,6 +22,64 @@ namespace
         return stream.str();
     }
 
+    void AppendEventKeyPart(std::wstring* key, const std::wstring& value)
+    {
+        if (key != nullptr)
+        {
+            *key += std::to_wstring(value.size());
+            *key += L":";
+            *key += value;
+            *key += L"|";
+        }
+    }
+
+    void AppendEventKeyPart(std::wstring* key, uint64_t value)
+    {
+        AppendEventKeyPart(key, std::to_wstring(value));
+    }
+
+    bool TimelineEventKeySkipsEvidence(const std::wstring& name)
+    {
+        bool skip = false;
+        std::wstring lowered = TimelineToLower(name);
+
+        if (lowered == L"mode" || lowered == L"source")
+        {
+            skip = true;
+        }
+
+        return skip;
+    }
+
+    std::wstring TimelineEventKey(const TimelineEvent& event)
+    {
+        std::wstring key;
+
+        AppendEventKeyPart(&key, event.TimestampFileTime);
+        AppendEventKeyPart(&key, event.TimestampUtc);
+        AppendEventKeyPart(&key, event.Source);
+        AppendEventKeyPart(&key, event.Domain);
+        AppendEventKeyPart(&key, event.Action);
+        AppendEventKeyPart(&key, event.ProcessId);
+        AppendEventKeyPart(&key, event.ThreadId);
+        AppendEventKeyPart(&key, event.TargetProcessId);
+        AppendEventKeyPart(&key, event.Entity);
+        AppendEventKeyPart(&key, event.Summary);
+        AppendEventKeyPart(&key, event.Risk);
+        AppendEventKeyPart(&key, event.Confidence);
+
+        for (const auto& item : event.Evidence)
+        {
+            if (!TimelineEventKeySkipsEvidence(item.first))
+            {
+                AppendEventKeyPart(&key, item.first);
+                AppendEventKeyPart(&key, item.second);
+            }
+        }
+
+        return key;
+    }
+
     std::wstring TiTaskText(const TiEventRecord& event)
     {
         std::wstring text = event.TaskName;
@@ -645,6 +703,8 @@ void TimelineStore::Clear()
 {
     std::lock_guard<std::mutex> lock(Mutex);
     Events.clear();
+    EventKeysInOrder.clear();
+    EventKeys.clear();
     NextEventId = 1;
     DroppedEvents = 0;
 }
@@ -664,7 +724,7 @@ void TimelineStore::SetCapacity(size_t capacity)
     MaxEvents = capacity;
     while (Events.size() > MaxEvents)
     {
-        Events.pop_front();
+        DropOldestEventLocked();
         ++DroppedEvents;
     }
 }
@@ -742,8 +802,10 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
             event.Evidence[L"payload_truncated"] = std::to_wstring(item.Payload.size() - payloadLimit);
         }
 
-        AddEventLocked(std::move(event));
-        ++result.Added;
+        if (AddEventLocked(std::move(event)))
+        {
+            ++result.Added;
+        }
     }
 
     result.Dropped = DroppedEvents - beforeDropped;
@@ -794,8 +856,10 @@ TimelineIngestResult TimelineStore::IngestSnapshot(
             event.Evidence[L"create_time"] = std::to_wstring(process.CreateTime);
         }
 
-        AddEventLocked(std::move(event));
-        ++result.Added;
+        if (AddEventLocked(std::move(event)))
+        {
+            ++result.Added;
+        }
     }
 
     for (const SnapshotRecord& record : document.Records)
@@ -829,8 +893,10 @@ TimelineIngestResult TimelineStore::IngestSnapshot(
             event.Evidence[L"tags"] = tags;
         }
 
-        AddEventLocked(std::move(event));
-        ++result.Added;
+        if (AddEventLocked(std::move(event)))
+        {
+            ++result.Added;
+        }
     }
 
     for (const auto& item : document.DomainWarnings)
@@ -856,8 +922,10 @@ TimelineIngestResult TimelineStore::IngestEvents(
     for (const TimelineEvent& item : events)
     {
         TimelineEvent event = item;
-        AddEventLocked(std::move(event));
-        ++result.Added;
+        if (AddEventLocked(std::move(event)))
+        {
+            ++result.Added;
+        }
     }
 
     result.Dropped = DroppedEvents - beforeDropped;
@@ -1186,14 +1254,39 @@ bool TimelineStore::ExportJsonl(const std::wstring& path, std::wstring* error) c
     return WriteSnapshotTextFile(path, BuildTimelineJsonl(events), error);
 }
 
-void TimelineStore::AddEventLocked(TimelineEvent event)
+bool TimelineStore::AddEventLocked(TimelineEvent event)
 {
+    bool added = false;
+    std::wstring key = TimelineEventKey(event);
+    if (EventKeys.find(key) != EventKeys.end())
+    {
+        return false;
+    }
+
     event.EventId = NextEventIdLocked();
     Events.push_back(std::move(event));
+    EventKeys.insert(key);
+    EventKeysInOrder.push_back(key);
     while (Events.size() > MaxEvents)
     {
-        Events.pop_front();
+        DropOldestEventLocked();
         ++DroppedEvents;
+    }
+
+    added = true;
+    return added;
+}
+
+void TimelineStore::DropOldestEventLocked()
+{
+    if (!Events.empty())
+    {
+        Events.pop_front();
+    }
+    if (!EventKeysInOrder.empty())
+    {
+        EventKeys.erase(EventKeysInOrder.front());
+        EventKeysInOrder.pop_front();
     }
 }
 
