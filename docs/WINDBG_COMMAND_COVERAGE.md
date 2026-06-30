@@ -124,6 +124,8 @@ version, vertarget, vercommand, drvstatus, home, dashboard, cls, probe
 q, qq, qd
 ```
 
+For scenario-based `!timeline` workflows, including TI, snapshot reconciliation, kernel live callback collection, graphing, export, and reset patterns, see `docs/TIMELINE_COMMAND_USAGE.md` and `docs/TIMELINE_COMMAND_USAGE.ko.md`.
+
 ## DbgEng-Routed Commands
 
 ```text
