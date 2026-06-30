@@ -82,7 +82,7 @@ mcp status     # current state
 | Option | Meaning | Default |
 |------|------|--------|
 | `<port>` (positional arg) | Listening port. Only `0 < port < 65536` applies; anything else is ignored | `51766` |
-| `--allow-write` (or `allow-write`) | Lab write mode. Registers the 8 write tools + arms kernel write | none = read-only |
+| `--allow-write` (or `allow-write`) | Lab write mode. Registers the 10 write tools + arms kernel write | none = read-only |
 | `--bind <addr>` | Network exposure. Additionally binds to `<addr>` | none = loopback only |
 | `--bind=<addr>` | Same as above (joined form) | none |
 | `--token <t>` | Use a fixed bearer token (persisted), instead of the auto-managed one | auto |
@@ -148,7 +148,7 @@ knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 ```
 
 - Read-only (default): on engine entry, `SetWriteMode(false)` **disarms the kernel write flag itself**. The write tools are not registered, and when called they are rejected with `writes are disabled; start the MCP server with --allow-write (lab mode)`.
-- `--allow-write`: the 8 write tools are exposed and `SetWriteMode(true)` arms them. Every write goes through the preflight/backup/verify-diff/audit rails (interactive confirmation is skipped).
+- `--allow-write`: the 10 write tools are exposed and `SetWriteMode(true)` arms kernel writes. Kernel-memory writes use the preflight/backup/verify-diff/audit rails; file/ring operations are still gated, audited, and warned when backup/verify is not meaningful (interactive confirmation is skipped).
 - **Mode-switch caveat**: if the server is already running, `mcp on --allow-write` (or `--bind`/port change) is **ignored** (it only prints `MCP server is already running on port N`). To change flags, first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch. **A new token is issued, so the client header must also be updated.**
 - **Recommendation**: take a VM snapshot before a write session, and capture an analysis baseline (`snapshot.capture`). It is for isolated VMs only; never use it on a live EDR/AC box.
 
@@ -393,7 +393,7 @@ mcp_servers:
       Authorization: "Bearer <token-from-server>"
     timeout: 300        # raise above the 120s default for slow scans (hunt.run, etc.)
     connect_timeout: 60
-    # tools:            # optional: expose only what you need (38 read tools is a lot of context)
+    # tools:            # optional: expose only what you need (41 read tools is a lot of context)
     #   include: [process.find, vad.list, threads.list, callbacks.list, hunt.run]
 ```
 
@@ -444,7 +444,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 
 ## 6. Capability Catalog
 
-### 6.1 Read tools (38, no `--allow-write` needed — except `ti.subscribe` start/stop)
+### 6.1 Read tools (41, no `--allow-write` needed — except `ti.subscribe` start/stop)
 
 | Tool | Description | Key args (all optional unless noted otherwise) |
 |-----|------|----------------------|
@@ -453,6 +453,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `type.describe` | Dump a kernel structure from an address/process (dt) | `source`, `address`, `type`, `fields` |
 | `callbacks.list` | Enumerate kernel callbacks (object/registry/process/thread/imageload/minifilter) | `scope`, `module` |
 | `wfp.list` | Enumerate WFP provider/sublayer/callout/filter/layer | `scope`, `module`, `provider`, `layer` |
+| `wfp.kernel_callouts` | Resolve kernel-mode WFP classify/notify/flowDelete pointers from `netio.sys` | (none) |
 | `alpc.list` | Enumerate ALPC ports/connections | `scope`, `name`, `pid` |
 | `vad.list` | Enumerate VADs (W+X/private/hidden-PTE/DKOM checks) | `pid`, `image`, `eprocess`, `exec`, `private`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
 | `threads.list` | Thread/start-address/APC/stack evidence | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
@@ -472,9 +473,11 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `msr.check` | SYSCALL MSR (LSTAR/CSTAR/STAR/FMASK/EFER) hooks | (none) |
 | `vbs.scan` | VBS/HVCI/CI/hypervisor/Secure Kernel/trustlet | (none) |
 | `byovd.scan` | Compare loaded modules against the local BYOVD/LOLDrivers catalog (no network/subprocess) | (none) |
+| `byovd.status` | Report local BYOVD catalog age/source counts/YARA rule availability | (none) |
 | `pool.scan_pe` | Hunt PEs staged in kernel big pool (including signature wipe) | `tag`, `limit`, `suspicious` |
 | `hunt.run` | Whole-system user-mode anomaly hunt (injection/VAD/PTE/threads/APC/driver/WFP/TI) | `mode` |
 | `snapshot.capture` | Capture a same-boot evidence baseline (in-memory, not written to disk) | `name` |
+| `snapshot.show` | Show the current snapshot baseline or a snapshot JSON file (summary + structured JSON) | `source`, `path`, `domains`, `warnings` |
 | `snapshot.diff` | Compare the session baseline with a live capture (or two snapshot files) | `old`, `new`, `domain`, `risk`, `limit`, `summary` |
 | `memory.read_virtual` | Read bytes at a virtual address (db/dq) — hex + unreadable mask (structured) | `address`/`va`/`symbol`, `width` (1/2/4/8), `count`, `process` |
 | `memory.read_physical` | Read bytes at a physical address (!db/!dq) — bypasses hooked VA mappings (structured) | `physical_address` (required), `width`, `count` |
@@ -487,9 +490,9 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `memory.compare` | Byte-compare two virtual ranges + mismatch offsets (c) — detect inline hooks/patches | `address1` (required), `address2` (required), `length` (required) |
 | `ti.subscribe` | Control TI ETW subscription (`action`=start/stop/status) — **start/stop require `--allow-write`** | `action` |
 
-> `snapshot.capture`/`snapshot.diff` **do not write files to disk** on the MCP path (in-memory). Read the baseline via `kn://snapshot/current`. `memory.read_virtual`/`read_physical`/`symbol.search` return structuredContent (JSON), and the remaining new tools return text content. `ti.subscribe` is a read category, but because of the side effect of starting/stopping the ETW session, only start/stop require write mode (status is always available, the same data as `kn://ti/stats`).
+> `snapshot.capture`/`snapshot.diff` **do not write files to disk** on the MCP path (in-memory). Read the baseline via `kn://snapshot/current` or use `snapshot.show` for summary + structuredContent. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show` return structuredContent (JSON), and the remaining new tools return text content. `ti.subscribe` is a read category, but because of the side effect of starting/stopping the ETW session, only start/stop require write mode (status is always available, the same data as `kn://ti/stats`).
 
-### 6.2 Write tools (8, `--allow-write` required)
+### 6.2 Write tools (10, `--allow-write` required)
 
 | Tool | Description | Required args | Optional args |
 |-----|------|-----------|-----------|
@@ -499,7 +502,9 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `memory.move` | Copy a kernel range (src->dest) | `source`, `dest`, `length` | — |
 | `type.set_field` | Set a struct field at an address (setfield) | `address`, `type`, `field`, `value` | — |
 | `process.set_protection` | Set PS_PROTECTION on an arbitrary target (PPL/PP) | `level` (none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid` (unspecified=self) |
-| `dump.raw` | Dump a kernel range to a given file path | `address`, `length`, `path` | — |
+| `ti.export` | Export the current Threat-Intelligence ETW ring to JSONL | `path` | — |
+| `ti.clear` | Clear the in-memory Threat-Intelligence ETW ring | — | — |
+| `dump.raw` | Dump a kernel range to a given file path | `address`, `length`, `path` | `zerofill` |
 | `dump.pe` | Reconstruct an on-disk PE image from memory | `address`, `path` | — |
 
 > **Caution — `process.set_protection` arbitrary target**: with `pid` you can raise the PPL/PP of an arbitrary process (e.g. promote a process to un-killable PP) or strip it (e.g. neutralize a PPL anti-cheat/AV). The driver IOCTL supports arbitrary targets (gated only by write-ack + write mode) and is for `--allow-write` lab mode only. Capturing a target-process baseline and a VM snapshot before the change is recommended. The response includes the before/after/requested bytes + the verification (readback) result.
@@ -668,10 +673,11 @@ module, callbacks registered by suspicious modules, and abnormal altitudes.
 ### 9.11 ETW/InfinityHook + WFP/ALPC/WNF surface
 
 ```
-Sweep ETW logger/GetCpuClock tampering with etw.integrity and nmi.list, and also look at non-MS-owned
-callouts with wfp.list, csrss/lsass pairings with alpc.list, and suspicious WNF instances with wnf.list.
+Sweep ETW logger/GetCpuClock tampering with etw.integrity and nmi.list, look at non-MS-owned
+callouts with wfp.list, resolve kernel callout function pointers with wfp.kernel_callouts,
+check csrss/lsass pairings with alpc.list, and suspicious WNF instances with wnf.list.
 ```
--> `etw.integrity` + `nmi.list` + `wfp.list` + `alpc.list` + `wnf.list`.
+-> `etw.integrity` + `nmi.list` + `wfp.list` + `wfp.kernel_callouts` + `alpc.list` + `wnf.list`.
 
 ### 9.12 Threat-intel capture (TI subscription)
 
@@ -685,10 +691,11 @@ When done, ti.subscribe stop.
 ### 9.13 Baseline -> delta detection
 
 ```
-Take a clean baseline now with snapshot.capture. (After running the game/cheat) show the callbacks/
-threads/VADs/pool allocations newly created relative to the baseline with snapshot.diff, ordered by risk.
+Take a clean baseline now with snapshot.capture, then show its current summary with snapshot.show.
+(After running the game/cheat) show the callbacks/threads/VADs/pool allocations newly created
+relative to the baseline with snapshot.diff, ordered by risk.
 ```
--> `snapshot.capture` -> (time passes) -> `snapshot.diff {risk:high}` or compare `kn://snapshot/current`.
+-> `snapshot.capture` -> `snapshot.show` -> (time passes) -> `snapshot.diff {risk:high}` or compare `kn://snapshot/current`.
 
 ### 9.14 Invoke an MCP prompt (playbook) directly
 
@@ -722,8 +729,12 @@ Strip PID 1234's protection to none.
 -> process.set_protection {pid:1234, level:"none"}
 
 # memory dump
-Dump 0x1000 bytes starting at 0xffff... to C:\lab\dump.bin.
--> dump.raw {address, length, path}
+Dump 0x1000 bytes starting at 0xffff... to C:\lab\dump.bin, zero-filling unreadable chunks.
+-> dump.raw {address, length, path, zerofill:true}
+
+# TI ring export/clear
+Export the current Threat-Intelligence ring to C:\lab\ti.jsonl, then clear the in-memory ring.
+-> ti.export {path:"C:\\lab\\ti.jsonl"} -> ti.clear {}
 ```
 
 ### 9.16 Tips for getting the most out of Claude
