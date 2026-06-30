@@ -36,6 +36,9 @@ public:
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
     std::vector<TimelineEvent> AllEvents() const;
     TimelineGraphResult BuildGraph(const TimelineGraphQueryOptions& options) const;
+    TimelineReconcileResult ReconcileSnapshot(
+        const SnapshotDocument& document,
+        const TimelineReconcileOptions& options) const;
     TimelineStats GetStats() const;
     bool ExportJsonl(const std::wstring& path, std::wstring* error) const;
 

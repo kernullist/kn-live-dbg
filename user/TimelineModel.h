@@ -90,6 +90,42 @@ struct TimelineGraphResult
     std::vector<TimelineGraphEdge> Edges;
 };
 
+struct TimelineReconcileOptions
+{
+    std::wstring Source;
+    std::wstring Domain;
+    bool HasProcessId = false;
+    uint32_t ProcessId = 0;
+    size_t Limit = 50;
+    uint64_t LiveDropped = 0;
+};
+
+struct TimelineReconcileFinding
+{
+    std::wstring Kind;
+    std::wstring Domain;
+    std::wstring Subject;
+    std::wstring Risk;
+    std::wstring Confidence;
+    std::wstring Summary;
+    uint64_t EventId = 0;
+    uint32_t ProcessId = 0;
+    std::map<std::wstring, std::wstring> Evidence;
+};
+
+struct TimelineReconcileResult
+{
+    std::wstring SnapshotLabel;
+    uint64_t TimelineEvents = 0;
+    uint64_t SnapshotProcesses = 0;
+    uint64_t SnapshotRecords = 0;
+    uint64_t LiveDropped = 0;
+    bool Truncated = false;
+    TimelineReconcileOptions Options;
+    std::vector<std::wstring> Warnings;
+    std::vector<TimelineReconcileFinding> Findings;
+};
+
 std::wstring TimelineToLower(const std::wstring& value);
 std::wstring TimelineEventToJson(const TimelineEvent& event);
 std::wstring BuildTimelineEventsJson(
@@ -99,3 +135,4 @@ std::wstring BuildTimelineEventsJson(
 std::wstring BuildTimelineStatusJson(const TimelineStats& stats);
 std::wstring BuildTimelineJsonl(const std::vector<TimelineEvent>& events);
 std::wstring BuildTimelineGraphJson(const TimelineGraphResult& graph);
+std::wstring BuildTimelineReconcileJson(const TimelineReconcileResult& result);

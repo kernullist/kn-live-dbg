@@ -1742,7 +1742,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !vad            VAD tree triage, hidden PTE checks, PE-like private memory\n";
     std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
     std::wcout << L"  help !pool           big-pool allocation triage and W+X annotation\n";
-    std::wcout << L"  help !timeline       time-ordered TI/snapshot evidence store\n";
+    std::wcout << L"  help !timeline       time-ordered TI/snapshot/live evidence store\n";
     std::wcout << L"  help !address        canonicality, page-table walk, effective permissions, owner symbol\n";
     std::wcout << L"  help dt              type layout, wildcard, and field filters\n";
     std::wcout << L"  help e               virtual memory editing and /process behavior\n";
@@ -1768,7 +1768,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
-    std::wcout << L"  timeline      !timeline ingest ti recent | !timeline query /source ti /limit 20\n";
+    std::wcout << L"  timeline      !timeline ingest ti recent | !timeline live status | !timeline reconcile snapshot\n";
     std::wcout << L"  ai            ai a.exe eprocess | ai explain callbacks all | ai plan check VBS status\n";
     std::wcout << L"\n";
 
@@ -3152,6 +3152,138 @@ static void AddDiffCompletionCandidates(std::vector<std::wstring>* candidates)
     AddCompletionCandidates(candidates, values);
 }
 
+static void AddTimelineCompletionCandidates(
+    std::vector<std::wstring>* candidates,
+    const std::vector<std::wstring>& argsBefore)
+{
+    static const wchar_t* rootValues[] =
+    {
+        L"status",
+        L"clear",
+        L"ingest",
+        L"live",
+        L"query",
+        L"graph",
+        L"reconcile",
+        L"export",
+        L"help"
+    };
+
+    do
+    {
+        if (argsBefore.size() <= 1)
+        {
+            AddCompletionCandidates(candidates, rootValues);
+            break;
+        }
+
+        std::wstring sub = ToLower(argsBefore[1]);
+        if (sub == L"ingest")
+        {
+            if (argsBefore.size() <= 2)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"ti",
+                    L"snapshot",
+                    L"help"
+                };
+                AddCompletionCandidates(candidates, values);
+            }
+            else if (ToLower(argsBefore[2]) == L"ti")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"recent",
+                    L"all",
+                    L"/limit"
+                };
+                AddCompletionCandidates(candidates, values);
+            }
+            else if (ToLower(argsBefore[2]) == L"snapshot")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"baseline"
+                };
+                AddCompletionCandidates(candidates, values);
+            }
+            break;
+        }
+
+        if (sub == L"live")
+        {
+            static const wchar_t* values[] =
+            {
+                L"start",
+                L"stop",
+                L"status",
+                L"clear",
+                L"drain",
+                L"/capacity",
+                L"/limit",
+                L"help"
+            };
+            AddCompletionCandidates(candidates, values);
+            break;
+        }
+
+        if (sub == L"query")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/source",
+                L"/domain",
+                L"/pid",
+                L"/limit",
+                L"/oldest",
+                L"/newest"
+            };
+            AddCompletionCandidates(candidates, values);
+            break;
+        }
+
+        if (sub == L"graph")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/source",
+                L"/domain",
+                L"/image",
+                L"/pid",
+                L"/limit",
+                L"/oldest",
+                L"/newest"
+            };
+            AddCompletionCandidates(candidates, values);
+            break;
+        }
+
+        if (sub == L"reconcile")
+        {
+            static const wchar_t* values[] =
+            {
+                L"snapshot",
+                L"baseline",
+                L"/source",
+                L"/domain",
+                L"/pid",
+                L"/limit"
+            };
+            AddCompletionCandidates(candidates, values);
+            break;
+        }
+
+        if (sub == L"export")
+        {
+            AddCompletionCandidate(candidates, L"/jsonl");
+            break;
+        }
+
+        AddCompletionCandidates(candidates, rootValues);
+    } while (false);
+}
+
 static void AddWfpScopeCompletionCandidates(std::vector<std::wstring>* candidates)
 {
     static const wchar_t* values[] =
@@ -3774,17 +3906,13 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 }
                 else if (topic == L"!timeline")
                 {
-                    static const wchar_t* values[] =
+                    std::vector<std::wstring> helpArgs;
+                    helpArgs.push_back(L"!timeline");
+                    for (size_t index = 2; index < argsBefore.size(); ++index)
                     {
-                        L"status",
-                        L"clear",
-                        L"ingest",
-                        L"live",
-                        L"query",
-                        L"graph",
-                        L"export"
-                    };
-                    AddCompletionCandidates(&candidates, values);
+                        helpArgs.push_back(argsBefore[index]);
+                    }
+                    AddTimelineCompletionCandidates(&candidates, helpArgs);
                 }
                 else if (topic == L"!diff")
                 {
@@ -4134,36 +4262,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         }
         else if (command == L"!timeline")
         {
-            static const wchar_t* values[] =
-            {
-                L"status",
-                L"clear",
-                L"ingest",
-                L"live",
-                L"query",
-                L"graph",
-                L"export",
-                L"start",
-                L"stop",
-                L"status",
-                L"drain",
-                L"ti",
-                L"snapshot",
-                L"recent",
-                L"all",
-                L"baseline",
-                L"/source",
-                L"/domain",
-                L"/image",
-                L"/pid",
-                L"/capacity",
-                L"/limit",
-                L"/oldest",
-                L"/newest",
-                L"/jsonl",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
+            AddTimelineCompletionCandidates(&candidates, argsBefore);
         }
         else if (command == L"!pool")
         {
@@ -17130,12 +17229,13 @@ static void PrintTimelineHelp()
     std::wcout << L"  !timeline live start|stop|status|clear|drain [/capacity <n>] [/limit <n>]\n";
     std::wcout << L"  !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]\n";
     std::wcout << L"  !timeline graph [/source <name>] [/domain <name>] [/pid <PID>] [/image <name>] [/limit <n>] [/oldest|/newest]\n";
+    std::wcout << L"  !timeline reconcile snapshot [baseline|<path>] [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>]\n";
     std::wcout << L"  !timeline export <path> [/jsonl]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
-    std::wcout << L"  Builds a user-mode time-ordered evidence store from existing TI and\n";
-    std::wcout << L"  snapshot evidence. Kernel live callbacks will feed this store in a later\n";
-    std::wcout << L"  phase; this command does not register kernel callbacks yet.\n";
+    std::wcout << L"  Maintains a bounded in-memory evidence timeline from TI, snapshots,\n";
+    std::wcout << L"  optional kernel live callbacks, graph queries, and reconciliation.\n";
+    std::wcout << L"  Use live start only when kernel callback collection is intended.\n";
 }
 
 static bool ParseTimelineLimit(
@@ -17378,6 +17478,46 @@ static void PrintTimelineGraph(const TimelineGraphResult& graph)
     }
 }
 
+static void PrintTimelineReconcile(const TimelineReconcileResult& result)
+{
+    PrintColoredText(L"[timeline.reconcile]", KNDBG_COLOR_TITLE);
+    std::wcout << L" snapshot=" << result.SnapshotLabel
+               << L" timeline_events=" << result.TimelineEvents
+               << L" snapshot_processes=" << result.SnapshotProcesses
+               << L" snapshot_records=" << result.SnapshotRecords
+               << L" findings=" << result.Findings.size()
+               << L" live_dropped=" << result.LiveDropped;
+    if (result.Truncated)
+    {
+        std::wcout << L" truncated=true";
+    }
+    std::wcout << L"\n";
+
+    for (const std::wstring& warning : result.Warnings)
+    {
+        PrintColoredText(L"[timeline.reconcile.warning]", KNDBG_COLOR_WARN);
+        std::wcout << L" " << warning << L"\n";
+    }
+
+    for (const TimelineReconcileFinding& finding : result.Findings)
+    {
+        std::wcout << L"  finding kind=" << finding.Kind
+                   << L" domain=" << finding.Domain
+                   << L" risk=" << finding.Risk
+                   << L" confidence=" << finding.Confidence;
+        if (finding.ProcessId != 0)
+        {
+            std::wcout << L" pid=" << finding.ProcessId;
+        }
+        if (finding.EventId != 0)
+        {
+            std::wcout << L" event_id=" << finding.EventId;
+        }
+        std::wcout << L" subject=" << finding.Subject
+                   << L" summary=" << finding.Summary << L"\n";
+    }
+}
+
 static bool ParseTimelineQueryOptions(
     const std::vector<std::wstring>& args,
     size_t start,
@@ -17481,6 +17621,113 @@ static bool ParseTimelineQueryOptions(
             {
                 options->NewestFirst = true;
                 ++index;
+                continue;
+            }
+
+            if (error != nullptr)
+            {
+                *error = L"unrecognised option: " + args[index];
+            }
+            break;
+        }
+
+        ok = (index >= args.size());
+    } while (false);
+
+    return ok;
+}
+
+static bool ParseTimelineReconcileOptions(
+    const std::vector<std::wstring>& args,
+    size_t start,
+    uint32_t numberBase,
+    TimelineReconcileOptions* options,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (options == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid reconcile options output";
+            }
+            break;
+        }
+
+        size_t index = start;
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/source")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/source requires a value";
+                    }
+                    break;
+                }
+                options->Source = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (option == L"/domain")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/domain requires a value";
+                    }
+                    break;
+                }
+                options->Domain = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (option == L"/pid")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/pid requires a value";
+                    }
+                    break;
+                }
+                uint64_t pid = 0;
+                if (!ParseUnsigned(args[index + 1], numberBase, &pid) || pid == 0 || pid > 0xffffffffull)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"invalid PID: " + args[index + 1];
+                    }
+                    break;
+                }
+                options->HasProcessId = true;
+                options->ProcessId = static_cast<uint32_t>(pid);
+                index += 2;
+                continue;
+            }
+            if (option == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/limit requires a value";
+                    }
+                    break;
+                }
+                if (!ParseTimelineLimit(args[index + 1], 5000, &options->Limit, error))
+                {
+                    break;
+                }
+                index += 2;
                 continue;
             }
 
@@ -17978,6 +18225,66 @@ static void HandleTimelineCommand(
             if (structuredJsonOut != nullptr)
             {
                 *structuredJsonOut = BuildTimelineGraphJson(graph);
+            }
+            break;
+        }
+
+        if (action == L"reconcile")
+        {
+            if (args.size() < 3 || ToLower(args[2]) != L"snapshot")
+            {
+                std::wcerr << L"usage: !timeline reconcile snapshot [baseline|<path>] [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>]\n";
+                break;
+            }
+
+            std::wstring target = L"baseline";
+            size_t optionStart = 3;
+            if (args.size() >= 4 && !args[3].empty() && args[3][0] != L'/')
+            {
+                target = args[3];
+                optionStart = 4;
+            }
+
+            TimelineReconcileOptions options = {};
+            std::wstring parseError;
+            if (!ParseTimelineReconcileOptions(args, optionStart, state.NumberBase, &options, &parseError))
+            {
+                std::wcerr << L"!timeline reconcile: " << parseError << L"\n";
+                break;
+            }
+
+            SnapshotDocument document = {};
+            std::wstring loadError;
+            if (ToLower(target) == L"baseline")
+            {
+                if (!state.HasSnapshotBaseline)
+                {
+                    std::wcerr << L"!timeline reconcile: no session baseline captured\n";
+                    break;
+                }
+                document = state.SnapshotBaseline;
+            }
+            else if (!ReadSnapshotJsonFile(target, &document, &loadError))
+            {
+                std::wcerr << L"!timeline reconcile failed: " << loadError << L"\n";
+                break;
+            }
+
+            if (device != nullptr && device->IsOpen())
+            {
+                TimelineLiveStatus live = {};
+                std::wstring liveError;
+                if (device->QueryTimelineStatus(&live, &liveError))
+                {
+                    options.LiveDropped = live.Dropped;
+                }
+            }
+
+            TimelineReconcileResult result = state.Timeline.ReconcileSnapshot(document, options);
+            PrintTimelineReconcile(result);
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildTimelineReconcileJson(result);
             }
             break;
         }
@@ -30083,6 +30390,7 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"timeline.status" ||
         tool == L"timeline.query" ||
         tool == L"timeline.export" ||
+        tool == L"timeline.reconcile" ||
         tool == L"graph.query" ||
         tool == L"module.integrity" ||
         tool == L"driver.integrity" ||
@@ -30207,6 +30515,10 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"timeline.export")
     {
         allowed = {L"source", L"domain", L"pid", L"limit", L"order"};
+    }
+    else if (tool == L"timeline.reconcile")
+    {
+        allowed = {L"path", L"snapshot", L"source", L"domain", L"pid", L"limit"};
     }
     else if (tool == L"graph.query")
     {
@@ -30425,7 +30737,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -30448,6 +30760,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- timeline.status: report the in-memory evidence timeline status. Args: {}.\n";
     stream << L"- timeline.query: query events already ingested into the timeline. Args: optional source, domain, pid, limit, order strings. order is newest or oldest.\n";
     stream << L"- timeline.export: return ingested timeline events as JSONL text without writing to disk. Args: optional source, domain, pid, limit, order strings.\n";
+    stream << L"- timeline.reconcile: compare ingested timeline events with a snapshot baseline or JSON file. Args: optional path or snapshot string, plus source, domain, pid, limit strings.\n";
     stream << L"- graph.query: derive a process/image/domain/source graph from ingested timeline events. Args: optional source, domain, image, pid, limit, order strings.\n";
     stream << L"- module.integrity: inspect loaded module PE headers, sections, and runtime page permissions. Args: optional module/name/target string, optional limit string, optional booleans summary, verbose, headers, sections, wx, mismatch.\n";
     stream << L"- driver.integrity: inspect DRIVER_OBJECT dispatch targets. Args: optional driver/name/target string and optional limit string.\n";
@@ -30491,7 +30804,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For address suspicion or page permission questions, use address.inspect.\n";
     stream << L"- For WNF decode questions, use wnf.decode; for live WNF instance/list questions, use wnf.list.\n";
     stream << L"- For recent Microsoft-Windows-Threat-Intelligence events, use ti.query with recent/stats/by/grep.\n";
-    stream << L"- For time-ordered evidence already ingested into !timeline, use timeline.status, timeline.query, timeline.export, or graph.query.\n";
+    stream << L"- For time-ordered evidence already ingested into !timeline, use timeline.status, timeline.query, timeline.export, timeline.reconcile, or graph.query.\n";
     stream << L"- For driver dispatch integrity questions, use driver.integrity.\n";
     stream << L"- For module text or executable section integrity questions, use module.integrity. Use wx=true for W+X-only module triage, headers=true for PE header evidence, and sections=true for full section-table evidence.\n";
     stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
@@ -33650,6 +33963,59 @@ static bool ExecuteAiCapabilityTimelineExport(
     return ok;
 }
 
+static bool ExecuteAiCapabilityTimelineReconcile(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    std::wstring* error,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    bool ok = false;
+
+    do
+    {
+        std::wstring path;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"path"}, &path);
+        path = TrimWhitespace(path);
+        std::wstring snapshot;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"snapshot"}, &snapshot);
+        snapshot = TrimWhitespace(snapshot);
+
+        std::wstring target = L"baseline";
+        if (!path.empty())
+        {
+            target = path;
+        }
+        else if (!snapshot.empty())
+        {
+            target = snapshot;
+        }
+
+        if (!target.empty() && !ValidateAiCapabilityScalarText(target, L"timeline.reconcile snapshot", error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!timeline");
+        args.push_back(L"reconcile");
+        args.push_back(L"snapshot");
+        args.push_back(target);
+        if (!AppendAiTimelineCommonFilterArgs(step, false, L"timeline.reconcile", &args, error))
+        {
+            break;
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": timeline.reconcile\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleTimelineCommand(args, state, structuredJsonOut, &device);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool ExecuteAiCapabilityGraphQuery(
     const AiCapabilityStep& step,
     DebuggerState& state,
@@ -34473,6 +34839,10 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"timeline.export")
             {
                 stepOk = ExecuteAiCapabilityTimelineExport(step, state, error);
+            }
+            else if (step.Tool == L"timeline.reconcile")
+            {
+                stepOk = ExecuteAiCapabilityTimelineReconcile(step, state, device, error, structuredJsonOut);
             }
             else if (step.Tool == L"graph.query")
             {

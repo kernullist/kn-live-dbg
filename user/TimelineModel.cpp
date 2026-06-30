@@ -235,3 +235,68 @@ std::wstring BuildTimelineGraphJson(const TimelineGraphResult& graph)
     out += L"]}";
     return out;
 }
+
+std::wstring BuildTimelineReconcileJson(const TimelineReconcileResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.timeline-reconcile.v1\"";
+    out += L",\"snapshotLabel\":" + mcpjson::Quote(result.SnapshotLabel);
+    out += L",\"timelineEvents\":" + std::to_wstring(result.TimelineEvents);
+    out += L",\"snapshotProcesses\":" + std::to_wstring(result.SnapshotProcesses);
+    out += L",\"snapshotRecords\":" + std::to_wstring(result.SnapshotRecords);
+    out += L",\"liveDropped\":" + std::to_wstring(result.LiveDropped);
+    out += L",\"truncated\":";
+    out += result.Truncated ? L"true" : L"false";
+    out += L",\"limit\":" + std::to_wstring(result.Options.Limit);
+    if (!result.Options.Source.empty())
+    {
+        out += L",\"source\":" + mcpjson::Quote(result.Options.Source);
+    }
+    if (!result.Options.Domain.empty())
+    {
+        out += L",\"domain\":" + mcpjson::Quote(result.Options.Domain);
+    }
+    if (result.Options.HasProcessId)
+    {
+        out += L",\"pid\":" + std::to_wstring(result.Options.ProcessId);
+    }
+
+    out += L",\"warnings\":[";
+    for (size_t i = 0; i < result.Warnings.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[i]);
+    }
+    out += L"]";
+
+    out += L",\"findings\":[";
+    for (size_t i = 0; i < result.Findings.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        const TimelineReconcileFinding& finding = result.Findings[i];
+        out += L"{\"kind\":" + mcpjson::Quote(finding.Kind);
+        out += L",\"domain\":" + mcpjson::Quote(finding.Domain);
+        out += L",\"subject\":" + mcpjson::Quote(finding.Subject);
+        out += L",\"risk\":" + mcpjson::Quote(finding.Risk);
+        out += L",\"confidence\":" + mcpjson::Quote(finding.Confidence);
+        out += L",\"summary\":" + mcpjson::Quote(finding.Summary);
+        if (finding.EventId != 0)
+        {
+            out += L",\"eventId\":" + std::to_wstring(finding.EventId);
+        }
+        if (finding.ProcessId != 0)
+        {
+            out += L",\"pid\":" + std::to_wstring(finding.ProcessId);
+        }
+        out += L",\"evidence\":";
+        AppendJsonStringMap(&out, finding.Evidence);
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}
