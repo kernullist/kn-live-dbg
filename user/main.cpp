@@ -3161,6 +3161,7 @@ static void AddTimelineCompletionCandidates(
     static const wchar_t* rootValues[] =
     {
         L"status",
+        L"update",
         L"clear",
         L"ingest",
         L"live",
@@ -3210,6 +3211,21 @@ static void AddTimelineCompletionCandidates(
                 };
                 AddCompletionCandidates(candidates, values);
             }
+            break;
+        }
+
+        if (sub == L"update")
+        {
+            static const wchar_t* values[] =
+            {
+                L"recent",
+                L"all",
+                L"/limit",
+                L"/snapshot",
+                L"/live",
+                L"help"
+            };
+            AddCompletionCandidates(candidates, values);
             break;
         }
 
@@ -17224,19 +17240,21 @@ static void HandleTiCommand(
 static void PrintTimelineHelp()
 {
     std::wcout << L"!timeline command:\n";
+    std::wcout << L"  !timeline update [recent|all] [/limit <n>] [/snapshot] [/live]\n";
+    std::wcout << L"  !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]\n";
+    std::wcout << L"  !timeline graph [/source <name>] [/domain <name>] [/pid <PID>] [/image <name>] [/limit <n>] [/oldest|/newest]\n";
+    std::wcout << L"  !timeline reconcile snapshot [baseline|<path>] [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>]\n";
     std::wcout << L"  !timeline status\n";
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
     std::wcout << L"  !timeline live start|stop|status|clear|drain [/capacity <n>] [/limit <n>]\n";
-    std::wcout << L"  !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]\n";
-    std::wcout << L"  !timeline graph [/source <name>] [/domain <name>] [/pid <PID>] [/image <name>] [/limit <n>] [/oldest|/newest]\n";
-    std::wcout << L"  !timeline reconcile snapshot [baseline|<path>] [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>]\n";
     std::wcout << L"  !timeline export <path> [/jsonl]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Maintains a bounded in-memory evidence timeline from TI, snapshots,\n";
     std::wcout << L"  optional kernel live callbacks, graph queries, and reconciliation.\n";
+    std::wcout << L"  update copies safe local evidence; /live drains queued kernel events only.\n";
     std::wcout << L"  Use live start only when kernel callback collection is intended.\n";
 }
 
@@ -17270,6 +17288,106 @@ static bool ParseTimelineLimit(
         }
 
         *limit = static_cast<size_t>(parsed);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+struct TimelineUpdateOptions
+{
+    std::wstring Mode;
+    size_t Limit = 0;
+    bool IncludeLive = false;
+};
+
+static bool ParseTimelineUpdateOptions(
+    const std::vector<std::wstring>& args,
+    size_t first,
+    TimelineUpdateOptions* options,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (options == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid update options output";
+            }
+            break;
+        }
+
+        TimelineUpdateOptions parsed = {};
+        parsed.Mode = L"recent";
+        parsed.Limit = 200;
+        parsed.IncludeLive = false;
+
+        size_t index = first;
+        if (index < args.size() && !args[index].empty() && args[index][0] != L'/')
+        {
+            parsed.Mode = ToLower(args[index]);
+            if (parsed.Mode == L"all")
+            {
+                parsed.Limit = 10000;
+            }
+            else if (parsed.Mode != L"recent")
+            {
+                if (error != nullptr)
+                {
+                    *error = L"mode must be recent or all";
+                }
+                break;
+            }
+            ++index;
+        }
+
+        while (index < args.size())
+        {
+            std::wstring option = ToLower(args[index]);
+            if (option == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"/limit requires a value";
+                    }
+                    break;
+                }
+                if (!ParseTimelineLimit(args[index + 1], 100000, &parsed.Limit, error))
+                {
+                    break;
+                }
+                index += 2;
+                continue;
+            }
+            if (option == L"/snapshot")
+            {
+                ++index;
+                continue;
+            }
+            if (option == L"/live")
+            {
+                parsed.IncludeLive = true;
+                ++index;
+                continue;
+            }
+            if (error != nullptr)
+            {
+                *error = L"unrecognised option: " + args[index];
+            }
+            break;
+        }
+
+        if (index < args.size())
+        {
+            break;
+        }
+
+        *options = parsed;
         ok = true;
     } while (false);
 
@@ -17352,6 +17470,21 @@ static void PrintTimelineStatus(const TimelineStats& stats)
     for (const auto& item : stats.ByDomain)
     {
         std::wcout << L" " << item.first << L"=" << item.second;
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  next:";
+    if (stats.Stored == 0)
+    {
+        std::wcout << L" !timeline update";
+    }
+    else
+    {
+        std::wcout << L" !timeline query | !timeline graph | !timeline reconcile snapshot";
+    }
+    if (stats.Dropped != 0)
+    {
+        std::wcout << L" (loss caveat: dropped events present)";
     }
     std::wcout << L"\n";
 }
@@ -17912,6 +18045,79 @@ static void HandleTimelineCommand(
                     std::wcout << L" status failed: " << liveError << L"\n";
                 }
             }
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildTimelineStatusJson(stats);
+            }
+            break;
+        }
+
+        if (action == L"update")
+        {
+            TimelineUpdateOptions update = {};
+            std::wstring parseError;
+            if (!ParseTimelineUpdateOptions(args, 2, &update, &parseError))
+            {
+                std::wcerr << L"!timeline update: " << parseError << L"\n";
+                break;
+            }
+
+            TiSubscriber& sub = GetTiSubscriberInstance();
+            std::vector<TiEventRecord> tiEvents = sub.Recent(update.Limit, false);
+            TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(tiEvents, update.Mode);
+            PrintTimelineIngestResult(L"ti", tiResult);
+
+            if (state.HasSnapshotBaseline)
+            {
+                TimelineIngestResult snapshotResult =
+                    state.Timeline.IngestSnapshot(state.SnapshotBaseline, L"baseline");
+                PrintTimelineIngestResult(L"snapshot", snapshotResult);
+            }
+            else
+            {
+                PrintColoredText(L"[timeline.update]", KNDBG_COLOR_DIM);
+                std::wcout << L" snapshot skipped: no session baseline captured\n";
+            }
+
+            if (update.IncludeLive)
+            {
+                if (device == nullptr || !device->IsOpen())
+                {
+                    PrintColoredText(L"[timeline.update]", KNDBG_COLOR_WARN);
+                    std::wcout << L" live skipped: driver device is not open\n";
+                }
+                else
+                {
+                    size_t liveLimit = std::min<size_t>(update.Limit, 1024);
+                    std::vector<TimelineLiveEvent> liveEvents;
+                    TimelineLiveStatus drainStatus = {};
+                    std::wstring liveError;
+                    if (!device->DrainTimelineEvents(
+                            static_cast<uint32_t>(liveLimit),
+                            &liveEvents,
+                            &drainStatus,
+                            &liveError))
+                    {
+                        PrintColoredText(L"[timeline.update]", KNDBG_COLOR_WARN);
+                        std::wcout << L" live drain failed: " << liveError << L"\n";
+                    }
+                    else
+                    {
+                        std::vector<TimelineEvent> events;
+                        events.reserve(liveEvents.size());
+                        for (const TimelineLiveEvent& item : liveEvents)
+                        {
+                            events.push_back(BuildTimelineEventFromLiveEvent(item));
+                        }
+                        TimelineIngestResult liveResult = state.Timeline.IngestEvents(events);
+                        PrintTimelineIngestResult(L"kernel-live", liveResult);
+                        PrintTimelineLiveStatus(drainStatus);
+                    }
+                }
+            }
+
+            TimelineStats stats = state.Timeline.GetStats();
+            PrintTimelineStatus(stats);
             if (structuredJsonOut != nullptr)
             {
                 *structuredJsonOut = BuildTimelineStatusJson(stats);
@@ -21158,6 +21364,239 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
     } while (false);
 
     return handled;
+}
+
+struct ConsoleSurfaceSelfTestContext
+{
+    uint32_t Passed = 0;
+    uint32_t Failed = 0;
+};
+
+static void CheckConsoleSurfaceSelfTest(
+    ConsoleSurfaceSelfTestContext* context,
+    bool condition,
+    const std::wstring& name)
+{
+    do
+    {
+        if (context == nullptr)
+        {
+            break;
+        }
+
+        if (condition)
+        {
+            ++context->Passed;
+            std::wcout << L"[console.selftest] PASS " << name << L"\n";
+        }
+        else
+        {
+            ++context->Failed;
+            std::wcerr << L"[console.selftest] FAIL " << name << L"\n";
+        }
+    } while (false);
+}
+
+static bool CompletionCandidateExists(
+    const std::vector<std::wstring>& argsBefore,
+    const std::wstring& expected)
+{
+    std::vector<std::wstring> candidates = BuildInteractiveCompletionCandidates(argsBefore);
+    return std::find(candidates.begin(), candidates.end(), expected) != candidates.end();
+}
+
+static void CheckCompletionCandidate(
+    ConsoleSurfaceSelfTestContext* context,
+    const std::vector<std::wstring>& argsBefore,
+    const std::wstring& expected,
+    const std::wstring& name)
+{
+    CheckConsoleSurfaceSelfTest(
+        context,
+        CompletionCandidateExists(argsBefore, expected),
+        name);
+}
+
+static std::wstring CaptureDetailedHelpOutput(
+    const std::vector<std::wstring>& args,
+    size_t commandIndex)
+{
+    std::wstring output;
+
+    do
+    {
+        std::wostringstream capture;
+        std::wstreambuf* oldOut = std::wcout.rdbuf(capture.rdbuf());
+        PrintDetailedCommandHelp(args, commandIndex);
+        std::wcout.rdbuf(oldOut);
+        output = capture.str();
+    } while (false);
+
+    return output;
+}
+
+static int RunConsoleSurfaceSelfTest()
+{
+    int exitCode = 1;
+    ConsoleSurfaceSelfTestContext context = {};
+
+    do
+    {
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline"},
+            L"live",
+            L"timeline-root-live-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline"},
+            L"update",
+            L"timeline-root-update-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline"},
+            L"reconcile",
+            L"timeline-root-reconcile-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"ingest"},
+            L"ti",
+            L"timeline-ingest-ti-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"ingest"},
+            L"snapshot",
+            L"timeline-ingest-snapshot-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"ingest", L"ti"},
+            L"/limit",
+            L"timeline-ingest-ti-limit-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"update"},
+            L"/live",
+            L"timeline-update-live-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"update"},
+            L"/snapshot",
+            L"timeline-update-snapshot-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"update"},
+            L"all",
+            L"timeline-update-all-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"live"},
+            L"start",
+            L"timeline-live-start-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"live"},
+            L"drain",
+            L"timeline-live-drain-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"query"},
+            L"/source",
+            L"timeline-query-source-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"query"},
+            L"/newest",
+            L"timeline-query-newest-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"graph"},
+            L"/image",
+            L"timeline-graph-image-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"reconcile"},
+            L"snapshot",
+            L"timeline-reconcile-snapshot-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"reconcile"},
+            L"baseline",
+            L"timeline-reconcile-baseline-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"export"},
+            L"/jsonl",
+            L"timeline-export-jsonl-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"help", L"!timeline"},
+            L"live",
+            L"help-timeline-root-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"help", L"!timeline", L"live"},
+            L"drain",
+            L"help-timeline-live-completion");
+
+        TimelineUpdateOptions updateOptions = {};
+        std::wstring parseError;
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ParseTimelineUpdateOptions(
+                {L"!timeline", L"update", L"all", L"/limit", L"7", L"/snapshot", L"/live"},
+                2,
+                &updateOptions,
+                &parseError) &&
+                updateOptions.Mode == L"all" &&
+                updateOptions.Limit == 7 &&
+                updateOptions.IncludeLive,
+            L"timeline-update-parser-valid");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !ParseTimelineUpdateOptions(
+                {L"!timeline", L"update", L"/limit"},
+                2,
+                &updateOptions,
+                &parseError),
+            L"timeline-update-parser-rejects-missing-limit");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !ParseTimelineUpdateOptions(
+                {L"!timeline", L"update", L"/bogus"},
+                2,
+                &updateOptions,
+                &parseError),
+            L"timeline-update-parser-rejects-unknown-option");
+
+        std::wstring helpCommandOutput = CaptureDetailedHelpOutput({L"help", L"!timeline"}, 1);
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            helpCommandOutput.find(L"!timeline live start|stop|status|clear|drain") != std::wstring::npos,
+            L"help-command-routes-timeline-live");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            helpCommandOutput.find(L"!timeline update") != std::wstring::npos,
+            L"help-command-routes-timeline-update");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            helpCommandOutput.find(L"!timeline reconcile snapshot") != std::wstring::npos,
+            L"help-command-routes-timeline-reconcile");
+
+        std::wstring suffixHelpOutput = CaptureDetailedHelpOutput({L"!timeline", L"help"}, 0);
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            suffixHelpOutput.find(L"!timeline ingest ti") != std::wstring::npos,
+            L"suffix-help-routes-timeline");
+
+        std::wcout << L"[console.selftest] passed=" << context.Passed
+                   << L" failed=" << context.Failed << L"\n";
+        if (context.Failed == 0)
+        {
+            exitCode = 0;
+        }
+    } while (false);
+
+    return exitCode;
 }
 
 static bool ParseDecimalIndex(const std::wstring& value, size_t* output)
@@ -37772,14 +38211,19 @@ int wmain(int argc, wchar_t** argv)
         {
             return RunMcpToolCatalogSelfTest();
         }
+        if (argc >= 3 && ToLower(argv[2]) == L"console")
+        {
+            return RunConsoleSurfaceSelfTest();
+        }
         if (argc >= 3 && ToLower(argv[2]) == L"all")
         {
             int timelineExit = RunTimelineSelfTest();
             int mcpExit = RunMcpToolCatalogSelfTest();
-            return (timelineExit == 0 && mcpExit == 0) ? 0 : 1;
+            int consoleExit = RunConsoleSurfaceSelfTest();
+            return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|all\n";
         return 2;
     }
 
