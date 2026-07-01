@@ -22,6 +22,7 @@
 #include "SnapshotJson.h"
 #include "SnapshotPrinter.h"
 #include "ThreatIntelSubscriber.h"
+#include "TimelineDashboard.h"
 #include "TimelineSelfTest.h"
 #include "TimelineStore.h"
 #include "NmiScanner.h"
@@ -57,6 +58,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static std::atomic_bool g_StopRequested = false;
@@ -1770,7 +1772,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
-    std::wcout << L"  timeline      !timeline ingest ti recent | !timeline live status | !timeline reconcile snapshot\n";
+    std::wcout << L"  timeline      !timeline | !timeline dashboard | !timeline help advanced\n";
     std::wcout << L"  ai            ai a.exe eprocess | ai explain callbacks all | ai plan check VBS status\n";
     std::wcout << L"\n";
 
@@ -3160,15 +3162,8 @@ static void AddTimelineCompletionCandidates(
 {
     static const wchar_t* rootValues[] =
     {
-        L"status",
-        L"update",
-        L"clear",
-        L"ingest",
-        L"live",
-        L"query",
-        L"graph",
-        L"reconcile",
-        L"export",
+        L"dashboard",
+        L"reset",
         L"help"
     };
 
@@ -3181,6 +3176,16 @@ static void AddTimelineCompletionCandidates(
         }
 
         std::wstring sub = ToLower(argsBefore[1]);
+        if (sub == L"help")
+        {
+            static const wchar_t* values[] =
+            {
+                L"advanced"
+            };
+            AddCompletionCandidates(candidates, values);
+            break;
+        }
+
         if (sub == L"ingest")
         {
             if (argsBefore.size() <= 2)
@@ -3233,9 +3238,11 @@ static void AddTimelineCompletionCandidates(
         {
             static const wchar_t* values[] =
             {
+                L"on",
+                L"off",
+                L"status",
                 L"start",
                 L"stop",
-                L"status",
                 L"clear",
                 L"drain",
                 L"/capacity",
@@ -3295,6 +3302,11 @@ static void AddTimelineCompletionCandidates(
         if (sub == L"export")
         {
             AddCompletionCandidate(candidates, L"/jsonl");
+            break;
+        }
+
+        if (sub == L"dashboard")
+        {
             break;
         }
 
@@ -17240,22 +17252,30 @@ static void HandleTiCommand(
 static void PrintTimelineHelp()
 {
     std::wcout << L"!timeline command:\n";
+    std::wcout << L"  !timeline                 guided refresh; asks whether to enable TI and live callbacks\n";
+    std::wcout << L"  !timeline dashboard\n";
+    std::wcout << L"  !timeline reset\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  The plain command is the normal operator path: it can turn on TI ETW and\n";
+    std::wcout << L"  kernel live process/image/thread callbacks, then refreshes the evidence timeline. Use the\n";
+    std::wcout << L"  dashboard for source/domain/PID/image/TI-task/risk filtering.\n";
+    std::wcout << L"  Advanced compatibility commands remain available with '!timeline help advanced'.\n";
+}
+
+static void PrintTimelineAdvancedHelp()
+{
+    std::wcout << L"!timeline advanced commands:\n";
     std::wcout << L"  !timeline update [recent|all] [/limit <n>] [/snapshot] [/live]\n";
-    std::wcout << L"  !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]\n";
-    std::wcout << L"  !timeline graph [/source <name>] [/domain <name>] [/pid <PID>] [/image <name>] [/limit <n>] [/oldest|/newest]\n";
-    std::wcout << L"  !timeline reconcile snapshot [baseline|<path>] [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>]\n";
     std::wcout << L"  !timeline status\n";
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
-    std::wcout << L"  !timeline live start|stop|status|clear|drain [/capacity <n>] [/limit <n>]\n";
+    std::wcout << L"  !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]\n";
+    std::wcout << L"  !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]\n";
+    std::wcout << L"  !timeline graph [/source <name>] [/domain <name>] [/pid <PID>] [/image <name>] [/limit <n>] [/oldest|/newest]\n";
+    std::wcout << L"  !timeline reconcile snapshot [baseline|<path>] [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>]\n";
     std::wcout << L"  !timeline export <path> [/jsonl]\n";
-    std::wcout << L"\n";
-    std::wcout << L"description:\n";
-    std::wcout << L"  Maintains a bounded in-memory evidence timeline from TI, snapshots,\n";
-    std::wcout << L"  optional kernel live callbacks, graph queries, and reconciliation.\n";
-    std::wcout << L"  update copies safe local evidence; /live drains queued kernel events only.\n";
-    std::wcout << L"  Use live start only when kernel callback collection is intended.\n";
 }
 
 static bool ParseTimelineLimit(
@@ -17519,6 +17539,14 @@ static std::wstring TimelineLiveEventTypeText(uint32_t type)
     {
         text = L"image-load";
     }
+    else if (type == KNDBG_TIMELINE_EVENT_THREAD_CREATE)
+    {
+        text = L"thread-create";
+    }
+    else if (type == KNDBG_TIMELINE_EVENT_THREAD_EXIT)
+    {
+        text = L"thread-exit";
+    }
     return text;
 }
 
@@ -17527,16 +17555,40 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     TimelineEvent event = {};
     event.TimestampFileTime = live.Timestamp100ns;
     event.Source = L"kernel-live";
-    event.Domain = live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD ? L"image" : L"process";
+    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
+    {
+        event.Domain = L"image";
+    }
+    else if (live.Type == KNDBG_TIMELINE_EVENT_THREAD_CREATE ||
+             live.Type == KNDBG_TIMELINE_EVENT_THREAD_EXIT)
+    {
+        event.Domain = L"thread";
+    }
+    else
+    {
+        event.Domain = L"process";
+    }
     event.Action = TimelineLiveEventTypeText(live.Type);
     event.ProcessId = live.ProcessId;
     event.ThreadId = live.ThreadId;
     event.Entity = live.ImagePath;
     if (event.Entity.empty())
     {
-        event.Entity = L"pid:" + std::to_wstring(live.ProcessId);
+        if (event.Domain == L"thread" && live.ThreadId != 0)
+        {
+            event.Entity = L"pid:" + std::to_wstring(live.ProcessId) +
+                L" tid:" + std::to_wstring(live.ThreadId);
+        }
+        else
+        {
+            event.Entity = L"pid:" + std::to_wstring(live.ProcessId);
+        }
     }
     event.Summary = event.Action + L" pid=" + std::to_wstring(live.ProcessId);
+    if (live.ThreadId != 0 && event.Domain == L"thread")
+    {
+        event.Summary += L" tid=" + std::to_wstring(live.ThreadId);
+    }
     if (live.ParentProcessId != 0)
     {
         event.Summary += L" parent_pid=" + std::to_wstring(live.ParentProcessId);
@@ -17563,19 +17615,316 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     event.Confidence = L"kernel-callback";
     event.Evidence[L"sequence"] = std::to_wstring(live.Sequence);
     event.Evidence[L"type"] = std::to_wstring(live.Type);
+    if (live.ThreadId != 0)
+    {
+        event.Evidence[L"tid"] = std::to_wstring(live.ThreadId);
+    }
     return event;
 }
 
 static void PrintTimelineLiveStatus(const TimelineLiveStatus& status)
 {
+    uint32_t pressure = 0;
+    if (status.Capacity != 0)
+    {
+        pressure = static_cast<uint32_t>(
+            std::min<uint64_t>(100, (static_cast<uint64_t>(status.Count) * 100ull) / status.Capacity));
+    }
+
     PrintColoredText(L"[timeline.live]", KNDBG_COLOR_TITLE);
     std::wcout << L" active=" << ((status.Flags & KNDBG_TIMELINE_STATUS_ACTIVE) != 0 ? L"yes" : L"no")
                << L" process_cb=" << ((status.Flags & KNDBG_TIMELINE_STATUS_PROCESS_CALLBACK) != 0 ? L"yes" : L"no")
                << L" image_cb=" << ((status.Flags & KNDBG_TIMELINE_STATUS_IMAGE_CALLBACK) != 0 ? L"yes" : L"no")
+               << L" thread_cb=" << ((status.Flags & KNDBG_TIMELINE_STATUS_THREAD_CALLBACK) != 0 ? L"yes" : L"no")
                << L" capacity=" << status.Capacity
                << L" queued=" << status.Count
+               << L" pressure=" << pressure << L"%"
                << L" dropped=" << status.Dropped
                << L" next_sequence=" << status.NextSequence << L"\n";
+}
+
+struct TimelineAutoDrainSnapshot
+{
+    bool Running = false;
+    uint64_t Batches = 0;
+    uint64_t Events = 0;
+    uint64_t Added = 0;
+    uint64_t Errors = 0;
+    std::wstring LastUtc;
+    std::wstring LastError;
+};
+
+static std::mutex g_TimelineLiveIoMutex;
+
+static bool QueryTimelineLiveStatus(
+    DeviceClient* device,
+    TimelineLiveStatus* status,
+    std::wstring* error)
+{
+    bool ok = false;
+    std::lock_guard<std::mutex> lock(g_TimelineLiveIoMutex);
+
+    do
+    {
+        if (device == nullptr || !device->IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver device is not open";
+            }
+            break;
+        }
+        ok = device->QueryTimelineStatus(status, error);
+    } while (false);
+
+    return ok;
+}
+
+static bool ControlTimelineLive(
+    DeviceClient* device,
+    uint32_t action,
+    uint32_t capacity,
+    std::wstring* error)
+{
+    bool ok = false;
+    std::lock_guard<std::mutex> lock(g_TimelineLiveIoMutex);
+
+    do
+    {
+        if (device == nullptr || !device->IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver device is not open";
+            }
+            break;
+        }
+        ok = device->ControlTimeline(action, capacity, error);
+    } while (false);
+
+    return ok;
+}
+
+static bool DrainTimelineLiveEvents(
+    DeviceClient* device,
+    uint32_t maxEvents,
+    std::vector<TimelineLiveEvent>* events,
+    TimelineLiveStatus* status,
+    std::wstring* error)
+{
+    bool ok = false;
+    std::lock_guard<std::mutex> lock(g_TimelineLiveIoMutex);
+
+    do
+    {
+        if (device == nullptr || !device->IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver device is not open";
+            }
+            break;
+        }
+        ok = device->DrainTimelineEvents(maxEvents, events, status, error);
+    } while (false);
+
+    return ok;
+}
+
+class TimelineAutoDrainWorker
+{
+public:
+    ~TimelineAutoDrainWorker()
+    {
+        Stop();
+    }
+
+    bool Start(DebuggerState* state, DeviceClient* device)
+    {
+        bool ok = false;
+        std::lock_guard<std::mutex> lock(ControlMutex);
+
+        do
+        {
+            if (state == nullptr || device == nullptr || !device->IsOpen())
+            {
+                break;
+            }
+
+            if (Running.load() && Thread.joinable())
+            {
+                ok = true;
+                break;
+            }
+
+            if (Thread.joinable())
+            {
+                StopRequested = true;
+                Thread.join();
+            }
+
+            {
+                std::lock_guard<std::mutex> statsLock(StatsMutex);
+                Batches = 0;
+                Events = 0;
+                Added = 0;
+                Errors = 0;
+                LastUtc.clear();
+                LastError.clear();
+            }
+
+            StopRequested = false;
+            Running = true;
+            Thread = std::thread(&TimelineAutoDrainWorker::WorkerLoop, this, state, device);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void Stop()
+    {
+        std::thread worker;
+        {
+            std::lock_guard<std::mutex> lock(ControlMutex);
+            StopRequested = true;
+            if (Thread.joinable())
+            {
+                worker = std::move(Thread);
+            }
+        }
+
+        if (worker.joinable())
+        {
+            worker.join();
+        }
+        Running = false;
+    }
+
+    bool IsRunning() const
+    {
+        return Running.load();
+    }
+
+    TimelineAutoDrainSnapshot Snapshot() const
+    {
+        TimelineAutoDrainSnapshot snapshot = {};
+        snapshot.Running = Running.load();
+        std::lock_guard<std::mutex> lock(StatsMutex);
+        snapshot.Batches = Batches;
+        snapshot.Events = Events;
+        snapshot.Added = Added;
+        snapshot.Errors = Errors;
+        snapshot.LastUtc = LastUtc;
+        snapshot.LastError = LastError;
+        return snapshot;
+    }
+
+private:
+    void WorkerLoop(DebuggerState* state, DeviceClient* device)
+    {
+        do
+        {
+            while (!StopRequested.load() && !g_StopRequested.load())
+            {
+                std::vector<TimelineLiveEvent> liveEvents;
+                TimelineLiveStatus drainStatus = {};
+                std::wstring error;
+                if (!DrainTimelineLiveEvents(device, 256, &liveEvents, &drainStatus, &error))
+                {
+                    RecordError(error);
+                    break;
+                }
+
+                std::vector<TimelineEvent> events;
+                events.reserve(liveEvents.size());
+                for (const TimelineLiveEvent& item : liveEvents)
+                {
+                    events.push_back(BuildTimelineEventFromLiveEvent(item));
+                }
+
+                TimelineIngestResult result = state->Timeline.IngestEvents(events);
+                RecordDrain(liveEvents.size(), result.Added);
+
+                for (size_t i = 0; i < 5; ++i)
+                {
+                    if (StopRequested.load() || g_StopRequested.load())
+                    {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+        } while (false);
+
+        Running = false;
+    }
+
+    void RecordDrain(size_t drained, uint64_t added)
+    {
+        std::lock_guard<std::mutex> lock(StatsMutex);
+        ++Batches;
+        Events += drained;
+        Added += added;
+        LastUtc = SnapshotCurrentUtcTimestamp();
+        LastError.clear();
+    }
+
+    void RecordError(const std::wstring& error)
+    {
+        std::lock_guard<std::mutex> lock(StatsMutex);
+        ++Errors;
+        LastUtc = SnapshotCurrentUtcTimestamp();
+        LastError = error;
+    }
+
+    mutable std::mutex ControlMutex;
+    mutable std::mutex StatsMutex;
+    std::thread Thread;
+    std::atomic_bool StopRequested{false};
+    std::atomic_bool Running{false};
+    uint64_t Batches = 0;
+    uint64_t Events = 0;
+    uint64_t Added = 0;
+    uint64_t Errors = 0;
+    std::wstring LastUtc;
+    std::wstring LastError;
+};
+
+static TimelineAutoDrainWorker g_TimelineAutoDrainWorker;
+
+static bool StartTimelineAutoDrainWorker(DebuggerState& state, DeviceClient* device)
+{
+    return g_TimelineAutoDrainWorker.Start(&state, device);
+}
+
+static void StopTimelineAutoDrainWorker()
+{
+    g_TimelineAutoDrainWorker.Stop();
+}
+
+static TimelineAutoDrainSnapshot QueryTimelineAutoDrainSnapshot()
+{
+    return g_TimelineAutoDrainWorker.Snapshot();
+}
+
+static void PrintTimelineAutoDrainStatus(const TimelineAutoDrainSnapshot& snapshot)
+{
+    PrintColoredText(L"[timeline.live]", KNDBG_COLOR_TITLE);
+    std::wcout << L" auto_drain=" << (snapshot.Running ? L"running" : L"stopped")
+               << L" batches=" << snapshot.Batches
+               << L" drained=" << snapshot.Events
+               << L" added=" << snapshot.Added
+               << L" errors=" << snapshot.Errors;
+    if (!snapshot.LastUtc.empty())
+    {
+        std::wcout << L" last=" << snapshot.LastUtc;
+    }
+    if (!snapshot.LastError.empty())
+    {
+        std::wcout << L" last_error=" << snapshot.LastError;
+    }
+    std::wcout << L"\n";
 }
 
 static void PrintTimelineGraph(const TimelineGraphResult& graph)
@@ -18012,15 +18361,315 @@ static bool ParseTimelineGraphOptions(
     return ok;
 }
 
+static constexpr size_t KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS = 10000;
+
+static std::wstring BuildTimelineDashboardDefaultPath()
+{
+    std::wstring path = GetExecutableDirectory();
+    path += L"\\.kn-live-dbg\\timeline-dashboard.html";
+    return path;
+}
+
+static std::vector<TimelineEvent> BuildTimelineDashboardEventSlice(
+    const TimelineStore& timeline,
+    bool* truncated)
+{
+    std::vector<TimelineEvent> events = timeline.AllEvents();
+
+    if (truncated != nullptr)
+    {
+        *truncated = false;
+    }
+
+    if (events.size() > KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS)
+    {
+        auto firstKept = events.end() -
+            static_cast<std::vector<TimelineEvent>::difference_type>(KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS);
+        events.erase(events.begin(), firstKept);
+        if (truncated != nullptr)
+        {
+            *truncated = true;
+        }
+    }
+
+    return events;
+}
+
+static bool OpenTimelineDashboardPath(const std::wstring& path, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        HINSTANCE result = ShellExecuteW(
+            nullptr,
+            L"open",
+            path.c_str(),
+            nullptr,
+            nullptr,
+            SW_SHOWNORMAL);
+        INT_PTR code = reinterpret_cast<INT_PTR>(result);
+        if (code <= 32)
+        {
+            if (error != nullptr)
+            {
+                *error = L"ShellExecuteW failed: " + std::to_wstring(code);
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool IsInteractiveConsoleInput()
+{
+    bool interactive = false;
+
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (input != INVALID_HANDLE_VALUE && input != nullptr)
+    {
+        DWORD mode = 0;
+        interactive = !!GetConsoleMode(input, &mode);
+    }
+
+    return interactive;
+}
+
+static bool PromptTimelineYesNo(const std::wstring& prompt, bool defaultValue)
+{
+    bool value = defaultValue;
+
+    do
+    {
+        if (!IsInteractiveConsoleInput())
+        {
+            break;
+        }
+
+        std::wcout << prompt << (defaultValue ? L" [Y/n] " : L" [y/N] ");
+        std::wstring line;
+        if (!std::getline(std::wcin, line))
+        {
+            break;
+        }
+
+        std::wstring answer = ToLower(TrimWhitespace(line));
+        if (answer.empty())
+        {
+            break;
+        }
+
+        wchar_t first = answer[0];
+        if (first == L'y')
+        {
+            value = true;
+        }
+        else if (first == L'n')
+        {
+            value = false;
+        }
+    } while (false);
+
+    return value;
+}
+
+static bool TimelineLiveIsActive(DeviceClient* device, TimelineLiveStatus* status)
+{
+    bool active = false;
+
+    do
+    {
+        if (device == nullptr || !device->IsOpen())
+        {
+            break;
+        }
+
+        TimelineLiveStatus current = {};
+        std::wstring error;
+        if (!QueryTimelineLiveStatus(device, &current, &error))
+        {
+            PrintColoredText(L"[timeline.live]", KNDBG_COLOR_WARN);
+            std::wcout << L" status failed: " << error << L"\n";
+            break;
+        }
+
+        if (status != nullptr)
+        {
+            *status = current;
+        }
+        active = (current.Flags & KNDBG_TIMELINE_STATUS_ACTIVE) != 0;
+    } while (false);
+
+    return active;
+}
+
+static void TryEnableTimelineTi(
+    DebuggerState& state,
+    DeviceClient* device,
+    SymbolEngine* symbols)
+{
+    TiSubscriber& sub = GetTiSubscriberInstance();
+
+    do
+    {
+        if (sub.IsActive())
+        {
+            PrintColoredText(L"[timeline]", KNDBG_COLOR_DIM);
+            std::wcout << L" TI ETW already active\n";
+            break;
+        }
+        if (device == nullptr || !device->IsOpen() || symbols == nullptr)
+        {
+            PrintColoredText(L"[timeline]", KNDBG_COLOR_WARN);
+            std::wcout << L" TI ETW not started: driver device or symbols are unavailable\n";
+            break;
+        }
+
+        uint8_t protection = 0;
+        std::wstring gateError;
+        if (!CheckSelfIsPplAntimalware(*device, *symbols, &protection, &gateError))
+        {
+            PrintColoredText(L"[timeline]", KNDBG_COLOR_TITLE);
+            std::wcout << L" enabling PPL Antimalware for TI ETW\n";
+            HandleSetPplAntimalwareCommand({L"set-ppl-antimalware", L"on"}, state, *device, *symbols);
+        }
+
+        PrintColoredText(L"[timeline]", KNDBG_COLOR_TITLE);
+        std::wcout << L" starting TI ETW capture\n";
+        HandleTiCommand({L"!ti", L"start"}, state, *device, *symbols);
+    } while (false);
+}
+
+static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
+{
+    bool active = false;
+
+    do
+    {
+        if (device == nullptr || !device->IsOpen())
+        {
+            PrintColoredText(L"[timeline.live]", KNDBG_COLOR_WARN);
+            std::wcout << L" not started: driver device is not open\n";
+            break;
+        }
+
+        TimelineLiveStatus status = {};
+        if (TimelineLiveIsActive(device, &status))
+        {
+            PrintColoredText(L"[timeline.live]", KNDBG_COLOR_DIM);
+            std::wcout << L" already active\n";
+            if (StartTimelineAutoDrainWorker(state, device))
+            {
+                std::wcout << L"[timeline.live] auto-drain running\n";
+            }
+            active = true;
+            break;
+        }
+
+        std::wstring error;
+        if (!ControlTimelineLive(
+                device,
+                KNDBG_TIMELINE_CONTROL_START,
+                static_cast<uint32_t>(KNDBG_TIMELINE_DEFAULT_CAPACITY),
+                &error))
+        {
+            std::wcerr << L"!timeline live on failed: " << error << L"\n";
+            break;
+        }
+
+        std::wcout << L"[timeline.live] on capacity=" << KNDBG_TIMELINE_DEFAULT_CAPACITY << L"\n";
+        if (StartTimelineAutoDrainWorker(state, device))
+        {
+            std::wcout << L"[timeline.live] auto-drain running\n";
+        }
+        active = true;
+    } while (false);
+
+    return active;
+}
+
 static void HandleTimelineCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     std::wstring* structuredJsonOut = nullptr,
-    DeviceClient* device = nullptr)
+    DeviceClient* device = nullptr,
+    SymbolEngine* symbols = nullptr);
+
+static void RunTimelineGuidedRefresh(
+    DebuggerState& state,
+    std::wstring* structuredJsonOut,
+    DeviceClient* device,
+    SymbolEngine* symbols)
+{
+    bool liveActive = TimelineLiveIsActive(device, nullptr);
+
+    if (!GetTiSubscriberInstance().IsActive())
+    {
+        if (PromptTimelineYesNo(L"Enable Threat-Intelligence ETW capture now?", false))
+        {
+            TryEnableTimelineTi(state, device, symbols);
+        }
+    }
+    else
+    {
+        PrintColoredText(L"[timeline]", KNDBG_COLOR_DIM);
+        std::wcout << L" TI ETW already active\n";
+    }
+
+    liveActive = TimelineLiveIsActive(device, nullptr);
+    if (!liveActive)
+    {
+        if (PromptTimelineYesNo(L"Enable kernel live process/image/thread callbacks now?", false))
+        {
+            liveActive = TryEnableTimelineLive(state, device);
+        }
+    }
+    else
+    {
+        PrintColoredText(L"[timeline.live]", KNDBG_COLOR_DIM);
+        std::wcout << L" already active\n";
+        if (StartTimelineAutoDrainWorker(state, device))
+        {
+            std::wcout << L"[timeline.live] auto-drain running\n";
+        }
+    }
+
+    std::vector<std::wstring> updateArgs;
+    updateArgs.push_back(L"!timeline");
+    updateArgs.push_back(L"update");
+    if (liveActive)
+    {
+        updateArgs.push_back(L"/live");
+    }
+
+    HandleTimelineCommand(updateArgs, state, structuredJsonOut, device, symbols);
+}
+
+static void HandleTimelineCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    std::wstring* structuredJsonOut,
+    DeviceClient* device,
+    SymbolEngine* symbols)
 {
     do
     {
-        if (args.size() < 2 || HasHelpToken(args, 1))
+        if (args.size() < 2)
+        {
+            RunTimelineGuidedRefresh(state, structuredJsonOut, device, symbols);
+            break;
+        }
+
+        if (ToLower(args[1]) == L"help" && args.size() >= 3 && ToLower(args[2]) == L"advanced")
+        {
+            PrintTimelineAdvancedHelp();
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
         {
             PrintTimelineHelp();
             break;
@@ -18035,9 +18684,10 @@ static void HandleTimelineCommand(
             {
                 TimelineLiveStatus live = {};
                 std::wstring liveError;
-                if (device->QueryTimelineStatus(&live, &liveError))
+                if (QueryTimelineLiveStatus(device, &live, &liveError))
                 {
                     PrintTimelineLiveStatus(live);
+                    PrintTimelineAutoDrainStatus(QueryTimelineAutoDrainSnapshot());
                 }
                 else
                 {
@@ -18092,7 +18742,8 @@ static void HandleTimelineCommand(
                     std::vector<TimelineLiveEvent> liveEvents;
                     TimelineLiveStatus drainStatus = {};
                     std::wstring liveError;
-                    if (!device->DrainTimelineEvents(
+                    if (!DrainTimelineLiveEvents(
+                            device,
                             static_cast<uint32_t>(liveLimit),
                             &liveEvents,
                             &drainStatus,
@@ -18111,7 +18762,16 @@ static void HandleTimelineCommand(
                         }
                         TimelineIngestResult liveResult = state.Timeline.IngestEvents(events);
                         PrintTimelineIngestResult(L"kernel-live", liveResult);
-                        PrintTimelineLiveStatus(drainStatus);
+                        TimelineLiveStatus live = {};
+                        if (QueryTimelineLiveStatus(device, &live, &liveError))
+                        {
+                            PrintTimelineLiveStatus(live);
+                        }
+                        else
+                        {
+                            PrintTimelineLiveStatus(drainStatus);
+                        }
+                        PrintTimelineAutoDrainStatus(QueryTimelineAutoDrainSnapshot());
                     }
                 }
             }
@@ -18136,6 +18796,91 @@ static void HandleTimelineCommand(
             break;
         }
 
+        if (action == L"reset")
+        {
+            state.Timeline.Clear();
+            std::wcout << L"[timeline.reset] store cleared.\n";
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildTimelineStatusJson(state.Timeline.GetStats());
+            }
+            break;
+        }
+
+        if (action == L"dashboard")
+        {
+            if (args.size() != 2)
+            {
+                std::wcerr << L"usage: !timeline dashboard\n";
+                break;
+            }
+
+            TimelineStats stats = state.Timeline.GetStats();
+            bool truncated = false;
+            std::vector<TimelineEvent> events = BuildTimelineDashboardEventSlice(state.Timeline, &truncated);
+
+            TimelineDashboardDocument document = {};
+            document.Stats = stats;
+            document.Analysis = state.Timeline.AnalyzeLiveSignals(128);
+            document.Events = std::move(events);
+            document.GeneratedUtc = SnapshotCurrentUtcTimestamp();
+            document.Truncated = truncated;
+            document.TotalStored = stats.Stored;
+            document.MaxEvents = KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS;
+            TimelineAutoDrainSnapshot autoDrain = QueryTimelineAutoDrainSnapshot();
+            document.AutoDrainRunning = autoDrain.Running;
+            document.AutoDrainBatches = autoDrain.Batches;
+            document.AutoDrainEvents = autoDrain.Events;
+            document.AutoDrainAdded = autoDrain.Added;
+            document.AutoDrainErrors = autoDrain.Errors;
+            document.AutoDrainLastUtc = autoDrain.LastUtc;
+            document.AutoDrainLastError = autoDrain.LastError;
+            if (device != nullptr && device->IsOpen())
+            {
+                TimelineLiveStatus live = {};
+                std::wstring liveError;
+                if (QueryTimelineLiveStatus(device, &live, &liveError))
+                {
+                    document.HasLiveStatus = true;
+                    document.LiveFlags = live.Flags;
+                    document.LiveCapacity = live.Capacity;
+                    document.LiveQueued = live.Count;
+                    document.LiveDropped = live.Dropped;
+                    document.LiveNextSequence = live.NextSequence;
+                }
+                else
+                {
+                    document.AutoDrainLastError = liveError;
+                }
+            }
+
+            std::wstring path = BuildTimelineDashboardDefaultPath();
+            std::wstring writeError;
+            if (!WriteSnapshotTextFile(path, BuildTimelineDashboardHtml(document), &writeError))
+            {
+                std::wcerr << L"!timeline dashboard failed: " << writeError << L"\n";
+                break;
+            }
+
+            std::wstring openError;
+            bool opened = OpenTimelineDashboardPath(path, &openError);
+            PrintColoredText(L"[timeline.dashboard]", KNDBG_COLOR_TITLE);
+            std::wcout << L" wrote " << path
+                       << L" events=" << document.Events.size()
+                       << L" total_stored=" << stats.Stored
+                       << L" opened=" << (opened ? L"yes" : L"no") << L"\n";
+            if (!opened)
+            {
+                PrintColoredText(L"[timeline.dashboard]", KNDBG_COLOR_WARN);
+                std::wcout << L" open failed: " << openError << L"\n";
+            }
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildTimelineStatusJson(stats);
+            }
+            break;
+        }
+
         if (action == L"live")
         {
             if (device == nullptr || !device->IsOpen())
@@ -18145,21 +18890,32 @@ static void HandleTimelineCommand(
             }
             if (args.size() < 3)
             {
-                std::wcerr << L"usage: !timeline live start|stop|status|clear|drain [/capacity <n>] [/limit <n>]\n";
+                std::wcerr << L"usage: !timeline live on|off|status\n";
+                std::wcerr << L"advanced: !timeline live start|stop|clear|drain [/capacity <n>] [/limit <n>]\n";
                 break;
             }
 
             std::wstring liveAction = ToLower(args[2]);
+            if (liveAction == L"on")
+            {
+                liveAction = L"start";
+            }
+            else if (liveAction == L"off")
+            {
+                liveAction = L"stop";
+            }
+
             if (liveAction == L"status")
             {
                 TimelineLiveStatus live = {};
                 std::wstring liveError;
-                if (!device->QueryTimelineStatus(&live, &liveError))
+                if (!QueryTimelineLiveStatus(device, &live, &liveError))
                 {
                     std::wcerr << L"!timeline live status failed: " << liveError << L"\n";
                     break;
                 }
                 PrintTimelineLiveStatus(live);
+                PrintTimelineAutoDrainStatus(QueryTimelineAutoDrainSnapshot());
                 break;
             }
 
@@ -18198,12 +18954,20 @@ static void HandleTimelineCommand(
                 }
 
                 std::wstring liveError;
-                if (!device->ControlTimeline(KNDBG_TIMELINE_CONTROL_START, static_cast<uint32_t>(capacity), &liveError))
+                if (!ControlTimelineLive(
+                        device,
+                        KNDBG_TIMELINE_CONTROL_START,
+                        static_cast<uint32_t>(capacity),
+                        &liveError))
                 {
-                    std::wcerr << L"!timeline live start failed: " << liveError << L"\n";
+                    std::wcerr << L"!timeline live on failed: " << liveError << L"\n";
                     break;
                 }
-                std::wcout << L"[timeline.live] started capacity=" << capacity << L"\n";
+                std::wcout << L"[timeline.live] on capacity=" << capacity << L"\n";
+                if (StartTimelineAutoDrainWorker(state, device))
+                {
+                    std::wcout << L"[timeline.live] auto-drain running\n";
+                }
                 break;
             }
 
@@ -18211,12 +18975,16 @@ static void HandleTimelineCommand(
             {
                 uint32_t control = liveAction == L"stop" ? KNDBG_TIMELINE_CONTROL_STOP : KNDBG_TIMELINE_CONTROL_CLEAR;
                 std::wstring liveError;
-                if (!device->ControlTimeline(control, 0, &liveError))
+                if (!ControlTimelineLive(device, control, 0, &liveError))
                 {
                     std::wcerr << L"!timeline live " << liveAction << L" failed: " << liveError << L"\n";
                     break;
                 }
-                std::wcout << L"[timeline.live] " << liveAction << L" ok\n";
+                if (control == KNDBG_TIMELINE_CONTROL_STOP)
+                {
+                    StopTimelineAutoDrainWorker();
+                }
+                std::wcout << L"[timeline.live] " << (control == KNDBG_TIMELINE_CONTROL_STOP ? L"off" : L"clear") << L" ok\n";
                 break;
             }
 
@@ -18254,7 +19022,7 @@ static void HandleTimelineCommand(
                 std::vector<TimelineLiveEvent> liveEvents;
                 TimelineLiveStatus drainStatus = {};
                 std::wstring liveError;
-                if (!device->DrainTimelineEvents(static_cast<uint32_t>(limit), &liveEvents, &drainStatus, &liveError))
+                if (!DrainTimelineLiveEvents(device, static_cast<uint32_t>(limit), &liveEvents, &drainStatus, &liveError))
                 {
                     std::wcerr << L"!timeline live drain failed: " << liveError << L"\n";
                     break;
@@ -18269,9 +19037,10 @@ static void HandleTimelineCommand(
                 TimelineIngestResult result = state.Timeline.IngestEvents(events);
                 PrintTimelineIngestResult(L"kernel-live", result);
                 TimelineLiveStatus live = {};
-                if (device->QueryTimelineStatus(&live, &liveError))
+                if (QueryTimelineLiveStatus(device, &live, &liveError))
                 {
                     PrintTimelineLiveStatus(live);
+                    PrintTimelineAutoDrainStatus(QueryTimelineAutoDrainSnapshot());
                 }
                 else
                 {
@@ -18482,7 +19251,7 @@ static void HandleTimelineCommand(
             {
                 TimelineLiveStatus live = {};
                 std::wstring liveError;
-                if (device->QueryTimelineStatus(&live, &liveError))
+                if (QueryTimelineLiveStatus(device, &live, &liveError))
                 {
                     options.LiveDropped = live.Dropped;
                 }
@@ -18493,6 +19262,28 @@ static void HandleTimelineCommand(
             if (structuredJsonOut != nullptr)
             {
                 *structuredJsonOut = BuildTimelineReconcileJson(result);
+            }
+            break;
+        }
+
+        if (action == L"save")
+        {
+            if (args.size() != 3)
+            {
+                std::wcerr << L"usage: !timeline save <path>\n";
+                break;
+            }
+            std::wstring exportError;
+            if (!state.Timeline.ExportJsonl(args[2], &exportError))
+            {
+                std::wcerr << L"!timeline save failed: " << exportError << L"\n";
+                break;
+            }
+            std::wcout << L"[timeline.save] wrote " << args[2]
+                       << L" events=" << state.Timeline.GetStats().Stored << L"\n";
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildTimelineStatusJson(state.Timeline.GetStats());
             }
             break;
         }
@@ -21442,21 +22233,24 @@ static int RunConsoleSurfaceSelfTest()
 
     do
     {
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !CompletionCandidateExists({L"!timeline"}, L"live"),
+            L"timeline-root-hides-live-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !CompletionCandidateExists({L"!timeline"}, L"save"),
+            L"timeline-root-hides-save-completion");
         CheckCompletionCandidate(
             &context,
             {L"!timeline"},
-            L"live",
-            L"timeline-root-live-completion");
+            L"dashboard",
+            L"timeline-root-dashboard-completion");
         CheckCompletionCandidate(
             &context,
             {L"!timeline"},
-            L"update",
-            L"timeline-root-update-completion");
-        CheckCompletionCandidate(
-            &context,
-            {L"!timeline"},
-            L"reconcile",
-            L"timeline-root-reconcile-completion");
+            L"reset",
+            L"timeline-root-reset-completion");
         CheckCompletionCandidate(
             &context,
             {L"!timeline", L"ingest"},
@@ -21490,13 +22284,13 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(
             &context,
             {L"!timeline", L"live"},
-            L"start",
-            L"timeline-live-start-completion");
+            L"on",
+            L"timeline-live-on-completion");
         CheckCompletionCandidate(
             &context,
             {L"!timeline", L"live"},
-            L"drain",
-            L"timeline-live-drain-completion");
+            L"off",
+            L"timeline-live-off-completion");
         CheckCompletionCandidate(
             &context,
             {L"!timeline", L"query"},
@@ -21530,13 +22324,13 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(
             &context,
             {L"help", L"!timeline"},
-            L"live",
+            L"dashboard",
             L"help-timeline-root-completion");
         CheckCompletionCandidate(
             &context,
-            {L"help", L"!timeline", L"live"},
-            L"drain",
-            L"help-timeline-live-completion");
+            {L"!timeline", L"help", L""},
+            L"advanced",
+            L"timeline-help-advanced-completion");
 
         TimelineUpdateOptions updateOptions = {};
         std::wstring parseError;
@@ -21571,22 +22365,35 @@ static int RunConsoleSurfaceSelfTest()
         std::wstring helpCommandOutput = CaptureDetailedHelpOutput({L"help", L"!timeline"}, 1);
         CheckConsoleSurfaceSelfTest(
             &context,
-            helpCommandOutput.find(L"!timeline live start|stop|status|clear|drain") != std::wstring::npos,
-            L"help-command-routes-timeline-live");
+            helpCommandOutput.find(L"!timeline live") == std::wstring::npos,
+            L"help-command-hides-timeline-live");
         CheckConsoleSurfaceSelfTest(
             &context,
-            helpCommandOutput.find(L"!timeline update") != std::wstring::npos,
-            L"help-command-routes-timeline-update");
+            helpCommandOutput.find(L"!timeline save") == std::wstring::npos,
+            L"help-command-hides-timeline-save");
         CheckConsoleSurfaceSelfTest(
             &context,
-            helpCommandOutput.find(L"!timeline reconcile snapshot") != std::wstring::npos,
-            L"help-command-routes-timeline-reconcile");
+            helpCommandOutput.find(L"!timeline dashboard") != std::wstring::npos,
+            L"help-command-routes-timeline-dashboard");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            helpCommandOutput.find(L"!timeline reset") != std::wstring::npos,
+            L"help-command-routes-timeline-reset");
 
-        std::wstring suffixHelpOutput = CaptureDetailedHelpOutput({L"!timeline", L"help"}, 0);
+        std::wostringstream advancedCapture;
+        std::wstreambuf* oldOut = std::wcout.rdbuf(advancedCapture.rdbuf());
+        DebuggerState dummyTimelineState = {};
+        HandleTimelineCommand({L"!timeline", L"help", L"advanced"}, dummyTimelineState);
+        std::wcout.rdbuf(oldOut);
+        std::wstring suffixHelpOutput = advancedCapture.str();
         CheckConsoleSurfaceSelfTest(
             &context,
             suffixHelpOutput.find(L"!timeline ingest ti") != std::wstring::npos,
-            L"suffix-help-routes-timeline");
+            L"advanced-help-routes-timeline");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            suffixHelpOutput.find(L"!timeline live on|off|status") != std::wstring::npos,
+            L"advanced-help-routes-timeline-live");
 
         std::wcout << L"[console.selftest] passed=" << context.Passed
                    << L" failed=" << context.Failed << L"\n";
@@ -23183,19 +23990,30 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             break;
         }
 
-        if (command == L"!timeline" && args.size() >= 2)
+        if (command == L"!timeline")
         {
+            if (args.size() < 2)
+            {
+                writeLike = true;
+                break;
+            }
+
             std::wstring action = ToLower(args[1]);
             if (action == L"clear" ||
+                action == L"reset" ||
                 action == L"ingest" ||
-                action == L"export")
+                action == L"save" ||
+                action == L"export" ||
+                action == L"dashboard")
             {
                 writeLike = true;
             }
             else if (action == L"live" && args.size() >= 3)
             {
                 std::wstring liveAction = ToLower(args[2]);
-                if (liveAction == L"start" ||
+                if (liveAction == L"on" ||
+                    liveAction == L"off" ||
+                    liveAction == L"start" ||
                     liveAction == L"stop" ||
                     liveAction == L"clear" ||
                     liveAction == L"drain")
@@ -25602,22 +26420,26 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
                 plan.Warning = L"unrecognized !ti write-like action";
             }
         }
-        else if (command == L"!timeline" && commandArgs.size() >= 2)
+        else if (command == L"!timeline")
         {
-            std::wstring action = ToLower(commandArgs[1]);
+            std::wstring action = commandArgs.size() >= 2 ? ToLower(commandArgs[1]) : L"";
             plan.TargetKind = L"timeline";
-            plan.Target = L"!timeline " + action;
+            plan.Target = action.empty() ? L"!timeline" : L"!timeline " + action;
             plan.ByteCountText = L"n/a";
 
-            if (action == L"live")
+            if (action.empty())
+            {
+                plan.Warning = L"plain !timeline may start TI ETW or kernel live callbacks after prompts, then mutates the in-memory timeline store";
+            }
+            else if (action == L"live")
             {
                 std::wstring liveAction = commandArgs.size() >= 3 ? ToLower(commandArgs[2]) : L"<missing>";
                 plan.Target += L" " + liveAction;
-                if (liveAction == L"start")
+                if (liveAction == L"on" || liveAction == L"start")
                 {
-                    plan.Warning = L"timeline live start registers kernel process/image callbacks and allocates a bounded nonpaged ring";
+                    plan.Warning = L"timeline live start registers kernel process/image/thread callbacks and allocates a bounded nonpaged ring";
                 }
-                else if (liveAction == L"stop")
+                else if (liveAction == L"off" || liveAction == L"stop")
                 {
                     plan.Warning = L"timeline live stop unregisters kernel callbacks and stops collecting live evidence";
                 }
@@ -25642,9 +26464,21 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
                 }
                 plan.Warning = L"timeline export writes a host JSONL evidence file; confirm the path is intended";
             }
-            else if (action == L"clear")
+            else if (action == L"save")
             {
-                plan.Warning = L"timeline clear drops the in-memory evidence store; export first if the evidence must be preserved";
+                if (commandArgs.size() >= 3)
+                {
+                    plan.Target += L" " + commandArgs[2];
+                }
+                plan.Warning = L"timeline save writes a host JSONL evidence file; confirm the path is intended";
+            }
+            else if (action == L"dashboard")
+            {
+                plan.Warning = L"timeline dashboard overwrites the fixed local HTML dashboard and opens it; timeline evidence is not ingested or cleared";
+            }
+            else if (action == L"clear" || action == L"reset")
+            {
+                plan.Warning = L"timeline reset drops the in-memory evidence store; export first if the evidence must be preserved";
             }
             else if (action == L"ingest")
             {
@@ -36729,7 +37563,7 @@ static bool HandleCommand(
         }
         else if (command == L"!timeline")
         {
-            HandleTimelineCommand(args, state, nullptr, &device);
+            HandleTimelineCommand(args, state, nullptr, &device, &symbols);
         }
         else if (command == L"!wnf")
         {
@@ -38451,6 +39285,7 @@ int wmain(int argc, wchar_t** argv)
     } while (false);
 
     g_McpServer.Stop();
+    StopTimelineAutoDrainWorker();
     dbgeng.Shutdown();
     bool cleanupOk = true;
     if (!CleanupByovdFixtureDriverOnExit(state))

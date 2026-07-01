@@ -125,6 +125,7 @@
     <ClCompile Include="ProcessTriageScanner.cpp" />
     <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
+    <ClCompile Include="TimelineDashboard.cpp" />
     <ClCompile Include="TimelineModel.cpp" />
     <ClCompile Include="TimelineSelfTest.cpp" />
     <ClCompile Include="TimelineStore.cpp" />
@@ -176,6 +177,7 @@
     <ClInclude Include="ProcessTriageScanner.h" />
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
+    <ClInclude Include="TimelineDashboard.h" />
     <ClInclude Include="TimelineModel.h" />
     <ClInclude Include="TimelineSelfTest.h" />
     <ClInclude Include="TimelineStore.h" />

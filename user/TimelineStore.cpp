@@ -90,6 +90,164 @@ namespace
         return text;
     }
 
+    bool TimelineTextContainsAny(
+        const std::wstring& text,
+        const wchar_t* const* needles,
+        size_t count,
+        std::wstring* matched)
+    {
+        bool found = false;
+
+        for (size_t index = 0; index < count; ++index)
+        {
+            if (needles[index] != nullptr &&
+                text.find(needles[index]) != std::wstring::npos)
+            {
+                if (matched != nullptr)
+                {
+                    *matched = needles[index];
+                }
+                found = true;
+                break;
+            }
+        }
+
+        return found;
+    }
+
+    std::wstring TiEventClassificationText(const TiEventRecord& event)
+    {
+        std::wstring text = TiTaskText(event);
+        text += L" ";
+        text += event.TaskName;
+        text += L" ";
+        text += event.OpcodeName;
+        text += L" ";
+        text += event.ImagePath;
+        text += L" ";
+        text += event.TargetImageBase;
+        text += L" ";
+        text += event.RawPayloadHex;
+
+        for (const TiPayloadField& field : event.Payload)
+        {
+            text += L" ";
+            text += field.Name;
+            text += L" ";
+            text += field.Value;
+            text += L" ";
+            text += field.TypeName;
+        }
+
+        return TimelineToLower(text);
+    }
+
+    std::wstring TiEventCursorKey(const TiEventRecord& event)
+    {
+        std::wstring key;
+
+        AppendEventKeyPart(&key, event.Timestamp);
+        AppendEventKeyPart(&key, event.ProcessId);
+        AppendEventKeyPart(&key, event.ThreadId);
+        AppendEventKeyPart(&key, event.TargetProcessId);
+        AppendEventKeyPart(&key, static_cast<uint64_t>(event.TaskId));
+        AppendEventKeyPart(&key, static_cast<uint64_t>(event.Version));
+        AppendEventKeyPart(&key, static_cast<uint64_t>(event.Level));
+        AppendEventKeyPart(&key, static_cast<uint64_t>(event.Opcode));
+        AppendEventKeyPart(&key, static_cast<uint64_t>(event.Channel));
+        AppendEventKeyPart(&key, event.Keyword);
+        AppendEventKeyPart(&key, event.TaskName);
+        AppendEventKeyPart(&key, event.OpcodeName);
+        AppendEventKeyPart(&key, event.ImagePath);
+        AppendEventKeyPart(&key, event.TargetImageBase);
+        AppendEventKeyPart(&key, event.RawPayloadHex);
+
+        for (const TiPayloadField& field : event.Payload)
+        {
+            AppendEventKeyPart(&key, field.Name);
+            AppendEventKeyPart(&key, field.Value);
+            AppendEventKeyPart(&key, field.TypeName);
+        }
+
+        return key;
+    }
+
+    struct TiTimelineClassification
+    {
+        std::wstring Risk;
+        std::wstring Category;
+        std::wstring Reason;
+    };
+
+    TiTimelineClassification ClassifyTiTimelineEvent(const TiEventRecord& event)
+    {
+        TiTimelineClassification classification = {};
+        classification.Risk = L"info";
+        classification.Category = L"general";
+        classification.Reason = L"default";
+
+        static const wchar_t* const criticalTerms[] =
+        {
+            L"writevirtualmemory",
+            L"writevm",
+            L"ntwritevirtualmemory",
+            L"queueuserapc",
+            L"setthreadcontext",
+            L"createremotethread",
+            L"terminateprocess",
+            L"suspendprocess",
+            L"processimpairment"
+        };
+        static const wchar_t* const warningTerms[] =
+        {
+            L"allocvm",
+            L"virtualalloc",
+            L"protectvm",
+            L"virtualprotect",
+            L"mapview",
+            L"openprocess",
+            L"duplicatehandle",
+            L"loadimage",
+            L"imageload",
+            L"image-load",
+            L"load image",
+            L"driver",
+            L"deviceiocontrol",
+            L"section"
+        };
+
+        std::wstring text = TiEventClassificationText(event);
+        std::wstring matched;
+        if (TimelineTextContainsAny(
+                text,
+                criticalTerms,
+                sizeof(criticalTerms) / sizeof(criticalTerms[0]),
+                &matched))
+        {
+            classification.Risk = L"critical";
+            classification.Category = L"process-impairment";
+            classification.Reason = matched;
+        }
+        else if (TimelineTextContainsAny(
+                     text,
+                     warningTerms,
+                     sizeof(warningTerms) / sizeof(warningTerms[0]),
+                     &matched))
+        {
+            classification.Risk = L"warning";
+            classification.Category = L"process-or-image-operation";
+            classification.Reason = matched;
+        }
+
+        if (!event.DecodedByTdh && classification.Risk == L"info" && !event.RawPayloadHex.empty())
+        {
+            classification.Category = L"raw-ti-event";
+            classification.Reason = L"raw-payload";
+        }
+
+        return classification;
+    }
+
     bool ParsePidFromText(const std::wstring& text, uint32_t* pid)
     {
         bool ok = false;
@@ -605,6 +763,242 @@ namespace
         return a.Subject < b.Subject;
     }
 
+    uint32_t TimelineAnalysisRiskRank(const std::wstring& risk)
+    {
+        uint32_t rank = 0;
+        std::wstring lowered = TimelineToLower(risk);
+        if (lowered == L"critical" || lowered == L"high")
+        {
+            rank = 4;
+        }
+        else if (lowered == L"medium" || lowered == L"warning")
+        {
+            rank = 3;
+        }
+        else if (lowered == L"low")
+        {
+            rank = 2;
+        }
+        else if (lowered == L"info")
+        {
+            rank = 1;
+        }
+        return rank;
+    }
+
+    bool TimelineAnalysisEventLess(const TimelineEvent& a, const TimelineEvent& b)
+    {
+        bool less = false;
+
+        do
+        {
+            if (a.TimestampFileTime != 0 &&
+                b.TimestampFileTime != 0 &&
+                a.TimestampFileTime != b.TimestampFileTime)
+            {
+                less = a.TimestampFileTime < b.TimestampFileTime;
+                break;
+            }
+            less = a.EventId < b.EventId;
+        } while (false);
+
+        return less;
+    }
+
+    uint64_t TimelineAnalysisDelta100ns(uint64_t a, uint64_t b)
+    {
+        uint64_t delta = static_cast<uint64_t>(-1);
+        if (a != 0 && b != 0)
+        {
+            delta = a >= b ? a - b : b - a;
+        }
+        return delta;
+    }
+
+    std::wstring TimelineAnalysisDeltaMsText(uint64_t delta100ns)
+    {
+        std::wstring text;
+        if (delta100ns != static_cast<uint64_t>(-1))
+        {
+            text = std::to_wstring(delta100ns / 10000);
+        }
+        return text;
+    }
+
+    std::wstring TimelineThreadKey(uint32_t pid, uint32_t tid)
+    {
+        return std::to_wstring(pid) + L":" + std::to_wstring(tid);
+    }
+
+    bool TimelineActionIs(const TimelineEvent& event, const std::wstring& action)
+    {
+        return TimelineToLower(event.Action) == action;
+    }
+
+    bool TimelineEventIsProcessCreate(const TimelineEvent& event)
+    {
+        return TimelineToLower(event.Domain) == L"process" &&
+            TimelineActionIs(event, L"process-create");
+    }
+
+    bool TimelineEventIsProcessExit(const TimelineEvent& event)
+    {
+        return TimelineToLower(event.Domain) == L"process" &&
+            TimelineActionIs(event, L"process-exit");
+    }
+
+    bool TimelineEventIsThreadCreate(const TimelineEvent& event)
+    {
+        return TimelineToLower(event.Domain) == L"thread" &&
+            TimelineActionIs(event, L"thread-create");
+    }
+
+    bool TimelineEventIsThreadExit(const TimelineEvent& event)
+    {
+        return TimelineToLower(event.Domain) == L"thread" &&
+            TimelineActionIs(event, L"thread-exit");
+    }
+
+    bool TimelineEventIsImageLoad(const TimelineEvent& event)
+    {
+        return TimelineToLower(event.Domain) == L"image" &&
+            TimelineActionIs(event, L"image-load");
+    }
+
+    bool TimelineEventIsRiskyTi(const TimelineEvent& event)
+    {
+        bool risky = false;
+        if (TimelineToLower(event.Source) == L"ti" &&
+            TimelineAnalysisRiskRank(event.Risk) >= 3)
+        {
+            risky = true;
+        }
+        return risky;
+    }
+
+    uint32_t TimelineCorrelationPid(const TimelineEvent& event)
+    {
+        uint32_t pid = event.TargetProcessId;
+        if (pid == 0)
+        {
+            pid = event.ProcessId;
+        }
+        return pid;
+    }
+
+    bool TimelineAnalysisFindingLess(
+        const TimelineAnalysisFinding& a,
+        const TimelineAnalysisFinding& b)
+    {
+        uint32_t ra = TimelineAnalysisRiskRank(a.Risk);
+        uint32_t rb = TimelineAnalysisRiskRank(b.Risk);
+        if (ra != rb)
+        {
+            return ra > rb;
+        }
+        if (a.FirstEventId != b.FirstEventId)
+        {
+            return a.FirstEventId < b.FirstEventId;
+        }
+        if (a.Kind != b.Kind)
+        {
+            return a.Kind < b.Kind;
+        }
+        return a.Summary < b.Summary;
+    }
+
+    void AddShortLifetimeFinding(
+        std::vector<TimelineAnalysisFinding>* findings,
+        const TimelineEvent& startEvent,
+        const TimelineEvent& endEvent,
+        const std::wstring& kind,
+        const std::wstring& risk,
+        uint64_t threshold100ns)
+    {
+        do
+        {
+            if (findings == nullptr ||
+                startEvent.TimestampFileTime == 0 ||
+                endEvent.TimestampFileTime == 0)
+            {
+                break;
+            }
+
+            uint64_t delta = TimelineAnalysisDelta100ns(
+                startEvent.TimestampFileTime,
+                endEvent.TimestampFileTime);
+            if (delta > threshold100ns)
+            {
+                break;
+            }
+
+            TimelineAnalysisFinding finding = {};
+            finding.Kind = kind;
+            finding.Risk = risk;
+            finding.Confidence = L"event-backed";
+            finding.FirstEventId = startEvent.EventId;
+            finding.LastEventId = endEvent.EventId;
+            finding.ProcessId = startEvent.ProcessId != 0 ? startEvent.ProcessId : endEvent.ProcessId;
+            finding.ThreadId = startEvent.ThreadId != 0 ? startEvent.ThreadId : endEvent.ThreadId;
+            finding.Summary = kind + L" pid=" + std::to_wstring(finding.ProcessId);
+            if (finding.ThreadId != 0)
+            {
+                finding.Summary += L" tid=" + std::to_wstring(finding.ThreadId);
+            }
+            finding.Evidence[L"delta_ms"] = TimelineAnalysisDeltaMsText(delta);
+            finding.Evidence[L"start_action"] = startEvent.Action;
+            finding.Evidence[L"end_action"] = endEvent.Action;
+            findings->push_back(std::move(finding));
+        } while (false);
+    }
+
+    void AddCorrelationFinding(
+        std::vector<TimelineAnalysisFinding>* findings,
+        const TimelineEvent& tiEvent,
+        const TimelineEvent& liveEvent,
+        const std::wstring& kind,
+        uint64_t threshold100ns)
+    {
+        do
+        {
+            if (findings == nullptr ||
+                tiEvent.TimestampFileTime == 0 ||
+                liveEvent.TimestampFileTime == 0)
+            {
+                break;
+            }
+
+            uint64_t delta = TimelineAnalysisDelta100ns(
+                tiEvent.TimestampFileTime,
+                liveEvent.TimestampFileTime);
+            if (delta > threshold100ns)
+            {
+                break;
+            }
+
+            TimelineAnalysisFinding finding = {};
+            finding.Kind = kind;
+            finding.Risk = TimelineAnalysisRiskRank(tiEvent.Risk) >= 4 ? L"critical" : L"warning";
+            finding.Confidence = L"correlated";
+            finding.FirstEventId = std::min(tiEvent.EventId, liveEvent.EventId);
+            finding.LastEventId = std::max(tiEvent.EventId, liveEvent.EventId);
+            finding.ProcessId = liveEvent.ProcessId;
+            finding.ThreadId = liveEvent.ThreadId;
+            finding.TargetProcessId = tiEvent.TargetProcessId;
+            finding.Summary = kind + L" pid=" + std::to_wstring(TimelineCorrelationPid(tiEvent));
+            finding.Evidence[L"delta_ms"] = TimelineAnalysisDeltaMsText(delta);
+            finding.Evidence[L"ti_action"] = tiEvent.Action;
+            finding.Evidence[L"ti_event_id"] = std::to_wstring(tiEvent.EventId);
+            finding.Evidence[L"live_action"] = liveEvent.Action;
+            finding.Evidence[L"live_event_id"] = std::to_wstring(liveEvent.EventId);
+            if (!liveEvent.Entity.empty())
+            {
+                finding.Evidence[L"live_entity"] = liveEvent.Entity;
+            }
+            findings->push_back(std::move(finding));
+        } while (false);
+    }
+
     void AddTimelineGraphEvent(
         const TimelineEvent& event,
         std::map<std::wstring, TimelineGraphNode>* nodes,
@@ -707,6 +1101,9 @@ void TimelineStore::Clear()
     EventKeys.clear();
     NextEventId = 1;
     DroppedEvents = 0;
+    TiRecentCursorInitialized = false;
+    TiRecentCursorTimestamp = 0;
+    TiRecentCursorBoundaryKeys.clear();
 }
 
 void TimelineStore::SetCapacity(size_t capacity)
@@ -746,23 +1143,49 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
     const std::wstring& mode)
 {
     TimelineIngestResult result = {};
-    result.SourceRecords = events.size();
 
     std::lock_guard<std::mutex> lock(Mutex);
     uint64_t beforeDropped = DroppedEvents;
+    bool useCursor = TimelineToLower(mode) != L"all";
+    size_t skippedByCursor = 0;
+    uint64_t maxTimestamp = TiRecentCursorTimestamp;
+    std::set<std::wstring> maxTimestampKeys = TiRecentCursorBoundaryKeys;
 
     for (const TiEventRecord& item : events)
     {
+        std::wstring cursorKey;
+        if (useCursor &&
+            TiRecentCursorInitialized &&
+            item.Timestamp != 0)
+        {
+            if (item.Timestamp < TiRecentCursorTimestamp)
+            {
+                ++skippedByCursor;
+                continue;
+            }
+            if (item.Timestamp == TiRecentCursorTimestamp)
+            {
+                cursorKey = TiEventCursorKey(item);
+                if (TiRecentCursorBoundaryKeys.find(cursorKey) != TiRecentCursorBoundaryKeys.end())
+                {
+                    ++skippedByCursor;
+                    continue;
+                }
+            }
+        }
+
+        ++result.SourceRecords;
+
         TimelineEvent event = {};
         event.TimestampFileTime = item.Timestamp;
         event.Source = L"ti";
         event.Domain = L"threat-intelligence";
-        event.Action = L"event";
+        event.Action = TiTaskText(item);
         event.ProcessId = item.ProcessId;
         event.ThreadId = item.ThreadId;
         event.TargetProcessId = item.TargetProcessId;
-        event.Entity = TiTaskText(item);
-        event.Summary = TiTaskText(item);
+        event.Entity = event.Action;
+        event.Summary = event.Action;
         if (!item.ImagePath.empty())
         {
             event.Summary += L" image=" + item.ImagePath;
@@ -771,9 +1194,14 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
         {
             event.Summary += L" target_pid=" + std::to_wstring(item.TargetProcessId);
         }
-        event.Risk = L"info";
+
+        TiTimelineClassification classification = ClassifyTiTimelineEvent(item);
+        event.Risk = classification.Risk;
         event.Confidence = item.DecodedByTdh ? L"tdh-decoded" : L"raw";
         event.Evidence[L"mode"] = mode;
+        event.Evidence[L"ti_action"] = event.Action;
+        event.Evidence[L"classification"] = classification.Category;
+        event.Evidence[L"classification_reason"] = classification.Reason;
         event.Evidence[L"task_id"] = std::to_wstring(static_cast<uint32_t>(item.TaskId));
         event.Evidence[L"level"] = std::to_wstring(static_cast<uint32_t>(item.Level));
         event.Evidence[L"opcode"] = std::to_wstring(static_cast<uint32_t>(item.Opcode));
@@ -806,6 +1234,43 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
         {
             ++result.Added;
         }
+
+        if (item.Timestamp > maxTimestamp)
+        {
+            maxTimestamp = item.Timestamp;
+            maxTimestampKeys.clear();
+        }
+        if (item.Timestamp != 0 && item.Timestamp == maxTimestamp)
+        {
+            if (cursorKey.empty())
+            {
+                cursorKey = TiEventCursorKey(item);
+            }
+            maxTimestampKeys.insert(cursorKey);
+        }
+    }
+
+    if (maxTimestamp > TiRecentCursorTimestamp)
+    {
+        TiRecentCursorTimestamp = maxTimestamp;
+        TiRecentCursorBoundaryKeys = std::move(maxTimestampKeys);
+        TiRecentCursorInitialized = true;
+    }
+    else if (!TiRecentCursorInitialized && result.SourceRecords != 0)
+    {
+        TiRecentCursorInitialized = true;
+        TiRecentCursorBoundaryKeys = std::move(maxTimestampKeys);
+    }
+    else if (TiRecentCursorInitialized && maxTimestamp == TiRecentCursorTimestamp)
+    {
+        TiRecentCursorBoundaryKeys = std::move(maxTimestampKeys);
+    }
+
+    if (skippedByCursor != 0)
+    {
+        result.Warnings.push_back(
+            L"ti recent cursor skipped " + std::to_wstring(skippedByCursor) +
+            L" previously ingested ring records; use '!timeline ingest ti all' to rescan the ring");
     }
 
     result.Dropped = DroppedEvents - beforeDropped;
@@ -1224,6 +1689,203 @@ TimelineReconcileResult TimelineStore::ReconcileSnapshot(
     if (options.Limit != 0 && result.Findings.size() > options.Limit)
     {
         result.Findings.resize(options.Limit);
+        result.Truncated = true;
+    }
+
+    return result;
+}
+
+TimelineAnalysisResult TimelineStore::AnalyzeLiveSignals(size_t limit) const
+{
+    static const uint64_t kShortProcessLifetime100ns = 2ull * 1000ull * 1000ull * 10ull;
+    static const uint64_t kShortThreadLifetime100ns = 500ull * 1000ull * 10ull;
+    static const uint64_t kCorrelationWindow100ns = 5ull * 1000ull * 1000ull * 10ull;
+
+    TimelineAnalysisResult result = {};
+    result.Limit = limit;
+    const size_t hardFindingLimit = limit == 0 ? 4096 : std::max<size_t>(limit * 4, 256);
+    std::vector<TimelineEvent> events = AllEvents();
+    result.TotalEvents = events.size();
+
+    std::sort(events.begin(), events.end(), TimelineAnalysisEventLess);
+
+    std::map<uint32_t, TimelineEvent> processCreates;
+    std::map<std::wstring, TimelineEvent> threadCreates;
+    std::map<uint32_t, std::vector<const TimelineEvent*>> threadActivityByPid;
+    std::map<uint32_t, std::vector<const TimelineEvent*>> imageLoadsByPid;
+    std::vector<const TimelineEvent*> tiEvents;
+
+    for (const TimelineEvent& event : events)
+    {
+        if (TimelineEventIsProcessCreate(event) && event.ProcessId != 0)
+        {
+            processCreates[event.ProcessId] = event;
+        }
+        else if (TimelineEventIsProcessExit(event) && event.ProcessId != 0)
+        {
+            auto it = processCreates.find(event.ProcessId);
+            if (it != processCreates.end())
+            {
+                if (result.Findings.size() < hardFindingLimit)
+                {
+                    AddShortLifetimeFinding(
+                        &result.Findings,
+                        it->second,
+                        event,
+                        L"short-lived-process",
+                        L"medium",
+                        kShortProcessLifetime100ns);
+                }
+                else
+                {
+                    result.Truncated = true;
+                }
+                processCreates.erase(it);
+            }
+        }
+
+        if (TimelineEventIsThreadCreate(event) && event.ProcessId != 0 && event.ThreadId != 0)
+        {
+            threadCreates[TimelineThreadKey(event.ProcessId, event.ThreadId)] = event;
+            threadActivityByPid[event.ProcessId].push_back(&event);
+        }
+        else if (TimelineEventIsThreadExit(event) && event.ProcessId != 0 && event.ThreadId != 0)
+        {
+            std::wstring key = TimelineThreadKey(event.ProcessId, event.ThreadId);
+            auto it = threadCreates.find(key);
+            if (it != threadCreates.end())
+            {
+                if (result.Findings.size() < hardFindingLimit)
+                {
+                    AddShortLifetimeFinding(
+                        &result.Findings,
+                        it->second,
+                        event,
+                        L"short-lived-thread",
+                        L"medium",
+                        kShortThreadLifetime100ns);
+                }
+                else
+                {
+                    result.Truncated = true;
+                }
+                threadCreates.erase(it);
+            }
+            threadActivityByPid[event.ProcessId].push_back(&event);
+        }
+
+        if (TimelineEventIsImageLoad(event) && event.ProcessId != 0)
+        {
+            imageLoadsByPid[event.ProcessId].push_back(&event);
+        }
+
+        if (TimelineEventIsRiskyTi(event))
+        {
+            tiEvents.push_back(&event);
+        }
+    }
+
+    auto eventPointerLess = [](const TimelineEvent* a, const TimelineEvent* b) -> bool
+    {
+        return TimelineAnalysisEventLess(*a, *b);
+    };
+    for (auto& item : threadActivityByPid)
+    {
+        std::sort(item.second.begin(), item.second.end(), eventPointerLess);
+    }
+    for (auto& item : imageLoadsByPid)
+    {
+        std::sort(item.second.begin(), item.second.end(), eventPointerLess);
+    }
+
+    auto addNearbyEvents =
+        [&result, hardFindingLimit](
+            const TimelineEvent& tiEvent,
+            const std::vector<const TimelineEvent*>& liveEvents,
+            const std::wstring& kind)
+    {
+        if (tiEvent.TimestampFileTime == 0)
+        {
+            return;
+        }
+
+        uint64_t minTime = 0;
+        if (tiEvent.TimestampFileTime > kCorrelationWindow100ns)
+        {
+            minTime = tiEvent.TimestampFileTime - kCorrelationWindow100ns;
+        }
+        uint64_t maxTime = static_cast<uint64_t>(-1);
+        if (tiEvent.TimestampFileTime <= static_cast<uint64_t>(-1) - kCorrelationWindow100ns)
+        {
+            maxTime = tiEvent.TimestampFileTime + kCorrelationWindow100ns;
+        }
+
+        auto it = std::lower_bound(
+            liveEvents.begin(),
+            liveEvents.end(),
+            minTime,
+            [](const TimelineEvent* event, uint64_t timestamp) -> bool
+            {
+                return event->TimestampFileTime < timestamp;
+            });
+
+        while (it != liveEvents.end())
+        {
+            const TimelineEvent* liveEvent = *it;
+            if (liveEvent == nullptr || liveEvent->TimestampFileTime > maxTime)
+            {
+                break;
+            }
+            if (result.Findings.size() >= hardFindingLimit)
+            {
+                result.Truncated = true;
+                break;
+            }
+            AddCorrelationFinding(
+                &result.Findings,
+                tiEvent,
+                *liveEvent,
+                kind,
+                kCorrelationWindow100ns);
+            ++it;
+        }
+    };
+
+    for (const TimelineEvent* tiEvent : tiEvents)
+    {
+        if (tiEvent == nullptr)
+        {
+            continue;
+        }
+        if (result.Findings.size() >= hardFindingLimit)
+        {
+            result.Truncated = true;
+            break;
+        }
+
+        uint32_t pid = TimelineCorrelationPid(*tiEvent);
+        if (pid == 0)
+        {
+            continue;
+        }
+
+        auto threadIt = threadActivityByPid.find(pid);
+        if (threadIt != threadActivityByPid.end())
+        {
+            addNearbyEvents(*tiEvent, threadIt->second, L"ti-near-thread-activity");
+        }
+
+        auto imageIt = imageLoadsByPid.find(pid);
+        if (imageIt != imageLoadsByPid.end())
+        {
+            addNearbyEvents(*tiEvent, imageIt->second, L"ti-near-image-load");
+        }
+    }
+
+    std::sort(result.Findings.begin(), result.Findings.end(), TimelineAnalysisFindingLess);
+    if (limit != 0 && result.Findings.size() > limit)
+    {
+        result.Findings.resize(limit);
         result.Truncated = true;
     }
 

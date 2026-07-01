@@ -57,6 +57,7 @@ static KSPIN_LOCK g_KnDbgTimelineLock;
 static volatile LONG g_KnDbgTimelineEnabled = 0;
 static BOOLEAN g_KnDbgTimelineProcessRegistered = FALSE;
 static BOOLEAN g_KnDbgTimelineImageRegistered = FALSE;
+static BOOLEAN g_KnDbgTimelineThreadRegistered = FALSE;
 static KNDBG_TIMELINE_EVENT_RECORD* g_KnDbgTimelineRing = nullptr;
 static ULONG g_KnDbgTimelineCapacity = 0;
 static ULONG g_KnDbgTimelineHead = 0;
@@ -74,6 +75,10 @@ static VOID KnDbgTimelineImageNotify(
     PUNICODE_STRING FullImageName,
     HANDLE ProcessId,
     PIMAGE_INFO ImageInfo);
+static VOID KnDbgTimelineThreadNotify(
+    HANDLE ProcessId,
+    HANDLE ThreadId,
+    BOOLEAN Create);
 
 typedef struct _KNDBG_TLB_FLUSH_CONTEXT
 {
@@ -390,6 +395,11 @@ static void KnDbgTimelineUnregisterCallbacks()
 {
     InterlockedExchange(&g_KnDbgTimelineEnabled, 0);
 
+    if (g_KnDbgTimelineThreadRegistered != FALSE)
+    {
+        PsRemoveCreateThreadNotifyRoutine(KnDbgTimelineThreadNotify);
+        g_KnDbgTimelineThreadRegistered = FALSE;
+    }
     if (g_KnDbgTimelineProcessRegistered != FALSE)
     {
         PsSetCreateProcessNotifyRoutineEx(KnDbgTimelineProcessNotify, TRUE);
@@ -408,7 +418,9 @@ static NTSTATUS KnDbgTimelineRegisterCallbacks()
 
     do
     {
-        if (g_KnDbgTimelineProcessRegistered != FALSE || g_KnDbgTimelineImageRegistered != FALSE)
+        if (g_KnDbgTimelineProcessRegistered != FALSE ||
+            g_KnDbgTimelineImageRegistered != FALSE ||
+            g_KnDbgTimelineThreadRegistered != FALSE)
         {
             status = STATUS_SUCCESS;
             break;
@@ -428,6 +440,15 @@ static NTSTATUS KnDbgTimelineRegisterCallbacks()
             break;
         }
         g_KnDbgTimelineImageRegistered = TRUE;
+
+        status = PsSetCreateThreadNotifyRoutine(KnDbgTimelineThreadNotify);
+        if (!NT_SUCCESS(status))
+        {
+            KnDbgTimelineUnregisterCallbacks();
+            break;
+        }
+        g_KnDbgTimelineThreadRegistered = TRUE;
+
         InterlockedExchange(&g_KnDbgTimelineEnabled, 1);
         status = STATUS_SUCCESS;
     } while (false);
@@ -460,6 +481,24 @@ static VOID KnDbgTimelineProcessNotify(
     {
         record.Type = KNDBG_TIMELINE_EVENT_PROCESS_EXIT;
     }
+
+    KnDbgTimelinePushEvent(&record);
+}
+
+static VOID KnDbgTimelineThreadNotify(
+    HANDLE ProcessId,
+    HANDLE ThreadId,
+    BOOLEAN Create)
+{
+    KNDBG_TIMELINE_EVENT_RECORD record = {};
+    LARGE_INTEGER now = {};
+    KeQuerySystemTime(&now);
+
+    record.Size = sizeof(record);
+    record.Type = Create != FALSE ? KNDBG_TIMELINE_EVENT_THREAD_CREATE : KNDBG_TIMELINE_EVENT_THREAD_EXIT;
+    record.Timestamp100ns = static_cast<KNDBG_UINT64>(now.QuadPart);
+    record.ProcessId = HandleToULong(ProcessId);
+    record.ThreadId = HandleToULong(ThreadId);
 
     KnDbgTimelinePushEvent(&record);
 }
@@ -1402,6 +1441,10 @@ static NTSTATUS KnDbgHandleTimelineStatus(PIRP Irp, PIO_STACK_LOCATION Stack, PV
         {
             response->Flags |= KNDBG_TIMELINE_STATUS_IMAGE_CALLBACK;
         }
+        if (g_KnDbgTimelineThreadRegistered != FALSE)
+        {
+            response->Flags |= KNDBG_TIMELINE_STATUS_THREAD_CALLBACK;
+        }
 
         information = sizeof(*response);
         status = STATUS_SUCCESS;
@@ -2107,6 +2150,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         g_KnDbgTimelineEnabled = 0;
         g_KnDbgTimelineProcessRegistered = FALSE;
         g_KnDbgTimelineImageRegistered = FALSE;
+        g_KnDbgTimelineThreadRegistered = FALSE;
         g_KnDbgTimelineRing = nullptr;
         g_KnDbgTimelineCapacity = 0;
         g_KnDbgTimelineHead = 0;
