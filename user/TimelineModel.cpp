@@ -300,3 +300,50 @@ std::wstring BuildTimelineReconcileJson(const TimelineReconcileResult& result)
     out += L"]}";
     return out;
 }
+
+std::wstring BuildTimelineAnalysisJson(const TimelineAnalysisResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.timeline-analysis.v1\"";
+    out += L",\"totalEvents\":" + std::to_wstring(result.TotalEvents);
+    out += L",\"limit\":" + std::to_wstring(result.Limit);
+    out += L",\"truncated\":";
+    out += result.Truncated ? L"true" : L"false";
+    out += L",\"findings\":[";
+    for (size_t i = 0; i < result.Findings.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        const TimelineAnalysisFinding& finding = result.Findings[i];
+        out += L"{\"kind\":" + mcpjson::Quote(finding.Kind);
+        out += L",\"risk\":" + mcpjson::Quote(finding.Risk);
+        out += L",\"confidence\":" + mcpjson::Quote(finding.Confidence);
+        out += L",\"summary\":" + mcpjson::Quote(finding.Summary);
+        if (finding.FirstEventId != 0)
+        {
+            out += L",\"firstEventId\":" + std::to_wstring(finding.FirstEventId);
+        }
+        if (finding.LastEventId != 0)
+        {
+            out += L",\"lastEventId\":" + std::to_wstring(finding.LastEventId);
+        }
+        if (finding.ProcessId != 0)
+        {
+            out += L",\"pid\":" + std::to_wstring(finding.ProcessId);
+        }
+        if (finding.ThreadId != 0)
+        {
+            out += L",\"tid\":" + std::to_wstring(finding.ThreadId);
+        }
+        if (finding.TargetProcessId != 0)
+        {
+            out += L",\"targetPid\":" + std::to_wstring(finding.TargetProcessId);
+        }
+        out += L",\"evidence\":";
+        AppendJsonStringMap(&out, finding.Evidence);
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}

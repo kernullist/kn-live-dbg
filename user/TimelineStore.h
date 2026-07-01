@@ -40,6 +40,7 @@ public:
     TimelineReconcileResult ReconcileSnapshot(
         const SnapshotDocument& document,
         const TimelineReconcileOptions& options) const;
+    TimelineAnalysisResult AnalyzeLiveSignals(size_t limit) const;
     TimelineStats GetStats() const;
     bool ExportJsonl(const std::wstring& path, std::wstring* error) const;
 
@@ -54,5 +55,8 @@ private:
     std::set<std::wstring> EventKeys;
     uint64_t NextEventId = 1;
     uint64_t DroppedEvents = 0;
+    bool TiRecentCursorInitialized = false;
+    uint64_t TiRecentCursorTimestamp = 0;
+    std::set<std::wstring> TiRecentCursorBoundaryKeys;
     size_t MaxEvents = 262144;
 };

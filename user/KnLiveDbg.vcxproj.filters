@@ -91,6 +91,9 @@
     <ClCompile Include="ThreatIntelSubscriber.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TimelineDashboard.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="TimelineModel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -220,6 +223,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ThreatIntelSubscriber.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TimelineDashboard.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TimelineModel.h">

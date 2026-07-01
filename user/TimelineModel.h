@@ -126,6 +126,28 @@ struct TimelineReconcileResult
     std::vector<TimelineReconcileFinding> Findings;
 };
 
+struct TimelineAnalysisFinding
+{
+    std::wstring Kind;
+    std::wstring Risk;
+    std::wstring Confidence;
+    std::wstring Summary;
+    uint64_t FirstEventId = 0;
+    uint64_t LastEventId = 0;
+    uint32_t ProcessId = 0;
+    uint32_t ThreadId = 0;
+    uint32_t TargetProcessId = 0;
+    std::map<std::wstring, std::wstring> Evidence;
+};
+
+struct TimelineAnalysisResult
+{
+    uint64_t TotalEvents = 0;
+    size_t Limit = 0;
+    bool Truncated = false;
+    std::vector<TimelineAnalysisFinding> Findings;
+};
+
 std::wstring TimelineToLower(const std::wstring& value);
 std::wstring TimelineEventToJson(const TimelineEvent& event);
 std::wstring BuildTimelineEventsJson(
@@ -136,3 +158,4 @@ std::wstring BuildTimelineStatusJson(const TimelineStats& stats);
 std::wstring BuildTimelineJsonl(const std::vector<TimelineEvent>& events);
 std::wstring BuildTimelineGraphJson(const TimelineGraphResult& graph);
 std::wstring BuildTimelineReconcileJson(const TimelineReconcileResult& result);
+std::wstring BuildTimelineAnalysisJson(const TimelineAnalysisResult& result);
