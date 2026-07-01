@@ -1747,7 +1747,10 @@ TimelineAnalysisResult TimelineStore::AnalyzeLiveSignals(size_t limit) const
         if (TimelineEventIsThreadCreate(event) && event.ProcessId != 0 && event.ThreadId != 0)
         {
             threadCreates[TimelineThreadKey(event.ProcessId, event.ThreadId)] = event;
-            threadActivityByPid[event.ProcessId].push_back(&event);
+            if (event.TimestampFileTime != 0)
+            {
+                threadActivityByPid[event.ProcessId].push_back(&event);
+            }
         }
         else if (TimelineEventIsThreadExit(event) && event.ProcessId != 0 && event.ThreadId != 0)
         {
@@ -1771,10 +1774,13 @@ TimelineAnalysisResult TimelineStore::AnalyzeLiveSignals(size_t limit) const
                 }
                 threadCreates.erase(it);
             }
-            threadActivityByPid[event.ProcessId].push_back(&event);
+            if (event.TimestampFileTime != 0)
+            {
+                threadActivityByPid[event.ProcessId].push_back(&event);
+            }
         }
 
-        if (TimelineEventIsImageLoad(event) && event.ProcessId != 0)
+        if (TimelineEventIsImageLoad(event) && event.ProcessId != 0 && event.TimestampFileTime != 0)
         {
             imageLoadsByPid[event.ProcessId].push_back(&event);
         }
