@@ -1200,6 +1200,19 @@ function visibleFindings(events) {
   });
 }
 
+function selectableFindingEventId(finding) {
+  const eventIds = new Set(KN_DATA.events.map((event) => String(event.eventId)));
+  const last = String(finding.lastEventId || "");
+  const first = String(finding.firstEventId || "");
+  if (last && eventIds.has(last)) {
+    return last;
+  }
+  if (first && eventIds.has(first)) {
+    return first;
+  }
+  return "";
+}
+
 function renderFindings(events) {
   const container = byId("findingFocus");
   const findings = visibleFindings(events);
@@ -1210,13 +1223,18 @@ function renderFindings(events) {
 
   container.innerHTML = findings.slice(0, 10).map((finding) =>
     "<button class=\"finding-card\" type=\"button\" data-event-id=\"" +
-    escapeHtml(finding.lastEventId || finding.firstEventId || "") + "\">" +
+    escapeHtml(selectableFindingEventId(finding)) + "\">" +
     "<div class=\"finding-title\">" + escapeHtml(finding.kind || "finding") + "</div>" +
     "<div class=\"finding-sub\">" + escapeHtml(finding.risk || "info") +
     " | " + escapeHtml(finding.summary || "") + "</div></button>"
   ).join("");
   container.querySelectorAll("[data-event-id]").forEach((element) => {
-    element.addEventListener("click", () => selectEvent(element.getAttribute("data-event-id")));
+    element.addEventListener("click", () => {
+      const eventId = element.getAttribute("data-event-id");
+      if (eventId) {
+        selectEvent(eventId);
+      }
+    });
   });
 }
 

@@ -404,6 +404,7 @@ int RunTimelineSelfTest()
                 dashboardHtml.find(L"function exportJsonl()") != std::wstring::npos &&
                 dashboardHtml.find(L"function renderLiveStatus") != std::wstring::npos &&
                 dashboardHtml.find(L"function renderFindings") != std::wstring::npos &&
+                dashboardHtml.find(L"function selectableFindingEventId") != std::wstring::npos &&
                 dashboardHtml.find(L"function relatedEvents") != std::wstring::npos &&
                 dashboardHtml.find(L"Related Events") != std::wstring::npos &&
                 dashboardHtml.find(L"application/jsonl;charset=utf-8") != std::wstring::npos &&
