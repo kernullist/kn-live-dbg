@@ -58,6 +58,8 @@ struct TiSubscriberStats
     uint64_t EventsLogged = 0;
     uint64_t LogBytesWritten = 0;
     uint32_t LogRotations = 0;
+    uint64_t MatchAnyKeyword = 0;
+    uint64_t MatchAllKeyword = 0;
     uint64_t StartTickMs = 0;          // GetTickCount64 at Start
     uint64_t LastEventTickMs = 0;
 };

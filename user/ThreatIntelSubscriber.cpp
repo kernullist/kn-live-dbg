@@ -28,6 +28,8 @@ static const GUID kThreatIntelligenceProviderGuid =
 
 static const wchar_t* kDefaultSessionName = L"KnLiveDbg-Ti";
 static const wchar_t* kDefaultLogBaseName = L"ti-events";
+static constexpr ULONGLONG kThreatIntelMatchAnyKeyword = 0;
+static constexpr ULONGLONG kThreatIntelMatchAllKeyword = 0;
 
 namespace
 {
@@ -390,8 +392,8 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         &kThreatIntelligenceProviderGuid,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
         TRACE_LEVEL_VERBOSE,
-        0xFFFFFFFFFFFFFFFFull, // all keywords
-        0,
+        kThreatIntelMatchAnyKeyword,
+        kThreatIntelMatchAllKeyword,
         0,
         nullptr);
 
@@ -1305,6 +1307,8 @@ TiSubscriberStats TiSubscriber::SnapshotStats() const
     s.EventsLogged = Stats.EventsLogged.load(std::memory_order_relaxed);
     s.LogBytesWritten = Stats.LogBytesWritten.load(std::memory_order_relaxed);
     s.LogRotations = Stats.LogRotations.load(std::memory_order_relaxed);
+    s.MatchAnyKeyword = kThreatIntelMatchAnyKeyword;
+    s.MatchAllKeyword = kThreatIntelMatchAllKeyword;
     s.StartTickMs = Stats.StartTickMs.load(std::memory_order_relaxed);
     s.LastEventTickMs = Stats.LastEventTickMs.load(std::memory_order_relaxed);
     return s;

@@ -8179,6 +8179,15 @@ static void HandleDiffCommand(
         }
 
         PrintSnapshotDiff(diff, options);
+        TimelineIngestResult timelineDiff = state.Timeline.IngestSnapshotDiff(diff, L"!diff");
+        if (timelineDiff.Added != 0 || timelineDiff.Dropped != 0)
+        {
+            PrintColoredText(L"[timeline.ingest]", KNDBG_COLOR_TITLE);
+            std::wcout << L" source=snapshot-diff"
+                       << L" source_records=" << timelineDiff.SourceRecords
+                       << L" added=" << timelineDiff.Added
+                       << L" dropped=" << timelineDiff.Dropped << L"\n";
+        }
     } while (false);
 }
 
@@ -16929,11 +16938,16 @@ static void HandleTiCommand(
 
             PrintColoredText(L"[ti]", KNDBG_COLOR_TITLE);
             std::wcout << L" subscribed to Microsoft-Windows-Threat-Intelligence (all tasks)\n";
+            TiSubscriberStats startStats = sub.SnapshotStats();
             TiOptions current = sub.CurrentOptions();
             std::wcout << L"     log directory=" << current.LogDirectory
                        << L" base=" << current.LogBaseName
                        << L" rotate=" << (current.LogRotateBytes >> 20) << L"MB x "
                        << current.LogRotateCount << L"\n";
+            std::wcout << L"     provider keywords=all match_any=0x"
+                       << std::hex << startStats.MatchAnyKeyword
+                       << L" match_all=0x" << startStats.MatchAllKeyword
+                       << std::dec << L"\n";
             std::wcout << L"     ring=" << current.RingCapacity
                        << L" throttle=" << current.ThrottlePerSecond << L"/s self_pid="
                        << current.SelfPid << L"\n";
@@ -16994,6 +17008,10 @@ static void HandleTiCommand(
             std::wcout << L"  logged=" << s.EventsLogged
                        << L" log_bytes=" << s.LogBytesWritten
                        << L" rotations=" << s.LogRotations << L"\n";
+            std::wcout << L"  provider keywords=all match_any=0x"
+                       << std::hex << s.MatchAnyKeyword
+                       << L" match_all=0x" << s.MatchAllKeyword
+                       << std::dec << L"\n";
             std::wcout << L"  watch:";
             for (uint32_t p : opt.WatchPids)
             {
@@ -17500,13 +17518,14 @@ static void PrintTimelineStatus(const TimelineStats& stats)
     }
     else
     {
-        std::wcout << L" !timeline query | !timeline graph | !timeline reconcile snapshot";
+        std::wcout << L" !timeline dashboard | !timeline query | !timeline graph | !timeline reconcile snapshot";
     }
     if (stats.Dropped != 0)
     {
         std::wcout << L" (loss caveat: dropped events present)";
     }
     std::wcout << L"\n";
+    std::wcout << L"  dashboard: !timeline dashboard (visual timeline, filters, relationships, JSONL export)\n";
 }
 
 static void PrintTimelineIngestResult(const std::wstring& source, const TimelineIngestResult& result)
@@ -17589,6 +17608,26 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     {
         event.Summary += L" tid=" + std::to_wstring(live.ThreadId);
     }
+    if (event.Domain == L"thread" && live.CreatorProcessId != 0)
+    {
+        event.Summary += L" creator_pid=" + std::to_wstring(live.CreatorProcessId);
+        event.Evidence[L"creator_pid"] = std::to_wstring(live.CreatorProcessId);
+        event.Evidence[L"source_pid"] = std::to_wstring(live.CreatorProcessId);
+        if (live.CreatorThreadId != 0)
+        {
+            event.Summary += L" creator_tid=" + std::to_wstring(live.CreatorThreadId);
+            event.Evidence[L"creator_tid"] = std::to_wstring(live.CreatorThreadId);
+        }
+        if (live.CreatorProcessId != 0 && live.CreatorProcessId != live.ProcessId)
+        {
+            event.Risk = L"warning";
+            event.Evidence[L"remote_thread"] = L"true";
+            event.Evidence[L"target_pid"] = std::to_wstring(live.ProcessId);
+            event.Evidence[L"cross_process_operation"] = L"createremotethread";
+            event.Evidence[L"analysis_family"] = L"cross-process";
+            event.Evidence[L"timeline_category"] = L"cross-process";
+        }
+    }
     if (live.ParentProcessId != 0)
     {
         event.Summary += L" parent_pid=" + std::to_wstring(live.ParentProcessId);
@@ -17611,7 +17650,10 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     {
         event.Evidence[L"file_object"] = HexTextWidth(live.FileObject, 16, true);
     }
-    event.Risk = L"info";
+    if (event.Risk.empty())
+    {
+        event.Risk = L"info";
+    }
     event.Confidence = L"kernel-callback";
     event.Evidence[L"sequence"] = std::to_wstring(live.Sequence);
     event.Evidence[L"type"] = std::to_wstring(live.Type);
@@ -18362,6 +18404,7 @@ static bool ParseTimelineGraphOptions(
 }
 
 static constexpr size_t KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS = 10000;
+static constexpr uint32_t KNDBG_TIMELINE_DASHBOARD_LIVE_REFRESH_LIMIT = 4096;
 
 static std::wstring BuildTimelineDashboardDefaultPath()
 {
@@ -18393,6 +18436,209 @@ static std::vector<TimelineEvent> BuildTimelineDashboardEventSlice(
     }
 
     return events;
+}
+
+static bool TimelineHasSnapshotProcessEvents(const TimelineStore& timeline)
+{
+    TimelineQueryOptions options = {};
+    options.Source = L"snapshot";
+    options.Domain = L"process";
+    options.Limit = 1;
+    options.NewestFirst = true;
+    return !timeline.Query(options).empty();
+}
+
+static bool TryIngestTimelineDashboardProcessBaseline(
+    DebuggerState& state,
+    DeviceClient* device,
+    SymbolEngine* symbols,
+    TimelineIngestResult* result,
+    std::wstring* warning)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result != nullptr)
+        {
+            *result = TimelineIngestResult{};
+        }
+        if (warning != nullptr)
+        {
+            warning->clear();
+        }
+
+        if (TimelineHasSnapshotProcessEvents(state.Timeline))
+        {
+            ok = true;
+            break;
+        }
+        if (device == nullptr || !device->IsOpen() || symbols == nullptr)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"Running process baseline unavailable: driver device or symbols are unavailable.";
+            }
+            break;
+        }
+
+        std::vector<SnapshotProcessRecord> processes;
+        std::vector<std::wstring> processWarnings;
+        std::wstring error;
+        if (!BuildSnapshotProcessInventory(state, *device, *symbols, &processes, &processWarnings, &error))
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"Running process baseline capture failed: " + error;
+            }
+            break;
+        }
+
+        SnapshotDocument document = {};
+        document.Schema = L"kn-live-dbg.snapshot.v1";
+        document.Label = L"timeline-dashboard-baseline";
+        document.TimestampUtc = SnapshotCurrentUtcTimestamp();
+        document.BootId = SnapshotCurrentBootId();
+        document.Metadata[L"source"] = L"!timeline dashboard";
+        document.Metadata[L"scope"] = L"process-baseline";
+        document.Processes = std::move(processes);
+        if (!processWarnings.empty())
+        {
+            document.DomainWarnings[L"process"] = processWarnings;
+        }
+
+        TimelineIngestResult ingest = state.Timeline.IngestSnapshot(document, L"timeline-dashboard");
+        if (result != nullptr)
+        {
+            *result = ingest;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static void AddTimelineDashboardWarning(
+    std::vector<std::wstring>* warnings,
+    const std::wstring& warning)
+{
+    if (warnings != nullptr &&
+        !warning.empty() &&
+        std::find(warnings->begin(), warnings->end(), warning) == warnings->end())
+    {
+        warnings->push_back(warning);
+    }
+}
+
+static void AddTimelineDashboardWarnings(
+    std::vector<std::wstring>* warnings,
+    const std::vector<std::wstring>& sourceWarnings)
+{
+    for (const std::wstring& warning : sourceWarnings)
+    {
+        AddTimelineDashboardWarning(warnings, warning);
+    }
+}
+
+static void RefreshTimelineDashboardEvidence(
+    DebuggerState& state,
+    DeviceClient* device,
+    std::vector<std::wstring>* warnings)
+{
+    TiSubscriber& ti = GetTiSubscriberInstance();
+    TiSubscriberStats tiStats = ti.SnapshotStats();
+    bool tiActive = ti.IsActive();
+    std::vector<TiEventRecord> tiEvents = ti.Recent(KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS, false);
+    TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(tiEvents, L"recent");
+    if (tiActive ||
+        tiStats.EventsReceived != 0 ||
+        tiStats.EventsKept != 0 ||
+        tiResult.SourceRecords != 0 ||
+        tiResult.Added != 0 ||
+        tiResult.Dropped != 0)
+    {
+        PrintColoredText(L"[timeline.dashboard]", KNDBG_COLOR_DIM);
+        std::wcout << L" ti_recent active=" << (tiActive ? L"yes" : L"no")
+                   << L" received=" << tiStats.EventsReceived
+                   << L" kept=" << tiStats.EventsKept
+                   << L" ring_records=" << tiEvents.size()
+                   << L" source_records=" << tiResult.SourceRecords
+                   << L" added=" << tiResult.Added
+                   << L" dropped=" << tiResult.Dropped << L"\n";
+    }
+    AddTimelineDashboardWarnings(warnings, tiResult.Warnings);
+    if (tiActive && tiStats.EventsReceived == 0)
+    {
+        AddTimelineDashboardWarning(
+            warnings,
+            L"Threat-Intelligence ETW is active but has received no events. RWX VAlloc/AllocVM evidence cannot appear until TI event delivery starts.");
+    }
+    else if (tiActive && tiStats.EventsKept == 0)
+    {
+        AddTimelineDashboardWarning(
+            warnings,
+            L"Threat-Intelligence ETW is active but no events are retained in the ring. Check self-exclusion, filtering, and '!ti status'.");
+    }
+
+    if (device != nullptr && device->IsOpen())
+    {
+        TimelineLiveStatus currentStatus = {};
+        std::wstring liveError;
+        if (!QueryTimelineLiveStatus(device, &currentStatus, &liveError))
+        {
+            AddTimelineDashboardWarning(
+                warnings,
+                L"Kernel live status was unavailable before dashboard generation: " + liveError);
+        }
+        else
+        {
+            bool currentLiveActive = (currentStatus.Flags & KNDBG_TIMELINE_STATUS_ACTIVE) != 0;
+            if (currentLiveActive || currentStatus.Count != 0)
+            {
+                std::vector<TimelineLiveEvent> liveEvents;
+                TimelineLiveStatus drainStatus = {};
+                if (DrainTimelineLiveEvents(
+                        device,
+                        KNDBG_TIMELINE_DASHBOARD_LIVE_REFRESH_LIMIT,
+                        &liveEvents,
+                        &drainStatus,
+                        &liveError))
+                {
+                    std::vector<TimelineEvent> events;
+                    events.reserve(liveEvents.size());
+                    for (const TimelineLiveEvent& item : liveEvents)
+                    {
+                        events.push_back(BuildTimelineEventFromLiveEvent(item));
+                    }
+
+                    TimelineIngestResult liveResult = state.Timeline.IngestEvents(events);
+                    bool liveActive = (drainStatus.Flags & KNDBG_TIMELINE_STATUS_ACTIVE) != 0;
+                    if (liveActive ||
+                        drainStatus.Count != 0 ||
+                        liveEvents.size() != 0 ||
+                        liveResult.Added != 0 ||
+                        liveResult.Dropped != 0)
+                    {
+                        PrintColoredText(L"[timeline.dashboard]", KNDBG_COLOR_DIM);
+                        std::wcout << L" kernel_live active=" << (liveActive ? L"yes" : L"no")
+                                   << L" drained=" << liveEvents.size()
+                                   << L" added=" << liveResult.Added
+                                   << L" dropped=" << liveResult.Dropped
+                                   << L" queued=" << drainStatus.Count
+                                   << L" capacity=" << drainStatus.Capacity << L"\n";
+                    }
+                }
+                else
+                {
+                    AddTimelineDashboardWarning(
+                        warnings,
+                        L"Kernel live refresh failed before dashboard generation: " + liveError);
+                    PrintColoredText(L"[timeline.dashboard]", KNDBG_COLOR_WARN);
+                    std::wcout << L" kernel_live refresh failed: " << liveError << L"\n";
+                }
+            }
+        }
+    }
 }
 
 static bool OpenTimelineDashboardPath(const std::wstring& path, std::wstring* error)
@@ -18506,6 +18752,23 @@ static bool TimelineLiveIsActive(DeviceClient* device, TimelineLiveStatus* statu
     return active;
 }
 
+static bool TimelineLiveErrorLooksAccessDenied(const std::wstring& error)
+{
+    std::wstring lowered = ToLower(error);
+    return lowered.find(L"access is denied") != std::wstring::npos ||
+        lowered.find(L": 5 ") != std::wstring::npos;
+}
+
+static void PrintTimelineLiveAccessDeniedHint(const std::wstring& error)
+{
+    if (TimelineLiveErrorLooksAccessDenied(error))
+    {
+        std::wcerr << L"  hint: timeline live requires driver write mode and a KnLiveDbg.sys image\n";
+        std::wcerr << L"        linked with /INTEGRITYCHECK for process-create callbacks.\n";
+        std::wcerr << L"        Run 'write on'; if it still fails, rebuild and reload KnLiveDbg.sys.\n";
+    }
+}
+
 static void TryEnableTimelineTi(
     DebuggerState& state,
     DeviceClient* device,
@@ -18577,6 +18840,7 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
                 &error))
         {
             std::wcerr << L"!timeline live on failed: " << error << L"\n";
+            PrintTimelineLiveAccessDeniedHint(error);
             break;
         }
 
@@ -18815,6 +19079,37 @@ static void HandleTimelineCommand(
                 break;
             }
 
+            std::vector<std::wstring> dashboardWarnings;
+            RefreshTimelineDashboardEvidence(state, device, &dashboardWarnings);
+
+            TimelineIngestResult processBaseline = {};
+            std::wstring processBaselineWarning;
+            if (TryIngestTimelineDashboardProcessBaseline(
+                    state,
+                    device,
+                    symbols,
+                    &processBaseline,
+                    &processBaselineWarning))
+            {
+                if (processBaseline.SourceRecords != 0 || processBaseline.Added != 0 || processBaseline.Dropped != 0)
+                {
+                    PrintColoredText(L"[timeline.dashboard]", KNDBG_COLOR_DIM);
+                    std::wcout << L" process_baseline source_records=" << processBaseline.SourceRecords
+                               << L" added=" << processBaseline.Added
+                               << L" dropped=" << processBaseline.Dropped << L"\n";
+                }
+                for (const std::wstring& warning : processBaseline.Warnings)
+                {
+                    AddTimelineDashboardWarning(&dashboardWarnings, warning);
+                }
+            }
+            else if (!processBaselineWarning.empty())
+            {
+                AddTimelineDashboardWarning(&dashboardWarnings, processBaselineWarning);
+                PrintColoredText(L"[timeline.dashboard]", KNDBG_COLOR_WARN);
+                std::wcout << L" " << processBaselineWarning << L"\n";
+            }
+
             TimelineStats stats = state.Timeline.GetStats();
             bool truncated = false;
             std::vector<TimelineEvent> events = BuildTimelineDashboardEventSlice(state.Timeline, &truncated);
@@ -18824,6 +19119,7 @@ static void HandleTimelineCommand(
             document.Analysis = state.Timeline.AnalyzeLiveSignals(128);
             document.Events = std::move(events);
             document.GeneratedUtc = SnapshotCurrentUtcTimestamp();
+            document.Warnings = std::move(dashboardWarnings);
             document.Truncated = truncated;
             document.TotalStored = stats.Stored;
             document.MaxEvents = KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS;
@@ -18961,6 +19257,7 @@ static void HandleTimelineCommand(
                         &liveError))
                 {
                     std::wcerr << L"!timeline live on failed: " << liveError << L"\n";
+                    PrintTimelineLiveAccessDeniedHint(liveError);
                     break;
                 }
                 std::wcout << L"[timeline.live] on capacity=" << capacity << L"\n";
@@ -22361,6 +22658,21 @@ static int RunConsoleSurfaceSelfTest()
                 &updateOptions,
                 &parseError),
             L"timeline-update-parser-rejects-unknown-option");
+
+        TimelineStats populatedTimelineStats = {};
+        populatedTimelineStats.Stored = 1;
+        populatedTimelineStats.Capacity = 262144;
+        populatedTimelineStats.NextEventId = 2;
+        std::wostringstream timelineStatusCapture;
+        std::wstreambuf* oldTimelineStatusOut = std::wcout.rdbuf(timelineStatusCapture.rdbuf());
+        PrintTimelineStatus(populatedTimelineStats);
+        std::wcout.rdbuf(oldTimelineStatusOut);
+        std::wstring timelineStatusOutput = timelineStatusCapture.str();
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            timelineStatusOutput.find(L"!timeline dashboard") != std::wstring::npos &&
+                timelineStatusOutput.find(L"visual timeline") != std::wstring::npos,
+            L"timeline-status-routes-dashboard");
 
         std::wstring helpCommandOutput = CaptureDetailedHelpOutput({L"help", L"!timeline"}, 1);
         CheckConsoleSurfaceSelfTest(
@@ -26474,7 +26786,7 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             }
             else if (action == L"dashboard")
             {
-                plan.Warning = L"timeline dashboard overwrites the fixed local HTML dashboard and opens it; timeline evidence is not ingested or cleared";
+                plan.Warning = L"timeline dashboard refreshes current TI/live evidence, may ingest a current process baseline if none exists, then overwrites the fixed local HTML dashboard and opens it";
             }
             else if (action == L"clear" || action == L"reset")
             {
@@ -34827,6 +35139,9 @@ static std::wstring BuildMcpTiStatsJson(const TiSubscriberStats& stats, bool act
     out += L",\"eventsLogged\":" + std::to_wstring(stats.EventsLogged);
     out += L",\"logBytesWritten\":" + std::to_wstring(stats.LogBytesWritten);
     out += L",\"logRotations\":" + std::to_wstring(stats.LogRotations);
+    out += L",\"keywordMode\":\"all\"";
+    out += L",\"matchAnyKeyword\":" + std::to_wstring(stats.MatchAnyKeyword);
+    out += L",\"matchAllKeyword\":" + std::to_wstring(stats.MatchAllKeyword);
     out += L"}";
     return out;
 }

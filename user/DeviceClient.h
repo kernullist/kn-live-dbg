@@ -79,6 +79,8 @@ struct TimelineLiveEvent
     uint32_t ProcessId;
     uint32_t ParentProcessId;
     uint32_t ThreadId;
+    uint32_t CreatorProcessId;
+    uint32_t CreatorThreadId;
     uint64_t Sequence;
     uint64_t Timestamp100ns;
     uint64_t ImageBase;

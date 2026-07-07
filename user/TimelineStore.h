@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+struct SnapshotDiffResult;
+
 class TimelineStore
 {
 public:
@@ -30,6 +32,9 @@ public:
         const std::wstring& mode);
     TimelineIngestResult IngestSnapshot(
         const SnapshotDocument& document,
+        const std::wstring& sourceName);
+    TimelineIngestResult IngestSnapshotDiff(
+        const SnapshotDiffResult& diff,
         const std::wstring& sourceName);
     TimelineIngestResult IngestEvents(
         const std::vector<TimelineEvent>& events);
