@@ -10,7 +10,7 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SERVICE_NAME L"KnLiveDbg"
 #define KNDBG_DISPLAY_NAME L"Kn Live Debug Driver"
 
-#define KNDBG_ABI_VERSION 11u
+#define KNDBG_ABI_VERSION 12u
 #define KNDBG_MAX_TRANSFER_SIZE (1024u * 1024u)
 #define KNDBG_WRITE_ACK_MAGIC 0x4B4E444247574F4Full
 #define KNDBG_TIMELINE_DEFAULT_CAPACITY 4096u
@@ -418,6 +418,8 @@ typedef struct _KNDBG_TIMELINE_EVENT_RECORD
     KNDBG_UINT32 ParentProcessId;
     KNDBG_UINT32 ThreadId;
     KNDBG_UINT32 ImagePathLength;
+    KNDBG_UINT32 CreatorProcessId;
+    KNDBG_UINT32 CreatorThreadId;
     KNDBG_UINT32 Reserved;
     KNDBG_UINT64 Sequence;
     KNDBG_UINT64 Timestamp100ns;

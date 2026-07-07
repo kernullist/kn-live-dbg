@@ -323,7 +323,7 @@ The `kn://` scheme. Resources that need live kernel data still go through the en
 
 | URI | Content |
 |-----|------|
-| `kn://session/info` | `DriverSessionStatus` (Flags/OwnerPid/CurrentPid/OpenHandleCount) + ABI 10 + `KNDBG_MAX_TRANSFER_SIZE` (1MB) + write-mode/MCP-arm state -> a situational-awareness anchor for the model |
+| `kn://session/info` | `DriverSessionStatus` (Flags/OwnerPid/CurrentPid/OpenHandleCount) + ABI 12 + `KNDBG_MAX_TRANSFER_SIZE` (1MB) + write-mode/MCP-arm state -> a situational-awareness anchor for the model |
 | `kn://session/symbols` | `SymbolEngine.SymbolPath()` + module count + kernel symbol load state (cached on the engine thread) |
 | `kn://modules/kernel` | kernel module list (name/base/size) -- a map the model uses for name->module arguments |
 | `kn://drivers/status` | `drvstatus` summary |

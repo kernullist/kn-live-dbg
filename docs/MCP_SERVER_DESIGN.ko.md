@@ -323,7 +323,7 @@ v1 툴(18종)과 인자 스키마(= 기존 화이트리스트, `additionalProper
 
 | URI | 내용 |
 |-----|------|
-| `kn://session/info` | `DriverSessionStatus`(Flags/OwnerPid/CurrentPid/OpenHandleCount) + ABI 10 + `KNDBG_MAX_TRANSFER_SIZE`(1MB) + write-mode/MCP-arm 상태 → 모델의 상황 인식 앵커 |
+| `kn://session/info` | `DriverSessionStatus`(Flags/OwnerPid/CurrentPid/OpenHandleCount) + ABI 12 + `KNDBG_MAX_TRANSFER_SIZE`(1MB) + write-mode/MCP-arm 상태 → 모델의 상황 인식 앵커 |
 | `kn://session/symbols` | `SymbolEngine.SymbolPath()` + 모듈 수 + 커널 심볼 로드 상태(엔진 스레드에서 캐시) |
 | `kn://modules/kernel` | 커널 모듈 목록(name/base/size) — 모델이 name→module 인자로 쓰는 지도 |
 | `kn://drivers/status` | `drvstatus` 요약 |

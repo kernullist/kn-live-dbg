@@ -55,6 +55,16 @@ namespace
         out += L",\"truncated\":";
         out += document.Truncated ? L"true" : L"false";
         out += L",\"maxEvents\":" + std::to_wstring(document.MaxEvents);
+        out += L",\"warnings\":[";
+        for (size_t i = 0; i < document.Warnings.size(); ++i)
+        {
+            if (i != 0)
+            {
+                out += L",";
+            }
+            out += mcpjson::Quote(document.Warnings[i]);
+        }
+        out += L"]";
         out += L"}";
         return out;
     }
@@ -127,22 +137,38 @@ std::wstring BuildTimelineDashboardHtml(const TimelineDashboardDocument& documen
   --bad: #ff5b72;
   --mid: #8bc7ff;
   --selected: #143653;
+  --left-width: 380px;
+  --side-width: 360px;
+  --timeline-height: 40vh;
+  --relationships-width: 42%;
+  --timeline-min-width: 1400px;
   font-family: Segoe UI, Inter, Arial, sans-serif;
 }
 * {
   box-sizing: border-box;
 }
+html {
+  height: 100%;
+  overflow: hidden;
+}
 body {
   margin: 0;
+  height: 100%;
   background: #05080c;
   color: var(--text);
   font-size: 12px;
   overflow: hidden;
 }
+body.resizing,
+body.resizing * {
+  user-select: none;
+}
 .app-window {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   display: grid;
   grid-template-rows: 32px 44px minmax(0, 1fr) 26px;
+  overflow: hidden;
   background: var(--bg);
 }
 .titlebar {
@@ -214,7 +240,7 @@ h1 {
   min-width: 0;
 }
 .tool-pill {
-  min-width: 118px;
+  min-width: 104px;
   height: 30px;
   display: inline-flex;
   align-items: center;
@@ -223,17 +249,19 @@ h1 {
   border-radius: 5px;
   color: #9db1c5;
   background: #0d131b;
+  font: inherit;
+  cursor: pointer;
 }
-.tool-pill.primary {
+.tool-pill.primary,
+.tool-pill.active {
   color: #001923;
   border-color: #58cfff;
   background: linear-gradient(#75d8ff, #2aa9df);
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 0 16px rgba(66,199,255,0.25);
 }
 .tool-pill.action {
-  font: inherit;
-  cursor: pointer;
 }
+.tool-pill:hover,
 .tool-pill.action:hover {
   color: #eaf8ff;
   border-color: var(--accent);
@@ -291,13 +319,52 @@ h1 {
 .layout {
   min-height: 0;
   display: grid;
-  grid-template-columns: 380px minmax(520px, 1fr) 360px;
+  grid-template-columns: var(--left-width) 6px minmax(520px, 1fr) 6px var(--side-width);
+  overflow: hidden;
 }
 .left-rail {
+  grid-column: 1;
   min-width: 0;
-  overflow: auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
   background: var(--chrome);
   border-right: 1px solid var(--line);
+}
+.splitter {
+  position: relative;
+  z-index: 8;
+  background: #071019;
+  touch-action: none;
+}
+.splitter.vertical {
+  width: 6px;
+  cursor: col-resize;
+  border-left: 1px solid rgba(255,255,255,0.06);
+  border-right: 1px solid rgba(255,255,255,0.06);
+}
+.splitter.horizontal {
+  height: 6px;
+  cursor: row-resize;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.splitter::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: transparent;
+}
+.splitter:hover::after,
+.splitter.dragging::after {
+  background: rgba(66,199,255,0.28);
+}
+.left-splitter {
+  grid-column: 2;
+}
+.workspace-side {
+  grid-column: 4;
 }
 .rail-tabs {
   display: grid;
@@ -313,11 +380,18 @@ h1 {
   text-align: center;
   color: #b5c9dd;
   background: #0b1118;
+  font: inherit;
+  cursor: pointer;
 }
 .rail-tab.active {
   color: #ffffff;
   background: #142435;
   border-color: var(--line2);
+}
+.tool-pill:focus-visible,
+.rail-tab:focus-visible {
+  outline: 1px solid rgba(66,199,255,0.75);
+  outline-offset: 2px;
 }
 .panel {
   border-bottom: 1px solid var(--line);
@@ -379,11 +453,70 @@ select:focus {
   gap: 7px;
   padding: 8px;
 }
+.analyst-focus,
 .ti-focus,
 .finding-focus {
   display: grid;
   gap: 7px;
   padding: 8px;
+}
+.focus-card {
+  display: grid;
+  gap: 5px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 5px;
+  background: var(--panel);
+}
+.focus-card.good {
+  border-left-color: var(--good);
+}
+.focus-card.warn {
+  border-left-color: var(--warn);
+  background: #16140d;
+}
+.focus-card.bad {
+  border-left-color: var(--bad);
+  background: #1a1014;
+}
+.focus-title {
+  color: var(--accent);
+  font-weight: 700;
+}
+.focus-card.good .focus-title {
+  color: var(--good);
+}
+.focus-card.warn .focus-title {
+  color: var(--warn);
+}
+.focus-card.bad .focus-title {
+  color: var(--bad);
+}
+.focus-sub {
+  color: var(--muted);
+  line-height: 1.35;
+}
+.focus-counts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+.focus-metric {
+  padding: 6px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 4px;
+  background: rgba(0,0,0,0.16);
+}
+.focus-metric b {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+}
+.focus-metric span {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
 }
 .ti-card,
 .finding-card {
@@ -392,6 +525,13 @@ select:focus {
   border-radius: 5px;
   background: var(--panel);
 }
+.ti-card {
+  cursor: pointer;
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
 .finding-card {
   cursor: pointer;
   width: 100%;
@@ -399,10 +539,13 @@ select:focus {
   font: inherit;
   text-align: left;
 }
+.ti-card:hover,
 .finding-card:hover {
   border-color: var(--accent);
   background: #102030;
 }
+)KNL";
+    html << LR"KNL(
 .ti-card .ti-title,
 .finding-card .finding-title {
   color: var(--accent);
@@ -428,11 +571,56 @@ select:focus {
   font-weight: 700;
 }
 .workspace {
+  grid-column: 3;
   min-width: 0;
   min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, var(--timeline-height)) 6px minmax(0, 1fr);
   overflow: hidden;
   border-right: 1px solid var(--line);
   background: #0b1118;
+}
+.app-window.mode-events .timeline,
+.app-window.mode-relationships .timeline,
+.app-window.mode-events .timeline-splitter,
+.app-window.mode-relationships .timeline-splitter {
+  display: none;
+}
+.app-window.mode-events .panels,
+.app-window.mode-relationships .panels {
+  grid-template-columns: 1fr;
+}
+.app-window.mode-events .workspace,
+.app-window.mode-relationships .workspace {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+.app-window.mode-events .relationships-panel,
+.app-window.mode-relationships .events-panel,
+.app-window.mode-events .panel-splitter,
+.app-window.mode-relationships .panel-splitter {
+  display: none;
+}
+.app-window.mode-events .event-list,
+.app-window.mode-relationships .graph-list {
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+}
+.app-window.mode-evidence .layout {
+  grid-template-columns: var(--left-width) 6px minmax(520px, 1fr);
+}
+.app-window.mode-evidence .workspace {
+  display: none;
+}
+.app-window.mode-evidence .workspace-side {
+  display: none;
+}
+.app-window.mode-evidence .side {
+  grid-column: 3;
+  border-right: 0;
+}
+.app-window.mode-evidence .detail {
+  max-height: none;
 }
 .section-title {
   padding: 9px 10px;
@@ -456,8 +644,7 @@ select:focus {
   color: var(--muted);
 }
 .timeline {
-  height: 40vh;
-  min-height: 260px;
+  min-height: 0;
   overflow: auto;
   padding: 8px 10px 12px;
   border-bottom: 1px solid var(--line);
@@ -468,9 +655,9 @@ select:focus {
   top: 0;
   z-index: 2;
   display: grid;
-  grid-template-columns: 210px 1fr;
+  grid-template-columns: 280px 1fr;
   align-items: center;
-  min-width: 820px;
+  min-width: var(--timeline-min-width);
   padding: 0 0 8px;
   background: #0a1016;
   color: var(--muted);
@@ -484,8 +671,8 @@ select:focus {
 }
 .lane {
   display: grid;
-  grid-template-columns: 210px 1fr;
-  min-width: 820px;
+  grid-template-columns: 280px 1fr;
+  min-width: var(--timeline-min-width);
   min-height: 38px;
   border-bottom: 1px solid rgba(255,255,255,0.06);
 }
@@ -533,6 +720,24 @@ select:focus {
 .marker.threat-intelligence {
   background: var(--warn);
 }
+.marker.network,
+.marker.dns {
+  background: var(--accent2);
+}
+.marker.file,
+.marker.registry,
+.marker.service,
+.marker.scheduled-task,
+.marker.task,
+.marker.wmi {
+  background: var(--warn);
+}
+.marker.memory,
+.marker.vad,
+.marker.vad-dkom,
+.marker.snapshot-diff {
+  background: var(--bad);
+}
 .marker.high,
 .marker.critical {
   background: var(--bad);
@@ -555,30 +760,97 @@ select:focus {
     html << LR"KNL(
 .panels {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 42%);
+  grid-template-columns: minmax(360px, 1fr) 6px minmax(320px, var(--relationships-width));
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.events-panel,
+.relationships-panel {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
 }
 .event-list,
 .graph-list {
-  min-height: 220px;
-  max-height: calc(60vh - 130px);
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  max-height: none;
   overflow: auto;
   background: #0a1016;
 }
 .event-row,
 .edge-row {
   display: grid;
-  grid-template-columns: 72px 96px 78px minmax(0, 1fr);
   gap: 8px;
   min-height: 27px;
   padding: 6px 10px;
   border-bottom: 1px solid rgba(255,255,255,0.06);
+  color: inherit;
   cursor: pointer;
   font-size: 12px;
+  white-space: nowrap;
+}
+.event-row {
+  grid-template-columns: 72px 176px 112px 108px 80px 80px 96px 88px minmax(720px, 1fr);
+  min-width: 1532px;
+}
+.edge-row {
+  grid-template-columns: 260px 300px 72px minmax(700px, 1fr);
+  min-width: 1360px;
+}
+.event-row.header,
+.event-row.header:nth-child(odd),
+.edge-row.header,
+.edge-row.header:nth-child(odd) {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  min-height: 28px;
+  color: #b8cde2;
+  background: #0e1721;
+  border-bottom: 1px solid var(--line);
+  cursor: default;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.graph-explainer {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: #0e1721;
+  color: #bfd4e8;
+  white-space: normal;
+}
+.graph-explainer b {
+  color: var(--accent);
+}
+.edge-kind-title {
+  color: var(--accent);
+  font-weight: 700;
+}
+.edge-kind-sub {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: normal;
+}
+.node-label {
+  color: #f2f7ff;
 }
 .event-row:nth-child(odd),
 .edge-row:nth-child(odd) {
   background: rgba(255,255,255,0.025);
+}
+.event-row.header:hover,
+.edge-row.header:hover {
+  background: #0e1721;
 }
 .event-row:hover,
 .edge-row:hover {
@@ -587,19 +859,26 @@ select:focus {
 .event-row.selected {
   background: var(--selected);
 }
+.edge-row.selected {
+  background: var(--selected);
+}
 .cell-muted {
   color: var(--muted);
 }
 .side {
+  grid-column: 5;
   min-width: 0;
   min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   background: var(--chrome);
 }
 .detail {
+  min-height: 0;
   padding: 14px;
   overflow: auto;
-  max-height: calc(100vh - 112px);
+  max-height: none;
 }
 .detail h2 {
   margin: 0 0 10px;
@@ -621,6 +900,28 @@ select:focus {
 .kv .k {
   color: var(--muted);
 }
+.evidence-table {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 14px;
+}
+.evidence-row {
+  display: grid;
+  grid-template-columns: 128px minmax(0, 1fr);
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+}
+.evidence-key {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.evidence-value {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
 pre {
   margin: 0;
   padding: 10px;
@@ -636,12 +937,15 @@ pre {
   display: grid;
   gap: 6px;
   margin-bottom: 14px;
+  min-width: 0;
+  overflow: visible;
 }
 .related-row {
   display: grid;
-  grid-template-columns: 52px 72px minmax(0, 1fr);
+  grid-template-columns: 52px 86px minmax(0, 1fr);
   gap: 7px;
   min-height: 25px;
+  min-width: 0;
   padding: 6px 8px;
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -650,6 +954,11 @@ pre {
   color: inherit;
   font: inherit;
   text-align: left;
+  white-space: normal;
+}
+.related-row > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .related-row:hover {
   border-color: var(--accent);
@@ -698,9 +1007,13 @@ pre {
   .layout {
     grid-template-columns: 1fr;
   }
+  .splitter {
+    display: none;
+  }
   .left-rail,
   .workspace,
   .side {
+    grid-column: auto;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
@@ -711,7 +1024,7 @@ pre {
 </style>
 </head>
 <body>
-<div class="app-window">
+<div class="app-window mode-timeline" id="appWindow">
 <div class="titlebar">
   <div class="window-brand"><span class="app-logo">K</span><span>KnLiveDbg Timeline Dashboard</span></div>
   <div class="window-actions">- [] X</div>
@@ -725,9 +1038,10 @@ pre {
     </div>
   </div>
   <div class="toolbar">
-    <div class="tool-pill primary">Timeline View</div>
-    <div class="tool-pill">Events</div>
-    <div class="tool-pill">Relationships</div>
+    <button class="tool-pill primary active" type="button" data-view="timeline">Timeline</button>
+    <button class="tool-pill" type="button" data-view="events">Events</button>
+    <button class="tool-pill" type="button" data-view="relationships">Relationships</button>
+    <button class="tool-pill" type="button" data-view="evidence">Evidence</button>
     <button class="tool-pill action" id="exportJsonl" type="button">Export JSONL</button>
   </div>
   <div class="snapshot-status" id="snapshotStatus">
@@ -737,13 +1051,19 @@ pre {
     <div class="status-chip"><b id="statusEvents">0</b><span>events</span></div>
   </div>
 </header>
+)KNL";
+    html << LR"KNL(
 <main class="layout">
   <aside class="left-rail">
     <div class="rail-tabs">
-      <div class="rail-tab active">Timeline</div>
-      <div class="rail-tab">Graph</div>
-      <div class="rail-tab">Evidence</div>
+      <button class="rail-tab active" type="button" data-view="timeline">Timeline</button>
+      <button class="rail-tab" type="button" data-view="relationships">Graph</button>
+      <button class="rail-tab" type="button" data-view="evidence">Evidence</button>
     </div>
+    <section class="panel">
+      <div class="section-title">Analyst Focus</div>
+      <div class="analyst-focus" id="analystFocus"></div>
+    </section>
     <section class="panel">
       <div class="section-title">Evidence Summary</div>
       <section class="summary" id="summary"></section>
@@ -779,26 +1099,30 @@ pre {
       </div>
     </section>
   </aside>
+  <div class="splitter vertical left-splitter" data-resize="left" title="Resize filters"></div>
   <section class="workspace">
     <div class="warning" id="warning"></div>
     <div class="workspace-top">
-      <div class="section-title">Timeline</div>
-      <div class="hint">select markers or rows to inspect evidence</div>
+      <div class="section-title" id="workspaceTitle">Timeline</div>
+      <div class="hint" id="workspaceHint">select markers or rows to inspect evidence</div>
     </div>
     <div class="timeline" id="timeline"></div>
+    <div class="splitter horizontal timeline-splitter" data-resize="timeline" title="Resize timeline"></div>
     <div class="panels">
-      <section>
+      <section class="events-panel" id="eventsPanel">
         <div class="section-title">Events</div>
         <div class="event-list" id="eventList"></div>
       </section>
-      <section>
+      <div class="splitter vertical panel-splitter" data-resize="relationships" title="Resize event and relationship panes"></div>
+      <section class="relationships-panel" id="relationshipsPanel">
         <div class="section-title">Relationships</div>
         <div class="graph-list" id="graphList"></div>
       </section>
     </div>
   </section>
+  <div class="splitter vertical workspace-side" data-resize="side" title="Resize evidence"></div>
   <aside class="side">
-    <div class="section-title">Selection</div>
+    <div class="section-title" id="detailTitle">Selection</div>
     <div class="detail" id="detail"></div>
   </aside>
 </main>
@@ -815,7 +1139,8 @@ const KN_DATA = )KNL";
     html << LR"KNL(;
 
 const state = {
-  selectedId: null
+  selectedId: null,
+  view: "timeline"
 };
 
 function byId(id) {
@@ -864,6 +1189,8 @@ function eventImageValues(event) {
   return Array.from(values).sort((a, b) => a.localeCompare(b));
 }
 
+)KNL";
+    html << LR"KNL(
 function eventText(event) {
   const parts = [
     event.eventId,
@@ -887,15 +1214,291 @@ function eventText(event) {
   return lower(parts.filter((item) => item !== undefined && item !== null).join(" "));
 }
 
+let KN_PID_CONTEXT = null;
+
+function addPidContext(map, pid, value) {
+  if (!hasValue(pid) || !hasValue(value)) {
+    return;
+  }
+  const key = String(pid);
+  if (!map.has(key)) {
+    map.set(key, []);
+  }
+  map.get(key).push(String(value));
+}
+
+function pidContextMap() {
+  if (KN_PID_CONTEXT) {
+    return KN_PID_CONTEXT;
+  }
+  KN_PID_CONTEXT = new Map();
+  for (const event of KN_DATA.events) {
+    if (!hasValue(event.pid)) {
+      continue;
+    }
+    if (event.domain === "process" || event.domain === "image") {
+      addPidContext(KN_PID_CONTEXT, event.pid, event.entity);
+      addPidContext(KN_PID_CONTEXT, event.pid, event.summary);
+      for (const image of eventImageValues(event)) {
+        addPidContext(KN_PID_CONTEXT, event.pid, image);
+      }
+    }
+  }
+  return KN_PID_CONTEXT;
+}
+
+function eventSearchText(event) {
+  const parts = [eventText(event)];
+  const context = pidContextMap();
+  for (const pid of eventPidValues(event)) {
+    if (hasValue(pid) && context.has(String(pid))) {
+      parts.push(context.get(String(pid)).join(" "));
+    }
+  }
+  return lower(parts.join(" "));
+}
+
+function addPidValue(values, value) {
+  if (!hasValue(value)) {
+    return;
+  }
+  values.add(String(value));
+}
+
+function evidencePidValue(event, keys) {
+  const evidence = event.evidence || {};
+  for (const key of keys) {
+    if (hasValue(evidence[key])) {
+      return String(evidence[key]);
+    }
+  }
+  return "";
+}
+
+function eventPidValues(event) {
+  const values = new Set();
+  const evidence = event.evidence || {};
+  addPidValue(values, event.pid);
+  addPidValue(values, event.targetPid);
+  [
+    "target_pid",
+    "target_process_id",
+    "targetprocessid",
+    "victim_pid",
+    "destination_pid",
+    "source_pid",
+    "creator_pid",
+    "parent_pid",
+    "ppid",
+    "parent_process_id",
+    "inherited_from_pid"
+  ].forEach((key) => addPidValue(values, evidence[key]));
+  return values;
+}
+
+function targetPidValue(event) {
+  if (hasValue(event.targetPid)) {
+    return String(event.targetPid);
+  }
+  return evidencePidValue(event, [
+    "target_pid",
+    "target_process_id",
+    "targetprocessid",
+    "victim_pid",
+    "destination_pid"
+  ]);
+}
+
+function sourcePidValue(event) {
+  return evidencePidValue(event, ["source_pid", "creator_pid"]);
+}
+
+)KNL";
+    html << LR"KNL(
 function tiTaskValue(event) {
   const evidence = event.evidence || {};
   return event.action || evidence.ti_action || evidence.task_name || "";
+}
+
+function evidenceValue(event, keys) {
+  const evidence = event.evidence || {};
+  for (const key of keys) {
+    if (evidence[key]) {
+      return String(evidence[key]);
+    }
+  }
+  return "";
+}
+
+function hasValue(value) {
+  return value !== undefined && value !== null && value !== "";
+}
+
+function displayValue(value) {
+  return hasValue(value) ? String(value) : "";
+}
+
+function entityCorrelationValues(event) {
+  const values = new Set();
+  for (const value of eventImageValues(event)) {
+    values.add("image:" + value);
+  }
+  const pairs = [
+    ["host", ["network_endpoint", "remote_host"]],
+    ["dns", ["dns_query"]],
+    ["file", ["file_path"]],
+    ["registry", ["registry_key"]],
+    ["service", ["service_name"]],
+    ["task", ["scheduled_task"]],
+    ["wmi", ["wmi_entity"]],
+    ["memory", ["memory_address", "vad_address"]],
+    ["snapshot-diff", ["snapshot_diff_subject"]]
+  ];
+  for (const pair of pairs) {
+    const value = evidenceValue(event, pair[1]);
+    if (value) {
+      values.add(pair[0] + ":" + value);
+    }
+  }
+  return values;
 }
 
 function isTiEvent(event) {
   return event.source === "ti" || event.domain === "threat-intelligence";
 }
 
+function eventHasAnyText(event, terms) {
+  const text = eventSearchText(event);
+  return terms.some((term) => text.includes(term));
+}
+
+function isSnapshotBaselineEvent(event) {
+  return event.source === "snapshot" && event.domain === "process";
+}
+
+function isMemorySignal(event) {
+  const domain = lower(event.domain);
+  if (domain === "memory" || domain === "vad" || domain === "vad-dkom") {
+    return true;
+  }
+  return eventHasAnyText(event, [
+    "allocvm",
+    "virtualalloc",
+    "valloc",
+    "protectvm",
+    "virtualprotect",
+    "rwx",
+    "page_execute_readwrite",
+    "execute_readwrite",
+    "rw->rx",
+    "memory_address",
+    "vad_address",
+    "private executable",
+    "private_executable"
+  ]);
+}
+
+function isRemoteThreadSignal(event) {
+  const evidence = event.evidence || {};
+  return evidence.remote_thread === "true" ||
+    eventHasAnyText(event, ["createremotethread", "ntcreatethreadex", "remote thread"]);
+}
+
+function isCrossProcessSignal(event) {
+  const evidence = event.evidence || {};
+  if (evidence.cross_process_operation) {
+    return true;
+  }
+  const sourcePid = sourcePidValue(event);
+  const targetPid = targetPidValue(event) || event.pid;
+  if (hasValue(sourcePid) && hasValue(targetPid) && String(sourcePid) !== String(targetPid)) {
+    return true;
+  }
+  return eventHasAnyText(event, [
+    "writevirtualmemory",
+    "readvirtualmemory",
+    "openprocess",
+    "duplicatehandle",
+    "queueuserapc",
+    "setthreadcontext"
+  ]);
+}
+
+function isHighRiskSignal(event) {
+  const risk = riskClass(event.risk);
+  return risk === "critical" || risk === "high" || risk === "warning" || risk === "medium";
+}
+
+function focusCard(level, title, subtitle) {
+  return "<div class=\"focus-card " + escapeHtml(level) + "\">" +
+    "<div class=\"focus-title\">" + escapeHtml(title) + "</div>" +
+    "<div class=\"focus-sub\">" + escapeHtml(subtitle) + "</div></div>";
+}
+
+function renderAnalystFocus(events) {
+  const container = byId("analystFocus");
+  const headerWarnings = KN_DATA.header.warnings || [];
+  const tiEvents = events.filter(isTiEvent);
+  const memoryEvents = events.filter(isMemorySignal);
+  const crossEvents = events.filter(isCrossProcessSignal);
+  const remoteEvents = events.filter(isRemoteThreadSignal);
+  const highRiskEvents = events.filter(isHighRiskSignal);
+  const liveEvents = events.filter((event) => event.source === "kernel-live");
+  const snapshotOnly = events.length > 0 && events.every(isSnapshotBaselineEvent);
+  const searchText = lower(byId("search").value);
+  const tiDeliveryWarning = headerWarnings.find((warning) =>
+    lower(warning).includes("threat-intelligence etw is active but has received no events"));
+
+  if (!events.length) {
+    container.innerHTML = focusCard("warn", "No events match the current filters", "Clear or widen filters to inspect the embedded timeline snapshot.");
+    return;
+  }
+
+  const cards = [];
+  if (tiDeliveryWarning) {
+    cards.push(focusCard("bad", "TI is active but silent", tiDeliveryWarning));
+  }
+  if (memoryEvents.length || crossEvents.length || remoteEvents.length) {
+    cards.push(focusCard(
+      highRiskEvents.length ? "bad" : "warn",
+      "Injection-relevant activity present",
+      "Memory=" + memoryEvents.length + ", cross-process=" + crossEvents.length + ", remote-thread=" + remoteEvents.length + ". Select rows to inspect the exact event evidence."));
+  }
+  else if (snapshotOnly) {
+    cards.push(focusCard(
+      "warn",
+      "Baseline only",
+      "Current filters only match already-running process snapshot rows. No live callback or TI activity matches this view."));
+  }
+  else {
+    cards.push(focusCard(
+      "good",
+      "No injection signal in this view",
+      "The current filter result has no TI memory, cross-process, or remote-thread evidence."));
+  }
+
+  if ((searchText.includes("notepad") || searchText.includes("valloc") || searchText.includes("rwx")) &&
+      !memoryEvents.length &&
+      !tiEvents.length) {
+    cards.push(focusCard(
+      "warn",
+      "RWX VAlloc is not present",
+      "The embedded timeline has no TI memory-allocation event for this filter. Re-run !timeline dashboard after TI receives AllocVM/VirtualAlloc evidence."));
+  }
+
+  const counts = "<div class=\"focus-card\"><div class=\"focus-title\">Current view</div>" +
+    "<div class=\"focus-counts\">" +
+    "<div class=\"focus-metric\"><b>" + escapeHtml(events.length) + "</b><span>events</span></div>" +
+    "<div class=\"focus-metric\"><b>" + escapeHtml(tiEvents.length) + "</b><span>TI</span></div>" +
+    "<div class=\"focus-metric\"><b>" + escapeHtml(liveEvents.length) + "</b><span>live</span></div>" +
+    "<div class=\"focus-metric\"><b>" + escapeHtml(highRiskEvents.length) + "</b><span>risk</span></div>" +
+    "</div></div>";
+  cards.push(counts);
+  container.innerHTML = cards.join("");
+}
+
+)KNL";
+    html << LR"KNL(
 function fileTimeToMs(value) {
   const numberValue = Number(value);
   if (!Number.isFinite(numberValue) || numberValue <= 0) {
@@ -932,12 +1535,13 @@ function laneLabel(event) {
   if (isTiEvent(event)) {
     return "TI " + (tiTaskValue(event) || "event");
   }
-  if (event.pid) {
+  if (hasValue(event.pid)) {
     const name = event.entity ? " " + event.entity : "";
     return "PID " + event.pid + name;
   }
-  if (event.targetPid) {
-    return "Target PID " + event.targetPid;
+  const targetPid = targetPidValue(event);
+  if (hasValue(targetPid)) {
+    return "Target PID " + targetPid;
   }
   if (event.domain) {
     return "Domain " + event.domain;
@@ -967,16 +1571,16 @@ function populateFilters() {
     if (event.domain) {
       domains.add(event.domain);
     }
-    if (event.pid) {
-      const label = "PID " + event.pid + (event.entity ? " " + event.entity : "");
-      if (!pids.has(String(event.pid))) {
-        pids.set(String(event.pid), label);
+    for (const value of eventPidValues(event)) {
+      if (!pids.has(value)) {
+        pids.set(value, "PID " + value);
       }
     }
-    if (event.targetPid) {
-      const target = String(event.targetPid);
-      if (!pids.has(target)) {
-        pids.set(target, "PID " + target);
+    if (hasValue(event.pid) && event.entity) {
+      const pid = String(event.pid);
+      const existing = pids.get(pid) || "";
+      if (event.domain === "process" || existing === "PID " + pid) {
+        pids.set(pid, "PID " + pid + " " + event.entity);
       }
     }
     for (const image of eventImageValues(event)) {
@@ -1006,7 +1610,14 @@ function populateFilters() {
 
   Array.from(sources).sort().forEach((value) => option(sourceFilter, value, value));
   Array.from(domains).sort().forEach((value) => option(domainFilter, value, value));
-  Array.from(pids.entries()).sort((a, b) => Number(a[0]) - Number(b[0])).forEach((item) => option(pidFilter, item[0], item[1]));
+  Array.from(pids.entries()).sort((a, b) => {
+    const an = Number(a[0]);
+    const bn = Number(b[0]);
+    if (Number.isFinite(an) && Number.isFinite(bn) && an !== bn) {
+      return an - bn;
+    }
+    return a[0].localeCompare(b[0]);
+  }).forEach((item) => option(pidFilter, item[0], item[1]));
   Array.from(images).sort((a, b) => a.localeCompare(b)).forEach((value) => option(imageFilter, value, value));
   Array.from(tasks).sort((a, b) => a.localeCompare(b)).forEach((value) => option(taskFilter, value, value));
   Array.from(risks).sort().forEach((value) => option(riskFilter, value, value));
@@ -1028,7 +1639,7 @@ function filteredEvents() {
     if (domain && event.domain !== domain) {
       return false;
     }
-    if (pid && String(event.pid || event.targetPid || "") !== pid && String(event.targetPid || "") !== pid) {
+    if (pid && !eventPidValues(event).has(pid)) {
       return false;
     }
     if (image && !eventImageValues(event).some((value) => value === image)) {
@@ -1040,7 +1651,7 @@ function filteredEvents() {
     if (risk && event.risk !== risk) {
       return false;
     }
-    if (text && !eventText(event).includes(text)) {
+    if (text && !eventSearchText(event).includes(text)) {
       return false;
     }
     return true;
@@ -1079,20 +1690,30 @@ function exportJsonl() {
 
 )KNL";
     html << LR"KNL(
-function markerPosition(events, event, index) {
-  const times = events.map(timeValue).filter((value) => Number.isFinite(value));
-  if (times.length > 1) {
-    const min = Math.min(...times);
-    const max = Math.max(...times);
-    const current = timeValue(event);
-    if (Number.isFinite(current) && max > min) {
-      return Math.max(1, Math.min(99, ((current - min) * 100) / (max - min)));
+function timelineScale(events) {
+  const times = events.map(timeValue);
+  const finiteTimes = times.filter((value) => Number.isFinite(value));
+  if (finiteTimes.length > 1) {
+    const min = Math.min(...finiteTimes);
+    const max = Math.max(...finiteTimes);
+    if (max > min) {
+      return { times, min, max, ranged: true };
     }
   }
-  if (events.length <= 1) {
+  return { times, min: 0, max: 0, ranged: false };
+}
+
+function markerPosition(scale, index, total) {
+  if (scale && scale.ranged) {
+    const current = scale.times[index];
+    if (Number.isFinite(current)) {
+      return Math.max(1, Math.min(99, ((current - scale.min) * 100) / (scale.max - scale.min)));
+    }
+  }
+  if (total <= 1) {
     return 50;
   }
-  return 1 + ((index * 98) / (events.length - 1));
+  return 1 + ((index * 98) / (total - 1));
 }
 
 function renderSummary(events) {
@@ -1105,6 +1726,7 @@ function renderSummary(events) {
   byId("statusGenerated").textContent = header.generatedUtc || "--";
   byId("statusEvents").textContent = String(events.length) + "/" + String(status.stored || 0);
   renderLiveStatus(live);
+  renderAnalystFocus(events);
 
   const metrics = [
     ["Stored", status.stored || 0],
@@ -1121,6 +1743,9 @@ function renderSummary(events) {
   ).join("");
 
   const warnings = [];
+  for (const item of (header.warnings || [])) {
+    warnings.push(item);
+  }
   if (status.dropped) {
     warnings.push("Timeline store reports dropped events. Treat this dashboard as partial evidence.");
   }
@@ -1136,6 +1761,9 @@ function renderSummary(events) {
   if (header.truncated) {
     warnings.push("Dashboard embeds newest " + header.maxEvents + " events out of " + header.totalStored + " stored events.");
   }
+  if (live.available && (live.active || live.autoDrainRunning)) {
+    warnings.push("This HTML is a generated snapshot. Run !timeline dashboard again to refresh after new live events arrive.");
+  }
   byId("warning").className = warnings.length ? "warning show" : "warning";
   byId("warning").textContent = warnings.join(" ");
   byId("footerStatus").textContent =
@@ -1145,7 +1773,8 @@ function renderSummary(events) {
     "    Dropped: " + (status.dropped || 0) +
     "    Capacity: " + (status.capacity || 0) +
     "    Live queued: " + (live.queued || 0) + "/" + (live.capacity || 0) +
-    "    Auto-drain: " + (live.autoDrainRunning ? "running" : "stopped");
+    "    Auto-drain: " + (live.autoDrainRunning ? "running" : "stopped") +
+    "    View: generated snapshot; rerun !timeline dashboard to refresh";
 
   renderTiFocus(tiEvents);
   renderFindings(events);
@@ -1190,6 +1819,28 @@ function renderLiveStatus(live) {
     "status-chip muted";
 }
 
+function attachEventSelectionHandlers(container) {
+  container.querySelectorAll("[data-event-id]").forEach((element) => {
+    const selectFromElement = () => {
+      const eventId = element.getAttribute("data-event-id");
+      if (eventId) {
+        selectEvent(eventId);
+      }
+    };
+    element.addEventListener("click", selectFromElement);
+    if (element.tagName !== "BUTTON") {
+      element.setAttribute("role", "button");
+      element.setAttribute("tabindex", "0");
+      element.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          selectFromElement();
+        }
+      });
+    }
+  });
+}
+
 function visibleFindings(events) {
   const visibleIds = new Set(events.map((event) => Number(event.eventId || 0)));
   const findings = ((KN_DATA.analysis || {}).findings || []);
@@ -1215,27 +1866,22 @@ function selectableFindingEventId(finding) {
 
 function renderFindings(events) {
   const container = byId("findingFocus");
-  const findings = visibleFindings(events);
+  const findings = visibleFindings(events)
+    .map((finding) => ({ finding, eventId: selectableFindingEventId(finding) }))
+    .filter((item) => item.eventId);
   if (!findings.length) {
     container.innerHTML = "<div class=\"empty\">No live analysis findings match the current filters.</div>";
     return;
   }
 
-  container.innerHTML = findings.slice(0, 10).map((finding) =>
+  container.innerHTML = findings.slice(0, 10).map((item) =>
     "<button class=\"finding-card\" type=\"button\" data-event-id=\"" +
-    escapeHtml(selectableFindingEventId(finding)) + "\">" +
-    "<div class=\"finding-title\">" + escapeHtml(finding.kind || "finding") + "</div>" +
-    "<div class=\"finding-sub\">" + escapeHtml(finding.risk || "info") +
-    " | " + escapeHtml(finding.summary || "") + "</div></button>"
+    escapeHtml(item.eventId) + "\">" +
+    "<div class=\"finding-title\">" + escapeHtml(item.finding.kind || "finding") + "</div>" +
+    "<div class=\"finding-sub\">" + escapeHtml(item.finding.risk || "info") +
+    " | " + escapeHtml(item.finding.summary || "") + "</div></button>"
   ).join("");
-  container.querySelectorAll("[data-event-id]").forEach((element) => {
-    element.addEventListener("click", () => {
-      const eventId = element.getAttribute("data-event-id");
-      if (eventId) {
-        selectEvent(eventId);
-      }
-    });
-  });
+  attachEventSelectionHandlers(container);
 }
 
 )KNL";
@@ -1267,11 +1913,19 @@ function renderTiFocus(events) {
     .sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]))
     .slice(0, 8)
     .map((item) =>
-      "<div class=\"ti-card\"><div class=\"ti-title\">" + escapeHtml(item[0]) + "</div>" +
+      "<button class=\"ti-card\" type=\"button\" data-ti-task=\"" + escapeHtml(item[0]) + "\"><div class=\"ti-title\">" + escapeHtml(item[0]) + "</div>" +
       "<div class=\"ti-sub\">events=" + escapeHtml(item[1].count) +
       " critical=" + escapeHtml(item[1].critical) +
-      " warning=" + escapeHtml(item[1].warning) + "</div></div>"
+      " warning=" + escapeHtml(item[1].warning) + "</div></button>"
     ).join("");
+  container.querySelectorAll("[data-ti-task]").forEach((element) => {
+    element.addEventListener("click", () => {
+      byId("taskFilter").value = element.getAttribute("data-ti-task") || "";
+      state.selectedId = null;
+      state.view = "events";
+      render();
+    });
+  });
 }
 
 function renderTimeline(events) {
@@ -1292,13 +1946,14 @@ function renderTimeline(events) {
 
   const first = timeLabel(events[0]);
   const last = timeLabel(events[events.length - 1]);
+  const scale = timelineScale(events);
   let html = "<div class=\"axis\"><div></div><div class=\"axis-line\"><span>" + escapeHtml(first) + "</span><span>" + escapeHtml(last) + "</span></div></div>";
 
   for (const [label, items] of laneMap.entries()) {
     html += "<div class=\"lane\"><div class=\"lane-label\" title=\"" + escapeHtml(label) + "\">" + escapeHtml(label) + "</div><div class=\"lane-track\">";
     for (const item of items) {
       const event = item.event;
-      const x = markerPosition(events, event, item.index);
+      const x = markerPosition(scale, item.index, events.length);
       const classes = ["marker", lower(event.domain || "event"), riskClass(event.risk)];
       if (String(event.eventId) === String(state.selectedId)) {
         classes.push("selected");
@@ -1309,9 +1964,7 @@ function renderTimeline(events) {
   }
 
   container.innerHTML = html;
-  container.querySelectorAll("[data-event-id]").forEach((element) => {
-    element.addEventListener("click", () => selectEvent(element.getAttribute("data-event-id")));
-  });
+  attachEventSelectionHandlers(container);
 }
 
 )KNL";
@@ -1322,18 +1975,24 @@ function renderEventList(events) {
     container.innerHTML = "<div class=\"empty\">No events.</div>";
     return;
   }
-  container.innerHTML = events.map((event) => {
+  const header = "<div class=\"event-row header\">" +
+    "<div>#</div><div>Time</div><div>Source</div><div>Domain</div>" +
+    "<div>PID</div><div>TID</div><div>Target</div><div>Risk</div><div>Summary</div></div>";
+  container.innerHTML = header + events.map((event) => {
     const selected = String(event.eventId) === String(state.selectedId) ? " selected" : "";
     return "<div class=\"event-row" + selected + "\" data-event-id=\"" + escapeHtml(event.eventId) + "\">" +
       "<div class=\"cell-muted\">#" + escapeHtml(event.eventId) + "</div>" +
+      "<div>" + escapeHtml(timeLabel(event)) + "</div>" +
       "<div>" + escapeHtml(event.source || "") + "</div>" +
       "<div>" + escapeHtml(event.domain || "") + "</div>" +
+      "<div>" + escapeHtml(displayValue(event.pid)) + "</div>" +
+      "<div>" + escapeHtml(displayValue(event.tid)) + "</div>" +
+      "<div>" + escapeHtml(displayValue(targetPidValue(event))) + "</div>" +
+      "<div>" + escapeHtml(event.risk || "") + "</div>" +
       "<div>" + escapeHtml(event.summary || event.entity || "") + "</div>" +
       "</div>";
   }).join("");
-  container.querySelectorAll("[data-event-id]").forEach((element) => {
-    element.addEventListener("click", () => selectEvent(element.getAttribute("data-event-id")));
-  });
+  attachEventSelectionHandlers(container);
 }
 
 )KNL";
@@ -1359,16 +2018,29 @@ function addEdge(map, from, to, kind, event) {
 function buildEdges(events) {
   const edges = new Map();
   for (const event of events) {
+    const evidence = event.evidence || {};
     const source = event.source ? "source:" + event.source : "";
     const domain = event.domain ? "domain:" + event.domain : "";
-    const process = event.pid ? "process:" + event.pid : "";
-    const target = event.targetPid ? "process:" + event.targetPid : "";
+    const process = hasValue(event.pid) ? "process:" + event.pid : "";
+    const targetPid = targetPidValue(event);
+    const target = hasValue(targetPid) ? "process:" + targetPid : "";
     addEdge(edges, source, domain, "source-domain", event);
     addEdge(edges, source, process || target, "source-observes-process", event);
     addEdge(edges, process, domain, event.source === "snapshot" ? "snapshot-record" : "process-domain", event);
     addEdge(edges, process, target, event.source === "ti" ? "ti-targets-process" : "targets-process", event);
-    const evidence = event.evidence || {};
-    const parent = evidence.parent_pid || evidence.ppid || evidence.parent_process_id || evidence.inherited_from_pid || evidence.creator_pid;
+    if (process && target && evidence.cross_process_operation) {
+      addEdge(edges, process, target, "cross-process-" + evidence.cross_process_operation, event);
+    }
+    const sourcePid = sourcePidValue(event);
+    if (sourcePid && process && String(sourcePid) !== String(event.pid || "")) {
+      addEdge(
+        edges,
+        "process:" + sourcePid,
+        target || process,
+        "cross-process-" + (evidence.cross_process_operation || "creator"),
+        event);
+    }
+    const parent = evidence.parent_pid || evidence.ppid || evidence.parent_process_id || evidence.inherited_from_pid;
     if (parent && process) {
       addEdge(edges, "process:" + parent, process, "parent-child", event);
     }
@@ -1377,8 +2049,127 @@ function buildEdges(events) {
       addEdge(edges, source, imageNode, "source-observes-image", event);
       addEdge(edges, process || target, imageNode, "process-loads-image", event);
     }
+    const entities = [
+      ["host", evidence.network_endpoint || evidence.remote_host, "process-connects-host"],
+      ["dns", evidence.dns_query, "process-queries-dns"],
+      ["file", evidence.file_path, "process-touches-file"],
+      ["registry", evidence.registry_key, "process-modifies-registry"],
+      ["service", evidence.service_name, "process-controls-service"],
+      ["task", evidence.scheduled_task, "process-controls-task"],
+      ["wmi", evidence.wmi_entity, "process-controls-wmi"],
+      ["memory", evidence.memory_address || evidence.vad_address, "process-changes-memory"],
+      ["snapshot-diff", evidence.snapshot_diff_subject || (event.source === "snapshot-diff" ? event.entity : ""), "snapshot-diff-record"]
+    ];
+    for (const entity of entities) {
+      if (!entity[1]) {
+        continue;
+      }
+      const node = entity[0] + ":" + entity[1];
+      addEdge(edges, source, node, "source-observes-" + entity[0], event);
+      addEdge(edges, process || target, node, entity[2], event);
+    }
   }
   return Array.from(edges.values()).sort((a, b) => b.count - a.count || a.kind.localeCompare(b.kind)).slice(0, 80);
+}
+
+function nodeLabel(node) {
+  const text = String(node || "");
+  if (text.startsWith("process:")) {
+    return "PID " + text.slice("process:".length);
+  }
+  if (text.startsWith("source:")) {
+    return "Source " + text.slice("source:".length);
+  }
+  if (text.startsWith("domain:")) {
+    return "Domain " + text.slice("domain:".length);
+  }
+  if (text.startsWith("image:")) {
+    return "Image " + text.slice("image:".length);
+  }
+  return text.replace(":", " ");
+}
+
+function relationshipLabel(kind) {
+  if (kind === "source-domain") {
+    return "Collector produced evidence domain";
+  }
+  if (kind === "source-observes-process") {
+    return "Collector observed process";
+  }
+  if (kind === "source-observes-image") {
+    return "Collector observed image";
+  }
+  if (kind === "process-domain") {
+    return "Process has event domain";
+  }
+  if (kind === "snapshot-record") {
+    return "Existing process baseline";
+  }
+  if (kind === "parent-child") {
+    return "Parent created child process";
+  }
+  if (kind === "process-loads-image") {
+    return "Process loaded image/module";
+  }
+  if (kind === "ti-targets-process") {
+    return "TI event targeted process";
+  }
+  if (kind === "targets-process") {
+    return "Event references target process";
+  }
+  if (kind.startsWith("cross-process-")) {
+    return "Cross-process operation";
+  }
+  if (kind === "process-connects-host") {
+    return "Process contacted host";
+  }
+  if (kind === "process-queries-dns") {
+    return "Process queried DNS";
+  }
+  if (kind === "process-touches-file") {
+    return "Process touched file";
+  }
+  if (kind === "process-modifies-registry") {
+    return "Process modified registry";
+  }
+  if (kind === "process-controls-service") {
+    return "Process controlled service";
+  }
+  if (kind === "process-controls-task") {
+    return "Process controlled scheduled task";
+  }
+  if (kind === "process-controls-wmi") {
+    return "Process touched WMI persistence";
+  }
+  if (kind === "process-changes-memory") {
+    return "Process changed executable memory";
+  }
+  if (kind === "snapshot-diff-record") {
+    return "Snapshot diff milestone";
+  }
+  return kind;
+}
+
+function relationshipHint(kind) {
+  if (kind === "snapshot-record") {
+    return "Baseline context for processes that were already running before live callbacks started.";
+  }
+  if (kind === "parent-child") {
+    return "Use this to follow process lineage and inherited execution context.";
+  }
+  if (kind === "process-loads-image") {
+    return "Use this to pivot from a process to loaded DLLs, drivers, or image paths.";
+  }
+  if (kind === "ti-targets-process" || kind.startsWith("cross-process-")) {
+    return "High-value pivot for injection, memory access, thread manipulation, or process control.";
+  }
+  if (kind.startsWith("process-controls") || kind === "process-modifies-registry") {
+    return "Persistence or system-control pivot from process activity to OS object.";
+  }
+  if (kind === "process-connects-host" || kind === "process-queries-dns") {
+    return "Network pivot from process activity to endpoint or DNS evidence.";
+  }
+  return "Aggregated relationship derived from the currently filtered timeline events.";
 }
 
 function renderGraph(events) {
@@ -1388,14 +2179,19 @@ function renderGraph(events) {
     container.innerHTML = "<div class=\"empty\">No relationships.</div>";
     return;
   }
-  container.innerHTML = edges.map((edge) =>
-    "<div class=\"edge-row\">" +
-    "<div class=\"cell-muted\">" + escapeHtml(edge.kind) + "</div>" +
-    "<div>" + escapeHtml(edge.from) + "</div>" +
+  const explainer = "<div class=\"graph-explainer\"><b>Relationship graph</b> connects the filtered events. Click a row to inspect the latest supporting event; count shows how many events support the same relationship.</div>";
+  container.innerHTML = explainer + edges.map((edge) => {
+    const selected = String(edge.first) === String(state.selectedId) || String(edge.last) === String(state.selectedId) ? " selected" : "";
+    const eventId = edge.last || edge.first || "";
+    return "<div class=\"edge-row" + selected + "\" role=\"button\" tabindex=\"0\" data-event-id=\"" +
+    escapeHtml(eventId) + "\">" +
+    "<div><div class=\"edge-kind-title\">" + escapeHtml(relationshipLabel(edge.kind)) + "</div><div class=\"edge-kind-sub\">" + escapeHtml(edge.kind + " | " + relationshipHint(edge.kind)) + "</div></div>" +
+    "<div class=\"node-label\">" + escapeHtml(nodeLabel(edge.from)) + "</div>" +
     "<div class=\"cell-muted\">x" + escapeHtml(edge.count) + "</div>" +
-    "<div>" + escapeHtml(edge.to) + "</div>" +
-    "</div>"
-  ).join("");
+    "<div class=\"node-label\">" + escapeHtml(nodeLabel(edge.to)) + "</div>" +
+    "</div>";
+  }).join("");
+  attachEventSelectionHandlers(container);
 }
 
 )KNL";
@@ -1405,14 +2201,9 @@ function relatedEvents(event) {
     return [];
   }
 
-  const pids = new Set();
-  if (event.pid) {
-    pids.add(String(event.pid));
-  }
-  if (event.targetPid) {
-    pids.add(String(event.targetPid));
-  }
+  const pids = eventPidValues(event);
   const tid = event.tid ? String(event.tid) : "";
+  const entityValues = entityCorrelationValues(event);
   const baseTime = timeValue(event);
   const windowMs = 10000;
 
@@ -1422,14 +2213,23 @@ function relatedEvents(event) {
     }
 
     let matched = false;
-    if (candidate.pid && pids.has(String(candidate.pid))) {
-      matched = true;
-    }
-    if (candidate.targetPid && pids.has(String(candidate.targetPid))) {
-      matched = true;
+    for (const value of eventPidValues(candidate)) {
+      if (pids.has(value)) {
+        matched = true;
+        break;
+      }
     }
     if (tid && candidate.tid && String(candidate.tid) === tid) {
       matched = true;
+    }
+    if (!matched && entityValues.size) {
+      const candidateValues = entityCorrelationValues(candidate);
+      for (const value of candidateValues) {
+        if (entityValues.has(value)) {
+          matched = true;
+          break;
+        }
+      }
     }
     if (!matched) {
       return false;
@@ -1457,10 +2257,63 @@ function renderRelatedEvents(event) {
   }
 
   return "<h3>Related Events</h3><div class=\"related-list\">" + related.map((item) =>
-    "<button class=\"related-row\" type=\"button\" data-event-id=\"" + escapeHtml(item.eventId) + "\">" +
-    "<div class=\"cell-muted\">#" + escapeHtml(item.eventId) + "</div>" +
-    "<div>" + escapeHtml(item.domain || "") + "</div>" +
-    "<div>" + escapeHtml(item.summary || item.entity || "") + "</div></button>"
+    "<button class=\"related-row\" type=\"button\" title=\"" +
+    escapeHtml(item.summary || item.entity || "") + "\" data-event-id=\"" +
+    escapeHtml(item.eventId) + "\">" +
+    "<div class=\"cell-muted related-id\">#" + escapeHtml(item.eventId) + "</div>" +
+    "<div class=\"related-domain\">" + escapeHtml(item.domain || "") + "</div>" +
+    "<div class=\"related-summary\">" + escapeHtml(item.summary || item.entity || "") + "</div></button>"
+  ).join("") + "</div>";
+}
+
+function evidencePriority(key) {
+  const priorities = [
+    "memory_address",
+    "allocation_size",
+    "protection",
+    "allocation_type",
+    "cross_process_operation",
+    "source_pid",
+    "target_pid",
+    "source_tid",
+    "target_tid",
+    "desired_access",
+    "granted_access",
+    "start_address",
+    "object_name",
+    "section_name",
+    "image_path",
+    "target_image",
+    "classification",
+    "classification_reason",
+    "ti_action"
+  ];
+  const index = priorities.indexOf(String(key || ""));
+  if (index >= 0) {
+    return index;
+  }
+  if (String(key || "").startsWith("payload.")) {
+    return 100;
+  }
+  if (String(key || "").startsWith("payload_type.")) {
+    return 200;
+  }
+  return 300;
+}
+
+function renderEvidenceFields(event) {
+  const evidence = event.evidence || {};
+  const entries = Object.keys(evidence)
+    .sort((a, b) => evidencePriority(a) - evidencePriority(b) || a.localeCompare(b))
+    .map((key) => [key, evidence[key]]);
+  if (!entries.length) {
+    return "<h3>Evidence Fields</h3><div class=\"empty\">No key/value evidence.</div>";
+  }
+
+  return "<h3>Evidence Fields</h3><div class=\"evidence-table\">" + entries.map((row) =>
+    "<div class=\"evidence-row\" title=\"" + escapeHtml(row[0] + "=" + row[1]) + "\">" +
+    "<div class=\"evidence-key\">" + escapeHtml(row[0]) + "</div>" +
+    "<div class=\"evidence-value\">" + escapeHtml(row[1]) + "</div></div>"
   ).join("") + "</div>";
 }
 
@@ -1470,15 +2323,24 @@ function renderDetail(event) {
     container.innerHTML = "<div class=\"empty\">Select a timeline marker or event row.</div>";
     return;
   }
+  const evidence = event.evidence || {};
   const rows = [
     ["Event", "#" + event.eventId],
     ["Time", timeLabel(event)],
     ["Source", event.source],
     ["Domain", event.domain],
     ["Action", event.action],
-    ["PID", event.pid || ""],
-    ["TID", event.tid || ""],
-    ["Target PID", event.targetPid || ""],
+    ["PID", displayValue(event.pid)],
+    ["TID", displayValue(event.tid)],
+    ["Target PID", displayValue(targetPidValue(event))],
+    ["Memory Address", displayValue(evidence.memory_address || evidence.vad_address)],
+    ["Allocation Size", displayValue(evidence.allocation_size || evidence.region_size)],
+    ["Protection", displayValue(evidence.protection || evidence.protect)],
+    ["Access", displayValue(evidence.desired_access || evidence.granted_access)],
+    ["Start Address", displayValue(evidence.start_address)],
+    ["Creator PID", displayValue(evidence.creator_pid || evidence.source_pid)],
+    ["Creator TID", displayValue(evidence.creator_tid)],
+    ["Remote Thread", evidence.remote_thread === "true" ? "yes" : ""],
     ["Risk", event.risk || ""],
     ["Confidence", event.confidence || ""],
     ["Entity", event.entity || ""],
@@ -1486,41 +2348,174 @@ function renderDetail(event) {
   ];
   container.innerHTML = "<h2>" + escapeHtml(event.summary || event.entity || "Event #" + event.eventId) + "</h2>" +
     "<div class=\"kv\">" + rows.map((row) => "<div class=\"k\">" + escapeHtml(row[0]) + "</div><div>" + escapeHtml(row[1]) + "</div>").join("") + "</div>" +
+    renderEvidenceFields(event) +
     renderRelatedEvents(event) +
     "<pre>" + escapeHtml(JSON.stringify(event, null, 2)) + "</pre>";
-  container.querySelectorAll("[data-event-id]").forEach((element) => {
-    element.addEventListener("click", () => selectEvent(element.getAttribute("data-event-id")));
-  });
+  attachEventSelectionHandlers(container);
 }
 
 function selectEvent(eventId) {
   state.selectedId = eventId;
-  const event = KN_DATA.events.find((item) => String(item.eventId) === String(eventId));
-  renderDetail(event);
   render();
+}
+
+function viewModeInfo(mode) {
+  const modes = {
+    timeline: {
+      title: "Timeline",
+      hint: "lanes, filtered events, and relationships stay linked",
+      detail: "Selection"
+    },
+    events: {
+      title: "Events",
+      hint: "filtered event table; select a row to inspect evidence",
+      detail: "Event Evidence"
+    },
+    relationships: {
+      title: "Relationships",
+      hint: "click an edge to inspect the latest supporting event",
+      detail: "Relationship Evidence"
+    },
+    evidence: {
+      title: "Evidence",
+      hint: "raw selected event evidence",
+      detail: "Evidence"
+    }
+  };
+  return modes[mode] || modes.timeline;
+}
+
+function applyDashboardMode() {
+  const mode = state.view || "timeline";
+  const info = viewModeInfo(mode);
+  const app = byId("appWindow");
+  app.classList.remove("mode-timeline", "mode-events", "mode-relationships", "mode-evidence");
+  app.classList.add("mode-" + mode);
+
+  document.querySelectorAll("[data-view]").forEach((item) => {
+    const active = item.getAttribute("data-view") === mode;
+    item.classList.toggle("active", active);
+    item.classList.toggle("primary", active && item.classList.contains("tool-pill"));
+  });
+
+  byId("workspaceTitle").textContent = info.title;
+  byId("workspaceHint").textContent = info.hint;
+  byId("detailTitle").textContent = info.detail;
+}
+
+function setDashboardMode(mode) {
+  state.view = mode || "timeline";
+  render();
+}
+
+)KNL";
+    html << LR"KNL(
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function setRootPixelVar(name, value) {
+  document.documentElement.style.setProperty(name, Math.round(value) + "px");
+}
+
+function resizeValue(kind, event) {
+  const layout = document.querySelector(".layout");
+  const panels = document.querySelector(".panels");
+  const timeline = byId("timeline");
+
+  if (kind === "left" && layout) {
+    const rect = layout.getBoundingClientRect();
+    const width = clamp(event.clientX - rect.left, 260, Math.max(300, rect.width - 760));
+    setRootPixelVar("--left-width", width);
+  }
+  else if (kind === "side" && layout) {
+    const rect = layout.getBoundingClientRect();
+    const width = clamp(rect.right - event.clientX, 300, Math.max(340, rect.width - 760));
+    setRootPixelVar("--side-width", width);
+  }
+  else if (kind === "timeline" && timeline) {
+    const rect = timeline.getBoundingClientRect();
+    const height = clamp(event.clientY - rect.top, 180, Math.max(220, window.innerHeight - 360));
+    setRootPixelVar("--timeline-height", height);
+  }
+  else if (kind === "relationships" && panels) {
+    const rect = panels.getBoundingClientRect();
+    const width = clamp(rect.right - event.clientX, 280, Math.max(320, rect.width - 420));
+    setRootPixelVar("--relationships-width", width);
+  }
+}
+
+function resetResizeValue(kind) {
+  const root = document.documentElement.style;
+  if (kind === "left") {
+    root.removeProperty("--left-width");
+  }
+  else if (kind === "side") {
+    root.removeProperty("--side-width");
+  }
+  else if (kind === "timeline") {
+    root.removeProperty("--timeline-height");
+  }
+  else if (kind === "relationships") {
+    root.removeProperty("--relationships-width");
+  }
+}
+
+function initSplitters() {
+  document.querySelectorAll("[data-resize]").forEach((splitter) => {
+    const kind = splitter.getAttribute("data-resize");
+    splitter.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      splitter.classList.add("dragging");
+      document.body.classList.add("resizing");
+      splitter.setPointerCapture(event.pointerId);
+      const move = (moveEvent) => resizeValue(kind, moveEvent);
+      const stop = () => {
+        splitter.classList.remove("dragging");
+        document.body.classList.remove("resizing");
+        splitter.removeEventListener("pointermove", move);
+        splitter.removeEventListener("pointerup", stop);
+        splitter.removeEventListener("pointercancel", stop);
+      };
+      splitter.addEventListener("pointermove", move);
+      splitter.addEventListener("pointerup", stop);
+      splitter.addEventListener("pointercancel", stop);
+    });
+    splitter.addEventListener("dblclick", () => resetResizeValue(kind));
+  });
 }
 
 function render() {
   const events = filteredEvents();
+  if (state.view === "evidence" && !state.selectedId && events.length) {
+    state.selectedId = String(events[0].eventId);
+  }
   renderSummary(events);
   renderTimeline(events);
   renderEventList(events);
   renderGraph(events);
-  if (state.selectedId) {
-    renderDetail(KN_DATA.events.find((item) => String(item.eventId) === String(state.selectedId)));
-  }
+  const selected = state.selectedId ?
+    KN_DATA.events.find((item) => String(item.eventId) === String(state.selectedId)) :
+    null;
+  renderDetail(selected || null);
+  applyDashboardMode();
 }
 
 populateFilters();
 byId("exportJsonl").addEventListener("click", exportJsonl);
+document.querySelectorAll("[data-view]").forEach((element) => {
+  element.addEventListener("click", () => setDashboardMode(element.getAttribute("data-view")));
+});
+initSplitters();
 ["search", "sourceFilter", "domainFilter", "pidFilter", "imageFilter", "taskFilter", "riskFilter"].forEach((id) => {
   byId(id).addEventListener("input", () => {
     state.selectedId = null;
-    renderDetail(null);
     render();
   });
 });
-renderDetail(null);
 render();
 </script>
 </body>

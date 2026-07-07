@@ -498,6 +498,8 @@ bool DeviceClient::DrainTimelineEvents(
             event.ProcessId = item.ProcessId;
             event.ParentProcessId = item.ParentProcessId;
             event.ThreadId = item.ThreadId;
+            event.CreatorProcessId = item.CreatorProcessId;
+            event.CreatorThreadId = item.CreatorThreadId;
             event.Sequence = item.Sequence;
             event.Timestamp100ns = item.Timestamp100ns;
             event.ImageBase = item.ImageBase;

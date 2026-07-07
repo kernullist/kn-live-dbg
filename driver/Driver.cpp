@@ -499,6 +499,11 @@ static VOID KnDbgTimelineThreadNotify(
     record.Timestamp100ns = static_cast<KNDBG_UINT64>(now.QuadPart);
     record.ProcessId = HandleToULong(ProcessId);
     record.ThreadId = HandleToULong(ThreadId);
+    if (Create != FALSE)
+    {
+        record.CreatorProcessId = HandleToULong(PsGetCurrentProcessId());
+        record.CreatorThreadId = HandleToULong(PsGetCurrentThreadId());
+    }
 
     KnDbgTimelinePushEvent(&record);
 }
@@ -1281,7 +1286,7 @@ static NTSTATUS KnDbgHandleGetVersion(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID 
         response->Size = sizeof(KNDBG_VERSION_RESPONSE);
         response->AbiVersion = KNDBG_ABI_VERSION;
         response->DriverMajor = 0;
-        response->DriverMinor = 4;
+        response->DriverMinor = 5;
         response->MaxTransferSize = KNDBG_MAX_TRANSFER_SIZE;
         response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER;
         if (KnDbgIsLa57Active())

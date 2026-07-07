@@ -11,6 +11,7 @@ struct TimelineDashboardDocument
     TimelineAnalysisResult Analysis;
     std::vector<TimelineEvent> Events;
     std::wstring GeneratedUtc;
+    std::vector<std::wstring> Warnings;
     bool Truncated = false;
     uint64_t TotalStored = 0;
     size_t MaxEvents = 0;
