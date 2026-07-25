@@ -1091,11 +1091,21 @@ bool DeviceClient::WritePhysical(uint64_t physicalAddress, const std::vector<uin
             break;
         }
 
-        if (returned < FIELD_OFFSET(KNDBG_PHYSICAL_WRITE_REQUEST, Data) || request->Length != bytes.size())
+        if (returned < FIELD_OFFSET(KNDBG_PHYSICAL_WRITE_REQUEST, Data))
         {
             if (error != nullptr)
             {
-                *error = L"Short physical write response";
+                *error = L"Short physical write response header";
+            }
+            break;
+        }
+
+        if (request->Length != bytes.size())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short physical write: requested=" + std::to_wstring(bytes.size()) +
+                         L" written=" + std::to_wstring(request->Length);
             }
             break;
         }

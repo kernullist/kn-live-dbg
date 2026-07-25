@@ -32,9 +32,10 @@ namespace
     }
 
     // Read [address, address+length) into out, chunked. Returns false on first
-    // failure unless zeroFillOnFailure is set, in which case the failed chunk
-    // is zero-filled and the read continues. failedChunks is incremented per
-    // zero-filled chunk.
+    // failure unless zeroFillOnFailure is set, in which case the missing tail of
+    // the chunk is zero-filled and the read continues. failedChunks is
+    // incremented per incomplete chunk; bytesZeroFilled/bytesFromKernel track
+    // actual byte counts (not chunk-size approximations).
     bool ReadKernelRange(
         DeviceClient& device,
         uint64_t address,
@@ -43,6 +44,8 @@ namespace
         std::vector<uint8_t>* out,
         uint32_t* chunksRead,
         uint32_t* chunksFailed,
+        uint64_t* bytesFromKernel,
+        uint64_t* bytesZeroFilled,
         std::wstring* error)
     {
         bool ok = false;
@@ -59,6 +62,14 @@ namespace
             }
 
             out->clear();
+            if (bytesFromKernel != nullptr)
+            {
+                *bytesFromKernel = 0;
+            }
+            if (bytesZeroFilled != nullptr)
+            {
+                *bytesZeroFilled = 0;
+            }
 
             if (length == 0)
             {
@@ -95,13 +106,26 @@ namespace
                                               &buf,
                                               &chunkErr);
 
-                if (readOk && buf.size() < chunk)
+                const uint32_t got = readOk
+                    ? static_cast<uint32_t>(std::min<size_t>(buf.size(), chunk))
+                    : 0;
+                if (readOk && got < chunk)
                 {
-                    readOk = false;
                     chunkErr = L"short read (expected " +
                                std::to_wstring(chunk) +
                                L" bytes, got " +
-                               std::to_wstring(buf.size()) + L")";
+                               std::to_wstring(got) + L")";
+                    // Keep the partial payload; only the tail is treated as
+                    // missing. Without zerofill this still aborts.
+                    if (got > 0)
+                    {
+                        std::memcpy(out->data() + offset, buf.data(), got);
+                        if (bytesFromKernel != nullptr)
+                        {
+                            *bytesFromKernel += got;
+                        }
+                    }
+                    readOk = false;
                 }
 
                 if (!readOk)
@@ -111,6 +135,7 @@ namespace
                         ++(*chunksFailed);
                     }
 
+                    const uint32_t missing = chunk - got;
                     if (!zeroFillOnFailure)
                     {
                         if (error != nullptr)
@@ -119,6 +144,7 @@ namespace
                             ss << L"ReadMemory failed at va=0x"
                                << std::hex << (address + offset)
                                << L" length=0x" << chunk
+                               << L" got=0x" << got
                                << L": " << chunkErr;
                             *error = ss.str();
                         }
@@ -126,7 +152,11 @@ namespace
                         break;
                     }
 
-                    // Leave the chunk zero-filled (already zeroed by resize)
+                    // Tail already zero from resize; count only missing bytes.
+                    if (bytesZeroFilled != nullptr)
+                    {
+                        *bytesZeroFilled += missing;
+                    }
                     offset += chunk;
                     remaining -= chunk;
                     continue;
@@ -138,6 +168,10 @@ namespace
                 }
 
                 std::memcpy(out->data() + offset, buf.data(), chunk);
+                if (bytesFromKernel != nullptr)
+                {
+                    *bytesFromKernel += chunk;
+                }
                 offset += chunk;
                 remaining -= chunk;
             }
@@ -604,6 +638,8 @@ bool DumpKernelRangeToFile(
     {
         std::vector<uint8_t> bytes;
         std::wstring readError;
+        uint64_t kernelBytes = 0;
+        uint64_t zeroBytes = 0;
         bool readOk = ReadKernelRange(device,
                                        address,
                                        length,
@@ -611,7 +647,12 @@ bool DumpKernelRangeToFile(
                                        &bytes,
                                        &result->ChunksRead,
                                        &result->ChunksFailed,
+                                       &kernelBytes,
+                                       &zeroBytes,
                                        &readError);
+
+        result->BytesRead = kernelBytes;
+        result->BytesZeroFilled = zeroBytes;
 
         if (!readOk)
         {
@@ -622,35 +663,27 @@ bool DumpKernelRangeToFile(
                 *error = readError +
                          L" (requested=0x" +
                          std::to_wstring(length) +
-                         L" bytes; dump aborted before full transfer)";
+                         L" kernel_bytes=" +
+                         std::to_wstring(kernelBytes) +
+                         L" zero_bytes=" +
+                         std::to_wstring(zeroBytes) +
+                         L"; dump aborted before full transfer)";
             }
             break;
         }
 
-        // With zerofill, output length always equals request; track how much
-        // came from kernel vs synthesized zeros.
+        // With zerofill, output length always equals request; kernel vs zero
+        // byte counts come from the actual per-chunk transfer, including short
+        // reads that kept a partial payload and zero-filled only the tail.
         const uint64_t total = static_cast<uint64_t>(bytes.size());
-        if (result->ChunksFailed > 0)
+        if (result->ChunksFailed > 0 || zeroBytes != 0)
         {
             result->ShortRead = true;
-            // Approximate zero-filled bytes from failed full chunks.
-            result->BytesZeroFilled =
-                static_cast<uint64_t>(result->ChunksFailed) * kReadChunkBytes;
-            if (result->BytesZeroFilled > total)
-            {
-                result->BytesZeroFilled = total;
-            }
-            result->BytesRead = total - result->BytesZeroFilled;
             result->Warnings.push_back(
                 L"zero-filled " + std::to_wstring(result->ChunksFailed) +
-                L" failed chunk(s); kernel_bytes=" + std::to_wstring(result->BytesRead) +
+                L" incomplete chunk(s); kernel_bytes=" + std::to_wstring(result->BytesRead) +
                 L" zero_bytes=" + std::to_wstring(result->BytesZeroFilled) +
                 L" requested=" + std::to_wstring(length));
-        }
-        else
-        {
-            result->BytesRead = total;
-            result->BytesZeroFilled = 0;
         }
 
         if (total != length)
@@ -720,6 +753,8 @@ bool DumpKernelPeToFile(
                              &headerBytes,
                              &headerChunksRead,
                              &headerChunksFailed,
+                             nullptr,
+                             nullptr,
                              &readError))
         {
             if (error != nullptr)
@@ -839,6 +874,8 @@ bool DumpKernelPeToFile(
                                  &headerBytes,
                                  &headerChunksRead,
                                  &headerChunksFailed,
+                                 nullptr,
+                                 nullptr,
                                  &rereadError))
             {
                 if (error != nullptr)
@@ -994,6 +1031,8 @@ bool DumpKernelPeToFile(
                                               &sectionBytes,
                                               &sectionChunksRead,
                                               &sectionChunksFailed,
+                                              nullptr,
+                                              nullptr,
                                               &sectionErr);
 
                 if (!readOk)

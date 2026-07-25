@@ -9120,7 +9120,7 @@ static bool ResolveNativeWriteContext(
             {
                 if (error != nullptr)
                 {
-                    *error = L"user virtual write requires procctx <pid>";
+                    *error = L"user virtual write requires procctx <pid> or /process <pid>";
                 }
                 break;
             }
@@ -10000,13 +10000,38 @@ static void HandleCompare(const std::vector<std::wstring>& args, const DebuggerS
             break;
         }
 
+        // Same process-aware policy as d*/m: user VA uses procctx when set,
+        // otherwise direct device read (kernel / self). Do not require procctx
+        // for bare kernel compares (would regress existing workflows).
         std::vector<uint8_t> left;
         std::vector<uint8_t> right;
-        if (!device.ReadMemory(address1, static_cast<uint32_t>(length), &left, &error) ||
-            !device.ReadMemory(address2, static_cast<uint32_t>(length), &right, &error))
+        if (!ReadMemoryWithProcessContext(
+                device,
+                state,
+                nullptr,
+                address1,
+                static_cast<uint32_t>(length),
+                &left,
+                &error) ||
+            !ReadMemoryWithProcessContext(
+                device,
+                state,
+                nullptr,
+                address2,
+                static_cast<uint32_t>(length),
+                &right,
+                &error))
         {
             std::wcerr << L"compare read failed: " << error << L"\n";
             break;
+        }
+
+        if (left.size() != static_cast<size_t>(length) ||
+            right.size() != static_cast<size_t>(length))
+        {
+            std::wcerr << L"compare short read: left="
+                       << left.size() << L" right=" << right.size()
+                       << L" requested=" << length << L"\n";
         }
 
         size_t mismatchCount = 0;
@@ -10290,11 +10315,25 @@ static void HandleSearch(const std::vector<std::wstring>& args, const DebuggerSt
             break;
         }
 
+        // Process-aware like d*/c/m: user VA uses procctx when set.
         std::vector<uint8_t> bytes;
-        if (!device.ReadMemory(address, static_cast<uint32_t>(length), &bytes, &error))
+        if (!ReadMemoryWithProcessContext(
+                device,
+                state,
+                nullptr,
+                address,
+                static_cast<uint32_t>(length),
+                &bytes,
+                &error))
         {
             std::wcerr << L"search read failed: " << error << L"\n";
             break;
+        }
+
+        if (bytes.size() != static_cast<size_t>(length))
+        {
+            std::wcerr << L"search short read: got="
+                       << bytes.size() << L" requested=" << length << L"\n";
         }
 
         size_t matches = 0;
@@ -15397,7 +15436,8 @@ static void PrintModuleIntegrityHelp()
     std::wcout << L"  /sections     print all section-table records.\n";
     std::wcout << L"  /wx           report only modules with W+X section/page evidence.\n";
     std::wcout << L"  /mismatch     report only modules with header, size, or section anomalies.\n";
-    std::wcout << L"  /disk         compare live executable pages against on-disk PE raw data (additive).\n";
+    std::wcout << L"  /disk         compare live executable pages against on-disk PE raw data (additive;\n";
+    std::wcout << L"                skips basereloc fixup pages when the image is relocated).\n";
     std::wcout << L"  /limit <n>    cap reported records while still scanning matching modules.\n";
     std::wcout << L"  /json <path>  write structured kn-live-dbg.module-integrity.v1 JSON.\n";
     std::wcout << L"\n";
@@ -22199,12 +22239,17 @@ static void PrintSearchHelp()
     std::wcout << L"notes:\n";
     std::wcout << L"  length is bytes; value tokens are encoded using the selected pattern width.\n";
     std::wcout << L"  -b is the default when no width option is supplied.\n";
+    std::wcout << L"  User VAs use active procctx when set; kernel VAs use the native kernel path.\n";
 }
 
 static void PrintCompareHelp()
 {
     std::wcout << L"compare command:\n";
     std::wcout << L"  c <address1> <address2> <length>\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  User VAs use active procctx when set; kernel VAs use the native kernel path.\n";
+    std::wcout << L"  Short reads are reported; comparison covers the overlapping successful bytes.\n";
 }
 
 static void PrintFillHelp()
@@ -22215,6 +22260,7 @@ static void PrintFillHelp()
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  length is bytes; the pattern repeats until the target range is filled.\n";
+    std::wcout << L"  User VAs require procctx or /process; kernel VAs use System(pid 4).\n";
 }
 
 static void PrintMoveHelp()
@@ -22224,6 +22270,7 @@ static void PrintMoveHelp()
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  length is bytes; the command reads the source range first, then writes destination.\n";
+    std::wcout << L"  Source and destination each use the same procctx/System policy as d*/e*.\n";
 }
 
 static void PrintSetFieldHelp()
