@@ -18931,8 +18931,13 @@ static void RefreshTimelineDashboardEvidence(
     TiSubscriber& ti = GetTiSubscriberInstance();
     TiSubscriberStats tiStats = ti.SnapshotStats();
     bool tiActive = ti.IsActive();
-    std::vector<TiEventRecord> tiEvents = ti.Recent(KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS, false);
-    TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(tiEvents, L"recent");
+    // Walk the full ring chronologically; maxAdd caps newly added events and
+    // keeps the recent cursor from skipping unprocessed older records.
+    std::vector<TiEventRecord> tiEvents = ti.Recent(0, false);
+    TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(
+        tiEvents,
+        L"recent",
+        KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS);
     if (tiActive ||
         tiStats.EventsReceived != 0 ||
         tiStats.EventsKept != 0 ||
@@ -19360,8 +19365,11 @@ static void HandleTimelineCommand(
             }
 
             TiSubscriber& sub = GetTiSubscriberInstance();
-            std::vector<TiEventRecord> tiEvents = sub.Recent(update.Limit, false);
-            TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(tiEvents, update.Mode);
+            std::vector<TiEventRecord> tiEvents = sub.Recent(0, false);
+            TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(
+                tiEvents,
+                update.Mode,
+                update.Limit);
             PrintTimelineIngestResult(L"ti", tiResult);
 
             if (state.HasSnapshotBaseline)
@@ -19791,8 +19799,8 @@ static void HandleTimelineCommand(
                 }
 
                 TiSubscriber& sub = GetTiSubscriberInstance();
-                std::vector<TiEventRecord> events = sub.Recent(limit, false);
-                TimelineIngestResult result = state.Timeline.IngestThreatIntel(events, mode);
+                std::vector<TiEventRecord> events = sub.Recent(0, false);
+                TimelineIngestResult result = state.Timeline.IngestThreatIntel(events, mode, limit);
                 PrintTimelineIngestResult(L"ti", result);
                 if (structuredJsonOut != nullptr)
                 {

@@ -2598,7 +2598,8 @@ uint64_t TimelineStore::Dropped() const
 
 TimelineIngestResult TimelineStore::IngestThreatIntel(
     const std::vector<TiEventRecord>& events,
-    const std::wstring& mode)
+    const std::wstring& mode,
+    size_t maxAdd)
 {
     TimelineIngestResult result = {};
 
@@ -2606,6 +2607,7 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
     uint64_t beforeDropped = DroppedEvents;
     bool useCursor = TimelineToLower(mode) != L"all";
     size_t skippedByCursor = 0;
+    size_t truncatedByMaxAdd = 0;
     uint64_t maxTimestamp = TiRecentCursorTimestamp;
     std::set<std::wstring> maxTimestampKeys = TiRecentCursorBoundaryKeys;
 
@@ -2630,6 +2632,14 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
                     continue;
                 }
             }
+        }
+
+        // Cap newly added events. Stop before consuming this item so the
+        // recent cursor does not jump past unprocessed ring records.
+        if (maxAdd != 0 && result.Added >= maxAdd)
+        {
+            ++truncatedByMaxAdd;
+            break;
         }
 
         ++result.SourceRecords;
@@ -2729,6 +2739,12 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
         result.Warnings.push_back(
             L"ti recent cursor skipped " + std::to_wstring(skippedByCursor) +
             L" previously ingested ring records; use '!timeline ingest ti all' to rescan the ring");
+    }
+    if (truncatedByMaxAdd != 0)
+    {
+        result.Warnings.push_back(
+            L"ti ingest stopped after maxAdd=" + std::to_wstring(maxAdd) +
+            L" added events; cursor advanced only through processed records so the remainder can be ingested next");
     }
 
     result.Dropped = DroppedEvents - beforeDropped;
