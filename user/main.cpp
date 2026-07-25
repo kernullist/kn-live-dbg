@@ -7504,7 +7504,8 @@ static bool BuildSnapshotProcessInventory(
     SymbolEngine& symbols,
     std::vector<SnapshotProcessRecord>* processes,
     std::vector<std::wstring>* warnings,
-    std::wstring* error)
+    std::wstring* error,
+    bool* inventoryIncomplete = nullptr)
 {
     bool ok = false;
 
@@ -7520,10 +7521,20 @@ static bool BuildSnapshotProcessInventory(
         }
 
         processes->clear();
+        if (inventoryIncomplete != nullptr)
+        {
+            *inventoryIncomplete = false;
+        }
+
         DmlProcessCollection collection = {};
         if (!CollectDmlProcessRecords(state, device, symbols, &collection, error))
         {
             break;
+        }
+
+        if (inventoryIncomplete != nullptr)
+        {
+            *inventoryIncomplete = collection.Incomplete;
         }
 
         if (warnings != nullptr)
@@ -11733,6 +11744,15 @@ static void HandleCallbacksCommand(
             PrintColoredText(L"module", KNDBG_COLOR_ACCENT);
             std::wcout << L"=";
             PrintColoredText(moduleFilter, KNDBG_COLOR_OK);
+        }
+        std::wcout << L" coverage_complete=" << (result.Incomplete ? L"no" : L"yes");
+        if (result.Incomplete)
+        {
+            std::wcout << L" incomplete=yes";
+        }
+        if (result.PoisonedEntryCount != 0)
+        {
+            std::wcout << L" poisoned_entries=" << result.PoisonedEntryCount;
         }
         std::wcout << L"\n";
         for (const KernelCallbackRecord& record : result.Records)
@@ -30366,6 +30386,11 @@ static void PrintHuntSummaryLine(const HuntResult& result)
                    << L" ti_events=" << result.ThreatIntelEventCount
                    << L" ti_correlations=" << result.ThreatIntelCorrelationCount;
     }
+    std::wcout << L" coverage_complete=" << (result.CoverageComplete ? L"yes" : L"no");
+    if (result.ProcessInventoryIncomplete)
+    {
+        std::wcout << L" process_inventory_incomplete=yes";
+    }
     std::wcout << L"\n";
 }
 
@@ -30396,6 +30421,14 @@ static void PrintHuntConclusion(const HuntResult& result, uint64_t warningCount)
         color = KNDBG_COLOR_ACCENT;
         action = L"low-risk leads only; save JSON if this is a baseline capture";
     }
+    else if (!result.CoverageComplete || result.ProcessInventoryIncomplete)
+    {
+        // Incomplete collection must never read as a clean whole-system bill
+        // of health when zero findings were emitted.
+        verdict = L"incomplete_coverage";
+        color = KNDBG_COLOR_WARN;
+        action = L"coverage is incomplete; do not treat empty findings as clean; re-run after fixing warnings or inspect incomplete inventory nodes";
+    }
 
     PrintColoredText(L"[hunt.conclusion]", color);
     std::wcout << L" verdict=" << verdict
@@ -30404,6 +30437,7 @@ static void PrintHuntConclusion(const HuntResult& result, uint64_t warningCount)
                << L" medium=" << result.MediumFindings
                << L" low=" << result.LowFindings
                << L" warnings=" << warningCount
+               << L" coverage_complete=" << (result.CoverageComplete ? L"yes" : L"no")
                << L"\n";
     std::wcout << L"  action: " << action << L"\n";
 }
@@ -30818,7 +30852,15 @@ static void HandleHuntCommand(
 
         std::vector<SnapshotProcessRecord> processes;
         std::vector<std::wstring> processWarnings;
-        if (!BuildSnapshotProcessInventory(state, device, symbols, &processes, &processWarnings, &error))
+        bool processInventoryIncomplete = false;
+        if (!BuildSnapshotProcessInventory(
+                state,
+                device,
+                symbols,
+                &processes,
+                &processWarnings,
+                &error,
+                &processInventoryIncomplete))
         {
             std::wcerr << L"!hunt process inventory failed: " << error << L"\n";
             break;
@@ -30868,6 +30910,11 @@ static void HandleHuntCommand(
         }
 
         result.Warnings.insert(result.Warnings.begin(), processWarnings.begin(), processWarnings.end());
+        result.ProcessInventoryIncomplete = processInventoryIncomplete;
+        if (processInventoryIncomplete)
+        {
+            result.CoverageComplete = false;
+        }
 
         if (structuredJsonOut != nullptr)
         {

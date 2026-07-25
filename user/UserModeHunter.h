@@ -168,6 +168,12 @@ struct HuntResult
     uint64_t SuspiciousWfpFilterCount = 0;
     bool ThreatIntelActive = false;
     bool ThreatIntelAvailable = false;
+    // Kernel ActiveProcessLinks inventory was partial (poisoned nodes skipped
+    // or walk stopped early). Findings must not be read as whole-system clean.
+    bool ProcessInventoryIncomplete = false;
+    // Aggregate coverage flag: false when any critical collection surface was
+    // incomplete (process inventory today; more surfaces can OR into this).
+    bool CoverageComplete = true;
     uint64_t ThreatIntelEventCount = 0;
     uint64_t ThreatIntelCorrelationCount = 0;
     uint64_t HighFindings = 0;

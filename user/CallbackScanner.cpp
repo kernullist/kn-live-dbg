@@ -2990,6 +2990,8 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
 
         result->Records.clear();
         result->Warnings.clear();
+        result->Incomplete = false;
+        result->PoisonedEntryCount = 0;
 
         std::wstring normalized = ToLowerLocal(scope.empty() ? L"all" : scope);
         bool scanAll = normalized == L"all";
@@ -3118,6 +3120,12 @@ std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result)
 {
     std::wstring out = L"{\"schema\":\"kn-live-dbg.callbacks.v1\",\"count\":";
     out += std::to_wstring(result.Records.size());
+    out += L",\"incomplete\":";
+    out += result.Incomplete ? L"true" : L"false";
+    out += L",\"poisonedEntryCount\":";
+    out += std::to_wstring(result.PoisonedEntryCount);
+    out += L",\"coverageComplete\":";
+    out += (!result.Incomplete) ? L"true" : L"false";
     out += L",\"records\":[";
 
     for (size_t index = 0; index < result.Records.size(); ++index)
@@ -3981,11 +3989,16 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 L"ob " + target + L": callback list walk hit entry cap without returning to head");
         }
 
-        if (walkIncomplete && poisonedEntries != 0)
+        if (walkIncomplete)
         {
-            result->Warnings.push_back(
-                L"ob " + target + L": walked past " + std::to_wstring(poisonedEntries) +
-                L" poisoned/invalid item(s); list coverage may be partial");
+            result->Incomplete = true;
+            if (poisonedEntries != 0)
+            {
+                result->PoisonedEntryCount += poisonedEntries;
+                result->Warnings.push_back(
+                    L"ob " + target + L": walked past " + std::to_wstring(poisonedEntries) +
+                    L" poisoned/invalid item(s); list coverage may be partial");
+            }
         }
 
         ok = true;

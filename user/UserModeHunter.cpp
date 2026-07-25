@@ -10791,6 +10791,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"threat_intel_available\":" << (result.ThreatIntelAvailable ? L"true" : L"false");
     json << L",\"threat_intel_events\":" << result.ThreatIntelEventCount;
     json << L",\"threat_intel_correlations\":" << result.ThreatIntelCorrelationCount;
+    json << L",\"process_inventory_incomplete\":" << (result.ProcessInventoryIncomplete ? L"true" : L"false");
+    json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
     json << L"},\n";
 
     json << L"  \"warnings\":";
