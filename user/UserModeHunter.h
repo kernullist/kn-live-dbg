@@ -168,6 +168,8 @@ struct HuntResult
     uint64_t SuspiciousWfpFilterCount = 0;
     bool ThreatIntelActive = false;
     bool ThreatIntelAvailable = false;
+    // Deep-mode TI correlation could not run with usable events.
+    bool ThreatIntelCorrelationIncomplete = false;
     // Kernel ActiveProcessLinks inventory was partial (poisoned nodes skipped
     // or walk stopped early). Findings must not be read as whole-system clean.
     bool ProcessInventoryIncomplete = false;

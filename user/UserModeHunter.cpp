@@ -7599,6 +7599,23 @@ namespace
             result->ThreatIntelEventCount = options.ThreatIntelEvents.size();
             if (options.ThreatIntelEvents.empty())
             {
+                // Deep mode expects TI correlation. Missing events must not look
+                // like "no TI findings because nothing suspicious happened".
+                if (options.Mode == HuntMode::Deep)
+                {
+                    result->ThreatIntelCorrelationIncomplete = true;
+                    result->CoverageComplete = false;
+                    if (!options.ThreatIntelActive)
+                    {
+                        result->Warnings.push_back(
+                            L"threat_intel correlation incomplete: deep mode without active !ti session or supplied events; TI behavioral correlation skipped");
+                    }
+                    else
+                    {
+                        result->Warnings.push_back(
+                            L"threat_intel correlation incomplete: TI session active but no ring events were available for this scan");
+                    }
+                }
                 break;
             }
 
@@ -10976,6 +10993,7 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"threat_intel_available\":" << (result.ThreatIntelAvailable ? L"true" : L"false");
     json << L",\"threat_intel_events\":" << result.ThreatIntelEventCount;
     json << L",\"threat_intel_correlations\":" << result.ThreatIntelCorrelationCount;
+    json << L",\"threat_intel_correlation_incomplete\":" << (result.ThreatIntelCorrelationIncomplete ? L"true" : L"false");
     json << L",\"process_inventory_incomplete\":" << (result.ProcessInventoryIncomplete ? L"true" : L"false");
     json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
     json << L"},\n";

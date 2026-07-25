@@ -30795,6 +30795,10 @@ static void PrintHuntSummaryLine(const HuntResult& result)
     {
         std::wcout << L" process_inventory_incomplete=yes";
     }
+    if (result.ThreatIntelCorrelationIncomplete)
+    {
+        std::wcout << L" ti_correlation_incomplete=yes";
+    }
     std::wcout << L"\n";
 }
 
