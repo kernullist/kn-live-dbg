@@ -28785,7 +28785,14 @@ static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryO
                << L" pe=" << result.PeLikeCount
                << L" suspicious=" << result.SuspiciousCount
                << L" truncated=" << (result.Truncated ? L"yes" : L"no")
-               << L"\n";
+               << L" coverage_complete=" << (result.CoverageComplete ? L"yes" : L"no")
+               << L" protection_resolved=" << (result.ProtectionResolved ? L"yes" : L"no")
+               << L" private_memory_resolved=" << (result.PrivateMemoryResolved ? L"yes" : L"no");
+    if (result.Incomplete)
+    {
+        std::wcout << L" incomplete=yes";
+    }
+    std::wcout << L"\n";
 
     if (result.HiddenPteScanEnabled)
     {

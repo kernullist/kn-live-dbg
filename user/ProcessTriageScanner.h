@@ -119,6 +119,12 @@ struct ProcessVadScanResult
     bool Truncated = false;
     bool HiddenPteScanEnabled = false;
     bool HiddenPteTruncated = false;
+    // False when Protection/PrivateMemory metadata is missing so exec/private/PE
+    // signals cannot be trusted as complete (not a clean empty result).
+    bool ProtectionResolved = false;
+    bool PrivateMemoryResolved = false;
+    bool CoverageComplete = true;
+    bool Incomplete = false;
     std::wstring LayoutSource;
 };
 
