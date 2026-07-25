@@ -9762,17 +9762,34 @@ static void HandleEnterCommand(
             break;
         }
 
+        // Context selection matches d*/vtop:
+        //   1) /process <pid> (one-shot)
+        //   2) user VA + procctx -> process DTB
+        //   3) kernel VA -> System(pid 4) for PTE-aware path
+        //   4) user VA without procctx -> hard error (do not guess)
         ProcessAddressContext kernelContext = {};
         const ProcessAddressContext* memoryContext = hasExplicitContext ? &explicitContext : nullptr;
         if (!hasExplicitContext)
         {
-            if (!EnsureKernelProcessAddressContext(state, device, symbols, &kernelContext, &error))
+            if (IsLikelyUserVirtualAddress(address))
             {
-                std::wcerr << L"kernel process context failed: " << error << L"\n";
-                break;
+                if (!state.HasProcessContext)
+                {
+                    std::wcerr << L"user virtual write requires procctx <pid> or /process <pid>\n";
+                    break;
+                }
+                // Leave memoryContext null so SelectMemoryAccessContext uses procctx.
             }
+            else
+            {
+                if (!EnsureKernelProcessAddressContext(state, device, symbols, &kernelContext, &error))
+                {
+                    std::wcerr << L"kernel process context failed: " << error << L"\n";
+                    break;
+                }
 
-            memoryContext = &kernelContext;
+                memoryContext = &kernelContext;
+            }
         }
 
         bool interactiveEdit = argIndex + 1 >= args.size();
@@ -9838,11 +9855,13 @@ static void HandleEnterCommand(
 
         if (WriteMemoryWithProcessContext(device, state, memoryContext, address, bytes, &error))
         {
+            const ProcessAddressContext* usedContext =
+                SelectMemoryAccessContext(state, memoryContext, address);
             PrintColoredText(L"wrote", KNDBG_COLOR_OK);
             std::wcout << L" " << bytes.size() << L" bytes";
-            if (memoryContext != nullptr)
+            if (usedContext != nullptr)
             {
-                std::wcout << L" pid=" << memoryContext->ProcessId;
+                std::wcout << L" pid=" << usedContext->ProcessId;
             }
             std::wcout << L"\n";
         }
@@ -21609,7 +21628,7 @@ static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const Symbol
     stream << L"- symbol path: " << symbols.SymbolPath() << L"\n";
     stream << L"- loaded kernel modules: " << symbols.Modules().size() << L"\n";
     stream << L"- write mode is enabled by default per device handle unless the operator ran write off\n";
-    stream << L"- native e* virtual writes default to System(pid 4) page-table context; use /process for a specific process\n";
+    stream << L"- native e* user VA writes use procctx or /process; kernel VA writes use System(pid 4)\n";
     stream << L"- address arguments support arithmetic such as nt!Symbol+20 or 0xfffff80000000000-10\n";
     stream << L"Rules:\n";
     stream << L"- Prefer concrete KnLiveDbg commands and exact preview text.\n";
@@ -21714,7 +21733,8 @@ static void PrintWriteHelp()
     std::wcout << L"  off   disable native write IOCTLs for the active device session\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Write mode defaults to on at startup. e* defaults to System(pid 4) context for kernel addresses.\n";
+    std::wcout << L"  Write mode defaults to on at startup.\n";
+    std::wcout << L"  e* user VAs use procctx or /process; kernel VAs use System(pid 4).\n";
     std::wcout << L"  This is the driver session write gate; it does not validate that a target patch is semantically safe.\n";
 }
 
@@ -21888,7 +21908,9 @@ static void PrintEnterHelp(const std::wstring& command)
     std::wcout << L"  eza/ezu write zero-terminated strings\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Address-only form prompts for replacement bytes. Kernel virtual writes use System(pid 4) context by default.\n";
+    std::wcout << L"  Address-only form prompts for replacement bytes.\n";
+    std::wcout << L"  User VAs use active procctx or /process <pid>; kernel VAs use System(pid 4).\n";
+    std::wcout << L"  User virtual writes without procctx or /process fail instead of guessing a DTB.\n";
     std::wcout << L"  /process <process-id> writes through that process page table for this command only.\n";
     std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  Read-only leaf PTEs are temporarily marked writable, flushed, written, and restored.\n";
@@ -26814,7 +26836,7 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             plan.BackupCommand = L"db " + contextPrefix + commandArgs[addressIndex] + L" " + std::to_wstring(byteCount == 0 ? 16 : byteCount);
             plan.VerifyCommand = plan.BackupCommand;
             plan.TranslationCommand = L"vtop " + contextPrefix + commandArgs[addressIndex] + L" " + std::to_wstring(byteCount == 0 ? 1 : byteCount);
-            plan.Warning = L"virtual write: native e* defaults to System(pid 4) page-table context; verify page ownership, target module, and whether the range touches code, callbacks, list links, or reference counts";
+            plan.Warning = L"virtual write: e* user VAs use procctx or /process, kernel VAs use System(pid 4); verify page ownership, target module, and whether the range touches code, callbacks, list links, or reference counts";
         }
         else if (IsPhysicalEnterCommand(command))
         {
