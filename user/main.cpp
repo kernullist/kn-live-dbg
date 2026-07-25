@@ -15196,13 +15196,18 @@ static void HandleDumpRawCommand(
 
         PrintColoredText(L"[dump-raw]", KNDBG_COLOR_TITLE);
         std::wcout << L" address=" << HexTextWidth(result.StartAddress, 16, true)
-                   << L" length=0x" << std::hex << result.Length << std::dec
+                   << L" requested=0x" << std::hex << result.BytesRequested << std::dec
+                   << L" kernel_bytes=" << result.BytesRead
+                   << L" zero_bytes=" << result.BytesZeroFilled
                    << L" wrote=" << result.BytesWritten
-                   << L" chunks=" << result.ChunksRead;
-        if (result.ChunksFailed > 0)
+                   << L" chunks_ok=" << result.ChunksRead
+                   << L" complete=" << (result.Complete ? L"yes" : L"no");
+        if (result.ShortRead || result.ChunksFailed > 0)
         {
             std::wcout << L" ";
-            PrintColoredText(L"zero-filled=" + std::to_wstring(result.ChunksFailed), KNDBG_COLOR_WARN);
+            PrintColoredText(
+                L"short_read=yes zero_filled_chunks=" + std::to_wstring(result.ChunksFailed),
+                KNDBG_COLOR_WARN);
         }
         std::wcout << L" path=";
         PrintColoredText(path, KNDBG_COLOR_OK);

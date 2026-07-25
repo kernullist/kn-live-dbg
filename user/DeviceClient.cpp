@@ -701,11 +701,21 @@ bool DeviceClient::WriteMemory(uint64_t address, const std::vector<uint8_t>& byt
             break;
         }
 
-        if (returned < FIELD_OFFSET(KNDBG_WRITE_REQUEST, Data) || request->Length != bytes.size())
+        if (returned < FIELD_OFFSET(KNDBG_WRITE_REQUEST, Data))
         {
             if (error != nullptr)
             {
-                *error = L"Short write response";
+                *error = L"Short write response header";
+            }
+            break;
+        }
+
+        if (request->Length != bytes.size())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short write: requested=" + std::to_wstring(bytes.size()) +
+                         L" written=" + std::to_wstring(request->Length);
             }
             break;
         }
