@@ -3061,6 +3061,8 @@ static bool IsPoolScopeName(const std::wstring& value)
     return lowered == L"big" ||
         lowered == L"bigpool" ||
         lowered == L"find" ||
+        lowered == L"tags" ||
+        lowered == L"tag" ||
         lowered == L"summary";
 }
 
@@ -3068,6 +3070,8 @@ static bool IsPoolOption(const std::wstring& value)
 {
     std::wstring lowered = ToLower(value);
     return lowered == L"/tag" ||
+        lowered == L"/tags" ||
+        lowered == L"/with-tags" ||
         lowered == L"/min" ||
         lowered == L"/max" ||
         lowered == L"/addr" ||
@@ -20557,6 +20561,7 @@ static void PrintPoolHelp()
     std::wcout << L"!pool command:\n";
     std::wcout << L"  !pool big [options]\n";
     std::wcout << L"  !pool find /tag <TAG> [options]\n";
+    std::wcout << L"  !pool tags [/tag <TAG>] [/limit <n>]\n";
     std::wcout << L"  !pool summary\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
@@ -20582,7 +20587,10 @@ static void PrintPoolHelp()
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Requires SeDebugPrivilege; run elevated. The scanner attempts to enable it automatically.\n";
-    std::wcout << L"  Only big pool (>= 0x1000 bytes) is tracked by nt!PoolBigPageTable. Use !pool find /tag <TAG> to scan\n";
+    std::wcout << L"  big/find list allocation VAs from PoolBigPageTable (page-sized+ only).\n";
+    std::wcout << L"  tags uses SystemPoolTagInformation for small+big pool usage by tag (no VA).\n";
+    std::wcout << L"  /tags on big/find also attaches a top-tag summary without replacing the VA list.\n";
+    std::wcout << L"  Use !pool find /tag <TAG> to scan\n";
     std::wcout << L"  for known suspicious tags; combine with /annotate to spot W+X allocations (executable NonPaged pool).\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
@@ -20676,6 +20684,10 @@ static void HandlePoolCommand(
             {
                 options.Target = PoolScanner::Scope::Find;
             }
+            else if (scope == L"tags" || scope == L"tag")
+            {
+                options.Target = PoolScanner::Scope::Tags;
+            }
             else if (scope == L"summary")
             {
                 summaryOnly = true;
@@ -20716,6 +20728,12 @@ static void HandlePoolCommand(
             {
                 options.WxOnly = true;
                 options.AnnotateAttributes = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/tags" || opt == L"/with-tags")
+            {
+                options.IncludePoolTagSummary = true;
                 ++index;
                 continue;
             }
@@ -20849,13 +20867,30 @@ static void HandlePoolCommand(
             {
                 PrintBigPoolRecord(entry, options.AnnotateAttributes);
             }
+            for (const PoolTagStatRecord& tag : result.TagStats)
+            {
+                PrintColoredText(L"[pool.tag]", KNDBG_COLOR_TITLE);
+                std::wcout << L" tag=";
+                PrintColoredText(tag.TagText, KNDBG_COLOR_OK);
+                std::wcout << L" np_used=0x" << std::hex << tag.NonPagedUsed
+                           << L" p_used=0x" << tag.PagedUsed
+                           << L" np_allocs=" << std::dec << tag.NonPagedAllocs
+                           << L" p_allocs=" << tag.PagedAllocs << L"\n";
+            }
         }
 
         PrintColoredText(L"[pool.summary]", KNDBG_COLOR_TITLE);
         std::wcout << L" total=" << std::dec << result.TotalEntries
                    << L" nonpaged=" << result.NonPagedCount
                    << L" paged=" << result.PagedCount
-                   << L" matching=" << result.MatchingCount;
+                   << L" matching=" << result.MatchingCount
+                   << L" big_pool_address_view=" << (result.BigPoolAddressViewOnly ? L"yes" : L"no")
+                   << L" pool_tag_view=" << (result.PoolTagViewAvailable ? L"yes" : L"no");
+        if (result.PoolTagViewAvailable)
+        {
+            std::wcout << L" tag_stats=" << result.TagStats.size()
+                       << L" tag_total=" << result.TagStatCount;
+        }
         if (result.QueryBufferBytes != 0)
         {
             std::wcout << L" buffer=0x" << std::hex << result.QueryBufferBytes << std::dec;

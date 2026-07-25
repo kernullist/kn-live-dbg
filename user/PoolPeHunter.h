@@ -33,6 +33,8 @@ struct PoolPeHunterResult
     std::vector<std::wstring> Warnings;
     std::vector<std::wstring> Diagnostics;
     bool     PrivilegeEnabled = false;
+    // Address scanning is limited to SystemBigPoolInformation (page-sized+).
+    bool     BigPoolAddressViewOnly = true;
 };
 
 class PoolPeHunter

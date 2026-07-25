@@ -4,6 +4,7 @@
 #include "McpJson.h"
 
 #include <Windows.h>
+#include <algorithm>
 #include <cstdio>
 #include <sstream>
 #include <iomanip>
@@ -11,6 +12,7 @@
 // Undocumented but stable across modern Windows builds.
 // Confirmed working on Windows 10 1809+ and Windows 11 22H2/23H2/24H2.
 constexpr ULONG kSystemBigPoolInformation = 0x42;
+constexpr ULONG kSystemPoolTagInformation = 0x16;
 constexpr ULONG kInitialQueryBytes = 0x10000;        // 64 KB
 constexpr ULONG kMaxQueryBytes     = 0x4000000;      // 64 MB
 constexpr ULONG kMaxQueryRetries   = 16;
@@ -56,7 +58,263 @@ namespace
         ULONG Count;
         SYSTEM_BIGPOOL_ENTRY_LOCAL Entries[1];
     } SYSTEM_BIGPOOL_INFORMATION_LOCAL, *PSYSTEM_BIGPOOL_INFORMATION_LOCAL;
+
+    typedef struct _SYSTEM_POOLTAG_LOCAL
+    {
+        union
+        {
+            UCHAR Tag[4];
+            ULONG TagUlong;
+        };
+        ULONG PagedAllocs;
+        ULONG PagedFrees;
+        SIZE_T PagedUsed;
+        ULONG NonPagedAllocs;
+        ULONG NonPagedFrees;
+        SIZE_T NonPagedUsed;
+    } SYSTEM_POOLTAG_LOCAL, *PSYSTEM_POOLTAG_LOCAL;
+
+    typedef struct _SYSTEM_POOLTAG_INFORMATION_LOCAL
+    {
+        ULONG Count;
+        SYSTEM_POOLTAG_LOCAL TagInfo[1];
+    } SYSTEM_POOLTAG_INFORMATION_LOCAL, *PSYSTEM_POOLTAG_INFORMATION_LOCAL;
 #pragma pack(pop)
+
+    bool QuerySystemInfoBuffer(
+        PfnNtQuerySystemInformation fn,
+        ULONG infoClass,
+        std::vector<uint8_t>* buffer,
+        ULONG* returnLength,
+        ULONG* retriesOut,
+        std::wstring* error)
+    {
+        bool ok = false;
+        void* raw = nullptr;
+
+        do
+        {
+            if (fn == nullptr || buffer == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid system info query arguments";
+                }
+                break;
+            }
+
+            ULONG bufferSize = kInitialQueryBytes;
+            ULONG returnLengthLocal = 0;
+            ULONG retries = 0;
+            bool fetched = false;
+            NTSTATUS_LOCAL status = STATUS_SUCCESS;
+
+            for (;;)
+            {
+                if (raw != nullptr)
+                {
+                    HeapFree(GetProcessHeap(), 0, raw);
+                    raw = nullptr;
+                }
+
+                raw = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bufferSize);
+                if (raw == nullptr)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"HeapAlloc for system info buffer failed";
+                    }
+                    break;
+                }
+
+                returnLengthLocal = 0;
+                status = fn(infoClass, raw, bufferSize, &returnLengthLocal);
+                if (status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL)
+                {
+                    ULONG nextSize = (returnLengthLocal > bufferSize) ? returnLengthLocal : (bufferSize * 2);
+                    if (nextSize <= bufferSize)
+                    {
+                        nextSize = bufferSize * 2;
+                    }
+                    if (nextSize > kMaxQueryBytes)
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = L"system info buffer exceeded 64MB ceiling";
+                        }
+                        break;
+                    }
+                    if (++retries > kMaxQueryRetries)
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = L"system info query exceeded retry budget";
+                        }
+                        break;
+                    }
+                    bufferSize = nextSize;
+                    continue;
+                }
+
+                if (status < 0)
+                {
+                    if (error != nullptr)
+                    {
+                        wchar_t buf[32] = {};
+                        swprintf_s(buf, L"0x%08X", static_cast<unsigned>(status));
+                        *error = L"NtQuerySystemInformation failed: status=" + std::wstring(buf);
+                    }
+                    break;
+                }
+
+                fetched = true;
+                break;
+            }
+
+            if (retriesOut != nullptr)
+            {
+                *retriesOut = retries;
+            }
+            if (returnLength != nullptr)
+            {
+                *returnLength = returnLengthLocal;
+            }
+            if (!fetched)
+            {
+                break;
+            }
+
+            buffer->assign(
+                reinterpret_cast<uint8_t*>(raw),
+                reinterpret_cast<uint8_t*>(raw) + returnLengthLocal);
+            ok = true;
+        } while (false);
+
+        if (raw != nullptr)
+        {
+            HeapFree(GetProcessHeap(), 0, raw);
+        }
+
+        return ok;
+    }
+
+    bool CollectPoolTagStats(
+        PfnNtQuerySystemInformation fn,
+        const PoolScanner::Options& options,
+        PoolScanResult* result,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> buffer;
+            ULONG returnLength = 0;
+            ULONG retries = 0;
+            std::wstring queryError;
+            if (!QuerySystemInfoBuffer(
+                    fn,
+                    kSystemPoolTagInformation,
+                    &buffer,
+                    &returnLength,
+                    &retries,
+                    &queryError))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"SystemPoolTagInformation: " + queryError;
+                }
+                break;
+            }
+
+            const SIZE_T headerBytes = FIELD_OFFSET(SYSTEM_POOLTAG_INFORMATION_LOCAL, TagInfo);
+            if (returnLength < headerBytes)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"pool tag buffer smaller than header";
+                }
+                break;
+            }
+
+            const SYSTEM_POOLTAG_INFORMATION_LOCAL* info =
+                reinterpret_cast<const SYSTEM_POOLTAG_INFORMATION_LOCAL*>(buffer.data());
+            const ULONG total = info->Count;
+            result->TagStatCount = total;
+
+            const SIZE_T expected =
+                headerBytes + static_cast<SIZE_T>(total) * sizeof(SYSTEM_POOLTAG_LOCAL);
+            const ULONG safeCount = static_cast<ULONG>(
+                (expected > returnLength)
+                    ? (returnLength - headerBytes) / sizeof(SYSTEM_POOLTAG_LOCAL)
+                    : total);
+
+            std::vector<PoolTagStatRecord> all;
+            all.reserve(safeCount);
+            for (ULONG i = 0; i < safeCount; ++i)
+            {
+                const SYSTEM_POOLTAG_LOCAL& src = info->TagInfo[i];
+                if (options.HasTagFilter && src.TagUlong != options.TagFilter)
+                {
+                    continue;
+                }
+
+                PoolTagStatRecord rec = {};
+                rec.TagRaw = src.TagUlong;
+                {
+                    std::wstring text;
+                    text.reserve(4);
+                    for (int bi = 0; bi < 4; ++bi)
+                    {
+                        unsigned char ch = static_cast<unsigned char>((src.TagUlong >> (bi * 8)) & 0xff);
+                        text.push_back((ch >= 0x20 && ch <= 0x7E) ? static_cast<wchar_t>(ch) : L'.');
+                    }
+                    rec.TagText = text;
+                }
+                rec.PagedAllocs = src.PagedAllocs;
+                rec.PagedFrees = src.PagedFrees;
+                rec.PagedUsed = static_cast<uint64_t>(src.PagedUsed);
+                rec.NonPagedAllocs = src.NonPagedAllocs;
+                rec.NonPagedFrees = src.NonPagedFrees;
+                rec.NonPagedUsed = static_cast<uint64_t>(src.NonPagedUsed);
+                all.push_back(rec);
+            }
+
+            std::sort(
+                all.begin(),
+                all.end(),
+                [](const PoolTagStatRecord& left, const PoolTagStatRecord& right)
+                {
+                    if (left.NonPagedUsed != right.NonPagedUsed)
+                    {
+                        return left.NonPagedUsed > right.NonPagedUsed;
+                    }
+                    return left.PagedUsed > right.PagedUsed;
+                });
+
+            const uint32_t limit =
+                options.LimitTagStats != 0
+                    ? options.LimitTagStats
+                    : (options.LimitEntries != 0 ? options.LimitEntries : 64u);
+            if (all.size() > limit)
+            {
+                all.resize(limit);
+            }
+
+            result->TagStats = std::move(all);
+            result->PoolTagViewAvailable = true;
+            result->Diagnostics.push_back(
+                L"pool tag view from SystemPoolTagInformation (covers small+big pool usage by tag; no per-allocation VA)");
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
 
     bool TryAdd(uint64_t left, uint64_t right, uint64_t* result)
     {
@@ -283,6 +541,7 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
     }
 
     *result = PoolScanResult{};
+    result->BigPoolAddressViewOnly = true;
 
     bool ok = false;
     void* buffer = nullptr;
@@ -312,6 +571,41 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
             }
             break;
         }
+
+        const bool tagsOnly = options.Target == PoolScanner::Scope::Tags;
+        const bool wantTags =
+            tagsOnly ||
+            options.IncludePoolTagSummary;
+        if (wantTags)
+        {
+            std::wstring tagError;
+            if (!CollectPoolTagStats(fn, options, result, &tagError))
+            {
+                result->Warnings.push_back(
+                    tagError.empty()
+                        ? L"pool tag summary unavailable"
+                        : tagError);
+                if (tagsOnly)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = tagError.empty() ? L"pool tag query failed" : tagError;
+                    }
+                    break;
+                }
+            }
+            else if (tagsOnly)
+            {
+                result->Diagnostics.push_back(
+                    L"address-level big pool enumeration skipped (tags scope); use !pool big/find for VAs");
+                ok = true;
+                break;
+            }
+        }
+
+        result->Diagnostics.push_back(
+            L"big pool address view only covers allocations tracked by PoolBigPageTable (>= page size); "
+            L"use !pool tags for small+big pool tag usage");
 
         ULONG bufferSize = kInitialQueryBytes;
         ULONG returnLength = 0;
@@ -608,7 +902,27 @@ std::wstring BuildPoolJson(const PoolScanResult& result)
     out += L",\"matchingCount\":" + std::to_wstring(result.MatchingCount);
     out += L",\"attributesAttempted\":";
     out += result.AttributesAttempted ? L"true" : L"false";
-    out += L",\"records\":[";
+    out += L",\"bigPoolAddressViewOnly\":";
+    out += result.BigPoolAddressViewOnly ? L"true" : L"false";
+    out += L",\"poolTagViewAvailable\":";
+    out += result.PoolTagViewAvailable ? L"true" : L"false";
+    out += L",\"tagStatCount\":" + std::to_wstring(result.TagStatCount);
+    out += L",\"tagStats\":[";
+    for (size_t ti = 0; ti < result.TagStats.size(); ++ti)
+    {
+        const PoolTagStatRecord& tag = result.TagStats[ti];
+        if (ti > 0)
+        {
+            out += L",";
+        }
+        out += L"{\"tag\":" + mcpjson::Quote(tag.TagText);
+        out += L",\"nonPagedUsed\":" + std::to_wstring(tag.NonPagedUsed);
+        out += L",\"pagedUsed\":" + std::to_wstring(tag.PagedUsed);
+        out += L",\"nonPagedAllocs\":" + std::to_wstring(tag.NonPagedAllocs);
+        out += L",\"pagedAllocs\":" + std::to_wstring(tag.PagedAllocs);
+        out += L"}";
+    }
+    out += L"],\"records\":[";
 
     for (size_t index = 0; index < result.Entries.size(); ++index)
     {
