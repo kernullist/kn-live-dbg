@@ -173,7 +173,10 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
             std::wstring DescriptorSymbol;
             uint64_t DescriptorAddress;
             std::wstring Name;
-            bool Win32k;
+            bool Win32k = false;
+            // Filter/optional tables may own routines in third-party modules;
+            // only flag targets outside every loaded kernel image.
+            bool AnyLoadedModuleOk = false;
         };
 
         std::vector<TableTarget> targets;
@@ -196,19 +199,87 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
         uint64_t shadowDescriptor = 0;
         if (symbols_.ResolveSymbol(L"nt!KeServiceDescriptorTableShadow", &shadowDescriptor, nullptr) && shadowDescriptor != 0)
         {
-            if (AnyWin32kModuleLoaded(symbols_))
+            // Shadow array holds up to four descriptors on modern Windows:
+            //   [0] native (often aliases KeServiceDescriptorTable)
+            //   [1] win32k
+            //   [2] filter / optional
+            //   [3] unused / optional
+            // Enumerate every non-empty slot without removing the legacy
+            // native + win32k[1] coverage.
+            const bool win32kLoaded = AnyWin32kModuleLoaded(symbols_);
+            if (!win32kLoaded)
             {
+                result->Warnings.push_back(
+                    L"win32k modules not loaded; shadow[1] may be empty (other shadow slots still checked)");
+            }
+
+            for (uint32_t slot = 0; slot < 4; ++slot)
+            {
+                const uint64_t descriptorAddress =
+                    shadowDescriptor + static_cast<uint64_t>(slot) * kDescriptorStride;
+
+                // Skip shadow[0] when it is the same object as the public native table.
+                if (slot == 0 && nativeDescriptor != 0 && descriptorAddress == nativeDescriptor)
+                {
+                    continue;
+                }
+
+                uint64_t probeBase = 0;
+                uint32_t probeLimit = 0;
+                if (!ReadU64(device_, descriptorAddress + baseField.Offset, &probeBase) ||
+                    !ReadU32(device_, descriptorAddress + limitField.Offset, &probeLimit))
+                {
+                    continue;
+                }
+                if (probeBase == 0 || probeLimit == 0 || !IsKernelAddress(probeBase))
+                {
+                    continue;
+                }
+
+                // Avoid double-walking the same table base already covered by native.
+                if (nativeDescriptor != 0)
+                {
+                    uint64_t nativeBase = 0;
+                    if (ReadU64(device_, nativeDescriptor + baseField.Offset, &nativeBase) &&
+                        nativeBase != 0 &&
+                        nativeBase == probeBase)
+                    {
+                        result->Warnings.push_back(
+                            L"KeServiceDescriptorTableShadow[" + std::to_wstring(slot) +
+                            L"] aliases native KiServiceTable; not double-scanned");
+                        continue;
+                    }
+                }
+
                 TableTarget target = {};
-                target.DescriptorSymbol = L"nt!KeServiceDescriptorTableShadow";
-                target.DescriptorAddress = shadowDescriptor + kDescriptorStride; // descriptor[1] = win32k
-                target.Name = L"KeServiceDescriptorTableShadow[1] (win32k)";
-                target.Win32k = true;
+                target.DescriptorSymbol =
+                    L"nt!KeServiceDescriptorTableShadow[" + std::to_wstring(slot) + L"]";
+                target.DescriptorAddress = descriptorAddress;
+                if (slot == 0)
+                {
+                    target.Name = L"KeServiceDescriptorTableShadow[0] (native/filter alias)";
+                    target.Win32k = false;
+                }
+                else if (slot == 1)
+                {
+                    target.Name = L"KeServiceDescriptorTableShadow[1] (win32k)";
+                    target.Win32k = true;
+                }
+                else
+                {
+                    target.Name =
+                        L"KeServiceDescriptorTableShadow[" + std::to_wstring(slot) +
+                        L"] (filter/optional)";
+                    target.Win32k = false;
+                    target.AnyLoadedModuleOk = true;
+                }
                 targets.push_back(target);
             }
-            else
-            {
-                result->Warnings.push_back(L"win32k modules not loaded; shadow SSDT validation skipped");
-            }
+        }
+        else
+        {
+            result->Warnings.push_back(
+                L"nt!KeServiceDescriptorTableShadow not resolved; only native SSDT scanned");
         }
 
         if (targets.empty())
@@ -262,7 +333,11 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
             table.Resolved = true;
 
             std::wstring expectedModule;
-            if (!target.Win32k)
+            if (target.AnyLoadedModuleOk)
+            {
+                table.ExpectedModule = L"<any-loaded-module>";
+            }
+            else if (!target.Win32k)
             {
                 expectedModule = FindOwningModule(symbols_, tableBase);
                 table.ExpectedModule = expectedModule.empty() ? L"<ntoskrnl>" : expectedModule;
@@ -304,6 +379,12 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
                     entry.Suspicious = true;
                     entry.InExpectedModule = false;
                     entry.Notes = L"service routine outside loaded kernel modules";
+                }
+                else if (target.AnyLoadedModuleOk)
+                {
+                    // Filter/optional tables may legitimately point into third
+                    // party filter drivers; only outside-all-modules is bad.
+                    entry.InExpectedModule = true;
                 }
                 else if (!target.Win32k)
                 {
