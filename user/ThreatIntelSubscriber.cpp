@@ -447,14 +447,12 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
 
 bool TiSubscriber::Stop(std::wstring* error)
 {
-    // Use atomic exchange to prevent two threads from racing into the
-    // teardown path. The loser sees Active was already false.
-    bool wasActive = Active.exchange(false);
-    if (!wasActive)
-    {
-        return true;
-    }
+    // Teardown any partial Start() state even when Active never became true
+    // (e.g. CTRL_CLOSE after StartTraceW but before Active.store). Use a
+    // dedicated lock so concurrent Stop calls serialize on resource cleanup.
     std::lock_guard<std::mutex> stateLock(StateMutex);
+
+    const bool wasActive = Active.exchange(false);
 
     // Closing the process handle causes ProcessTrace to return.
     ProcessTraceShouldExit.store(true);
@@ -469,7 +467,7 @@ bool TiSubscriber::Stop(std::wstring* error)
     }
     ProcessHandle = INVALID_PROCESSTRACE_HANDLE;
 
-    // Disable provider and stop the session.
+    // Disable provider and stop the session when Start opened one.
     if (SessionHandle != 0)
     {
         EnableTraceEx2(
@@ -479,10 +477,40 @@ bool TiSubscriber::Stop(std::wstring* error)
             TRACE_LEVEL_VERBOSE,
             0, 0, 0, nullptr);
 
-        EVENT_TRACE_PROPERTIES* props =
-            reinterpret_cast<EVENT_TRACE_PROPERTIES*>(SessionPropertiesBlob.data());
-        ControlTraceW(SessionHandle, nullptr, props, EVENT_TRACE_CONTROL_STOP);
+        if (!SessionPropertiesBlob.empty())
+        {
+            EVENT_TRACE_PROPERTIES* props =
+                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(SessionPropertiesBlob.data());
+            ControlTraceW(SessionHandle, nullptr, props, EVENT_TRACE_CONTROL_STOP);
+        }
+        else
+        {
+            // Partial start may not have built SessionPropertiesBlob yet; still
+            // try a name-based stop for leftover realtime sessions.
+            std::vector<uint8_t> stopBlob;
+            BuildRealtimeSessionProperties(SessionName.empty() ? kDefaultSessionName : SessionName, &stopBlob);
+            ControlTraceW(
+                0,
+                (SessionName.empty() ? kDefaultSessionName : SessionName.c_str()),
+                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(stopBlob.data()),
+                EVENT_TRACE_CONTROL_STOP);
+        }
         SessionHandle = 0;
+    }
+    else if (!wasActive)
+    {
+        // Best-effort: if Active never flipped but a named session may exist
+        // from a half-started attempt, try stop-by-name.
+        if (!SessionName.empty())
+        {
+            std::vector<uint8_t> stopBlob;
+            BuildRealtimeSessionProperties(SessionName, &stopBlob);
+            ControlTraceW(
+                0,
+                SessionName.c_str(),
+                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(stopBlob.data()),
+                EVENT_TRACE_CONTROL_STOP);
+        }
     }
 
     // Close log file.
@@ -1108,7 +1136,9 @@ std::vector<TiEventRecord> TiSubscriber::FilterByPid(uint32_t pid, size_t maxCou
     std::lock_guard<std::mutex> lock(RingMutex);
     for (auto it = Ring.rbegin(); it != Ring.rend(); ++it)
     {
-        if (it->ProcessId == pid)
+        // Match caller or cross-process target so !ti by pid <victim> surfaces
+        // WriteVM/AllocVM/etc. against that process (same as MatchesWatch).
+        if (it->ProcessId == pid || it->TargetProcessId == pid)
         {
             out.push_back(*it);
             if (maxCount != 0 && out.size() >= maxCount)

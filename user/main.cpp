@@ -16757,6 +16757,12 @@ static bool ParseProtectionByte(const std::wstring& levelText, uint8_t* outByte,
     return ok;
 }
 
+static bool CheckSelfIsPplAntimalware(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint8_t* outProtection,
+    std::wstring* error);
+
 static void HandleSetPplAntimalwareCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -16828,26 +16834,46 @@ static void HandleSetPplAntimalwareCommand(
 
         uint32_t pid = static_cast<uint32_t>(GetCurrentProcessId());
 
-        // For 'status' we read the current byte by writing the same value
-        // back -- the driver returns the old byte and the read-back which
-        // is what we want to display. Writing the same byte is idempotent.
+        // status is a pure read of EPROCESS.Protection (no write IOCTL).
+        if (action == L"status")
+        {
+            uint8_t protection = 0;
+            std::wstring gateError;
+            CheckSelfIsPplAntimalware(device, symbols, &protection, &gateError);
+            // CheckSelf returns false for both "not 0x31" and hard failure.
+            // Hard failure always sets gateError; successful non-0x31 read leaves
+            // it empty and still fills *outProtection.
+            if (!gateError.empty())
+            {
+                std::wcerr << L"set-ppl-antimalware status failed: " << gateError << L"\n";
+                break;
+            }
+
+            PrintColoredText(L"[set-ppl-antimalware]", KNDBG_COLOR_TITLE);
+            std::wcout << L" pid=" << std::dec << pid
+                       << L" offset=0x" << std::hex << protectionField.Offset << std::dec
+                       << L"\n";
+            std::wcout << L"  protection=0x" << std::hex << std::setw(2) << std::setfill(L'0')
+                       << static_cast<unsigned>(protection) << std::dec
+                       << L" (" << DescribeProtectionByte(protection) << L")";
+            if (protection == KNDBG_PROTECTION_PPL_ANTIMALWARE)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[ppl-antimalware]", KNDBG_COLOR_OK);
+            }
+            else
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[not ppl-antimalware]", KNDBG_COLOR_WARN);
+            }
+            std::wcout << L"\n";
+            break;
+        }
+
         uint8_t requestedValue = KNDBG_PROTECTION_PPL_ANTIMALWARE;
-        bool isStatusOnly = false;
         if (action == L"off")
         {
             requestedValue = KNDBG_PROTECTION_NONE;
-        }
-        else if (action == L"status")
-        {
-            // Read current value first via a no-op rewrite. We need an
-            // intermediate read; reuse the IOCTL by writing back what we
-            // read. Simpler: do a single round where the new value is the
-            // value we hope is already there (use 0x31 by default) -- the
-            // response carries the OldProtection regardless. We then
-            // immediately overwrite again with OldProtection to be
-            // idempotent.
-            isStatusOnly = true;
-            requestedValue = KNDBG_PROTECTION_PPL_ANTIMALWARE;
         }
 
         uint8_t oldByte = 0;
@@ -16868,27 +16894,6 @@ static void HandleSetPplAntimalwareCommand(
             break;
         }
 
-        // For status, restore the original byte so the read is non-destructive.
-        if (isStatusOnly && oldByte != requestedValue)
-        {
-            std::wstring restoreError;
-            if (!device.SetProcessProtection(
-                    pid,
-                    static_cast<uint32_t>(protectionField.Offset),
-                    oldByte,
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    &restoreError))
-            {
-                std::wcerr << L"set-ppl-antimalware: status read succeeded but restoring the original byte failed: "
-                           << restoreError << L"\n";
-                std::wcerr << L"  process is currently 0x" << std::hex << static_cast<unsigned>(readBack)
-                           << std::dec << L"\n";
-            }
-            readBack = oldByte;
-        }
-
         PrintColoredText(L"[set-ppl-antimalware]", KNDBG_COLOR_TITLE);
         std::wcout << L" pid=" << std::dec << pid
                    << L" eprocess=" << HexTextWidth(eprocessAddress, 16, true)
@@ -16903,29 +16908,26 @@ static void HandleSetPplAntimalwareCommand(
                    << static_cast<unsigned>(readBack) << std::dec
                    << L" (" << DescribeProtectionByte(readBack) << L")";
 
-        if (!isStatusOnly)
+        std::wcout << L" requested=0x" << std::hex << std::setw(2) << std::setfill(L'0')
+                   << static_cast<unsigned>(requestedValue) << std::dec;
+        if (readBack != requestedValue)
         {
-            std::wcout << L" requested=0x" << std::hex << std::setw(2) << std::setfill(L'0')
-                       << static_cast<unsigned>(requestedValue) << std::dec;
-            if (readBack != requestedValue)
-            {
-                std::wcout << L" ";
-                PrintColoredText(L"[write rejected]", KNDBG_COLOR_FAIL);
-            }
-            else if (oldByte != readBack)
-            {
-                std::wcout << L" ";
-                PrintColoredText(L"[ok]", KNDBG_COLOR_OK);
-            }
-            else
-            {
-                std::wcout << L" ";
-                PrintColoredText(L"[no change]", KNDBG_COLOR_DIM);
-            }
+            std::wcout << L" ";
+            PrintColoredText(L"[write rejected]", KNDBG_COLOR_FAIL);
+        }
+        else if (oldByte != readBack)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[ok]", KNDBG_COLOR_OK);
+        }
+        else
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[no change]", KNDBG_COLOR_DIM);
         }
         std::wcout << L"\n";
 
-        if (!isStatusOnly && readBack == KNDBG_PROTECTION_PPL_ANTIMALWARE)
+        if (readBack == KNDBG_PROTECTION_PPL_ANTIMALWARE)
         {
             std::wcout << L"  KnLiveDbg.exe is now PPL Antimalware; Microsoft-Windows-Threat-Intelligence\n"
                        << L"  ETW subscription is now allowed for this process.\n";
