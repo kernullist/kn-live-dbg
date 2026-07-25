@@ -27,9 +27,14 @@ public:
     size_t Capacity() const;
     uint64_t Dropped() const;
 
+    // mode: "recent" uses a timestamp cursor; "all" rescans every event.
+    // maxAdd: when non-zero, stop after adding this many new timeline events
+    // and only advance the recent cursor over events considered so far so a
+    // limited newest window cannot permanently skip older ring records.
     TimelineIngestResult IngestThreatIntel(
         const std::vector<TiEventRecord>& events,
-        const std::wstring& mode);
+        const std::wstring& mode,
+        size_t maxAdd = 0);
     TimelineIngestResult IngestSnapshot(
         const SnapshotDocument& document,
         const std::wstring& sourceName);
