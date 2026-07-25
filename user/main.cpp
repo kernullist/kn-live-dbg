@@ -627,6 +627,9 @@ static constexpr const wchar_t* KNDBG_BYOVD_FIXTURE_IMAGE_NAME = L"amdryzenmaste
 static constexpr uint64_t KNDBG_X64_PTE_PRESENT = 0x1ull;
 static constexpr uint64_t KNDBG_X64_PTE_WRITE = 0x2ull;
 static constexpr uint64_t KNDBG_X64_PTE_LARGE_PAGE = 0x80ull;
+// Windows MM_PTE_COPY_ON_WRITE on valid x64 PTEs (software bit). Physical
+// writes through a CoW leaf corrupt the shared frame instead of breaking CoW.
+static constexpr uint64_t KNDBG_X64_PTE_COPY_ON_WRITE = 0x200ull;
 static constexpr uint64_t KNDBG_X64_PTE_4K_BASE_MASK = 0x000ffffffffff000ull;
 static constexpr uint64_t KNDBG_X64_PTE_2MB_BASE_MASK = 0x000fffffffe00000ull;
 static constexpr uint64_t KNDBG_X64_PTE_1GB_BASE_MASK = 0x000fffffc0000000ull;
@@ -8758,7 +8761,11 @@ static bool EndTemporaryWritablePageEntry(
             break;
         }
 
-        uint64_t restoredEntry = currentEntry & ~KNDBG_X64_PTE_WRITE;
+        // Restore the original Write bit from the pre-flip snapshot while
+        // preserving any Accessed/Dirty bits the CPU set during the edit.
+        uint64_t restoredEntry =
+            (currentEntry & ~KNDBG_X64_PTE_WRITE) |
+            (temporary->OriginalValue & KNDBG_X64_PTE_WRITE);
         if (!WritePhysicalQword(device, temporary->PhysicalAddress, restoredEntry, error))
         {
             if (error != nullptr)
@@ -8878,6 +8885,7 @@ static bool WriteProcessVirtualMemory(
         uint64_t current = address;
         size_t offset = 0;
         size_t remaining = bytes.size();
+        bool warnedReadonlyUserPhysical = false;
         while (remaining != 0)
         {
             PhysicalTranslationInfo translation = {};
@@ -8895,6 +8903,44 @@ static bool WriteProcessVirtualMemory(
             }
 
             std::vector<uint8_t> pageBytes(bytes.begin() + offset, bytes.begin() + offset + chunk);
+            const bool writeViaKernelVirtualAddress = !IsLikelyUserVirtualAddress(current);
+
+            // User VA path writes through the translated physical frame after an
+            // optional temporary Write-bit flip. That skips the processor CoW
+            // fault path, so a CoW leaf would silently patch the shared page.
+            if (!writeViaKernelVirtualAddress)
+            {
+                LeafPageTableEntry leaf = {};
+                if (!GetLeafPageTableEntry(translation, &leaf, error))
+                {
+                    break;
+                }
+
+                if ((leaf.Value & KNDBG_X64_PTE_COPY_ON_WRITE) != 0)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"refusing user write through Copy-on-Write PTE va=" +
+                            HexTextWidth(current, 16, true) +
+                            L" leaf-pa=" + HexTextWidth(leaf.PhysicalAddress, 16, true) +
+                            L": physical write would modify the shared frame without a private break";
+                    }
+                    break;
+                }
+
+                if ((leaf.Value & KNDBG_X64_PTE_WRITE) == 0 && !warnedReadonlyUserPhysical)
+                {
+                    // R/O but not CoW (e.g. image .text). Still a shared-frame
+                    // risk if the PFN is multi-mapped; surface the semantics so
+                    // operators know this is not a private CoW break.
+                    std::wcerr << L"write warning: read-only user page(s) starting va="
+                               << HexTextWidth(current, 16, true)
+                               << L" will be patched via temporary Write-bit flip + physical write; "
+                               << L"shared image/DLL frames may change globally\n";
+                    warnedReadonlyUserPhysical = true;
+                }
+            }
+
             TemporaryWritablePageEntry temporary = {};
             if (!BeginTemporaryWritablePageEntry(device, translation, chunk, &temporary, error))
             {
@@ -8902,7 +8948,6 @@ static bool WriteProcessVirtualMemory(
             }
 
             std::wstring writeError;
-            bool writeViaKernelVirtualAddress = !IsLikelyUserVirtualAddress(current);
             bool writeOk = false;
             std::wstring writeTargetText;
             std::wstring writeFailureText;
