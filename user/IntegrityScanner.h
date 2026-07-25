@@ -13,6 +13,7 @@ struct ModuleIntegritySectionRecord
     uint32_t VirtualAddress = 0;
     uint32_t VirtualSize = 0;
     uint32_t RawSize = 0;
+    uint32_t PointerToRawData = 0;
     uint32_t Characteristics = 0;
     bool Executable = false;
     bool Writable = false;
@@ -26,6 +27,10 @@ struct ModuleIntegritySectionRecord
     bool FirstPageExecutable = false;
     bool FirstPageLargePage = false;
     uint32_t FirstPagePagingLevels = 0;
+    bool DiskCompareAttempted = false;
+    bool DiskCompareMatched = false;
+    bool DiskCompareMismatch = false;
+    bool DiskCompareFailed = false;
     bool LastPageQueried = false;
     bool LastPageQueryFailed = false;
     bool LastPageReadable = false;
@@ -92,6 +97,10 @@ struct ModuleIntegrityOptions
     bool IncludeSections = false;
     bool WxOnly = false;
     bool MismatchOnly = false;
+    // Compare live executable pages against on-disk PE section raw data.
+    // Additive: never disables existing W+X / header checks.
+    bool CompareDiskPages = false;
+    uint32_t DiskPagesPerSection = 2; // first + one interior sample by default
 };
 
 struct ModuleIntegrityResult

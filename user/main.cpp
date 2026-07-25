@@ -15392,6 +15392,7 @@ static void PrintModuleIntegrityHelp()
     std::wcout << L"  /sections     print all section-table records.\n";
     std::wcout << L"  /wx           report only modules with W+X section/page evidence.\n";
     std::wcout << L"  /mismatch     report only modules with header, size, or section anomalies.\n";
+    std::wcout << L"  /disk         compare live executable pages against on-disk PE raw data (additive).\n";
     std::wcout << L"  /limit <n>    cap reported records while still scanning matching modules.\n";
     std::wcout << L"  /json <path>  write structured kn-live-dbg.module-integrity.v1 JSON.\n";
     std::wcout << L"\n";
@@ -16314,7 +16315,7 @@ static void HandleModuleIntegrityCommand(
 
         if (args.size() < 2 || ToLower(args[1]) != L"integrity")
         {
-            std::wcerr << L"usage: !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]\n";
+            std::wcerr << L"usage: !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/limit <n>] [/json <path>]\n";
             PrintModuleIntegrityHelp();
             break;
         }
@@ -16367,6 +16368,12 @@ static void HandleModuleIntegrityCommand(
             if (opt == L"/mismatch")
             {
                 options.MismatchOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/disk")
+            {
+                options.CompareDiskPages = true;
                 ++index;
                 continue;
             }
