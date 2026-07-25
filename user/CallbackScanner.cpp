@@ -2058,7 +2058,11 @@ static bool ScanRegistryCallbackListRoot(
             if (layout.PreCallback.Length != 0)
             {
                 ReadFieldValueByDescriptor(context, blockAddress, layout.PreCallback, &preCallback, nullptr);
-                if (preCallback != 0 && !context.IsKernelImagePointer(preCallback))
+                // Keep outside-module kernel pointers: they are the primary Cm
+                // hook signal (pool shellcode, manual-map drivers). Only drop
+                // non-canonical / non-kernel garbage so list noise does not
+                // become fake records. Do NOT require IsKernelImagePointer.
+                if (preCallback != 0 && !context.IsKernelPointer(preCallback))
                 {
                     preCallback = 0;
                 }
@@ -2067,7 +2071,7 @@ static bool ScanRegistryCallbackListRoot(
             if (layout.PostCallback.Length != 0)
             {
                 ReadFieldValueByDescriptor(context, blockAddress, layout.PostCallback, &postCallback, nullptr);
-                if (postCallback != 0 && !context.IsKernelImagePointer(postCallback))
+                if (postCallback != 0 && !context.IsKernelPointer(postCallback))
                 {
                     postCallback = 0;
                 }
@@ -2118,6 +2122,40 @@ static bool ScanRegistryCallbackListRoot(
                 {
                     context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
                 }
+
+                // Surface outside-module pre/post as explicit notes so console
+                // and JSON consumers treat them as high-signal hooks, not noise.
+                const bool preOutsideModule =
+                    record.Function != 0 && record.FunctionModule.empty();
+                const bool postOutsideModule =
+                    record.PostFunction != 0 && record.PostFunctionModule.empty();
+                if (preOutsideModule || postOutsideModule)
+                {
+                    std::wstring outsideNote = L"function outside loaded modules";
+                    if (preOutsideModule && postOutsideModule)
+                    {
+                        outsideNote = L"pre/post outside loaded modules";
+                    }
+                    else if (postOutsideModule)
+                    {
+                        outsideNote = L"post outside loaded modules";
+                    }
+                    else
+                    {
+                        outsideNote = L"pre outside loaded modules";
+                    }
+
+                    if (record.Notes.empty())
+                    {
+                        record.Notes = outsideNote;
+                    }
+                    else
+                    {
+                        record.Notes += L"; ";
+                        record.Notes += outsideNote;
+                    }
+                }
+
                 records.push_back(record);
             }
 
@@ -3152,11 +3190,17 @@ std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result)
         {
             out += L",\"notes\":" + mcpjson::Quote(record.Notes);
         }
-        // The owning function lands outside every loaded kernel module: the
-        // primary hook signal for the model to triage.
-        bool unbacked = record.Function != 0 && record.FunctionModule.empty();
+        // Owning pre and/or post lands outside every loaded kernel module:
+        // primary Cm/Ob hook signal for triage (pool shellcode, manual map).
+        const bool preUnbacked = record.Function != 0 && record.FunctionModule.empty();
+        const bool postUnbacked = record.PostFunction != 0 && record.PostFunctionModule.empty();
+        const bool unbacked = preUnbacked || postUnbacked;
         out += L",\"functionUnbacked\":";
         out += unbacked ? L"true" : L"false";
+        out += L",\"preFunctionUnbacked\":";
+        out += preUnbacked ? L"true" : L"false";
+        out += L",\"postFunctionUnbacked\":";
+        out += postUnbacked ? L"true" : L"false";
         out += L"}";
     }
 
