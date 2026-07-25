@@ -10816,7 +10816,11 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             QueryProcessPublicDetails(&process);
             AddProcessViewFindings(result, process);
 
-            if (process.ActiveProcessLinksSeen && process.Kernel.Eprocess != 0)
+            // Deep triage needs EPROCESS. Prefer ActiveProcessLinks inventory;
+            // also accept CID-recovered EPROCESS for API-only / unlinked processes
+            // without disabling the original path for list-visible processes.
+            if (process.Kernel.Eprocess != 0 &&
+                (process.ActiveProcessLinksSeen || process.CidTableSeen))
             {
                 CollectPebIdentity(device_, &process);
                 ApplyBuiltinProfile(&process);
