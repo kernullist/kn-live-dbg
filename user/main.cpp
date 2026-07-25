@@ -2115,97 +2115,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
     return result;
 }
 
-// Commands that must always hit native handlers before any backend-dbgeng
-// catch-all. This is the investigation core (driver memory, TI, dumps, PPL,
-// process context, session control) and must not silently fall into DbgEng.
-static bool IsNativeOwnedCommand(const std::wstring& command)
-{
-    bool owned = false;
-
-    do
-    {
-        if (command.empty())
-        {
-            break;
-        }
-
-        if (IsNativeBangCommand(command) ||
-            IsDisplayCommand(command) ||
-            IsEnterCommand(command) ||
-            IsPhysicalDisplayCommand(command) ||
-            IsPhysicalEnterCommand(command))
-        {
-            owned = true;
-            break;
-        }
-
-        if (command == L"u" ||
-            command == L"uf" ||
-            command == L"vtop" ||
-            command == L"!vtop" ||
-            command == L"dt" ||
-            command == L"dtx" ||
-            command == L"c" ||
-            command == L"f" ||
-            command == L"fp" ||
-            command == L"m" ||
-            command == L"s" ||
-            command == L"setfield" ||
-            command == L"write" ||
-            command == L"set-ppl-antimalware" ||
-            command == L"dump-raw" ||
-            command == L"dump-pe" ||
-            command == L"pool-scan-pe" ||
-            command == L"byovd" ||
-            command == L"callbacks" ||
-            command == L"probe" ||
-            command == L"procctx" ||
-            command == L"ai" ||
-            command == L"backend" ||
-            command == L"kdinit" ||
-            command == L"kddetach" ||
-            command == L"kd" ||
-            command == L"log" ||
-            command == L"mcp" ||
-            command == L"home" ||
-            command == L"dashboard" ||
-            command == L"cls" ||
-            command == L"drvstatus" ||
-            command == L"version" ||
-            command == L"vertarget" ||
-            command == L"vercommand" ||
-            command == L"n" ||
-            command == L"sq" ||
-            command == L"lm" ||
-            command == L"modules" ||
-            command == L"x" ||
-            command == L"ln" ||
-            command == L"ld" ||
-            command == L"reload" ||
-            command == L".reload" ||
-            command == L".sympath" ||
-            command == L"sympath" ||
-            command == L".sympath+" ||
-            command == L"?" ||
-            command == L"??" ||
-            command == L"||" ||
-            command == L"||s" ||
-            command == L"|" ||
-            command == L"unload" ||
-            command == L"q" ||
-            command == L"qq" ||
-            command == L"qd" ||
-            command == L"quit" ||
-            command == L"exit" ||
-            command == L"help")
-        {
-            owned = true;
-            break;
-        }
-    } while (false);
-
-    return owned;
-}
+static bool IsNativeOwnedCommand(const std::wstring& command);
 
 static bool ShouldRouteToDbgEng(const std::wstring& command)
 {
@@ -2916,6 +2826,98 @@ static bool IsPhysicalEnterCommand(const std::wstring& command)
         command == L"peq" ||
         command == L"!eb" || command == L"!ew" || command == L"!ed" ||
         command == L"!eq";
+}
+
+// Commands that must always hit native handlers before any backend-dbgeng
+// catch-all. This is the investigation core (driver memory, TI, dumps, PPL,
+// process context, session control) and must not silently fall into DbgEng.
+static bool IsNativeOwnedCommand(const std::wstring& command)
+{
+    bool owned = false;
+
+    do
+    {
+        if (command.empty())
+        {
+            break;
+        }
+
+        if (IsNativeBangCommand(command) ||
+            IsDisplayCommand(command) ||
+            IsEnterCommand(command) ||
+            IsPhysicalDisplayCommand(command) ||
+            IsPhysicalEnterCommand(command))
+        {
+            owned = true;
+            break;
+        }
+
+        if (command == L"u" ||
+            command == L"uf" ||
+            command == L"vtop" ||
+            command == L"!vtop" ||
+            command == L"dt" ||
+            command == L"dtx" ||
+            command == L"c" ||
+            command == L"f" ||
+            command == L"fp" ||
+            command == L"m" ||
+            command == L"s" ||
+            command == L"setfield" ||
+            command == L"write" ||
+            command == L"set-ppl-antimalware" ||
+            command == L"dump-raw" ||
+            command == L"dump-pe" ||
+            command == L"pool-scan-pe" ||
+            command == L"byovd" ||
+            command == L"callbacks" ||
+            command == L"probe" ||
+            command == L"procctx" ||
+            command == L"ai" ||
+            command == L"backend" ||
+            command == L"kdinit" ||
+            command == L"kddetach" ||
+            command == L"kd" ||
+            command == L"log" ||
+            command == L"mcp" ||
+            command == L"home" ||
+            command == L"dashboard" ||
+            command == L"cls" ||
+            command == L"drvstatus" ||
+            command == L"version" ||
+            command == L"vertarget" ||
+            command == L"vercommand" ||
+            command == L"n" ||
+            command == L"sq" ||
+            command == L"lm" ||
+            command == L"modules" ||
+            command == L"x" ||
+            command == L"ln" ||
+            command == L"ld" ||
+            command == L"reload" ||
+            command == L".reload" ||
+            command == L".sympath" ||
+            command == L"sympath" ||
+            command == L".sympath+" ||
+            command == L"?" ||
+            command == L"??" ||
+            command == L"||" ||
+            command == L"||s" ||
+            command == L"|" ||
+            command == L"unload" ||
+            command == L"q" ||
+            command == L"qq" ||
+            command == L"qd" ||
+            command == L"quit" ||
+            command == L"exit" ||
+            command == L"help")
+        {
+            owned = true;
+            break;
+        }
+    } while (false);
+
+    return owned;
 }
 
 static bool IsWfpScopeName(const std::wstring& value)
