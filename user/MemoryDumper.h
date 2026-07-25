@@ -9,12 +9,16 @@
 struct DumpRawResult
 {
     uint64_t StartAddress = 0;
-    uint64_t Length = 0;
-    uint64_t BytesRead = 0;
-    uint64_t BytesWritten = 0;
+    uint64_t Length = 0;              // requested length
+    uint64_t BytesRequested = 0;
+    uint64_t BytesRead = 0;           // bytes successfully read from kernel
+    uint64_t BytesZeroFilled = 0;     // bytes synthesized on failure (if allowed)
+    uint64_t BytesWritten = 0;        // bytes written to the output file
     uint32_t ChunksRead = 0;
     uint32_t ChunksFailed = 0;
     bool     ZeroFilledOnFailure = false;
+    bool     Complete = false;        // full request satisfied without abort
+    bool     ShortRead = false;       // any short/failed kernel chunk
     std::vector<std::wstring> Warnings;
 };
 

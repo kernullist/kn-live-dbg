@@ -595,6 +595,7 @@ bool DumpKernelRangeToFile(
     *result = DumpRawResult{};
     result->StartAddress = address;
     result->Length = length;
+    result->BytesRequested = length;
     result->ZeroFilledOnFailure = zeroFillOnFailure;
 
     bool ok = false;
@@ -614,33 +615,69 @@ bool DumpKernelRangeToFile(
 
         if (!readOk)
         {
+            result->ShortRead = true;
+            result->Complete = false;
             if (error != nullptr)
             {
-                *error = readError;
+                *error = readError +
+                         L" (requested=0x" +
+                         std::to_wstring(length) +
+                         L" bytes; dump aborted before full transfer)";
             }
             break;
         }
 
+        // With zerofill, output length always equals request; track how much
+        // came from kernel vs synthesized zeros.
+        const uint64_t total = static_cast<uint64_t>(bytes.size());
         if (result->ChunksFailed > 0)
         {
-            result->Warnings.push_back(L"zero-filled " +
-                                        std::to_wstring(result->ChunksFailed) +
-                                        L" failed chunk(s)");
+            result->ShortRead = true;
+            // Approximate zero-filled bytes from failed full chunks.
+            result->BytesZeroFilled =
+                static_cast<uint64_t>(result->ChunksFailed) * kReadChunkBytes;
+            if (result->BytesZeroFilled > total)
+            {
+                result->BytesZeroFilled = total;
+            }
+            result->BytesRead = total - result->BytesZeroFilled;
+            result->Warnings.push_back(
+                L"zero-filled " + std::to_wstring(result->ChunksFailed) +
+                L" failed chunk(s); kernel_bytes=" + std::to_wstring(result->BytesRead) +
+                L" zero_bytes=" + std::to_wstring(result->BytesZeroFilled) +
+                L" requested=" + std::to_wstring(length));
+        }
+        else
+        {
+            result->BytesRead = total;
+            result->BytesZeroFilled = 0;
         }
 
-        result->BytesRead = bytes.size();
+        if (total != length)
+        {
+            result->ShortRead = true;
+            result->Warnings.push_back(
+                L"output buffer size " + std::to_wstring(total) +
+                L" differs from requested " + std::to_wstring(length));
+        }
 
         std::wstring writeError;
         if (!WriteBufferToFile(path, bytes.data(), bytes.size(), &writeError))
         {
             if (error != nullptr)
             {
-                *error = writeError;
+                *error = writeError +
+                         L" (after reading kernel_bytes=" +
+                         std::to_wstring(result->BytesRead) +
+                         L" zero_bytes=" +
+                         std::to_wstring(result->BytesZeroFilled) +
+                         L")";
             }
             break;
         }
 
         result->BytesWritten = bytes.size();
+        result->Complete = !result->ShortRead && result->BytesWritten == length;
         ok = true;
     } while (false);
 
