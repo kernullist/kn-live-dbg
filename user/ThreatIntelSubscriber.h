@@ -119,6 +119,9 @@ public:
     // Ring snapshot helpers. Copies under lock; returns newest-first when
     // newestFirst is true. maxCount == 0 means unlimited.
     std::vector<TiEventRecord> Recent(size_t maxCount, bool newestFirst) const;
+    // Chronological events with Timestamp >= minTimestampInclusive.
+    // maxCount == 0 means unlimited after the timestamp filter.
+    std::vector<TiEventRecord> RecentSince(uint64_t minTimestampInclusive, size_t maxCount) const;
     std::vector<TiEventRecord> FilterByPid(uint32_t pid, size_t maxCount) const;
     std::vector<TiEventRecord> FilterByTask(const std::wstring& taskName, size_t maxCount) const;
     std::vector<TiEventRecord> Grep(const std::wstring& pattern, size_t maxCount) const;

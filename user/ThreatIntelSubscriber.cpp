@@ -1101,6 +1101,25 @@ std::wstring TiSubscriber::ResolveImageBasename(uint32_t pid)
     return BasenameLower(full);
 }
 
+std::vector<TiEventRecord> TiSubscriber::RecentSince(uint64_t minTimestampInclusive, size_t maxCount) const
+{
+    std::vector<TiEventRecord> out;
+    std::lock_guard<std::mutex> lock(RingMutex);
+    for (const TiEventRecord& item : Ring)
+    {
+        if (minTimestampInclusive != 0 && item.Timestamp < minTimestampInclusive)
+        {
+            continue;
+        }
+        out.push_back(item);
+        if (maxCount != 0 && out.size() >= maxCount)
+        {
+            break;
+        }
+    }
+    return out;
+}
+
 std::vector<TiEventRecord> TiSubscriber::Recent(size_t maxCount, bool newestFirst) const
 {
     std::vector<TiEventRecord> out;

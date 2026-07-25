@@ -54,6 +54,10 @@ public:
     TimelineStats GetStats() const;
     bool ExportJsonl(const std::wstring& path, std::wstring* error) const;
 
+    // TI recent-mode cursor for callers that want to pull only unprocessed
+    // ring records instead of cloning the entire TI ring every update.
+    uint64_t GetTiRecentCursorTimestamp(bool* initialized) const;
+
 private:
     bool AddEventLocked(TimelineEvent event);
     void DropOldestEventLocked();
