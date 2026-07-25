@@ -50,6 +50,12 @@ struct KernelCallbackScanResult
 {
     std::vector<KernelCallbackRecord> Records;
     std::vector<std::wstring> Warnings;
+    // True when at least one list/table walk was partial (poisoned entries,
+    // unreadable links, entry cap). Empty Records with Incomplete=false means
+    // "no callbacks observed"; Incomplete=true means "coverage is not clean".
+    bool Incomplete = false;
+    // Count of object-callback items kept as poisoned/invalid evidence.
+    uint32_t PoisonedEntryCount = 0;
 };
 
 class KernelCallbackScanner
