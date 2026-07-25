@@ -11,10 +11,7 @@
 
 namespace
 {
-    constexpr uint64_t kKernelSpaceMin       = 0xffff800000000000ull;
-    // Reject sign-extended small negatives such as ffffffff`fffe79e8.
-    // They pass a broad kernel-half test but are not useful ETW structure VAs.
-    constexpr uint64_t kKernelSpaceGuardMin  = 0xffffffff00000000ull;
+    constexpr uint64_t kKernelSpaceMin = 0xffff800000000000ull;
     constexpr uint32_t kEtwLoggerSlotCount   = 64;
     constexpr uint64_t kLoggerArrayOffset    = 0x10;
     constexpr uint64_t kFallbackLoggerName   = 0x68;
@@ -22,9 +19,22 @@ namespace
     constexpr uint32_t kMaxRawBytesPerRead   = 0x1000;
     constexpr uint32_t kMaxNameByteLength    = 2048;
 
+    // Accept the full canonical kernel half, including high system VA bands
+    // (e.g. 0xffffffff`8xxxxxxx). Only reject the dense high tip that is
+    // almost always sign-extended small junk (ffffffff`ffxxxxxx).
     bool IsKernelAddress(uint64_t value)
     {
-        return value >= kKernelSpaceMin && value < kKernelSpaceGuardMin;
+        if (value < kKernelSpaceMin)
+        {
+            return false;
+        }
+
+        if ((value & 0xffffffffff000000ull) == 0xffffffffff000000ull)
+        {
+            return false;
+        }
+
+        return true;
     }
 
     bool TryAdd(uint64_t left, uint64_t right, uint64_t* result)

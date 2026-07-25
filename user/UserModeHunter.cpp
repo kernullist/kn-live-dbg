@@ -1821,7 +1821,8 @@ namespace
 
     bool IsUserAddress(uint64_t value)
     {
-        return value != 0 && value < 0x0000800000000000ull;
+        // LA57 user half (2^56-1). Matches process-triage / e* user VA policy.
+        return value != 0 && value <= 0x00ffffffffffffffull;
     }
 
     bool IsKernelAddress(uint64_t value)
