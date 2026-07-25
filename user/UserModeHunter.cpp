@@ -6279,8 +6279,7 @@ namespace
                         symbols,
                         {L"nt!_EPROCESS", L"_EPROCESS", L"nt!_KPROCESS", L"_KPROCESS"},
                         L"DirectoryTableBase",
-                        &dtbField,
-                        &fieldError))
+                        &dtbField))
                 {
                     if (warning != nullptr)
                     {
@@ -6306,8 +6305,7 @@ namespace
                     symbols,
                     {L"nt!_EPROCESS", L"_EPROCESS", L"nt!_KPROCESS", L"_KPROCESS"},
                     L"UserDirectoryTableBase",
-                    &userDtbField,
-                    nullptr))
+                    &userDtbField))
             {
                 if (userDtbField.Offset != 0 && userDtbField.Offset <= 0x4000)
                 {
