@@ -6861,7 +6861,10 @@ static bool EnsureKernelProcessAddressContext(
 
 static bool IsLikelyUserVirtualAddress(uint64_t virtualAddress)
 {
-    return virtualAddress < 0x0000800000000000ull;
+    // LA48 user max is 2^47-1; LA57 extends to 2^56-1. Accept the LA57 user
+    // half so process-aware paths work on 5-level paging. LA48 hosts do not
+    // produce canonical addresses in the 2^47..2^56-1 band for real mappings.
+    return virtualAddress != 0 && virtualAddress <= 0x00ffffffffffffffull;
 }
 
 static bool IsLikelyKernelVirtualAddress(uint64_t virtualAddress)

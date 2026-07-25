@@ -79,7 +79,10 @@ namespace
 
     bool IsUserAddress(uint64_t address)
     {
-        return address != 0 && address <= kUserAddressMax;
+        // Include the LA57 user half so TEB/stack/start classification works
+        // on 5-level paging. LA48-only hosts never form canonical VAs above
+        // kUserAddressMax for real thread state.
+        return address != 0 && address <= kLa57UserAddressMax;
     }
 
     bool TryAdd(uint64_t base, uint64_t offset, uint64_t* result)
