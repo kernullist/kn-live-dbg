@@ -3012,92 +3012,69 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
         }
 
         bool anyScannerSucceeded = false;
+        uint32_t surfacesRequested = 0;
+        uint32_t surfacesFailed = 0;
         std::wstring localError;
+
+        auto runSurface = [&](const wchar_t* name, bool (KernelCallbackScanner::*scanner)(KernelCallbackScanResult*, std::wstring*))
+        {
+            ++surfacesRequested;
+            localError.clear();
+            if ((this->*scanner)(result, &localError))
+            {
+                anyScannerSucceeded = true;
+            }
+            else
+            {
+                ++surfacesFailed;
+                // A failed surface must never look like clean empty coverage when
+                // another surface still returned records.
+                result->Incomplete = true;
+                result->Warnings.push_back(std::wstring(name) + L": " + localError);
+            }
+        };
 
         if (scanOb)
         {
-            if (ScanObjectCallbacks(result, &localError))
-            {
-                anyScannerSucceeded = true;
-            }
-            else
-            {
-                result->Warnings.push_back(L"ob: " + localError);
-            }
+            runSurface(L"ob", &KernelCallbackScanner::ScanObjectCallbacks);
         }
-
         if (scanRegistry)
         {
-            localError.clear();
-            if (ScanRegistryCallbacks(result, &localError))
-            {
-                anyScannerSucceeded = true;
-            }
-            else
-            {
-                result->Warnings.push_back(L"registry: " + localError);
-            }
+            runSurface(L"registry", &KernelCallbackScanner::ScanRegistryCallbacks);
         }
-
         if (scanProcess)
         {
-            localError.clear();
-            if (ScanProcessCallbacks(result, &localError))
-            {
-                anyScannerSucceeded = true;
-            }
-            else
-            {
-                result->Warnings.push_back(L"process: " + localError);
-            }
+            runSurface(L"process", &KernelCallbackScanner::ScanProcessCallbacks);
         }
-
         if (scanThread)
         {
-            localError.clear();
-            if (ScanThreadCallbacks(result, &localError))
-            {
-                anyScannerSucceeded = true;
-            }
-            else
-            {
-                result->Warnings.push_back(L"thread: " + localError);
-            }
+            runSurface(L"thread", &KernelCallbackScanner::ScanThreadCallbacks);
         }
-
         if (scanImageLoad)
         {
-            localError.clear();
-            if (ScanImageLoadCallbacks(result, &localError))
-            {
-                anyScannerSucceeded = true;
-            }
-            else
-            {
-                result->Warnings.push_back(L"imageload: " + localError);
-            }
+            runSurface(L"imageload", &KernelCallbackScanner::ScanImageLoadCallbacks);
         }
-
         if (scanMini)
         {
-            localError.clear();
-            if (ScanMinifilterCallbacks(result, &localError))
-            {
-                anyScannerSucceeded = true;
-            }
-            else
-            {
-                result->Warnings.push_back(L"minifilter: " + localError);
-            }
+            runSurface(L"minifilter", &KernelCallbackScanner::ScanMinifilterCallbacks);
         }
 
         if (!anyScannerSucceeded)
         {
+            result->Incomplete = true;
             if (error != nullptr)
             {
                 *error = JoinWarnings(result->Warnings);
             }
             break;
+        }
+
+        if (surfacesFailed != 0)
+        {
+            result->Warnings.push_back(
+                L"callback coverage incomplete: " + std::to_wstring(surfacesFailed) +
+                L" of " + std::to_wstring(surfacesRequested) +
+                L" requested surface(s) failed; remaining records are partial");
         }
 
         ok = true;

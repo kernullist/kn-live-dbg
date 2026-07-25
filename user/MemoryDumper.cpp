@@ -843,6 +843,24 @@ bool DumpKernelPeToFile(
         result->ImageBase = imageBase;
         result->SizeOfImage = sizeOfImage;
 
+        // Keep in-memory OptionalHeader/reloc metadata as-is. After ASLR the
+        // ImageBase field usually equals the dump VA and no longer matches the
+        // on-disk preferred base; say so before offline tools mis-read it.
+        result->Warnings.push_back(
+            L"PE dump preserves in-memory headers (relocated ImageBase / loader patches); "
+            L"this is not a pristine on-disk image copy");
+        if (imageBase != 0 && imageBase != address)
+        {
+            wchar_t detail[192];
+            swprintf_s(
+                detail,
+                L"OptionalHeader.ImageBase=0x%llx differs from dump VA=0x%llx; "
+                L"relocation directory may still describe preferred-base fixups",
+                static_cast<unsigned long long>(imageBase),
+                static_cast<unsigned long long>(address));
+            result->Warnings.push_back(detail);
+        }
+
         if (sizeOfHeaders == 0 || sizeOfHeaders > kMaxHeaderBytes)
         {
             if (error != nullptr)

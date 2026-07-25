@@ -253,6 +253,15 @@ namespace
                 (expected > returnLength)
                     ? (returnLength - headerBytes) / sizeof(SYSTEM_POOLTAG_LOCAL)
                     : total);
+            result->TagStatsSafeCount = safeCount;
+            if (safeCount < total)
+            {
+                result->TagStatsBufferClamped = true;
+                result->Warnings.push_back(
+                    L"pool tag buffer clamped: kernel Count=" + std::to_wstring(total) +
+                    L" but only " + std::to_wstring(safeCount) +
+                    L" tag record(s) fit the returned buffer");
+            }
 
             std::vector<PoolTagStatRecord> all;
             all.reserve(safeCount);
@@ -297,15 +306,29 @@ namespace
                     return left.PagedUsed > right.PagedUsed;
                 });
 
+            // Matching count is post-filter / pre-truncate so JSON consumers can
+            // tell top-N summaries apart from a complete matching set.
+            result->TagStatsMatchingCount = all.size();
+
+            // Tag filter requests must not be top-N truncated: the operator asked
+            // for a specific tag and absence must mean "not present", not "not in top 64".
             const uint32_t limit =
-                options.LimitTagStats != 0
-                    ? options.LimitTagStats
-                    : (options.LimitEntries != 0 ? options.LimitEntries : 64u);
-            if (all.size() > limit)
+                options.HasTagFilter
+                    ? 0u
+                    : (options.LimitTagStats != 0
+                           ? options.LimitTagStats
+                           : (options.LimitEntries != 0 ? options.LimitEntries : 64u));
+            if (limit != 0 && all.size() > limit)
             {
+                result->TagStatsTruncated = true;
+                result->Warnings.push_back(
+                    L"pool tag summary truncated to top " + std::to_wstring(limit) +
+                    L" of " + std::to_wstring(all.size()) +
+                    L" matching tag(s); missing tags are not proof of absence");
                 all.resize(limit);
             }
 
+            result->TagStatsReturned = all.size();
             result->TagStats = std::move(all);
             result->PoolTagViewAvailable = true;
             result->Diagnostics.push_back(
@@ -907,6 +930,13 @@ std::wstring BuildPoolJson(const PoolScanResult& result)
     out += L",\"poolTagViewAvailable\":";
     out += result.PoolTagViewAvailable ? L"true" : L"false";
     out += L",\"tagStatCount\":" + std::to_wstring(result.TagStatCount);
+    out += L",\"tagStatsMatchingCount\":" + std::to_wstring(result.TagStatsMatchingCount);
+    out += L",\"tagStatsReturned\":" + std::to_wstring(result.TagStatsReturned);
+    out += L",\"tagStatsSafeCount\":" + std::to_wstring(result.TagStatsSafeCount);
+    out += L",\"tagStatsTruncated\":";
+    out += result.TagStatsTruncated ? L"true" : L"false";
+    out += L",\"tagStatsBufferClamped\":";
+    out += result.TagStatsBufferClamped ? L"true" : L"false";
     out += L",\"tagStats\":[";
     for (size_t ti = 0; ti < result.TagStats.size(); ++ti)
     {
@@ -915,7 +945,9 @@ std::wstring BuildPoolJson(const PoolScanResult& result)
         {
             out += L",";
         }
+        // tag = printable rendering ('.' for non-printable); tagRaw disambiguates collisions.
         out += L"{\"tag\":" + mcpjson::Quote(tag.TagText);
+        out += L",\"tagRaw\":" + mcpjson::Quote(PoolJsonHex(tag.TagRaw));
         out += L",\"nonPagedUsed\":" + std::to_wstring(tag.NonPagedUsed);
         out += L",\"pagedUsed\":" + std::to_wstring(tag.PagedUsed);
         out += L",\"nonPagedAllocs\":" + std::to_wstring(tag.NonPagedAllocs);
@@ -935,6 +967,7 @@ std::wstring BuildPoolJson(const PoolScanResult& result)
         out += L"{\"virtualAddress\":" + mcpjson::Quote(PoolJsonHex(entry.VirtualAddress));
         out += L",\"sizeInBytes\":" + std::to_wstring(entry.SizeInBytes);
         out += L",\"tag\":" + mcpjson::Quote(entry.TagText);
+        out += L",\"tagRaw\":" + mcpjson::Quote(PoolJsonHex(entry.TagRaw));
         out += L",\"nonPaged\":";
         out += entry.NonPaged ? L"true" : L"false";
         if (entry.AttributesQueried)

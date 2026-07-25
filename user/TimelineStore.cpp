@@ -2560,6 +2560,7 @@ void TimelineStore::Clear()
     NextEventId = 1;
     DroppedEvents = 0;
     TiRecentCursorInitialized = false;
+    TiRecentCursorSequence = 0;
     TiRecentCursorTimestamp = 0;
     TiRecentCursorBoundaryKeys.clear();
 }
@@ -2600,6 +2601,16 @@ uint64_t TimelineStore::GetTiRecentCursorTimestamp(bool* initialized) const
     return TiRecentCursorTimestamp;
 }
 
+uint64_t TimelineStore::GetTiRecentCursorSequence(bool* initialized) const
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    if (initialized != nullptr)
+    {
+        *initialized = TiRecentCursorInitialized;
+    }
+    return TiRecentCursorSequence;
+}
+
 uint64_t TimelineStore::Dropped() const
 {
     std::lock_guard<std::mutex> lock(Mutex);
@@ -2618,28 +2629,41 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
     bool useCursor = TimelineToLower(mode) != L"all";
     size_t skippedByCursor = 0;
     size_t truncatedByMaxAdd = 0;
+    uint64_t maxSequence = TiRecentCursorSequence;
     uint64_t maxTimestamp = TiRecentCursorTimestamp;
     std::set<std::wstring> maxTimestampKeys = TiRecentCursorBoundaryKeys;
 
     for (const TiEventRecord& item : events)
     {
         std::wstring cursorKey;
-        if (useCursor &&
-            TiRecentCursorInitialized &&
-            item.Timestamp != 0)
+        if (useCursor && TiRecentCursorInitialized)
         {
-            if (item.Timestamp < TiRecentCursorTimestamp)
+            // Prefer ring Sequence so out-of-order ETW timestamps are not
+            // permanently skipped. Fall back to timestamp+boundary keys only
+            // for synthetic/unsequenced records (Sequence==0).
+            if (item.Sequence != 0)
             {
-                ++skippedByCursor;
-                continue;
-            }
-            if (item.Timestamp == TiRecentCursorTimestamp)
-            {
-                cursorKey = TiEventCursorKey(item);
-                if (TiRecentCursorBoundaryKeys.find(cursorKey) != TiRecentCursorBoundaryKeys.end())
+                if (item.Sequence <= TiRecentCursorSequence)
                 {
                     ++skippedByCursor;
                     continue;
+                }
+            }
+            else if (item.Timestamp != 0)
+            {
+                if (item.Timestamp < TiRecentCursorTimestamp)
+                {
+                    ++skippedByCursor;
+                    continue;
+                }
+                if (item.Timestamp == TiRecentCursorTimestamp)
+                {
+                    cursorKey = TiEventCursorKey(item);
+                    if (TiRecentCursorBoundaryKeys.find(cursorKey) != TiRecentCursorBoundaryKeys.end())
+                    {
+                        ++skippedByCursor;
+                        continue;
+                    }
                 }
             }
         }
@@ -2684,6 +2708,10 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
         event.Evidence[L"level"] = std::to_wstring(static_cast<uint32_t>(item.Level));
         event.Evidence[L"opcode"] = std::to_wstring(static_cast<uint32_t>(item.Opcode));
         event.Evidence[L"channel"] = std::to_wstring(static_cast<uint32_t>(item.Channel));
+        if (item.Sequence != 0)
+        {
+            event.Evidence[L"ti_sequence"] = std::to_wstring(item.Sequence);
+        }
         if (item.Keyword != 0)
         {
             event.Evidence[L"keyword"] = HexU64(item.Keyword);
@@ -2713,6 +2741,10 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
             ++result.Added;
         }
 
+        if (item.Sequence > maxSequence)
+        {
+            maxSequence = item.Sequence;
+        }
         if (item.Timestamp > maxTimestamp)
         {
             maxTimestamp = item.Timestamp;
@@ -2728,18 +2760,18 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
         }
     }
 
-    if (maxTimestamp > TiRecentCursorTimestamp)
+    if (maxSequence > TiRecentCursorSequence ||
+        maxTimestamp > TiRecentCursorTimestamp ||
+        (!TiRecentCursorInitialized && result.SourceRecords != 0))
     {
+        TiRecentCursorSequence = maxSequence;
         TiRecentCursorTimestamp = maxTimestamp;
         TiRecentCursorBoundaryKeys = std::move(maxTimestampKeys);
         TiRecentCursorInitialized = true;
     }
-    else if (!TiRecentCursorInitialized && result.SourceRecords != 0)
-    {
-        TiRecentCursorInitialized = true;
-        TiRecentCursorBoundaryKeys = std::move(maxTimestampKeys);
-    }
-    else if (TiRecentCursorInitialized && maxTimestamp == TiRecentCursorTimestamp)
+    else if (TiRecentCursorInitialized &&
+             maxSequence == TiRecentCursorSequence &&
+             maxTimestamp == TiRecentCursorTimestamp)
     {
         TiRecentCursorBoundaryKeys = std::move(maxTimestampKeys);
     }

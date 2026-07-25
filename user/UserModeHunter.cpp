@@ -122,6 +122,8 @@ namespace
         std::vector<DiskPeSection> Sections;
         std::set<uint32_t> RelocationPages;
         std::set<uint32_t> LoaderMutablePages;
+        uint32_t BaserelocRva = 0;
+        uint32_t BaserelocSize = 0;
     };
 
     struct BuiltinProcessProfile
@@ -4305,6 +4307,20 @@ namespace
 
                     uint32_t fixupRva = block->VirtualAddress + offset;
                     metadata->RelocationPages.insert(fixupRva & 0xfffff000u);
+                    uint32_t fixupWidth = 0;
+                    if (type == IMAGE_REL_BASED_DIR64)
+                    {
+                        fixupWidth = sizeof(uint64_t);
+                    }
+                    else if (type == IMAGE_REL_BASED_HIGHLOW)
+                    {
+                        fixupWidth = sizeof(uint32_t);
+                    }
+                    if (fixupWidth != 0 &&
+                        ((fixupRva & 0xfffu) + fixupWidth) > 0x1000u)
+                    {
+                        metadata->RelocationPages.insert((fixupRva & 0xfffff000u) + 0x1000u);
+                    }
                 }
 
                 parsed += block->SizeOfBlock;
@@ -4530,6 +4546,8 @@ namespace
                 }
             }
 
+            metadata->BaserelocRva = relocRva;
+            metadata->BaserelocSize = relocSize;
             PopulateRelocationPages(file, metadata, relocRva, relocSize);
 
             ok = true;
@@ -4539,6 +4557,146 @@ namespace
         {
             CloseHandle(file);
         }
+
+        return ok;
+    }
+
+    bool ApplyBaseRelocationsToDiskPage(
+        HANDLE file,
+        const DiskPeMetadata& metadata,
+        uint32_t pageRva,
+        uint64_t imageDelta,
+        std::vector<uint8_t>* pageBytes,
+        std::vector<uint8_t>* nextPageBytes)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (file == INVALID_HANDLE_VALUE ||
+                pageBytes == nullptr ||
+                pageBytes->size() < kPageSize ||
+                metadata.BaserelocRva == 0 ||
+                metadata.BaserelocSize < sizeof(IMAGE_BASE_RELOCATION))
+            {
+                break;
+            }
+
+            const uint32_t pageEnd = pageRva + static_cast<uint32_t>(kPageSize);
+            uint32_t parsed = 0;
+            bool failed = false;
+
+            while (parsed + sizeof(IMAGE_BASE_RELOCATION) <= metadata.BaserelocSize)
+            {
+                std::vector<uint8_t> blockHeader;
+                if (!ReadDiskBytesForRva(
+                        file,
+                        metadata,
+                        metadata.BaserelocRva + parsed,
+                        sizeof(IMAGE_BASE_RELOCATION),
+                        &blockHeader) ||
+                    blockHeader.size() < sizeof(IMAGE_BASE_RELOCATION))
+                {
+                    failed = true;
+                    break;
+                }
+
+                const IMAGE_BASE_RELOCATION* block =
+                    reinterpret_cast<const IMAGE_BASE_RELOCATION*>(blockHeader.data());
+                if (block->VirtualAddress == 0 ||
+                    block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                    parsed + block->SizeOfBlock > metadata.BaserelocSize)
+                {
+                    break;
+                }
+
+                const uint32_t entryBytes = block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
+                std::vector<uint8_t> entries;
+                if (entryBytes != 0 &&
+                    (!ReadDiskBytesForRva(
+                         file,
+                         metadata,
+                         metadata.BaserelocRva + parsed + sizeof(IMAGE_BASE_RELOCATION),
+                         entryBytes,
+                         &entries) ||
+                     entries.size() < entryBytes))
+                {
+                    failed = true;
+                    break;
+                }
+
+                const size_t entryCount = entryBytes / sizeof(uint16_t);
+                for (size_t index = 0; index < entryCount; ++index)
+                {
+                    uint16_t entry = 0;
+                    std::memcpy(&entry, entries.data() + index * sizeof(uint16_t), sizeof(entry));
+                    const uint16_t type = static_cast<uint16_t>(entry >> 12);
+                    const uint16_t offset = static_cast<uint16_t>(entry & 0x0fffu);
+                    if (type == IMAGE_REL_BASED_ABSOLUTE)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t fixupRva = block->VirtualAddress + offset;
+                    if (fixupRva < pageRva || fixupRva >= pageEnd)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t pageOffset = fixupRva - pageRva;
+                    uint32_t width = 0;
+                    if (type == IMAGE_REL_BASED_DIR64)
+                    {
+                        width = sizeof(uint64_t);
+                    }
+                    else if (type == IMAGE_REL_BASED_HIGHLOW)
+                    {
+                        width = sizeof(uint32_t);
+                    }
+                    else
+                    {
+                        failed = true;
+                        break;
+                    }
+
+                    if (pageOffset + width <= pageBytes->size())
+                    {
+                        uint64_t value = 0;
+                        std::memcpy(&value, pageBytes->data() + pageOffset, width);
+                        value += imageDelta;
+                        std::memcpy(pageBytes->data() + pageOffset, &value, width);
+                        continue;
+                    }
+
+                    const uint32_t first = static_cast<uint32_t>(pageBytes->size() - pageOffset);
+                    const uint32_t second = width - first;
+                    if (nextPageBytes == nullptr || nextPageBytes->size() < second)
+                    {
+                        failed = true;
+                        break;
+                    }
+
+                    uint8_t raw[8] = {};
+                    std::memcpy(raw, pageBytes->data() + pageOffset, first);
+                    std::memcpy(raw + first, nextPageBytes->data(), second);
+                    uint64_t value = 0;
+                    std::memcpy(&value, raw, width);
+                    value += imageDelta;
+                    std::memcpy(raw, &value, width);
+                    std::memcpy(pageBytes->data() + pageOffset, raw, first);
+                    std::memcpy(nextPageBytes->data(), raw + first, second);
+                }
+
+                if (failed)
+                {
+                    break;
+                }
+
+                parsed += block->SizeOfBlock;
+            }
+
+            ok = !failed;
+        } while (false);
 
         return ok;
     }
@@ -6225,9 +6383,10 @@ namespace
         return high;
     }
 
-    // Annotate processes with PspCidTable presence via driver ResolveProcess
-    // (PsLookupProcessByProcessId). Does not replace other views; only fills
-    // HasCidTableView/CidTableSeen and missing EPROCESS/DTB when lookup works.
+    // Known-PID CID lookup via driver ResolveProcess (PsLookupProcessByProcessId).
+    // This is NOT a full PspCidTable enumeration: PIDs absent from the starting
+    // process map are never discovered. Only annotates HasCidTableView /
+    // CidTableSeen and may fill missing EPROCESS/DTB when lookup works.
     bool ApplyCidTableLookupView(
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -6242,7 +6401,7 @@ namespace
             {
                 if (warning != nullptr)
                 {
-                    *warning = L"cid table view: invalid process map";
+                    *warning = L"cid known-pid lookup: invalid process map";
                 }
                 break;
             }
@@ -6251,7 +6410,7 @@ namespace
             {
                 if (warning != nullptr)
                 {
-                    *warning = L"cid table view unavailable: driver device is not open";
+                    *warning = L"cid known-pid lookup unavailable: driver device is not open";
                 }
                 break;
             }
@@ -6263,7 +6422,7 @@ namespace
                 {
                     if (warning != nullptr)
                     {
-                        *warning = L"cid table view unavailable: " + loadError;
+                        *warning = L"cid known-pid lookup unavailable: " + loadError;
                     }
                     break;
                 }
@@ -6283,7 +6442,7 @@ namespace
                 {
                     if (warning != nullptr)
                     {
-                        *warning = L"cid table view unavailable: DirectoryTableBase offset unresolved: " + fieldError;
+                        *warning = L"cid known-pid lookup unavailable: DirectoryTableBase offset unresolved: " + fieldError;
                     }
                     break;
                 }
@@ -6293,7 +6452,7 @@ namespace
             {
                 if (warning != nullptr)
                 {
-                    *warning = L"cid table view unavailable: DirectoryTableBase offset out of range";
+                    *warning = L"cid known-pid lookup unavailable: DirectoryTableBase offset out of range";
                 }
                 break;
             }
@@ -6366,9 +6525,10 @@ namespace
             if (warning != nullptr)
             {
                 *warning =
-                    L"cid table lookup view: looked_up=" + std::to_wstring(lookedUp) +
+                    L"cid known-pid lookup (not full PspCidTable enumeration): looked_up=" +
+                    std::to_wstring(lookedUp) +
                     L" present=" + std::to_wstring(present) +
-                    L" (via PsLookupProcessByProcessId / PspCidTable)";
+                    L" via PsLookupProcessByProcessId; PIDs absent from other views are not discovered";
             }
             ok = lookedUp != 0;
         } while (false);
@@ -6402,9 +6562,12 @@ namespace
                 !process.SystemProcessInformationSeen &&
                 !process.ToolhelpProcessSeen)
             {
+                // Lookup-only: confirms an already-known PID is still in CID,
+                // not an independent hidden-process discovery surface.
                 bool cidTableConfirmsHidden =
                     process.HasCidTableView &&
                     process.CidTableSeen;
+                evidence[L"cid_view"] = L"known_pid_lookup";
                 evidence[L"snapshot_race_possible"] = cidTableConfirmsHidden ? L"false" : L"true";
                 if (!cidTableConfirmsHidden)
                 {
@@ -6428,6 +6591,7 @@ namespace
             {
                 const bool cidConfirms =
                     process.HasCidTableView && process.CidTableSeen;
+                evidence[L"cid_view"] = L"known_pid_lookup";
                 evidence[L"snapshot_race_possible"] = cidConfirms ? L"false" : L"true";
                 if (cidConfirms)
                 {
@@ -6438,7 +6602,7 @@ namespace
                     L"missing_from_active_process_links"};
                 if (cidConfirms)
                 {
-                    reasons.push_back(L"cid_table_present");
+                    reasons.push_back(L"cid_known_pid_present");
                     reasons.push_back(L"possible_activeprocesslinks_unlink");
                 }
                 AddFinding(
@@ -6448,7 +6612,7 @@ namespace
                     cidConfirms ? L"medium" : L"low",
                     L"process_cross_view",
                     cidConfirms
-                        ? L"process is visible to user APIs and CID table but missing from ActiveProcessLinks"
+                        ? L"process is visible to user APIs and known-PID CID lookup but missing from ActiveProcessLinks"
                         : L"process is visible through user API views but missing from ActiveProcessLinks",
                     0,
                     L"",
@@ -7595,6 +7759,15 @@ namespace
             }
 
             result->ThreatIntelEventCount = options.ThreatIntelEvents.size();
+            if (options.ThreatIntelEventsDropped != 0)
+            {
+                result->ThreatIntelCorrelationIncomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(
+                    L"threat_intel correlation incomplete: TI ring dropped " +
+                    std::to_wstring(options.ThreatIntelEventsDropped) +
+                    L" event(s); correlation coverage is partial");
+            }
             if (options.ThreatIntelEvents.empty())
             {
                 // Deep mode expects TI correlation. Missing events must not look
@@ -9592,11 +9765,6 @@ namespace
         do
         {
             uint32_t pageRva = rva & 0xfffff000u;
-            if (PageHasExpectedRelocationDelta(module, metadata, pageRva))
-            {
-                break;
-            }
-
             if (PageHasExpectedLoaderMutableData(metadata, pageRva))
             {
                 break;
@@ -9619,6 +9787,53 @@ namespace
             if (!ReadDiskPageForRva(module.Path, metadata, pageRva, &diskPage, &ignored))
             {
                 break;
+            }
+
+            if (PageHasExpectedRelocationDelta(module, metadata, pageRva) &&
+                metadata.ImageBase != 0 &&
+                module.Base != metadata.ImageBase)
+            {
+                const uint64_t imageDelta = module.Base - metadata.ImageBase;
+                std::wstring path = Win32FilePathFromMaybeNtPath(module.Path);
+                HANDLE relocFile = CreateFileW(
+                    path.c_str(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    nullptr);
+                std::vector<uint8_t> diskNextPage;
+                std::wstring nextIgnored;
+                if (relocFile != INVALID_HANDLE_VALUE)
+                {
+                    ReadDiskPageForRva(module.Path, metadata, pageRva + static_cast<uint32_t>(kPageSize), &diskNextPage, &nextIgnored);
+                }
+                if (relocFile == INVALID_HANDLE_VALUE ||
+                    !ApplyBaseRelocationsToDiskPage(
+                        relocFile,
+                        metadata,
+                        pageRva,
+                        imageDelta,
+                        &diskPage,
+                        diskNextPage.empty() ? nullptr : &diskNextPage))
+                {
+                    if (relocFile != INVALID_HANDLE_VALUE)
+                    {
+                        CloseHandle(relocFile);
+                    }
+                    // Reloc normalize failed: do not skip the page as "expected
+                    // delta" (that hid live patches). Treat as incomplete coverage.
+                    if (result != nullptr)
+                    {
+                        result->CoverageComplete = false;
+                        result->Warnings.push_back(
+                            module.Name + L": deep page compare reloc normalize failed at rva=0x" +
+                            HuntHex(pageRva, 8));
+                    }
+                    break;
+                }
+                CloseHandle(relocFile);
             }
 
             if (livePage.size() != diskPage.size())
@@ -10804,9 +11019,9 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             }
         }
 
-        // PspCidTable cross-view via driver ResolveProcess (PsLookupProcessByProcessId).
-        // This does not remove any prior views; it only annotates CidTableSeen and
-        // may fill missing EPROCESS/DTB for API-visible processes still in the CID table.
+        // Known-PID CID lookup only (not full PspCidTable enumeration).
+        result->CidTableLookupOnly = true;
+        result->CidTableFullEnumeration = false;
         warning.clear();
         if (!ApplyCidTableLookupView(device_, symbols_, &processes, &warning) && !warning.empty())
         {
@@ -10816,6 +11031,9 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         {
             result->Warnings.push_back(warning);
         }
+        result->Warnings.push_back(
+            L"cid coverage: known-PID lookup only; full PspCidTable enumeration is not available "
+            L"(hidden PIDs absent from other views will not be discovered)");
 
         ProcessTriageScanner triage(device_, symbols_);
         std::map<std::wstring, FileSha1CacheEntry> processSha1Cache;
@@ -10871,9 +11089,21 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     process.HiddenPteRanges = vadResult.HiddenPteRanges;
                     process.HiddenPteBytes = vadResult.HiddenPteBytes;
                     process.Warnings.insert(process.Warnings.end(), vadResult.Warnings.begin(), vadResult.Warnings.end());
-                    if (vadResult.HiddenPteTruncated)
+                    if (vadResult.HiddenPteTruncated ||
+                        vadResult.Incomplete ||
+                        !vadResult.CoverageComplete ||
+                        vadResult.Truncated)
                     {
-                        AddUnique(&process.Warnings, L"hidden PTE scan hit the hunt per-process record limit");
+                        result->ProcessTriageCoverageIncomplete = true;
+                        result->CoverageComplete = false;
+                        if (vadResult.HiddenPteTruncated)
+                        {
+                            AddUnique(&process.Warnings, L"hidden PTE scan hit the hunt per-process record limit");
+                        }
+                        if (vadResult.Incomplete || !vadResult.CoverageComplete)
+                        {
+                            AddUnique(&process.Warnings, L"VAD coverage incomplete for this process");
+                        }
                     }
                     result->VadRecordCount += vadResult.TotalRecords;
                     result->HiddenPteRangeCount += vadResult.HiddenPteRanges;
@@ -10881,6 +11111,8 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 else if (!scanError.empty())
                 {
                     process.Warnings.push_back(L"VAD scan failed: " + scanError);
+                    result->ProcessTriageCoverageIncomplete = true;
+                    result->CoverageComplete = false;
                 }
 
                 ProcessThreadScanOptions threadOptions = {};
@@ -10898,11 +11130,28 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     process.NonEmptyApcQueues = threadResult.ApcNonEmptyCount;
                     process.StackReferenceCount = threadResult.StackReferenceCount;
                     process.Warnings.insert(process.Warnings.end(), threadResult.Warnings.begin(), threadResult.Warnings.end());
+                    if (threadResult.Truncated ||
+                        threadResult.Incomplete ||
+                        !threadResult.CoverageComplete)
+                    {
+                        result->ProcessTriageCoverageIncomplete = true;
+                        result->CoverageComplete = false;
+                        if (threadResult.Truncated)
+                        {
+                            AddUnique(&process.Warnings, L"thread scan truncated");
+                        }
+                        if (threadResult.Incomplete || !threadResult.CoverageComplete)
+                        {
+                            AddUnique(&process.Warnings, L"thread coverage incomplete for this process");
+                        }
+                    }
                     result->ThreadRecordCount += threadResult.MatchingRecords;
                 }
                 else if (!scanError.empty())
                 {
                     process.Warnings.push_back(L"thread scan failed: " + scanError);
+                    result->ProcessTriageCoverageIncomplete = true;
+                    result->CoverageComplete = false;
                 }
 
                 AddIdentityFindings(result, process);
@@ -10993,6 +11242,9 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"threat_intel_correlations\":" << result.ThreatIntelCorrelationCount;
     json << L",\"threat_intel_correlation_incomplete\":" << (result.ThreatIntelCorrelationIncomplete ? L"true" : L"false");
     json << L",\"process_inventory_incomplete\":" << (result.ProcessInventoryIncomplete ? L"true" : L"false");
+    json << L",\"cid_table_full_enumeration\":" << (result.CidTableFullEnumeration ? L"true" : L"false");
+    json << L",\"cid_table_lookup_only\":" << (result.CidTableLookupOnly ? L"true" : L"false");
+    json << L",\"process_triage_coverage_incomplete\":" << (result.ProcessTriageCoverageIncomplete ? L"true" : L"false");
     json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
     json << L"},\n";
 
