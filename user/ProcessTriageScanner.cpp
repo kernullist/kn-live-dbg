@@ -2335,13 +2335,29 @@ bool ProcessTriageScanner::ScanVad(
 
         result->Warnings.insert(result->Warnings.end(), layout.Warnings.begin(), layout.Warnings.end());
         result->LayoutSource = L"PDB/DIA";
+        result->ProtectionResolved = layout.HasProtection;
+        result->PrivateMemoryResolved = layout.HasPrivateMemory;
+        if (!layout.HasProtection)
+        {
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"coverage incomplete: VAD Protection field unresolved; executable/W+X classification is unavailable (not a clean empty exec set)");
+        }
+        if (!layout.HasPrivateMemory)
+        {
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"coverage incomplete: VAD PrivateMemory field unresolved; private-exec/PE probes are unavailable (not a clean empty private set)");
+        }
         if ((options.ExecOnly || options.WxOnly) && !layout.HasProtection)
         {
-            result->Warnings.push_back(L"VAD protection field is unavailable; executable/W+X filters may return no records");
+            result->Warnings.push_back(L"executable/W+X filters will match no records while Protection is unresolved");
         }
-        if ((options.PrivateOnly || options.PeOnly) && !layout.HasPrivateMemory)
+        if ((options.PrivateOnly || options.PeOnly || options.ProbePe) && !layout.HasPrivateMemory)
         {
-            result->Warnings.push_back(L"VAD private-memory field is unavailable; private/PE filters may return no records");
+            result->Warnings.push_back(L"private/PE filters and PE probes will match no records while PrivateMemory is unresolved");
         }
 
         std::vector<VadInterval> vadIntervals;
@@ -2786,7 +2802,11 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
          << L",\"pte_leaf_mappings\":" << result.PteLeafMappings
          << L",\"page_table_pages_read\":" << result.PageTablePagesRead
          << L",\"page_table_read_failures\":" << result.PageTableReadFailures
-         << L",\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},\n";
+         << L",\"truncated\":" << (result.Truncated ? L"true" : L"false")
+         << L",\"protection_resolved\":" << (result.ProtectionResolved ? L"true" : L"false")
+         << L",\"private_memory_resolved\":" << (result.PrivateMemoryResolved ? L"true" : L"false")
+         << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false")
+         << L",\"incomplete\":" << (result.Incomplete ? L"true" : L"false") << L"},\n";
     json << L"  \"warnings\":[";
     for (size_t i = 0; i < result.Warnings.size(); ++i)
     {
