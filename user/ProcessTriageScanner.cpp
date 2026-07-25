@@ -2535,6 +2535,14 @@ bool ProcessTriageScanner::ScanVad(
             result->Warnings.push_back(L"VAD traversal hit the node limit");
         }
 
+        if (!vadCoverageReliable)
+        {
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"coverage incomplete: VAD traversal had unreadable/poisoned nodes, cycles, or a node-limit stop");
+        }
+
         if (options.ScanHiddenPtes)
         {
             if (vadTraversalHitLimit)
@@ -2551,6 +2559,14 @@ bool ProcessTriageScanner::ScanVad(
                 NormalizeVadIntervals(&vadIntervals);
                 ScanHiddenVadPtes(device_, options, vadIntervals, result);
             }
+        }
+
+        if (result->HiddenPteTruncated)
+        {
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"coverage incomplete: hidden PTE scan hit the record limit");
         }
 
         ok = true;
@@ -2634,12 +2650,16 @@ bool ProcessTriageScanner::ScanThreads(
             if (!IsKernelAddress(current))
             {
                 result->Warnings.push_back(L"thread list entry is not kernel-canonical: " + Hex(current, 16));
+                result->Incomplete = true;
+                result->CoverageComplete = false;
                 break;
             }
 
             if (std::find(visited.begin(), visited.end(), current) != visited.end())
             {
                 result->Warnings.push_back(L"thread list cycle detected at " + Hex(current, 16));
+                result->Incomplete = true;
+                result->CoverageComplete = false;
                 break;
             }
             visited.push_back(current);
@@ -2648,6 +2668,8 @@ bool ProcessTriageScanner::ScanThreads(
             if (!TrySub(current, layout.ThreadListEntry.Offset, &ethread))
             {
                 result->Warnings.push_back(L"ETHREAD address underflow at " + Hex(current, 16));
+                result->Incomplete = true;
+                result->CoverageComplete = false;
                 break;
             }
 
@@ -2767,6 +2789,8 @@ bool ProcessTriageScanner::ScanThreads(
             if (!ReadListEntry(device_, current, &next, &blink, nullptr))
             {
                 result->Warnings.push_back(L"failed to read next thread list entry at " + Hex(current, 16));
+                result->Incomplete = true;
+                result->CoverageComplete = false;
                 break;
             }
             current = next;
@@ -2775,7 +2799,14 @@ bool ProcessTriageScanner::ScanThreads(
         if (result->ThreadsVisited >= kMaxThreads)
         {
             result->Truncated = true;
+            result->Incomplete = true;
+            result->CoverageComplete = false;
             result->Warnings.push_back(L"thread traversal hit the node limit");
+        }
+
+        if (result->Incomplete)
+        {
+            result->CoverageComplete = false;
         }
 
         ok = true;
@@ -2888,7 +2919,10 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
          << L",\"suspicious_start\":" << result.SuspiciousStartCount
          << L",\"nonempty_apc_queues\":" << result.ApcNonEmptyCount
          << L",\"stack_references\":" << result.StackReferenceCount
-         << L",\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},\n";
+         << L",\"truncated\":" << (result.Truncated ? L"true" : L"false")
+         << L",\"incomplete\":" << (result.Incomplete ? L"true" : L"false")
+         << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false")
+         << L"},\n";
     json << L"  \"warnings\":[";
     for (size_t i = 0; i < result.Warnings.size(); ++i)
     {

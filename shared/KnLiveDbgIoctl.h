@@ -10,7 +10,7 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SERVICE_NAME L"KnLiveDbg"
 #define KNDBG_DISPLAY_NAME L"Kn Live Debug Driver"
 
-#define KNDBG_ABI_VERSION 12u
+#define KNDBG_ABI_VERSION 13u
 #define KNDBG_MAX_TRANSFER_SIZE (1024u * 1024u)
 #define KNDBG_WRITE_ACK_MAGIC 0x4B4E444247574F4Full
 #define KNDBG_TIMELINE_DEFAULT_CAPACITY 4096u
@@ -44,6 +44,10 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SESSION_FLAG_WRITE_ENABLED 0x00000002u
 
 #define KNDBG_PROCESS_FLAG_USER_DTB_AVAILABLE 0x00000001u
+
+// Flush the supplied VA range against DirectoryTableBase on every CPU (CR3
+// switch + invlpg). When clear, flush uses each CPU's current CR3 only.
+#define KNDBG_FLUSH_FLAG_PROCESS_DTB 0x00000001u
 
 #define KNDBG_TIMELINE_CONTROL_START 1u
 #define KNDBG_TIMELINE_CONTROL_STOP 2u
@@ -235,15 +239,19 @@ typedef struct _KNDBG_ADDRESS_QUERY_REQUEST
     KNDBG_UINT32 Flags;
 } KNDBG_ADDRESS_QUERY_REQUEST;
 
+// IsWritable is the session write-gate (IOCTL write mode), NOT PTE.W.
+// Reserved bit0 mirrors that write-gate for explicit consumers.
+#define KNDBG_ADDRESS_QUERY_RESERVED_WRITE_GATE 0x1u
+
 typedef struct _KNDBG_ADDRESS_QUERY_RESPONSE
 {
     KNDBG_UINT32 Size;
     KNDBG_UINT32 IsReadable;
-    KNDBG_UINT32 IsWritable;
+    KNDBG_UINT32 IsWritable; // write-gate enabled; not page writability
     KNDBG_UINT32 Reserved;
     KNDBG_UINT64 Address;
     KNDBG_UINT32 RequestedLength;
-    KNDBG_UINT32 ProbedLength;
+    KNDBG_UINT32 ProbedLength; // first-byte probe only (current address space)
 } KNDBG_ADDRESS_QUERY_RESPONSE;
 
 typedef struct _KNDBG_TRANSLATE_VIRTUAL_REQUEST
@@ -309,8 +317,11 @@ typedef struct _KNDBG_FLUSH_VIRTUAL_REQUEST
     KNDBG_UINT32 Flags;
     KNDBG_UINT64 VirtualAddress;
     KNDBG_UINT32 Length;
-    KNDBG_UINT32 Reserved;
+    KNDBG_UINT32 ProcessId; // optional; used for lifetime pin when PROCESS_DTB is set
     KNDBG_UINT64 Acknowledge;
+    // Target address-space CR3/DTB when KNDBG_FLUSH_FLAG_PROCESS_DTB is set.
+    // Zero keeps legacy current-CR3 flush behavior.
+    KNDBG_UINT64 DirectoryTableBase;
 } KNDBG_FLUSH_VIRTUAL_REQUEST;
 
 typedef struct _KNDBG_SET_PROCESS_PROTECTION_REQUEST

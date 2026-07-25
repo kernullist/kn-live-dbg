@@ -8478,6 +8478,8 @@ struct TemporaryWritablePageEntry
     uint64_t OriginalValue;
     uint64_t WritableValue;
     uint64_t CompareMask;
+    uint32_t ProcessId;
+    uint64_t DirectoryTableBase;
     std::wstring Name;
 };
 
@@ -8624,6 +8626,76 @@ static bool WritePhysicalQword(DeviceClient& device, uint64_t physicalAddress, u
     return device.WritePhysical(physicalAddress, bytes, error);
 }
 
+// Re-translate and require the same physical frame / page size as `expected`.
+// Closes the translate→physical-write TOCTOU window without refusing CoW/R-O
+// shared-frame patches (those keep the same PFN by design).
+static bool ConfirmPhysicalMappingUnchanged(
+    DeviceClient& device,
+    uint64_t directoryTableBase,
+    uint64_t virtualAddress,
+    uint32_t length,
+    const PhysicalTranslationInfo& expected,
+    PhysicalTranslationInfo* refreshed,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        PhysicalTranslationInfo again = {};
+        if (!device.TranslateVirtual(directoryTableBase, virtualAddress, length, &again, error))
+        {
+            if (error != nullptr && !error->empty())
+            {
+                *error = L"mapping re-translate failed before physical write: " + *error;
+            }
+            break;
+        }
+
+        if (again.PhysicalAddress != expected.PhysicalAddress ||
+            again.PageSize != expected.PageSize ||
+            again.PageOffset != expected.PageOffset)
+        {
+            if (error != nullptr)
+            {
+                *error = L"mapping changed between translate and physical write (TOCTOU): va=" +
+                    HexTextWidth(virtualAddress, 16, true) +
+                    L" expected-pa=" + HexTextWidth(expected.PhysicalAddress, 16, true) +
+                    L" now-pa=" + HexTextWidth(again.PhysicalAddress, 16, true);
+            }
+            break;
+        }
+
+        LeafPageTableEntry expectedLeaf = {};
+        LeafPageTableEntry againLeaf = {};
+        if (GetLeafPageTableEntry(expected, &expectedLeaf, nullptr) &&
+            GetLeafPageTableEntry(again, &againLeaf, nullptr))
+        {
+            const uint64_t mask = expectedLeaf.CompareMask;
+            if ((againLeaf.Value & mask) != (expectedLeaf.Value & mask) ||
+                againLeaf.PhysicalAddress != expectedLeaf.PhysicalAddress)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"leaf page table entry changed between translate and physical write (TOCTOU): va=" +
+                        HexTextWidth(virtualAddress, 16, true) +
+                        L" entry-pa=" + HexTextWidth(expectedLeaf.PhysicalAddress, 16, true);
+                }
+                break;
+            }
+        }
+
+        if (refreshed != nullptr)
+        {
+            *refreshed = again;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static bool EndTemporaryWritablePageEntry(
     DeviceClient& device,
     TemporaryWritablePageEntry* temporary,
@@ -8633,6 +8705,8 @@ static bool BeginTemporaryWritablePageEntry(
     DeviceClient& device,
     const PhysicalTranslationInfo& translation,
     uint32_t flushLength,
+    uint32_t processId,
+    uint64_t directoryTableBase,
     TemporaryWritablePageEntry* temporary,
     std::wstring* error)
 {
@@ -8650,6 +8724,8 @@ static bool BeginTemporaryWritablePageEntry(
         }
 
         *temporary = TemporaryWritablePageEntry{};
+        temporary->ProcessId = processId;
+        temporary->DirectoryTableBase = directoryTableBase;
 
         LeafPageTableEntry leaf = {};
         if (!GetLeafPageTableEntry(translation, &leaf, error))
@@ -8713,9 +8789,16 @@ static bool BeginTemporaryWritablePageEntry(
         temporary->OriginalValue = currentEntry;
         temporary->WritableValue = writableEntry;
         temporary->CompareMask = leaf.CompareMask;
+        temporary->ProcessId = processId;
+        temporary->DirectoryTableBase = directoryTableBase;
         temporary->Name = leaf.Name;
 
-        if (!device.FlushVirtual(temporary->VirtualAddress, temporary->FlushLength, error))
+        if (!device.FlushVirtual(
+                temporary->VirtualAddress,
+                temporary->FlushLength,
+                temporary->ProcessId,
+                temporary->DirectoryTableBase,
+                error))
         {
             std::wstring flushError = error != nullptr ? *error : L"unknown error";
             std::wstring restoreError;
@@ -8786,7 +8869,12 @@ static bool EndTemporaryWritablePageEntry(
         }
 
         temporary->Active = false;
-        if (!device.FlushVirtual(temporary->VirtualAddress, temporary->FlushLength, error))
+        if (!device.FlushVirtual(
+                temporary->VirtualAddress,
+                temporary->FlushLength,
+                temporary->ProcessId,
+                temporary->DirectoryTableBase,
+                error))
         {
             if (error != nullptr)
             {
@@ -8915,7 +9003,8 @@ static bool WriteProcessVirtualMemory(
 
             // User VA path writes through the translated physical frame after an
             // optional temporary Write-bit flip. That skips the processor CoW
-            // fault path, so a CoW leaf would silently patch the shared page.
+            // fault path and intentionally patches the shared frame — this is a
+            // primary patch workflow for EXE/DLL WriteCopy pages. Warn once.
             if (!writeViaKernelVirtualAddress)
             {
                 LeafPageTableEntry leaf = {};
@@ -8924,11 +9013,6 @@ static bool WriteProcessVirtualMemory(
                     break;
                 }
 
-                // Do not refuse CoW leaves: EXE/DLL code is commonly mapped
-                // PAGE_EXECUTE_WRITECOPY (valid PTE with CoW bit), and refusing
-                // that path breaks the normal game/cheat patch workflow that
-                // already relied on temporary Write-bit flip + physical write.
-                // Surface the shared-frame semantics once, then proceed.
                 if (!warnedReadonlyUserPhysical &&
                     (((leaf.Value & KNDBG_X64_PTE_WRITE) == 0) ||
                      ((leaf.Value & KNDBG_X64_PTE_COPY_ON_WRITE) != 0)))
@@ -8945,7 +9029,14 @@ static bool WriteProcessVirtualMemory(
             }
 
             TemporaryWritablePageEntry temporary = {};
-            if (!BeginTemporaryWritablePageEntry(device, translation, chunk, &temporary, error))
+            if (!BeginTemporaryWritablePageEntry(
+                    device,
+                    translation,
+                    chunk,
+                    context.ProcessId,
+                    directoryTableBase,
+                    &temporary,
+                    error))
             {
                 break;
             }
@@ -8962,9 +9053,30 @@ static bool WriteProcessVirtualMemory(
             }
             else
             {
-                writeTargetText = L" pa=" + HexTextWidth(translation.PhysicalAddress, 16, true);
-                writeFailureText = L"physical data write failed";
-                writeOk = device.WritePhysical(translation.PhysicalAddress, pageBytes, &writeError);
+                // Re-check PFN after the temporary Write-bit flip/flush window.
+                // If the VA remapped, refuse the stale physical write (does not
+                // block intentional CoW shared-frame patches that keep the PFN).
+                PhysicalTranslationInfo confirmed = {};
+                if (!ConfirmPhysicalMappingUnchanged(
+                        device,
+                        directoryTableBase,
+                        current,
+                        chunk,
+                        translation,
+                        &confirmed,
+                        &writeError))
+                {
+                    writeOk = false;
+                    writeTargetText = L" pa=" + HexTextWidth(translation.PhysicalAddress, 16, true);
+                    writeFailureText = L"physical mapping changed before write";
+                }
+                else
+                {
+                    translation = confirmed;
+                    writeTargetText = L" pa=" + HexTextWidth(translation.PhysicalAddress, 16, true);
+                    writeFailureText = L"physical data write failed";
+                    writeOk = device.WritePhysical(translation.PhysicalAddress, pageBytes, &writeError);
+                }
             }
 
             std::wstring restoreError;
@@ -8991,14 +9103,38 @@ static bool WriteProcessVirtualMemory(
             }
 
             // Read-back verification: confirm the bytes actually landed before
-            // advancing. A silent short or dropped write (e.g. a racing remap
-            // or copy-on-write split) would otherwise pass unnoticed. Reads do
-            // not require the write bit, so this runs after the PTE is restored.
+            // advancing. Re-translate on the user/physical path so a racing
+            // remap cannot make a stale-PFN verify look successful.
             std::vector<uint8_t> verifyBytes;
             std::wstring verifyError;
-            bool verifyRead = writeViaKernelVirtualAddress
-                ? device.ReadMemory(current, chunk, &verifyBytes, &verifyError)
-                : device.ReadPhysical(translation.PhysicalAddress, chunk, &verifyBytes, &verifyError);
+            bool verifyRead = false;
+            if (writeViaKernelVirtualAddress)
+            {
+                verifyRead = device.ReadMemory(current, chunk, &verifyBytes, &verifyError);
+            }
+            else
+            {
+                PhysicalTranslationInfo verifyTranslation = {};
+                if (!ConfirmPhysicalMappingUnchanged(
+                        device,
+                        directoryTableBase,
+                        current,
+                        chunk,
+                        translation,
+                        &verifyTranslation,
+                        &verifyError))
+                {
+                    verifyRead = false;
+                }
+                else
+                {
+                    verifyRead = device.ReadPhysical(
+                        verifyTranslation.PhysicalAddress,
+                        chunk,
+                        &verifyBytes,
+                        &verifyError);
+                }
+            }
             if (!verifyRead || verifyBytes.size() != pageBytes.size() ||
                 memcmp(verifyBytes.data(), pageBytes.data(), pageBytes.size()) != 0)
             {
@@ -9059,6 +9195,116 @@ static bool ReadMemoryWithProcessContext(
         {
             ok = device.ReadMemory(address, length, bytes, error);
         }
+    } while (false);
+
+    return ok;
+}
+
+// Process-aware address probe. User VAs with procctx use translate+physical;
+// otherwise falls back to the driver's current-AS first-byte query.
+// write_gate = session write mode; pte_writable = leaf PTE.W when translated.
+static bool QueryAddressWithProcessContext(
+    DeviceClient& device,
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address,
+    uint32_t length,
+    std::wstring* summary,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (summary == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid query summary output";
+            }
+            break;
+        }
+
+        AddressQueryInfo gateInfo = {};
+        if (!device.QueryAddress(address, length, &gateInfo, error))
+        {
+            break;
+        }
+
+        const ProcessAddressContext* context = SelectMemoryAccessContext(state, explicitContext, address);
+        if (context == nullptr)
+        {
+            std::wstringstream stream;
+            stream << L"address=0x" << std::hex << gateInfo.Address
+                   << L" readable=" << std::dec << (gateInfo.IsReadable ? 1 : 0)
+                   << L" write_gate=" << (gateInfo.WriteGateEnabled ? 1 : 0)
+                   << L" pte_writable=n/a"
+                   << L" probed=" << gateInfo.ProbedLength
+                   << L" requested=" << gateInfo.RequestedLength
+                   << L" probe_scope=current_as"
+                   << L" note=first_byte";
+            *summary = stream.str();
+            ok = true;
+            break;
+        }
+
+        PhysicalTranslationInfo translation = {};
+        const uint64_t directoryTableBase = SelectProcessDirectoryTableBase(*context, address);
+        std::wstring translateError;
+        if (!device.TranslateVirtual(directoryTableBase, address, length, &translation, &translateError))
+        {
+            // Fail-open like the driver query IOCTL: unmapped VAs report readable=0.
+            std::wstringstream stream;
+            stream << L"address=0x" << std::hex << address
+                   << L" readable=0"
+                   << L" write_gate=" << std::dec << (gateInfo.WriteGateEnabled ? 1 : 0)
+                   << L" pte_writable=n/a"
+                   << L" probed=0"
+                   << L" requested=" << length
+                   << L" pid=" << context->ProcessId
+                   << L" probe_scope=procctx"
+                   << L" note=first_byte"
+                   << L" translate_error=" << translateError;
+            *summary = stream.str();
+            ok = true;
+            break;
+        }
+
+        bool pteWritable = false;
+        bool haveLeaf = false;
+        LeafPageTableEntry leaf = {};
+        if (GetLeafPageTableEntry(translation, &leaf, nullptr))
+        {
+            haveLeaf = true;
+            pteWritable = (leaf.Value & KNDBG_X64_PTE_WRITE) != 0;
+        }
+
+        std::vector<uint8_t> probeBytes;
+        std::wstring probeError;
+        const bool readable =
+            ReadProcessVirtualMemory(device, *context, address, 1, &probeBytes, &probeError) &&
+            probeBytes.size() == 1;
+        const uint32_t probed = readable ? 1u : 0u;
+
+        std::wstringstream stream;
+        stream << L"address=0x" << std::hex << address
+               << L" readable=" << std::dec << (readable ? 1 : 0)
+               << L" write_gate=" << (gateInfo.WriteGateEnabled ? 1 : 0)
+               << L" pte_writable=" << (haveLeaf ? (pteWritable ? L"1" : L"0") : L"n/a")
+               << L" probed=" << probed
+               << L" requested=" << length
+               << L" translated=0x" << std::hex << translation.TranslatedLength
+               << L" pa=0x" << translation.PhysicalAddress
+               << L" cr3=0x" << translation.DirectoryTableBase
+               << L" pid=" << std::dec << context->ProcessId
+               << L" probe_scope=procctx"
+               << L" note=first_byte";
+        if (!readable && !probeError.empty())
+        {
+            stream << L" read_error=" << probeError;
+        }
+        *summary = stream.str();
+        ok = true;
     } while (false);
 
     return ok;
@@ -10062,14 +10308,65 @@ static void HandleFill(const std::vector<std::wstring>& args, DebuggerState& sta
     {
         if (args.size() < 4)
         {
-            std::wcerr << L"usage: f <address> <length> <value...>\n";
+            std::wcerr << L"usage: " << command
+                       << L" [/process <process-id>] <address> <length> <value...>\n";
+            break;
+        }
+
+        size_t argIndex = 1;
+        ProcessAddressContext explicitContext = {};
+        bool hasExplicitContext = false;
+        if (IsDeprecatedProcessContextOption(args[argIndex]))
+        {
+            std::wcerr << L"usage: " << command
+                       << L" [/process <process-id>] <address> <length> <value...>\n";
+            break;
+        }
+
+        if (IsProcessContextOption(args[argIndex]))
+        {
+            if (args.size() < argIndex + 5)
+            {
+                std::wcerr << L"usage: " << command
+                           << L" /process <process-id> <address> <length> <value...>\n";
+                break;
+            }
+
+            uint64_t processId = 0;
+            if (!ParseUnsigned(args[argIndex + 1], 10, &processId) ||
+                processId == 0 ||
+                processId > 0xffffffffull)
+            {
+                std::wcerr << L"invalid process id\n";
+                break;
+            }
+
+            if (!ResolveProcessAddressContext(
+                    device,
+                    symbols,
+                    static_cast<uint32_t>(processId),
+                    &explicitContext,
+                    &error))
+            {
+                std::wcerr << L"process context failed: " << error << L"\n";
+                break;
+            }
+
+            hasExplicitContext = true;
+            argIndex += 2;
+        }
+
+        if (args.size() < argIndex + 3)
+        {
+            std::wcerr << L"usage: " << command
+                       << L" [/process <process-id>] <address> <length> <value...>\n";
             break;
         }
 
         uint64_t address = 0;
         uint64_t length = 0;
-        if (!ParseAddressOrSymbol(symbols, state, args[1], &address, &error) ||
-            !ParseUnsigned(args[2], state.NumberBase, &length))
+        if (!ParseAddressOrSymbol(symbols, state, args[argIndex], &address, &error) ||
+            !ParseUnsigned(args[argIndex + 1], state.NumberBase, &length))
         {
             std::wcerr << L"fill argument parse failed\n";
             break;
@@ -10084,7 +10381,7 @@ static void HandleFill(const std::vector<std::wstring>& args, DebuggerState& sta
         std::vector<uint8_t> pattern;
         size_t width = command == L"fp" ? sizeof(uint64_t) : 1;
         bool valuesOk = true;
-        for (size_t index = 3; index < args.size(); ++index)
+        for (size_t index = argIndex + 2; index < args.size(); ++index)
         {
             uint64_t value = 0;
             if (!ParseUnsigned(args[index], state.NumberBase, &value))
@@ -10123,11 +10420,21 @@ static void HandleFill(const std::vector<std::wstring>& args, DebuggerState& sta
         }
 
         ProcessAddressContext kernelContext = {};
-        const ProcessAddressContext* memoryContext = nullptr;
-        if (!ResolveNativeWriteContext(state, device, symbols, address, &kernelContext, &memoryContext, &error))
+        const ProcessAddressContext* memoryContext = hasExplicitContext ? &explicitContext : nullptr;
+        if (!hasExplicitContext)
         {
-            std::wcerr << L"fill failed: " << error << L"\n";
-            break;
+            if (!ResolveNativeWriteContext(
+                    state,
+                    device,
+                    symbols,
+                    address,
+                    &kernelContext,
+                    &memoryContext,
+                    &error))
+            {
+                std::wcerr << L"fill failed: " << error << L"\n";
+                break;
+            }
         }
 
         if (WriteMemoryWithProcessContext(device, state, memoryContext, address, bytes, &error))
@@ -10157,16 +10464,63 @@ static void HandleMove(const std::vector<std::wstring>& args, DebuggerState& sta
     {
         if (args.size() < 4)
         {
-            std::wcerr << L"usage: m <source> <destination> <length>\n";
+            std::wcerr << L"usage: m [/process <process-id>] <source> <destination> <length>\n";
+            break;
+        }
+
+        size_t argIndex = 1;
+        ProcessAddressContext explicitContext = {};
+        bool hasExplicitContext = false;
+        if (IsDeprecatedProcessContextOption(args[argIndex]))
+        {
+            std::wcerr << L"usage: m [/process <process-id>] <source> <destination> <length>\n";
+            break;
+        }
+
+        if (IsProcessContextOption(args[argIndex]))
+        {
+            if (args.size() < argIndex + 5)
+            {
+                std::wcerr << L"usage: m /process <process-id> <source> <destination> <length>\n";
+                break;
+            }
+
+            uint64_t processId = 0;
+            if (!ParseUnsigned(args[argIndex + 1], 10, &processId) ||
+                processId == 0 ||
+                processId > 0xffffffffull)
+            {
+                std::wcerr << L"invalid process id\n";
+                break;
+            }
+
+            if (!ResolveProcessAddressContext(
+                    device,
+                    symbols,
+                    static_cast<uint32_t>(processId),
+                    &explicitContext,
+                    &error))
+            {
+                std::wcerr << L"process context failed: " << error << L"\n";
+                break;
+            }
+
+            hasExplicitContext = true;
+            argIndex += 2;
+        }
+
+        if (args.size() < argIndex + 3)
+        {
+            std::wcerr << L"usage: m [/process <process-id>] <source> <destination> <length>\n";
             break;
         }
 
         uint64_t source = 0;
         uint64_t destination = 0;
         uint64_t length = 0;
-        if (!ParseAddressOrSymbol(symbols, state, args[1], &source, &error) ||
-            !ParseAddressOrSymbol(symbols, state, args[2], &destination, &error) ||
-            !ParseUnsigned(args[3], state.NumberBase, &length))
+        if (!ParseAddressOrSymbol(symbols, state, args[argIndex], &source, &error) ||
+            !ParseAddressOrSymbol(symbols, state, args[argIndex + 1], &destination, &error) ||
+            !ParseUnsigned(args[argIndex + 2], state.NumberBase, &length))
         {
             std::wcerr << L"move argument parse failed\n";
             break;
@@ -10178,16 +10532,25 @@ static void HandleMove(const std::vector<std::wstring>& args, DebuggerState& sta
             break;
         }
 
-        // Source and destination may be different address spaces; each end
-        // uses the same procctx/System policy as e*/d*.
+        // Optional /process applies to both ends for this command only (like e*).
+        // Without it, source and destination each use procctx/System policy.
         ProcessAddressContext sourceKernelContext = {};
-        const ProcessAddressContext* sourceContext = nullptr;
-        if (!ResolveNativeWriteContext(state, device, symbols, source, &sourceKernelContext, &sourceContext, &error))
+        const ProcessAddressContext* sourceContext =
+            hasExplicitContext ? &explicitContext : nullptr;
+        if (!hasExplicitContext)
         {
-            // Read of kernel does not require write context, but user read
-            // still needs procctx. Reuse the same policy for consistency.
-            std::wcerr << L"move source context failed: " << error << L"\n";
-            break;
+            if (!ResolveNativeWriteContext(
+                    state,
+                    device,
+                    symbols,
+                    source,
+                    &sourceKernelContext,
+                    &sourceContext,
+                    &error))
+            {
+                std::wcerr << L"move source context failed: " << error << L"\n";
+                break;
+            }
         }
 
         std::vector<uint8_t> bytes;
@@ -10212,11 +10575,22 @@ static void HandleMove(const std::vector<std::wstring>& args, DebuggerState& sta
         }
 
         ProcessAddressContext destKernelContext = {};
-        const ProcessAddressContext* destContext = nullptr;
-        if (!ResolveNativeWriteContext(state, device, symbols, destination, &destKernelContext, &destContext, &error))
+        const ProcessAddressContext* destContext =
+            hasExplicitContext ? &explicitContext : nullptr;
+        if (!hasExplicitContext)
         {
-            std::wcerr << L"move destination context failed: " << error << L"\n";
-            break;
+            if (!ResolveNativeWriteContext(
+                    state,
+                    device,
+                    symbols,
+                    destination,
+                    &destKernelContext,
+                    &destContext,
+                    &error))
+            {
+                std::wcerr << L"move destination context failed: " << error << L"\n";
+                break;
+            }
         }
 
         if (WriteMemoryWithProcessContext(device, state, destContext, destination, bytes, &error))
@@ -15437,7 +15811,7 @@ static void PrintModuleIntegrityHelp()
     std::wcout << L"  /wx           report only modules with W+X section/page evidence.\n";
     std::wcout << L"  /mismatch     report only modules with header, size, or section anomalies.\n";
     std::wcout << L"  /disk         compare live executable pages against on-disk PE raw data (additive;\n";
-    std::wcout << L"                skips basereloc fixup pages when the image is relocated).\n";
+    std::wcout << L"                applies basereloc deltas to disk pages when the image is relocated).\n";
     std::wcout << L"  /limit <n>    cap reported records while still scanning matching modules.\n";
     std::wcout << L"  /json <path>  write structured kn-live-dbg.module-integrity.v1 JSON.\n";
     std::wcout << L"\n";
@@ -18987,10 +19361,10 @@ static void RefreshTimelineDashboardEvidence(
     // cloned on every dashboard refresh. maxAdd still caps added events and
     // the cursor only advances through processed records.
     bool cursorInitialized = false;
-    const uint64_t cursorTs = state.Timeline.GetTiRecentCursorTimestamp(&cursorInitialized);
+    const uint64_t cursorSeq = state.Timeline.GetTiRecentCursorSequence(&cursorInitialized);
     const size_t fetchCap = KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS + 256;
-    std::vector<TiEventRecord> tiEvents = ti.RecentSince(
-        cursorInitialized ? cursorTs : 0,
+    std::vector<TiEventRecord> tiEvents = ti.RecentAfterSequence(
+        cursorInitialized ? cursorSeq : 0,
         fetchCap);
     TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(
         tiEvents,
@@ -19432,9 +19806,9 @@ static void HandleTimelineCommand(
             else
             {
                 bool cursorInitialized = false;
-                const uint64_t cursorTs = state.Timeline.GetTiRecentCursorTimestamp(&cursorInitialized);
+                const uint64_t cursorSeq = state.Timeline.GetTiRecentCursorSequence(&cursorInitialized);
                 const size_t fetchCap = update.Limit == 0 ? 0 : (update.Limit + 256);
-                tiEvents = sub.RecentSince(cursorInitialized ? cursorTs : 0, fetchCap);
+                tiEvents = sub.RecentAfterSequence(cursorInitialized ? cursorSeq : 0, fetchCap);
             }
             TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(
                 tiEvents,
@@ -19877,9 +20251,9 @@ static void HandleTimelineCommand(
                 else
                 {
                     bool cursorInitialized = false;
-                    const uint64_t cursorTs = state.Timeline.GetTiRecentCursorTimestamp(&cursorInitialized);
+                    const uint64_t cursorSeq = state.Timeline.GetTiRecentCursorSequence(&cursorInitialized);
                     const size_t fetchCap = limit == 0 ? 0 : (limit + 256);
-                    events = sub.RecentSince(cursorInitialized ? cursorTs : 0, fetchCap);
+                    events = sub.RecentAfterSequence(cursorInitialized ? cursorSeq : 0, fetchCap);
                 }
                 TimelineIngestResult result = state.Timeline.IngestThreatIntel(events, mode, limit);
                 PrintTimelineIngestResult(L"ti", result);
@@ -22012,6 +22386,8 @@ static void PrintWriteHelp()
     std::wcout << L"notes:\n";
     std::wcout << L"  Write mode defaults to on at startup.\n";
     std::wcout << L"  e* user VAs use procctx or /process; kernel VAs use System(pid 4).\n";
+    std::wcout << L"  User CoW/R-O pages are patched via temporary Write-bit flip + physical write\n";
+    std::wcout << L"  (shared-frame semantics; no private CoW break).\n";
     std::wcout << L"  This is the driver session write gate; it does not validate that a target patch is semantically safe.\n";
 }
 
@@ -22255,22 +22631,24 @@ static void PrintCompareHelp()
 static void PrintFillHelp()
 {
     std::wcout << L"fill command:\n";
-    std::wcout << L"  f <address> <length> <byte-pattern...>\n";
-    std::wcout << L"  fp <address> <length> <pointer-pattern...>\n";
+    std::wcout << L"  f [/process <process-id>] <address> <length> <byte-pattern...>\n";
+    std::wcout << L"  fp [/process <process-id>] <address> <length> <pointer-pattern...>\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  length is bytes; the pattern repeats until the target range is filled.\n";
     std::wcout << L"  User VAs require procctx or /process; kernel VAs use System(pid 4).\n";
+    std::wcout << L"  /process is one-shot (does not change persistent procctx), matching e*.\n";
 }
 
 static void PrintMoveHelp()
 {
     std::wcout << L"move command:\n";
-    std::wcout << L"  m <source> <destination> <length>\n";
+    std::wcout << L"  m [/process <process-id>] <source> <destination> <length>\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  length is bytes; the command reads the source range first, then writes destination.\n";
-    std::wcout << L"  Source and destination each use the same procctx/System policy as d*/e*.\n";
+    std::wcout << L"  Without /process, source and destination each use the same procctx/System policy as d*/e*.\n";
+    std::wcout << L"  With /process, both ends use that process context for this command only.\n";
 }
 
 static void PrintSetFieldHelp()
@@ -22436,7 +22814,7 @@ static void PrintSessionHelp(const std::wstring& command)
 static void PrintQueryHelp()
 {
     std::wcout << L"query command:\n";
-    std::wcout << L"  query <address|symbol> [length]\n";
+    std::wcout << L"  query <address|symbol> [length]  (procctx for user VA; write_gate≠pte_writable)\n";
     std::wcout << L"  Ask the driver for a native virtual-address range summary.\n";
     std::wcout << L"  length is bytes and defaults to one byte.\n";
 }
@@ -30847,6 +31225,14 @@ static void PrintHuntSummaryLine(const HuntResult& result)
     {
         std::wcout << L" process_inventory_incomplete=yes";
     }
+    if (result.ProcessTriageCoverageIncomplete)
+    {
+        std::wcout << L" process_triage_incomplete=yes";
+    }
+    if (result.CidTableLookupOnly)
+    {
+        std::wcout << L" cid_lookup_only=yes";
+    }
     if (result.ThreatIntelCorrelationIncomplete)
     {
         std::wcout << L" ti_correlation_incomplete=yes";
@@ -31332,6 +31718,8 @@ static void HandleHuntCommand(
         {
             TiSubscriber& ti = GetTiSubscriberInstance();
             options.ThreatIntelActive = ti.IsActive();
+            TiSubscriberStats tiStats = ti.SnapshotStats();
+            options.ThreatIntelEventsDropped = tiStats.EventsDropped;
             std::vector<TiEventRecord> recentTiEvents = ti.Recent(4096, true);
             options.ThreatIntelAvailable = !recentTiEvents.empty();
             options.ThreatIntelEvents.reserve(recentTiEvents.size());
@@ -35202,7 +35590,14 @@ static bool ExecuteAiCapabilityMemoryProbe(
         std::wcout << L": memory.probe\n";
         std::wcout << L"tool> query " << addrText << L" " << length << L"\n";
         std::wstring summary;
-        if (!device.QueryAddress(address, static_cast<uint32_t>(length), &summary, error))
+        if (!QueryAddressWithProcessContext(
+                device,
+                state,
+                nullptr,
+                address,
+                static_cast<uint32_t>(length),
+                &summary,
+                error))
         {
             break;
         }
@@ -38290,7 +38685,14 @@ static bool HandleCommand(
             }
 
             std::wstring summary;
-            if (device.QueryAddress(address, static_cast<uint32_t>(length), &summary, &error))
+            if (QueryAddressWithProcessContext(
+                    device,
+                    state,
+                    nullptr,
+                    address,
+                    static_cast<uint32_t>(length),
+                    &summary,
+                    &error))
             {
                 std::wcout << summary << L"\n";
             }
@@ -38506,10 +38908,35 @@ static bool HandleCommand(
                 break;
             }
 
-            size_t width = static_cast<size_t>(field.Length);
+            if (field.IsBitField)
+            {
+                std::wcerr << L"setfield failed: bitfield writes are refused "
+                           << L"(Length is bit-count; a byte-width overwrite would corrupt adjacent fields). "
+                           << L"Use a containing integer field or implement read-modify-write manually.\n";
+                break;
+            }
+
+            const size_t width = static_cast<size_t>(field.Length);
             if (width == 0 || width > sizeof(uint64_t))
             {
-                width = sizeof(uint64_t);
+                std::wcerr << L"setfield failed: unsupported integer field width "
+                           << field.Length
+                           << L" (expected 1.." << sizeof(uint64_t)
+                           << L" bytes); refusing silent widen/truncate that could corrupt neighbors\n";
+                break;
+            }
+
+            if (width < sizeof(uint64_t))
+            {
+                const uint64_t maxValue = (1ull << (width * 8)) - 1ull;
+                if (value > maxValue)
+                {
+                    std::wcerr << L"setfield failed: value 0x" << std::hex << value
+                               << L" does not fit in " << std::dec << width
+                               << L"-byte field (max 0x" << std::hex << maxValue << std::dec
+                               << L"); refusing truncated write that would silently drop high bytes\n";
+                    break;
+                }
             }
 
             std::vector<uint8_t> bytes = EncodeInteger(value, width);

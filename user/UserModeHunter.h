@@ -46,6 +46,8 @@ struct HuntOptions
     bool ThreatIntelActive = false;
     bool ThreatIntelAvailable = false;
     std::vector<HuntTelemetryEvent> ThreatIntelEvents;
+    // Ring overflow / eviction count from the TI subscriber for this scan window.
+    uint64_t ThreatIntelEventsDropped = 0;
 };
 
 struct HuntModuleRecord
@@ -76,6 +78,9 @@ struct HuntProcessRecord
     bool ActiveProcessLinksSeen = false;
     bool SystemProcessInformationSeen = false;
     bool ToolhelpProcessSeen = false;
+    // True when known-PID CID lookup was attempted for this process (not a full
+    // PspCidTable enumeration). CidTableSeen means PsLookupProcessByProcessId
+    // succeeded for that PID.
     bool HasCidTableView = false;
     bool CidTableSeen = false;
     std::wstring KernelImageName;
@@ -173,8 +178,13 @@ struct HuntResult
     // Kernel ActiveProcessLinks inventory was partial (poisoned nodes skipped
     // or walk stopped early). Findings must not be read as whole-system clean.
     bool ProcessInventoryIncomplete = false;
+    // CID path is known-PID lookup only; full PspCidTable enumeration is absent.
+    bool CidTableFullEnumeration = false;
+    bool CidTableLookupOnly = true;
+    // VAD / hidden-PTE / thread collection surfaces reported incompleteness.
+    bool ProcessTriageCoverageIncomplete = false;
     // Aggregate coverage flag: false when any critical collection surface was
-    // incomplete (process inventory today; more surfaces can OR into this).
+    // incomplete (process inventory, TI drops, triage truncation, etc.).
     bool CoverageComplete = true;
     uint64_t ThreatIntelEventCount = 0;
     uint64_t ThreatIntelCorrelationCount = 0;

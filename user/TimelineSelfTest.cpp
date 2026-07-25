@@ -127,6 +127,8 @@ namespace
         return event;
     }
 
+    uint64_t g_tiTestSequence = 1;
+
     TiEventRecord MakeTiEvent(
         uint64_t timestamp,
         uint32_t pid,
@@ -135,6 +137,7 @@ namespace
         const std::wstring& image)
     {
         TiEventRecord event = {};
+        event.Sequence = g_tiTestSequence++;
         event.Timestamp = timestamp;
         event.ProcessId = pid;
         event.ThreadId = 44;
@@ -383,12 +386,11 @@ int RunTimelineSelfTest()
                 tiFiltered[1].Evidence[L"classification_reason"] == L"writevm",
             L"ti-classification-action-risk");
 
+        // Re-present the already-ingested seq=1 record plus a newer seq event.
+        // Sequence cursor must skip seq<=cursor while still accepting the new one,
+        // even if a later synthetic batch reused an older timestamp.
         std::vector<TiEventRecord> repeatedTiEvents;
-        repeatedTiEvents.push_back(MakeTiEvent(1000, 400, 500, L"KERNEL_THREATINT_TASK_ALLOCVM", L"suspect.exe"));
-        AddTiPayloadField(&repeatedTiEvents.back(), L"BaseAddress", L"0x0000000012340000", L"ptr");
-        AddTiPayloadField(&repeatedTiEvents.back(), L"RegionSize", L"8192", L"u64");
-        AddTiPayloadField(&repeatedTiEvents.back(), L"Protection", L"PAGE_EXECUTE_READWRITE", L"u32");
-        AddTiPayloadField(&repeatedTiEvents.back(), L"AllocationType", L"MEM_COMMIT|MEM_RESERVE", L"u32");
+        repeatedTiEvents.push_back(tiEvents[0]); // same Sequence as first ingest
         repeatedTiEvents.push_back(MakeTiEvent(3000, 401, 500, L"KERNEL_THREATINT_TASK_OPENPROCESS", L"tool.exe"));
         TimelineIngestResult tiCursorIngest = store.IngestThreatIntel(repeatedTiEvents, L"recent");
         Check(
@@ -412,6 +414,25 @@ int RunTimelineSelfTest()
             tiAllIngest.SourceRecords == 2 &&
                 tiAllIngest.Added == 0,
             L"ti-all-rescans-ring-with-dedupe");
+
+        // Out-of-order ETW timestamp must not be skipped when Sequence advances.
+        TimelineStore oooStore(1024);
+        std::vector<TiEventRecord> oooFirst;
+        oooFirst.push_back(MakeTiEvent(5000, 410, 500, L"KERNEL_THREATINT_TASK_ALLOCVM", L"ooo.exe"));
+        Check(
+            &context,
+            oooStore.IngestThreatIntel(oooFirst, L"recent").Added == 1,
+            L"ti-ooo-cursor-seed");
+        std::vector<TiEventRecord> oooLate;
+        TiEventRecord late = MakeTiEvent(1000, 411, 500, L"KERNEL_THREATINT_TASK_WRITEVM", L"ooo.exe");
+        oooLate.push_back(late);
+        TimelineIngestResult oooIngest = oooStore.IngestThreatIntel(oooLate, L"recent");
+        Check(
+            &context,
+            oooIngest.SourceRecords == 1 &&
+                oooIngest.Added == 1 &&
+                late.Timestamp < oooFirst[0].Timestamp,
+            L"ti-sequence-cursor-accepts-earlier-timestamp");
 
         TimelineQueryOptions query = {};
         query.Source = L"live";

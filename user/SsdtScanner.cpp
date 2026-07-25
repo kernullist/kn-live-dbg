@@ -204,8 +204,8 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
             //   [1] win32k
             //   [2] filter / optional
             //   [3] unused / optional
-            // Enumerate every non-empty slot without removing the legacy
-            // native + win32k[1] coverage.
+            // Prefer PDB/symbol size for the slot bound; without it, only the
+            // legacy native+win32k slots are trusted and [2]/[3] are marked unverified.
             const bool win32kLoaded = AnyWin32kModuleLoaded(symbols_);
             if (!win32kLoaded)
             {
@@ -213,7 +213,41 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
                     L"win32k modules not loaded; shadow[1] may be empty (other shadow slots still checked)");
             }
 
-            for (uint32_t slot = 0; slot < 4; ++slot)
+            uint32_t shadowSlotCount = 4;
+            bool shadowBoundVerified = false;
+            {
+                std::vector<SymbolMatchInfo> matches;
+                if (symbols_.EnumerateSymbols(L"nt!KeServiceDescriptorTableShadow", 8, &matches, nullptr))
+                {
+                    for (const SymbolMatchInfo& match : matches)
+                    {
+                        if (match.Address == shadowDescriptor && match.Size >= kDescriptorStride)
+                        {
+                            shadowSlotCount = static_cast<uint32_t>(match.Size / kDescriptorStride);
+                            if (shadowSlotCount == 0)
+                            {
+                                shadowSlotCount = 2;
+                            }
+                            if (shadowSlotCount > 4)
+                            {
+                                shadowSlotCount = 4;
+                            }
+                            shadowBoundVerified = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!shadowBoundVerified)
+            {
+                // Without a verified array size, keep legacy [0]/[1] as trusted
+                // coverage and still probe [2]/[3] as optional/unverified.
+                result->Warnings.push_back(
+                    L"KeServiceDescriptorTableShadow array bound unverified; scanning slots [0..3] with "
+                    L"[2]/[3] treated as filter/optional");
+            }
+
+            for (uint32_t slot = 0; slot < shadowSlotCount; ++slot)
             {
                 const uint64_t descriptorAddress =
                     shadowDescriptor + static_cast<uint64_t>(slot) * kDescriptorStride;
@@ -339,8 +373,54 @@ bool SsdtScanner::Scan(SsdtScanResult* result, std::wstring* error)
             }
             else if (!target.Win32k)
             {
-                expectedModule = FindOwningModule(symbols_, tableBase);
-                table.ExpectedModule = expectedModule.empty() ? L"<ntoskrnl>" : expectedModule;
+                // Prefer a fixed ntoskrnl expectation. Deriving expectedModule
+                // from FindOwningModule(tableBase) lets a redirected descriptor
+                // Base inside a clone table make every entry look clean.
+                uint64_t kiServiceTable = 0;
+                const bool haveKiServiceTable =
+                    symbols_.ResolveSymbol(L"nt!KiServiceTable", &kiServiceTable, nullptr) &&
+                    kiServiceTable != 0;
+                const std::wstring tableOwner = FindOwningModule(symbols_, tableBase);
+                const std::wstring ntosOwner =
+                    haveKiServiceTable ? FindOwningModule(symbols_, kiServiceTable) : std::wstring();
+
+                if (haveKiServiceTable && tableBase != kiServiceTable)
+                {
+                    table.Warning =
+                        L"native service table base does not match nt!KiServiceTable (" +
+                        NearestSymbolText(symbols_, tableBase) + L")";
+                    ++table.SuspiciousCount;
+                    ++result->SuspiciousCount;
+                    result->AnySuspicious = true;
+                }
+
+                if (!ntosOwner.empty())
+                {
+                    expectedModule = ntosOwner;
+                }
+                else if (!tableOwner.empty() &&
+                         (EqualsCI(tableOwner, L"ntoskrnl.exe") ||
+                          EqualsCI(tableOwner, L"ntkrnlpa.exe") ||
+                          EqualsCI(tableOwner, L"ntkrnlmp.exe") ||
+                          EqualsCI(tableOwner, L"ntkrpamp.exe")))
+                {
+                    expectedModule = tableOwner;
+                }
+                else
+                {
+                    expectedModule = L"ntoskrnl.exe";
+                    if (!tableOwner.empty() && !EqualsCI(tableOwner, expectedModule))
+                    {
+                        table.Warning =
+                            (table.Warning.empty() ? L"" : table.Warning + L"; ") +
+                            L"native table base owned by " + tableOwner +
+                            L" instead of ntoskrnl";
+                        ++table.SuspiciousCount;
+                        ++result->SuspiciousCount;
+                        result->AnySuspicious = true;
+                    }
+                }
+                table.ExpectedModule = expectedModule;
             }
             else
             {

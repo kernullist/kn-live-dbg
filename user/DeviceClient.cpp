@@ -726,12 +726,21 @@ bool DeviceClient::WriteMemory(uint64_t address, const std::vector<uint8_t>& byt
     return ok;
 }
 
-bool DeviceClient::QueryAddress(uint64_t address, uint32_t length, std::wstring* summary, std::wstring* error)
+bool DeviceClient::QueryAddress(uint64_t address, uint32_t length, AddressQueryInfo* info, std::wstring* error)
 {
     bool ok = false;
 
     do
     {
+        if (info == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid query output";
+            }
+            break;
+        }
+
         if (length == 0 || length > KNDBG_MAX_TRANSFER_SIZE)
         {
             if (error != nullptr)
@@ -740,6 +749,8 @@ bool DeviceClient::QueryAddress(uint64_t address, uint32_t length, std::wstring*
             }
             break;
         }
+
+        *info = AddressQueryInfo{};
 
         KNDBG_ADDRESS_QUERY_REQUEST request = {};
         request.Size = sizeof(request);
@@ -769,20 +780,43 @@ bool DeviceClient::QueryAddress(uint64_t address, uint32_t length, std::wstring*
             break;
         }
 
-        if (summary != nullptr)
-        {
-            std::wstringstream stream;
-            stream << L"address=0x" << std::hex << buffer.Response.Address
-                   << L" readable=" << std::dec << buffer.Response.IsReadable
-                   << L" writable=" << buffer.Response.IsWritable
-                   << L" probed=" << buffer.Response.ProbedLength;
-            *summary = stream.str();
-        }
+        info->Address = buffer.Response.Address;
+        info->RequestedLength = buffer.Response.RequestedLength;
+        info->ProbedLength = buffer.Response.ProbedLength;
+        info->IsReadable = buffer.Response.IsReadable != 0;
+        info->WriteGateEnabled =
+            buffer.Response.IsWritable != 0 ||
+            (buffer.Response.Reserved & KNDBG_ADDRESS_QUERY_RESERVED_WRITE_GATE) != 0;
 
         ok = true;
     } while (false);
 
     return ok;
+}
+
+bool DeviceClient::QueryAddress(uint64_t address, uint32_t length, std::wstring* summary, std::wstring* error)
+{
+    AddressQueryInfo info = {};
+    if (!QueryAddress(address, length, &info, error))
+    {
+        return false;
+    }
+
+    if (summary != nullptr)
+    {
+        std::wstringstream stream;
+        stream << L"address=0x" << std::hex << info.Address
+               << L" readable=" << std::dec << (info.IsReadable ? 1 : 0)
+               << L" write_gate=" << (info.WriteGateEnabled ? 1 : 0)
+               << L" pte_writable=n/a"
+               << L" probed=" << info.ProbedLength
+               << L" requested=" << info.RequestedLength
+               << L" probe_scope=current_as"
+               << L" note=first_byte";
+        *summary = stream.str();
+    }
+
+    return true;
 }
 
 bool DeviceClient::TranslateVirtual(
@@ -866,6 +900,16 @@ bool DeviceClient::TranslateVirtual(
 
 bool DeviceClient::FlushVirtual(uint64_t virtualAddress, uint32_t length, std::wstring* error)
 {
+    return FlushVirtual(virtualAddress, length, 0, 0, error);
+}
+
+bool DeviceClient::FlushVirtual(
+    uint64_t virtualAddress,
+    uint32_t length,
+    uint32_t processId,
+    uint64_t directoryTableBase,
+    std::wstring* error)
+{
     bool ok = false;
 
     do
@@ -883,7 +927,13 @@ bool DeviceClient::FlushVirtual(uint64_t virtualAddress, uint32_t length, std::w
         request.Size = sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST);
         request.VirtualAddress = virtualAddress;
         request.Length = length;
+        request.ProcessId = processId;
         request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
+        request.DirectoryTableBase = directoryTableBase;
+        if (directoryTableBase != 0)
+        {
+            request.Flags |= KNDBG_FLUSH_FLAG_PROCESS_DTB;
+        }
 
         DWORD returned = 0;
         if (!Ioctl(

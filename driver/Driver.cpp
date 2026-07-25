@@ -10,6 +10,30 @@ PsLookupProcessByProcessId(
     HANDLE ProcessId,
     PEPROCESS* Process);
 
+// ntddk alone does not publish KAPC_STATE. Use an opaque, oversized storage
+// block so OS layout drift cannot smash the stack, and declare the exports.
+typedef struct _KAPC_STATE* PKAPC_STATE;
+
+extern "C"
+NTKERNELAPI
+VOID
+KeStackAttachProcess(
+    _Inout_ PRKPROCESS Process,
+    _Out_ PKAPC_STATE ApcState);
+
+extern "C"
+NTKERNELAPI
+VOID
+KeUnstackDetachProcess(
+    _In_ PKAPC_STATE ApcState);
+
+extern "C"
+NTKERNELAPI
+VOID
+KeFlushEntireTb(
+    BOOLEAN Invalid,
+    BOOLEAN AllProcessors);
+
 #if defined(_M_X64)
 #pragma intrinsic(__readcr0)
 #pragma intrinsic(__readcr2)
@@ -18,7 +42,11 @@ PsLookupProcessByProcessId(
 #pragma intrinsic(__readcr8)
 #pragma intrinsic(__invlpg)
 #pragma intrinsic(__readmsr)
+#pragma intrinsic(__writecr3)
 #endif
+
+// CR4.PCIDE enables process-context identifiers in CR3[11:0].
+static const ULONGLONG KNDBG_CR4_PCIDE = 0x20000ull;
 
 typedef struct _KNDBG_FILE_CONTEXT
 {
@@ -84,7 +112,65 @@ typedef struct _KNDBG_TLB_FLUSH_CONTEXT
 {
     ULONGLONG StartAddress;
     SIZE_T PageCount;
+    // Full CR3 value to load before invlpg (includes PCID when PCIDE is on).
+    // 0 = flush against each CPU's current CR3.
+    ULONGLONG Cr3Value;
+    // When TRUE and PCIDE is enabled, also invalidate the VA across all PCIDs
+    // (INVPCID type 2) because only a physical DTB was supplied.
+    BOOLEAN InvalidateAllContexts;
 } KNDBG_TLB_FLUSH_CONTEXT, *PKNDBG_TLB_FLUSH_CONTEXT;
+
+static ULONGLONG KnDbgNormalizeDirectoryTableBase(ULONGLONG DirectoryTableBase)
+{
+    return DirectoryTableBase & KNDBG_PTE_4K_BASE_MASK;
+}
+
+static BOOLEAN KnDbgIsPlausibleDirectoryTableBase(ULONGLONG DirectoryTableBase)
+{
+    const ULONGLONG normalized = KnDbgNormalizeDirectoryTableBase(DirectoryTableBase);
+    // Reject zero and values with non-address junk outside the PFN field after
+    // normalization would still be zero/identity for a page-aligned DTB.
+    if (normalized == 0)
+    {
+        return FALSE;
+    }
+
+    // Allow software bits in [11:0] (PCID / OS flags) but reject non-canonical
+    // high junk above the physical address field.
+    if ((DirectoryTableBase & ~KNDBG_PTE_4K_BASE_MASK & ~0xfffull) != 0)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN KnDbgIsPcideEnabled()
+{
+#if defined(_M_X64)
+    return (__readcr4() & KNDBG_CR4_PCIDE) != 0;
+#else
+    return FALSE;
+#endif
+}
+
+static BOOLEAN KnDbgCpuSupportsInvpcid()
+{
+    int cpuInfo[4] = {};
+    __cpuidex(cpuInfo, 7, 0);
+    // CPUID.(EAX=7,ECX=0):EBX.INVPCID[bit 10]
+    return (cpuInfo[1] & (1 << 10)) != 0;
+}
+
+static void KnDbgInvpcidAllContexts()
+{
+#if defined(_M_X64)
+    // Type 2: all-context invalidation (non-global mappings for every PCID).
+    // Descriptor is ignored; pass zeros.
+    unsigned __int64 descriptor[2] = {};
+    _invpcid(2, descriptor);
+#endif
+}
 
 static NTSTATUS KnDbgCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
@@ -802,10 +888,39 @@ static ULONG_PTR KnDbgFlushVirtualRangeWorker(ULONG_PTR Context)
         }
 
 #if defined(_M_X64)
+        // IPI runs at IPI_LEVEL. Load the caller's CR3 (with PCID when present)
+        // so invlpg hits the same tagged translations the target process uses.
+        ULONGLONG previousCr3 = 0;
+        BOOLEAN switched = FALSE;
+        if (flushContext->Cr3Value != 0)
+        {
+            previousCr3 = __readcr3();
+            if (previousCr3 != flushContext->Cr3Value)
+            {
+                __writecr3(flushContext->Cr3Value);
+                switched = TRUE;
+            }
+        }
+
         for (SIZE_T index = 0; index < flushContext->PageCount; ++index)
         {
             ULONGLONG address = flushContext->StartAddress + index * PAGE_SIZE;
             __invlpg(reinterpret_cast<void*>(static_cast<ULONG_PTR>(address)));
+        }
+
+        if (switched != FALSE)
+        {
+            __writecr3(previousCr3);
+        }
+
+        // Physical-DTB-only flushes cannot recover the live PCID. When PCIDE is
+        // on, broaden invalidation so stale tagged entries cannot retain a
+        // temporary Write-bit view.
+        if (flushContext->InvalidateAllContexts != FALSE &&
+            KnDbgIsPcideEnabled() &&
+            KnDbgCpuSupportsInvpcid())
+        {
+            KnDbgInvpcidAllContexts();
         }
 #endif
     } while (false);
@@ -813,7 +928,11 @@ static ULONG_PTR KnDbgFlushVirtualRangeWorker(ULONG_PTR Context)
     return 0;
 }
 
-static NTSTATUS KnDbgFlushVirtualRange(ULONGLONG VirtualAddress, SIZE_T Length)
+static NTSTATUS KnDbgFlushVirtualRange(
+    ULONGLONG VirtualAddress,
+    SIZE_T Length,
+    ULONGLONG Cr3Value,
+    BOOLEAN InvalidateAllContexts)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
@@ -851,6 +970,8 @@ static NTSTATUS KnDbgFlushVirtualRange(ULONGLONG VirtualAddress, SIZE_T Length)
         KNDBG_TLB_FLUSH_CONTEXT context = {};
         context.StartAddress = startPage;
         context.PageCount = pageCount;
+        context.Cr3Value = Cr3Value;
+        context.InvalidateAllContexts = InvalidateAllContexts;
 
 #if defined(_M_X64)
         KeIpiGenericCall(KnDbgFlushVirtualRangeWorker, reinterpret_cast<ULONG_PTR>(&context));
@@ -1805,14 +1926,21 @@ static NTSTATUS KnDbgHandleQueryAddress(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
         response->Address = request.Address;
         response->RequestedLength = request.Length;
         response->ProbedLength = 0;
+        response->IsReadable = 0;
         response->IsWritable = 0;
+        response->Reserved = 0;
 
+        // IsWritable / Reserved WRITE_GATE = session write mode only.
+        // This is not a PTE.W / page-attribute probe (see user-mode query path).
         PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
         if (fileContext != nullptr && fileContext->WriteEnabled != FALSE)
         {
             response->IsWritable = 1;
+            response->Reserved |= KNDBG_ADDRESS_QUERY_RESERVED_WRITE_GATE;
         }
 
+        // First-byte probe in the *current* address space (typically System).
+        // Process-aware VA probes are performed in user-mode via translate+physical.
         UCHAR scratch = 0;
         SIZE_T copied = 0;
         status = KnDbgReadVirtualAddress(request.Address, &scratch, sizeof(scratch), 0, &copied);
@@ -2013,7 +2141,92 @@ static NTSTATUS KnDbgHandleFlushVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
             break;
         }
 
-        status = KnDbgFlushVirtualRange(request->VirtualAddress, request->Length);
+        ULONGLONG cr3Value = 0;
+        BOOLEAN invalidateAllContexts = FALSE;
+        PEPROCESS process = nullptr;
+        // Oversized opaque APC state: never depend on a re-declared layout.
+        DECLSPEC_ALIGN(16) UCHAR apcStateStorage[128] = {};
+        PKAPC_STATE apcState = reinterpret_cast<PKAPC_STATE>(apcStateStorage);
+        BOOLEAN attached = FALSE;
+
+        if ((request->Flags & KNDBG_FLUSH_FLAG_PROCESS_DTB) != 0)
+        {
+            if (!KnDbgIsPlausibleDirectoryTableBase(request->DirectoryTableBase) &&
+                request->ProcessId == 0)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            // Preferred path: attach to the target process so CR3 includes the
+            // live PCID Windows assigned. That keeps invlpg PCID-correct without
+            // refusing the shared-frame physical write workflow.
+            if (request->ProcessId != 0)
+            {
+                status = PsLookupProcessByProcessId(ULongToHandle(request->ProcessId), &process);
+                if (!NT_SUCCESS(status))
+                {
+                    break;
+                }
+
+                KeStackAttachProcess(reinterpret_cast<PRKPROCESS>(process), apcState);
+                attached = TRUE;
+                cr3Value = __readcr3();
+
+                if (request->DirectoryTableBase != 0)
+                {
+                    const ULONGLONG liveFrame = KnDbgNormalizeDirectoryTableBase(cr3Value);
+                    const ULONGLONG requestedFrame =
+                        KnDbgNormalizeDirectoryTableBase(request->DirectoryTableBase);
+                    if (requestedFrame != 0 && liveFrame != 0 && requestedFrame != liveFrame)
+                    {
+                        // Supplied DTB is a different page-table root than the
+                        // attached CR3 (e.g. user vs kernel DTB). Flush that
+                        // root at PCID 0 and broaden invalidation under PCIDE.
+                        cr3Value = requestedFrame;
+                        invalidateAllContexts = KnDbgIsPcideEnabled() ? TRUE : FALSE;
+                    }
+                }
+            }
+            else
+            {
+                if (!KnDbgIsPlausibleDirectoryTableBase(request->DirectoryTableBase))
+                {
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+
+                cr3Value = KnDbgNormalizeDirectoryTableBase(request->DirectoryTableBase);
+                invalidateAllContexts = KnDbgIsPcideEnabled() ? TRUE : FALSE;
+            }
+        }
+
+        status = KnDbgFlushVirtualRange(
+            request->VirtualAddress,
+            request->Length,
+            cr3Value,
+            invalidateAllContexts);
+
+        // INVPCID may be unavailable on PCIDE systems. Fall back to a full TB
+        // flush at PASSIVE/APC after the IPI returns (never from IPI_LEVEL).
+        if (NT_SUCCESS(status) &&
+            invalidateAllContexts != FALSE &&
+            KnDbgIsPcideEnabled() &&
+            !KnDbgCpuSupportsInvpcid())
+        {
+            KeFlushEntireTb(TRUE, TRUE);
+        }
+
+        if (attached != FALSE)
+        {
+            KeUnstackDetachProcess(apcState);
+        }
+
+        if (process != nullptr)
+        {
+            ObDereferenceObject(process);
+        }
+
         if (NT_SUCCESS(status))
         {
             information = sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST);

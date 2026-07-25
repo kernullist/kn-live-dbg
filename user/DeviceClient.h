@@ -37,6 +37,16 @@ struct DriverSessionStatus
     uint32_t OpenHandleCount;
 };
 
+// Current-AS first-byte probe. WriteGateEnabled is session write mode, not PTE.W.
+struct AddressQueryInfo
+{
+    uint64_t Address = 0;
+    uint32_t RequestedLength = 0;
+    uint32_t ProbedLength = 0;
+    bool IsReadable = false;
+    bool WriteGateEnabled = false;
+};
+
 struct ProcessAddressContext
 {
     uint32_t Flags;
@@ -115,6 +125,7 @@ public:
         std::wstring* error,
         uint32_t flags = 0);
     bool WriteMemory(uint64_t address, const std::vector<uint8_t>& bytes, std::wstring* error);
+    bool QueryAddress(uint64_t address, uint32_t length, AddressQueryInfo* info, std::wstring* error);
     bool QueryAddress(uint64_t address, uint32_t length, std::wstring* summary, std::wstring* error);
     bool TranslateVirtual(
         uint64_t directoryTableBase,
@@ -122,7 +133,15 @@ public:
         uint32_t length,
         PhysicalTranslationInfo* info,
         std::wstring* error);
+    // Flush VA translations. When processId/directoryTableBase are supplied the
+    // driver switches each CPU to that DTB before invlpg (ABI v13+).
     bool FlushVirtual(uint64_t virtualAddress, uint32_t length, std::wstring* error);
+    bool FlushVirtual(
+        uint64_t virtualAddress,
+        uint32_t length,
+        uint32_t processId,
+        uint64_t directoryTableBase,
+        std::wstring* error);
     bool ReadPhysical(uint64_t physicalAddress, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error);
     bool WritePhysical(uint64_t physicalAddress, const std::vector<uint8_t>& bytes, std::wstring* error);
 

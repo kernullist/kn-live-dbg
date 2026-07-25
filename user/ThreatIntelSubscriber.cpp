@@ -572,14 +572,13 @@ void TiSubscriber::OnEventRecord(PEVENT_RECORD eventRecord)
     DecodeEvent(eventRecord, &record);
 
     // Pre-extract the cross-process target so the watch matcher and the
-    // printer never walk the payload again. We skip CallingProcessId
-    // explicitly because it duplicates the caller PID and would mask the
-    // real target.
-    for (const TiPayloadField& f : record.Payload)
+    // printer never walk the payload again. Prefer explicit target-ish field
+    // names; never promote Parent/Source/Creator/Calling PIDs to TargetProcessId.
+    auto FieldNameLower = [](const std::wstring& name) -> std::wstring
     {
         std::wstring lower;
-        lower.reserve(f.Name.size());
-        for (wchar_t c : f.Name)
+        lower.reserve(name.size());
+        for (wchar_t c : name)
         {
             if (c >= L'A' && c <= L'Z')
             {
@@ -587,38 +586,83 @@ void TiSubscriber::OnEventRecord(PEVENT_RECORD eventRecord)
             }
             lower.push_back(c);
         }
-        if (lower.find(L"callingprocessid") != std::wstring::npos)
+        return lower;
+    };
+    auto ParsePidField = [](const TiPayloadField& f) -> uint32_t
+    {
+        if (f.Value.empty() || f.Value[0] == L'<')
         {
-            continue;
+            return 0;
         }
+        const wchar_t* str = f.Value.c_str();
+        int base = 10;
+        if (f.Value.size() >= 2 && f.Value[0] == L'0' &&
+            (f.Value[1] == L'x' || f.Value[1] == L'X'))
+        {
+            base = 16;
+        }
+        wchar_t* end = nullptr;
+        unsigned long long parsed = wcstoull(str, &end, base);
+        if (end == str || parsed == 0 || parsed > 0xFFFFFFFFull)
+        {
+            return 0;
+        }
+        return static_cast<uint32_t>(parsed);
+    };
+    auto IsRejectedTargetName = [](const std::wstring& lower) -> bool
+    {
+        return lower.find(L"callingprocessid") != std::wstring::npos ||
+            lower.find(L"parentprocessid") != std::wstring::npos ||
+            lower.find(L"sourceprocessid") != std::wstring::npos ||
+            lower.find(L"originalprocessid") != std::wstring::npos ||
+            lower.find(L"creatorprocessid") != std::wstring::npos ||
+            lower == L"processid"; // bare ProcessId usually means the caller
+    };
+    auto IsPreferredTargetName = [](const std::wstring& lower) -> bool
+    {
+        return lower == L"targetprocessid" ||
+            lower == L"victimprocessid" ||
+            lower == L"destinationprocessid" ||
+            lower == L"remoteprocessid" ||
+            lower.find(L"targetprocessid") != std::wstring::npos ||
+            lower.find(L"victimprocessid") != std::wstring::npos ||
+            lower.find(L"destinationprocessid") != std::wstring::npos ||
+            lower.find(L"remoteprocessid") != std::wstring::npos;
+    };
+
+    uint32_t preferredTarget = 0;
+    for (const TiPayloadField& f : record.Payload)
+    {
+        const std::wstring lower = FieldNameLower(f.Name);
         if (lower.find(L"processid") == std::wstring::npos)
         {
             continue;
         }
-        uint32_t tpid = 0;
-        if (!f.Value.empty() && f.Value[0] != L'<')
+        if (IsRejectedTargetName(lower))
         {
-            const wchar_t* str = f.Value.c_str();
-            int base = 10;
-            if (f.Value.size() >= 2 && f.Value[0] == L'0' &&
-                (f.Value[1] == L'x' || f.Value[1] == L'X'))
-            {
-                base = 16;
-            }
-            wchar_t* end = nullptr;
-            unsigned long long parsed = wcstoull(str, &end, base);
-            if (end != str && parsed != 0 && parsed <= 0xFFFFFFFFull)
-            {
-                tpid = static_cast<uint32_t>(parsed);
-            }
+            continue;
         }
+        if (!IsPreferredTargetName(lower))
+        {
+            // Ambiguous *ProcessId* names are ignored: wrong victim attribution
+            // is worse than missing target correlation.
+            continue;
+        }
+
+        const uint32_t tpid = ParsePidField(f);
         if (tpid == 0 || tpid == record.ProcessId)
         {
             continue;
         }
-        record.TargetProcessId = tpid;
-        record.TargetImageBase = BasenameLower(GetCachedImageOrResolve(tpid));
+
+        preferredTarget = tpid;
         break;
+    }
+
+    if (preferredTarget != 0)
+    {
+        record.TargetProcessId = preferredTarget;
+        record.TargetImageBase = BasenameLower(GetCachedImageOrResolve(preferredTarget));
     }
 
     RecordKeep(std::move(record));
@@ -940,13 +984,23 @@ void TiSubscriber::RecordKeep(TiEventRecord&& record)
     // Always log to JSONL.
     WriteLogLine(record);
 
-    // Push to ring (newest at back).
+    // Push to ring (newest at back). Assign a monotonic Sequence under the
+    // ring lock so timeline recent cursors can track arrival order instead of
+    // ETW timestamps (which may arrive out of order).
     {
         std::lock_guard<std::mutex> ringLock(RingMutex);
         if (Ring.size() >= Options.RingCapacity)
         {
             Ring.pop_front();
             Stats.EventsDropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (record.Sequence == 0)
+        {
+            record.Sequence = NextRingSequence++;
+            if (NextRingSequence == 0)
+            {
+                NextRingSequence = 1; // skip 0 (0 means "unsequenced")
+            }
         }
         Ring.push_back(record);
         Stats.EventsKept.fetch_add(1, std::memory_order_relaxed);
@@ -1108,6 +1162,31 @@ std::vector<TiEventRecord> TiSubscriber::RecentSince(uint64_t minTimestampInclus
     for (const TiEventRecord& item : Ring)
     {
         if (minTimestampInclusive != 0 && item.Timestamp < minTimestampInclusive)
+        {
+            continue;
+        }
+        out.push_back(item);
+        if (maxCount != 0 && out.size() >= maxCount)
+        {
+            break;
+        }
+    }
+    return out;
+}
+
+std::vector<TiEventRecord> TiSubscriber::RecentAfterSequence(uint64_t minSequenceExclusive, size_t maxCount) const
+{
+    std::vector<TiEventRecord> out;
+    std::lock_guard<std::mutex> lock(RingMutex);
+    for (const TiEventRecord& item : Ring)
+    {
+        if (item.Sequence != 0 && item.Sequence <= minSequenceExclusive)
+        {
+            continue;
+        }
+        // Unsequenced records (Sequence==0) are only returned when the caller
+        // has no cursor yet (minSequenceExclusive==0).
+        if (item.Sequence == 0 && minSequenceExclusive != 0)
         {
             continue;
         }

@@ -173,8 +173,7 @@ namespace
         return ok;
     }
 
-    // Populate page-aligned RVAs that contain base relocation fixups so live
-    // vs disk compares can skip expected loader deltas (same policy as !hunt).
+    // Populate page-aligned RVAs that contain base relocation fixups.
     void CollectRelocationPagesFromDisk(
         HANDLE file,
         const IMAGE_SECTION_HEADER* sections,
@@ -247,11 +246,261 @@ namespace
 
                     const uint32_t fixupRva = block.VirtualAddress + offset;
                     pages->insert(fixupRva & 0xfffff000u);
+                    uint32_t fixupWidth = 0;
+                    if (type == IMAGE_REL_BASED_DIR64)
+                    {
+                        fixupWidth = sizeof(uint64_t);
+                    }
+                    else if (type == IMAGE_REL_BASED_HIGHLOW)
+                    {
+                        fixupWidth = sizeof(uint32_t);
+                    }
+                    if (fixupWidth != 0 &&
+                        ((fixupRva & 0xfffu) + fixupWidth) > 0x1000u)
+                    {
+                        pages->insert((fixupRva & 0xfffff000u) + 0x1000u);
+                    }
                 }
 
                 parsed += block.SizeOfBlock;
             }
         } while (false);
+    }
+
+    bool ApplyIntegerDeltaAcrossPages(
+        std::vector<uint8_t>* pageBytes,
+        std::vector<uint8_t>* nextPageBytes,
+        uint32_t pageOffset,
+        uint32_t width,
+        uint64_t imageDelta,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (pageBytes == nullptr || width == 0 || width > sizeof(uint64_t) ||
+                pageOffset >= pageBytes->size())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid cross-page reloc apply";
+                }
+                break;
+            }
+
+            const uint32_t first = static_cast<uint32_t>(pageBytes->size() - pageOffset);
+            if (first >= width)
+            {
+                uint64_t value = 0;
+                std::memcpy(&value, pageBytes->data() + pageOffset, width);
+                value += imageDelta;
+                std::memcpy(pageBytes->data() + pageOffset, &value, width);
+                ok = true;
+                break;
+            }
+
+            const uint32_t second = width - first;
+            if (nextPageBytes == nullptr || nextPageBytes->size() < second)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"cross-page reloc fixup requires next page bytes";
+                }
+                break;
+            }
+
+            uint8_t raw[8] = {};
+            std::memcpy(raw, pageBytes->data() + pageOffset, first);
+            std::memcpy(raw + first, nextPageBytes->data(), second);
+            uint64_t value = 0;
+            std::memcpy(&value, raw, width);
+            value += imageDelta;
+            std::memcpy(raw, &value, width);
+            std::memcpy(pageBytes->data() + pageOffset, raw, first);
+            std::memcpy(nextPageBytes->data(), raw + first, second);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    // Apply base relocations that land inside [pageRva, pageRva+pageBytes).
+    // Cross-page DIR64/HIGHLOW fixups use nextPageBytes (must hold at least the
+    // spilled tail). Missing next-page storage is a hard failure, not a skip.
+    bool ApplyBaseRelocationsToPage(
+        HANDLE file,
+        const IMAGE_SECTION_HEADER* sections,
+        uint16_t sectionCount,
+        uint32_t relocRva,
+        uint32_t relocSize,
+        uint32_t pageRva,
+        uint64_t imageDelta,
+        std::vector<uint8_t>* pageBytes,
+        std::vector<uint8_t>* nextPageBytes,
+        uint32_t* appliedCount,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (appliedCount != nullptr)
+            {
+                *appliedCount = 0;
+            }
+
+            if (file == INVALID_HANDLE_VALUE ||
+                sections == nullptr ||
+                pageBytes == nullptr ||
+                pageBytes->empty() ||
+                relocRva == 0 ||
+                relocSize < sizeof(IMAGE_BASE_RELOCATION))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid reloc apply inputs";
+                }
+                break;
+            }
+
+            const uint32_t pageEnd = pageRva + static_cast<uint32_t>(pageBytes->size());
+            uint32_t parsed = 0;
+            uint32_t applied = 0;
+            bool failed = false;
+
+            while (parsed + sizeof(IMAGE_BASE_RELOCATION) <= relocSize)
+            {
+                uint32_t blockRaw = 0;
+                if (!MapRvaToRawOffset(sections, sectionCount, relocRva + parsed, &blockRaw))
+                {
+                    failed = true;
+                    if (error != nullptr)
+                    {
+                        *error = L"reloc block RVA map failed";
+                    }
+                    break;
+                }
+
+                IMAGE_BASE_RELOCATION block = {};
+                LARGE_INTEGER seek = {};
+                seek.QuadPart = static_cast<LONGLONG>(blockRaw);
+                DWORD got = 0;
+                if (!SetFilePointerEx(file, seek, nullptr, FILE_BEGIN) ||
+                    !ReadFile(file, &block, sizeof(block), &got, nullptr) ||
+                    got != sizeof(block))
+                {
+                    failed = true;
+                    if (error != nullptr)
+                    {
+                        *error = L"reloc block read failed";
+                    }
+                    break;
+                }
+
+                if (block.VirtualAddress == 0 ||
+                    block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                    parsed + block.SizeOfBlock > relocSize)
+                {
+                    break;
+                }
+
+                const uint32_t entryBytes = block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
+                if (entryBytes == 0)
+                {
+                    parsed += block.SizeOfBlock;
+                    continue;
+                }
+
+                std::vector<uint8_t> entries(entryBytes);
+                if (!ReadFile(file, entries.data(), entryBytes, &got, nullptr) || got != entryBytes)
+                {
+                    failed = true;
+                    if (error != nullptr)
+                    {
+                        *error = L"reloc entry read failed";
+                    }
+                    break;
+                }
+
+                const size_t entryCount = entryBytes / sizeof(uint16_t);
+                for (size_t index = 0; index < entryCount; ++index)
+                {
+                    uint16_t entry = 0;
+                    std::memcpy(&entry, entries.data() + index * sizeof(uint16_t), sizeof(entry));
+                    const uint16_t type = static_cast<uint16_t>(entry >> 12);
+                    const uint16_t offset = static_cast<uint16_t>(entry & 0x0fffu);
+                    if (type == IMAGE_REL_BASED_ABSOLUTE)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t fixupRva = block.VirtualAddress + offset;
+                    if (fixupRva < pageRva || fixupRva >= pageEnd)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t pageOffset = fixupRva - pageRva;
+                    uint32_t width = 0;
+                    if (type == IMAGE_REL_BASED_DIR64)
+                    {
+                        width = sizeof(uint64_t);
+                    }
+                    else if (type == IMAGE_REL_BASED_HIGHLOW)
+                    {
+                        width = sizeof(uint32_t);
+                    }
+                    else
+                    {
+                        failed = true;
+                        if (error != nullptr)
+                        {
+                            *error = L"unsupported reloc type in compared page";
+                        }
+                        break;
+                    }
+
+                    std::wstring applyError;
+                    if (!ApplyIntegerDeltaAcrossPages(
+                            pageBytes,
+                            nextPageBytes,
+                            pageOffset,
+                            width,
+                            imageDelta,
+                            &applyError))
+                    {
+                        failed = true;
+                        if (error != nullptr)
+                        {
+                            *error = applyError;
+                        }
+                        break;
+                    }
+                    ++applied;
+                }
+
+                if (failed)
+                {
+                    break;
+                }
+
+                parsed += block.SizeOfBlock;
+            }
+
+            if (failed)
+            {
+                break;
+            }
+
+            if (appliedCount != nullptr)
+            {
+                *appliedCount = applied;
+            }
+            ok = true;
+        } while (false);
+
+        return ok;
     }
 
     uint64_t DecodeInteger(const uint8_t* bytes, size_t width)
@@ -1681,8 +1930,8 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                             }
 
                             uint64_t optionalEnd = 0;
-                            // Survives the optional-header block so /disk compare can skip
-                            // basereloc fixup pages after optional goes out of scope.
+                            // Survives the optional-header block so /disk compare can
+                            // reloc-normalize pages after optional goes out of scope.
                             uint32_t baserelocRva = 0;
                             uint32_t baserelocSize = 0;
                             if (!TryAdd(optionalHeaderOffset, optionalHeaderSize, &optionalEnd) ||
@@ -1865,8 +2114,8 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                     reinterpret_cast<const IMAGE_SECTION_HEADER*>(headerBytes.data() + sectionTable);
 
                                 // Optional live-vs-disk compare: open once per module and
-                                // collect basereloc page RVAs so relocated fixup pages are
-                                // not reported as false-positive stomps.
+                                // collect basereloc page RVAs so those pages can be
+                                // reloc-normalized before compare (not skipped).
                                 HANDLE diskCompareFile = INVALID_HANDLE_VALUE;
                                 std::set<uint32_t> relocPages;
                                 bool diskCompareFileReady = false;
@@ -2127,43 +2376,46 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                         }
                                         else
                                         {
+                                            const uint64_t pageSpan =
+                                                (span > 0) ? (span / 0x1000) : 0;
+                                            std::set<uint32_t> sampledOffsets;
+                                            uint32_t comparedPages = 0;
+                                            uint32_t relocNormalizedPages = 0;
+                                            uint32_t relocApplyFailures = 0;
+
                                             for (uint32_t pageIndex = 0; pageIndex < pageCount; ++pageIndex)
                                             {
-                                                uint32_t pageRvaOffset = 0;
-                                                if (pageIndex == 0)
+                                                if (pageSpan == 0)
                                                 {
-                                                    pageRvaOffset = 0;
+                                                    break;
                                                 }
-                                                else if (span > 0x1000)
+
+                                                uint64_t pageSlot = 0;
+                                                if (pageCount == 1 || pageSpan == 1)
                                                 {
-                                                    pageRvaOffset = static_cast<uint32_t>(
-                                                        ((span / 0x1000) / 2) * 0x1000);
-                                                    if (pageRvaOffset >= span)
-                                                    {
-                                                        pageRvaOffset = 0x1000;
-                                                    }
+                                                    pageSlot = 0;
                                                 }
                                                 else
                                                 {
-                                                    break;
+                                                    pageSlot =
+                                                        (static_cast<uint64_t>(pageIndex) * (pageSpan - 1ull)) /
+                                                        static_cast<uint64_t>(pageCount - 1u);
                                                 }
 
-                                                if (pageRvaOffset >= section.RawSize)
-                                                {
-                                                    break;
-                                                }
-
-                                                const uint32_t pageRva =
-                                                    (section.VirtualAddress + pageRvaOffset) & 0xfffff000u;
-                                                // Skip pages that the loader rewrites via basereloc when
-                                                // the image is not at its preferred base. Same policy as
-                                                // !hunt deep page compare -- avoids relocated-module FN.
-                                                if (record.ImageBaseMismatch &&
-                                                    relocPages.find(pageRva) != relocPages.end())
+                                                const uint32_t pageRvaOffset =
+                                                    static_cast<uint32_t>(pageSlot * 0x1000ull);
+                                                if (!sampledOffsets.insert(pageRvaOffset).second)
                                                 {
                                                     continue;
                                                 }
 
+                                                if (pageRvaOffset >= section.RawSize || pageRvaOffset >= span)
+                                                {
+                                                    continue;
+                                                }
+
+                                                const uint32_t pageRva =
+                                                    (section.VirtualAddress + pageRvaOffset) & 0xfffff000u;
                                                 const uint32_t fileOffset = section.PointerToRawData + pageRvaOffset;
                                                 const uint32_t readLen = static_cast<uint32_t>(
                                                     (section.RawSize - pageRvaOffset) < 0x1000
@@ -2171,7 +2423,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                         : 0x1000);
                                                 if (readLen == 0)
                                                 {
-                                                    break;
+                                                    continue;
                                                 }
 
                                                 LARGE_INTEGER seek = {};
@@ -2199,6 +2451,76 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     break;
                                                 }
 
+                                                if (record.ImageBaseMismatch &&
+                                                    relocPages.find(pageRva) != relocPages.end() &&
+                                                    baserelocRva != 0 &&
+                                                    baserelocSize != 0 &&
+                                                    record.PreferredImageBase != 0)
+                                                {
+                                                    const uint64_t imageDelta =
+                                                        module.Base - record.PreferredImageBase;
+                                                    // Prefetch next page prefix so DIR64/HIGHLOW fixups
+                                                    // that spill past this page are not silently skipped.
+                                                    std::vector<uint8_t> diskNextPage;
+                                                    if (pageRvaOffset + readLen < section.RawSize)
+                                                    {
+                                                        const uint32_t nextLen = static_cast<uint32_t>(
+                                                            (section.RawSize - (pageRvaOffset + readLen)) < 0x1000
+                                                                ? (section.RawSize - (pageRvaOffset + readLen))
+                                                                : 0x1000);
+                                                        if (nextLen != 0)
+                                                        {
+                                                            LARGE_INTEGER nextSeek = {};
+                                                            nextSeek.QuadPart = static_cast<LONGLONG>(
+                                                                fileOffset + readLen);
+                                                            DWORD nextGot = 0;
+                                                            diskNextPage.resize(nextLen);
+                                                            if (!SetFilePointerEx(
+                                                                    diskCompareFile,
+                                                                    nextSeek,
+                                                                    nullptr,
+                                                                    FILE_BEGIN) ||
+                                                                !ReadFile(
+                                                                    diskCompareFile,
+                                                                    diskNextPage.data(),
+                                                                    nextLen,
+                                                                    &nextGot,
+                                                                    nullptr) ||
+                                                                nextGot != nextLen)
+                                                            {
+                                                                diskNextPage.clear();
+                                                            }
+                                                        }
+                                                    }
+
+                                                    uint32_t applied = 0;
+                                                    std::wstring relocError;
+                                                    if (!ApplyBaseRelocationsToPage(
+                                                            diskCompareFile,
+                                                            sections,
+                                                            record.NumberOfSections,
+                                                            baserelocRva,
+                                                            baserelocSize,
+                                                            pageRva,
+                                                            imageDelta,
+                                                            &diskPage,
+                                                            diskNextPage.empty() ? nullptr : &diskNextPage,
+                                                            &applied,
+                                                            &relocError))
+                                                    {
+                                                        ++relocApplyFailures;
+                                                        AddSectionReason(
+                                                            &section,
+                                                            L"disk_compare_reloc_apply_failed",
+                                                            relocError.empty()
+                                                                ? L"failed to apply base relocations to disk page"
+                                                                : relocError);
+                                                        // Do not treat as match; keep scanning other pages.
+                                                        continue;
+                                                    }
+                                                    ++relocNormalizedPages;
+                                                }
+
                                                 uint64_t liveAddress = 0;
                                                 if (!TryAdd(module.Base, section.VirtualAddress, &liveAddress) ||
                                                     !TryAdd(liveAddress, pageRvaOffset, &liveAddress))
@@ -2220,6 +2542,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     break;
                                                 }
 
+                                                ++comparedPages;
                                                 if (memcmp(livePage.data(), diskPage.data(), readLen) != 0)
                                                 {
                                                     section.DiskCompareMismatch = true;
@@ -2227,25 +2550,39 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     AddSectionReason(
                                                         &section,
                                                         L"disk_live_page_mismatch",
-                                                        L"live executable page differs from on-disk PE raw data");
+                                                        L"live executable page differs from reloc-normalized on-disk PE data");
                                                     break;
                                                 }
 
                                                 section.DiskCompareMatched = true;
                                             }
 
-                                            // If every sample page was a reloc skip, do not leave the
-                                            // section looking like a failed compare with no outcome.
-                                            if (!section.DiskCompareMismatch &&
-                                                !section.DiskCompareFailed &&
-                                                !section.DiskCompareMatched &&
-                                                record.ImageBaseMismatch &&
-                                                !relocPages.empty())
+                                            if (relocApplyFailures != 0 &&
+                                                !section.DiskCompareMismatch &&
+                                                !section.DiskCompareMatched)
+                                            {
+                                                section.DiskCompareFailed = true;
+                                                result->Warnings.push_back(
+                                                    record.ImageName +
+                                                    L": disk compare coverage incomplete (reloc apply failures=" +
+                                                    std::to_wstring(relocApplyFailures) + L")");
+                                            }
+                                            else if (comparedPages == 0 &&
+                                                     !section.DiskCompareMismatch &&
+                                                     !section.DiskCompareFailed)
+                                            {
+                                                section.DiskCompareFailed = true;
+                                                AddSectionReason(
+                                                    &section,
+                                                    L"disk_compare_no_pages",
+                                                    L"no executable pages were compared");
+                                            }
+                                            else if (relocNormalizedPages != 0)
                                             {
                                                 AddSectionReason(
                                                     &section,
-                                                    L"disk_compare_reloc_skipped",
-                                                    L"sampled executable pages only contain expected base relocation fixups");
+                                                    L"disk_compare_reloc_normalized",
+                                                    L"compared pages after applying base relocation deltas to disk bytes");
                                             }
                                         }
                                     }

@@ -25,6 +25,9 @@ struct TiPayloadField
 
 struct TiEventRecord
 {
+    // Monotonic ring arrival id (assigned in RecordKeep). Used by timeline
+    // recent-mode cursor so out-of-order ETW timestamps are not skipped.
+    uint64_t Sequence = 0;
     uint64_t Timestamp = 0;       // FILETIME (100-ns ticks since 1601 UTC)
     uint32_t ProcessId = 0;
     uint32_t ThreadId = 0;
@@ -122,6 +125,9 @@ public:
     // Chronological events with Timestamp >= minTimestampInclusive.
     // maxCount == 0 means unlimited after the timestamp filter.
     std::vector<TiEventRecord> RecentSince(uint64_t minTimestampInclusive, size_t maxCount) const;
+    // Chronological events with Sequence > minSequenceExclusive (preferred
+    // for timeline recent ingest; avoids timestamp-reorder skips).
+    std::vector<TiEventRecord> RecentAfterSequence(uint64_t minSequenceExclusive, size_t maxCount) const;
     std::vector<TiEventRecord> FilterByPid(uint32_t pid, size_t maxCount) const;
     std::vector<TiEventRecord> FilterByTask(const std::wstring& taskName, size_t maxCount) const;
     std::vector<TiEventRecord> Grep(const std::wstring& pattern, size_t maxCount) const;
@@ -200,6 +206,8 @@ private:
     // Ring buffer (mutex-protected; deque keeps insertion order).
     mutable std::mutex RingMutex;
     std::deque<TiEventRecord> Ring;
+    // Never reset on Clear(): timeline cursors remain valid across ring wipes.
+    uint64_t NextRingSequence = 1;
 
     // Print queue (bounded, drained by '!ti watch' polling).
     mutable std::mutex PrintMutex;

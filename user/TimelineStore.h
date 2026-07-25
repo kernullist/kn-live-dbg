@@ -56,7 +56,10 @@ public:
 
     // TI recent-mode cursor for callers that want to pull only unprocessed
     // ring records instead of cloning the entire TI ring every update.
+    // Prefer GetTiRecentCursorSequence; timestamp is retained for display /
+    // legacy unsequenced records.
     uint64_t GetTiRecentCursorTimestamp(bool* initialized) const;
+    uint64_t GetTiRecentCursorSequence(bool* initialized) const;
 
 private:
     bool AddEventLocked(TimelineEvent event);
@@ -70,7 +73,8 @@ private:
     uint64_t NextEventId = 1;
     uint64_t DroppedEvents = 0;
     bool TiRecentCursorInitialized = false;
-    uint64_t TiRecentCursorTimestamp = 0;
-    std::set<std::wstring> TiRecentCursorBoundaryKeys;
+    uint64_t TiRecentCursorSequence = 0; // last ingested ring Sequence
+    uint64_t TiRecentCursorTimestamp = 0; // last ingested timestamp (display/legacy)
+    std::set<std::wstring> TiRecentCursorBoundaryKeys; // legacy Timestamp==cursor keys
     size_t MaxEvents = 262144;
 };

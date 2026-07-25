@@ -50,7 +50,12 @@ struct PoolScanResult
     uint64_t MatchingCount = 0;       // entries kept after filtering
     uint64_t QueryBufferBytes = 0;
     uint32_t QueryRetries = 0;
-    uint64_t TagStatCount = 0;
+    uint64_t TagStatCount = 0;           // kernel Count from SystemPoolTagInformation
+    uint64_t TagStatsMatchingCount = 0;  // after tag filter, before top-N truncate
+    uint64_t TagStatsReturned = 0;       // TagStats.size() after truncate
+    uint64_t TagStatsSafeCount = 0;
+    bool     TagStatsTruncated = false;
+    bool     TagStatsBufferClamped = false;
     std::vector<std::wstring> Diagnostics;
     std::vector<std::wstring> Warnings;
     bool     PrivilegeEnabled = false;

@@ -225,6 +225,10 @@ struct ProcessThreadScanResult
     uint64_t ApcNonEmptyCount = 0;
     uint64_t StackReferenceCount = 0;
     bool Truncated = false;
+    // True when the walk stopped early due to poisoned links, cycles, or
+    // unreadable entries (not a clean complete thread inventory).
+    bool Incomplete = false;
+    bool CoverageComplete = true;
     std::wstring LayoutSource;
 };
 
