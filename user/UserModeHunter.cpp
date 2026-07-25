@@ -6225,6 +6225,159 @@ namespace
         return high;
     }
 
+    // Annotate processes with PspCidTable presence via driver ResolveProcess
+    // (PsLookupProcessByProcessId). Does not replace other views; only fills
+    // HasCidTableView/CidTableSeen and missing EPROCESS/DTB when lookup works.
+    bool ApplyCidTableLookupView(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        std::map<uint32_t, HuntProcessRecord>* processes,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (processes == nullptr)
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"cid table view: invalid process map";
+                }
+                break;
+            }
+
+            if (!device.IsOpen())
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"cid table view unavailable: driver device is not open";
+                }
+                break;
+            }
+
+            if (symbols.Modules().empty())
+            {
+                std::wstring loadError;
+                if (!symbols.LoadKernelModules(&loadError))
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning = L"cid table view unavailable: " + loadError;
+                    }
+                    break;
+                }
+            }
+
+            TypeFieldInfo dtbField = {};
+            std::wstring fieldError;
+            if (!symbols.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &fieldError))
+            {
+                // Nested path used on some PDB views.
+                if (!symbols.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &fieldError) &&
+                    !FindFieldRecursive(
+                        symbols,
+                        {L"nt!_EPROCESS", L"_EPROCESS", L"nt!_KPROCESS", L"_KPROCESS"},
+                        L"DirectoryTableBase",
+                        &dtbField,
+                        &fieldError))
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning = L"cid table view unavailable: DirectoryTableBase offset unresolved: " + fieldError;
+                    }
+                    break;
+                }
+            }
+
+            if (dtbField.Offset == 0 || dtbField.Offset > 0x4000)
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"cid table view unavailable: DirectoryTableBase offset out of range";
+                }
+                break;
+            }
+
+            TypeFieldInfo userDtbField = {};
+            uint32_t userDtbOffset = 0;
+            if (symbols.FindField(L"nt!_KPROCESS", L"UserDirectoryTableBase", &userDtbField, nullptr) ||
+                FindFieldRecursive(
+                    symbols,
+                    {L"nt!_EPROCESS", L"_EPROCESS", L"nt!_KPROCESS", L"_KPROCESS"},
+                    L"UserDirectoryTableBase",
+                    &userDtbField,
+                    nullptr))
+            {
+                if (userDtbField.Offset != 0 && userDtbField.Offset <= 0x4000)
+                {
+                    userDtbOffset = static_cast<uint32_t>(userDtbField.Offset);
+                }
+            }
+
+            uint32_t lookedUp = 0;
+            uint32_t present = 0;
+            for (auto& item : *processes)
+            {
+                const uint32_t pid = item.first;
+                if (pid == 0)
+                {
+                    continue;
+                }
+
+                HuntProcessRecord& process = item.second;
+                process.HasCidTableView = true;
+                ++lookedUp;
+
+                ProcessAddressContext ctx = {};
+                std::wstring resolveError;
+                if (device.ResolveProcess(
+                        pid,
+                        static_cast<uint32_t>(dtbField.Offset),
+                        userDtbOffset,
+                        &ctx,
+                        &resolveError))
+                {
+                    process.CidTableSeen = true;
+                    ++present;
+                    // Fill missing kernel identity without overwriting a
+                    // stronger ActiveProcessLinks inventory record.
+                    if (process.Kernel.Eprocess == 0)
+                    {
+                        process.Kernel.Eprocess = ctx.Eprocess;
+                    }
+                    if (process.Kernel.ProcessId == 0)
+                    {
+                        process.Kernel.ProcessId = pid;
+                    }
+                    if (process.Kernel.DirectoryTableBase == 0 && ctx.DirectoryTableBase != 0)
+                    {
+                        process.Kernel.DirectoryTableBase = ctx.DirectoryTableBase;
+                    }
+                    if (process.Kernel.UserDirectoryTableBase == 0 && ctx.UserDirectoryTableBase != 0)
+                    {
+                        process.Kernel.UserDirectoryTableBase = ctx.UserDirectoryTableBase;
+                    }
+                }
+                else
+                {
+                    process.CidTableSeen = false;
+                }
+            }
+
+            if (warning != nullptr)
+            {
+                *warning =
+                    L"cid table lookup view: looked_up=" + std::to_wstring(lookedUp) +
+                    L" present=" + std::to_wstring(present) +
+                    L" (via PsLookupProcessByProcessId / PspCidTable)";
+            }
+            ok = lookedUp != 0;
+        } while (false);
+
+        return ok;
+    }
+
     void AddProcessViewFindings(HuntResult* result, const HuntProcessRecord& process)
     {
         do
@@ -6273,20 +6426,35 @@ namespace
                     evidence);
             }
             else if (!process.ActiveProcessLinksSeen &&
-                     process.SystemProcessInformationSeen &&
-                     process.ToolhelpProcessSeen)
+                     (process.SystemProcessInformationSeen || process.ToolhelpProcessSeen))
             {
-                evidence[L"snapshot_race_possible"] = L"true";
+                const bool cidConfirms =
+                    process.HasCidTableView && process.CidTableSeen;
+                evidence[L"snapshot_race_possible"] = cidConfirms ? L"false" : L"true";
+                if (cidConfirms)
+                {
+                    evidence[L"cid_lookup"] = L"present";
+                }
+                std::vector<std::wstring> reasons = {
+                    L"api_only_process",
+                    L"missing_from_active_process_links"};
+                if (cidConfirms)
+                {
+                    reasons.push_back(L"cid_table_present");
+                    reasons.push_back(L"possible_activeprocesslinks_unlink");
+                }
                 AddFinding(
                     result,
                     process,
-                    L"low",
-                    L"low",
+                    cidConfirms ? L"medium" : L"low",
+                    cidConfirms ? L"medium" : L"low",
                     L"process_cross_view",
-                    L"process is visible through user API views but missing from ActiveProcessLinks",
+                    cidConfirms
+                        ? L"process is visible to user APIs and CID table but missing from ActiveProcessLinks"
+                        : L"process is visible through user API views but missing from ActiveProcessLinks",
                     0,
                     L"",
-                    {L"api_only_process", L"missing_from_active_process_links"},
+                    reasons,
                     evidence);
             }
             else if (process.ActiveProcessLinksSeen &&
@@ -10547,7 +10715,6 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         result->ModeText = HuntModeToText(options.Mode);
         result->ThreatIntelActive = options.ThreatIntelActive;
         result->ThreatIntelAvailable = options.ThreatIntelAvailable || !options.ThreatIntelEvents.empty();
-        result->Warnings.push_back(L"PspCidTable process-object cross-view is not implemented; cid_table_seen is null");
         result->Warnings.push_back(L"builtin process signer verification is not implemented; publisher evidence unavailable");
 
         std::map<uint32_t, HuntProcessRecord> processes;
@@ -10620,6 +10787,19 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     process.ParentImageName = BestProcessImageName(parent->second);
                 }
             }
+        }
+
+        // PspCidTable cross-view via driver ResolveProcess (PsLookupProcessByProcessId).
+        // This does not remove any prior views; it only annotates CidTableSeen and
+        // may fill missing EPROCESS/DTB for API-visible processes still in the CID table.
+        warning.clear();
+        if (!ApplyCidTableLookupView(device_, symbols_, &processes, &warning) && !warning.empty())
+        {
+            result->Warnings.push_back(warning);
+        }
+        else if (!warning.empty())
+        {
+            result->Warnings.push_back(warning);
         }
 
         ProcessTriageScanner triage(device_, symbols_);
