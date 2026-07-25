@@ -2590,6 +2590,16 @@ size_t TimelineStore::Capacity() const
     return MaxEvents;
 }
 
+uint64_t TimelineStore::GetTiRecentCursorTimestamp(bool* initialized) const
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    if (initialized != nullptr)
+    {
+        *initialized = TiRecentCursorInitialized;
+    }
+    return TiRecentCursorTimestamp;
+}
+
 uint64_t TimelineStore::Dropped() const
 {
     std::lock_guard<std::mutex> lock(Mutex);

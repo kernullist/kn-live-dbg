@@ -2883,6 +2883,7 @@ static bool IsNativeOwnedCommand(const std::wstring& command)
             command == L"kd" ||
             command == L"log" ||
             command == L"mcp" ||
+            command == L"query" ||
             command == L"home" ||
             command == L"dashboard" ||
             command == L"cls" ||
@@ -8919,27 +8920,22 @@ static bool WriteProcessVirtualMemory(
                     break;
                 }
 
-                if ((leaf.Value & KNDBG_X64_PTE_COPY_ON_WRITE) != 0)
+                // Do not refuse CoW leaves: EXE/DLL code is commonly mapped
+                // PAGE_EXECUTE_WRITECOPY (valid PTE with CoW bit), and refusing
+                // that path breaks the normal game/cheat patch workflow that
+                // already relied on temporary Write-bit flip + physical write.
+                // Surface the shared-frame semantics once, then proceed.
+                if (!warnedReadonlyUserPhysical &&
+                    (((leaf.Value & KNDBG_X64_PTE_WRITE) == 0) ||
+                     ((leaf.Value & KNDBG_X64_PTE_COPY_ON_WRITE) != 0)))
                 {
-                    if (error != nullptr)
-                    {
-                        *error = L"refusing user write through Copy-on-Write PTE va=" +
-                            HexTextWidth(current, 16, true) +
-                            L" leaf-pa=" + HexTextWidth(leaf.PhysicalAddress, 16, true) +
-                            L": physical write would modify the shared frame without a private break";
-                    }
-                    break;
-                }
-
-                if ((leaf.Value & KNDBG_X64_PTE_WRITE) == 0 && !warnedReadonlyUserPhysical)
-                {
-                    // R/O but not CoW (e.g. image .text). Still a shared-frame
-                    // risk if the PFN is multi-mapped; surface the semantics so
-                    // operators know this is not a private CoW break.
-                    std::wcerr << L"write warning: read-only user page(s) starting va="
+                    std::wcerr << L"write warning: user page va="
                                << HexTextWidth(current, 16, true)
-                               << L" will be patched via temporary Write-bit flip + physical write; "
-                               << L"shared image/DLL frames may change globally\n";
+                               << L" will be patched via temporary Write-bit flip + physical write"
+                               << (((leaf.Value & KNDBG_X64_PTE_COPY_ON_WRITE) != 0)
+                                       ? L" (CoW PTE; no private break)"
+                                       : L" (R/O PTE)")
+                               << L"; shared image/DLL frames may change globally\n";
                     warnedReadonlyUserPhysical = true;
                 }
             }
@@ -18931,9 +18927,15 @@ static void RefreshTimelineDashboardEvidence(
     TiSubscriber& ti = GetTiSubscriberInstance();
     TiSubscriberStats tiStats = ti.SnapshotStats();
     bool tiActive = ti.IsActive();
-    // Walk the full ring chronologically; maxAdd caps newly added events and
-    // keeps the recent cursor from skipping unprocessed older records.
-    std::vector<TiEventRecord> tiEvents = ti.Recent(0, false);
+    // Pull only records at/after the TI recent cursor so a 1M ring is not
+    // cloned on every dashboard refresh. maxAdd still caps added events and
+    // the cursor only advances through processed records.
+    bool cursorInitialized = false;
+    const uint64_t cursorTs = state.Timeline.GetTiRecentCursorTimestamp(&cursorInitialized);
+    const size_t fetchCap = KNDBG_TIMELINE_DASHBOARD_MAX_EVENTS + 256;
+    std::vector<TiEventRecord> tiEvents = ti.RecentSince(
+        cursorInitialized ? cursorTs : 0,
+        fetchCap);
     TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(
         tiEvents,
         L"recent",
@@ -19365,7 +19367,19 @@ static void HandleTimelineCommand(
             }
 
             TiSubscriber& sub = GetTiSubscriberInstance();
-            std::vector<TiEventRecord> tiEvents = sub.Recent(0, false);
+            std::vector<TiEventRecord> tiEvents;
+            if (ToLower(update.Mode) == L"all")
+            {
+                // Full rescan of the current ring window (capped by Limit).
+                tiEvents = sub.Recent(update.Limit == 0 ? 0 : update.Limit, false);
+            }
+            else
+            {
+                bool cursorInitialized = false;
+                const uint64_t cursorTs = state.Timeline.GetTiRecentCursorTimestamp(&cursorInitialized);
+                const size_t fetchCap = update.Limit == 0 ? 0 : (update.Limit + 256);
+                tiEvents = sub.RecentSince(cursorInitialized ? cursorTs : 0, fetchCap);
+            }
             TimelineIngestResult tiResult = state.Timeline.IngestThreatIntel(
                 tiEvents,
                 update.Mode,
@@ -19799,7 +19813,18 @@ static void HandleTimelineCommand(
                 }
 
                 TiSubscriber& sub = GetTiSubscriberInstance();
-                std::vector<TiEventRecord> events = sub.Recent(0, false);
+                std::vector<TiEventRecord> events;
+                if (ToLower(mode) == L"all")
+                {
+                    events = sub.Recent(limit == 0 ? 0 : limit, false);
+                }
+                else
+                {
+                    bool cursorInitialized = false;
+                    const uint64_t cursorTs = state.Timeline.GetTiRecentCursorTimestamp(&cursorInitialized);
+                    const size_t fetchCap = limit == 0 ? 0 : (limit + 256);
+                    events = sub.RecentSince(cursorInitialized ? cursorTs : 0, fetchCap);
+                }
                 TimelineIngestResult result = state.Timeline.IngestThreatIntel(events, mode, limit);
                 PrintTimelineIngestResult(L"ti", result);
                 if (structuredJsonOut != nullptr)
