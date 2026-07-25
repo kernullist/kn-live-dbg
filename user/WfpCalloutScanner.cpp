@@ -221,9 +221,14 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
         uint64_t globalSymbol = 0;
         if (!symbols_.ResolveSymbol(L"netio!gWfpGlobal", &globalSymbol, nullptr) || globalSymbol == 0)
         {
+            result->Resolved = false;
+            result->CoverageComplete = false;
+            result->Incomplete = true;
             result->Warnings.push_back(
                 L"netio!gWfpGlobal not resolved; netio.sys private/public symbols are required for kernel callout walking");
-            ok = true; // not a hard error: report cleanly that we could not resolve
+            result->Warnings.push_back(
+                L"coverage incomplete: kernel callout table was not walked (not a clean empty result)");
+            ok = true; // soft failure: operator sees unresolved, not a crash
             break;
         }
         result->GlobalSymbol = globalSymbol;
@@ -304,8 +309,13 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
 
         if (bestScore < 0.8 || bestArray == 0)
         {
+            result->Resolved = false;
+            result->CoverageComplete = false;
+            result->Incomplete = true;
             result->Warnings.push_back(
                 L"could not locate a plausible WFP callout array from gWfpGlobal; netio.sys layout may have drifted (offsets need RE refinement on this build)");
+            result->Warnings.push_back(
+                L"coverage incomplete: kernel callout table was not walked (not a clean empty result)");
             ok = true;
             break;
         }
@@ -327,6 +337,7 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
         if (walkBytes > kMaxWalkBytes)
         {
             walkCount = kMaxWalkBytes / bestLayout.EntrySize;
+            result->Incomplete = true;
             result->Warnings.push_back(L"callout count exceeds single-read bound; walk truncated");
         }
 
@@ -334,7 +345,11 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
         uint32_t bufferBytes = walkCount * bestLayout.EntrySize;
         if (!device_.ReadMemory(bestArray, bufferBytes, &buffer, nullptr) || buffer.size() != bufferBytes)
         {
+            result->CoverageComplete = false;
+            result->Incomplete = true;
             result->Warnings.push_back(L"failed to read the full callout array");
+            result->Warnings.push_back(
+                L"coverage incomplete: layout resolved but array bytes were not readable");
             ok = true;
             break;
         }
@@ -368,13 +383,47 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
                 result->AnySuspicious = true;
             }
 
-            if (callout.NotifyFn != 0 && IsKernelAddress(callout.NotifyFn))
+            if (callout.NotifyFn != 0)
             {
-                callout.NotifyModule = FindOwningModule(symbols_, callout.NotifyFn);
+                if (IsKernelAddress(callout.NotifyFn))
+                {
+                    callout.NotifyModule = FindOwningModule(symbols_, callout.NotifyFn);
+                }
+                if (!IsKernelAddress(callout.NotifyFn) || callout.NotifyModule.empty())
+                {
+                    callout.NotifySuspicious = true;
+                    if (callout.Notes.empty())
+                    {
+                        callout.Notes = L"notify function outside loaded kernel modules";
+                    }
+                    else
+                    {
+                        callout.Notes += L"; notify outside loaded modules";
+                    }
+                    ++result->SuspiciousCount;
+                    result->AnySuspicious = true;
+                }
             }
-            if (callout.FlowDeleteFn != 0 && IsKernelAddress(callout.FlowDeleteFn))
+            if (callout.FlowDeleteFn != 0)
             {
-                callout.FlowDeleteModule = FindOwningModule(symbols_, callout.FlowDeleteFn);
+                if (IsKernelAddress(callout.FlowDeleteFn))
+                {
+                    callout.FlowDeleteModule = FindOwningModule(symbols_, callout.FlowDeleteFn);
+                }
+                if (!IsKernelAddress(callout.FlowDeleteFn) || callout.FlowDeleteModule.empty())
+                {
+                    callout.FlowDeleteSuspicious = true;
+                    if (callout.Notes.empty())
+                    {
+                        callout.Notes = L"flowDelete function outside loaded kernel modules";
+                    }
+                    else
+                    {
+                        callout.Notes += L"; flowDelete outside loaded modules";
+                    }
+                    ++result->SuspiciousCount;
+                    result->AnySuspicious = true;
+                }
             }
 
             auto it = metadata.find(i);
@@ -389,6 +438,7 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
             result->Callouts.push_back(std::move(callout));
         }
 
+        result->CoverageComplete = !result->Incomplete;
         ok = true;
     } while (false);
 

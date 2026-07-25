@@ -12142,14 +12142,24 @@ static void HandleWfpKernelCalloutsCommand(
 
         if (!result.Resolved)
         {
-            std::wcout << L"wfp kernel callouts: unresolved (netio.sys layout could not be located; see warnings)\n";
+            PrintColoredText(L"wfp kernel callouts", KNDBG_COLOR_WARN);
+            std::wcout << L" resolved=no coverage_complete=no incomplete=yes"
+                       << L" callouts=" << std::dec << result.Callouts.size()
+                       << L"\n";
+            std::wcout << L"  verdict: incomplete_coverage (not a clean empty callout table)\n";
+            std::wcout << L"  reason: netio.sys gWfpGlobal/layout could not be located; see warnings\n";
             break;
         }
 
-        PrintColoredText(L"wfp kernel callouts", KNDBG_COLOR_TITLE);
+        PrintColoredText(L"wfp kernel callouts", result.CoverageComplete ? KNDBG_COLOR_TITLE : KNDBG_COLOR_WARN);
         std::wcout << L" count=" << std::dec << result.Callouts.size()
                    << L" array=" << HexTextWidth(result.ArrayAddress, 16, true)
-                   << L" layout=" << result.LayoutSource;
+                   << L" layout=" << result.LayoutSource
+                   << L" coverage_complete=" << (result.CoverageComplete ? L"yes" : L"no");
+        if (!result.CoverageComplete)
+        {
+            std::wcout << L" incomplete=yes";
+        }
         if (result.AnySuspicious)
         {
             std::wcout << L" ";
@@ -12157,6 +12167,10 @@ static void HandleWfpKernelCalloutsCommand(
             std::wcout << L" hooks=" << std::dec << result.SuspiciousCount;
         }
         std::wcout << L"\n";
+        if (!result.CoverageComplete)
+        {
+            std::wcout << L"  verdict: incomplete_coverage (partial walk; not a clean empty callout table)\n";
+        }
 
         // Report the resolved engine base and the offsets that validated, so a
         // fallback-scan layout can be pinned as a documented candidate.
@@ -12183,12 +12197,47 @@ static void HandleWfpKernelCalloutsCommand(
             {
                 std::wcout << L" (" << callout.ClassifySymbol << L")";
             }
-            if (callout.ClassifySuspicious)
+            if (callout.ClassifySuspicious || callout.NotifySuspicious || callout.FlowDeleteSuspicious)
             {
                 std::wcout << L" ";
                 PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
             }
             std::wcout << L"\n";
+
+            if (callout.NotifyFn != 0)
+            {
+                std::wcout << L"    notify=" << HexTextWidth(callout.NotifyFn, 16, true);
+                if (!callout.NotifyModule.empty())
+                {
+                    std::wcout << L" module=";
+                    PrintColoredText(
+                        callout.NotifyModule,
+                        callout.NotifySuspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_OK);
+                }
+                else if (callout.NotifySuspicious)
+                {
+                    std::wcout << L" module=";
+                    PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+                }
+                std::wcout << L"\n";
+            }
+            if (callout.FlowDeleteFn != 0)
+            {
+                std::wcout << L"    flowDelete=" << HexTextWidth(callout.FlowDeleteFn, 16, true);
+                if (!callout.FlowDeleteModule.empty())
+                {
+                    std::wcout << L" module=";
+                    PrintColoredText(
+                        callout.FlowDeleteModule,
+                        callout.FlowDeleteSuspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_OK);
+                }
+                else if (callout.FlowDeleteSuspicious)
+                {
+                    std::wcout << L" module=";
+                    PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+                }
+                std::wcout << L"\n";
+            }
 
             if (callout.HasMetadata && (!callout.Name.empty() || !callout.LayerName.empty() || !callout.ProviderName.empty()))
             {

@@ -24,6 +24,8 @@ struct WfpKernelCallout
     std::wstring NotifyModule;
     std::wstring FlowDeleteModule;
     bool ClassifySuspicious = false;
+    bool NotifySuspicious = false;
+    bool FlowDeleteSuspicious = false;
     bool HasMetadata = false;
     std::wstring Name;
     std::wstring LayerName;
@@ -34,6 +36,10 @@ struct WfpKernelCallout
 struct WfpCalloutScanResult
 {
     bool Resolved = false;
+    // False when gWfpGlobal/layout/array walk could not complete. Empty Callouts
+    // with CoverageComplete=false must not be treated as "no hooks".
+    bool CoverageComplete = false;
+    bool Incomplete = false;
     uint64_t GlobalSymbol = 0;   // netio!gWfpGlobal address
     uint64_t EngineBase = 0;     // resolved engine struct base
     uint64_t ArrayAddress = 0;   // callout array base
