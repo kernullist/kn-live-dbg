@@ -1722,6 +1722,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                     section.VirtualAddress = sections[i].VirtualAddress;
                                     section.VirtualSize = sections[i].Misc.VirtualSize;
                                     section.RawSize = sections[i].SizeOfRawData;
+                                    section.PointerToRawData = sections[i].PointerToRawData;
                                     section.Characteristics = sections[i].Characteristics;
                                     section.Executable = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
                                     section.Writable = (section.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
@@ -1919,6 +1920,134 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+
+                                    // Optional live-vs-disk page compare for executable sections.
+                                    if (options.CompareDiskPages &&
+                                        section.Executable &&
+                                        section.RangeValid &&
+                                        section.PointerToRawData != 0 &&
+                                        section.RawSize != 0 &&
+                                        !record.ImagePath.empty())
+                                    {
+                                        section.DiskCompareAttempted = true;
+                                        const uint32_t pageCount =
+                                            options.DiskPagesPerSection == 0 ? 2u : options.DiskPagesPerSection;
+                                        HANDLE file = CreateFileW(
+                                            record.ImagePath.c_str(),
+                                            GENERIC_READ,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                            nullptr,
+                                            OPEN_EXISTING,
+                                            FILE_ATTRIBUTE_NORMAL,
+                                            nullptr);
+                                        if (file == INVALID_HANDLE_VALUE)
+                                        {
+                                            section.DiskCompareFailed = true;
+                                            AddSectionReason(
+                                                &section,
+                                                L"disk_open_failed",
+                                                L"could not open module image on disk for page compare");
+                                        }
+                                        else
+                                        {
+                                            for (uint32_t pageIndex = 0; pageIndex < pageCount; ++pageIndex)
+                                            {
+                                                uint32_t pageRvaOffset = 0;
+                                                if (pageIndex == 0)
+                                                {
+                                                    pageRvaOffset = 0;
+                                                }
+                                                else if (span > 0x1000)
+                                                {
+                                                    pageRvaOffset = static_cast<uint32_t>(
+                                                        ((span / 0x1000) / 2) * 0x1000);
+                                                    if (pageRvaOffset >= span)
+                                                    {
+                                                        pageRvaOffset = 0x1000;
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    break;
+                                                }
+
+                                                if (pageRvaOffset >= section.RawSize)
+                                                {
+                                                    break;
+                                                }
+
+                                                const uint32_t fileOffset = section.PointerToRawData + pageRvaOffset;
+                                                const uint32_t readLen = static_cast<uint32_t>(
+                                                    (section.RawSize - pageRvaOffset) < 0x1000
+                                                        ? (section.RawSize - pageRvaOffset)
+                                                        : 0x1000);
+                                                if (readLen == 0)
+                                                {
+                                                    break;
+                                                }
+
+                                                LARGE_INTEGER seek = {};
+                                                seek.QuadPart = static_cast<LONGLONG>(fileOffset);
+                                                if (!SetFilePointerEx(file, seek, nullptr, FILE_BEGIN))
+                                                {
+                                                    section.DiskCompareFailed = true;
+                                                    AddSectionReason(
+                                                        &section,
+                                                        L"disk_seek_failed",
+                                                        L"disk page seek failed");
+                                                    break;
+                                                }
+
+                                                std::vector<uint8_t> diskPage(readLen);
+                                                DWORD got = 0;
+                                                if (!ReadFile(file, diskPage.data(), readLen, &got, nullptr) ||
+                                                    got != readLen)
+                                                {
+                                                    section.DiskCompareFailed = true;
+                                                    AddSectionReason(
+                                                        &section,
+                                                        L"disk_read_failed",
+                                                        L"disk page read failed");
+                                                    break;
+                                                }
+
+                                                uint64_t liveAddress = 0;
+                                                if (!TryAdd(module.Base, section.VirtualAddress, &liveAddress) ||
+                                                    !TryAdd(liveAddress, pageRvaOffset, &liveAddress))
+                                                {
+                                                    section.DiskCompareFailed = true;
+                                                    break;
+                                                }
+
+                                                std::vector<uint8_t> livePage;
+                                                std::wstring liveError;
+                                                if (!device_.ReadMemory(liveAddress, readLen, &livePage, &liveError) ||
+                                                    livePage.size() != readLen)
+                                                {
+                                                    section.DiskCompareFailed = true;
+                                                    AddSectionReason(
+                                                        &section,
+                                                        L"live_read_failed",
+                                                        L"live page read failed during disk compare");
+                                                    break;
+                                                }
+
+                                                if (memcmp(livePage.data(), diskPage.data(), readLen) != 0)
+                                                {
+                                                    section.DiskCompareMismatch = true;
+                                                    section.MismatchEvidence = true;
+                                                    AddSectionReason(
+                                                        &section,
+                                                        L"disk_live_page_mismatch",
+                                                        L"live executable page differs from on-disk PE raw data");
+                                                    break;
+                                                }
+
+                                                section.DiskCompareMatched = true;
+                                            }
+                                            CloseHandle(file);
                                         }
                                     }
 
