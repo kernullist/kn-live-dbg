@@ -9087,6 +9087,57 @@ static bool WriteMemoryWithProcessContext(
     return ok;
 }
 
+// Shared policy for e*/f/m/setfield: user VAs need procctx; kernel VAs use System.
+static bool ResolveNativeWriteContext(
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint64_t address,
+    ProcessAddressContext* kernelContextStorage,
+    const ProcessAddressContext** memoryContext,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (memoryContext == nullptr || kernelContextStorage == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid write context output";
+            }
+            break;
+        }
+
+        *memoryContext = nullptr;
+        if (IsLikelyUserVirtualAddress(address))
+        {
+            if (!state.HasProcessContext)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"user virtual write requires procctx <pid>";
+                }
+                break;
+            }
+            // Leave null so SelectMemoryAccessContext applies procctx.
+            ok = true;
+            break;
+        }
+
+        if (!EnsureKernelProcessAddressContext(state, device, symbols, kernelContextStorage, error))
+        {
+            break;
+        }
+
+        *memoryContext = kernelContextStorage;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static void HandleTranslateVirtualCommand(
     const std::vector<std::wstring>& args,
     const DebuggerState& state,
@@ -9974,7 +10025,7 @@ static void HandleCompare(const std::vector<std::wstring>& args, const DebuggerS
     } while (false);
 }
 
-static void HandleFill(const std::vector<std::wstring>& args, const DebuggerState& state, DeviceClient& device, SymbolEngine& symbols)
+static void HandleFill(const std::vector<std::wstring>& args, DebuggerState& state, DeviceClient& device, SymbolEngine& symbols)
 {
     std::wstring error;
     std::wstring command = NormalizeInputCommand(args[0]);
@@ -10043,10 +10094,25 @@ static void HandleFill(const std::vector<std::wstring>& args, const DebuggerStat
             bytes[index] = pattern[index % pattern.size()];
         }
 
-        if (device.WriteMemory(address, bytes, &error))
+        ProcessAddressContext kernelContext = {};
+        const ProcessAddressContext* memoryContext = nullptr;
+        if (!ResolveNativeWriteContext(state, device, symbols, address, &kernelContext, &memoryContext, &error))
         {
+            std::wcerr << L"fill failed: " << error << L"\n";
+            break;
+        }
+
+        if (WriteMemoryWithProcessContext(device, state, memoryContext, address, bytes, &error))
+        {
+            const ProcessAddressContext* used =
+                SelectMemoryAccessContext(state, memoryContext, address);
             PrintColoredText(L"filled", KNDBG_COLOR_OK);
-            std::wcout << L" " << bytes.size() << L" bytes\n";
+            std::wcout << L" " << bytes.size() << L" bytes";
+            if (used != nullptr)
+            {
+                std::wcout << L" pid=" << used->ProcessId;
+            }
+            std::wcout << L"\n";
         }
         else
         {
@@ -10055,7 +10121,7 @@ static void HandleFill(const std::vector<std::wstring>& args, const DebuggerStat
     } while (false);
 }
 
-static void HandleMove(const std::vector<std::wstring>& args, const DebuggerState& state, DeviceClient& device, SymbolEngine& symbols)
+static void HandleMove(const std::vector<std::wstring>& args, DebuggerState& state, DeviceClient& device, SymbolEngine& symbols)
 {
     std::wstring error;
 
@@ -10084,17 +10150,58 @@ static void HandleMove(const std::vector<std::wstring>& args, const DebuggerStat
             break;
         }
 
+        // Source and destination may be different address spaces; each end
+        // uses the same procctx/System policy as e*/d*.
+        ProcessAddressContext sourceKernelContext = {};
+        const ProcessAddressContext* sourceContext = nullptr;
+        if (!ResolveNativeWriteContext(state, device, symbols, source, &sourceKernelContext, &sourceContext, &error))
+        {
+            // Read of kernel does not require write context, but user read
+            // still needs procctx. Reuse the same policy for consistency.
+            std::wcerr << L"move source context failed: " << error << L"\n";
+            break;
+        }
+
         std::vector<uint8_t> bytes;
-        if (!device.ReadMemory(source, static_cast<uint32_t>(length), &bytes, &error))
+        if (!ReadMemoryWithProcessContext(
+                device,
+                state,
+                sourceContext,
+                source,
+                static_cast<uint32_t>(length),
+                &bytes,
+                &error))
         {
             std::wcerr << L"move read failed: " << error << L"\n";
             break;
         }
 
-        if (device.WriteMemory(destination, bytes, &error))
+        if (bytes.size() != static_cast<size_t>(length))
         {
+            std::wcerr << L"move read failed: short read got "
+                       << bytes.size() << L" of " << length << L" bytes\n";
+            break;
+        }
+
+        ProcessAddressContext destKernelContext = {};
+        const ProcessAddressContext* destContext = nullptr;
+        if (!ResolveNativeWriteContext(state, device, symbols, destination, &destKernelContext, &destContext, &error))
+        {
+            std::wcerr << L"move destination context failed: " << error << L"\n";
+            break;
+        }
+
+        if (WriteMemoryWithProcessContext(device, state, destContext, destination, bytes, &error))
+        {
+            const ProcessAddressContext* used =
+                SelectMemoryAccessContext(state, destContext, destination);
             PrintColoredText(L"moved", KNDBG_COLOR_OK);
-            std::wcout << L" " << bytes.size() << L" bytes\n";
+            std::wcout << L" " << bytes.size() << L" bytes";
+            if (used != nullptr)
+            {
+                std::wcout << L" pid=" << used->ProcessId;
+            }
+            std::wcout << L"\n";
         }
         else
         {
@@ -38270,12 +38377,27 @@ static bool HandleCommand(
                 break;
             }
 
-            if (device.WriteMemory(fieldAddress, bytes, &error))
+            ProcessAddressContext kernelContext = {};
+            const ProcessAddressContext* memoryContext = nullptr;
+            if (!ResolveNativeWriteContext(state, device, symbols, fieldAddress, &kernelContext, &memoryContext, &error))
             {
+                std::wcerr << L"setfield failed: " << error << L"\n";
+                break;
+            }
+
+            if (WriteMemoryWithProcessContext(device, state, memoryContext, fieldAddress, bytes, &error))
+            {
+                const ProcessAddressContext* used =
+                    SelectMemoryAccessContext(state, memoryContext, fieldAddress);
                 PrintColoredText(L"wrote field", KNDBG_COLOR_OK);
                 std::wcout << L" ";
                 PrintColoredText(field.Name, KNDBG_COLOR_TITLE);
-                std::wcout << L" at +0x" << std::hex << field.Offset << std::dec << L"\n";
+                std::wcout << L" at +0x" << std::hex << field.Offset << std::dec;
+                if (used != nullptr)
+                {
+                    std::wcout << L" pid=" << used->ProcessId;
+                }
+                std::wcout << L"\n";
             }
             else
             {
