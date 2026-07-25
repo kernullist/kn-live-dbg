@@ -33,6 +33,11 @@ struct ModuleIntegritySectionRecord
     bool LastPageExecutable = false;
     bool LastPageLargePage = false;
     uint32_t LastPagePagingLevels = 0;
+    // Interior executable-page samples (between first and last) so mid-section
+    // W+X hooks are not invisible when only endpoints are clean.
+    uint32_t MidPagesQueried = 0;
+    uint32_t MidPagesQueryFailed = 0;
+    uint32_t MidPagesWx = 0;
     bool PageAttributesQueried = false;
     bool PageAttributeQueryFailed = false;
     bool EffectiveReadable = false;

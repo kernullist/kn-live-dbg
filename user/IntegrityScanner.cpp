@@ -1837,6 +1837,88 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     }
                                                 }
                                             }
+
+                                            // Sample interior pages so inline hooks past the first
+                                            // page and before the last page are not invisible.
+                                            constexpr uint64_t kIntegrityPageSize = 0x1000ull;
+                                            constexpr uint32_t kMaxMidPageSamples = 8u;
+                                            if (span > (kIntegrityPageSize * 2ull))
+                                            {
+                                                const uint64_t pageCount = span / kIntegrityPageSize;
+                                                if (pageCount > 2ull)
+                                                {
+                                                    const uint64_t interiorPages = pageCount - 2ull;
+                                                    const uint32_t sampleCount =
+                                                        interiorPages < kMaxMidPageSamples
+                                                            ? static_cast<uint32_t>(interiorPages)
+                                                            : kMaxMidPageSamples;
+                                                    for (uint32_t sample = 0; sample < sampleCount; ++sample)
+                                                    {
+                                                        uint64_t pageIndex = 1ull;
+                                                        if (sampleCount == 1)
+                                                        {
+                                                            pageIndex = 1ull + (interiorPages / 2ull);
+                                                        }
+                                                        else
+                                                        {
+                                                            pageIndex = 1ull +
+                                                                ((static_cast<uint64_t>(sample) * (interiorPages - 1ull)) /
+                                                                 static_cast<uint64_t>(sampleCount - 1u));
+                                                        }
+
+                                                        uint64_t midOffset = 0;
+                                                        uint64_t midAddress = 0;
+                                                        if (!TryAdd(0, pageIndex * kIntegrityPageSize, &midOffset) ||
+                                                            !TryAdd(sectionAddress, midOffset, &midAddress) ||
+                                                            midOffset >= span)
+                                                        {
+                                                            continue;
+                                                        }
+
+                                                        ModulePageAttributes midProbe = {};
+                                                        if (QueryEffectivePageAttributes(device_, midAddress, 1, &midProbe))
+                                                        {
+                                                            ++section.MidPagesQueried;
+                                                            section.PageAttributesQueried = true;
+                                                            section.EffectiveReadable =
+                                                                section.EffectiveReadable || midProbe.Readable;
+                                                            section.EffectiveWritable =
+                                                                section.EffectiveWritable || midProbe.Writable;
+                                                            section.EffectiveExecutable =
+                                                                section.EffectiveExecutable || midProbe.Executable;
+                                                            if (midProbe.Writable && midProbe.Executable)
+                                                            {
+                                                                ++section.MidPagesWx;
+                                                                section.WxEvidence = true;
+                                                                if (section.MidPagesWx == 1)
+                                                                {
+                                                                    AddSectionReason(
+                                                                        &section,
+                                                                        L"effective_wx_mid_page",
+                                                                        L"interior executable page is effective W+X");
+                                                                }
+                                                            }
+                                                        }
+                                                        else
+                                                        {
+                                                            ++section.MidPagesQueryFailed;
+                                                            section.PageAttributeQueryFailed = true;
+                                                            if (section.PageAttributeError.empty())
+                                                            {
+                                                                section.PageAttributeError = midProbe.Error;
+                                                            }
+                                                            if (section.Executable)
+                                                            {
+                                                                section.MismatchEvidence = true;
+                                                                AddSectionReason(
+                                                                    &section,
+                                                                    L"exec_mid_page_query_failed",
+                                                                    L"interior executable page translation failed");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
 
