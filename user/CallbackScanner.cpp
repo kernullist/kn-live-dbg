@@ -3850,16 +3850,19 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
         }
 
         uint64_t current = head.Flink;
-        bool listWalkOk = true;
+        bool walkIncomplete = false;
+        uint32_t poisonedEntries = 0;
         for (uint32_t index = 0; index < 512 && current != 0 && current != headAddress; ++index)
         {
             if (!context.IsKernelPointer(current))
             {
-                listWalkOk = false;
-                if (error != nullptr)
-                {
-                    *error = L"Object callback list entry is not a kernel pointer";
-                }
+                // Cannot recover Flink from a non-kernel link. Keep prior
+                // records and report incomplete coverage instead of failing
+                // the whole object-type walk.
+                walkIncomplete = true;
+                result->Warnings.push_back(
+                    L"ob " + target + L": non-kernel list entry at slot " + std::to_wstring(index) +
+                    L"; remaining callbacks not walked");
                 break;
             }
 
@@ -3867,23 +3870,23 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
             std::wstring readError;
             if (!context.ReadListEntry(current, &entryLinks, &readError))
             {
-                listWalkOk = false;
-                if (error != nullptr)
-                {
-                    *error = readError;
-                }
+                walkIncomplete = true;
+                result->Warnings.push_back(
+                    L"ob " + target + L": list entry read failed at slot " + std::to_wstring(index) +
+                    L": " + readError + L"; remaining callbacks not walked");
                 break;
             }
 
             uint64_t itemAddress = 0;
             if (!context.TrySubtract(current, layout.ItemList.Offset, &itemAddress))
             {
-                listWalkOk = false;
-                if (error != nullptr)
-                {
-                    *error = L"Object callback item address underflow";
-                }
-                break;
+                walkIncomplete = true;
+                ++poisonedEntries;
+                result->Warnings.push_back(
+                    L"ob " + target + L": item address underflow at slot " + std::to_wstring(index) +
+                    L" (continuing walk)");
+                current = entryLinks.Flink;
+                continue;
             }
 
             uint64_t preOperation = 0;
@@ -3900,24 +3903,23 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
             if (preOperation != 0 || postOperation != 0)
             {
                 std::wstring validationError;
-                if (!ValidateObjectCallbackItemFields(
-                        context,
-                        callbackEntry,
-                        preOperation,
-                        postOperation,
-                        operations,
-                        &validationError))
-                {
-                    listWalkOk = false;
-                    if (error != nullptr)
-                    {
-                        *error = validationError;
-                    }
-                    break;
-                }
+                const bool fieldsValid = ValidateObjectCallbackItemFields(
+                    context,
+                    callbackEntry,
+                    preOperation,
+                    postOperation,
+                    operations,
+                    &validationError);
 
                 std::wstring altitude;
-                ReadObjectCallbackRegistrationMetadata(context, callbackEntry, &registrationContext, &altitude);
+                if (fieldsValid)
+                {
+                    ReadObjectCallbackRegistrationMetadata(
+                        context,
+                        callbackEntry,
+                        &registrationContext,
+                        &altitude);
+                }
 
                 KernelCallbackRecord record = {};
                 record.Kind = L"ob";
@@ -3938,9 +3940,30 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 {
                     record.Notes = L"partial fallback object callback item fields";
                 }
+
+                if (!fieldsValid)
+                {
+                    // Poison / decoy entries used to abort the walk and hide
+                    // every later real callback. Keep the entry as evidence
+                    // and continue so subsequent hooks remain visible.
+                    walkIncomplete = true;
+                    ++poisonedEntries;
+                    std::wstring poisonNote =
+                        L"poisoned/invalid object callback item: " + validationError;
+                    if (record.Notes.empty())
+                    {
+                        record.Notes = poisonNote;
+                    }
+                    else
+                    {
+                        record.Notes += L"; ";
+                        record.Notes += poisonNote;
+                    }
+                }
+
                 context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
                 context.AnnotateAddress(record.PostFunction, &record.PostFunctionModule, &record.PostFunctionSymbol);
-                if (context.IsKernelImagePointer(record.Context))
+                if (fieldsValid && context.IsKernelImagePointer(record.Context))
                 {
                     context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
                 }
@@ -3950,9 +3973,19 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
             current = entryLinks.Flink;
         }
 
-        if (!listWalkOk)
+        if (current != 0 && current != headAddress)
         {
-            break;
+            // Hit the 512-entry cap without returning to the head.
+            walkIncomplete = true;
+            result->Warnings.push_back(
+                L"ob " + target + L": callback list walk hit entry cap without returning to head");
+        }
+
+        if (walkIncomplete && poisonedEntries != 0)
+        {
+            result->Warnings.push_back(
+                L"ob " + target + L": walked past " + std::to_wstring(poisonedEntries) +
+                L" poisoned/invalid item(s); list coverage may be partial");
         }
 
         ok = true;

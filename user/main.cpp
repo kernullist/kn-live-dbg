@@ -7322,7 +7322,12 @@ struct DmlProcessCollection
     std::vector<DmlProcessRecord> Records;
     std::vector<std::wstring> Warnings;
     size_t ScannedCount = 0;
+    size_t FailedReadCount = 0;
     bool Truncated = false;
+    // True when at least one list node could not be fully decoded and was
+    // skipped (or the walk stopped early for a non-cycle reason). Callers must
+    // not treat a partial inventory as a complete process set.
+    bool Incomplete = false;
 };
 
 static bool CollectDmlProcessRecords(
@@ -7375,7 +7380,12 @@ static bool CollectDmlProcessRecords(
 
         uint64_t current = 0;
         constexpr size_t maxProcessRecords = 4096;
+        // Cap consecutive node failures so a fully poisoned chain cannot spin
+        // on the same recovery path forever. Each failed node is still visited
+        // once via the visited set.
+        constexpr size_t maxConsecutiveFailures = 64;
         std::vector<uint64_t> visited;
+        size_t consecutiveFailures = 0;
 
         if (hasGlobalHead)
         {
@@ -7415,6 +7425,7 @@ static bool CollectDmlProcessRecords(
             if (!TrySubtractOffset(current, layout.ActiveProcessLinks.Offset, &eprocess))
             {
                 output->Warnings.push_back(L"list entry underflow at " + HexTextWidth(current, 16, true));
+                output->Incomplete = true;
                 break;
             }
 
@@ -7425,37 +7436,60 @@ static bool CollectDmlProcessRecords(
                 output->Records.push_back(record);
                 ++output->ScannedCount;
                 current = record.Flink;
+                consecutiveFailures = 0;
             }
             else
             {
-                if (!hasGlobalHead)
-                {
-                    uint64_t hiddenHeadFlink = 0;
-                    if (ReadKernelPointer(device, current, &hiddenHeadFlink, nullptr) &&
-                        IsLikelyKernelVirtualAddress(hiddenHeadFlink))
-                    {
-                        if (hiddenHeadFlink == systemListEntry)
-                        {
-                            break;
-                        }
+                // Fail-open: a single poisoned/unreadable EPROCESS must not
+                // hide every subsequent process. Advance via LIST_ENTRY.Flink
+                // at the current link when possible and keep walking.
+                ++output->FailedReadCount;
+                ++consecutiveFailures;
+                output->Incomplete = true;
+                output->Warnings.push_back(
+                    L"failed to read EPROCESS " + HexTextWidth(eprocess, 16, true) + L": " + readError +
+                    L" (continuing walk)");
 
-                        if (!DmlProcessAlreadyVisited(visited, hiddenHeadFlink))
-                        {
-                            current = hiddenHeadFlink;
-                            continue;
-                        }
+                uint64_t nextFlink = 0;
+                bool advanced = false;
+                if (ReadKernelPointer(device, current, &nextFlink, nullptr) &&
+                    IsLikelyKernelVirtualAddress(nextFlink))
+                {
+                    if (nextFlink == listHead || nextFlink == systemListEntry)
+                    {
+                        break;
+                    }
+
+                    if (!DmlProcessAlreadyVisited(visited, nextFlink))
+                    {
+                        current = nextFlink;
+                        advanced = true;
                     }
                 }
 
-                output->Warnings.push_back(
-                    L"failed to read EPROCESS " + HexTextWidth(eprocess, 16, true) + L": " + readError);
-                break;
+                if (!advanced)
+                {
+                    output->Warnings.push_back(
+                        L"process list walk stopped: cannot advance past unreadable entry " +
+                        HexTextWidth(current, 16, true));
+                    break;
+                }
+
+                if (consecutiveFailures >= maxConsecutiveFailures)
+                {
+                    output->Warnings.push_back(
+                        L"process list walk stopped after " +
+                        std::to_wstring(maxConsecutiveFailures) +
+                        L" consecutive unreadable entries");
+                    break;
+                }
             }
         }
 
         if (output->ScannedCount >= maxProcessRecords)
         {
             output->Truncated = true;
+            output->Incomplete = true;
         }
 
         ok = true;
@@ -7498,6 +7532,12 @@ static bool BuildSnapshotProcessInventory(
             if (collection.Truncated)
             {
                 warnings->push_back(L"process inventory was truncated");
+            }
+            if (collection.Incomplete)
+            {
+                warnings->push_back(
+                    L"process inventory incomplete: failedReads=" +
+                    std::to_wstring(collection.FailedReadCount));
             }
         }
 
@@ -8280,6 +8320,10 @@ static void HandleDmlProcCommand(
         if (collection.Truncated)
         {
             std::wcout << L" truncated=yes";
+        }
+        if (collection.Incomplete)
+        {
+            std::wcout << L" incomplete=yes failedReads=" << std::dec << collection.FailedReadCount;
         }
         std::wcout << L"\n";
     } while (false);
@@ -31396,6 +31440,10 @@ static bool TryHandleAiProcessQuery(
         if (collection.Truncated)
         {
             std::wcout << L" truncated=yes";
+        }
+        if (collection.Incomplete)
+        {
+            std::wcout << L" incomplete=yes failedReads=" << std::dec << collection.FailedReadCount;
         }
         std::wcout << L"\n";
 
