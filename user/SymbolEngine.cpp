@@ -2573,6 +2573,7 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
         }
 
         layout->Fields.reserve(childrenCount);
+        size_t skippedWithoutOffset = 0;
 
         for (ULONG index = 0; index < childrenCount; ++index)
         {
@@ -2589,6 +2590,20 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
             field.IsBitField = false;
             field.BitPosition = 0;
 
+            // Only data members and base classes participate in layout offsets.
+            // Nested types/functions without TI_GET_OFFSET used to be recorded
+            // as Offset=0 and silently corrupt every scanner that trusted them.
+            if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMTAG, &field.Tag))
+            {
+                ++skippedWithoutOffset;
+                continue;
+            }
+
+            if (field.Tag != SymTagData && field.Tag != SymTagBaseClass)
+            {
+                continue;
+            }
+
             WCHAR* rawName = nullptr;
             if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMNAME, &rawName) && rawName != nullptr)
             {
@@ -2596,9 +2611,20 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
                 LocalFree(rawName);
             }
 
-            SymGetTypeInfo(process_, moduleBase, childId, TI_GET_OFFSET, &field.Offset);
+            if (field.Name.empty())
+            {
+                continue;
+            }
+
+            if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_OFFSET, &field.Offset))
+            {
+                // Do not invent Offset=0 for named members when DbgHelp fails.
+                // A true first member may still be 0 only when OFFSET succeeds.
+                ++skippedWithoutOffset;
+                continue;
+            }
+
             SymGetTypeInfo(process_, moduleBase, childId, TI_GET_LENGTH, &field.Length);
-            SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMTAG, &field.Tag);
 
             if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_BITPOSITION, &field.BitPosition))
             {
@@ -2618,10 +2644,16 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
                 field.TypeName = L"<unknown>";
             }
 
-            if (!field.Name.empty())
+            layout->Fields.push_back(field);
+        }
+
+        if (layout->Fields.empty() && childrenCount != 0 && skippedWithoutOffset != 0)
+        {
+            if (error != nullptr)
             {
-                layout->Fields.push_back(field);
+                *error = L"type has children but no members with a valid TI_GET_OFFSET";
             }
+            break;
         }
 
         ok = true;
