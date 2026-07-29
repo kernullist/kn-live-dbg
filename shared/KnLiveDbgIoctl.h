@@ -10,7 +10,7 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define KNDBG_SERVICE_NAME L"KnLiveDbg"
 #define KNDBG_DISPLAY_NAME L"Kn Live Debug Driver"
 
-#define KNDBG_ABI_VERSION 13u
+#define KNDBG_ABI_VERSION 14u
 #define KNDBG_MAX_TRANSFER_SIZE (1024u * 1024u)
 #define KNDBG_WRITE_ACK_MAGIC 0x4B4E444247574F4Full
 #define KNDBG_TIMELINE_DEFAULT_CAPACITY 4096u
@@ -143,6 +143,9 @@ typedef unsigned __int64 KNDBG_UINT64;
 #define IOCTL_KNDBG_TIMELINE_DRAIN \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 
+#define IOCTL_KNDBG_READ_PROCESS_VIRTUAL \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_READ_DATA)
+
 // Known _EPROCESS.Protection byte values. The PS_PROTECTION struct packs
 // Signer (high nibble) over Audit (bit 3) over Type (bits 0..2).
 //   Type:   0 = None, 1 = ProtectedLight (PPL), 2 = Protected
@@ -211,6 +214,20 @@ typedef struct _KNDBG_READ_REQUEST
     KNDBG_UINT32 Flags;
     KNDBG_UINT8 Data[1];
 } KNDBG_READ_REQUEST;
+
+typedef struct _KNDBG_PROCESS_VIRTUAL_READ_REQUEST
+{
+    KNDBG_UINT32 Size;
+    KNDBG_UINT32 Flags;
+    KNDBG_UINT32 ProcessId;
+    KNDBG_UINT32 Reserved;
+    KNDBG_UINT64 ExpectedEprocess;
+    KNDBG_UINT64 ExpectedCreateTime;
+    KNDBG_UINT64 Address;
+    KNDBG_UINT32 Length;
+    KNDBG_UINT32 Reserved2;
+    KNDBG_UINT8 Data[1];
+} KNDBG_PROCESS_VIRTUAL_READ_REQUEST;
 
 typedef struct _KNDBG_WRITE_REQUEST
 {

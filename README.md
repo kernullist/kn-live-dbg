@@ -108,7 +108,12 @@ Driver-free regression checks after a build:
 .\tools\validate-timeline-selftest.ps1 -Configuration Release
 .\tools\validate-mcp-tool-catalog.ps1 -Configuration Release
 .\tools\validate-console-surface.ps1 -Configuration Release
+.\tools\validate-hunt-clean-host-selftest.ps1
 ```
+
+The hunt clean-host self-test is driver-free. It proves that the whole-host
+negative-control gate accepts a complete zero-finding hunt JSON and rejects
+non-empty, incomplete, mistyped, or malformed evidence.
 
 Refresh the pinned Debugging Tools runtime from the newest complete local x64 set:
 
@@ -117,7 +122,7 @@ Refresh the pinned Debugging Tools runtime from the newest complete local x64 se
 ```
 
 The driver projects use WDK `TestSign` for Debug and Release x64 builds. The build helper verifies that both `KnLiveDbg.sys` and `KnLiveDbgProbe.sys` have Authenticode signers and prints signature status/thumbprints after MSBuild completes.
-Normal scripted builds reuse the current PE version from `.build\version-state.json` or the existing output file and do not increment it. Use `.\tools\build.ps1 -Configuration Release -BumpVersion` only when a new build version should be minted; with no previous state, the baseline is `0.0.0`, so the first bumped build stamps `0.0.1` into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys`. The generated resource header is written under `.build\generated`, while `shared\KnLiveDbgVersion.h` remains a `0.0.0` fallback for direct Visual Studio builds that do not run the helper script.
+Normal scripted builds reuse the highest current PE version found in `.build\version-state.json`, the existing output file, or an exact `vX.Y.Z` Git tag reachable from `HEAD`, and do not increment it. This keeps a clean checkout from restarting at `0.0.1` after releases have already been tagged. Use `.\tools\build.ps1 -Configuration Release -BumpVersion` only when a new build version should be minted; with no previous state, PE, or reachable version tag, the baseline is `0.0.0`, so the first bumped build stamps `0.0.1` into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys`. The generated resource header is written under `.build\generated`, while `shared\KnLiveDbgVersion.h` remains a `0.0.0` fallback for direct Visual Studio builds that do not run the helper script.
 The build helper also stages the pinned `vendor\debugging-tools\x64` runtime beside the EXE (`dbghelp.dll`, `dbgeng.dll`, `dbgcore.dll`, `DbgModel.dll`, `msdia140.dll`, `symsrv.dll`, `srcsrv.dll`, and `symsrv.yes`) so DbgHelp and DbgEng can use the Microsoft symbol server instead of falling back to the limited System32 runtime. If the vendor pair is missing, the script falls back to the locally installed Windows Kits Debugging Tools copy. DIA include/lib paths are passed to MSBuild from the discovered Visual Studio installation instead of relying on a fixed VS edition path. If `symsrv.dll` is staged but `symsrv.yes` is missing, the sync script, build script, and EXE startup path create `symsrv.yes` before symbol loading. Startup creates `<exe-dir>\symbols` and uses it as the downstream symbol store, so downloaded PDBs stay with the runnable EXE bundle rather than going to `C:\Symbols`. When `msdia140.dll` is staged, startup registers it automatically with `DllRegisterServer` before symbol initialization. The symbol engine also has a no-reg fallback that loads the staged `msdia*.dll` directly and creates `IDiaDataSource` through `DllGetClassObject`, so type fallback can still work when COM registration is unavailable.
 
 Create a release zip:
@@ -147,6 +152,26 @@ Run from an elevated console:
 cd .\x64\Release
 .\KnLiveDbg.exe
 ```
+
+For a repeatable whole-host negative control from the repository root, use:
+
+```powershell
+.\tools\run-hunt-clean-host.ps1 -Mode Default -Count 3 -RequireClean
+```
+
+The runner requests elevation when needed, feeds `write off`, captures each
+hunt JSON plus transcript under `.build\hunt-clean-host`, exits through the
+normal driver lifecycle, and fails if the exact `KnLiveDbg` service remains.
+`tools\validate-hunt-clean-host.ps1` can validate a saved JSON separately.
+`tools\analyze-hunt-clean-host.ps1` accepts multiple saved JSON paths and groups
+findings by a semantic fingerprint that ignores transient PID/address/path
+differences, labeling fingerprints as deterministic or intermittent across
+runs. It can emit both JSON and Markdown ledgers through `-OutputJson` and
+`-OutputMarkdown`.
+Deep mode expects usable Threat Intelligence events as part of complete
+coverage; use `-Mode Deep -EnableThreatIntel -RequireClean` when that temporary
+self-PPL/TI setup is acceptable. The runner enables writes only for
+`set-ppl-antimalware`, then issues `write off` before `!hunt`.
 
 The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs beside the EXE as well when copying the tool to another directory; otherwise Windows may load `C:\Windows\System32\dbghelp.dll` without `symsrv.dll`, and startup can report `symType=0 (SymNone)` while trying to download the kernel PDB. If `symsrv.dll` is present but `symsrv.yes` is missing, startup creates `symsrv.yes` before calling DbgHelp so first-run symbol-server consent does not block noninteractive PDB downloads. Startup creates `<exe-dir>\symbols`, excludes that cache tree from plain local-directory scanning, and then uses `SRV*<exe-dir>\symbols*https://msdl.microsoft.com/download/symbols` as the default Microsoft symbol path. If `msdia140.dll` is present, startup registers DIA COM automatically before DbgHelp/DIA initialization; if registration is not available, DIA type fallback can still instantiate the staged DLL directly without registry state. It resolves the absolute driver path, updates an existing service config when present, creates the service when missing, starts it, and waits for `SERVICE_RUNNING`. Startup, single-instance acquisition, install/update, driver load, device open, ABI verification, automatic EXE-directory symbol path discovery, EXE-local symbol cache setup, symbol initialization, default `nt` kernel PDB download/load, probe load, and unload paths are printed as colored staged `[ .. ]`, `[ OK ]`, `[WARN]`, and `[FAIL]` rows. Only one `KnLiveDbg.exe` instance can run at a time; a second elevated process exits before touching SCM or the driver. On successful startup the console prints a colored welcome banner plus a dashboard with driver, write gate, backend, symbols, AI, probe, and quick-action hints before the `knkd>` prompt. `home` or `dashboard` redraws that screen. `q`, `quit`, `exit`, EOF, Ctrl+C, and `unload` close the device handle, stop the main driver, delete the service, and wait for deletion before exit. If the session loaded `KnLiveDbgProbe.sys` with `probe load`, that probe service is also stopped and deleted during process cleanup. Use `drvstatus` to inspect SCM state plus the active single-controller owner/write-mode state. Use `probe load` when you want the optional positive-control driver loaded from the same output directory.
 
@@ -688,9 +713,14 @@ decimal count and also enables raw triage tables plus detail rendering;
 well, and `/summary` suppresses repetitive per-process warning detail; use
 `/json` for the full warning set. Normal image-backed
 `EXECUTE_WRITECOPY` VADs are tracked as copy-on-write executable mappings, not
-as generic W+X evidence; W+X hunt findings require actual writable executable
-permission or disk PE section evidence that the image exposes a writable
-executable section. Loader-owned image VADs are compared against disk PE section
+as generic W+X evidence. The kernel VAD protection is treated as the allocation
+default; when `VirtualQueryEx` can cover the whole VAD, hunt records the current
+committed permission subranges and correlates a thread, APC, or stack address
+against the exact page that contains it. A small RWX page inside a larger image
+VAD therefore does not make every thread in that VAD a W+X execution finding.
+W+X hunt findings require an exact writable-executable current page or disk PE
+section evidence that the image exposes a writable executable section.
+Loader-owned image VADs are compared against disk PE section
 characteristics, so execute/write permission drift over non-writable executable
 sections, entrypoint write-capability, and Mockingjay-style writable executable
 image sections are reported as module-stomping permission evidence. Generic W+X,
@@ -789,9 +819,9 @@ operator-facing console phrase is generalized.
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 ```
 
-Targets can be decimal PID, image name, or EPROCESS address. `!vad` resolves `_EPROCESS.VadRoot` through PDB/DIA type metadata, walks the balanced tree with bounded traversal and cycle detection, decodes VPN range, protection, private-memory, commit, large/no-change, subsection, and PE-like first-page evidence when available, then prints a compact table plus `[vad.summary]`. `/exec`, `/private`, `/wx`, and `/pe` narrow the output; `/pe` probes private VAD first pages with the same PE header detector used by pool PE hunting. `/hiddenpte` also walks the target process page tables from its DTB, subtracts the normalized VAD coverage plus known VAD-less OS shared mappings, and prints `[hidden-pte]` ranges where a present user PTE exists without VAD coverage, which is a DKOM-style hidden memory signal.
+Targets can be decimal PID, image name, or EPROCESS address. `!vad` resolves `_EPROCESS.VadRoot` through PDB/DIA type metadata, walks the balanced tree with bounded traversal and cycle detection, decodes VPN range, allocation/default protection, private-memory, commit, large/no-change, subsection, and PE-like first-page evidence when available, then enriches each VAD with current committed protection totals from `VirtualQueryEx`. `/exec`, `/private`, `/wx`, and `/pe` narrow the output; `/wx` means at least one currently writable-executable subrange when the effective query is complete, and `/pe` probes private VAD first pages with the same PE header detector used by pool PE hunting. `/hiddenpte` also walks the target process page tables from its DTB, subtracts the normalized VAD coverage plus known VAD-less OS shared mappings, and prints `[hidden-pte]` ranges where a present user PTE exists without VAD coverage, which is a DKOM-style hidden memory signal.
 
-`!threads` walks the process thread list, prints ETHREAD/TID/start/Win32StartAddress/TEB/module/VAD annotations, optionally includes user-stack bounds plus bounded stack references into suspicious executable memory, and `/apc` surfaces conservative APC queue evidence when ETHREAD/KAPC layouts are available. Both commands support `/json <path>` with stable field names for diffing. Warnings are expected on PDB drift, protected process/module enumeration failures, partial reads, or APC layouts that cannot be interpreted confidently.
+`!threads` walks the process thread list, prints ETHREAD/TID/start/Win32StartAddress/TEB/module/VAD annotations, optionally includes user-stack bounds plus bounded stack references into suspicious executable memory, and `/apc` surfaces conservative APC queue evidence when ETHREAD/KAPC layouts are available. Address-to-VAD annotations use the exact current protection subrange when available. On current Windows user APCs whose `KAPC.NormalRoutine` is an `ntdll.dll` dispatcher, the scanner also checks the context/argument slots and promotes a caller callback only when it resolves to suspicious executable provenance; ordinary data arguments remain telemetry. Both commands support `/json <path>` with stable field names for diffing. Warnings are expected on PDB drift, protected process/module enumeration failures, partial reads, or APC layouts that cannot be interpreted confidently.
 
 ## Kernel Callback Scanner
 
@@ -1168,7 +1198,7 @@ Symbolic forms (`nt!XXX`, `module+0xNN`, hex/decimal values, address expressions
 !driver integrity [driver|all] [/limit <n>] [/json <path>]
 ```
 
-`!module integrity` reads loaded kernel module PE headers from live memory, validates PE signatures, optional-header bounds, `SizeOfImage`, `SizeOfHeaders`, alignments, data directories, and section ranges, then page-walks executable/`.text` section first/last pages to flag static or effective W+X evidence. Console output stays compact by default; `/summary` suppresses records, `/verbose` shows every reported module and section, `/headers` prints PE header evidence, `/sections` prints all sections, `/wx` filters to W+X evidence, and `/mismatch` filters to size/header/section mismatch evidence. JSON output uses the stable `kn-live-dbg.module-integrity.v1` schema with summary counts, warnings, module reason codes, section reason codes, page-probe state, and notes for baseline diffing. `!driver integrity` walks `\Driver`, decodes `_DRIVER_OBJECT` fields from PDB/DIA metadata, annotates `MajorFunction[]` handlers with module/symbol ownership, and flags dispatch pointers outside loaded modules or redirected into another non-kernel driver image.
+`!module integrity` reads loaded kernel module PE headers from live memory, validates PE signatures, optional-header bounds, `SizeOfImage`, `SizeOfHeaders`, alignments, data directories, and section ranges, then page-walks executable/`.text` section first/last pages to flag static or effective W+X evidence. Live-vs-disk comparison masks loader-owned mutable bytes, including supported Dynamic Value Relocation Table Function Override fixups, while malformed or unsupported fixup metadata fails closed. Console output stays compact by default; `/summary` suppresses records, `/verbose` shows every reported module and section, `/headers` prints PE header evidence, `/sections` prints all sections, `/wx` filters to W+X evidence, and `/mismatch` filters to size/header/section mismatch evidence. JSON output uses the stable `kn-live-dbg.module-integrity.v1` schema with summary counts, warnings, module reason codes, section reason codes, page-probe state, and notes for baseline diffing. `!driver integrity` walks `\Driver`, decodes `_DRIVER_OBJECT` fields from PDB/DIA metadata, annotates `MajorFunction[]` handlers with module/symbol ownership, and flags only dispatch pointers outside every loaded module; cross-module handlers inside a loaded image are retained as delegation telemetry.
 
 Examples:
 

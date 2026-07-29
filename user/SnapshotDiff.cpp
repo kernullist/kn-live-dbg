@@ -6,9 +6,24 @@
 
 namespace
 {
+    std::wstring DiffRecordKey(
+        const std::wstring& domain,
+        const std::wstring& identity)
+    {
+        // A delimiter-only key can collide when an imported snapshot embeds
+        // that delimiter in a domain or identity. Prefix the domain length so
+        // every pair has one unambiguous representation.
+        return std::to_wstring(domain.size()) +
+            L":" +
+            domain +
+            identity;
+    }
+
     std::wstring DiffRecordKey(const SnapshotRecord& record)
     {
-        return record.Domain + L"\n" + record.Identity;
+        return DiffRecordKey(
+            record.Domain,
+            record.Identity);
     }
 
     bool DomainAllowed(const SnapshotDiffOptions& options, const std::wstring& domain)
@@ -68,28 +83,67 @@ namespace
         return oldValue != newValue;
     }
 
-    bool IsEscalatedRecord(const SnapshotRecord& oldRecord, const SnapshotRecord& newRecord)
+    bool DriverDispatchPointerChanged(
+        const SnapshotRecord& oldRecord,
+        const SnapshotRecord& newRecord)
+    {
+        auto stableNonemptyEvidence =
+            [&oldRecord, &newRecord](const std::wstring& key)
+            {
+                auto oldValue = oldRecord.Evidence.find(key);
+                auto newValue = newRecord.Evidence.find(key);
+                return oldValue != oldRecord.Evidence.end() &&
+                    newValue != newRecord.Evidence.end() &&
+                    !oldValue->second.empty() &&
+                    oldValue->second == newValue->second;
+            };
+
+        auto oldFunction =
+            oldRecord.Evidence.find(L"function");
+        auto newFunction =
+            newRecord.Evidence.find(L"function");
+        return
+            newRecord.Domain == L"drivers" &&
+            SnapshotRecordHasTag(oldRecord, L"dispatch") &&
+            SnapshotRecordHasTag(newRecord, L"dispatch") &&
+            stableNonemptyEvidence(L"driver_object") &&
+            stableNonemptyEvidence(L"driver_start") &&
+            oldFunction != oldRecord.Evidence.end() &&
+            newFunction != newRecord.Evidence.end() &&
+            !oldFunction->second.empty() &&
+            !newFunction->second.empty() &&
+            oldFunction->second != newFunction->second;
+    }
+
+    bool IsEscalatedRecord(
+        const SnapshotRecord& oldRecord,
+        const SnapshotRecord& newRecord,
+        bool sameBoot)
     {
         bool escalated = SnapshotRiskRank(newRecord.Risk) > SnapshotRiskRank(oldRecord.Risk);
 
-        if (!escalated && newRecord.Domain == L"drivers" && SnapshotRecordHasTag(newRecord, L"dispatch"))
+        if (!escalated &&
+            sameBoot &&
+            DriverDispatchPointerChanged(oldRecord, newRecord))
         {
-            escalated = EvidenceChanged(oldRecord, newRecord, L"function") ||
-                EvidenceChanged(oldRecord, newRecord, L"module") ||
-                EvidenceChanged(oldRecord, newRecord, L"in_loaded_module");
-            if (escalated && SnapshotRiskRank(newRecord.Risk) < 2)
-            {
-                escalated = false;
-            }
+            // Cross-image delegation is legitimate for many driver stacks, but
+            // the actual MajorFunction pointer should remain stable within the
+            // same boot. Preserve that temporal detection even when the static
+            // record is intentionally low-risk telemetry.
+            escalated = true;
         }
 
-        if (!escalated && newRecord.Domain == L"etw")
+        if (!escalated &&
+            sameBoot &&
+            newRecord.Domain == L"etw")
         {
             escalated = EvidenceChanged(oldRecord, newRecord, L"get_cpu_clock") &&
                 SnapshotRiskRank(newRecord.Risk) >= 2;
         }
 
-        if (!escalated && newRecord.Domain == L"cpu-state")
+        if (!escalated &&
+            sameBoot &&
+            newRecord.Domain == L"cpu-state")
         {
             // The kernel keeps these values/tables stable within a boot, so any
             // change to a SYSCALL MSR / control register value or an SSDT/IDT
@@ -140,7 +194,10 @@ namespace
                 break;
             }
 
-            key = L"drivers\n" + std::wstring(L"driver:") + SnapshotToLower(driver->second);
+            key = DiffRecordKey(
+                L"drivers",
+                std::wstring(L"driver:") +
+                    SnapshotToLower(driver->second));
         } while (false);
 
         return key;
@@ -333,9 +390,50 @@ bool BuildSnapshotDiff(
         }
 
         std::map<std::wstring, SnapshotRecord> oldRecords;
+        bool uniqueRecords = true;
         for (const SnapshotRecord& record : oldSnapshot.Records)
         {
-            oldRecords[DiffRecordKey(record)] = record;
+            const std::wstring key = DiffRecordKey(record);
+            if (!oldRecords.emplace(key, record).second)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"baseline snapshot contains duplicate record identity: " +
+                        record.Domain +
+                        L"/" +
+                        record.Identity;
+                }
+                uniqueRecords = false;
+                break;
+            }
+        }
+        if (!uniqueRecords)
+        {
+            break;
+        }
+
+        std::set<std::wstring> newRecordKeys;
+        for (const SnapshotRecord& record : newSnapshot.Records)
+        {
+            if (!newRecordKeys.insert(
+                    DiffRecordKey(record)).second)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"current snapshot contains duplicate record identity: " +
+                        record.Domain +
+                        L"/" +
+                        record.Identity;
+                }
+                uniqueRecords = false;
+                break;
+            }
+        }
+        if (!uniqueRecords)
+        {
+            break;
         }
 
         std::set<std::wstring> addedDriverParents;
@@ -408,12 +506,26 @@ bool BuildSnapshotDiff(
                     ++result->High;
                 }
             }
-            else if (IsEscalatedRecord(oldIt->second, record))
+            else if (IsEscalatedRecord(oldIt->second, record, result->SameBoot))
             {
                 SnapshotDiffFinding finding;
                 finding.Kind = L"escalated";
                 finding.OldRecord = oldIt->second;
                 finding.NewRecord = record;
+                if (result->SameBoot &&
+                    DriverDispatchPointerChanged(oldIt->second, record) &&
+                    SnapshotRiskRank(finding.NewRecord.Risk) < 2)
+                {
+                    finding.NewRecord.Risk = L"medium";
+                    finding.NewRecord.Tags.push_back(L"baseline-pointer-change");
+                    auto oldFunction =
+                        oldIt->second.Evidence.find(L"function");
+                    if (oldFunction != oldIt->second.Evidence.end())
+                    {
+                        finding.NewRecord.Evidence[L"baseline_function"] =
+                            oldFunction->second;
+                    }
+                }
                 result->Findings.push_back(std::move(finding));
                 ++result->Escalated;
                 if (SnapshotRiskRank(record.Risk) >= 3)
@@ -434,4 +546,195 @@ bool BuildSnapshotDiff(
     } while (false);
 
     return ok;
+}
+
+bool SnapshotDriverDispatchDiffSelfTest()
+{
+    SnapshotRecord oldDispatch = {};
+    oldDispatch.Domain = L"drivers";
+    oldDispatch.Identity = L"driver-dispatch:selftest:14";
+    oldDispatch.Display = L"selftest DEVICE_CONTROL";
+    oldDispatch.Risk = L"low";
+    oldDispatch.Tags = {L"dispatch"};
+    oldDispatch.Evidence[L"driver"] = L"selftest";
+    oldDispatch.Evidence[L"driver_object"] =
+        L"0xffffa00000001000";
+    oldDispatch.Evidence[L"driver_start"] =
+        L"0xfffff80000000000";
+    oldDispatch.Evidence[L"function"] = L"0xfffff80000001000";
+
+    SnapshotRecord newDispatch = oldDispatch;
+    newDispatch.Evidence[L"function"] = L"0xfffff80000002000";
+
+    SnapshotDocument oldSnapshot = {};
+    SnapshotDocument newSnapshot = {};
+    oldSnapshot.Records.push_back(oldDispatch);
+    newSnapshot.Records.push_back(newDispatch);
+
+    SnapshotDiffOptions options = {};
+    options.InMemoryBaseline = true;
+    options.Details = true;
+    SnapshotDiffResult result = {};
+    std::wstring error;
+    if (!BuildSnapshotDiff(
+            oldSnapshot,
+            newSnapshot,
+            options,
+            &result,
+            &error) ||
+        result.Findings.size() != 1 ||
+        result.Findings[0].Kind != L"escalated" ||
+        result.Findings[0].NewRecord.Risk != L"medium" ||
+        !SnapshotRecordHasTag(
+            result.Findings[0].NewRecord,
+            L"baseline-pointer-change"))
+    {
+        return false;
+    }
+
+    SnapshotDocument reloadedSnapshot = newSnapshot;
+    reloadedSnapshot.Records[0].Evidence[L"driver_object"] =
+        L"0xffffa00000002000";
+    SnapshotDiffResult reloadedResult = {};
+    if (!BuildSnapshotDiff(
+            oldSnapshot,
+            reloadedSnapshot,
+            options,
+            &reloadedResult,
+            &error) ||
+        !reloadedResult.Findings.empty())
+    {
+        return false;
+    }
+
+    SnapshotDocument typeChangedBaseline = oldSnapshot;
+    typeChangedBaseline.Records[0].Tags.clear();
+    SnapshotDiffResult typeChangedResult = {};
+    if (!BuildSnapshotDiff(
+            typeChangedBaseline,
+            newSnapshot,
+            options,
+            &typeChangedResult,
+            &error) ||
+        !typeChangedResult.Findings.empty())
+    {
+        return false;
+    }
+
+    SnapshotDocument missingFunctionBaseline = oldSnapshot;
+    missingFunctionBaseline.Records[0].Evidence.erase(
+        L"function");
+    SnapshotDiffResult missingFunctionResult = {};
+    if (!BuildSnapshotDiff(
+            missingFunctionBaseline,
+            newSnapshot,
+            options,
+            &missingFunctionResult,
+            &error) ||
+        !missingFunctionResult.Findings.empty())
+    {
+        return false;
+    }
+
+    SnapshotDocument duplicateBaseline = oldSnapshot;
+    duplicateBaseline.Records.push_back(oldDispatch);
+    SnapshotDiffResult duplicateResult = {};
+    if (BuildSnapshotDiff(
+            duplicateBaseline,
+            newSnapshot,
+            options,
+            &duplicateResult,
+            &error))
+    {
+        return false;
+    }
+
+    SnapshotRecord collisionA = {};
+    collisionA.Domain = L"a";
+    collisionA.Identity = L"b\nc";
+    collisionA.Risk = L"low";
+    SnapshotRecord collisionB = {};
+    collisionB.Domain = L"a\nb";
+    collisionB.Identity = L"c";
+    collisionB.Risk = L"low";
+    SnapshotDocument collisionOld = {};
+    collisionOld.Records = {collisionA, collisionB};
+    SnapshotDocument collisionNew = collisionOld;
+    SnapshotDiffResult collisionResult = {};
+    if (!BuildSnapshotDiff(
+            collisionOld,
+            collisionNew,
+            options,
+            &collisionResult,
+            &error) ||
+        !collisionResult.Findings.empty())
+    {
+        return false;
+    }
+
+    oldSnapshot.SameBootOnly = true;
+    newSnapshot.SameBootOnly = true;
+    oldSnapshot.BootId = L"boot-a";
+    newSnapshot.BootId = L"boot-b";
+    options.InMemoryBaseline = false;
+    result = {};
+    if (!BuildSnapshotDiff(
+            oldSnapshot,
+            newSnapshot,
+            options,
+            &result,
+            &error) ||
+        result.SameBoot ||
+        !result.Findings.empty())
+    {
+        return false;
+    }
+
+    SnapshotRecord oldEtw = {};
+    oldEtw.Domain = L"etw";
+    oldEtw.Identity = L"logger:selftest";
+    oldEtw.Risk = L"medium";
+    oldEtw.Evidence[L"get_cpu_clock"] =
+        L"0xfffff80000001000";
+    SnapshotRecord newEtw = oldEtw;
+    newEtw.Evidence[L"get_cpu_clock"] =
+        L"0xfffff80000002000";
+    SnapshotDocument oldEtwSnapshot = {};
+    SnapshotDocument newEtwSnapshot = {};
+    oldEtwSnapshot.SameBootOnly = true;
+    newEtwSnapshot.SameBootOnly = true;
+    oldEtwSnapshot.BootId = L"boot-a";
+    newEtwSnapshot.BootId = L"boot-b";
+    oldEtwSnapshot.Records.push_back(oldEtw);
+    newEtwSnapshot.Records.push_back(newEtw);
+    SnapshotDiffResult etwResult = {};
+    if (!BuildSnapshotDiff(
+            oldEtwSnapshot,
+            newEtwSnapshot,
+            options,
+            &etwResult,
+            &error) ||
+        etwResult.SameBoot ||
+        !etwResult.Findings.empty())
+    {
+        return false;
+    }
+
+    // A normal risk-rank change remains reportable across boots, but a
+    // coincidental dispatch-address change must not acquire the stronger
+    // same-boot pointer-change label or risk promotion.
+    oldSnapshot.Records[0].Risk = L"info";
+    result = {};
+    return BuildSnapshotDiff(
+               oldSnapshot,
+               newSnapshot,
+               options,
+               &result,
+               &error) &&
+        !result.SameBoot &&
+        result.Findings.size() == 1 &&
+        result.Findings[0].NewRecord.Risk == L"low" &&
+        !SnapshotRecordHasTag(
+            result.Findings[0].NewRecord,
+            L"baseline-pointer-change");
 }

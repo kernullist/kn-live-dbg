@@ -671,6 +671,120 @@ bool DeviceClient::ReadMemory(
     return ok;
 }
 
+bool DeviceClient::ReadProcessVirtual(
+    uint32_t processId,
+    uint64_t expectedEprocess,
+    uint64_t expectedCreateTime,
+    uint64_t address,
+    uint32_t length,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (bytes != nullptr)
+        {
+            bytes->clear();
+        }
+        if (bytes == nullptr ||
+            processId == 0 ||
+            expectedEprocess == 0 ||
+            expectedCreateTime == 0 ||
+            length == 0 ||
+            length > KNDBG_MAX_TRANSFER_SIZE)
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"Invalid process virtual read request";
+            }
+            break;
+        }
+
+        const DWORD headerLength =
+            FIELD_OFFSET(
+                KNDBG_PROCESS_VIRTUAL_READ_REQUEST,
+                Data);
+        const DWORD bufferLength = headerLength + length;
+        if (bufferLength < headerLength)
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"Process virtual read buffer overflow";
+            }
+            break;
+        }
+
+        std::vector<uint8_t> buffer(bufferLength);
+        KNDBG_PROCESS_VIRTUAL_READ_REQUEST* request =
+            reinterpret_cast<
+                KNDBG_PROCESS_VIRTUAL_READ_REQUEST*>(
+                    buffer.data());
+        request->Size = headerLength;
+        request->ProcessId = processId;
+        request->ExpectedEprocess = expectedEprocess;
+        request->ExpectedCreateTime =
+            expectedCreateTime;
+        request->Address = address;
+        request->Length = length;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_READ_PROCESS_VIRTUAL,
+                buffer.data(),
+                headerLength,
+                bufferLength,
+                &returned,
+                error))
+        {
+            break;
+        }
+        if (returned < headerLength)
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"Short process virtual read response";
+            }
+            break;
+        }
+
+        const KNDBG_PROCESS_VIRTUAL_READ_REQUEST* response =
+            reinterpret_cast<
+                const KNDBG_PROCESS_VIRTUAL_READ_REQUEST*>(
+                    buffer.data());
+        if (response->Size != bufferLength ||
+            response->Flags != 0 ||
+            response->Reserved != 0 ||
+            response->Reserved2 != 0 ||
+            response->ProcessId != processId ||
+            response->ExpectedEprocess != expectedEprocess ||
+            response->ExpectedCreateTime !=
+                expectedCreateTime ||
+            response->Address != address ||
+            response->Length != length ||
+            returned < headerLength + length)
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"Invalid process virtual read response";
+            }
+            break;
+        }
+
+        bytes->assign(
+            buffer.begin() + headerLength,
+            buffer.begin() + headerLength + length);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::WriteMemory(uint64_t address, const std::vector<uint8_t>& bytes, std::wstring* error)
 {
     bool ok = false;

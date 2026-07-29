@@ -125,6 +125,7 @@ struct DriverDispatchRecord
     std::wstring SymbolName;
     bool InLoadedModule = false;
     bool InOwningImage = false;
+    bool DelegatedToLoadedModule = false;
     bool Suspicious = false;
     std::wstring Notes;
 };

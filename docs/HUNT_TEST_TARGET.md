@@ -193,14 +193,14 @@ operator-facing console labels.
 | Option | Artifact | Expected `!hunt` reason codes |
 | --- | --- | --- |
 | `/baseline` | No positive-control artifacts | No target-specific findings in strict baseline validation |
-| `/private-exec` | Private executable RX page | `private_executable_vad` |
-| `/rwx` | Private executable writable page | `wx_user_vad`, `private_executable_vad` |
+| `/private-exec` | Private executable RX page | Raw `!vad /exec /private` telemetry only; no standalone `hunt` finding without execution or stronger provenance |
+| `/rwx` | Private executable writable page | Raw `!vad /wx` telemetry only; no standalone `hunt` finding without execution or stronger provenance |
 | `/large-private-exec` | Large private executable RX region | `large_private_executable_vad`, `private_executable_vad` |
 | `/pe-like` | Private executable page copied from this EXE's PE header | `private_pe_mapping`, `private_pe_without_loader_entry` |
 | `/wiped-pe` | PE-like private page with wiped `MZ` and `PE` signatures | `wiped_pe_header`, `private_pe_mapping` |
-| `/thread` | Thread start address inside private executable memory | `suspicious_thread_start` |
-| `/apc` | Queued APC normal routine inside private executable memory | `suspicious_apc_routine` |
-| `/threadless-stack` | Normal module thread whose user stack references private executable memory | `stack_reference_to_executable_memory`, `stack_reference_to_private_executable_vad`, `stack_reference_to_user_executable_outside_module` |
+| `/thread` | Thread start address inside private executable memory | `suspicious_thread_start`, `private_executable_vad` |
+| `/apc` | Queued user APC callback inside private executable memory | `suspicious_apc_routine`, `private_executable_vad` |
+| `/threadless-stack` | Normal module thread whose user stack references a private PE-like executable mapping | `stack_reference_to_executable_memory`, `stack_reference_to_private_executable_vad`, `stack_reference_to_user_executable_outside_module` |
 | `/module-patch` | Loaded fixture DLL export bytes modified in this process | `live_disk_exec_page_mismatch`, `module_text_mismatch` or `module_entrypoint_mismatch` |
 | `/module-patch-late` | Loaded fixture DLL export in a later executable section modified in this process | `live_disk_exec_page_mismatch`, `module_text_mismatch`, `module_stomping_evidence` |
 | `/stomp-thread` | Thread start address inside a modified module executable page | `thread_start_in_modified_module_page`, `module_stomping_evidence` |
@@ -257,6 +257,14 @@ Use `-Strict` with `/baseline` when validating that the target process itself
 does not produce positive-control findings.
 This is a reason-code plus bounded evidence-contract check; inspect the full
 JSON evidence when validating address ownership or page-level provenance.
+
+`/private-exec` and `/rwx` are deliberately telemetry-only controls. Private RX
+and RWX allocations are common in JIT engines and security emulators, so the
+whole-host hunter keeps their counts and raw VAD records but only promotes them
+when there is execution correlation, PE/header evidence, unusually large
+private code, image permission drift, or a corroborating built-in-process
+identity violation. `/thread`, `/apc`, `/threadless-stack`, `/large-private-exec`,
+`/pe-like`, and `/wiped-pe` remain finding-producing positive controls.
 
 ## Image-Section Fixtures
 
@@ -421,33 +429,39 @@ than by making this target change host firewall state.
 6. `/locked-backed-image` uses share-mode denial rather than deleting the
    backing file because Windows normally blocks immediate deletion of an active
    image section with `ERROR_ACCESS_DENIED`.
-7. Browser, .NET, and JIT-heavy systems may produce additional private
-   executable findings. Weak private RX-only VADs and generic W+X VAD-only
-   findings are reported at lower risk/confidence and capped per process.
-   PE-like private VADs without observed thread/APC/stack execution are also
-   low-risk leads; filter by `image=KnLiveDbgHuntTarget.exe` or use the JSON
-   output when validating reason codes.
+7. Browser, .NET, security-emulator, and JIT-heavy systems commonly contain
+   private executable or small RWX regions. Weak private RX-only and generic W+X
+   VAD primitives remain raw telemetry unless exact-page execution or stronger
+   provenance corroborates them. Current permissions come from complete
+   `VirtualQueryEx` subranges when available, so a 4 KB RWX page does not taint
+   unrelated thread starts elsewhere in a large image VAD.
 8. Image-backed `EXECUTE_WRITECOPY` VADs are treated as executable
    copy-on-write mappings rather than generic W+X evidence. Image-backed
    writable executable findings include disk PE section evidence so operators
    can separate default RWX section exposure from live permission drift on
    normally RX or non-executable sections.
 9. `/threadless-stack` keeps the thread start in normal module code but leaves
-   a private executable address on the user stack. This validates the deep
+   a private PE-like executable address on the user stack. This validates the deep
    stack-reference correlation used for threadless and worker-callback style
    execution evidence without cross-process injection. The
    `stack_reference_to_user_executable_outside_module` reason is emitted only
-   when user module enumeration succeeded for the target process.
-10. Built-in module provenance findings are intentionally path-provenance
+    when user module enumeration succeeded for the target process.
+10. On current Windows builds a queued user APC can use an `ntdll.dll`
+    dispatcher as `KAPC.NormalRoutine` and carry the requested callback in
+    `NormalContext` or an argument slot. The target synchronizes with the
+    non-alertable waiter before queueing; the scanner records both addresses and
+    promotes the carried callback only when its exact page has suspicious
+    executable provenance.
+11. Built-in module provenance findings are intentionally path-provenance
     signals. They are strongest for core Windows service profiles and should be
     reviewed with module signature and vendor context in real endpoint data.
-11. `/deep` stack correlation uses a per-process stack-pointer cache instead of
+12. `/deep` stack correlation uses a per-process stack-pointer cache instead of
     rereading every user stack for every modified executable page. The JSON
     evidence includes the cache sample count and whether the cache hit its
     per-process cap.
-12. The target is intentionally noisy. Do not run it as a clean-baseline
+13. The target is intentionally noisy. Do not run it as a clean-baseline
     process.
-13. `/edr-killer-suffix-name` creates temporary self-copies and child processes.
+14. `/edr-killer-suffix-name` creates temporary self-copies and child processes.
     Each child waits for the parent process or the configured `/seconds`
     timeout, and parent cleanup removes the temporary copies after the children
     exit.

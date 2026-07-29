@@ -61,3 +61,5 @@ bool BuildSnapshotDiff(
     const SnapshotDiffOptions& options,
     SnapshotDiffResult* result,
     std::wstring* error);
+
+bool SnapshotDriverDispatchDiffSelfTest();

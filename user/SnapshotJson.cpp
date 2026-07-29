@@ -2,86 +2,122 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <set>
 #include <sstream>
 
 namespace
 {
-    std::string WideToUtf8(const std::wstring& value)
+    constexpr uint64_t kMaxSnapshotTextFileBytes =
+        64ull * 1024ull * 1024ull;
+
+    bool WideToUtf8(
+        const std::wstring& value,
+        std::string* result)
     {
-        std::string result;
-
-        do
+        if (result == nullptr)
         {
-            if (value.empty())
-            {
-                break;
-            }
+            return false;
+        }
+        result->clear();
 
-            int required = WideCharToMultiByte(
-                CP_UTF8,
-                0,
-                value.c_str(),
-                static_cast<int>(value.size()),
-                nullptr,
-                0,
-                nullptr,
-                nullptr);
-            if (required <= 0)
-            {
-                break;
-            }
+        if (value.empty())
+        {
+            return true;
+        }
 
-            result.resize(required);
-            WideCharToMultiByte(
+        if (value.size() >
+            static_cast<size_t>(
+                std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        const int inputLength =
+            static_cast<int>(value.size());
+        const int required = WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            value.data(),
+            inputLength,
+            nullptr,
+            0,
+            nullptr,
+            nullptr);
+        if (required <= 0)
+        {
+            return false;
+        }
+
+        result->resize(required);
+        if (WideCharToMultiByte(
                 CP_UTF8,
-                0,
-                value.c_str(),
-                static_cast<int>(value.size()),
-                &result[0],
+                WC_ERR_INVALID_CHARS,
+                value.data(),
+                inputLength,
+                result->data(),
                 required,
                 nullptr,
-                nullptr);
-        } while (false);
-
-        return result;
+                nullptr) != required)
+        {
+            result->clear();
+            return false;
+        }
+        return true;
     }
 
-    std::wstring Utf8ToWide(const std::string& value)
+    bool Utf8ToWide(
+        const std::string& value,
+        std::wstring* result)
     {
-        std::wstring result;
-
-        do
+        if (result == nullptr)
         {
-            if (value.empty())
-            {
-                break;
-            }
+            return false;
+        }
+        result->clear();
 
-            int required = MultiByteToWideChar(
+        if (value.empty())
+        {
+            return true;
+        }
+
+        if (value.size() >
+            static_cast<size_t>(
+                std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        const int inputLength =
+            static_cast<int>(value.size());
+        const int required = MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.data(),
+            inputLength,
+            nullptr,
+            0);
+        if (required <= 0)
+        {
+            return false;
+        }
+
+        result->resize(required);
+        if (MultiByteToWideChar(
                 CP_UTF8,
-                0,
+                MB_ERR_INVALID_CHARS,
                 value.data(),
-                static_cast<int>(value.size()),
-                nullptr,
-                0);
-            if (required <= 0)
-            {
-                break;
-            }
-
-            result.resize(required);
-            MultiByteToWideChar(
-                CP_UTF8,
-                0,
-                value.data(),
-                static_cast<int>(value.size()),
-                &result[0],
-                required);
-        } while (false);
-
-        return result;
+                inputLength,
+                result->data(),
+                required) != required)
+        {
+            result->clear();
+            return false;
+        }
+        return true;
     }
 
     std::wstring DirectoryFromPath(const std::wstring& path)
@@ -247,8 +283,12 @@ namespace
                     ok = true;
                     break;
                 }
-                if (ch == L'\\' && index + 1 < text.size())
+                if (ch == L'\\')
                 {
+                    if (index + 1 >= text.size())
+                    {
+                        break;
+                    }
                     wchar_t esc = text[++index];
                     if (esc == L'"' || esc == L'\\' || esc == L'/')
                     {
@@ -274,8 +314,12 @@ namespace
                     {
                         parsed.push_back(L'\t');
                     }
-                    else if (esc == L'u' && index + 4 < text.size())
+                    else if (esc == L'u')
                     {
+                        if (index + 4 >= text.size())
+                        {
+                            break;
+                        }
                         uint32_t codepoint = 0;
                         bool valid = true;
                         for (size_t offset = 1; offset <= 4; ++offset)
@@ -289,20 +333,73 @@ namespace
                             codepoint = (codepoint << 4) | static_cast<uint32_t>(digit);
                         }
 
-                        if (valid)
+                        if (!valid)
                         {
-                            parsed.push_back(static_cast<wchar_t>(codepoint));
-                            index += 4;
+                            break;
+                        }
+                        if (codepoint >= 0xd800u &&
+                            codepoint <= 0xdbffu)
+                        {
+                            if (index + 10 >= text.size() ||
+                                text[index + 5] != L'\\' ||
+                                text[index + 6] != L'u')
+                            {
+                                break;
+                            }
+
+                            uint32_t lowSurrogate = 0;
+                            for (size_t offset = 7;
+                                 offset <= 10;
+                                 ++offset)
+                            {
+                                int digit =
+                                    HexDigitValue(
+                                        text[index + offset]);
+                                if (digit < 0)
+                                {
+                                    valid = false;
+                                    break;
+                                }
+                                lowSurrogate =
+                                    (lowSurrogate << 4) |
+                                    static_cast<uint32_t>(digit);
+                            }
+                            if (!valid ||
+                                lowSurrogate < 0xdc00u ||
+                                lowSurrogate > 0xdfffu)
+                            {
+                                break;
+                            }
+
+                            parsed.push_back(
+                                static_cast<wchar_t>(
+                                    codepoint));
+                            parsed.push_back(
+                                static_cast<wchar_t>(
+                                    lowSurrogate));
+                            index += 10;
+                        }
+                        else if (codepoint >= 0xdc00u &&
+                                 codepoint <= 0xdfffu)
+                        {
+                            break;
                         }
                         else
                         {
-                            parsed.push_back(esc);
+                            parsed.push_back(
+                                static_cast<wchar_t>(
+                                    codepoint));
+                            index += 4;
                         }
                     }
                     else
                     {
-                        parsed.push_back(esc);
+                        break;
                     }
+                }
+                else if (ch < 0x20)
+                {
+                    break;
                 }
                 else
                 {
@@ -314,21 +411,473 @@ namespace
         return ok;
     }
 
+    constexpr size_t kMaxJsonNestingDepth = 128;
+
+    bool IsJsonWhitespace(wchar_t value)
+    {
+        return value == L' ' ||
+            value == L'\t' ||
+            value == L'\r' ||
+            value == L'\n';
+    }
+
+    void SkipJsonWhitespace(
+        const std::wstring& text,
+        size_t* index)
+    {
+        if (index == nullptr)
+        {
+            return;
+        }
+        while (*index < text.size() &&
+               IsJsonWhitespace(text[*index]))
+        {
+            ++*index;
+        }
+    }
+
+    bool ParseJsonValueAt(
+        const std::wstring& text,
+        size_t* index,
+        size_t depth);
+
+    bool ParseJsonNumberAt(
+        const std::wstring& text,
+        size_t* index)
+    {
+        if (index == nullptr || *index >= text.size())
+        {
+            return false;
+        }
+
+        size_t cursor = *index;
+        if (text[cursor] == L'-')
+        {
+            ++cursor;
+        }
+        if (cursor >= text.size())
+        {
+            return false;
+        }
+
+        if (text[cursor] == L'0')
+        {
+            ++cursor;
+            if (cursor < text.size() &&
+                text[cursor] >= L'0' &&
+                text[cursor] <= L'9')
+            {
+                return false;
+            }
+        }
+        else if (text[cursor] >= L'1' &&
+                 text[cursor] <= L'9')
+        {
+            do
+            {
+                ++cursor;
+            } while (cursor < text.size() &&
+                     text[cursor] >= L'0' &&
+                     text[cursor] <= L'9');
+        }
+        else
+        {
+            return false;
+        }
+
+        if (cursor < text.size() && text[cursor] == L'.')
+        {
+            ++cursor;
+            const size_t fractionStart = cursor;
+            while (cursor < text.size() &&
+                   text[cursor] >= L'0' &&
+                   text[cursor] <= L'9')
+            {
+                ++cursor;
+            }
+            if (cursor == fractionStart)
+            {
+                return false;
+            }
+        }
+
+        if (cursor < text.size() &&
+            (text[cursor] == L'e' ||
+             text[cursor] == L'E'))
+        {
+            ++cursor;
+            if (cursor < text.size() &&
+                (text[cursor] == L'+' ||
+                 text[cursor] == L'-'))
+            {
+                ++cursor;
+            }
+            const size_t exponentStart = cursor;
+            while (cursor < text.size() &&
+                   text[cursor] >= L'0' &&
+                   text[cursor] <= L'9')
+            {
+                ++cursor;
+            }
+            if (cursor == exponentStart)
+            {
+                return false;
+            }
+        }
+
+        *index = cursor;
+        return true;
+    }
+
+    bool ParseJsonObjectAt(
+        const std::wstring& text,
+        size_t* index,
+        size_t depth)
+    {
+        if (index == nullptr ||
+            *index >= text.size() ||
+            text[*index] != L'{' ||
+            depth > kMaxJsonNestingDepth)
+        {
+            return false;
+        }
+
+        size_t cursor = *index + 1;
+        SkipJsonWhitespace(text, &cursor);
+        if (cursor < text.size() &&
+            text[cursor] == L'}')
+        {
+            *index = cursor + 1;
+            return true;
+        }
+
+        std::set<std::wstring> keys;
+        for (;;)
+        {
+            std::wstring key;
+            size_t next = 0;
+            if (!ParseJsonStringAt(
+                    text,
+                    cursor,
+                    &key,
+                    &next) ||
+                !keys.insert(key).second)
+            {
+                return false;
+            }
+
+            cursor = next;
+            SkipJsonWhitespace(text, &cursor);
+            if (cursor >= text.size() ||
+                text[cursor] != L':')
+            {
+                return false;
+            }
+            ++cursor;
+            SkipJsonWhitespace(text, &cursor);
+            if (!ParseJsonValueAt(
+                    text,
+                    &cursor,
+                    depth + 1))
+            {
+                return false;
+            }
+
+            SkipJsonWhitespace(text, &cursor);
+            if (cursor >= text.size())
+            {
+                return false;
+            }
+            if (text[cursor] == L'}')
+            {
+                *index = cursor + 1;
+                return true;
+            }
+            if (text[cursor] != L',')
+            {
+                return false;
+            }
+            ++cursor;
+            SkipJsonWhitespace(text, &cursor);
+        }
+    }
+
+    bool ParseJsonArrayAt(
+        const std::wstring& text,
+        size_t* index,
+        size_t depth)
+    {
+        if (index == nullptr ||
+            *index >= text.size() ||
+            text[*index] != L'[' ||
+            depth > kMaxJsonNestingDepth)
+        {
+            return false;
+        }
+
+        size_t cursor = *index + 1;
+        SkipJsonWhitespace(text, &cursor);
+        if (cursor < text.size() &&
+            text[cursor] == L']')
+        {
+            *index = cursor + 1;
+            return true;
+        }
+
+        for (;;)
+        {
+            if (!ParseJsonValueAt(
+                    text,
+                    &cursor,
+                    depth + 1))
+            {
+                return false;
+            }
+            SkipJsonWhitespace(text, &cursor);
+            if (cursor >= text.size())
+            {
+                return false;
+            }
+            if (text[cursor] == L']')
+            {
+                *index = cursor + 1;
+                return true;
+            }
+            if (text[cursor] != L',')
+            {
+                return false;
+            }
+            ++cursor;
+            SkipJsonWhitespace(text, &cursor);
+        }
+    }
+
+    bool ParseJsonValueAt(
+        const std::wstring& text,
+        size_t* index,
+        size_t depth)
+    {
+        if (index == nullptr ||
+            *index >= text.size() ||
+            depth > kMaxJsonNestingDepth)
+        {
+            return false;
+        }
+
+        if (text[*index] == L'{')
+        {
+            return ParseJsonObjectAt(
+                text,
+                index,
+                depth);
+        }
+        if (text[*index] == L'[')
+        {
+            return ParseJsonArrayAt(
+                text,
+                index,
+                depth);
+        }
+        if (text[*index] == L'"')
+        {
+            std::wstring ignored;
+            size_t next = 0;
+            if (!ParseJsonStringAt(
+                    text,
+                    *index,
+                    &ignored,
+                    &next))
+            {
+                return false;
+            }
+            *index = next;
+            return true;
+        }
+
+        const struct
+        {
+            const wchar_t* Text;
+            size_t Length;
+        } literals[] =
+        {
+            {L"true", 4},
+            {L"false", 5},
+            {L"null", 4}
+        };
+        for (const auto& literal : literals)
+        {
+            if (text.compare(
+                    *index,
+                    literal.Length,
+                    literal.Text) == 0)
+            {
+                *index += literal.Length;
+                return true;
+            }
+        }
+
+        return ParseJsonNumberAt(text, index);
+    }
+
+    bool ValidateJsonDocument(
+        const std::wstring& text)
+    {
+        size_t index = 0;
+        SkipJsonWhitespace(text, &index);
+        if (index >= text.size() ||
+            text[index] != L'{' ||
+            !ParseJsonValueAt(text, &index, 0))
+        {
+            return false;
+        }
+        SkipJsonWhitespace(text, &index);
+        return index == text.size();
+    }
+
+    enum class JsonKeyLookup
+    {
+        Missing,
+        Found,
+        Invalid
+    };
+
+    JsonKeyLookup FindTopLevelJsonKey(
+        const std::wstring& json,
+        const std::wstring& key,
+        size_t* colon)
+    {
+        int objectDepth = 0;
+        int arrayDepth = 0;
+        bool found = false;
+        bool rootStarted = false;
+        bool rootClosed = false;
+        size_t foundColon = 0;
+
+        for (size_t index = 0; index < json.size(); ++index)
+        {
+            wchar_t ch = json[index];
+            if (rootClosed)
+            {
+                if (iswspace(ch) == 0)
+                {
+                    return JsonKeyLookup::Invalid;
+                }
+                continue;
+            }
+            if (ch == L'{')
+            {
+                if (!rootStarted)
+                {
+                    rootStarted = true;
+                }
+                else if (objectDepth == 0)
+                {
+                    return JsonKeyLookup::Invalid;
+                }
+                ++objectDepth;
+            }
+            else if (ch == L'}')
+            {
+                if (objectDepth == 0)
+                {
+                    return JsonKeyLookup::Invalid;
+                }
+                --objectDepth;
+                if (objectDepth == 0)
+                {
+                    if (arrayDepth != 0)
+                    {
+                        return JsonKeyLookup::Invalid;
+                    }
+                    rootClosed = true;
+                }
+            }
+            else if (ch == L'[')
+            {
+                if (!rootStarted || objectDepth == 0)
+                {
+                    return JsonKeyLookup::Invalid;
+                }
+                ++arrayDepth;
+            }
+            else if (ch == L']')
+            {
+                if (arrayDepth == 0)
+                {
+                    return JsonKeyLookup::Invalid;
+                }
+                --arrayDepth;
+            }
+            else if (ch == L'"')
+            {
+                if (!rootStarted || objectDepth == 0)
+                {
+                    return JsonKeyLookup::Invalid;
+                }
+                std::wstring parsed;
+                size_t next = 0;
+                if (!ParseJsonStringAt(json, index, &parsed, &next))
+                {
+                    return JsonKeyLookup::Invalid;
+                }
+
+                if (objectDepth == 1 && arrayDepth == 0)
+                {
+                    size_t probe = next;
+                    while (probe < json.size() &&
+                           iswspace(json[probe]) != 0)
+                    {
+                        ++probe;
+                    }
+                    if (probe < json.size() &&
+                        json[probe] == L':' &&
+                        parsed == key)
+                    {
+                        if (found)
+                        {
+                            return JsonKeyLookup::Invalid;
+                        }
+                        found = true;
+                        foundColon = probe;
+                    }
+                }
+
+                index = next - 1;
+            }
+            else if (!rootStarted && iswspace(ch) == 0)
+            {
+                return JsonKeyLookup::Invalid;
+            }
+        }
+
+        if (!rootStarted ||
+            !rootClosed ||
+            objectDepth != 0 ||
+            arrayDepth != 0)
+        {
+            return JsonKeyLookup::Invalid;
+        }
+        if (!found)
+        {
+            return JsonKeyLookup::Missing;
+        }
+        if (colon != nullptr)
+        {
+            *colon = foundColon;
+        }
+        return JsonKeyLookup::Found;
+    }
+
     bool ExtractJsonStringValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
     {
         bool ok = false;
-        std::wstring pattern = L"\"" + key + L"\"";
-        size_t pos = json.find(pattern);
+        size_t colon = 0;
 
         do
         {
-            if (value == nullptr || pos == std::wstring::npos)
-            {
-                break;
-            }
-
-            size_t colon = json.find(L':', pos + pattern.size());
-            if (colon == std::wstring::npos)
+            if (value == nullptr ||
+                FindTopLevelJsonKey(json, key, &colon) !=
+                    JsonKeyLookup::Found)
             {
                 break;
             }
@@ -347,18 +896,13 @@ namespace
     bool ExtractJsonBoolValue(const std::wstring& json, const std::wstring& key, bool* value)
     {
         bool ok = false;
-        std::wstring pattern = L"\"" + key + L"\"";
-        size_t pos = json.find(pattern);
+        size_t colon = 0;
 
         do
         {
-            if (value == nullptr || pos == std::wstring::npos)
-            {
-                break;
-            }
-
-            size_t colon = json.find(L':', pos + pattern.size());
-            if (colon == std::wstring::npos)
+            if (value == nullptr ||
+                FindTopLevelJsonKey(json, key, &colon) !=
+                    JsonKeyLookup::Found)
             {
                 break;
             }
@@ -369,12 +913,23 @@ namespace
                 ++start;
             }
 
-            if (json.compare(start, 4, L"true") == 0)
+            auto tokenEndsAt = [&json](size_t end)
+            {
+                return end >= json.size() ||
+                    json[end] == L',' ||
+                    json[end] == L'}' ||
+                    json[end] == L']' ||
+                    iswspace(json[end]) != 0;
+            };
+
+            if (json.compare(start, 4, L"true") == 0 &&
+                tokenEndsAt(start + 4))
             {
                 *value = true;
                 ok = true;
             }
-            else if (json.compare(start, 5, L"false") == 0)
+            else if (json.compare(start, 5, L"false") == 0 &&
+                     tokenEndsAt(start + 5))
             {
                 *value = false;
                 ok = true;
@@ -387,32 +942,32 @@ namespace
     bool ExtractJsonScalarValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
     {
         bool ok = false;
-        std::wstring pattern = L"\"" + key + L"\"";
-        size_t pos = json.find(pattern);
+        size_t colon = 0;
 
         do
         {
-            if (value == nullptr || pos == std::wstring::npos)
-            {
-                break;
-            }
-
-            if (ExtractJsonStringValue(json, key, value))
-            {
-                ok = true;
-                break;
-            }
-
-            size_t colon = json.find(L':', pos + pattern.size());
-            if (colon == std::wstring::npos)
+            if (value == nullptr ||
+                FindTopLevelJsonKey(json, key, &colon) !=
+                    JsonKeyLookup::Found)
             {
                 break;
             }
 
             size_t start = colon + 1;
-            while (start < json.size() && iswspace(json[start]) != 0)
+            while (start < json.size() &&
+                   iswspace(json[start]) != 0)
             {
                 ++start;
+            }
+
+            if (start < json.size() && json[start] == L'"')
+            {
+                ok = ParseJsonStringAt(
+                    json,
+                    start,
+                    value,
+                    nullptr);
+                break;
             }
 
             size_t end = start;
@@ -438,18 +993,12 @@ namespace
     std::wstring ExtractJsonObjectValue(const std::wstring& json, const std::wstring& key)
     {
         std::wstring result;
-        std::wstring pattern = L"\"" + key + L"\"";
-        size_t pos = json.find(pattern);
+        size_t colon = 0;
 
         do
         {
-            if (pos == std::wstring::npos)
-            {
-                break;
-            }
-
-            size_t colon = json.find(L':', pos + pattern.size());
-            if (colon == std::wstring::npos)
+            if (FindTopLevelJsonKey(json, key, &colon) !=
+                JsonKeyLookup::Found)
             {
                 break;
             }
@@ -510,158 +1059,139 @@ namespace
         return result;
     }
 
-    std::vector<std::wstring> ExtractJsonArrayObjects(const std::wstring& json, const std::wstring& key)
+    bool ExtractJsonArrayObjects(
+        const std::wstring& json,
+        const std::wstring& key,
+        std::vector<std::wstring>* objects)
     {
-        std::vector<std::wstring> objects;
-        std::wstring pattern = L"\"" + key + L"\"";
-        size_t pos = json.find(pattern);
-
-        do
+        if (objects == nullptr)
         {
-            if (pos == std::wstring::npos)
+            return false;
+        }
+        objects->clear();
+
+        size_t colon = 0;
+        if (FindTopLevelJsonKey(json, key, &colon) !=
+            JsonKeyLookup::Found)
+        {
+            return false;
+        }
+
+        size_t cursor = colon + 1;
+        SkipJsonWhitespace(json, &cursor);
+        if (cursor >= json.size() ||
+            json[cursor] != L'[')
+        {
+            return false;
+        }
+        ++cursor;
+        SkipJsonWhitespace(json, &cursor);
+        if (cursor < json.size() &&
+            json[cursor] == L']')
+        {
+            return true;
+        }
+
+        for (;;)
+        {
+            if (cursor >= json.size() ||
+                json[cursor] != L'{')
             {
-                break;
+                return false;
             }
 
-            size_t bracket = json.find(L'[', pos + pattern.size());
-            if (bracket == std::wstring::npos)
+            const size_t objectStart = cursor;
+            if (!ParseJsonValueAt(json, &cursor, 0))
             {
-                break;
+                return false;
             }
+            objects->push_back(
+                json.substr(
+                    objectStart,
+                    cursor - objectStart));
 
-            int arrayDepth = 0;
-            int objectDepth = 0;
-            bool inString = false;
-            bool escaped = false;
-            size_t objectStart = std::wstring::npos;
-
-            for (size_t index = bracket; index < json.size(); ++index)
+            SkipJsonWhitespace(json, &cursor);
+            if (cursor >= json.size())
             {
-                wchar_t ch = json[index];
-                if (inString)
-                {
-                    if (escaped)
-                    {
-                        escaped = false;
-                    }
-                    else if (ch == L'\\')
-                    {
-                        escaped = true;
-                    }
-                    else if (ch == L'"')
-                    {
-                        inString = false;
-                    }
-                    continue;
-                }
-
-                if (ch == L'"')
-                {
-                    inString = true;
-                }
-                else if (ch == L'[')
-                {
-                    ++arrayDepth;
-                }
-                else if (ch == L']')
-                {
-                    --arrayDepth;
-                    if (arrayDepth == 0)
-                    {
-                        break;
-                    }
-                }
-                else if (ch == L'{')
-                {
-                    if (objectDepth == 0)
-                    {
-                        objectStart = index;
-                    }
-                    ++objectDepth;
-                }
-                else if (ch == L'}')
-                {
-                    --objectDepth;
-                    if (objectDepth == 0 && objectStart != std::wstring::npos)
-                    {
-                        objects.push_back(json.substr(objectStart, index - objectStart + 1));
-                        objectStart = std::wstring::npos;
-                    }
-                }
+                return false;
             }
-        } while (false);
-
-        return objects;
+            if (json[cursor] == L']')
+            {
+                return true;
+            }
+            if (json[cursor] != L',')
+            {
+                return false;
+            }
+            ++cursor;
+            SkipJsonWhitespace(json, &cursor);
+        }
     }
 
-    std::vector<std::wstring> ExtractJsonStringArrayValues(const std::wstring& json, const std::wstring& key)
+    bool ExtractJsonStringArrayValues(
+        const std::wstring& json,
+        const std::wstring& key,
+        std::vector<std::wstring>* values)
     {
-        std::vector<std::wstring> values;
-        std::wstring pattern = L"\"" + key + L"\"";
-        size_t pos = json.find(pattern);
-
-        do
+        if (values == nullptr)
         {
-            if (pos == std::wstring::npos)
+            return false;
+        }
+        values->clear();
+
+        size_t colon = 0;
+        if (FindTopLevelJsonKey(json, key, &colon) !=
+            JsonKeyLookup::Found)
+        {
+            return false;
+        }
+
+        size_t cursor = colon + 1;
+        SkipJsonWhitespace(json, &cursor);
+        if (cursor >= json.size() ||
+            json[cursor] != L'[')
+        {
+            return false;
+        }
+        ++cursor;
+        SkipJsonWhitespace(json, &cursor);
+        if (cursor < json.size() &&
+            json[cursor] == L']')
+        {
+            return true;
+        }
+
+        for (;;)
+        {
+            std::wstring value;
+            size_t next = 0;
+            if (!ParseJsonStringAt(
+                    json,
+                    cursor,
+                    &value,
+                    &next))
             {
-                break;
+                return false;
             }
+            values->push_back(value);
+            cursor = next;
 
-            size_t bracket = json.find(L'[', pos + pattern.size());
-            if (bracket == std::wstring::npos)
+            SkipJsonWhitespace(json, &cursor);
+            if (cursor >= json.size())
             {
-                break;
+                return false;
             }
-
-            bool inString = false;
-            bool escaped = false;
-            int depth = 0;
-            for (size_t index = bracket; index < json.size(); ++index)
+            if (json[cursor] == L']')
             {
-                wchar_t ch = json[index];
-                if (inString)
-                {
-                    if (escaped)
-                    {
-                        escaped = false;
-                    }
-                    else if (ch == L'\\')
-                    {
-                        escaped = true;
-                    }
-                    else if (ch == L'"')
-                    {
-                        inString = false;
-                    }
-                    continue;
-                }
-
-                if (ch == L'[')
-                {
-                    ++depth;
-                }
-                else if (ch == L']')
-                {
-                    --depth;
-                    if (depth == 0)
-                    {
-                        break;
-                    }
-                }
-                else if (ch == L'"')
-                {
-                    std::wstring value;
-                    size_t next = 0;
-                    if (ParseJsonStringAt(json, index, &value, &next))
-                    {
-                        values.push_back(value);
-                        index = next - 1;
-                    }
-                }
+                return true;
             }
-        } while (false);
-
-        return values;
+            if (json[cursor] != L',')
+            {
+                return false;
+            }
+            ++cursor;
+            SkipJsonWhitespace(json, &cursor);
+        }
     }
 
     std::vector<std::wstring> ExtractJsonObjectKeys(const std::wstring& json)
@@ -726,26 +1256,45 @@ namespace
         return keys;
     }
 
-    std::map<std::wstring, std::wstring> ParseJsonStringMap(const std::wstring& objectText)
+    bool ParseJsonStringMap(
+        const std::wstring& objectText,
+        std::map<std::wstring, std::wstring>* result)
     {
-        std::map<std::wstring, std::wstring> result;
+        if (result == nullptr ||
+            objectText.empty() ||
+            !ValidateJsonDocument(objectText))
+        {
+            return false;
+        }
+        result->clear();
+
         std::vector<std::wstring> keys = ExtractJsonObjectKeys(objectText);
 
         for (const std::wstring& key : keys)
         {
             std::wstring value;
-            if (ExtractJsonScalarValue(objectText, key, &value))
+            if (!ExtractJsonStringValue(
+                    objectText,
+                    key,
+                    &value))
             {
-                result[key] = value;
+                result->clear();
+                return false;
             }
+            (*result)[key] = value;
         }
 
-        return result;
+        return true;
     }
 
-    uint64_t ParseUint64Loose(const std::wstring& value)
+    bool TryParseUint64Strict(const std::wstring& value, uint64_t* parsed)
     {
-        uint64_t parsed = 0;
+        if (parsed == nullptr || value.empty())
+        {
+            return false;
+        }
+
+        *parsed = 0;
         int base = 10;
         size_t index = 0;
 
@@ -753,6 +1302,10 @@ namespace
         {
             base = 16;
             index = 2;
+        }
+        if (index >= value.size())
+        {
+            return false;
         }
 
         for (; index < value.size(); ++index)
@@ -773,12 +1326,122 @@ namespace
             }
             else
             {
-                break;
+                return false;
             }
-            parsed = (parsed * static_cast<uint64_t>(base)) + digit;
+            if (*parsed >
+                (std::numeric_limits<uint64_t>::max() - digit) /
+                    static_cast<uint64_t>(base))
+            {
+                return false;
+            }
+            *parsed = (*parsed * static_cast<uint64_t>(base)) + digit;
         }
 
-        return parsed;
+        return true;
+    }
+
+    bool JsonContainsKey(
+        const std::wstring& json,
+        const std::wstring& key)
+    {
+        return FindTopLevelJsonKey(json, key, nullptr) !=
+            JsonKeyLookup::Missing;
+    }
+
+    bool ExtractOptionalJsonBoolStrict(
+        const std::wstring& json,
+        const std::wstring& key,
+        bool* value)
+    {
+        return !JsonContainsKey(json, key) ||
+            ExtractJsonBoolValue(json, key, value);
+    }
+
+    bool ExtractOptionalJsonUint64Strict(
+        const std::wstring& json,
+        const std::wstring& key,
+        uint64_t* value,
+        bool* present = nullptr)
+    {
+        if (present != nullptr)
+        {
+            *present = false;
+        }
+        if (!JsonContainsKey(json, key))
+        {
+            return true;
+        }
+
+        std::wstring text;
+        if (!ExtractJsonScalarValue(json, key, &text) ||
+            !TryParseUint64Strict(text, value))
+        {
+            return false;
+        }
+        if (present != nullptr)
+        {
+            *present = true;
+        }
+        return true;
+    }
+
+    bool SnapshotDocumentIdentitiesUnique(
+        const SnapshotDocument& document,
+        std::wstring* duplicate)
+    {
+        std::set<uint32_t> processIds;
+        std::set<std::wstring> processIdentities;
+        for (const SnapshotProcessRecord& process :
+             document.Processes)
+        {
+            if (!processIds.insert(
+                    process.ProcessId).second)
+            {
+                if (duplicate != nullptr)
+                {
+                    *duplicate =
+                        L"process pid " +
+                        std::to_wstring(
+                            process.ProcessId);
+                }
+                return false;
+            }
+            if (!processIdentities.insert(
+                    process.Identity).second)
+            {
+                if (duplicate != nullptr)
+                {
+                    *duplicate =
+                        L"process identity " +
+                        process.Identity;
+                }
+                return false;
+            }
+        }
+
+        std::set<
+            std::pair<
+                std::wstring,
+                std::wstring>> recordIdentities;
+        for (const SnapshotRecord& record :
+             document.Records)
+        {
+            if (!recordIdentities.insert(
+                    {record.Domain,
+                     record.Identity}).second)
+            {
+                if (duplicate != nullptr)
+                {
+                    *duplicate =
+                        L"record identity " +
+                        record.Domain +
+                        L"/" +
+                        record.Identity;
+                }
+                return false;
+            }
+        }
+        return true;
     }
 }
 
@@ -877,9 +1540,14 @@ std::wstring BuildSnapshotJson(const SnapshotDocument& document)
              << L"\",\"dtb\":\"" << SnapshotHex(process.DirectoryTableBase, 16)
              << L"\",\"user_dtb\":\"" << SnapshotHex(process.UserDirectoryTableBase, 16)
              << L"\",\"peb\":\"" << SnapshotHex(process.Peb, 16)
-             << L"\",\"has_create_time\":" << (process.HasCreateTime ? L"true" : L"false")
+             << L"\",\"has_peb\":" << (process.HasPeb ? L"true" : L"false")
+             << L",\"has_create_time\":" << (process.HasCreateTime ? L"true" : L"false")
              << L",\"create_time\":\"" << SnapshotHex(process.CreateTime, 16)
-             << L"\"}";
+             << L"\",\"has_exit_time\":" << (process.HasExitTime ? L"true" : L"false")
+             << L",\"exit_time\":\"" << SnapshotHex(process.ExitTime, 16)
+             << L"\",\"has_active_threads\":" << (process.HasActiveThreads ? L"true" : L"false")
+             << L",\"active_threads\":" << process.ActiveThreads
+             << L"}";
         if (i + 1 != document.Processes.size())
         {
             json << L",";
@@ -921,9 +1589,29 @@ bool EnsureSnapshotDirectoryForFile(const std::wstring& path, std::wstring* erro
 bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, std::wstring* error)
 {
     bool ok = false;
+    std::string utf8;
+
+    if (error != nullptr)
+    {
+        error->clear();
+    }
 
     do
     {
+        // Validate and convert before opening the destination.  Opening with
+        // truncation first would destroy an existing snapshot when conversion
+        // later rejects malformed UTF-16.
+        if (!WideToUtf8(text, &utf8))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot text contains invalid UTF-16: " +
+                    path;
+            }
+            break;
+        }
+
         if (!EnsureSnapshotDirectoryForFile(path, error))
         {
             break;
@@ -939,7 +1627,6 @@ bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, s
             break;
         }
 
-        std::string utf8 = WideToUtf8(text);
         file.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
         ok = file.good();
         if (!ok && error != nullptr)
@@ -954,6 +1641,16 @@ bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, s
 bool ReadSnapshotTextFile(const std::wstring& path, std::wstring* text, std::wstring* error)
 {
     bool ok = false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    if (text != nullptr)
+    {
+        text->clear();
+    }
 
     do
     {
@@ -966,22 +1663,106 @@ bool ReadSnapshotTextFile(const std::wstring& path, std::wstring* text, std::wst
             break;
         }
 
-        std::ifstream file(path, std::ios::binary);
-        if (!file.good())
+        file = CreateFileW(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
         {
             if (error != nullptr)
             {
-                *error = L"failed to open file: " + path;
+                *error =
+                    L"failed to open file: " +
+                    path +
+                    L" gle=" +
+                    std::to_wstring(GetLastError());
             }
             break;
         }
 
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        *text = Utf8ToWide(buffer.str());
+        LARGE_INTEGER fileSize = {};
+        if (!GetFileSizeEx(file, &fileSize) ||
+            fileSize.QuadPart < 0)
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"failed to query snapshot file size: " +
+                    path;
+            }
+            break;
+        }
+        if (static_cast<uint64_t>(fileSize.QuadPart) >
+            kMaxSnapshotTextFileBytes)
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot file exceeds the 64 MiB safety limit: " +
+                    path;
+            }
+            break;
+        }
+
+        std::string utf8(
+            static_cast<size_t>(fileSize.QuadPart),
+            '\0');
+        size_t offset = 0;
+        while (offset < utf8.size())
+        {
+            const DWORD requested = static_cast<DWORD>(
+                std::min<size_t>(
+                    utf8.size() - offset,
+                    std::numeric_limits<DWORD>::max()));
+            DWORD bytesRead = 0;
+            if (!ReadFile(
+                    file,
+                    utf8.data() + offset,
+                    requested,
+                    &bytesRead,
+                    nullptr) ||
+                bytesRead == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"failed to read complete snapshot file: " +
+                        path;
+                }
+                break;
+            }
+            offset += bytesRead;
+        }
+        if (offset != utf8.size())
+        {
+            break;
+        }
+
+        if (!Utf8ToWide(utf8, text))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot file contains invalid UTF-8: " +
+                    path;
+            }
+            break;
+        }
         ok = true;
     } while (false);
 
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+    }
+    if (!ok && text != nullptr)
+    {
+        text->clear();
+    }
     return ok;
 }
 
@@ -994,6 +1775,15 @@ bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, 
 {
     bool ok = false;
     std::wstring json;
+
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    if (document != nullptr)
+    {
+        *document = SnapshotDocument{};
+    }
 
     do
     {
@@ -1010,8 +1800,17 @@ bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, 
         {
             break;
         }
+        if (!ValidateJsonDocument(json))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot is not a valid duplicate-free JSON object: " +
+                    path;
+            }
+            break;
+        }
 
-        *document = SnapshotDocument{};
         document->JsonPath = path;
         if (!ExtractJsonStringValue(json, L"schema", &document->Schema) ||
             document->Schema != L"kn-live-dbg.snapshot.v1")
@@ -1022,77 +1821,710 @@ bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, 
             }
             break;
         }
-        ExtractJsonStringValue(json, L"label", &document->Label);
-        ExtractJsonStringValue(json, L"timestamp_utc", &document->TimestampUtc);
-        ExtractJsonStringValue(json, L"boot_id", &document->BootId);
-        ExtractJsonStringValue(json, L"report_path", &document->ReportPath);
-        ExtractJsonBoolValue(json, L"same_boot_only", &document->SameBootOnly);
-        document->Metadata = ParseJsonStringMap(ExtractJsonObjectValue(json, L"metadata"));
-        std::wstring warningObject = ExtractJsonObjectValue(json, L"domain_warnings");
-        for (const std::wstring& key : ExtractJsonObjectKeys(warningObject))
+        if (!ExtractJsonStringValue(
+                json,
+                L"label",
+                &document->Label) ||
+            !ExtractJsonStringValue(
+                json,
+                L"timestamp_utc",
+                &document->TimestampUtc) ||
+            !ExtractJsonStringValue(
+                json,
+                L"boot_id",
+                &document->BootId) ||
+            !ExtractJsonStringValue(
+                json,
+                L"report_path",
+                &document->ReportPath))
         {
-            document->DomainWarnings[key] = ExtractJsonStringArrayValues(warningObject, key);
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot contains a missing or non-string root field";
+            }
+            break;
+        }
+        if (!ExtractJsonBoolValue(
+                json,
+                L"same_boot_only",
+                &document->SameBootOnly))
+        {
+            if (error != nullptr)
+            {
+                *error = L"snapshot same_boot_only is not a valid JSON boolean";
+            }
+            break;
         }
 
-        std::vector<std::wstring> processObjects = ExtractJsonArrayObjects(json, L"process_inventory");
+        const std::wstring metadataObject =
+            ExtractJsonObjectValue(json, L"metadata");
+        if (!ParseJsonStringMap(
+                metadataObject,
+                &document->Metadata))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot metadata must be an object of string values";
+            }
+            break;
+        }
+
+        std::wstring warningObject = ExtractJsonObjectValue(json, L"domain_warnings");
+        if (warningObject.empty())
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot domain_warnings must be an object";
+            }
+            break;
+        }
+        bool domainWarningsValid = true;
+        for (const std::wstring& key : ExtractJsonObjectKeys(warningObject))
+        {
+            std::vector<std::wstring> warnings;
+            if (!ExtractJsonStringArrayValues(
+                    warningObject,
+                    key,
+                    &warnings))
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot domain warning values must be string arrays";
+                }
+                domainWarningsValid = false;
+                break;
+            }
+            document->DomainWarnings[key] =
+                std::move(warnings);
+        }
+        if (!domainWarningsValid)
+        {
+            break;
+        }
+
+        std::vector<std::wstring> processObjects;
+        if (!ExtractJsonArrayObjects(
+                json,
+                L"process_inventory",
+                &processObjects))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot process_inventory must be an array of objects";
+            }
+            break;
+        }
+        bool processInventoryValid = true;
         for (const std::wstring& object : processObjects)
         {
             SnapshotProcessRecord process = {};
-            std::wstring value;
-            if (ExtractJsonScalarValue(object, L"pid", &value))
+            uint64_t parsed = 0;
+            bool present = false;
+            bool pebPresent = false;
+            bool createTimePresent = false;
+            bool exitTimePresent = false;
+            if (!ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"pid",
+                    &parsed,
+                    &present) ||
+                !present ||
+                parsed > std::numeric_limits<uint32_t>::max())
             {
-                process.ProcessId = static_cast<uint32_t>(ParseUint64Loose(value));
+                if (error != nullptr)
+                {
+                    *error = L"snapshot process pid is not a valid uint32";
+                }
+                processInventoryValid = false;
+                break;
             }
-            ExtractJsonStringValue(object, L"image", &process.ImageName);
-            ExtractJsonStringValue(object, L"identity", &process.Identity);
-            if (ExtractJsonScalarValue(object, L"eprocess", &value))
+            process.ProcessId =
+                static_cast<uint32_t>(parsed);
+            if (!ExtractJsonStringValue(
+                    object,
+                    L"image",
+                    &process.ImageName) ||
+                !ExtractJsonStringValue(
+                    object,
+                    L"identity",
+                    &process.Identity) ||
+                process.Identity.empty())
             {
-                process.Eprocess = ParseUint64Loose(value);
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot process image/identity is missing or invalid";
+                }
+                processInventoryValid = false;
+                break;
             }
-            if (ExtractJsonScalarValue(object, L"dtb", &value))
+            if (!ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"eprocess",
+                    &process.Eprocess) ||
+                !ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"dtb",
+                    &process.DirectoryTableBase) ||
+                !ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"user_dtb",
+                    &process.UserDirectoryTableBase) ||
+                !ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"peb",
+                    &process.Peb,
+                    &pebPresent) ||
+                !ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"create_time",
+                    &process.CreateTime,
+                    &createTimePresent) ||
+                !ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"exit_time",
+                    &process.ExitTime,
+                    &exitTimePresent))
             {
-                process.DirectoryTableBase = ParseUint64Loose(value);
+                if (error != nullptr)
+                {
+                    *error = L"snapshot process contains an invalid uint64 field";
+                }
+                processInventoryValid = false;
+                break;
             }
-            if (ExtractJsonScalarValue(object, L"user_dtb", &value))
+            process.HasPeb = process.Peb != 0;
+            if (!ExtractOptionalJsonBoolStrict(
+                    object,
+                    L"has_peb",
+                    &process.HasPeb) ||
+                (process.Peb != 0 && !process.HasPeb) ||
+                !ExtractOptionalJsonBoolStrict(
+                    object,
+                    L"has_create_time",
+                    &process.HasCreateTime) ||
+                !ExtractOptionalJsonBoolStrict(
+                    object,
+                    L"has_exit_time",
+                    &process.HasExitTime) ||
+                !ExtractOptionalJsonBoolStrict(
+                    object,
+                    L"has_active_threads",
+                    &process.HasActiveThreads) ||
+                (process.HasPeb && !pebPresent) ||
+                (process.HasCreateTime &&
+                 (!createTimePresent ||
+                  process.CreateTime == 0)) ||
+                (process.HasExitTime &&
+                 !exitTimePresent) ||
+                (process.CreateTime != 0 &&
+                 !process.HasCreateTime) ||
+                (process.ExitTime != 0 &&
+                 !process.HasExitTime))
             {
-                process.UserDirectoryTableBase = ParseUint64Loose(value);
+                if (error != nullptr)
+                {
+                    *error = L"snapshot process contains an invalid boolean field";
+                }
+                processInventoryValid = false;
+                break;
             }
-            if (ExtractJsonScalarValue(object, L"peb", &value))
+            parsed = 0;
+            present = false;
+            if (!ExtractOptionalJsonUint64Strict(
+                    object,
+                    L"active_threads",
+                    &parsed,
+                    &present) ||
+                (present &&
+                 parsed > std::numeric_limits<uint32_t>::max()))
             {
-                process.Peb = ParseUint64Loose(value);
-                process.HasPeb = process.Peb != 0;
+                if (error != nullptr)
+                {
+                    *error = L"snapshot process active_threads is not a valid uint32";
+                }
+                processInventoryValid = false;
+                break;
             }
-            ExtractJsonBoolValue(object, L"has_create_time", &process.HasCreateTime);
-            if (ExtractJsonScalarValue(object, L"create_time", &value))
+            if (present)
             {
-                process.CreateTime = ParseUint64Loose(value);
+                process.ActiveThreads = static_cast<uint32_t>(parsed);
+            }
+            if (present &&
+                !process.HasActiveThreads &&
+                process.ActiveThreads != 0)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot process active_threads conflicts with has_active_threads";
+                }
+                processInventoryValid = false;
+                break;
+            }
+            if (process.HasActiveThreads &&
+                !present)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot process has_active_threads requires active_threads";
+                }
+                processInventoryValid = false;
+                break;
             }
             document->Processes.push_back(process);
         }
+        if (!processInventoryValid)
+        {
+            break;
+        }
 
-        std::vector<std::wstring> recordObjects = ExtractJsonArrayObjects(json, L"records");
+        std::vector<std::wstring> recordObjects;
+        if (!ExtractJsonArrayObjects(
+                json,
+                L"records",
+                &recordObjects))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot records must be an array of objects";
+            }
+            break;
+        }
         for (const std::wstring& object : recordObjects)
         {
             SnapshotRecord record;
-            ExtractJsonStringValue(object, L"domain", &record.Domain);
-            ExtractJsonStringValue(object, L"identity", &record.Identity);
-            ExtractJsonStringValue(object, L"display", &record.Display);
-            ExtractJsonStringValue(object, L"risk", &record.Risk);
-            // Clamp an attacker-supplied or malformed risk string to the known
-            // {high,medium,low,info} set (unknown collapses to "info") so diff
-            // ranking/sorting cannot be skewed by a crafted snapshot file.
-            record.Risk = SnapshotRiskNormalize(record.Risk);
-            ExtractJsonBoolValue(object, L"volatile", &record.Volatile);
-            record.Tags = ExtractJsonStringArrayValues(object, L"tags");
-            record.Evidence = ParseJsonStringMap(ExtractJsonObjectValue(object, L"evidence"));
-            if (!record.Domain.empty() && !record.Identity.empty())
+            if (!ExtractJsonStringValue(
+                    object,
+                    L"domain",
+                    &record.Domain) ||
+                !ExtractJsonStringValue(
+                    object,
+                    L"identity",
+                    &record.Identity) ||
+                !ExtractJsonStringValue(
+                    object,
+                    L"display",
+                    &record.Display) ||
+                !ExtractJsonStringValue(
+                    object,
+                    L"risk",
+                    &record.Risk) ||
+                record.Domain.empty() ||
+                record.Identity.empty())
             {
-                document->Records.push_back(record);
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot record contains a missing or invalid string field";
+                }
+                processInventoryValid = false;
+                break;
             }
+
+            const std::wstring normalizedRisk =
+                SnapshotRiskNormalize(record.Risk);
+            if (normalizedRisk != SnapshotToLower(record.Risk))
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot record risk is not high, medium, low, or info";
+                }
+                processInventoryValid = false;
+                break;
+            }
+            record.Risk = normalizedRisk;
+            if (!ExtractJsonBoolValue(
+                    object,
+                    L"volatile",
+                    &record.Volatile))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"snapshot record volatile is not a valid JSON boolean";
+                }
+                processInventoryValid = false;
+                break;
+            }
+            if (!ExtractJsonStringArrayValues(
+                    object,
+                    L"tags",
+                    &record.Tags) ||
+                !ParseJsonStringMap(
+                    ExtractJsonObjectValue(
+                        object,
+                        L"evidence"),
+                    &record.Evidence))
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot record tags/evidence has an invalid type";
+                }
+                processInventoryValid = false;
+                break;
+            }
+            document->Records.push_back(record);
+        }
+        if (!processInventoryValid)
+        {
+            break;
+        }
+
+        std::wstring duplicateIdentity;
+        if (!SnapshotDocumentIdentitiesUnique(
+                *document,
+                &duplicateIdentity))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot contains duplicate " +
+                    duplicateIdentity;
+            }
+            break;
         }
 
         ok = true;
     } while (false);
 
+    if (!ok && document != nullptr)
+    {
+        *document = SnapshotDocument{};
+    }
     return ok;
+}
+
+bool SnapshotJsonStrictParsingSelfTest()
+{
+    std::string utf8;
+    std::wstring wide;
+    const std::wstring invalidUtf16(
+        1,
+        static_cast<wchar_t>(0xd800));
+    const std::string invalidUtf8(
+        "\xc0\xaf",
+        2);
+    if (!WideToUtf8(L"", &utf8) ||
+        !utf8.empty() ||
+        !Utf8ToWide("", &wide) ||
+        !wide.empty() ||
+        WideToUtf8(invalidUtf16, &utf8) ||
+        Utf8ToWide(invalidUtf8, &wide))
+    {
+        return false;
+    }
+
+    wchar_t tempDirectory[MAX_PATH + 1] = {};
+    wchar_t tempPath[MAX_PATH + 1] = {};
+    const DWORD tempLength = GetTempPathW(
+        static_cast<DWORD>(_countof(tempDirectory)),
+        tempDirectory);
+    if (tempLength == 0 ||
+        tempLength >= _countof(tempDirectory) ||
+        GetTempFileNameW(
+            tempDirectory,
+            L"ksj",
+            0,
+            tempPath) == 0)
+    {
+        return false;
+    }
+
+    bool fileSafetyOk = false;
+    do
+    {
+        std::wstring fileError;
+        const std::wstring sentinel = L"preserve-existing-snapshot";
+        if (!WriteSnapshotTextFile(
+                tempPath,
+                sentinel,
+                &fileError))
+        {
+            break;
+        }
+        if (WriteSnapshotTextFile(
+                tempPath,
+                invalidUtf16,
+                &fileError))
+        {
+            break;
+        }
+
+        std::wstring preserved;
+        if (!ReadSnapshotTextFile(
+                tempPath,
+                &preserved,
+                &fileError) ||
+            preserved != sentinel)
+        {
+            break;
+        }
+
+        if (!WriteSnapshotTextFile(
+                tempPath,
+                L"{\"schema\":",
+                &fileError))
+        {
+            break;
+        }
+        SnapshotDocument failedDocument = {};
+        failedDocument.Schema = L"must-be-cleared";
+        failedDocument.JsonPath = L"must-be-cleared";
+        failedDocument.Records.push_back(SnapshotRecord{});
+        if (ReadSnapshotJsonFile(
+                tempPath,
+                &failedDocument,
+                &fileError) ||
+            !failedDocument.Schema.empty() ||
+            !failedDocument.JsonPath.empty() ||
+            !failedDocument.Records.empty())
+        {
+            break;
+        }
+
+        SnapshotDocument requiredFieldDocument = {};
+        requiredFieldDocument.Label = L"selftest";
+        requiredFieldDocument.TimestampUtc =
+            L"2026-01-01T00:00:00Z";
+        requiredFieldDocument.BootId = L"selftest-boot";
+        SnapshotProcessRecord requiredFieldProcess = {};
+        requiredFieldProcess.ProcessId = 1;
+        requiredFieldProcess.Identity = L"pid:1";
+        requiredFieldProcess.HasActiveThreads = true;
+        requiredFieldProcess.ActiveThreads = 0;
+        requiredFieldDocument.Processes.push_back(
+            requiredFieldProcess);
+        std::wstring missingActiveThreads =
+            BuildSnapshotJson(requiredFieldDocument);
+        const std::wstring activeThreadsField =
+            L",\"active_threads\":0";
+        const size_t activeThreadsOffset =
+            missingActiveThreads.find(
+                activeThreadsField);
+        if (activeThreadsOffset ==
+            std::wstring::npos)
+        {
+            break;
+        }
+        missingActiveThreads.erase(
+            activeThreadsOffset,
+            activeThreadsField.size());
+        if (!WriteSnapshotTextFile(
+                tempPath,
+                missingActiveThreads,
+                &fileError))
+        {
+            break;
+        }
+        SnapshotDocument missingRequiredField = {};
+        if (ReadSnapshotJsonFile(
+                tempPath,
+                &missingRequiredField,
+                &fileError))
+        {
+            break;
+        }
+
+        fileSafetyOk = true;
+    } while (false);
+    DeleteFileW(tempPath);
+    if (!fileSafetyOk)
+    {
+        return false;
+    }
+
+    uint64_t value = 0;
+    if (!TryParseUint64Strict(
+            L"18446744073709551615",
+            &value) ||
+        value != std::numeric_limits<uint64_t>::max() ||
+        !TryParseUint64Strict(L"0xffffffffffffffff", &value) ||
+        value != std::numeric_limits<uint64_t>::max())
+    {
+        return false;
+    }
+
+    const std::wstring invalidNumbers[] =
+    {
+        L"",
+        L"0x",
+        L"-1",
+        L"+1",
+        L"1junk",
+        L"18446744073709551616",
+        L"0x10000000000000000"
+    };
+    for (const std::wstring& invalid : invalidNumbers)
+    {
+        if (TryParseUint64Strict(invalid, &value))
+        {
+            return false;
+        }
+    }
+
+    bool flag = false;
+    if (!ExtractJsonBoolValue(
+            L"{\"flag\": true}",
+            L"flag",
+            &flag) ||
+        !flag ||
+        ExtractJsonBoolValue(
+            L"{\"flag\": truejunk}",
+            L"flag",
+            &flag) ||
+        ExtractJsonBoolValue(
+            L"{\"flag\":true,\"flag\":false}",
+            L"flag",
+            &flag) ||
+        ExtractJsonBoolValue(
+            L"{\"flag\":true} trailing",
+            L"flag",
+            &flag) ||
+        ExtractOptionalJsonBoolStrict(
+            L"{\"flag\":true,\"flag\":false}",
+            L"flag",
+            &flag) ||
+        ExtractOptionalJsonUint64Strict(
+            L"{\"eprocess\":\"0x12junk\"}",
+            L"eprocess",
+            &value))
+    {
+        return false;
+    }
+
+    flag = false;
+    if (!ExtractOptionalJsonBoolStrict(
+            L"{\"image\":\"has_exit_time\"}",
+            L"has_exit_time",
+            &flag) ||
+        flag ||
+        !ExtractJsonBoolValue(
+            L"{\"metadata\":{\"flag\":false},\"flag\":true}",
+            L"flag",
+            &flag) ||
+        !flag)
+    {
+        return false;
+    }
+
+    flag = false;
+    if (!ExtractOptionalJsonBoolStrict(
+            L"{\"has_peb\":true,\"peb\":\"0x0\"}",
+            L"has_peb",
+            &flag) ||
+        !flag)
+    {
+        return false;
+    }
+
+    const std::wstring validDocument =
+        L"{\"objects\":[{\"id\":1},{\"id\":2}],"
+        L"\"strings\":[\"a\",\"b\"],"
+        L"\"map\":{\"key\":\"value\"}}";
+    const std::wstring invalidDocuments[] =
+    {
+        L"{\"a\":1 \"b\":2}",
+        L"{\"a\":1,}",
+        L"{\"a\":[1,]}",
+        L"{\"a\":{\"b\":1,\"b\":2}}",
+        L"{\"a\":\"\\q\"}",
+        L"{\"a\":\"\\ud800\"}",
+        L"{\"a\":\"\\ud800\\u0041\"}",
+        L"{\"a\":\"\\udc00\"}",
+        std::wstring(L"{\"a\":\"") +
+            static_cast<wchar_t>(1) +
+            L"\"}",
+        L"{\"a\":01}",
+        L"{\"a\":1e}"
+    };
+    if (!ValidateJsonDocument(validDocument) ||
+        !ValidateJsonDocument(
+            L"{\"a\":\"\\ud83d\\ude00\"}"))
+    {
+        return false;
+    }
+    for (const std::wstring& invalid : invalidDocuments)
+    {
+        if (ValidateJsonDocument(invalid))
+        {
+            return false;
+        }
+    }
+
+    std::vector<std::wstring> objects;
+    std::vector<std::wstring> strings;
+    std::map<std::wstring, std::wstring> stringMap;
+    if (!ExtractJsonArrayObjects(
+            validDocument,
+            L"objects",
+            &objects) ||
+        objects.size() != 2 ||
+        ExtractJsonArrayObjects(
+            L"{\"objects\":[{\"id\":1},2]}",
+            L"objects",
+            &objects) ||
+        !ExtractJsonStringArrayValues(
+            validDocument,
+            L"strings",
+            &strings) ||
+        strings.size() != 2 ||
+        ExtractJsonStringArrayValues(
+            L"{\"strings\":[\"a\",1]}",
+            L"strings",
+            &strings) ||
+        !ParseJsonStringMap(
+            L"{\"key\":\"value\"}",
+            &stringMap) ||
+        stringMap[L"key"] != L"value" ||
+        ParseJsonStringMap(
+            L"{\"key\":1}",
+            &stringMap))
+    {
+        return false;
+    }
+
+    SnapshotDocument duplicateProcessId = {};
+    SnapshotProcessRecord firstProcess = {};
+    firstProcess.ProcessId = 10;
+    firstProcess.Identity = L"process-a";
+    SnapshotProcessRecord secondProcess = {};
+    secondProcess.ProcessId = 10;
+    secondProcess.Identity = L"process-b";
+    duplicateProcessId.Processes =
+        {firstProcess, secondProcess};
+    std::wstring duplicate;
+    if (SnapshotDocumentIdentitiesUnique(
+            duplicateProcessId,
+            &duplicate))
+    {
+        return false;
+    }
+
+    SnapshotDocument duplicateRecord = {};
+    SnapshotRecord firstRecord = {};
+    firstRecord.Domain = L"drivers";
+    firstRecord.Identity = L"duplicate";
+    duplicateRecord.Records =
+        {firstRecord, firstRecord};
+    if (SnapshotDocumentIdentitiesUnique(
+            duplicateRecord,
+            &duplicate))
+    {
+        return false;
+    }
+
+    return ExtractOptionalJsonUint64Strict(
+            L"{\"eprocess\":\"0x1234\"}",
+            L"eprocess",
+            &value) &&
+        value == 0x1234;
 }

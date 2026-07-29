@@ -240,14 +240,43 @@ function Increment-Version
     return $next
 }
 
+function Add-VersionCandidate
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Candidates,
+        [Parameter(Mandatory = $true)]
+        [string]$VersionText,
+        [Parameter(Mandatory = $true)]
+        [string]$Source
+    )
+
+    $parts = Parse-VersionParts -VersionText $VersionText
+    $score =
+        ([Convert]::ToUInt64($parts[0]) * 4294967296) +
+        ([Convert]::ToUInt64($parts[1]) * 65536) +
+        [Convert]::ToUInt64($parts[2])
+    $Candidates.Add([pscustomobject]@{
+        version = Format-Version -Parts $parts
+        source  = $Source
+        score   = $score
+    }) | Out-Null
+}
+
 function Get-BaselineVersion
 {
+    $candidates = [System.Collections.Generic.List[object]]::new()
+
     if (Test-Path $statePath)
     {
         $state = Get-Content $statePath -Raw | ConvertFrom-Json
         if ($state.current_version)
         {
-            return [string]$state.current_version
+            Add-VersionCandidate `
+                -Candidates $candidates `
+                -VersionText ([string]$state.current_version) `
+                -Source "version state"
         }
     }
 
@@ -256,11 +285,45 @@ function Get-BaselineVersion
         $fileVersion = (Get-Item -LiteralPath $exePath).VersionInfo.FileVersion
         if (-not [string]::IsNullOrWhiteSpace($fileVersion))
         {
-            return [string]$fileVersion
+            Add-VersionCandidate `
+                -Candidates $candidates `
+                -VersionText ([string]$fileVersion) `
+                -Source "existing PE"
         }
     }
 
-    return "0.0.0"
+    $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+    if ($null -ne $gitCommand)
+    {
+        $reachableTags =
+            & $gitCommand.Source `
+                -C $repo `
+                tag `
+                --merged HEAD `
+                --list "v[0-9]*" 2>$null
+        if ($LASTEXITCODE -eq 0)
+        {
+            foreach ($tag in @($reachableTags))
+            {
+                if ([string]$tag -match '^v([0-9]+\.[0-9]+\.[0-9]+)$')
+                {
+                    Add-VersionCandidate `
+                        -Candidates $candidates `
+                        -VersionText $Matches[1] `
+                        -Source "reachable Git tag $tag"
+                }
+            }
+        }
+    }
+
+    if ($candidates.Count -eq 0)
+    {
+        return "0.0.0"
+    }
+
+    $baseline = $candidates | Sort-Object score -Descending | Select-Object -First 1
+    Write-Host "PE version baseline: $($baseline.version) ($($baseline.source))"
+    return [string]$baseline.version
 }
 
 function Write-VersionHeader

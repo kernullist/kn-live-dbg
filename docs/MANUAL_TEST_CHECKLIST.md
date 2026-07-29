@@ -23,6 +23,44 @@ before the feature is trusted.
    dashboard shows symbol state; if `symType=0 (SymNone)`, fix the symbol path
    before running symbol-dependent checks).
 
+## Whole-host hunt negative control
+
+From the repository root, the repeatable clean-host gate is:
+
+```powershell
+.\tools\validate-hunt-clean-host-selftest.ps1
+.\tools\run-hunt-clean-host.ps1 -Mode Default -Count 3 -RequireClean
+```
+
+The first command is driver-free and validates the validator itself. The second
+requests elevation, disables the driver write gate before scanning, captures
+JSON and transcripts under `.build\hunt-clean-host`, and requires zero findings
+with complete process/triage coverage on every run. It also requires the
+`KnLiveDbg` service to be absent after each session.
+
+When a baseline emits findings, group repeated and intermittent evidence before
+changing a detector:
+
+```powershell
+.\tools\analyze-hunt-clean-host.ps1 `
+  -HuntJson .\.build\hunt-clean-host\hunt-clean-default-*.json `
+  -OutputJson .\.build\hunt-clean-host\analysis.json `
+  -OutputMarkdown .\.build\hunt-clean-host\analysis.md
+```
+
+For complete `/deep` coverage, use:
+
+```powershell
+.\tools\run-hunt-clean-host.ps1 -Mode Deep -EnableThreatIntel -Count 3 -RequireClean
+```
+
+`-EnableThreatIntel` temporarily enables writes only to apply
+`set-ppl-antimalware` to the KnLiveDbg process and start TI collection. The
+runner turns writes off before executing `!hunt`, stops TI, unloads the driver,
+and exits. An active, readable TI ring is valid even when a clean interval
+contains zero events; an unavailable/inactive subscription still makes deep
+coverage incomplete and the clean-host validator rejects the result.
+
 ## M2 - CPU-state detection (clean-box expectations)
 
 On a clean machine every command below must report **no `[SUSPICIOUS]`**. A

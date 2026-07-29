@@ -78,6 +78,30 @@ function Test-RequiredText
     }
 }
 
+function Test-RequiredPattern
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [System.Collections.Generic.List[string]]$Failures
+    )
+
+    $options =
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    if (-not [regex]::IsMatch($Text, $Pattern, $options))
+    {
+        $Failures.Add("missing ${Name}: pattern $Pattern")
+    }
+}
+
 function Test-ForbiddenText
 {
     param(
@@ -1005,7 +1029,8 @@ Test-OrderedText `
 Test-RequiredText -Text $targetSource -Needle "/hunt-parser-check" -Name "quoted SCM ImagePath test fixture" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "/hunt-parser-check-unquoted-extensionless" -Name "unquoted extensionless SCM ImagePath test fixture" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "/stop-event" -Name "hunt target graceful stop-event option" -Failures $failures
-Test-RequiredText -Text $targetSource -Needle "WaitForMultipleObjects(waitCount, waitHandles, FALSE, waitMs)" -Name "hunt target external stop-event wait" -Failures $failures
+Test-RequiredPattern -Text $targetSource -Pattern 'WaitForMultipleObjects\s*\(\s*waitCount\s*,\s*waitHandles\s*,\s*FALSE\s*,\s*waitMs\s*\)' -Name "hunt target external stop-event wait" -Failures $failures
+Test-RequiredText -Text $targetSource -Needle "WaitForMultipleObjects target stop failed" -Name "hunt target external stop-event failure check" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "Available hunt target experiments:" -Name "hunt target interactive experiment menu" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "Select a focused experiment. Each item explains what the target creates" -Name "hunt target operator-readable menu intro" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "category: " -Name "hunt target menu category field" -Failures $failures

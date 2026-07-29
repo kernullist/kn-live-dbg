@@ -1746,6 +1746,26 @@ Invoke-Step -Name "ESET IOC source coverage" -Script {
     }
 }
 
+Invoke-Step -Name "clean-host validator negative controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\validate-hunt-clean-host-selftest.ps1") `
+        -Root $rootPath
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "clean-host validator self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step -Name "clean-host recurrence analyzer controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\analyze-hunt-clean-host-selftest.ps1") `
+        -Root $rootPath
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "clean-host analyzer self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
 Invoke-Step -Name "synthetic ESET driver-service validator" -Script {
     $serviceManifest = Join-Path $rootPath ".build\hunt-readiness-service-synthetic-manifest.json"
     $serviceJson = Join-Path $rootPath ".build\hunt-readiness-service-synthetic.json"
@@ -2217,6 +2237,33 @@ else
     if (-not (Test-Path -LiteralPath $releaseTarget))
     {
         throw "release hunt target not found: $releaseTarget"
+    }
+
+    Invoke-Step -Name "target run-seconds overflow rejection" -Script {
+        $stdoutLog = Join-Path $rootPath ".build\hunt-readiness-seconds-overflow.stdout.log"
+        $stderrLog = Join-Path $rootPath ".build\hunt-readiness-seconds-overflow.stderr.log"
+        Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
+        $targetProcess =
+            Start-Process `
+                -FilePath $releaseTarget `
+                -ArgumentList @("/baseline", "/seconds", "4294968") `
+                -NoNewWindow `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $stdoutLog `
+                -RedirectStandardError $stderrLog
+        $targetExitCode = $targetProcess.ExitCode
+        $output =
+            (Get-Content -LiteralPath $stdoutLog, $stderrLog -Raw) -join
+            [Environment]::NewLine
+        if ($targetExitCode -eq 0 -or
+            $output.IndexOf(
+                "invalid /seconds value",
+                [System.StringComparison]::OrdinalIgnoreCase) -lt 0)
+        {
+            throw "hunt target did not reject a run-seconds value whose millisecond conversion overflows"
+        }
+        Write-Host "[hunt-readiness] target run-seconds overflow rejected=yes"
     }
 
     Invoke-Step -Name "interactive menu baseline smoke" -Script {
