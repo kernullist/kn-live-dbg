@@ -13,7 +13,11 @@ struct SnapshotProcessRecord
     uint64_t UserDirectoryTableBase = 0;
     uint64_t Peb = 0;
     uint64_t CreateTime = 0;
+    uint64_t ExitTime = 0;
+    uint32_t ActiveThreads = 0;
     bool HasCreateTime = false;
+    bool HasExitTime = false;
+    bool HasActiveThreads = false;
     bool HasPeb = false;
     std::wstring ImageName;
     std::wstring Identity;

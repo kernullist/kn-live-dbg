@@ -1,31 +1,7 @@
-#include <ntddk.h>
+#include <ntifs.h>
 #include <wdmsec.h>
 #include <intrin.h>
 #include "../shared/KnLiveDbgIoctl.h"
-
-extern "C"
-NTKERNELAPI
-NTSTATUS
-PsLookupProcessByProcessId(
-    HANDLE ProcessId,
-    PEPROCESS* Process);
-
-// ntddk alone does not publish KAPC_STATE. Use an opaque, oversized storage
-// block so OS layout drift cannot smash the stack, and declare the exports.
-typedef struct _KAPC_STATE* PKAPC_STATE;
-
-extern "C"
-NTKERNELAPI
-VOID
-KeStackAttachProcess(
-    _Inout_ PRKPROCESS Process,
-    _Out_ PKAPC_STATE ApcState);
-
-extern "C"
-NTKERNELAPI
-VOID
-KeUnstackDetachProcess(
-    _In_ PKAPC_STATE ApcState);
 
 extern "C"
 NTKERNELAPI
@@ -1805,6 +1781,168 @@ static NTSTATUS KnDbgHandleReadVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+static NTSTATUS KnDbgHandleReadProcessVirtual(
+    PIRP Irp,
+    PIO_STACK_LOCATION Stack,
+    PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+    PEPROCESS process = nullptr;
+
+    do
+    {
+        const ULONG inputLength =
+            Stack->Parameters.DeviceIoControl.InputBufferLength;
+        const ULONG outputLength =
+            Stack->Parameters.DeviceIoControl.OutputBufferLength;
+        const ULONG headerLength =
+            FIELD_OFFSET(KNDBG_PROCESS_VIRTUAL_READ_REQUEST, Data);
+
+        if (!KnDbgCheckInputHeader(
+                Buffer,
+                inputLength,
+                headerLength))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        KNDBG_PROCESS_VIRTUAL_READ_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, headerLength);
+        if (request.Flags != 0 ||
+            request.Reserved != 0 ||
+            request.Reserved2 != 0 ||
+            request.ProcessId == 0 ||
+            request.ExpectedEprocess == 0 ||
+            request.ExpectedCreateTime == 0)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (request.Length == 0 ||
+            request.Length > KNDBG_MAX_TRANSFER_SIZE)
+        {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+        if (request.Address == 0 ||
+            KnDbgRangeOverflows(request.Address, request.Length))
+        {
+            status = STATUS_INVALID_ADDRESS;
+            break;
+        }
+
+        const ULONGLONG highestUserAddress =
+            static_cast<ULONGLONG>(
+                reinterpret_cast<ULONG_PTR>(
+                    MmHighestUserAddress));
+        if (request.Address > highestUserAddress ||
+            static_cast<ULONGLONG>(request.Length - 1) >
+                highestUserAddress - request.Address)
+        {
+            status = STATUS_INVALID_ADDRESS;
+            break;
+        }
+        if (KeGetCurrentIrql() > APC_LEVEL)
+        {
+            // MmCopyMemory is documented only through APC_LEVEL, and this
+            // request also attaches to the target process address space.
+            status = STATUS_INVALID_DEVICE_STATE;
+            break;
+        }
+
+        const ULONG requiredLength =
+            headerLength + request.Length;
+        if (requiredLength < headerLength ||
+            outputLength < requiredLength)
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        status = PsLookupProcessByProcessId(
+            ULongToHandle(request.ProcessId),
+            &process);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+        if ((request.ExpectedEprocess != 0 &&
+             request.ExpectedEprocess !=
+                reinterpret_cast<KNDBG_UINT64>(process)) ||
+            (request.ExpectedCreateTime != 0 &&
+             request.ExpectedCreateTime !=
+                static_cast<KNDBG_UINT64>(
+                    PsGetProcessCreateTimeQuadPart(process))))
+        {
+            status = STATUS_NOT_FOUND;
+            break;
+        }
+        if (PsGetProcessExitStatus(process) !=
+            STATUS_PENDING)
+        {
+            status = STATUS_PROCESS_IS_TERMINATING;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, outputLength);
+        KNDBG_PROCESS_VIRTUAL_READ_REQUEST* response =
+            reinterpret_cast<
+                KNDBG_PROCESS_VIRTUAL_READ_REQUEST*>(Buffer);
+        response->Size = requiredLength;
+        response->ProcessId = request.ProcessId;
+        response->ExpectedEprocess = request.ExpectedEprocess;
+        response->ExpectedCreateTime =
+            request.ExpectedCreateTime;
+        response->Address = request.Address;
+        response->Length = request.Length;
+
+        KAPC_STATE apcState = {};
+        BOOLEAN attached = FALSE;
+        SIZE_T bytesCopied = 0;
+        __try
+        {
+            KeStackAttachProcess(
+                reinterpret_cast<PRKPROCESS>(process),
+                &apcState);
+            attached = TRUE;
+            status = KnDbgReadVirtualAddress(
+                request.Address,
+                response->Data,
+                request.Length,
+                0,
+                &bytesCopied);
+        }
+        __finally
+        {
+            if (attached != FALSE)
+            {
+                KeUnstackDetachProcess(&apcState);
+            }
+        }
+
+        response->Length =
+            static_cast<KNDBG_UINT32>(bytesCopied);
+        if (NT_SUCCESS(status) &&
+            bytesCopied == request.Length)
+        {
+            information = headerLength + bytesCopied;
+        }
+        else if (NT_SUCCESS(status))
+        {
+            status = STATUS_PARTIAL_COPY;
+        }
+    } while (false);
+
+    if (process != nullptr)
+    {
+        ObDereferenceObject(process);
+    }
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static NTSTATUS KnDbgHandleWriteVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -2821,6 +2959,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_TIMELINE_DRAIN:
         status = KnDbgHandleTimelineDrain(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_READ_PROCESS_VIRTUAL:
+        status = KnDbgHandleReadProcessVirtual(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

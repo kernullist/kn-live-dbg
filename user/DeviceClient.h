@@ -124,6 +124,14 @@ public:
         std::vector<uint8_t>* bytes,
         std::wstring* error,
         uint32_t flags = 0);
+    bool ReadProcessVirtual(
+        uint32_t processId,
+        uint64_t expectedEprocess,
+        uint64_t expectedCreateTime,
+        uint64_t address,
+        uint32_t length,
+        std::vector<uint8_t>* bytes,
+        std::wstring* error);
     bool WriteMemory(uint64_t address, const std::vector<uint8_t>& bytes, std::wstring* error);
     bool QueryAddress(uint64_t address, uint32_t length, AddressQueryInfo* info, std::wstring* error);
     bool QueryAddress(uint64_t address, uint32_t length, std::wstring* summary, std::wstring* error);

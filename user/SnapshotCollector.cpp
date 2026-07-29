@@ -267,6 +267,8 @@ namespace
         target.UserDirectoryTableBase = process.UserDirectoryTableBase;
         target.Peb = process.Peb;
         target.HasPeb = process.HasPeb;
+        target.CreateTime = process.CreateTime;
+        target.HasCreateTime = process.HasCreateTime;
         target.ImageName = process.ImageName;
         return target;
     }
@@ -299,6 +301,14 @@ namespace
             record.Evidence[L"eprocess"] = SnapshotHex(process.Eprocess, 16);
             record.Evidence[L"dtb"] = SnapshotHex(process.DirectoryTableBase, 16);
             record.Evidence[L"user_dtb"] = SnapshotHex(process.UserDirectoryTableBase, 16);
+            if (process.HasActiveThreads)
+            {
+                record.Evidence[L"active_threads"] = DecText(process.ActiveThreads);
+            }
+            if (process.HasExitTime)
+            {
+                record.Evidence[L"exit_time"] = SnapshotHex(process.ExitTime, 16);
+            }
             record.Evidence[L"has_create_time"] = BoolText(process.HasCreateTime);
             record.Evidence[L"create_time"] = SnapshotHex(process.CreateTime, 16);
             AddRecord(document, std::move(record));
@@ -399,6 +409,10 @@ namespace
                     dispatchRecord.Tags.push_back(L"suspicious");
                 }
                 dispatchRecord.Evidence[L"driver"] = driver.Name;
+                dispatchRecord.Evidence[L"driver_object"] =
+                    SnapshotHex(driver.DriverObject, 16);
+                dispatchRecord.Evidence[L"driver_start"] =
+                    SnapshotHex(driver.DriverStart, 16);
                 dispatchRecord.Evidence[L"irp"] = DecText(dispatch.Index);
                 dispatchRecord.Evidence[L"name"] = dispatch.Name;
                 dispatchRecord.Evidence[L"function"] = SnapshotHex(dispatch.Function, 16);
@@ -406,6 +420,8 @@ namespace
                 dispatchRecord.Evidence[L"symbol"] = dispatch.SymbolName;
                 dispatchRecord.Evidence[L"in_loaded_module"] = BoolText(dispatch.InLoadedModule);
                 dispatchRecord.Evidence[L"in_owning_image"] = BoolText(dispatch.InOwningImage);
+                dispatchRecord.Evidence[L"delegated_to_loaded_module"] =
+                    BoolText(dispatch.DelegatedToLoadedModule);
                 AddRecord(document, std::move(dispatchRecord));
             }
         }

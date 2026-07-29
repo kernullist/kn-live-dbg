@@ -1774,8 +1774,15 @@ namespace
                          !dispatch.ModuleName.empty() &&
                          !IsKernelModuleName(dispatch.ModuleName))
                 {
-                    dispatch.Suspicious = true;
-                    dispatch.Notes = L"dispatch pointer targets another non-kernel module";
+                    // KMDF, NDIS, Storport, display, USB, class, and media
+                    // miniport drivers legitimately delegate MajorFunction
+                    // entries into another loaded kernel module.  Cross-image
+                    // ownership alone cannot distinguish that architecture
+                    // from a hook.  Keep it as structured telemetry; only a
+                    // pointer outside every loaded module is an integrity
+                    // finding without additional provenance.
+                    dispatch.DelegatedToLoadedModule = true;
+                    dispatch.Notes = L"dispatch pointer delegates to another loaded kernel module";
                 }
 
                 if (dispatch.Suspicious)
@@ -3029,6 +3036,8 @@ std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result)
                  << L"\",\"function\":\"" << Hex(dispatch.Function, 16)
                  << L"\",\"module\":\"" << JsonEscape(dispatch.ModuleName)
                  << L"\",\"symbol\":\"" << JsonEscape(dispatch.SymbolName)
+                 << L"\",\"delegated_to_loaded_module\":"
+                 << (dispatch.DelegatedToLoadedModule ? L"true" : L"false")
                  << L"\",\"suspicious\":" << (dispatch.Suspicious ? L"true" : L"false")
                  << L"}";
         }

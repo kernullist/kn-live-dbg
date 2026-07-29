@@ -16,6 +16,8 @@ struct ProcessTriageTarget
     uint64_t UserDirectoryTableBase = 0;
     uint64_t Peb = 0;
     bool     HasPeb = false;
+    uint64_t CreateTime = 0;
+    bool     HasCreateTime = false;
     std::wstring ImageName;
 };
 
@@ -26,6 +28,21 @@ struct ProcessUserModuleRange
     std::wstring ImageName;
     std::wstring ImagePath;
 };
+
+struct ProcessVadProtectionRange
+{
+    uint64_t StartAddress = 0;
+    uint64_t EndAddress = 0;
+    uint32_t Protection = 0;
+    bool Committed = false;
+    bool Executable = false;
+    bool Writable = false;
+    bool CopyOnWrite = false;
+    bool WritableExecutable = false;
+    bool CopyOnWriteExecutable = false;
+};
+
+bool ProcessTriageEffectiveProtectionSelfTest();
 
 struct ProcessVadRecord
 {
@@ -45,6 +62,21 @@ struct ProcessVadRecord
     bool Executable = false;
     bool Writable = false;
     bool CopyOnWrite = false;
+    // VAD Protection is the allocation/default protection and can remain RW
+    // after VirtualProtect turns committed pages into RX.  When available,
+    // these fields summarize the current VirtualQueryEx view across the VAD.
+    bool EffectiveProtectionQueried = false;
+    bool EffectiveProtectionComplete = false;
+    bool WritableExecutable = false;
+    bool CopyOnWriteExecutable = false;
+    uint64_t EffectiveCommittedBytes = 0;
+    uint64_t EffectiveExecutableBytes = 0;
+    uint64_t EffectiveWritableBytes = 0;
+    uint64_t EffectiveCopyOnWriteBytes = 0;
+    uint64_t EffectiveWritableExecutableBytes = 0;
+    uint64_t EffectiveCopyOnWriteExecutableBytes = 0;
+    std::wstring EffectiveProtectionText;
+    std::vector<ProcessVadProtectionRange> EffectiveProtectionRanges;
     bool HasPrivateMemory = false;
     bool PrivateMemory = false;
     bool HasNoChange = false;
@@ -137,13 +169,22 @@ struct ProcessApcEntryRecord
     uint64_t NormalContext = 0;
     uint64_t SystemArgument1 = 0;
     uint64_t SystemArgument2 = 0;
+    uint64_t UserRoutine = 0;
     std::wstring KernelRoutineModule;
     std::wstring KernelRoutineSymbol;
     std::wstring NormalRoutineModule;
+    std::wstring NormalRoutineVadClassification;
+    std::wstring UserRoutineSource;
+    std::wstring UserRoutineModule;
+    std::wstring UserRoutineVadClassification;
     std::wstring Notes;
     bool HasKernelRoutine = false;
     bool HasRundownRoutine = false;
     bool HasNormalRoutine = false;
+    bool NormalRoutineInPrivateExecVad = false;
+    bool NormalRoutineInWxVad = false;
+    bool UserRoutineInPrivateExecVad = false;
+    bool UserRoutineInWxVad = false;
     bool Suspicious = false;
 };
 
@@ -154,9 +195,11 @@ struct ProcessApcQueueRecord
     uint64_t Flink = 0;
     uint64_t Blink = 0;
     uint32_t EntriesScanned = 0;
+    std::wstring Notes;
     bool Present = false;
     bool NonEmpty = false;
     bool Truncated = false;
+    bool Incomplete = false;
     std::vector<ProcessApcEntryRecord> Entries;
 };
 
@@ -209,6 +252,11 @@ struct ProcessThreadRecord
 struct ProcessThreadScanOptions
 {
     ProcessTriageTarget Target = {};
+    // Hunt can provide its independently collected PEB/Toolhelp union so
+    // protected processes do not lose module provenance merely because a
+    // second Toolhelp snapshot is denied.
+    std::vector<ProcessUserModuleRange> UserModules;
+    bool UserModuleEnumerationComplete = false;
     bool IncludeApc = false;
     bool IncludeStacks = false;
     uint32_t Limit = 0;

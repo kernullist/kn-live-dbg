@@ -6915,12 +6915,14 @@ struct DmlProcessLayout
     TypeFieldInfo ActiveThreads = {};
     TypeFieldInfo Peb = {};
     TypeFieldInfo CreateTime = {};
+    TypeFieldInfo ExitTime = {};
     uint32_t DirectoryTableBaseOffset = 0;
     uint32_t UserDirectoryTableBaseOffset = 0;
     bool HasInheritedFromUniqueProcessId = false;
     bool HasActiveThreads = false;
     bool HasPeb = false;
     bool HasCreateTime = false;
+    bool HasExitTime = false;
 };
 
 struct DmlProcessRecord
@@ -6935,12 +6937,14 @@ struct DmlProcessRecord
     uint64_t UserDirectoryTableBase = 0;
     uint64_t Peb = 0;
     uint64_t CreateTime = 0;
+    uint64_t ExitTime = 0;
     uint32_t ActiveThreads = 0;
     std::wstring ImageName;
     bool HasParentProcessId = false;
     bool HasActiveThreads = false;
     bool HasPeb = false;
     bool HasCreateTime = false;
+    bool HasExitTime = false;
 };
 
 static bool ReadKernelBytes(
@@ -7103,6 +7107,8 @@ static bool ResolveDmlProcessLayout(SymbolEngine& symbols, DmlProcessLayout* lay
             FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"Peb", &layout->Peb, &ignored);
         layout->HasCreateTime =
             FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"CreateTime", &layout->CreateTime, &ignored);
+        layout->HasExitTime =
+            FindFieldAny(symbols, {L"nt!_EPROCESS", L"_EPROCESS"}, L"ExitTime", &layout->ExitTime, &ignored);
 
         if (!ResolveProcessDirectoryTableBaseOffsets(symbols, &layout->DirectoryTableBaseOffset, &layout->UserDirectoryTableBaseOffset, error))
         {
@@ -7283,6 +7289,11 @@ static bool ReadDmlProcessRecord(
         {
             record->HasCreateTime =
                 ReadKernelFieldInteger(device, eprocess, layout.CreateTime, sizeof(uint64_t), &record->CreateTime, nullptr);
+        }
+        if (layout.HasExitTime)
+        {
+            record->HasExitTime =
+                ReadKernelFieldInteger(device, eprocess, layout.ExitTime, sizeof(uint64_t), &record->ExitTime, nullptr);
         }
 
         uint64_t directoryTableBaseAddress = 0;
@@ -7668,6 +7679,10 @@ static bool BuildSnapshotProcessInventory(
             process.HasPeb = record.HasPeb;
             process.CreateTime = record.CreateTime;
             process.HasCreateTime = record.HasCreateTime;
+            process.ExitTime = record.ExitTime;
+            process.HasExitTime = record.HasExitTime;
+            process.ActiveThreads = record.ActiveThreads;
+            process.HasActiveThreads = record.HasActiveThreads;
             process.ImageName = record.ImageName;
             process.Identity = BuildSnapshotProcessIdentity(process, warnings);
             processes->push_back(std::move(process));
@@ -23423,6 +23438,67 @@ static int RunConsoleSurfaceSelfTest()
     {
         CheckConsoleSurfaceSelfTest(
             &context,
+            HuntFirstCommandLineImage(L"\"C:\\Program Files\\Example\\example.exe\" --flag") ==
+                L"C:\\Program Files\\Example\\example.exe",
+            L"hunt-command-line-image-quoted");
+
+        std::wstring embeddedNullCommandLine = L"C:\\Windows\\System32\\wbem\\WmiPrvSE.exe";
+        embeddedNullCommandLine.push_back(L'\0');
+        embeddedNullCommandLine += L"-secured";
+        embeddedNullCommandLine.push_back(L'\0');
+        embeddedNullCommandLine += L"-Embedding";
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntFirstCommandLineImage(embeddedNullCommandLine) ==
+                L"C:\\Windows\\System32\\wbem\\WmiPrvSE.exe",
+            L"hunt-command-line-image-embedded-null");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntFirstCommandLineImage(L"/QuitInfo:0000000000000358;").empty(),
+            L"hunt-command-line-image-argument-only");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntProcessLifecycleSelfTest(),
+            L"hunt-process-handle-lifecycle-identity");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntDiskPeBoundsSelfTest(),
+            L"hunt-disk-pe-bounds");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntBaseRelocationMaskSelfTest(),
+            L"hunt-base-relocation-exact-mask");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntDynamicRelocationMaskSelfTest(),
+            L"hunt-dvrt-function-override-mask");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntEffectiveVadProtectionSelfTest(),
+            L"hunt-effective-vad-address-protection");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntEdrKillerProfileSelfTest(),
+            L"hunt-edr-killer-profile-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntManagedLoaderlessMappingSelfTest(),
+            L"hunt-managed-loaderless-runtime-gate");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ProcessTriageEffectiveProtectionSelfTest(),
+            L"process-triage-effective-protection-range-bounds");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            SnapshotDriverDispatchDiffSelfTest(),
+            L"snapshot-driver-dispatch-same-boot-delta");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            SnapshotJsonStrictParsingSelfTest(),
+            L"snapshot-json-strict-numeric-and-boolean-fields");
+
+        CheckConsoleSurfaceSelfTest(
+            &context,
             !CompletionCandidateExists({L"!timeline"}, L"live"),
             L"timeline-root-hides-live-completion");
         CheckConsoleSurfaceSelfTest(
@@ -29043,6 +29119,8 @@ static ProcessTriageTarget ProcessTriageTargetFromDmlRecord(const DmlProcessReco
     target.UserDirectoryTableBase = record.UserDirectoryTableBase;
     target.Peb = record.Peb;
     target.HasPeb = record.HasPeb;
+    target.CreateTime = record.CreateTime;
+    target.HasCreateTime = record.HasCreateTime;
     target.ImageName = record.ImageName;
     return target;
 }
@@ -29207,13 +29285,17 @@ static void PrintProcessTriageWarnings(const std::wstring& prefix, const std::ve
 
 static void PrintVadRecord(const ProcessVadRecord& record)
 {
-    WORD color = record.Executable && record.Writable ? KNDBG_COLOR_WARN : KNDBG_COLOR_ACCENT;
+    WORD color = record.WritableExecutable ? KNDBG_COLOR_WARN : KNDBG_COLOR_ACCENT;
 
     PrintColoredText(HexTextWidth(record.StartAddress, 16, true), color);
     std::wcout << L"-" << HexTextWidth(record.EndAddress, 16, true);
     std::wcout << L" size=" << HexText(record.Size);
     std::wcout << L" vad=" << HexTextWidth(record.VadAddress, 16, true);
     std::wcout << L" prot=" << (record.HasProtection ? record.ProtectionText : L"?");
+    if (record.EffectiveProtectionComplete)
+    {
+        std::wcout << L" effective={" << record.EffectiveProtectionText << L"}";
+    }
     if (record.HasPrivateMemory)
     {
         std::wcout << L" private=" << (record.PrivateMemory ? L"yes" : L"no");
@@ -29400,6 +29482,14 @@ static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeSta
             {
                 std::wcout << L" truncated=yes";
             }
+            if (queue.Incomplete)
+            {
+                std::wcout << L" incomplete=yes";
+            }
+            if (!queue.Notes.empty())
+            {
+                std::wcout << L" notes=" << queue.Notes;
+            }
             std::wcout << L"\n";
 
             for (const ProcessApcEntryRecord& entry : queue.Entries)
@@ -29407,6 +29497,8 @@ static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeSta
                 std::wcout << L"        kapc=" << HexTextWidth(entry.KapcAddress, 16, true)
                            << L" kernel=" << HexTextWidth(entry.KernelRoutine, 16, true)
                            << L" normal=" << HexTextWidth(entry.NormalRoutine, 16, true)
+                           << L" user=" << HexTextWidth(entry.UserRoutine, 16, true)
+                           << L" user_source=" << entry.UserRoutineSource
                            << L" suspicious=" << (entry.Suspicious ? L"yes" : L"no");
                 if (!entry.KernelRoutineModule.empty())
                 {
@@ -29415,6 +29507,10 @@ static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeSta
                 if (!entry.NormalRoutineModule.empty())
                 {
                     std::wcout << L" nmod=" << entry.NormalRoutineModule;
+                }
+                if (!entry.UserRoutineModule.empty())
+                {
+                    std::wcout << L" umod=" << entry.UserRoutineModule;
                 }
                 if (!entry.Notes.empty())
                 {
@@ -31229,6 +31325,10 @@ static void PrintHuntSummaryLine(const HuntResult& result)
     {
         std::wcout << L" process_triage_incomplete=yes";
     }
+    if (result.DeepImageComparisonCoverageIncomplete)
+    {
+        std::wcout << L" deep_image_comparison_incomplete=yes";
+    }
     if (result.CidTableLookupOnly)
     {
         std::wcout << L" cid_lookup_only=yes";
@@ -31721,7 +31821,10 @@ static void HandleHuntCommand(
             TiSubscriberStats tiStats = ti.SnapshotStats();
             options.ThreatIntelEventsDropped = tiStats.EventsDropped;
             std::vector<TiEventRecord> recentTiEvents = ti.Recent(4096, true);
-            options.ThreatIntelAvailable = !recentTiEvents.empty();
+            // An active, successfully queried ring is available even when a
+            // quiet host produced zero events.  Event count and collection
+            // availability are separate signals.
+            options.ThreatIntelAvailable = options.ThreatIntelActive;
             options.ThreatIntelEvents.reserve(recentTiEvents.size());
 
             for (const TiEventRecord& tiEvent : recentTiEvents)
@@ -31758,8 +31861,10 @@ static void HandleHuntCommand(
         }
 
         result.Warnings.insert(result.Warnings.begin(), processWarnings.begin(), processWarnings.end());
-        result.ProcessInventoryIncomplete = processInventoryIncomplete;
-        if (processInventoryIncomplete)
+        result.ProcessInventoryIncomplete =
+            result.ProcessInventoryIncomplete ||
+            processInventoryIncomplete;
+        if (result.ProcessInventoryIncomplete)
         {
             result.CoverageComplete = false;
         }

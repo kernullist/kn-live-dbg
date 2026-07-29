@@ -2633,7 +2633,15 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
 
             if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_TYPEID, &field.ChildTypeId))
             {
-                SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_LENGTH, &field.Length);
+                // TI_GET_LENGTH on the data symbol is the bit width for a
+                // bitfield.  The child type length is its storage size, so
+                // overwriting the former turns one-bit flags into multi-bit
+                // values and makes adjacent flags look set.  Keep this path
+                // consistent with the DIA layout reader above.
+                if (field.Length == 0 || !field.IsBitField)
+                {
+                    SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_LENGTH, &field.Length);
+                }
                 SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_BASETYPE, &field.BaseType);
                 SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_SYMTAG, &field.ChildTag);
                 field.TypeName = DescribeType(process_, moduleBase, field.ChildTypeId, 0);

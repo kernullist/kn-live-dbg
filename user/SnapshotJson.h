@@ -11,3 +11,4 @@ bool WriteSnapshotJsonFile(const std::wstring& path, const SnapshotDocument& doc
 bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, std::wstring* error);
 bool EnsureSnapshotDirectoryForFile(const std::wstring& path, std::wstring* error);
 std::wstring SnapshotJsonEscape(const std::wstring& value);
+bool SnapshotJsonStrictParsingSelfTest();

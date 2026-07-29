@@ -72,6 +72,28 @@ namespace
         return _wcsicmp(a.c_str(), b.c_str()) == 0;
     }
 
+    bool IsKernelOnlyProcessTarget(
+        const ProcessTriageTarget& target)
+    {
+        // HasPeb means the EPROCESS.Peb field was read successfully; it does
+        // not mean the pointer stored in that field is non-null.  Kernel-only
+        // pseudo processes normally expose a readable, zero Peb value.
+        if (target.Peb != 0)
+        {
+            return false;
+        }
+
+        return target.ProcessId == 0 ||
+            target.ProcessId == 4 ||
+            EqualsNoCase(target.ImageName, L"registry") ||
+            EqualsNoCase(
+                target.ImageName,
+                L"memcompression") ||
+            EqualsNoCase(
+                target.ImageName,
+                L"secure system");
+    }
+
     bool IsKernelAddress(uint64_t address)
     {
         return address >= kKernelAddressMin;
@@ -338,7 +360,10 @@ namespace
 
             if (field.IsBitField)
             {
-                if (field.Length == 0 || field.Length > 64 || field.BitPosition >= 64)
+                if (field.Length == 0 ||
+                    field.Length > 64 ||
+                    field.BitPosition >= 64 ||
+                    field.Length > 64 - field.BitPosition)
                 {
                     if (error != nullptr)
                     {
@@ -600,6 +625,245 @@ namespace
     {
         uint32_t p = protection & 0x7u;
         return p == 5 || p == 7;
+    }
+
+    bool WindowsProtectionExecutable(DWORD protection)
+    {
+        switch (protection & 0xffu)
+        {
+        case PAGE_EXECUTE:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool WindowsProtectionWritable(DWORD protection)
+    {
+        switch (protection & 0xffu)
+        {
+        case PAGE_READWRITE:
+        case PAGE_EXECUTE_READWRITE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool WindowsProtectionCopyOnWrite(DWORD protection)
+    {
+        switch (protection & 0xffu)
+        {
+        case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    constexpr size_t kMaxEffectiveProtectionRangesPerVad = 4096;
+
+    bool SameEffectiveProtection(
+        const ProcessVadProtectionRange& left,
+        const ProcessVadProtectionRange& right)
+    {
+        return
+            left.Protection == right.Protection &&
+            left.Committed == right.Committed &&
+            left.Executable == right.Executable &&
+            left.Writable == right.Writable &&
+            left.CopyOnWrite == right.CopyOnWrite &&
+            left.WritableExecutable == right.WritableExecutable &&
+            left.CopyOnWriteExecutable == right.CopyOnWriteExecutable;
+    }
+
+    bool AppendEffectiveProtectionRange(
+        std::vector<ProcessVadProtectionRange>* ranges,
+        const ProcessVadProtectionRange& range)
+    {
+        if (ranges == nullptr ||
+            range.EndAddress < range.StartAddress)
+        {
+            return false;
+        }
+
+        if (!ranges->empty())
+        {
+            ProcessVadProtectionRange& previous = ranges->back();
+            if (previous.EndAddress != std::numeric_limits<uint64_t>::max() &&
+                previous.EndAddress + 1 == range.StartAddress &&
+                SameEffectiveProtection(previous, range))
+            {
+                previous.EndAddress = range.EndAddress;
+                return true;
+            }
+        }
+
+        if (ranges->size() >= kMaxEffectiveProtectionRangesPerVad)
+        {
+            return false;
+        }
+        ranges->push_back(range);
+        return true;
+    }
+
+    void EnrichVadEffectiveProtection(HANDLE process, ProcessVadRecord* record)
+    {
+        do
+        {
+            if (process == nullptr ||
+                process == INVALID_HANDLE_VALUE ||
+                record == nullptr ||
+                record->EndAddress < record->StartAddress)
+            {
+                break;
+            }
+
+            record->EffectiveProtectionQueried = false;
+            record->EffectiveProtectionComplete = false;
+            record->EffectiveCommittedBytes = 0;
+            record->EffectiveExecutableBytes = 0;
+            record->EffectiveWritableBytes = 0;
+            record->EffectiveCopyOnWriteBytes = 0;
+            record->EffectiveWritableExecutableBytes = 0;
+            record->EffectiveCopyOnWriteExecutableBytes = 0;
+            record->EffectiveProtectionText.clear();
+            record->EffectiveProtectionRanges.clear();
+
+            uint64_t cursor = record->StartAddress;
+            bool complete = false;
+            bool queried = false;
+            bool rangeLimitReached = false;
+            while (cursor <= record->EndAddress)
+            {
+                MEMORY_BASIC_INFORMATION memory = {};
+                SIZE_T returned = VirtualQueryEx(
+                    process,
+                    reinterpret_cast<const void*>(cursor),
+                    &memory,
+                    sizeof(memory));
+                if (returned < sizeof(memory) || memory.RegionSize == 0)
+                {
+                    break;
+                }
+                queried = true;
+
+                uint64_t regionStart = reinterpret_cast<uint64_t>(memory.BaseAddress);
+                uint64_t regionSize = static_cast<uint64_t>(memory.RegionSize);
+                uint64_t regionEnd = std::numeric_limits<uint64_t>::max();
+                if (regionSize - 1 <= std::numeric_limits<uint64_t>::max() - regionStart)
+                {
+                    regionEnd = regionStart + regionSize - 1;
+                }
+                if (regionEnd < cursor)
+                {
+                    break;
+                }
+
+                uint64_t overlapStart = cursor > regionStart ? cursor : regionStart;
+                uint64_t overlapEnd = regionEnd < record->EndAddress
+                    ? regionEnd
+                    : record->EndAddress;
+                if (overlapEnd < overlapStart)
+                {
+                    break;
+                }
+
+                uint64_t overlapBytes = overlapEnd - overlapStart + 1;
+                ProcessVadProtectionRange protectionRange = {};
+                protectionRange.StartAddress = overlapStart;
+                protectionRange.EndAddress = overlapEnd;
+                protectionRange.Protection = memory.Protect;
+                protectionRange.Committed = memory.State == MEM_COMMIT;
+                if (memory.State == MEM_COMMIT)
+                {
+                    bool executable = WindowsProtectionExecutable(memory.Protect);
+                    bool writable = WindowsProtectionWritable(memory.Protect);
+                    bool copyOnWrite = WindowsProtectionCopyOnWrite(memory.Protect);
+                    protectionRange.Executable = executable;
+                    protectionRange.Writable = writable;
+                    protectionRange.CopyOnWrite = copyOnWrite;
+                    protectionRange.WritableExecutable = executable && writable;
+                    protectionRange.CopyOnWriteExecutable = executable && copyOnWrite;
+                    record->EffectiveCommittedBytes += overlapBytes;
+                    if (executable)
+                    {
+                        record->EffectiveExecutableBytes += overlapBytes;
+                    }
+                    if (writable)
+                    {
+                        record->EffectiveWritableBytes += overlapBytes;
+                    }
+                    if (copyOnWrite)
+                    {
+                        record->EffectiveCopyOnWriteBytes += overlapBytes;
+                    }
+                    if (executable && writable)
+                    {
+                        record->EffectiveWritableExecutableBytes += overlapBytes;
+                    }
+                    if (executable && copyOnWrite)
+                    {
+                        record->EffectiveCopyOnWriteExecutableBytes += overlapBytes;
+                    }
+                }
+                if (!AppendEffectiveProtectionRange(
+                        &record->EffectiveProtectionRanges,
+                        protectionRange))
+                {
+                    rangeLimitReached = true;
+                    break;
+                }
+
+                if (regionEnd >= record->EndAddress)
+                {
+                    complete = true;
+                    break;
+                }
+                if (regionEnd == std::numeric_limits<uint64_t>::max())
+                {
+                    break;
+                }
+                cursor = regionEnd + 1;
+            }
+
+            record->EffectiveProtectionQueried = queried;
+            record->EffectiveProtectionComplete =
+                queried && complete && !rangeLimitReached;
+            if (!record->EffectiveProtectionComplete)
+            {
+                record->EffectiveProtectionRanges.clear();
+                record->EffectiveCommittedBytes = 0;
+                record->EffectiveExecutableBytes = 0;
+                record->EffectiveWritableBytes = 0;
+                record->EffectiveCopyOnWriteBytes = 0;
+                record->EffectiveWritableExecutableBytes = 0;
+                record->EffectiveCopyOnWriteExecutableBytes = 0;
+                break;
+            }
+
+            record->Executable = record->EffectiveExecutableBytes != 0;
+            record->Writable = record->EffectiveWritableBytes != 0;
+            record->WritableExecutable =
+                record->EffectiveWritableExecutableBytes != 0;
+            record->CopyOnWriteExecutable =
+                record->EffectiveCopyOnWriteExecutableBytes != 0;
+            record->CopyOnWrite =
+                record->EffectiveCopyOnWriteBytes != 0;
+
+            std::wstringstream summary;
+            summary << L"committed=" << record->EffectiveCommittedBytes
+                    << L",exec=" << record->EffectiveExecutableBytes
+                    << L",write=" << record->EffectiveWritableBytes
+                    << L",cow=" << record->EffectiveCopyOnWriteBytes
+                    << L",wx=" << record->EffectiveWritableExecutableBytes
+                    << L",x_cow=" << record->EffectiveCopyOnWriteExecutableBytes;
+            record->EffectiveProtectionText = summary.str();
+        } while (false);
     }
 
     bool ReadProcessMemoryByDtb(
@@ -1157,6 +1421,25 @@ namespace
                 vadIntervals,
                 &vadCursor,
                 result);
+
+            if (result->PageTableReadFailures != 0)
+            {
+                // A lock-free page-table walk can race process teardown or
+                // page-table reclamation.  Once an intermediate page cannot
+                // be read, bytes reached through that snapshot are no longer
+                // trustworthy as DKOM evidence.  Fail closed and let the hunt
+                // caller retry from a fresh VAD/page-table snapshot.
+                result->HiddenPteRecords.clear();
+                result->HiddenPteRanges = 0;
+                result->HiddenPteBytes = 0;
+                result->HiddenPteExecutableCount = 0;
+                result->HiddenPteWxCount = 0;
+                result->HiddenPteTruncated = false;
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(
+                    L"hidden PTE evidence suppressed because the page-table walk had read failures");
+            }
         } while (false);
     }
 
@@ -1220,6 +1503,7 @@ namespace
     bool EnumerateUserModules(uint32_t pid, std::vector<ProcessUserModuleRange>* modules, std::wstring* warning)
     {
         bool ok = false;
+        HANDLE snapshot = INVALID_HANDLE_VALUE;
 
         do
         {
@@ -1229,12 +1513,34 @@ namespace
             }
 
             modules->clear();
-            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+            DWORD snapshotError = ERROR_SUCCESS;
+            constexpr size_t kMaxModuleSnapshotAttempts = 8;
+            for (size_t attempt = 0;
+                 attempt < kMaxModuleSnapshotAttempts;
+                 ++attempt)
+            {
+                snapshot = CreateToolhelp32Snapshot(
+                    TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                    pid);
+                if (snapshot != INVALID_HANDLE_VALUE)
+                {
+                    break;
+                }
+
+                snapshotError = GetLastError();
+                if (snapshotError != ERROR_BAD_LENGTH)
+                {
+                    break;
+                }
+                SwitchToThread();
+            }
             if (snapshot == INVALID_HANDLE_VALUE)
             {
                 if (warning != nullptr)
                 {
-                    *warning = L"user module enumeration failed: CreateToolhelp32Snapshot gle=" + std::to_wstring(GetLastError());
+                    *warning =
+                        L"user module enumeration failed: CreateToolhelp32Snapshot gle=" +
+                        std::to_wstring(snapshotError);
                 }
                 break;
             }
@@ -1247,11 +1553,10 @@ namespace
                 {
                     *warning = L"user module enumeration failed: Module32FirstW gle=" + std::to_wstring(GetLastError());
                 }
-                CloseHandle(snapshot);
                 break;
             }
 
-            do
+            for (;;)
             {
                 ProcessUserModuleRange module = {};
                 module.Base = reinterpret_cast<uint64_t>(entry.modBaseAddr);
@@ -1260,13 +1565,154 @@ namespace
                 module.ImagePath = entry.szExePath;
                 modules->push_back(module);
                 entry.dwSize = sizeof(entry);
-            } while (Module32NextW(snapshot, &entry));
+                if (Module32NextW(snapshot, &entry))
+                {
+                    continue;
+                }
 
-            CloseHandle(snapshot);
-            ok = true;
+                const DWORD enumerationError = GetLastError();
+                if (enumerationError == ERROR_NO_MORE_FILES)
+                {
+                    ok = true;
+                }
+                else if (warning != nullptr)
+                {
+                    *warning =
+                        L"user module enumeration failed: Module32NextW gle=" +
+                        std::to_wstring(enumerationError);
+                }
+                break;
+            }
         } while (false);
 
+        if (snapshot != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(snapshot);
+        }
         return ok;
+    }
+
+    bool HasExactProcessIdentity(
+        const ProcessTriageTarget& target)
+    {
+        return target.ProcessId != 0 &&
+            target.Eprocess != 0 &&
+            target.HasCreateTime &&
+            target.CreateTime != 0;
+    }
+
+    bool ProcessHandleMatchesTriageTarget(
+        HANDLE handle,
+        const ProcessTriageTarget& target)
+    {
+        if (handle == nullptr ||
+            handle == INVALID_HANDLE_VALUE ||
+            !HasExactProcessIdentity(target))
+        {
+            return false;
+        }
+
+        FILETIME createTime = {};
+        FILETIME exitTime = {};
+        FILETIME kernelTime = {};
+        FILETIME userTime = {};
+        DWORD exitCode = 0;
+        if (!GetProcessTimes(
+                handle,
+                &createTime,
+                &exitTime,
+                &kernelTime,
+                &userTime) ||
+            !GetExitCodeProcess(
+                handle,
+                &exitCode))
+        {
+            return false;
+        }
+
+        ULARGE_INTEGER observed = {};
+        observed.LowPart = createTime.dwLowDateTime;
+        observed.HighPart = createTime.dwHighDateTime;
+        return observed.QuadPart ==
+                target.CreateTime &&
+            exitCode == STILL_ACTIVE;
+    }
+
+    bool ReadTargetProcessMemory(
+        DeviceClient& device,
+        const ProcessTriageTarget& target,
+        uint64_t dtb,
+        uint64_t address,
+        uint32_t length,
+        std::vector<uint8_t>* bytes,
+        std::wstring* error)
+    {
+        if (HasExactProcessIdentity(target))
+        {
+            // An exact read failure may mean process exit or PID reuse. Do not
+            // accept bytes from the captured DTB after that identity gate
+            // failed.
+            return device.ReadProcessVirtual(
+                target.ProcessId,
+                target.Eprocess,
+                target.CreateTime,
+                address,
+                length,
+                bytes,
+                error);
+        }
+
+        return ReadProcessMemoryByDtb(
+            device,
+            dtb,
+            address,
+            length,
+            bytes,
+            error);
+    }
+
+    void MergeUserModuleRanges(
+        std::vector<ProcessUserModuleRange>* destination,
+        const std::vector<ProcessUserModuleRange>& source)
+    {
+        if (destination == nullptr)
+        {
+            return;
+        }
+
+        for (const ProcessUserModuleRange& incoming : source)
+        {
+            if (incoming.Base == 0 || incoming.Size == 0)
+            {
+                continue;
+            }
+
+            auto existing = std::find_if(
+                destination->begin(),
+                destination->end(),
+                [&incoming](const ProcessUserModuleRange& candidate)
+                {
+                    return candidate.Base == incoming.Base;
+                });
+            if (existing == destination->end())
+            {
+                destination->push_back(incoming);
+                continue;
+            }
+
+            if (existing->Size == 0)
+            {
+                existing->Size = incoming.Size;
+            }
+            if (existing->ImageName.empty())
+            {
+                existing->ImageName = incoming.ImageName;
+            }
+            if (existing->ImagePath.empty())
+            {
+                existing->ImagePath = incoming.ImagePath;
+            }
+        }
     }
 
     const ProcessUserModuleRange* FindUserModule(
@@ -1311,7 +1757,59 @@ namespace
         return found;
     }
 
-    bool ReadProcessU64ByDtb(DeviceClient& device, uint64_t dtb, uint64_t address, uint64_t* value)
+    const ProcessVadProtectionRange* FindEffectiveProtectionForAddress(
+        const ProcessVadRecord& record,
+        uint64_t address)
+    {
+        auto after = std::upper_bound(
+            record.EffectiveProtectionRanges.begin(),
+            record.EffectiveProtectionRanges.end(),
+            address,
+            [](uint64_t value, const ProcessVadProtectionRange& range)
+            {
+                return value < range.StartAddress;
+            });
+        if (after == record.EffectiveProtectionRanges.begin())
+        {
+            return nullptr;
+        }
+
+        --after;
+        return address <= after->EndAddress ? &*after : nullptr;
+    }
+
+    bool VadAddressIsExecutable(const ProcessVadRecord& record, uint64_t address)
+    {
+        if (!record.EffectiveProtectionComplete)
+        {
+            return record.Executable;
+        }
+
+        const ProcessVadProtectionRange* range =
+            FindEffectiveProtectionForAddress(record, address);
+        return range != nullptr && range->Committed && range->Executable;
+    }
+
+    bool VadAddressIsWritableExecutable(const ProcessVadRecord& record, uint64_t address)
+    {
+        if (!record.EffectiveProtectionComplete)
+        {
+            return record.WritableExecutable;
+        }
+
+        const ProcessVadProtectionRange* range =
+            FindEffectiveProtectionForAddress(record, address);
+        return range != nullptr &&
+            range->Committed &&
+            range->WritableExecutable;
+    }
+
+    bool ReadTargetProcessU64(
+        DeviceClient& device,
+        const ProcessTriageTarget& target,
+        uint64_t dtb,
+        uint64_t address,
+        uint64_t* value)
     {
         bool ok = false;
 
@@ -1325,7 +1823,14 @@ namespace
             *value = 0;
             std::vector<uint8_t> bytes;
             std::wstring ignored;
-            if (!ReadProcessMemoryByDtb(device, dtb, address, sizeof(uint64_t), &bytes, &ignored) ||
+            if (!ReadTargetProcessMemory(
+                    device,
+                    target,
+                    dtb,
+                    address,
+                    sizeof(uint64_t),
+                    &bytes,
+                    &ignored) ||
                 bytes.size() != sizeof(uint64_t))
             {
                 break;
@@ -1338,7 +1843,11 @@ namespace
         return ok;
     }
 
-    bool ReadUserStackBoundsFromTeb(DeviceClient& device, uint64_t dtb, ProcessThreadRecord* record)
+    bool ReadUserStackBoundsFromTeb(
+        DeviceClient& device,
+        const ProcessTriageTarget& target,
+        uint64_t dtb,
+        ProcessThreadRecord* record)
     {
         bool ok = false;
 
@@ -1357,8 +1866,18 @@ namespace
             uint64_t stackLimit = 0;
             if (record->HasTeb && IsUserAddress(record->Teb))
             {
-                if (!ReadProcessU64ByDtb(device, dtb, record->Teb + 0x08, &stackBase) ||
-                    !ReadProcessU64ByDtb(device, dtb, record->Teb + 0x10, &stackLimit))
+                if (!ReadTargetProcessU64(
+                        device,
+                        target,
+                        dtb,
+                        record->Teb + 0x08,
+                        &stackBase) ||
+                    !ReadTargetProcessU64(
+                        device,
+                        target,
+                        dtb,
+                        record->Teb + 0x10,
+                        &stackLimit))
                 {
                     stackBase = 0;
                     stackLimit = 0;
@@ -1414,6 +1933,7 @@ namespace
 
     void TryAppendStackReference(
         const std::vector<ProcessUserModuleRange>& modules,
+        bool userModuleCoverageComplete,
         const std::vector<ProcessVadRecord>& vadRecords,
         uint64_t stackAddress,
         uint64_t value,
@@ -1430,16 +1950,19 @@ namespace
             }
 
             const ProcessVadRecord* vad = FindVadForAddress(vadRecords, value);
-            if (vad == nullptr || !vad->Executable)
+            if (vad == nullptr || !VadAddressIsExecutable(*vad, value))
             {
                 break;
             }
 
             const ProcessUserModuleRange* module = FindUserModule(modules, value);
-            bool privateExec = vad->HasPrivateMemory && vad->PrivateMemory && vad->Executable;
-            bool wx = vad->Executable && vad->Writable;
-            bool userModuleEnumerationAvailable = !modules.empty();
-            bool executableOutsideModule = userModuleEnumerationAvailable && module == nullptr;
+            bool privateExec =
+                vad->HasPrivateMemory &&
+                vad->PrivateMemory;
+            bool wx = VadAddressIsWritableExecutable(*vad, value);
+            bool executableOutsideModule =
+                userModuleCoverageComplete &&
+                module == nullptr;
             if (!privateExec && !wx && !executableOutsideModule)
             {
                 break;
@@ -1448,7 +1971,8 @@ namespace
             ProcessStackReferenceRecord ref = {};
             ref.StackAddress = stackAddress;
             ref.Value = value;
-            ref.UserModuleEnumerationAvailable = userModuleEnumerationAvailable;
+            ref.UserModuleEnumerationAvailable =
+                userModuleCoverageComplete;
             ref.ValueInUserModule = module != nullptr;
             ref.ValueOutsideUserModules = executableOutsideModule;
             ref.ValueModule = module != nullptr ? module->ImageName : L"";
@@ -1475,7 +1999,9 @@ namespace
 
     void ScanUserStackReferences(
         DeviceClient& device,
+        const ProcessTriageTarget& target,
         const std::vector<ProcessUserModuleRange>& modules,
+        bool userModuleCoverageComplete,
         const std::vector<ProcessVadRecord>& vadRecords,
         uint64_t dtb,
         ProcessThreadRecord* record)
@@ -1484,7 +2010,8 @@ namespace
         {
             if (record == nullptr ||
                 !record->HasUserStackBounds ||
-                dtb == 0 ||
+                (dtb == 0 &&
+                 !HasExactProcessIdentity(target)) ||
                 record->UserStackBase <= record->UserStackLimit)
             {
                 break;
@@ -1519,7 +2046,14 @@ namespace
                 uint32_t chunkSize = static_cast<uint32_t>(chunkEnd - current);
                 std::vector<uint8_t> bytes;
                 std::wstring ignored;
-                if (ReadProcessMemoryByDtb(device, dtb, current, chunkSize, &bytes, &ignored))
+                if (ReadTargetProcessMemory(
+                        device,
+                        target,
+                        dtb,
+                        current,
+                        chunkSize,
+                        &bytes,
+                        &ignored))
                 {
                     for (size_t offset = 0;
                          offset + sizeof(uint64_t) <= bytes.size() &&
@@ -1530,6 +2064,7 @@ namespace
                         memcpy(&value, bytes.data() + offset, sizeof(uint64_t));
                         TryAppendStackReference(
                             modules,
+                            userModuleCoverageComplete,
                             vadRecords,
                             current + offset,
                             value,
@@ -1806,6 +2341,10 @@ namespace
                     record->Executable = ProtectionExecutable(record->Protection);
                     record->Writable = ProtectionWritable(record->Protection);
                     record->CopyOnWrite = ProtectionCopyOnWrite(record->Protection);
+                    record->WritableExecutable =
+                        record->Executable && record->Writable;
+                    record->CopyOnWriteExecutable =
+                        record->Executable && record->CopyOnWrite;
                     record->HasProtection = true;
                 }
             }
@@ -1879,7 +2418,7 @@ namespace
                 break;
             }
 
-            if (options.WxOnly && !(record.Executable && record.Writable))
+            if (options.WxOnly && !record.WritableExecutable)
             {
                 matched = false;
                 break;
@@ -1909,11 +2448,11 @@ namespace
             {
                 tags.push_back(L"exec");
             }
-            if (record->Executable && record->Writable)
+            if (record->WritableExecutable)
             {
                 tags.push_back(L"W+X");
             }
-            if (record->Executable && record->CopyOnWrite)
+            if (record->CopyOnWriteExecutable)
             {
                 tags.push_back(L"X+COW");
             }
@@ -1925,7 +2464,12 @@ namespace
             {
                 tags.push_back(L"private-exec");
             }
-            if (record->Size >= kLargeVadThreshold && record->Executable && record->HasPrivateMemory && record->PrivateMemory)
+            uint64_t executableBytes = record->EffectiveProtectionComplete
+                ? record->EffectiveExecutableBytes
+                : (record->Executable ? record->Size : 0);
+            if (executableBytes >= kLargeVadThreshold &&
+                record->HasPrivateMemory &&
+                record->PrivateMemory)
             {
                 tags.push_back(L"large-private-exec");
             }
@@ -2153,6 +2697,8 @@ namespace
         DeviceClient& device,
         SymbolEngine& symbols,
         const std::vector<ProcessUserModuleRange>& modules,
+        bool userModuleCoverageComplete,
+        const std::vector<ProcessVadRecord>& vadRecords,
         const ThreadLayout& layout,
         uint64_t listEntry,
         bool userQueue,
@@ -2174,7 +2720,14 @@ namespace
             }
 
             uint64_t value = 0;
-            if (ReadFieldInteger(device, record->KapcAddress, layout.KapcKernelRoutine, sizeof(uint64_t), &value, nullptr))
+            const bool kernelRoutineRead = ReadFieldInteger(
+                device,
+                record->KapcAddress,
+                layout.KapcKernelRoutine,
+                sizeof(uint64_t),
+                &value,
+                nullptr);
+            if (kernelRoutineRead)
             {
                 record->KernelRoutine = value;
                 record->HasKernelRoutine = true;
@@ -2193,15 +2746,48 @@ namespace
                 record->HasRundownRoutine = true;
             }
 
-            if (ReadFieldInteger(device, record->KapcAddress, layout.KapcNormalRoutine, sizeof(uint64_t), &value, nullptr))
+            const bool normalRoutineRead = ReadFieldInteger(
+                device,
+                record->KapcAddress,
+                layout.KapcNormalRoutine,
+                sizeof(uint64_t),
+                &value,
+                nullptr);
+            if (normalRoutineRead)
             {
                 record->NormalRoutine = value;
                 record->HasNormalRoutine = true;
                 AnnotateUserOrKernelAddress(symbols, modules, value, &record->NormalRoutineModule, nullptr);
+                const ProcessVadRecord* normalVad =
+                    FindVadForAddress(vadRecords, value);
+                if (normalVad != nullptr)
+                {
+                    record->NormalRoutineVadClassification =
+                        normalVad->Classification;
+                    record->NormalRoutineInPrivateExecVad =
+                        VadAddressIsExecutable(*normalVad, value) &&
+                        normalVad->HasPrivateMemory &&
+                        normalVad->PrivateMemory;
+                    record->NormalRoutineInWxVad =
+                        VadAddressIsWritableExecutable(*normalVad, value);
+                }
+                if (userQueue)
+                {
+                    record->UserRoutine = value;
+                    record->UserRoutineSource = L"normal_routine";
+                    record->UserRoutineModule =
+                        record->NormalRoutineModule;
+                    record->UserRoutineVadClassification =
+                        record->NormalRoutineVadClassification;
+                    record->UserRoutineInPrivateExecVad =
+                        record->NormalRoutineInPrivateExecVad;
+                    record->UserRoutineInWxVad =
+                        record->NormalRoutineInWxVad;
+                }
                 if (value != 0 &&
                     userQueue &&
                     IsUserAddress(value) &&
-                    !modules.empty() &&
+                    userModuleCoverageComplete &&
                     FindUserModule(modules, value) == nullptr)
                 {
                     record->Suspicious = true;
@@ -2210,6 +2796,18 @@ namespace
                         record->Notes += L"; ";
                     }
                     record->Notes += L"user APC normal routine is outside enumerated user modules";
+                }
+                if (value != 0 &&
+                    userQueue &&
+                    (record->NormalRoutineInPrivateExecVad ||
+                     record->NormalRoutineInWxVad))
+                {
+                    record->Suspicious = true;
+                    if (!record->Notes.empty())
+                    {
+                        record->Notes += L"; ";
+                    }
+                    record->Notes += L"user APC normal routine lands in suspicious VAD";
                 }
             }
 
@@ -2226,7 +2824,88 @@ namespace
                 ReadFieldInteger(device, record->KapcAddress, layout.KapcSystemArgument2, sizeof(uint64_t), &record->SystemArgument2, nullptr);
             }
 
-            ok = true;
+            // Current Windows builds can queue a user APC through an ntdll
+            // dispatcher.  In that form KAPC.NormalRoutine belongs to ntdll
+            // and the caller-supplied callback is carried in the context or
+            // argument slots.  Only promote such a slot when it resolves to
+            // executable memory with suspicious VAD/module provenance; plain
+            // data arguments remain telemetry.
+            if (userQueue &&
+                EqualsNoCase(record->NormalRoutineModule, L"ntdll.dll"))
+            {
+                struct ApcUserRoutineCandidate
+                {
+                    uint64_t Address;
+                    const wchar_t* Source;
+                };
+                const ApcUserRoutineCandidate candidates[] =
+                {
+                    {record->NormalContext, L"normal_context"},
+                    {record->SystemArgument1, L"system_argument1"},
+                    {record->SystemArgument2, L"system_argument2"}
+                };
+
+                for (const ApcUserRoutineCandidate& candidate : candidates)
+                {
+                    if (!IsUserAddress(candidate.Address))
+                    {
+                        continue;
+                    }
+
+                    const ProcessVadRecord* candidateVad =
+                        FindVadForAddress(vadRecords, candidate.Address);
+                    if (candidateVad == nullptr ||
+                        !VadAddressIsExecutable(*candidateVad, candidate.Address))
+                    {
+                        continue;
+                    }
+
+                    const ProcessUserModuleRange* candidateModule =
+                        FindUserModule(modules, candidate.Address);
+                    bool privateExecutable =
+                        candidateVad->HasPrivateMemory &&
+                        candidateVad->PrivateMemory;
+                    bool writableExecutable =
+                        VadAddressIsWritableExecutable(
+                            *candidateVad,
+                            candidate.Address);
+                    bool outsideModules =
+                        userModuleCoverageComplete &&
+                        candidateModule == nullptr;
+                    if (!privateExecutable &&
+                        !writableExecutable &&
+                        !outsideModules)
+                    {
+                        continue;
+                    }
+
+                    record->UserRoutine = candidate.Address;
+                    record->UserRoutineSource = candidate.Source;
+                    record->UserRoutineModule =
+                        candidateModule != nullptr
+                            ? candidateModule->ImageName
+                            : L"";
+                    record->UserRoutineVadClassification =
+                        candidateVad->Classification;
+                    record->UserRoutineInPrivateExecVad =
+                        privateExecutable;
+                    record->UserRoutineInWxVad =
+                        writableExecutable;
+                    record->Suspicious = true;
+                    if (!record->Notes.empty())
+                    {
+                        record->Notes += L"; ";
+                    }
+                    record->Notes +=
+                        L"ntdll APC dispatcher carries an executable callback in " +
+                        std::wstring(candidate.Source);
+                    break;
+                }
+            }
+
+            // Without both essential routines this entry cannot be classified
+            // as benign; let the queue mark the snapshot incomplete and retry.
+            ok = kernelRoutineRead && normalRoutineRead;
         } while (false);
 
         return ok;
@@ -2236,6 +2915,8 @@ namespace
         DeviceClient& device,
         SymbolEngine& symbols,
         const std::vector<ProcessUserModuleRange>& modules,
+        bool userModuleCoverageComplete,
+        const std::vector<ProcessVadRecord>& vadRecords,
         const ThreadLayout& layout,
         uint64_t headAddress,
         const std::wstring& name,
@@ -2255,52 +2936,270 @@ namespace
             if (!ReadListEntry(device, headAddress, &queue.Flink, &queue.Blink, nullptr) ||
                 !IsValidListEntry(queue.Flink, queue.Blink))
             {
+                queue.Incomplete = true;
+                queue.Notes = L"APC queue head is unreadable or invalid";
                 break;
             }
 
             queue.Present = true;
-            queue.NonEmpty = queue.Flink != 0 && queue.Flink != headAddress;
+            if ((queue.Flink == headAddress) !=
+                (queue.Blink == headAddress))
+            {
+                queue.Incomplete = true;
+                queue.Notes =
+                    L"APC queue empty-state links are inconsistent";
+                break;
+            }
+            queue.NonEmpty = queue.Flink != headAddress;
             if (!queue.NonEmpty)
             {
                 break;
             }
 
             uint64_t current = queue.Flink;
+            uint64_t previous = headAddress;
             std::vector<uint64_t> visited;
             while (current != 0 && current != headAddress && queue.EntriesScanned < kMaxApcEntriesPerQueue)
             {
-                if (!IsKernelAddress(current) ||
-                    std::find(visited.begin(), visited.end(), current) != visited.end())
+                if (!IsKernelAddress(current))
                 {
+                    queue.Incomplete = true;
+                    queue.Notes = L"APC queue contains a non-kernel list pointer";
+                    break;
+                }
+                if (std::find(visited.begin(), visited.end(), current) != visited.end())
+                {
+                    queue.Incomplete = true;
+                    queue.Notes = L"APC queue cycle does not return to its head";
                     break;
                 }
 
                 visited.push_back(current);
                 ProcessApcEntryRecord entry = {};
-                if (ReadApcEntry(device, symbols, modules, layout, current, userQueue, &entry))
+                if (ReadApcEntry(
+                        device,
+                        symbols,
+                        modules,
+                        userModuleCoverageComplete,
+                        vadRecords,
+                        layout,
+                        current,
+                        userQueue,
+                        &entry))
                 {
                     queue.Entries.push_back(entry);
+                }
+                else
+                {
+                    queue.Incomplete = true;
+                    queue.Notes = L"APC entry routines could not be read";
                 }
 
                 uint64_t next = 0;
                 uint64_t blink = 0;
                 if (!ReadListEntry(device, current, &next, &blink, nullptr))
                 {
+                    queue.Incomplete = true;
+                    queue.Notes = L"APC queue link could not be read";
+                    break;
+                }
+                if (blink != previous)
+                {
+                    queue.Incomplete = true;
+                    queue.Notes = L"APC queue backward link is inconsistent";
                     break;
                 }
 
+                previous = current;
                 current = next;
                 ++queue.EntriesScanned;
             }
 
-            if (queue.EntriesScanned >= kMaxApcEntriesPerQueue)
+            if (current == 0)
+            {
+                queue.Incomplete = true;
+                queue.Notes = L"APC queue terminated at a null link";
+            }
+            else if (current == headAddress &&
+                     previous != queue.Blink)
+            {
+                queue.Incomplete = true;
+                queue.Notes = L"APC queue tail changed during traversal";
+            }
+            else if (queue.EntriesScanned >= kMaxApcEntriesPerQueue &&
+                     current != headAddress)
             {
                 queue.Truncated = true;
+                queue.Incomplete = true;
+                queue.Notes = L"APC queue hit the per-queue entry limit";
             }
         } while (false);
 
         return queue;
     }
+
+    bool ThreadTraversalHitNodeLimit(
+        uint64_t threadsVisited,
+        uint64_t current,
+        uint64_t listHead)
+    {
+        return threadsVisited >= kMaxThreads &&
+            current != listHead;
+    }
+}
+
+bool ProcessTriageEffectiveProtectionSelfTest()
+{
+    ProcessTriageTarget kernelOnly = {};
+    kernelOnly.ProcessId = 4;
+    kernelOnly.ImageName = L"System";
+    if (!IsKernelOnlyProcessTarget(kernelOnly))
+    {
+        return false;
+    }
+    kernelOnly.ProcessId = 1234;
+    kernelOnly.ImageName = L"ordinary.exe";
+    if (IsKernelOnlyProcessTarget(kernelOnly))
+    {
+        return false;
+    }
+    kernelOnly.ImageName = L"Registry";
+    kernelOnly.HasPeb = true;
+    kernelOnly.Peb = 0;
+    if (!IsKernelOnlyProcessTarget(kernelOnly))
+    {
+        return false;
+    }
+    kernelOnly.Peb = 0x1000;
+    if (IsKernelOnlyProcessTarget(kernelOnly))
+    {
+        return false;
+    }
+
+    std::vector<ProcessVadProtectionRange> ranges;
+    ProcessVadProtectionRange first = {};
+    first.StartAddress = 0x1000;
+    first.EndAddress = 0x1fff;
+    first.Protection = PAGE_EXECUTE_READ;
+    first.Committed = true;
+    first.Executable = true;
+    if (!AppendEffectiveProtectionRange(&ranges, first))
+    {
+        return false;
+    }
+
+    ProcessVadProtectionRange adjacent = first;
+    adjacent.StartAddress = 0x2000;
+    adjacent.EndAddress = 0x2fff;
+    if (!AppendEffectiveProtectionRange(&ranges, adjacent) ||
+        ranges.size() != 1 ||
+        ranges[0].StartAddress != 0x1000 ||
+        ranges[0].EndAddress != 0x2fff)
+    {
+        return false;
+    }
+
+    ProcessVadProtectionRange writable = {};
+    writable.StartAddress = 0x4000;
+    writable.EndAddress = 0x4fff;
+    writable.Protection = PAGE_EXECUTE_READWRITE;
+    writable.Committed = true;
+    writable.Executable = true;
+    writable.Writable = true;
+    writable.WritableExecutable = true;
+    if (!AppendEffectiveProtectionRange(&ranges, writable))
+    {
+        return false;
+    }
+
+    ProcessVadRecord record = {};
+    record.EffectiveProtectionRanges = ranges;
+    if (FindEffectiveProtectionForAddress(record, 0x1000) == nullptr ||
+        FindEffectiveProtectionForAddress(record, 0x2fff) == nullptr ||
+        FindEffectiveProtectionForAddress(record, 0x3000) != nullptr ||
+        FindEffectiveProtectionForAddress(record, 0x4fff) == nullptr ||
+        FindEffectiveProtectionForAddress(record, 0x5000) != nullptr)
+    {
+        return false;
+    }
+
+    std::vector<ProcessVadProtectionRange> capped;
+    capped.reserve(kMaxEffectiveProtectionRangesPerVad);
+    for (size_t index = 0; index < kMaxEffectiveProtectionRangesPerVad; ++index)
+    {
+        ProcessVadProtectionRange range = first;
+        range.StartAddress = static_cast<uint64_t>(index) * 0x2000;
+        range.EndAddress = range.StartAddress + 0xfff;
+        if (!AppendEffectiveProtectionRange(&capped, range))
+        {
+            return false;
+        }
+    }
+    ProcessVadProtectionRange overflow = first;
+    overflow.StartAddress =
+        static_cast<uint64_t>(kMaxEffectiveProtectionRangesPerVad) * 0x2000;
+    overflow.EndAddress = overflow.StartAddress + 0xfff;
+    if (AppendEffectiveProtectionRange(&capped, overflow))
+    {
+        return false;
+    }
+
+    HANDLE currentProcess = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        FALSE,
+        GetCurrentProcessId());
+    FILETIME createTime = {};
+    FILETIME exitTime = {};
+    FILETIME kernelTime = {};
+    FILETIME userTime = {};
+    if (currentProcess == nullptr ||
+        !GetProcessTimes(
+            currentProcess,
+            &createTime,
+            &exitTime,
+            &kernelTime,
+            &userTime))
+    {
+        if (currentProcess != nullptr)
+        {
+            CloseHandle(currentProcess);
+        }
+        return false;
+    }
+    ULARGE_INTEGER observedCreate = {};
+    observedCreate.LowPart = createTime.dwLowDateTime;
+    observedCreate.HighPart = createTime.dwHighDateTime;
+    ProcessTriageTarget currentTarget = {};
+    currentTarget.ProcessId = GetCurrentProcessId();
+    currentTarget.Eprocess = 1;
+    currentTarget.HasCreateTime = true;
+    currentTarget.CreateTime = observedCreate.QuadPart;
+    const bool exactHandleAccepted =
+        ProcessHandleMatchesTriageTarget(
+            currentProcess,
+            currentTarget);
+    ++currentTarget.CreateTime;
+    const bool wrongHandleRejected =
+        !ProcessHandleMatchesTriageTarget(
+            currentProcess,
+            currentTarget);
+    CloseHandle(currentProcess);
+    if (!exactHandleAccepted ||
+        !wrongHandleRejected)
+    {
+        return false;
+    }
+
+    const uint64_t listHead = 0xffff800000001000ull;
+    const uint64_t anotherEntry = 0xffff800000002000ull;
+    return !ThreadTraversalHitNodeLimit(
+               kMaxThreads,
+               listHead,
+               listHead) &&
+        ThreadTraversalHitNodeLimit(
+            kMaxThreads,
+            anotherEntry,
+            listHead);
 }
 
 ProcessTriageScanner::ProcessTriageScanner(DeviceClient& device, SymbolEngine& symbols) :
@@ -2412,6 +3311,25 @@ bool ProcessTriageScanner::ScanVad(
         stack.push_back(root);
 
         uint64_t dtb = TargetUserDtb(options.Target);
+        HANDLE processQuery = nullptr;
+        if (options.Target.ProcessId != 0 &&
+            options.Target.HasCreateTime)
+        {
+            processQuery = OpenProcess(
+                PROCESS_QUERY_INFORMATION,
+                FALSE,
+                options.Target.ProcessId);
+            if (processQuery != nullptr)
+            {
+                if (!ProcessHandleMatchesTriageTarget(
+                        processQuery,
+                        options.Target))
+                {
+                    CloseHandle(processQuery);
+                    processQuery = nullptr;
+                }
+            }
+        }
         bool vadTraversalHitLimit = false;
         bool vadCoverageReliable = true;
         while (!stack.empty() && result->NodesVisited < kMaxVadNodes)
@@ -2448,6 +3366,7 @@ bool ProcessTriageScanner::ScanVad(
                 vadCoverageReliable = false;
                 continue;
             }
+            EnrichVadEffectiveProtection(processQuery, &record);
 
             vadIntervals.push_back({record.StartAddress, record.EndAddress});
 
@@ -2468,7 +3387,7 @@ bool ProcessTriageScanner::ScanVad(
             {
                 ++result->PrivateExecutableCount;
             }
-            if (record.Executable && record.Writable)
+            if (record.WritableExecutable)
             {
                 ++result->WxCount;
             }
@@ -2478,12 +3397,20 @@ bool ProcessTriageScanner::ScanVad(
                 record.PrivateMemory &&
                 record.StartAddress != 0 &&
                 record.Size >= kPageSize &&
-                dtb != 0)
+                (dtb != 0 ||
+                 HasExactProcessIdentity(options.Target)))
             {
                 std::vector<uint8_t> firstPage;
                 std::wstring ignored;
                 record.PeProbeAttempted = true;
-                if (ReadProcessMemoryByDtb(device_, dtb, record.StartAddress, static_cast<uint32_t>(kPageSize), &firstPage, &ignored))
+                if (ReadTargetProcessMemory(
+                        device_,
+                        options.Target,
+                        dtb,
+                        record.StartAddress,
+                        static_cast<uint32_t>(kPageSize),
+                        &firstPage,
+                        &ignored))
                 {
                     if (ProbeForPeHeader(firstPage.data(), firstPage.size(), &record.PeProbe))
                     {
@@ -2503,10 +3430,14 @@ bool ProcessTriageScanner::ScanVad(
 
             ClassifyVad(&record);
             bool suspicious =
-                (record.Executable && record.Writable) ||
+                record.WritableExecutable ||
                 (record.Executable && record.HasPrivateMemory && record.PrivateMemory) ||
                 record.PeHeaderFound ||
-                (record.Size >= kLargeVadThreshold && record.Executable && record.HasPrivateMemory && record.PrivateMemory);
+                ((record.EffectiveProtectionComplete
+                        ? record.EffectiveExecutableBytes
+                        : (record.Executable ? record.Size : 0)) >= kLargeVadThreshold &&
+                    record.HasPrivateMemory &&
+                    record.PrivateMemory);
             if (suspicious)
             {
                 ++result->SuspiciousCount;
@@ -2525,6 +3456,11 @@ bool ProcessTriageScanner::ScanVad(
                 }
                 ++result->MatchingRecords;
             }
+        }
+        if (processQuery != nullptr)
+        {
+            CloseHandle(processQuery);
+            processQuery = nullptr;
         }
 
         if (result->NodesVisited >= kMaxVadNodes)
@@ -2604,25 +3540,74 @@ bool ProcessTriageScanner::ScanThreads(
 
         result->Warnings.insert(result->Warnings.end(), layout.Warnings.begin(), layout.Warnings.end());
         result->LayoutSource = L"PDB/DIA";
-
-        std::vector<ProcessUserModuleRange> userModules;
-        std::wstring moduleWarning;
-        if (!EnumerateUserModules(options.Target.ProcessId, &userModules, &moduleWarning) && !moduleWarning.empty())
+        if ((!layout.HasStartAddress &&
+             !layout.HasWin32StartAddress) ||
+            (options.IncludeApc &&
+             (!layout.HasApcState ||
+              !layout.HasApcListHead ||
+              !layout.HasKapcLayout)))
         {
-            result->Warnings.push_back(moduleWarning);
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+        }
+
+        std::vector<ProcessUserModuleRange> userModules =
+            options.UserModules;
+        bool userModuleCoverageComplete =
+            options.UserModuleEnumerationComplete ||
+            IsKernelOnlyProcessTarget(options.Target);
+        std::wstring moduleWarning;
+        if (!userModuleCoverageComplete)
+        {
+            std::vector<ProcessUserModuleRange> toolhelpModules;
+            if (EnumerateUserModules(
+                    options.Target.ProcessId,
+                    &toolhelpModules,
+                    &moduleWarning))
+            {
+                MergeUserModuleRanges(
+                    &userModules,
+                    toolhelpModules);
+                userModuleCoverageComplete = true;
+            }
+            else
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                if (!moduleWarning.empty())
+                {
+                    result->Warnings.push_back(
+                        moduleWarning);
+                }
+            }
         }
 
         std::vector<ProcessVadRecord> vadRecords;
         ProcessVadScanResult vadResult = {};
         ProcessVadScanOptions vadOptions = {};
         vadOptions.Target = options.Target;
+        // Stack provenance needs the same PE/header classification used by
+        // hunt VAD triage.  Without it, a stack reference to a private
+        // PE-like RX page is indistinguishable from an ordinary JIT page.
+        vadOptions.ProbePe = options.IncludeStacks;
         if (ScanVad(vadOptions, &vadResult, nullptr))
         {
             vadRecords = vadResult.Records;
+            if (vadResult.Truncated ||
+                vadResult.Incomplete ||
+                !vadResult.CoverageComplete)
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(
+                    L"VAD correlation coverage is incomplete for thread classification");
+            }
         }
         else
         {
             result->Warnings.push_back(L"VAD correlation unavailable for thread-start classification");
+            result->Incomplete = true;
+            result->CoverageComplete = false;
         }
 
         uint64_t userDtb = TargetUserDtb(options.Target);
@@ -2643,8 +3628,22 @@ bool ProcessTriageScanner::ScanThreads(
         {
             break;
         }
+        if (!IsKernelAddress(current) ||
+            !IsKernelAddress(headBlink) ||
+            ((current == listHead) !=
+             (headBlink == listHead)))
+        {
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"thread list head links are invalid or inconsistent");
+            ok = true;
+            break;
+        }
 
         std::vector<uint64_t> visited;
+        uint64_t previous = listHead;
+        bool threadListLinkFailure = false;
         while (current != 0 && current != listHead && result->ThreadsVisited < kMaxThreads)
         {
             if (!IsKernelAddress(current))
@@ -2652,6 +3651,7 @@ bool ProcessTriageScanner::ScanThreads(
                 result->Warnings.push_back(L"thread list entry is not kernel-canonical: " + Hex(current, 16));
                 result->Incomplete = true;
                 result->CoverageComplete = false;
+                threadListLinkFailure = true;
                 break;
             }
 
@@ -2660,6 +3660,7 @@ bool ProcessTriageScanner::ScanThreads(
                 result->Warnings.push_back(L"thread list cycle detected at " + Hex(current, 16));
                 result->Incomplete = true;
                 result->CoverageComplete = false;
+                threadListLinkFailure = true;
                 break;
             }
             visited.push_back(current);
@@ -2670,6 +3671,7 @@ bool ProcessTriageScanner::ScanThreads(
                 result->Warnings.push_back(L"ETHREAD address underflow at " + Hex(current, 16));
                 result->Incomplete = true;
                 result->CoverageComplete = false;
+                threadListLinkFailure = true;
                 break;
             }
 
@@ -2701,11 +3703,24 @@ bool ProcessTriageScanner::ScanThreads(
             ReadOptionalPointerField(device_, ethread, layout.StackLimit, layout.HasStackLimit, &record.StackLimit, &hasStackLimit);
             record.HasStackBounds = record.HasStackBounds && hasStackLimit;
 
-            if (options.IncludeStacks && userDtb != 0)
+            if (options.IncludeStacks &&
+                (userDtb != 0 ||
+                 HasExactProcessIdentity(options.Target)))
             {
-                if (ReadUserStackBoundsFromTeb(device_, userDtb, &record))
+                if (ReadUserStackBoundsFromTeb(
+                        device_,
+                        options.Target,
+                        userDtb,
+                        &record))
                 {
-                    ScanUserStackReferences(device_, userModules, vadRecords, userDtb, &record);
+                    ScanUserStackReferences(
+                        device_,
+                        options.Target,
+                        userModules,
+                        userModuleCoverageComplete,
+                        vadRecords,
+                        userDtb,
+                        &record);
                     result->StackReferenceCount += record.StackReferences.size();
                 }
             }
@@ -2720,15 +3735,19 @@ bool ProcessTriageScanner::ScanThreads(
             {
                 record.VadClassification = containingVad->Classification;
                 record.StartInPrivateExecVad =
-                    containingVad->Executable &&
+                    VadAddressIsExecutable(*containingVad, classifyAddress) &&
                     containingVad->HasPrivateMemory &&
                     containingVad->PrivateMemory;
-                record.StartInWxVad = containingVad->Executable && containingVad->Writable;
+                record.StartInWxVad =
+                    VadAddressIsWritableExecutable(
+                        *containingVad,
+                        classifyAddress);
             }
 
             if (IsUserAddress(classifyAddress))
             {
-                if (!userModules.empty() && !record.StartInUserModule)
+                if (userModuleCoverageComplete &&
+                    !record.StartInUserModule)
                 {
                     record.SuspiciousStart = true;
                     record.Notes += L"user start is outside enumerated modules";
@@ -2754,16 +3773,71 @@ bool ProcessTriageScanner::ScanThreads(
                 uint64_t apcState = 0;
                 if (TryAdd(ethread, layout.ApcState.Offset, &apcState))
                 {
-                    uint64_t base = apcState + layout.ApcListHead.Offset;
-                    record.ApcQueues.push_back(ReadApcQueue(device_, symbols_, userModules, layout, base, L"kernel", false));
-                    record.ApcQueues.push_back(ReadApcQueue(device_, symbols_, userModules, layout, base + sizeof(uint64_t) * 2, L"user", true));
+                    uint64_t base = 0;
+                    uint64_t userHead = 0;
+                    if (!TryAdd(
+                            apcState,
+                            layout.ApcListHead.Offset,
+                            &base) ||
+                        !TryAdd(
+                            base,
+                            sizeof(uint64_t) * 2,
+                            &userHead))
+                    {
+                        result->Incomplete = true;
+                        result->CoverageComplete = false;
+                        result->Warnings.push_back(
+                            L"APC queue head address overflow for thread " +
+                            Hex(ethread, 16));
+                    }
+                    else
+                    {
+                    record.ApcQueues.push_back(ReadApcQueue(
+                        device_,
+                        symbols_,
+                        userModules,
+                        userModuleCoverageComplete,
+                        vadRecords,
+                        layout,
+                        base,
+                        L"kernel",
+                        false));
+                    record.ApcQueues.push_back(ReadApcQueue(
+                        device_,
+                        symbols_,
+                        userModules,
+                        userModuleCoverageComplete,
+                        vadRecords,
+                        layout,
+                        userHead,
+                        L"user",
+                        true));
                     for (const ProcessApcQueueRecord& queue : record.ApcQueues)
                     {
                         if (queue.NonEmpty)
                         {
                             ++result->ApcNonEmptyCount;
                         }
+                        if (queue.Incomplete || queue.Truncated)
+                        {
+                            result->Incomplete = true;
+                            result->CoverageComplete = false;
+                            result->Warnings.push_back(
+                                L"thread " + Hex(ethread, 16) +
+                                L" " + queue.Name +
+                                L" APC queue incomplete: " +
+                                queue.Notes);
+                        }
                     }
+                    }
+                }
+                else
+                {
+                    result->Incomplete = true;
+                    result->CoverageComplete = false;
+                    result->Warnings.push_back(
+                        L"APC state address overflow for thread " +
+                        Hex(ethread, 16));
                 }
             }
 
@@ -2791,12 +3865,46 @@ bool ProcessTriageScanner::ScanThreads(
                 result->Warnings.push_back(L"failed to read next thread list entry at " + Hex(current, 16));
                 result->Incomplete = true;
                 result->CoverageComplete = false;
+                threadListLinkFailure = true;
                 break;
             }
+            if (blink != previous)
+            {
+                result->Warnings.push_back(
+                    L"thread list backward link is inconsistent at " +
+                    Hex(current, 16));
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                threadListLinkFailure = true;
+                break;
+            }
+            previous = current;
             current = next;
         }
 
-        if (result->ThreadsVisited >= kMaxThreads)
+        if (!threadListLinkFailure)
+        {
+            if (current == 0)
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(
+                    L"thread list terminated at a null link");
+            }
+            else if (current == listHead &&
+                     previous != headBlink)
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(
+                    L"thread list tail changed during traversal");
+            }
+        }
+
+        if (ThreadTraversalHitNodeLimit(
+                result->ThreadsVisited,
+                current,
+                listHead))
         {
             result->Truncated = true;
             result->Incomplete = true;
@@ -2863,7 +3971,18 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
              << L",\"protection\":\"" << JsonEscape(r.ProtectionText)
              << L"\",\"executable\":" << (r.Executable ? L"true" : L"false")
              << L",\"writable\":" << (r.Writable ? L"true" : L"false")
+             << L",\"writable_executable\":" << (r.WritableExecutable ? L"true" : L"false")
              << L",\"copy_on_write\":" << (r.CopyOnWrite ? L"true" : L"false")
+             << L",\"copy_on_write_executable\":" << (r.CopyOnWriteExecutable ? L"true" : L"false")
+             << L",\"effective_protection_queried\":" << (r.EffectiveProtectionQueried ? L"true" : L"false")
+             << L",\"effective_protection_complete\":" << (r.EffectiveProtectionComplete ? L"true" : L"false")
+             << L",\"effective_protection\":\"" << JsonEscape(r.EffectiveProtectionText)
+             << L"\",\"effective_committed_bytes\":" << r.EffectiveCommittedBytes
+             << L",\"effective_executable_bytes\":" << r.EffectiveExecutableBytes
+             << L",\"effective_writable_bytes\":" << r.EffectiveWritableBytes
+             << L",\"effective_copy_on_write_bytes\":" << r.EffectiveCopyOnWriteBytes
+             << L",\"effective_wx_bytes\":" << r.EffectiveWritableExecutableBytes
+             << L",\"effective_x_cow_bytes\":" << r.EffectiveCopyOnWriteExecutableBytes
              << L",\"private\":" << (r.HasPrivateMemory && r.PrivateMemory ? L"true" : L"false")
              << L",\"commit_charge\":" << r.CommitCharge
              << L",\"pe_like\":" << (r.PeHeaderFound ? L"true" : L"false")
@@ -2963,6 +4082,10 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
                  << L"\",\"head\":\"" << Hex(queue.HeadAddress, 16)
                  << L"\",\"nonempty\":" << (queue.NonEmpty ? L"true" : L"false")
                  << L",\"entries_scanned\":" << queue.EntriesScanned
+                 << L",\"truncated\":" << (queue.Truncated ? L"true" : L"false")
+                 << L",\"incomplete\":" << (queue.Incomplete ? L"true" : L"false")
+                 << L",\"notes\":\"" << JsonEscape(queue.Notes)
+                 << L"\""
                  << L",\"entries\":[";
             for (size_t e = 0; e < queue.Entries.size(); ++e)
             {
@@ -2974,7 +4097,19 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
                 json << L"{\"kapc\":\"" << Hex(entry.KapcAddress, 16)
                      << L"\",\"kernel_routine\":\"" << Hex(entry.KernelRoutine, 16)
                      << L"\",\"normal_routine\":\"" << Hex(entry.NormalRoutine, 16)
-                     << L"\",\"suspicious\":" << (entry.Suspicious ? L"true" : L"false")
+                     << L"\",\"normal_context\":\"" << Hex(entry.NormalContext, 16)
+                     << L"\",\"system_argument1\":\"" << Hex(entry.SystemArgument1, 16)
+                     << L"\",\"system_argument2\":\"" << Hex(entry.SystemArgument2, 16)
+                     << L"\",\"normal_routine_vad\":\"" << JsonEscape(entry.NormalRoutineVadClassification)
+                     << L"\",\"normal_routine_private_exec\":" << (entry.NormalRoutineInPrivateExecVad ? L"true" : L"false")
+                     << L",\"normal_routine_wx\":" << (entry.NormalRoutineInWxVad ? L"true" : L"false")
+                     << L",\"user_routine\":\"" << Hex(entry.UserRoutine, 16)
+                     << L"\",\"user_routine_source\":\"" << JsonEscape(entry.UserRoutineSource)
+                     << L"\",\"user_routine_module\":\"" << JsonEscape(entry.UserRoutineModule)
+                     << L"\",\"user_routine_vad\":\"" << JsonEscape(entry.UserRoutineVadClassification)
+                     << L"\",\"user_routine_private_exec\":" << (entry.UserRoutineInPrivateExecVad ? L"true" : L"false")
+                     << L",\"user_routine_wx\":" << (entry.UserRoutineInWxVad ? L"true" : L"false")
+                     << L",\"suspicious\":" << (entry.Suspicious ? L"true" : L"false")
                      << L"}";
             }
             json << L"]}";
@@ -2993,7 +4128,7 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
                  << L"\",\"vad\":\"" << JsonEscape(ref.VadClassification)
                  << L"\",\"module_enum_available\":" << (ref.UserModuleEnumerationAvailable ? L"true" : L"false")
                  << L",\"outside_modules\":" << (ref.ValueOutsideUserModules ? L"true" : L"false")
-                 << L"\",\"private_exec\":" << (ref.ValueInPrivateExecVad ? L"true" : L"false")
+                 << L",\"private_exec\":" << (ref.ValueInPrivateExecVad ? L"true" : L"false")
                  << L",\"wx\":" << (ref.ValueInWxVad ? L"true" : L"false")
                  << L",\"notes\":\"" << JsonEscape(ref.Notes)
                  << L"\"}";

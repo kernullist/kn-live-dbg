@@ -77,6 +77,12 @@ namespace
         std::wstring Name;
     };
 
+    struct StackReferenceThreadContext
+    {
+        void* Reference = nullptr;
+        HANDLE ReadyEvent = nullptr;
+    };
+
     struct ScenarioRecord
     {
         std::wstring Name;
@@ -154,19 +160,19 @@ namespace
         {
             L"/private-exec",
             L"private executable VAD",
-            L"mapped code / injection primitive",
+            L"raw VAD telemetry / weak primitive",
             L"a private RX page owned by this process",
-            L"hunt should report private executable memory",
-            L"focused test for mapped code without thread evidence",
+            L"!vad should expose it; hunt should not promote it without corroboration",
+            L"focused negative control for uncorroborated dynamic code",
             &Options::PrivateExec
         },
         {
             L"/rwx",
             L"writable executable VAD",
-            L"mapped code / injection primitive",
+            L"raw VAD telemetry / weak primitive",
             L"a private RWX page owned by this process",
-            L"hunt should report writable executable private memory",
-            L"stronger than RX because write and execute are both present",
+            L"!vad should expose it; hunt should not promote it without corroboration",
+            L"JIT and emulator hosts make standalone RWX a noisy hunt signal",
             &Options::Rwx
         },
         {
@@ -217,10 +223,10 @@ namespace
         {
             L"/threadless-stack",
             L"threadless stack reference",
-            L"threadless mapped-code evidence",
-            L"a normal thread stack that references private executable memory",
-            L"hunt should report stack references to user executable memory",
-            L"no suspicious thread start is required for this one",
+            L"threadless manual-map evidence",
+            L"a normal thread stack that references a private PE-like executable mapping",
+            L"hunt should report stack references only when code provenance is strong",
+            L"the thread start remains normal; the referenced page carries PE evidence",
             &Options::ThreadlessStack
         },
         {
@@ -1099,7 +1105,13 @@ namespace
                 }
                 else if (arg == L"/seconds")
                 {
-                    if (index + 1 >= argc || !ParseUInt32(argv[index + 1], &options->RunSeconds))
+                    if (index + 1 >= argc ||
+                        !ParseUInt32(
+                            argv[index + 1],
+                            &options->RunSeconds) ||
+                        (options->RunSeconds != 0 &&
+                         options->RunSeconds >
+                            0xffffffffu / 1000u))
                     {
                         std::wcerr << L"invalid /seconds value\n";
                         break;
@@ -1659,7 +1671,7 @@ namespace
         do
         {
             DWORD waitMs = INFINITE;
-            if (options.RunSeconds != 0 && options.RunSeconds <= 0xffffffffu / 1000u)
+            if (options.RunSeconds != 0)
             {
                 waitMs = options.RunSeconds * 1000u;
             }
@@ -1667,13 +1679,37 @@ namespace
             parent = OpenProcess(SYNCHRONIZE, FALSE, options.ChildWaitParentPid);
             if (parent == nullptr)
             {
-                WaitForSingleObject(g_StopEvent, waitMs);
+                const DWORD waitResult =
+                    WaitForSingleObject(
+                        g_StopEvent,
+                        waitMs);
+                if (waitResult == WAIT_FAILED)
+                {
+                    std::wcerr
+                        << Win32ErrorText(
+                            L"WaitForSingleObject child stop failed")
+                        << L"\n";
+                    break;
+                }
                 ok = true;
                 break;
             }
 
             HANDLE handles[2] = { g_StopEvent, parent };
-            WaitForMultipleObjects(2, handles, FALSE, waitMs);
+            const DWORD waitResult =
+                WaitForMultipleObjects(
+                    2,
+                    handles,
+                    FALSE,
+                    waitMs);
+            if (waitResult == WAIT_FAILED)
+            {
+                std::wcerr
+                    << Win32ErrorText(
+                        L"WaitForMultipleObjects child stop failed")
+                    << L"\n";
+                break;
+            }
             ok = true;
         } while (false);
 
@@ -1685,9 +1721,10 @@ namespace
         return ok;
     }
 
-    void DeleteCreatedDriverServices()
+    bool DeleteCreatedDriverServices()
     {
         SC_HANDLE scm = nullptr;
+        bool ok = true;
 
         do
         {
@@ -1699,6 +1736,11 @@ namespace
             scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
             if (scm == nullptr)
             {
+                std::wcerr
+                    << Win32ErrorText(
+                        L"cleanup OpenSCManagerW failed")
+                    << L"\n";
+                ok = false;
                 break;
             }
 
@@ -1710,13 +1752,74 @@ namespace
                     SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
                 if (service == nullptr)
                 {
+                    const DWORD error = GetLastError();
+                    if (error !=
+                        ERROR_SERVICE_DOES_NOT_EXIST)
+                    {
+                        const std::wstring context =
+                            L"cleanup OpenServiceW failed for " +
+                            serviceName;
+                        std::wcerr
+                            << Win32ErrorText(
+                                context.c_str(),
+                                error)
+                            << L"\n";
+                        ok = false;
+                    }
                     continue;
                 }
 
                 SERVICE_STATUS status = {};
                 ControlService(service, SERVICE_CONTROL_STOP, &status);
-                DeleteService(service);
+                if (!DeleteService(service) &&
+                    GetLastError() !=
+                        ERROR_SERVICE_MARKED_FOR_DELETE)
+                {
+                    const DWORD error = GetLastError();
+                    const std::wstring context =
+                        L"cleanup DeleteService failed for " +
+                        serviceName;
+                    std::wcerr
+                        << Win32ErrorText(
+                            context.c_str(),
+                            error)
+                        << L"\n";
+                    ok = false;
+                }
                 CloseServiceHandle(service);
+
+                bool removed = false;
+                for (size_t attempt = 0;
+                     attempt < 100;
+                     ++attempt)
+                {
+                    SC_HANDLE probe = OpenServiceW(
+                        scm,
+                        serviceName.c_str(),
+                        SERVICE_QUERY_STATUS);
+                    if (probe == nullptr)
+                    {
+                        if (GetLastError() ==
+                            ERROR_SERVICE_DOES_NOT_EXIST)
+                        {
+                            removed = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        CloseServiceHandle(probe);
+                    }
+                    Sleep(100);
+                }
+                if (!removed)
+                {
+                    std::wcerr
+                        << L"cleanup service remained registered: "
+                        << serviceName
+                        << L"\n";
+                    ok = false;
+                }
             }
         } while (false);
 
@@ -1726,6 +1829,7 @@ namespace
         }
 
         g_CreatedServices.clear();
+        return ok;
     }
 
     bool ResolveFixtureDllPath(std::wstring* path)
@@ -1805,6 +1909,7 @@ namespace
                 std::wstring candidatePath = candidate.str();
                 if (CopyFileW(fixturePath.c_str(), candidatePath.c_str(), TRUE))
                 {
+                    g_TempFiles.push_back(candidatePath);
                     *path = candidatePath;
                     ok = true;
                     break;
@@ -1925,6 +2030,41 @@ namespace
         }
 
         *record = {};
+    }
+
+    bool DeleteTempFileWithRetries(
+        const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return true;
+        }
+
+        constexpr size_t kDeleteAttempts = 100;
+        for (size_t attempt = 0;
+             attempt < kDeleteAttempts;
+             ++attempt)
+        {
+            if (DeleteFileW(path.c_str()))
+            {
+                return true;
+            }
+
+            const DWORD error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND ||
+                error == ERROR_PATH_NOT_FOUND)
+            {
+                return true;
+            }
+            if (error != ERROR_SHARING_VIOLATION &&
+                error != ERROR_LOCK_VIOLATION &&
+                error != ERROR_ACCESS_DENIED)
+            {
+                return false;
+            }
+            Sleep(50);
+        }
+        return false;
     }
 
     bool MapFixtureImageCopyEx(
@@ -2163,8 +2303,8 @@ namespace
                 L"private executable RX page",
                 reinterpret_cast<uint64_t>(base),
                 kPageSize,
-                {L"private_executable_vad"},
-                L"single private RX page");
+                {},
+                L"raw !vad telemetry only; no standalone hunt finding");
         }
 
         return ok;
@@ -2197,8 +2337,8 @@ namespace
                 L"private executable writable page",
                 reinterpret_cast<uint64_t>(base),
                 kPageSize,
-                {L"wx_user_vad", L"private_executable_vad"},
-                L"single private RWX page");
+                {},
+                L"raw !vad telemetry only; no standalone hunt finding");
             ok = true;
         } while (false);
 
@@ -2313,6 +2453,8 @@ namespace
         return ok;
     }
 
+    DWORD WINAPI NonAlertableSleeper(void* parameter);
+
     bool BuildSleepLoopCode(std::vector<uint8_t>* code)
     {
         bool ok = false;
@@ -2324,40 +2466,34 @@ namespace
                 break;
             }
 
-            HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-            if (kernel32 == nullptr)
-            {
-                std::wcerr << Win32ErrorText(L"GetModuleHandleW kernel32 failed") << L"\n";
-                break;
-            }
-
-            void* sleepAddress = reinterpret_cast<void*>(GetProcAddress(kernel32, "Sleep"));
-            if (sleepAddress == nullptr)
-            {
-                std::wcerr << Win32ErrorText(L"GetProcAddress Sleep failed") << L"\n";
-                break;
-            }
-
             code->clear();
+            // Keep the recorded Win32 thread start address in private RX
+            // memory, but tail-jump to a stop-event-aware fixture routine.
+            // The previous raw Sleep loop could never observe teardown and
+            // left /thread runs failing cleanup.
             const uint8_t prefix[] =
             {
-                0x48, 0x83, 0xec, 0x28,
-                0xb9, 0xe8, 0x03, 0x00, 0x00,
                 0x48, 0xb8
             };
             code->insert(code->end(), prefix, prefix + sizeof(prefix));
 
-            uint64_t sleepValue = reinterpret_cast<uint64_t>(sleepAddress);
-            for (size_t index = 0; index < sizeof(sleepValue); ++index)
+            const uint64_t sleeperValue =
+                reinterpret_cast<uint64_t>(
+                    &NonAlertableSleeper);
+            for (size_t index = 0;
+                 index < sizeof(sleeperValue);
+                 ++index)
             {
-                code->push_back(static_cast<uint8_t>((sleepValue >> (index * 8)) & 0xff));
+                code->push_back(
+                    static_cast<uint8_t>(
+                        (sleeperValue >>
+                         (index * 8)) &
+                        0xff));
             }
 
             const uint8_t suffix[] =
             {
-                0xff, 0xd0,
-                0x48, 0x83, 0xc4, 0x28,
-                0xeb, 0xe5
+                0xff, 0xe0
             };
             code->insert(code->end(), suffix, suffix + sizeof(suffix));
             code->resize(kPageSize, 0x90);
@@ -2415,8 +2551,15 @@ namespace
         return ok;
     }
 
-    DWORD WINAPI NonAlertableSleeper(void*)
+    DWORD WINAPI NonAlertableSleeper(void* parameter)
     {
+        HANDLE readyEvent = static_cast<HANDLE>(parameter);
+        if (readyEvent != nullptr)
+        {
+            SetEvent(readyEvent);
+            CloseHandle(readyEvent);
+        }
+
         while (WaitForSingleObject(g_StopEvent, 1000) == WAIT_TIMEOUT)
         {
         }
@@ -2439,13 +2582,44 @@ namespace
                 break;
             }
 
+            HANDLE readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (readyEvent == nullptr)
+            {
+                std::wcerr << Win32ErrorText(L"CreateEvent APC sleeper ready failed") << L"\n";
+                break;
+            }
+            HANDLE threadReadyEvent = nullptr;
+            if (!DuplicateHandle(
+                    GetCurrentProcess(),
+                    readyEvent,
+                    GetCurrentProcess(),
+                    &threadReadyEvent,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS))
+            {
+                std::wcerr << Win32ErrorText(L"DuplicateHandle APC sleeper ready failed") << L"\n";
+                CloseHandle(readyEvent);
+                break;
+            }
+
             DWORD threadId = 0;
-            HANDLE thread = CreateThread(nullptr, 0, NonAlertableSleeper, nullptr, 0, &threadId);
+            HANDLE thread = CreateThread(nullptr, 0, NonAlertableSleeper, threadReadyEvent, 0, &threadId);
             if (thread == nullptr)
             {
                 std::wcerr << Win32ErrorText(L"CreateThread APC sleeper failed") << L"\n";
+                CloseHandle(threadReadyEvent);
+                CloseHandle(readyEvent);
                 break;
             }
+            if (WaitForSingleObject(readyEvent, 5000) != WAIT_OBJECT_0)
+            {
+                std::wcerr << L"APC sleeper did not reach its non-alertable wait\n";
+                CloseHandle(readyEvent);
+                g_Threads.push_back(thread);
+                break;
+            }
+            CloseHandle(readyEvent);
 
             g_Threads.push_back(thread);
             if (QueueUserAPC(reinterpret_cast<PAPCFUNC>(base), thread, 0) == 0)
@@ -2471,8 +2645,22 @@ namespace
 
     DWORD WINAPI StackReferenceSleeper(void* parameter)
     {
+        StackReferenceThreadContext* context =
+            static_cast<StackReferenceThreadContext*>(parameter);
         volatile uintptr_t references[8] = {};
-        references[0] = reinterpret_cast<uintptr_t>(parameter);
+        HANDLE readyEvent = nullptr;
+        if (context != nullptr)
+        {
+            references[0] =
+                reinterpret_cast<uintptr_t>(context->Reference);
+            readyEvent = context->ReadyEvent;
+            HeapFree(GetProcessHeap(), 0, context);
+        }
+        if (readyEvent != nullptr)
+        {
+            SetEvent(readyEvent);
+            CloseHandle(readyEvent);
+        }
 
         while (WaitForSingleObject(g_StopEvent, 1000) == WAIT_TIMEOUT)
         {
@@ -2492,33 +2680,84 @@ namespace
 
         do
         {
-            std::vector<uint8_t> code(kPageSize, 0x90);
-            code[0] = 0xc3;
-
-            void* base = nullptr;
-            if (!AllocateBytes(L"threadless-stack-reference-rx", code, PAGE_EXECUTE_READ, &base))
+            std::vector<uint8_t> code;
+            if (!ReadOwnImageHeaderPage(&code))
             {
                 break;
             }
 
+            void* base = nullptr;
+            if (!AllocateBytes(L"threadless-stack-reference-private-pe-rx", code, PAGE_EXECUTE_READ, &base))
+            {
+                break;
+            }
+
+            HANDLE readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (readyEvent == nullptr)
+            {
+                std::wcerr << Win32ErrorText(L"CreateEvent stack-reference sleeper ready failed") << L"\n";
+                break;
+            }
+            HANDLE threadReadyEvent = nullptr;
+            if (!DuplicateHandle(
+                    GetCurrentProcess(),
+                    readyEvent,
+                    GetCurrentProcess(),
+                    &threadReadyEvent,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS))
+            {
+                std::wcerr << Win32ErrorText(L"DuplicateHandle stack-reference sleeper ready failed") << L"\n";
+                CloseHandle(readyEvent);
+                break;
+            }
+
+            StackReferenceThreadContext* context =
+                static_cast<StackReferenceThreadContext*>(
+                    HeapAlloc(
+                        GetProcessHeap(),
+                        HEAP_ZERO_MEMORY,
+                        sizeof(StackReferenceThreadContext)));
+            if (context == nullptr)
+            {
+                std::wcerr << L"HeapAlloc stack-reference context failed\n";
+                CloseHandle(threadReadyEvent);
+                CloseHandle(readyEvent);
+                break;
+            }
+            context->Reference = base;
+            context->ReadyEvent = threadReadyEvent;
+
             DWORD threadId = 0;
-            HANDLE thread = CreateThread(nullptr, 0, StackReferenceSleeper, base, 0, &threadId);
+            HANDLE thread = CreateThread(nullptr, 0, StackReferenceSleeper, context, 0, &threadId);
             if (thread == nullptr)
             {
                 std::wcerr << Win32ErrorText(L"CreateThread stack-reference sleeper failed") << L"\n";
+                HeapFree(GetProcessHeap(), 0, context);
+                CloseHandle(threadReadyEvent);
+                CloseHandle(readyEvent);
                 break;
             }
+            if (WaitForSingleObject(readyEvent, 5000) != WAIT_OBJECT_0)
+            {
+                std::wcerr << L"stack-reference sleeper did not publish its stack slot\n";
+                CloseHandle(readyEvent);
+                g_Threads.push_back(thread);
+                break;
+            }
+            CloseHandle(readyEvent);
 
             g_Threads.push_back(thread);
             std::wcout << L"threadless-stack tid=" << threadId
                        << L" referenced=" << Hex(reinterpret_cast<uint64_t>(base)) << L"\n";
             AddScenario(
                 L"threadless-stack",
-                L"normal thread stack references private executable memory",
+                L"normal thread stack references private PE-like executable memory",
                 reinterpret_cast<uint64_t>(base),
                 kPageSize,
-                {L"private_executable_vad", L"stack_reference_to_executable_memory", L"stack_reference_to_private_executable_vad", L"stack_reference_to_user_executable_outside_module"},
-                L"thread start remains in the target module while a stack slot preserves the private RX address");
+                {L"stack_reference_to_executable_memory", L"stack_reference_to_private_executable_vad", L"stack_reference_to_user_executable_outside_module"},
+                L"thread start remains in the target module while a stack slot preserves a private PE-like RX address");
             ok = true;
         } while (false);
 
@@ -2694,8 +2933,8 @@ namespace
                 L"fixture DLL export bytes modified in process memory",
                 g_DefaultPatchAddress,
                 16,
-                {L"live_disk_exec_page_mismatch", L"module_text_mismatch", L"module_stomping_evidence"},
-                L"patches only this process mapping of the fixture DLL");
+                {L"live_disk_exec_page_mismatch", L"module_entrypoint_mismatch", L"module_stomping_evidence"},
+                L"patches the fixture entrypoint page only in this process mapping");
             ok = true;
         } while (false);
 
@@ -2819,13 +3058,44 @@ namespace
                 break;
             }
 
+            HANDLE readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (readyEvent == nullptr)
+            {
+                std::wcerr << Win32ErrorText(L"CreateEvent stomp APC sleeper ready failed") << L"\n";
+                break;
+            }
+            HANDLE threadReadyEvent = nullptr;
+            if (!DuplicateHandle(
+                    GetCurrentProcess(),
+                    readyEvent,
+                    GetCurrentProcess(),
+                    &threadReadyEvent,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS))
+            {
+                std::wcerr << Win32ErrorText(L"DuplicateHandle stomp APC sleeper ready failed") << L"\n";
+                CloseHandle(readyEvent);
+                break;
+            }
+
             DWORD threadId = 0;
-            HANDLE thread = CreateThread(nullptr, 0, NonAlertableSleeper, nullptr, 0, &threadId);
+            HANDLE thread = CreateThread(nullptr, 0, NonAlertableSleeper, threadReadyEvent, 0, &threadId);
             if (thread == nullptr)
             {
                 std::wcerr << Win32ErrorText(L"CreateThread stomp APC sleeper failed") << L"\n";
+                CloseHandle(threadReadyEvent);
+                CloseHandle(readyEvent);
                 break;
             }
+            if (WaitForSingleObject(readyEvent, 5000) != WAIT_OBJECT_0)
+            {
+                std::wcerr << L"stomp APC sleeper did not reach its non-alertable wait\n";
+                CloseHandle(readyEvent);
+                g_Threads.push_back(thread);
+                break;
+            }
+            CloseHandle(readyEvent);
 
             g_Threads.push_back(thread);
             if (QueueUserAPC(apcRoutine, thread, 0) == 0)
@@ -3790,7 +4060,7 @@ namespace
                     scm,
                     serviceName.c_str(),
                     displayName.c_str(),
-                    SERVICE_QUERY_STATUS | DELETE,
+                    SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | DELETE,
                     SERVICE_KERNEL_DRIVER,
                     SERVICE_DEMAND_START,
                     SERVICE_ERROR_IGNORE,
@@ -3819,10 +4089,54 @@ namespace
 
                 g_CreatedServices.push_back(serviceName);
 
+                // The SCM canonicalizes some kernel-driver ImagePath values
+                // (for example, it can add the native "\??\" prefix and
+                // normalize separators).  Record what QueryServiceConfig
+                // actually exposes because the hunter observes that same
+                // surface, not the caller's pre-CreateService input string.
+                std::wstring observedServiceBinaryPath = serviceBinaryPath;
+                DWORD configBytes = 0;
+                if (QueryServiceConfigW(service, nullptr, 0, &configBytes) ||
+                    GetLastError() != ERROR_INSUFFICIENT_BUFFER ||
+                    configBytes < sizeof(QUERY_SERVICE_CONFIGW))
+                {
+                    std::wcerr << Win32ErrorText(
+                        L"QueryServiceConfigW EDR-killer driver service size failed",
+                        GetLastError()) << L"\n";
+                    anyFailure = true;
+                    CloseServiceHandle(service);
+                    continue;
+                }
+
+                std::vector<uint64_t> configBuffer(
+                    (static_cast<size_t>(configBytes) +
+                     sizeof(uint64_t) - 1) /
+                    sizeof(uint64_t),
+                    0);
+                QUERY_SERVICE_CONFIGW* config =
+                    reinterpret_cast<QUERY_SERVICE_CONFIGW*>(configBuffer.data());
+                const DWORD configBufferBytes = static_cast<DWORD>(
+                    configBuffer.size() * sizeof(uint64_t));
+                if (!QueryServiceConfigW(
+                        service,
+                        config,
+                        configBufferBytes,
+                        &configBytes) ||
+                    config->lpBinaryPathName == nullptr)
+                {
+                    std::wcerr << Win32ErrorText(
+                        L"QueryServiceConfigW EDR-killer driver service failed",
+                        GetLastError()) << L"\n";
+                    anyFailure = true;
+                    CloseServiceHandle(service);
+                    continue;
+                }
+                observedServiceBinaryPath = config->lpBinaryPathName;
+
                 std::wcout << L"edr-killer-driver-service service="
                            << serviceName
                            << L" binary="
-                           << serviceBinaryPath
+                           << observedServiceBinaryPath
                            << L"\n";
                 AddScenario(
                     fixture.ScenarioName,
@@ -3867,8 +4181,8 @@ namespace
                 if (!g_Scenarios.empty())
                 {
                     g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"service_name", serviceName);
-                    g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"binary_path", serviceBinaryPath);
-                    g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"expanded_binary_path", serviceBinaryPath);
+                    g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"binary_path", observedServiceBinaryPath);
+                    g_Scenarios.back().ExpectedEvidenceValues.emplace_back(L"expanded_binary_path", observedServiceBinaryPath);
                     if (!strongName)
                     {
                         g_Scenarios.back().ExpectedReasons.push_back(L"name_only_requires_hash_or_staging_correlation");
@@ -3974,8 +4288,8 @@ namespace
                 L"2light",
                 L"2;light",
                 L"mixed",
-                L"mixed",
-                L"mixed"
+                L"true",
+                L"true"
             },
             {
                 L"BitD1.exe",
@@ -4109,11 +4423,11 @@ namespace
         }
         if (options.PrivateExec)
         {
-            std::wcout << L"  private_executable_vad\n";
+            std::wcout << L"  private-exec: raw VAD telemetry only (no standalone finding expected)\n";
         }
         if (options.Rwx)
         {
-            std::wcout << L"  wx_user_vad, private_executable_vad\n";
+            std::wcout << L"  rwx: raw VAD telemetry only (no standalone finding expected)\n";
         }
         if (options.LargePrivateExec)
         {
@@ -4137,7 +4451,7 @@ namespace
         }
         if (options.ThreadlessStack)
         {
-            std::wcout << L"  private_executable_vad, stack_reference_to_executable_memory, "
+            std::wcout << L"  stack_reference_to_executable_memory, "
                        << L"stack_reference_to_private_executable_vad, "
                        << L"stack_reference_to_user_executable_outside_module\n";
         }
@@ -4375,7 +4689,14 @@ int wmain(int argc, wchar_t** argv)
             break;
         }
 
-        SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+        if (!SetConsoleCtrlHandler(ConsoleHandler, TRUE))
+        {
+            std::wcerr
+                << Win32ErrorText(
+                    L"SetConsoleCtrlHandler failed")
+                << L"\n";
+            break;
+        }
         if (!options.StopEventName.empty())
         {
             externalStopEvent = CreateEventW(
@@ -4441,7 +4762,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"press Ctrl+C to stop this target\n";
 
         DWORD waitMs = INFINITE;
-        if (options.RunSeconds != 0 && options.RunSeconds <= 0xffffffffu / 1000u)
+        if (options.RunSeconds != 0)
         {
             waitMs = options.RunSeconds * 1000u;
         }
@@ -4451,7 +4772,20 @@ int wmain(int argc, wchar_t** argv)
             externalStopEvent
         };
         DWORD waitCount = externalStopEvent != nullptr ? 2u : 1u;
-        WaitForMultipleObjects(waitCount, waitHandles, FALSE, waitMs);
+        const DWORD waitResult =
+            WaitForMultipleObjects(
+                waitCount,
+                waitHandles,
+                FALSE,
+                waitMs);
+        if (waitResult == WAIT_FAILED)
+        {
+            std::wcerr
+                << Win32ErrorText(
+                    L"WaitForMultipleObjects target stop failed")
+                << L"\n";
+            break;
+        }
         exitCode = 0;
     } while (false);
 
@@ -4460,6 +4794,7 @@ int wmain(int argc, wchar_t** argv)
         SetEvent(g_StopEvent);
     }
 
+    bool cleanupOk = true;
     for (MappedImageRecord& record : g_MappedImages)
     {
         ReleaseMappedImageRecord(&record);
@@ -4470,9 +4805,20 @@ int wmain(int argc, wchar_t** argv)
     {
         if (thread != nullptr)
         {
+            const DWORD waitResult =
+                WaitForSingleObject(thread, 5000);
+            if (waitResult != WAIT_OBJECT_0)
+            {
+                std::wcerr
+                    << L"cleanup failed waiting for fixture thread"
+                    << L" wait=" << waitResult
+                    << L"\n";
+                cleanupOk = false;
+            }
             CloseHandle(thread);
         }
     }
+    g_Threads.clear();
 
     for (HANDLE process : g_ChildProcesses)
     {
@@ -4481,29 +4827,85 @@ int wmain(int argc, wchar_t** argv)
             continue;
         }
 
-        if (WaitForSingleObject(process, 1500) == WAIT_TIMEOUT)
+        const DWORD initialWait =
+            WaitForSingleObject(
+                process,
+                1500);
+        if (initialWait != WAIT_OBJECT_0)
         {
-            TerminateProcess(process, 0);
-            WaitForSingleObject(process, 1500);
+            const BOOL terminateRequested =
+                TerminateProcess(
+                    process,
+                    0);
+            const DWORD terminateError =
+                terminateRequested
+                    ? ERROR_SUCCESS
+                    : GetLastError();
+            const DWORD finalWait =
+                WaitForSingleObject(
+                    process,
+                    1500);
+            if (finalWait != WAIT_OBJECT_0)
+            {
+                std::wcerr
+                    << L"cleanup failed stopping fixture child process"
+                    << L" initial_wait=" << initialWait
+                    << L" terminate_error=" << terminateError
+                    << L" final_wait=" << finalWait
+                    << L"\n";
+                cleanupOk = false;
+            }
         }
         CloseHandle(process);
     }
     g_ChildProcesses.clear();
 
-    DeleteCreatedDriverServices();
+    if (!DeleteCreatedDriverServices())
+    {
+        cleanupOk = false;
+    }
 
     for (const std::wstring& path : g_TempFiles)
     {
-        DeleteFileW(path.c_str());
+        if (!DeleteTempFileWithRetries(path))
+        {
+            const DWORD error = GetLastError();
+            const std::wstring context =
+                L"cleanup failed deleting temp artifact " +
+                path;
+            std::wcerr
+                << Win32ErrorText(
+                    context.c_str(),
+                    error)
+                << L"\n";
+            cleanupOk = false;
+        }
     }
     g_TempFiles.clear();
 
     for (const std::wstring& directory : g_TempDirectories)
     {
-        RemoveDirectoryW(directory.c_str());
+        if (!RemoveDirectoryW(directory.c_str()))
+        {
+            const DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND &&
+                error != ERROR_PATH_NOT_FOUND)
+            {
+                const std::wstring context =
+                    L"cleanup failed removing temp directory " +
+                    directory;
+                std::wcerr
+                    << Win32ErrorText(
+                        context.c_str(),
+                        error)
+                    << L"\n";
+                cleanupOk = false;
+            }
+        }
     }
     g_TempDirectories.clear();
 
+    SetConsoleCtrlHandler(ConsoleHandler, FALSE);
     if (g_StopEvent != nullptr)
     {
         CloseHandle(g_StopEvent);
@@ -4515,5 +4917,9 @@ int wmain(int argc, wchar_t** argv)
         externalStopEvent = nullptr;
     }
 
+    if (!cleanupOk && exitCode == 0)
+    {
+        exitCode = 1;
+    }
     return exitCode;
 }

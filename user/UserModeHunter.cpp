@@ -6,6 +6,7 @@
 
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <ShlObj.h>
 #include <WinTrust.h>
 #include <wincrypt.h>
 
@@ -32,6 +33,7 @@ namespace
     constexpr size_t kMaxPebStringBytes = 32768;
     constexpr size_t kMaxLdrModules = 1024;
     constexpr uint32_t kHuntHiddenPteRecordLimitPerProcess = 64;
+    constexpr uint32_t kHuntTriageStabilityAttempts = 3;
     constexpr size_t kMaxDeepModuleComparisonsPerProcess = 96;
     constexpr size_t kMaxDeepPagesPerProcess = 512;
     constexpr size_t kMaxSampledExecPagesPerSection = 2;
@@ -42,7 +44,15 @@ namespace
     constexpr size_t kMaxByovdMatchEvidence = 6;
     constexpr size_t kMaxDriverDispatchEvidence = 8;
     constexpr size_t kMaxTelemetryPayloadEvidence = 8;
+    // Large Microsoft images legitimately carry several million base-reloc
+    // entries. Keep a separate allocation guard, but do not reject those
+    // images merely because the table is larger than older desktop binaries.
+    constexpr size_t kMaxBaseRelocationEntries = 8 * 1024 * 1024;
+    constexpr uint32_t kMaxBaseRelocationTableBytes = 64u * 1024u * 1024u;
+    constexpr size_t kMaxDynamicRelocationRanges = 65536;
+    constexpr uint64_t kUserAddressMax = 0x00ffffffffffffffull;
     constexpr uint64_t kKernelAddressMin = 0xffff800000000000ull;
+    constexpr uint32_t kComImageFlagsIlOnly = 0x00000001u;
 
     struct HuntLocalUnicodeString
     {
@@ -88,6 +98,28 @@ namespace
         std::vector<DeepStackPointerSample> Samples;
     };
 
+    struct ScopedHuntHandle
+    {
+        explicit ScopedHuntHandle(HANDLE value = nullptr) :
+            Value(value)
+        {
+        }
+
+        ~ScopedHuntHandle()
+        {
+            if (Value != nullptr &&
+                Value != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(Value);
+            }
+        }
+
+        ScopedHuntHandle(const ScopedHuntHandle&) = delete;
+        ScopedHuntHandle& operator=(const ScopedHuntHandle&) = delete;
+
+        HANDLE Value = nullptr;
+    };
+
     typedef LONG (NTAPI* NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
 
     struct ApiProcessRecord
@@ -110,8 +142,24 @@ namespace
         bool Writable = false;
     };
 
+    struct DiskPeMutableRange
+    {
+        uint32_t Rva = 0;
+        uint32_t Size = 0;
+    };
+
+    struct DiskPeBaseRelocation
+    {
+        uint32_t Rva = 0;
+        uint32_t Width = 0;
+    };
+
     struct DiskPeMetadata
     {
+        BY_HANDLE_FILE_INFORMATION FileIdentity = {};
+        FILE_BASIC_INFO FileBasicIdentity = {};
+        bool HasFileIdentity = false;
+        bool HasFileBasicIdentity = false;
         uint64_t ImageBase = 0;
         uint32_t EntryPointRva = 0;
         uint32_t FirstExecutableSectionRva = 0;
@@ -119,11 +167,20 @@ namespace
         uint32_t SizeOfImage = 0;
         bool HasEntryPoint = false;
         bool HasExecutableSection = false;
+        bool ManagedImage = false;
+        bool ManagedIlOnly = false;
         std::vector<DiskPeSection> Sections;
         std::set<uint32_t> RelocationPages;
-        std::set<uint32_t> LoaderMutablePages;
+        std::vector<DiskPeBaseRelocation> BaseRelocations;
+        std::vector<DiskPeMutableRange> CrossPageRelocationRanges;
+        std::vector<DiskPeMutableRange> LoaderMutableRanges;
+        std::vector<DiskPeMutableRange> DynamicRelocationRanges;
         uint32_t BaserelocRva = 0;
         uint32_t BaserelocSize = 0;
+        bool BaseRelocationTablePresent = false;
+        bool BaseRelocationTableComplete = true;
+        bool DynamicRelocationTablePresent = false;
+        bool DynamicRelocationTableComplete = true;
     };
 
     struct BuiltinProcessProfile
@@ -218,6 +275,10 @@ namespace
         std::wstring PackerSectionHint;
         std::wstring PackerSectionNames;
     };
+
+    bool VerifyImageAuthenticodeSignature(
+        const std::wstring& path,
+        ImageMetadataRecord* metadata);
 
     struct ThreatIntelCorrelationBucket
     {
@@ -1034,7 +1095,74 @@ namespace
 
     bool PathContainsGentlemenCollection(const std::wstring& path)
     {
-        return NormalizePathText(path).find(L"gentlemencollection") != std::wstring::npos;
+        const std::wstring normalized = NormalizePathText(path);
+        const std::wstring component = L"gentlemencollection";
+        size_t offset = 0;
+        while (offset < normalized.size())
+        {
+            const size_t match = normalized.find(component, offset);
+            if (match == std::wstring::npos)
+            {
+                break;
+            }
+
+            const size_t after = match + component.size();
+            bool fixturePrefixBoundary = false;
+            if (match != 0 &&
+                normalized[match - 1] == L'-')
+            {
+                const size_t slash =
+                    normalized.rfind(
+                        L'\\',
+                        match - 1);
+                const size_t componentStart =
+                    slash == std::wstring::npos
+                        ? 0
+                        : slash + 1;
+                const std::wstring prefix =
+                    normalized.substr(
+                        componentStart,
+                        match - componentStart);
+                constexpr wchar_t fixturePrefix[] =
+                    L"knhunt-";
+                constexpr size_t fixturePrefixLength =
+                    _countof(fixturePrefix) - 1;
+                fixturePrefixBoundary =
+                    prefix.size() >
+                        fixturePrefixLength + 1 &&
+                    prefix.compare(
+                        0,
+                        fixturePrefixLength,
+                        fixturePrefix) == 0 &&
+                    prefix.back() == L'-' &&
+                    std::all_of(
+                        prefix.begin() +
+                            fixturePrefixLength,
+                        prefix.end() - 1,
+                        [](wchar_t ch)
+                        {
+                            return iswdigit(ch) != 0;
+                        });
+            }
+            const bool prefixBoundary =
+                match == 0 ||
+                normalized[match - 1] == L'\\' ||
+                fixturePrefixBoundary ||
+                normalized[match - 1] == L'"' ||
+                iswspace(normalized[match - 1]) != 0;
+            const bool suffixBoundary =
+                after == normalized.size() ||
+                normalized[after] == L'\\' ||
+                normalized[after] == L'"' ||
+                iswspace(normalized[after]) != 0;
+            if (prefixBoundary && suffixBoundary)
+            {
+                return true;
+            }
+            offset = match + 1;
+        }
+
+        return false;
     }
 
     std::wstring FirstCommandLineImage(const std::wstring& commandLine);
@@ -1132,34 +1260,44 @@ namespace
 
         do
         {
-            size_t begin = commandLine.find_first_not_of(L" \t\r\n");
+            std::wstring normalized = commandLine;
+            std::replace(normalized.begin(), normalized.end(), L'\0', L' ');
+
+            size_t begin = normalized.find_first_not_of(L" \t\r\n");
             if (begin == std::wstring::npos)
             {
                 break;
             }
 
-            if (commandLine[begin] == L'"')
+            // Some native processes expose an argument-only PEB command line.
+            // It has no image token to compare with ImagePathName.
+            if (normalized[begin] == L'/' || normalized[begin] == L'-')
             {
-                size_t end = commandLine.find(L'"', begin + 1);
+                break;
+            }
+
+            if (normalized[begin] == L'"')
+            {
+                size_t end = normalized.find(L'"', begin + 1);
                 if (end != std::wstring::npos)
                 {
-                    image = commandLine.substr(begin + 1, end - begin - 1);
+                    image = normalized.substr(begin + 1, end - begin - 1);
                 }
                 else
                 {
-                    image = commandLine.substr(begin + 1);
+                    image = normalized.substr(begin + 1);
                 }
                 break;
             }
 
-            size_t end = commandLine.find_first_of(L" \t\r\n", begin);
+            size_t end = normalized.find_first_of(L" \t\r\n", begin);
             if (end == std::wstring::npos)
             {
-                image = commandLine.substr(begin);
+                image = normalized.substr(begin);
             }
             else
             {
-                image = commandLine.substr(begin, end - begin);
+                image = normalized.substr(begin, end - begin);
             }
         } while (false);
 
@@ -1187,7 +1325,7 @@ namespace
                     continue;
                 }
 
-                if (!inQuotes && std::iswspace(ch) != 0)
+                if (!inQuotes && (ch == L'\0' || std::iswspace(ch) != 0))
                 {
                     if (!current.empty())
                     {
@@ -1269,6 +1407,8 @@ namespace
 
                     const std::wstring& value = arguments[index + 1];
                     if (!value.empty() &&
+                        value[0] != L'-' &&
+                        value[0] != L'/' &&
                         !OxideHarvestOptionTokenIsKnown(value, options, optionCount))
                     {
                         matched = true;
@@ -1345,9 +1485,57 @@ namespace
         return matched;
     }
 
+    std::wstring WindowsDirectory();
+    std::wstring ProgramDataDirectory();
+    std::wstring ProgramFilesDirectory();
+
+    bool StableDriverServiceEnvironmentValue(
+        const std::wstring& variable,
+        std::wstring* replacement)
+    {
+        if (replacement == nullptr)
+        {
+            return false;
+        }
+        replacement->clear();
+
+        const std::wstring lowered = HuntToLower(variable);
+        if (lowered == L"systemroot" ||
+            lowered == L"windir")
+        {
+            *replacement = WindowsDirectory();
+        }
+        else if (lowered == L"systemdrive")
+        {
+            const std::wstring windows = WindowsDirectory();
+            if (windows.size() < 2 ||
+                windows[1] != L':')
+            {
+                return false;
+            }
+            *replacement = windows.substr(0, 2);
+        }
+        else if (lowered == L"programdata" ||
+                 lowered == L"allusersprofile")
+        {
+            *replacement = ProgramDataDirectory();
+        }
+        else if (lowered == L"programfiles" ||
+                 lowered == L"programw6432")
+        {
+            *replacement = ProgramFilesDirectory();
+        }
+        else
+        {
+            return false;
+        }
+
+        return !replacement->empty();
+    }
+
     std::wstring ExpandEnvironmentText(const std::wstring& value)
     {
-        std::wstring expanded = value;
+        std::wstring expanded;
 
         do
         {
@@ -1356,20 +1544,51 @@ namespace
                 break;
             }
 
-            DWORD required = ExpandEnvironmentStringsW(value.c_str(), nullptr, 0);
-            if (required == 0)
+            size_t cursor = 0;
+            bool replaced = false;
+            while (cursor < value.size())
             {
-                break;
+                const size_t open = value.find(L'%', cursor);
+                if (open == std::wstring::npos)
+                {
+                    expanded.append(value, cursor, std::wstring::npos);
+                    break;
+                }
+                expanded.append(value, cursor, open - cursor);
+
+                const size_t close = value.find(L'%', open + 1);
+                if (close == std::wstring::npos ||
+                    close == open + 1)
+                {
+                    expanded = value;
+                    replaced = false;
+                    break;
+                }
+
+                std::wstring replacement;
+                if (!StableDriverServiceEnvironmentValue(
+                        value.substr(
+                            open + 1,
+                            close - open - 1),
+                        &replacement))
+                {
+                    // QueryServiceConfigW describes a machine service.  Never
+                    // resolve an arbitrary token from the invoking user's
+                    // environment, since that can point hashing/correlation at
+                    // a different file than SCM or the kernel would use.
+                    expanded = value;
+                    replaced = false;
+                    break;
+                }
+                expanded += replacement;
+                replaced = true;
+                cursor = close + 1;
             }
 
-            std::vector<wchar_t> buffer(required + 1);
-            DWORD written = ExpandEnvironmentStringsW(value.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
-            if (written == 0 || written > buffer.size())
+            if (!replaced)
             {
-                break;
+                expanded = value;
             }
-
-            expanded.assign(buffer.data());
         } while (false);
 
         return expanded;
@@ -1503,6 +1722,29 @@ namespace
             value == L'\n';
     }
 
+    size_t FindDriverServiceSysExtensionEnd(const std::wstring& lowered)
+    {
+        size_t searchOffset = 0;
+        while (searchOffset < lowered.size())
+        {
+            const size_t match = lowered.find(L".sys", searchOffset);
+            if (match == std::wstring::npos)
+            {
+                break;
+            }
+
+            const size_t after = match + 4;
+            if (after == lowered.size() ||
+                IsServiceImagePathLeafSuffixBoundary(lowered[after]))
+            {
+                return after;
+            }
+            searchOffset = match + 1;
+        }
+
+        return std::wstring::npos;
+    }
+
     std::wstring DriverServiceKnownExtensionlessImagePath(const std::wstring& value)
     {
         std::wstring path;
@@ -1592,10 +1834,10 @@ namespace
 
             trimmed = TrimServiceImagePathToken(trimmed);
             std::wstring lowered = HuntToLower(trimmed);
-            size_t sys = lowered.find(L".sys");
-            if (sys != std::wstring::npos)
+            size_t sysEnd = FindDriverServiceSysExtensionEnd(lowered);
+            if (sysEnd != std::wstring::npos)
             {
-                path = TrimServiceImagePathToken(trimmed.substr(0, sys + 4));
+                path = TrimServiceImagePathToken(trimmed.substr(0, sysEnd));
                 break;
             }
 
@@ -1655,9 +1897,18 @@ namespace
                 break;
             }
 
-            std::vector<BYTE> buffer(required);
-            QUERY_SERVICE_CONFIGW* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
-            if (!QueryServiceConfigW(service, config, static_cast<DWORD>(buffer.size()), &required))
+            std::vector<uint64_t> buffer(
+                (static_cast<size_t>(required) + sizeof(uint64_t) - 1) /
+                sizeof(uint64_t));
+            QUERY_SERVICE_CONFIGW* config =
+                reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
+            const DWORD bufferBytes = static_cast<DWORD>(
+                buffer.size() * sizeof(uint64_t));
+            if (!QueryServiceConfigW(
+                    service,
+                    config,
+                    bufferBytes,
+                    &required))
             {
                 break;
             }
@@ -1678,14 +1929,20 @@ namespace
         return ok;
     }
 
-    void CollectDriverServices(std::vector<DriverServiceRecord>* records, std::vector<std::wstring>* warnings)
+    bool CollectDriverServices(
+        std::vector<DriverServiceRecord>* records,
+        std::vector<std::wstring>* warnings)
     {
+        bool complete = false;
+        uint32_t configFailureCount = 0;
+        std::vector<std::wstring> configFailureSamples;
         do
         {
             if (records == nullptr)
             {
                 break;
             }
+            records->clear();
 
             SC_HANDLE scm = OpenSCManagerW(
                 nullptr,
@@ -1695,94 +1952,188 @@ namespace
             {
                 if (warnings != nullptr)
                 {
-                    warnings->push_back(L"OpenSCManagerW failed for driver service enumeration: " + std::to_wstring(GetLastError()));
+                    warnings->push_back(
+                        L"OpenSCManagerW failed for driver service enumeration: " +
+                        std::to_wstring(GetLastError()));
                 }
                 break;
             }
 
-            DWORD bytesNeeded = 0;
-            DWORD serviceCount = 0;
+            constexpr DWORD kServiceEnumerationBufferBytes =
+                256u * 1024u;
+            constexpr uint32_t kMaximumServiceEnumerationPages = 1024;
+            std::vector<uint64_t> buffer(
+                (kServiceEnumerationBufferBytes +
+                 sizeof(uint64_t) - 1) /
+                sizeof(uint64_t));
             DWORD resumeHandle = 0;
-            EnumServicesStatusExW(
-                scm,
-                SC_ENUM_PROCESS_INFO,
-                SERVICE_DRIVER,
-                SERVICE_STATE_ALL,
-                nullptr,
-                0,
-                &bytesNeeded,
-                &serviceCount,
-                &resumeHandle,
-                nullptr);
-
-            DWORD error = GetLastError();
-            if (bytesNeeded == 0 || error != ERROR_MORE_DATA)
+            std::set<std::wstring> seenServices;
+            for (uint32_t page = 0;
+                 page < kMaximumServiceEnumerationPages;
+                 ++page)
             {
-                if (error != ERROR_SUCCESS && warnings != nullptr)
-                {
-                    warnings->push_back(L"EnumServicesStatusExW sizing failed: " + std::to_wstring(error));
-                }
-                CloseServiceHandle(scm);
-                break;
-            }
-
-            std::vector<BYTE> buffer(bytesNeeded);
-            resumeHandle = 0;
-            if (!EnumServicesStatusExW(
+                const DWORD previousResumeHandle = resumeHandle;
+                DWORD bytesNeeded = 0;
+                DWORD serviceCount = 0;
+                const BOOL enumerated = EnumServicesStatusExW(
                     scm,
                     SC_ENUM_PROCESS_INFO,
                     SERVICE_DRIVER,
                     SERVICE_STATE_ALL,
-                    buffer.data(),
-                    static_cast<DWORD>(buffer.size()),
+                    reinterpret_cast<LPBYTE>(buffer.data()),
+                    static_cast<DWORD>(
+                        buffer.size() * sizeof(uint64_t)),
                     &bytesNeeded,
                     &serviceCount,
                     &resumeHandle,
-                    nullptr))
+                    nullptr);
+                const DWORD enumerationError =
+                    enumerated ? ERROR_SUCCESS : GetLastError();
+
+                const size_t maximumRecords =
+                    (buffer.size() * sizeof(uint64_t)) /
+                    sizeof(ENUM_SERVICE_STATUS_PROCESSW);
+                if (serviceCount > maximumRecords)
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(
+                            L"EnumServicesStatusExW returned an invalid service count");
+                    }
+                    break;
+                }
+
+                ENUM_SERVICE_STATUS_PROCESSW* services =
+                    reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(
+                        buffer.data());
+                for (DWORD index = 0; index < serviceCount; ++index)
+                {
+                    DriverServiceRecord record = {};
+                    if (services[index].lpServiceName != nullptr)
+                    {
+                        record.ServiceName =
+                            services[index].lpServiceName;
+                    }
+                    if (record.ServiceName.empty() ||
+                        !seenServices.insert(
+                            HuntToLower(record.ServiceName)).second)
+                    {
+                        continue;
+                    }
+                    if (services[index].lpDisplayName != nullptr)
+                    {
+                        record.DisplayName =
+                            services[index].lpDisplayName;
+                    }
+                    record.ServiceType =
+                        services[index].ServiceStatusProcess.dwServiceType;
+                    record.CurrentState =
+                        services[index].ServiceStatusProcess.dwCurrentState;
+                    record.StateText =
+                        DriverServiceStateText(record.CurrentState);
+                    record.Running =
+                        record.CurrentState == SERVICE_RUNNING;
+
+                    SC_HANDLE service = OpenServiceW(
+                        scm,
+                        record.ServiceName.c_str(),
+                        SERVICE_QUERY_CONFIG);
+                    if (service != nullptr)
+                    {
+                        if (!QueryDriverServiceConfig(service, &record))
+                        {
+                            ++configFailureCount;
+                            if (configFailureSamples.size() < 5)
+                            {
+                                configFailureSamples.push_back(
+                                    record.ServiceName);
+                            }
+                        }
+                        CloseServiceHandle(service);
+                    }
+                    else
+                    {
+                        ++configFailureCount;
+                        if (configFailureSamples.size() < 5)
+                        {
+                            configFailureSamples.push_back(
+                                record.ServiceName);
+                        }
+                    }
+
+                    if (record.BinaryLeaf.empty())
+                    {
+                        record.BinaryLeaf =
+                            LeafName(record.ServiceName);
+                    }
+                    records->push_back(std::move(record));
+                }
+
+                if (enumerated)
+                {
+                    complete = true;
+                    break;
+                }
+                if (enumerationError != ERROR_MORE_DATA)
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(
+                            L"EnumServicesStatusExW failed: " +
+                            std::to_wstring(enumerationError));
+                    }
+                    break;
+                }
+                if (serviceCount == 0 ||
+                    resumeHandle == 0 ||
+                    resumeHandle == previousResumeHandle)
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(
+                            L"EnumServicesStatusExW made no progress while more data remained");
+                    }
+                    break;
+                }
+            }
+
+            if (!complete &&
+                warnings != nullptr &&
+                resumeHandle != 0)
             {
+                warnings->push_back(
+                    L"driver service enumeration did not reach the final page");
+            }
+            if (configFailureCount != 0)
+            {
+                complete = false;
                 if (warnings != nullptr)
                 {
-                    warnings->push_back(L"EnumServicesStatusExW failed: " + std::to_wstring(GetLastError()));
+                    std::wstring warning =
+                        L"driver service configuration unavailable for " +
+                        std::to_wstring(configFailureCount) +
+                        L" service(s)";
+                    if (!configFailureSamples.empty())
+                    {
+                        warning += L": ";
+                        for (size_t index = 0;
+                             index < configFailureSamples.size();
+                             ++index)
+                        {
+                            if (index != 0)
+                            {
+                                warning += L", ";
+                            }
+                            warning += configFailureSamples[index];
+                        }
+                    }
+                    warnings->push_back(warning);
                 }
-                CloseServiceHandle(scm);
-                break;
             }
-
-            ENUM_SERVICE_STATUS_PROCESSW* services =
-                reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
-            for (DWORD index = 0; index < serviceCount; ++index)
-            {
-                DriverServiceRecord record = {};
-                if (services[index].lpServiceName != nullptr)
-                {
-                    record.ServiceName = services[index].lpServiceName;
-                }
-                if (services[index].lpDisplayName != nullptr)
-                {
-                    record.DisplayName = services[index].lpDisplayName;
-                }
-                record.ServiceType = services[index].ServiceStatusProcess.dwServiceType;
-                record.CurrentState = services[index].ServiceStatusProcess.dwCurrentState;
-                record.StateText = DriverServiceStateText(record.CurrentState);
-                record.Running = record.CurrentState == SERVICE_RUNNING;
-
-                SC_HANDLE service = OpenServiceW(scm, record.ServiceName.c_str(), SERVICE_QUERY_CONFIG);
-                if (service != nullptr)
-                {
-                    QueryDriverServiceConfig(service, &record);
-                    CloseServiceHandle(service);
-                }
-
-                if (record.BinaryLeaf.empty())
-                {
-                    record.BinaryLeaf = LeafName(record.ServiceName);
-                }
-
-                records->push_back(std::move(record));
-            }
-
             CloseServiceHandle(scm);
         } while (false);
+
+        return complete;
     }
 
     uint32_t ConfidenceRank(const std::wstring& confidence)
@@ -1813,6 +2164,15 @@ namespace
             : process.DirectoryTableBase;
     }
 
+    bool HasExactProcessIdentity(
+        const SnapshotProcessRecord& process)
+    {
+        return process.ProcessId != 0 &&
+            process.Eprocess != 0 &&
+            process.HasCreateTime &&
+            process.CreateTime != 0;
+    }
+
     bool HasVerifiedUserAddressSpace(const SnapshotProcessRecord& process)
     {
         return process.ProcessId > 4 &&
@@ -1821,10 +2181,16 @@ namespace
             TargetUserDtb(process) != 0;
     }
 
+    bool IsTerminatingProcessSnapshot(const SnapshotProcessRecord& process)
+    {
+        return (process.HasExitTime && process.ExitTime != 0) ||
+            (process.HasActiveThreads && process.ActiveThreads == 0);
+    }
+
     bool IsUserAddress(uint64_t value)
     {
         // LA57 user half (2^56-1). Matches process-triage / e* user VA policy.
-        return value != 0 && value <= 0x00ffffffffffffffull;
+        return value != 0 && value <= kUserAddressMax;
     }
 
     bool IsKernelAddress(uint64_t value)
@@ -2051,7 +2417,10 @@ namespace
 
             if (field.IsBitField)
             {
-                if (field.Length == 0 || field.Length > 64 || field.BitPosition >= 64)
+                if (field.Length == 0 ||
+                    field.Length > 64 ||
+                    field.BitPosition >= 64 ||
+                    field.Length > 64 - field.BitPosition)
                 {
                     if (error != nullptr)
                     {
@@ -2410,6 +2779,63 @@ namespace
         return result;
     }
 
+    std::wstring ProgramDataDirectory()
+    {
+        PWSTR knownPath = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(
+                FOLDERID_ProgramData,
+                KF_FLAG_DEFAULT,
+                nullptr,
+                &knownPath)) &&
+            knownPath != nullptr)
+        {
+            std::wstring result = knownPath;
+            CoTaskMemFree(knownPath);
+            return result;
+        }
+        if (knownPath != nullptr)
+        {
+            CoTaskMemFree(knownPath);
+        }
+
+        std::wstring windows = WindowsDirectory();
+        if (windows.size() >= 2 && windows[1] == L':')
+        {
+            return windows.substr(0, 2) + L"\\ProgramData";
+        }
+        return L"C:\\ProgramData";
+    }
+
+    std::wstring ProgramFilesDirectory()
+    {
+        PWSTR knownPath = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(
+                FOLDERID_ProgramFiles,
+                KF_FLAG_DEFAULT,
+                nullptr,
+                &knownPath)) &&
+            knownPath != nullptr)
+        {
+            std::wstring result = knownPath;
+            CoTaskMemFree(knownPath);
+            return result;
+        }
+        if (knownPath != nullptr)
+        {
+            CoTaskMemFree(knownPath);
+        }
+
+        // Do not let a caller-controlled environment variable redefine a
+        // trusted provenance root.  The known-folder API is authoritative;
+        // its conservative fallback is anchored to the Windows volume.
+        const std::wstring windows = WindowsDirectory();
+        if (windows.size() >= 2 && windows[1] == L':')
+        {
+            return windows.substr(0, 2) + L"\\Program Files";
+        }
+        return L"C:\\Program Files";
+    }
+
     std::wstring SystemDirectory()
     {
         std::wstring result;
@@ -2721,6 +3147,38 @@ namespace
         return ok;
     }
 
+    bool ReadHuntProcessMemory(
+        DeviceClient& device,
+        const SnapshotProcessRecord& process,
+        uint64_t address,
+        uint32_t length,
+        std::vector<uint8_t>* bytes,
+        std::wstring* error)
+    {
+        if (HasExactProcessIdentity(process))
+        {
+            // Never fall back to a captured DTB after an exact-identity read
+            // fails: the process may have exited or the PID may have been
+            // reused, in which case the old address space is stale evidence.
+            return device.ReadProcessVirtual(
+                process.ProcessId,
+                process.Eprocess,
+                process.CreateTime,
+                address,
+                length,
+                bytes,
+                error);
+        }
+
+        return ReadProcessMemoryByDtb(
+            device,
+            TargetUserDtb(process),
+            address,
+            length,
+            bytes,
+            error);
+    }
+
     bool ReadProcessU64(DeviceClient& device, const SnapshotProcessRecord& process, uint64_t address, uint64_t* value)
     {
         bool ok = false;
@@ -2734,7 +3192,13 @@ namespace
 
             std::vector<uint8_t> bytes;
             std::wstring ignored;
-            if (!ReadProcessMemoryByDtb(device, TargetUserDtb(process), address, sizeof(uint64_t), &bytes, &ignored))
+            if (!ReadHuntProcessMemory(
+                    device,
+                    process,
+                    address,
+                    sizeof(uint64_t),
+                    &bytes,
+                    &ignored))
             {
                 break;
             }
@@ -2765,7 +3229,13 @@ namespace
 
             std::vector<uint8_t> bytes;
             std::wstring ignored;
-            if (!ReadProcessMemoryByDtb(device, TargetUserDtb(process), address, sizeof(uint32_t), &bytes, &ignored))
+            if (!ReadHuntProcessMemory(
+                    device,
+                    process,
+                    address,
+                    sizeof(uint32_t),
+                    &bytes,
+                    &ignored))
             {
                 break;
             }
@@ -2803,21 +3273,43 @@ namespace
 
             std::vector<uint8_t> bytes;
             std::wstring ignored;
-            if (!ReadProcessMemoryByDtb(device, TargetUserDtb(process), unicodeStringAddress, 16, &bytes, &ignored))
+            if (!ReadHuntProcessMemory(
+                    device,
+                    process,
+                    unicodeStringAddress,
+                    16,
+                    &bytes,
+                    &ignored))
             {
                 break;
             }
 
             uint16_t length = static_cast<uint16_t>(bytes[0] | (static_cast<uint16_t>(bytes[1]) << 8));
+            uint16_t maximumLength = static_cast<uint16_t>(
+                bytes[2] |
+                (static_cast<uint16_t>(bytes[3]) << 8));
             uint64_t buffer = 0;
             for (size_t index = 0; index < sizeof(uint64_t); ++index)
             {
                 buffer |= static_cast<uint64_t>(bytes[8 + index]) << (index * 8);
             }
 
-            if (length == 0 || buffer == 0 || !IsUserAddress(buffer))
+            if ((length % sizeof(wchar_t)) != 0 ||
+                (maximumLength % sizeof(wchar_t)) != 0 ||
+                maximumLength < length)
+            {
+                break;
+            }
+            if (length == 0)
             {
                 ok = true;
+                break;
+            }
+            if (buffer == 0 ||
+                !IsUserAddress(buffer) ||
+                static_cast<uint64_t>(length - 1) >
+                    kUserAddressMax - buffer)
+            {
                 break;
             }
 
@@ -2830,9 +3322,9 @@ namespace
             }
 
             std::vector<uint8_t> stringBytes;
-            if (!ReadProcessMemoryByDtb(
+            if (!ReadHuntProcessMemory(
                     device,
-                    TargetUserDtb(process),
+                    process,
                     buffer,
                     static_cast<uint32_t>(cappedLength),
                     &stringBytes,
@@ -3912,6 +4404,8 @@ namespace
             target->LdrInitSeen = target->LdrInitSeen || incoming.LdrInitSeen;
             target->PrivatePeVadSeen = target->PrivatePeVadSeen || incoming.PrivatePeVadSeen;
             target->VadImageSeen = target->VadImageSeen || incoming.VadImageSeen;
+            target->VadBackingManagedImage =
+                target->VadBackingManagedImage || incoming.VadBackingManagedImage;
             if (target->VadAddress == 0)
             {
                 target->VadAddress = incoming.VadAddress;
@@ -3973,6 +4467,19 @@ namespace
                 break;
             }
 
+            // Kernel FILE_OBJECT names are commonly root-relative
+            // ("\Windows\..."), while Win32 directory APIs return a drive
+            // qualified path.  Compare them on the directory's drive instead
+            // of treating the same file as a different provenance.
+            if (IsRootRelativePath(canonicalPath) && IsDriveQualifiedPath(canonicalDirectory))
+            {
+                canonicalPath = canonicalDirectory.substr(0, 2) + canonicalPath;
+            }
+            else if (IsRootRelativePath(canonicalDirectory) && IsDriveQualifiedPath(canonicalPath))
+            {
+                canonicalDirectory = canonicalPath.substr(0, 2) + canonicalDirectory;
+            }
+
             canonicalDirectory = EnsureTrailingSlash(canonicalDirectory);
             if (canonicalPath.size() <= canonicalDirectory.size())
             {
@@ -3983,6 +4490,103 @@ namespace
         } while (false);
 
         return matched;
+    }
+
+    bool ProcessNativePebShowsWow64(
+        const HuntProcessRecord& process)
+    {
+        static const std::set<std::wstring> kWow64RuntimeModules = {
+            L"wow64.dll",
+            L"wow64cpu.dll",
+            L"wow64win.dll"
+        };
+        for (const auto& candidate : process.Modules)
+        {
+            if (!ModuleHasCoreLdrView(candidate))
+            {
+                continue;
+            }
+
+            const std::wstring leaf = LeafName(
+                candidate.Path.empty() ? candidate.Name : candidate.Path);
+            if (kWow64RuntimeModules.find(leaf) != kWow64RuntimeModules.end())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool ProcessHasCompleteUserModuleInventory(
+        const HuntProcessRecord& process)
+    {
+        return ProcessHasReliableCoreLdrView(process) &&
+            (!ProcessNativePebShowsWow64(process) ||
+             process.ToolhelpModuleEnumerated);
+    }
+
+    bool ProcessHasManagedRuntimeModule(const HuntProcessRecord& process)
+    {
+        if (!process.PebLdrEnumerated)
+        {
+            return false;
+        }
+
+        static const std::set<std::wstring> kManagedRuntimeModules = {
+            L"clr.dll",
+            L"coreclr.dll",
+            L"mscorwks.dll",
+            L"mono-2.0-bdwgc.dll",
+            L"monosgen-2.0.dll"
+        };
+        const bool nativePebShowsWow64 =
+            ProcessNativePebShowsWow64(process);
+
+        for (const auto& candidate : process.Modules)
+        {
+            const bool nativeLdrSeen =
+                candidate.LdrLoadSeen ||
+                candidate.LdrMemorySeen ||
+                candidate.LdrInitSeen;
+            // A 64-bit reader sees the native PEB lists of a WOW64 process,
+            // while Toolhelp exposes its 32-bit loader list. Accept that
+            // second loader view only when the native PEB independently
+            // proves this is a WOW64 host and Toolhelp completed.
+            const bool wow64ToolhelpLdrSeen =
+                nativePebShowsWow64 &&
+                process.ToolhelpModuleEnumerated &&
+                candidate.ToolhelpSeen;
+            if (!nativeLdrSeen && !wow64ToolhelpLdrSeen)
+            {
+                continue;
+            }
+
+            std::wstring leaf = LeafName(
+                candidate.Path.empty() ? candidate.Name : candidate.Path);
+            if (kManagedRuntimeModules.find(leaf) != kManagedRuntimeModules.end())
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool IsExpectedManagedLoaderlessMapping(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module)
+    {
+        // CLR maps managed assemblies as SEC_IMAGE but does not have to insert
+        // them into the native PEB loader lists.  That invariant is independent
+        // of install path.  Require both a validated CLR metadata header in the
+        // backing PE and a CLR runtime observed through a completed loader
+        // view. WOW64's 32-bit list is represented by Toolhelp only after its
+        // native PEB independently proves the WOW64 host; a forged COM
+        // directory alone must not disable the detector.
+        return module.VadBackingManagedImage &&
+            module.VadBackingState == L"resolved" &&
+            !module.VadBackingPath.empty() &&
+            ProcessHasManagedRuntimeModule(process);
     }
 
     bool IsWindowsBackedModulePath(const std::wstring& path)
@@ -3996,10 +4600,96 @@ namespace
                 break;
             }
 
-            backed = CanonicalPathUnderDirectory(path, WindowsDirectory());
+            backed =
+                CanonicalPathUnderDirectory(path, WindowsDirectory()) ||
+                CanonicalPathUnderDirectory(
+                    path,
+                    EnsureTrailingSlash(ProgramDataDirectory()) +
+                        L"Microsoft\\Windows Defender\\Platform");
         } while (false);
 
         return backed;
+    }
+
+    bool IsMicrosoftWindowsAppRuntimeModulePathShape(
+        const std::wstring& windowsAppsDirectory,
+        const std::wstring& path)
+    {
+        if (!CanonicalPathUnderDirectory(
+                path,
+                windowsAppsDirectory))
+        {
+            return false;
+        }
+
+        const std::wstring canonicalPath =
+            CanonicalPathForCompare(path);
+        std::wstring canonicalRoot =
+            EnsureTrailingSlash(
+                CanonicalPathForCompare(
+                    windowsAppsDirectory));
+        if (canonicalPath.size() <= canonicalRoot.size())
+        {
+            return false;
+        }
+
+        const std::wstring relative =
+            canonicalPath.substr(canonicalRoot.size());
+        const size_t separator = relative.find(L'\\');
+        if (separator == std::wstring::npos ||
+            separator == 0)
+        {
+            return false;
+        }
+
+        const std::wstring packageDirectory =
+            relative.substr(0, separator);
+        constexpr wchar_t kPackagePrefix[] =
+            L"microsoft.windowsappruntime.";
+        constexpr wchar_t kMicrosoftPublisherId[] =
+            L"__8wekyb3d8bbwe";
+        if (packageDirectory.rfind(kPackagePrefix, 0) != 0 ||
+            packageDirectory.size() <=
+                _countof(kMicrosoftPublisherId) - 1 ||
+            packageDirectory.compare(
+                packageDirectory.size() -
+                    (_countof(kMicrosoftPublisherId) - 1),
+                _countof(kMicrosoftPublisherId) - 1,
+                kMicrosoftPublisherId) != 0)
+        {
+            return false;
+        }
+
+        static const std::set<std::wstring> kExpectedModules =
+        {
+            L"windowsappruntime.deploymentextensions.onecore.dll",
+            L"windowsappsdk.appxdeploymentextensions.desktop.dll"
+        };
+        return kExpectedModules.find(
+            LeafName(canonicalPath)) !=
+            kExpectedModules.end();
+    }
+
+    bool IsTrustedMicrosoftWindowsAppRuntimeModule(
+        const std::wstring& path)
+    {
+        const std::wstring windowsApps =
+            EnsureTrailingSlash(ProgramFilesDirectory()) +
+            L"WindowsApps";
+        if (!IsMicrosoftWindowsAppRuntimeModulePathShape(
+                windowsApps,
+                path))
+        {
+            return false;
+        }
+
+        ImageMetadataRecord metadata = {};
+        return VerifyImageAuthenticodeSignature(
+                   DosPathFromDevicePath(
+                       Win32FilePathFromMaybeNtPath(path)),
+                   &metadata) &&
+            metadata.SignatureChecked &&
+            metadata.SignatureValid;
     }
 
     bool ShouldAuditBuiltinModuleProvenance(const HuntProcessRecord& process)
@@ -4231,21 +4921,104 @@ namespace
 
         do
         {
-            if (bytes == nullptr || length == 0)
+            if (bytes == nullptr ||
+                file == INVALID_HANDLE_VALUE ||
+                length == 0 ||
+                rva >= metadata.SizeOfImage ||
+                length > metadata.SizeOfImage - rva)
             {
                 break;
             }
 
-            uint64_t rawOffset = 0;
-            if (!RvaToRawOffset(metadata, rva, &rawOffset))
+            bytes->clear();
+            bytes->reserve(length);
+            uint32_t currentRva = rva;
+            uint32_t remaining = length;
+            while (remaining != 0)
             {
-                break;
+                uint64_t rawOffset = 0;
+                uint64_t available = 0;
+                if (metadata.SizeOfHeaders != 0 &&
+                    currentRva < metadata.SizeOfHeaders)
+                {
+                    rawOffset = currentRva;
+                    available =
+                        static_cast<uint64_t>(metadata.SizeOfHeaders) -
+                        currentRva;
+                }
+                else
+                {
+                    for (const DiskPeSection& section : metadata.Sections)
+                    {
+                        const uint64_t sectionStart =
+                            section.VirtualAddress;
+                        const uint64_t rawSpan = section.SizeOfRawData;
+                        const uint64_t sectionRawEnd =
+                            sectionStart + rawSpan;
+                        if (rawSpan == 0 ||
+                            sectionRawEnd < sectionStart ||
+                            currentRva < sectionStart ||
+                            currentRva >= sectionRawEnd)
+                        {
+                            continue;
+                        }
+
+                        const uint64_t delta =
+                            static_cast<uint64_t>(currentRva) -
+                            sectionStart;
+                        rawOffset =
+                            static_cast<uint64_t>(
+                                section.PointerToRawData) +
+                            delta;
+                        available = rawSpan - delta;
+                        break;
+                    }
+                }
+                if (available == 0)
+                {
+                    break;
+                }
+
+                const uint32_t chunk = static_cast<uint32_t>(
+                    std::min<uint64_t>(available, remaining));
+                std::vector<uint8_t> part;
+                if (!ReadFileBytesAt(
+                        file,
+                        rawOffset,
+                        chunk,
+                        &part) ||
+                    part.size() != chunk)
+                {
+                    break;
+                }
+                bytes->insert(
+                    bytes->end(),
+                    part.begin(),
+                    part.end());
+                currentRva += chunk;
+                remaining -= chunk;
             }
 
-            ok = ReadFileBytesAt(file, rawOffset, length, bytes);
+            ok = remaining == 0 && bytes->size() == length;
         } while (false);
 
+        if (!ok && bytes != nullptr)
+        {
+            bytes->clear();
+        }
         return ok;
+    }
+
+    bool BytesAreAllZero(
+        const std::vector<uint8_t>& bytes)
+    {
+        return std::all_of(
+            bytes.begin(),
+            bytes.end(),
+            [](uint8_t value)
+            {
+                return value == 0;
+            });
     }
 
     void PopulateRelocationPages(
@@ -4254,127 +5027,247 @@ namespace
         uint32_t relocRva,
         uint32_t relocSize)
     {
-        do
+        if (metadata == nullptr)
         {
-            if (metadata == nullptr || file == INVALID_HANDLE_VALUE || relocRva == 0 || relocSize < sizeof(IMAGE_BASE_RELOCATION))
+            return;
+        }
+
+        metadata->BaseRelocationTablePresent =
+            relocRva != 0 || relocSize != 0;
+        if (!metadata->BaseRelocationTablePresent)
+        {
+            return;
+        }
+
+        bool complete =
+            file != INVALID_HANDLE_VALUE &&
+            relocRva != 0 &&
+            relocSize >= sizeof(IMAGE_BASE_RELOCATION) &&
+            relocSize <= kMaxBaseRelocationTableBytes &&
+            relocRva < metadata->SizeOfImage &&
+            relocSize <= metadata->SizeOfImage - relocRva;
+        uint32_t parsed = 0;
+        size_t relocationEntries = 0;
+        while (complete && parsed < relocSize)
+        {
+            const uint32_t remaining = relocSize - parsed;
+            if (remaining < sizeof(IMAGE_BASE_RELOCATION))
+            {
+                complete = false;
+                break;
+            }
+
+            std::vector<uint8_t> blockHeader;
+            if (!ReadDiskBytesForRva(
+                    file,
+                    *metadata,
+                    relocRva + parsed,
+                    sizeof(IMAGE_BASE_RELOCATION),
+                    &blockHeader) ||
+                blockHeader.size() < sizeof(IMAGE_BASE_RELOCATION))
+            {
+                complete = false;
+                break;
+            }
+
+            IMAGE_BASE_RELOCATION block = {};
+            std::memcpy(&block, blockHeader.data(), sizeof(block));
+            if (block.VirtualAddress == 0 && block.SizeOfBlock == 0)
+            {
+                const uint32_t trailingBytes =
+                    remaining -
+                    static_cast<uint32_t>(
+                        sizeof(IMAGE_BASE_RELOCATION));
+                std::vector<uint8_t> terminatorPadding;
+                if (trailingBytes != 0 &&
+                    (!ReadDiskBytesForRva(
+                         file,
+                         *metadata,
+                         relocRva +
+                             parsed +
+                             sizeof(IMAGE_BASE_RELOCATION),
+                         trailingBytes,
+                         &terminatorPadding) ||
+                     terminatorPadding.size() != trailingBytes ||
+                     !BytesAreAllZero(
+                         terminatorPadding)))
+                {
+                    // A zero relocation header is an optional terminator, not
+                    // permission to ignore arbitrary trailing table data.
+                    complete = false;
+                    break;
+                }
+                parsed = relocSize;
+                break;
+            }
+            if (block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                block.SizeOfBlock > remaining ||
+                ((block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) %
+                    sizeof(uint16_t)) != 0)
+            {
+                complete = false;
+                break;
+            }
+
+            const uint32_t entryBytes =
+                block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
+            std::vector<uint8_t> entries;
+            if (entryBytes != 0 &&
+                (!ReadDiskBytesForRva(
+                     file,
+                     *metadata,
+                     relocRva + parsed + sizeof(IMAGE_BASE_RELOCATION),
+                     entryBytes,
+                     &entries) ||
+                 entries.size() < entryBytes))
+            {
+                complete = false;
+                break;
+            }
+
+            const size_t entryCount = entryBytes / sizeof(uint16_t);
+            for (size_t index = 0; index < entryCount; ++index)
+            {
+                uint16_t entry = 0;
+                std::memcpy(
+                    &entry,
+                    entries.data() + index * sizeof(uint16_t),
+                    sizeof(entry));
+                const uint16_t type = entry >> 12;
+                const uint16_t offset = entry & 0x0fffu;
+                if (type == IMAGE_REL_BASED_ABSOLUTE)
+                {
+                    continue;
+                }
+                if (++relocationEntries > kMaxBaseRelocationEntries)
+                {
+                    complete = false;
+                    break;
+                }
+
+                uint32_t fixupWidth = 0;
+                if (type == IMAGE_REL_BASED_DIR64)
+                {
+                    fixupWidth = sizeof(uint64_t);
+                }
+                else if (type == IMAGE_REL_BASED_HIGHLOW)
+                {
+                    fixupWidth = sizeof(uint32_t);
+                }
+                else
+                {
+                    complete = false;
+                    break;
+                }
+
+                const uint64_t fixupRva64 =
+                    static_cast<uint64_t>(block.VirtualAddress) + offset;
+                if (fixupRva64 >= metadata->SizeOfImage ||
+                    fixupWidth > metadata->SizeOfImage - fixupRva64)
+                {
+                    complete = false;
+                    break;
+                }
+
+                const uint32_t fixupRva =
+                    static_cast<uint32_t>(fixupRva64);
+                metadata->RelocationPages.insert(
+                    fixupRva & 0xfffff000u);
+                DiskPeBaseRelocation relocation = {};
+                relocation.Rva = fixupRva;
+                relocation.Width = fixupWidth;
+                metadata->BaseRelocations.push_back(relocation);
+                if (((fixupRva & 0xfffu) + fixupWidth) > 0x1000u)
+                {
+                    const uint64_t nextPage =
+                        static_cast<uint64_t>(fixupRva & 0xfffff000u) +
+                        0x1000u;
+                    if (nextPage >= metadata->SizeOfImage ||
+                        nextPage > std::numeric_limits<uint32_t>::max())
+                    {
+                        complete = false;
+                        break;
+                    }
+                    metadata->RelocationPages.insert(
+                        static_cast<uint32_t>(nextPage));
+                    DiskPeMutableRange crossPage = {};
+                    crossPage.Rva = fixupRva;
+                    crossPage.Size = fixupWidth;
+                    metadata->CrossPageRelocationRanges.push_back(
+                        crossPage);
+                }
+            }
+            if (!complete)
             {
                 break;
             }
 
-            uint32_t parsed = 0;
-            while (parsed + sizeof(IMAGE_BASE_RELOCATION) <= relocSize)
-            {
-                std::vector<uint8_t> blockHeader;
-                if (!ReadDiskBytesForRva(file, *metadata, relocRva + parsed, sizeof(IMAGE_BASE_RELOCATION), &blockHeader) ||
-                    blockHeader.size() < sizeof(IMAGE_BASE_RELOCATION))
+            parsed += block.SizeOfBlock;
+        }
+
+        metadata->BaseRelocationTableComplete =
+            complete && parsed == relocSize;
+        if (metadata->BaseRelocationTableComplete)
+        {
+            std::stable_sort(
+                metadata->BaseRelocations.begin(),
+                metadata->BaseRelocations.end(),
+                [](const DiskPeBaseRelocation& left,
+                   const DiskPeBaseRelocation& right)
                 {
-                    break;
-                }
-
-                const IMAGE_BASE_RELOCATION* block =
-                    reinterpret_cast<const IMAGE_BASE_RELOCATION*>(blockHeader.data());
-                if (block->VirtualAddress == 0 ||
-                    block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
-                    parsed + block->SizeOfBlock > relocSize)
-                {
-                    break;
-                }
-
-                uint32_t entryBytes = block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
-                std::vector<uint8_t> entries;
-                if (!ReadDiskBytesForRva(
-                        file,
-                        *metadata,
-                        relocRva + parsed + sizeof(IMAGE_BASE_RELOCATION),
-                        entryBytes,
-                        &entries) ||
-                    entries.size() < entryBytes)
-                {
-                    break;
-                }
-
-                size_t entryCount = entryBytes / sizeof(uint16_t);
-                for (size_t index = 0; index < entryCount; ++index)
-                {
-                    uint16_t entry = 0;
-                    std::memcpy(&entry, entries.data() + index * sizeof(uint16_t), sizeof(entry));
-                    uint16_t type = entry >> 12;
-                    uint16_t offset = entry & 0x0fffu;
-                    if (type == IMAGE_REL_BASED_ABSOLUTE)
-                    {
-                        continue;
-                    }
-
-                    uint32_t fixupRva = block->VirtualAddress + offset;
-                    metadata->RelocationPages.insert(fixupRva & 0xfffff000u);
-                    uint32_t fixupWidth = 0;
-                    if (type == IMAGE_REL_BASED_DIR64)
-                    {
-                        fixupWidth = sizeof(uint64_t);
-                    }
-                    else if (type == IMAGE_REL_BASED_HIGHLOW)
-                    {
-                        fixupWidth = sizeof(uint32_t);
-                    }
-                    if (fixupWidth != 0 &&
-                        ((fixupRva & 0xfffu) + fixupWidth) > 0x1000u)
-                    {
-                        metadata->RelocationPages.insert((fixupRva & 0xfffff000u) + 0x1000u);
-                    }
-                }
-
-                parsed += block->SizeOfBlock;
-            }
-        } while (false);
+                    return left.Rva < right.Rva;
+                });
+        }
+        else
+        {
+            metadata->RelocationPages.clear();
+            metadata->BaseRelocations.clear();
+            metadata->CrossPageRelocationRanges.clear();
+        }
     }
 
-    void AddRvaRangePages(std::set<uint32_t>* pages, uint32_t rva, uint32_t size)
+    void AddLoaderMutableRange(
+        std::vector<DiskPeMutableRange>* ranges,
+        uint32_t rva,
+        uint32_t size)
     {
-        do
+        if (ranges == nullptr || rva == 0 || size == 0)
         {
-            if (pages == nullptr || rva == 0 || size == 0)
-            {
-                break;
-            }
+            return;
+        }
 
-            uint64_t start = rva & 0xfffff000u;
-            uint64_t end = static_cast<uint64_t>(rva) + size;
-            if (end < rva)
-            {
-                break;
-            }
+        const uint64_t end = static_cast<uint64_t>(rva) + size;
+        if (end >
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1ull)
+        {
+            return;
+        }
 
-            for (uint64_t page = start; page < end; page += kPageSize)
-            {
-                if (page > std::numeric_limits<uint32_t>::max())
-                {
-                    break;
-                }
-
-                pages->insert(static_cast<uint32_t>(page));
-            }
-        } while (false);
+        DiskPeMutableRange range = {};
+        range.Rva = rva;
+        range.Size = size;
+        ranges->push_back(range);
     }
 
-    void AddLoaderMutableDirectoryPages(
-        std::set<uint32_t>* pages,
+    void AddLoaderMutableDirectoryRanges(
+        std::vector<DiskPeMutableRange>* ranges,
         const IMAGE_DATA_DIRECTORY* directories,
         uint32_t count)
     {
         do
         {
-            if (pages == nullptr || directories == nullptr)
+            if (ranges == nullptr || directories == nullptr)
             {
                 break;
             }
 
+            // The loader overwrites IAT slots. Import descriptors, delay-load
+            // descriptors, TLS, and load-config structures are not themselves
+            // blanket-mutable and masking their whole directories can hide an
+            // executable-page patch.
             const uint32_t mutableDirectories[] =
             {
-                IMAGE_DIRECTORY_ENTRY_IMPORT,
-                IMAGE_DIRECTORY_ENTRY_IAT,
-                IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT,
-                IMAGE_DIRECTORY_ENTRY_TLS,
-                IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG
+                IMAGE_DIRECTORY_ENTRY_IAT
             };
 
             for (uint32_t directoryIndex : mutableDirectories)
@@ -4384,12 +5277,564 @@ namespace
                     continue;
                 }
 
-                AddRvaRangePages(
-                    pages,
+                AddLoaderMutableRange(
+                    ranges,
                     directories[directoryIndex].VirtualAddress,
                     directories[directoryIndex].Size);
             }
         } while (false);
+    }
+
+    bool AddDynamicRelocationRange(
+        std::vector<DiskPeMutableRange>* ranges,
+        uint32_t rva,
+        uint32_t size)
+    {
+        if (ranges == nullptr || size == 0)
+        {
+            return false;
+        }
+
+        const uint64_t end = static_cast<uint64_t>(rva) + size;
+        if (end > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1ull)
+        {
+            return false;
+        }
+
+        for (const DiskPeMutableRange& existing : *ranges)
+        {
+            if (existing.Rva == rva && existing.Size == size)
+            {
+                return true;
+            }
+        }
+        if (ranges->size() >= kMaxDynamicRelocationRanges)
+        {
+            return false;
+        }
+
+        DiskPeMutableRange range = {};
+        range.Rva = rva;
+        range.Size = size;
+        ranges->push_back(range);
+        return true;
+    }
+
+    bool ParseFunctionOverrideBaseRelocations(
+        const uint8_t* bytes,
+        size_t size,
+        uint32_t sizeOfImage,
+        std::vector<DiskPeMutableRange>* ranges)
+    {
+        if (bytes == nullptr ||
+            ranges == nullptr ||
+            sizeOfImage == 0)
+        {
+            return false;
+        }
+
+        size_t cursor = 0;
+        while (cursor < size)
+        {
+            if (size - cursor < sizeof(IMAGE_BASE_RELOCATION))
+            {
+                return false;
+            }
+
+            IMAGE_BASE_RELOCATION block = {};
+            std::memcpy(&block, bytes + cursor, sizeof(block));
+            if (block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                block.SizeOfBlock > size - cursor ||
+                ((block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) % sizeof(uint16_t)) != 0)
+            {
+                return false;
+            }
+
+            const size_t entryBytes = block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
+            const size_t entryCount = entryBytes / sizeof(uint16_t);
+            for (size_t index = 0; index < entryCount; ++index)
+            {
+                uint16_t entry = 0;
+                std::memcpy(
+                    &entry,
+                    bytes + cursor + sizeof(IMAGE_BASE_RELOCATION) + index * sizeof(entry),
+                    sizeof(entry));
+
+                const uint16_t type = static_cast<uint16_t>(entry >> 12);
+                const uint16_t offset = static_cast<uint16_t>(entry & 0x0fffu);
+                if (type == IMAGE_FUNCTION_OVERRIDE_INVALID)
+                {
+                    continue;
+                }
+
+                uint32_t width = 0;
+                if (type == IMAGE_FUNCTION_OVERRIDE_X64_REL32 ||
+                    type == IMAGE_FUNCTION_OVERRIDE_ARM64_BRANCH26)
+                {
+                    width = sizeof(uint32_t);
+                }
+                else
+                {
+                    // The SDK does not define the byte span of THUNK records.
+                    // Fail closed instead of masking an assumed range.
+                    return false;
+                }
+
+                const uint64_t fixupRva = static_cast<uint64_t>(block.VirtualAddress) + offset;
+                if (fixupRva >= sizeOfImage ||
+                    width > sizeOfImage - fixupRva ||
+                    !AddDynamicRelocationRange(
+                        ranges,
+                        static_cast<uint32_t>(fixupRva),
+                        width))
+                {
+                    return false;
+                }
+            }
+
+            cursor += block.SizeOfBlock;
+        }
+
+        return cursor == size;
+    }
+
+    bool ParseFunctionOverrideDynamicRelocations(
+        const uint8_t* bytes,
+        size_t size,
+        uint32_t sizeOfImage,
+        std::vector<DiskPeMutableRange>* ranges)
+    {
+        if (bytes == nullptr ||
+            ranges == nullptr ||
+            sizeOfImage == 0 ||
+            size < sizeof(IMAGE_FUNCTION_OVERRIDE_HEADER))
+        {
+            return false;
+        }
+
+        IMAGE_FUNCTION_OVERRIDE_HEADER header = {};
+        std::memcpy(&header, bytes, sizeof(header));
+        const size_t recordsStart = sizeof(header);
+        if (header.FuncOverrideSize > size - recordsStart)
+        {
+            return false;
+        }
+
+        const size_t recordsEnd = recordsStart + header.FuncOverrideSize;
+        size_t cursor = recordsStart;
+        std::vector<uint32_t> bddOffsets;
+        while (cursor < recordsEnd)
+        {
+            if (recordsEnd - cursor < sizeof(IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION))
+            {
+                return false;
+            }
+
+            IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION record = {};
+            std::memcpy(&record, bytes + cursor, sizeof(record));
+            if (record.OriginalRva >= sizeOfImage ||
+                (record.RvaSize % sizeof(uint32_t)) != 0)
+            {
+                return false;
+            }
+            bddOffsets.push_back(record.BDDOffset);
+
+            const uint64_t recordSize =
+                static_cast<uint64_t>(sizeof(record)) +
+                record.RvaSize +
+                record.BaseRelocSize;
+            if (recordSize > recordsEnd - cursor)
+            {
+                return false;
+            }
+
+            const size_t rvaOffset =
+                cursor + sizeof(record);
+            const size_t rvaCount =
+                record.RvaSize / sizeof(uint32_t);
+            for (size_t index = 0;
+                 index < rvaCount;
+                 ++index)
+            {
+                uint32_t overrideRva = 0;
+                std::memcpy(
+                    &overrideRva,
+                    bytes +
+                        rvaOffset +
+                        index * sizeof(uint32_t),
+                    sizeof(overrideRva));
+                if (overrideRva >= sizeOfImage)
+                {
+                    return false;
+                }
+            }
+
+            const size_t relocOffset =
+                cursor + sizeof(record) + static_cast<size_t>(record.RvaSize);
+            if (!ParseFunctionOverrideBaseRelocations(
+                    bytes + relocOffset,
+                    record.BaseRelocSize,
+                    sizeOfImage,
+                    ranges))
+            {
+                return false;
+            }
+
+            cursor += static_cast<size_t>(recordSize);
+        }
+
+        if (cursor != recordsEnd)
+        {
+            return false;
+        }
+
+        // The remaining payload is a sequence of BDD records. Each override
+        // points at the IMAGE_BDD_INFO that selects its active RVA. Current
+        // Windows images can contain several contiguous BDDs, so validate the
+        // complete sequence instead of treating the whole region as one BDD.
+        if (size - recordsEnd < sizeof(IMAGE_BDD_INFO))
+        {
+            return false;
+        }
+
+        const size_t bddRegionSize = size - recordsEnd;
+        std::sort(bddOffsets.begin(), bddOffsets.end());
+        bddOffsets.erase(
+            std::unique(bddOffsets.begin(), bddOffsets.end()),
+            bddOffsets.end());
+        if (bddOffsets.empty() || bddOffsets.front() != 0)
+        {
+            return false;
+        }
+
+        size_t expectedOffset = 0;
+        for (uint32_t offset : bddOffsets)
+        {
+            if (offset != expectedOffset ||
+                offset > bddRegionSize - sizeof(IMAGE_BDD_INFO))
+            {
+                return false;
+            }
+
+            IMAGE_BDD_INFO bdd = {};
+            std::memcpy(
+                &bdd,
+                bytes + recordsEnd + offset,
+                sizeof(bdd));
+            if (bdd.Version != 1 ||
+                (bdd.BDDSize % sizeof(IMAGE_BDD_DYNAMIC_RELOCATION)) != 0 ||
+                bdd.BDDSize >
+                    bddRegionSize - offset - sizeof(IMAGE_BDD_INFO))
+            {
+                return false;
+            }
+
+            expectedOffset =
+                static_cast<size_t>(offset) +
+                sizeof(IMAGE_BDD_INFO) +
+                bdd.BDDSize;
+        }
+
+        return expectedOffset == bddRegionSize;
+    }
+
+    bool ParseDynamicRelocationTable(
+        const std::vector<uint8_t>& bytes,
+        bool pe64,
+        uint32_t sizeOfImage,
+        std::vector<DiskPeMutableRange>* ranges)
+    {
+        if (ranges == nullptr ||
+            sizeOfImage == 0 ||
+            bytes.size() < sizeof(IMAGE_DYNAMIC_RELOCATION_TABLE))
+        {
+            return false;
+        }
+
+        std::vector<DiskPeMutableRange> parsedRanges;
+        IMAGE_DYNAMIC_RELOCATION_TABLE table = {};
+        std::memcpy(&table, bytes.data(), sizeof(table));
+        if (table.Version != 1 ||
+            table.Size != bytes.size() - sizeof(table))
+        {
+            return false;
+        }
+
+        const size_t tableEnd = sizeof(table) + table.Size;
+        size_t cursor = sizeof(table);
+        while (cursor < tableEnd)
+        {
+            const size_t entryHeaderSize =
+                pe64 ? sizeof(IMAGE_DYNAMIC_RELOCATION64) : sizeof(IMAGE_DYNAMIC_RELOCATION32);
+            if (tableEnd - cursor < entryHeaderSize)
+            {
+                return false;
+            }
+
+            uint64_t symbol = 0;
+            uint32_t payloadSize = 0;
+            if (pe64)
+            {
+                IMAGE_DYNAMIC_RELOCATION64 entry = {};
+                std::memcpy(&entry, bytes.data() + cursor, sizeof(entry));
+                symbol = entry.Symbol;
+                payloadSize = entry.BaseRelocSize;
+            }
+            else
+            {
+                IMAGE_DYNAMIC_RELOCATION32 entry = {};
+                std::memcpy(&entry, bytes.data() + cursor, sizeof(entry));
+                symbol = entry.Symbol;
+                payloadSize = entry.BaseRelocSize;
+            }
+
+            if (payloadSize > tableEnd - cursor - entryHeaderSize)
+            {
+                return false;
+            }
+
+            const uint8_t* payload = bytes.data() + cursor + entryHeaderSize;
+            if (symbol != IMAGE_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE ||
+                !ParseFunctionOverrideDynamicRelocations(
+                    payload,
+                    payloadSize,
+                    sizeOfImage,
+                    &parsedRanges))
+            {
+                // Other DVRT symbol formats use different record layouts.
+                // Unknown records make the deep comparison incomplete; they
+                // must never become a clean result through broad masking.
+                return false;
+            }
+
+            cursor += entryHeaderSize + payloadSize;
+        }
+
+        if (cursor != tableEnd)
+        {
+            return false;
+        }
+
+        std::sort(
+            parsedRanges.begin(),
+            parsedRanges.end(),
+            [](const DiskPeMutableRange& left, const DiskPeMutableRange& right)
+            {
+                if (left.Rva != right.Rva)
+                {
+                    return left.Rva < right.Rva;
+                }
+                return left.Size < right.Size;
+            });
+        std::vector<DiskPeMutableRange> normalized;
+        normalized.reserve(parsedRanges.size());
+        for (const DiskPeMutableRange& range : parsedRanges)
+        {
+            const uint64_t rangeEnd = static_cast<uint64_t>(range.Rva) + range.Size;
+            if (normalized.empty())
+            {
+                normalized.push_back(range);
+                continue;
+            }
+
+            DiskPeMutableRange& previous = normalized.back();
+            const uint64_t previousEnd =
+                static_cast<uint64_t>(previous.Rva) + previous.Size;
+            if (range.Rva <= previousEnd)
+            {
+                const uint64_t mergedEnd = std::max(previousEnd, rangeEnd);
+                const uint64_t mergedSize = mergedEnd - previous.Rva;
+                if (mergedSize > std::numeric_limits<uint32_t>::max())
+                {
+                    return false;
+                }
+                previous.Size = static_cast<uint32_t>(mergedSize);
+            }
+            else
+            {
+                normalized.push_back(range);
+            }
+        }
+        *ranges = std::move(normalized);
+        return true;
+    }
+
+    void PopulateDynamicRelocationRanges(
+        HANDLE file,
+        DiskPeMetadata* metadata,
+        uint32_t loadConfigRva,
+        uint32_t loadConfigSize,
+        bool pe64)
+    {
+        if (file == INVALID_HANDLE_VALUE ||
+            metadata == nullptr ||
+            loadConfigRva == 0 ||
+            loadConfigSize < sizeof(uint32_t))
+        {
+            return;
+        }
+
+        const size_t structureSize =
+            pe64 ? sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64) : sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32);
+        const uint32_t bytesToRead =
+            static_cast<uint32_t>(std::min<size_t>(loadConfigSize, structureSize));
+        std::vector<uint8_t> loadConfig;
+        if (!ReadDiskBytesForRva(file, *metadata, loadConfigRva, bytesToRead, &loadConfig) ||
+            loadConfig.size() < sizeof(uint32_t))
+        {
+            metadata->DynamicRelocationTablePresent = true;
+            metadata->DynamicRelocationTableComplete = false;
+            return;
+        }
+
+        uint32_t declaredSize = 0;
+        std::memcpy(&declaredSize, loadConfig.data(), sizeof(declaredSize));
+        const size_t available = std::min<size_t>(loadConfig.size(), declaredSize);
+        uint64_t tableVa = 0;
+        uint32_t tableOffset = 0;
+        uint16_t tableSection = 0;
+
+        if (pe64)
+        {
+            if (available >= offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, DynamicValueRelocTable) + sizeof(uint64_t))
+            {
+                std::memcpy(
+                    &tableVa,
+                    loadConfig.data() + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, DynamicValueRelocTable),
+                    sizeof(tableVa));
+            }
+            if (available >= offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, DynamicValueRelocTableSection) + sizeof(uint16_t))
+            {
+                std::memcpy(
+                    &tableOffset,
+                    loadConfig.data() + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, DynamicValueRelocTableOffset),
+                    sizeof(tableOffset));
+                std::memcpy(
+                    &tableSection,
+                    loadConfig.data() + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, DynamicValueRelocTableSection),
+                    sizeof(tableSection));
+            }
+        }
+        else
+        {
+            uint32_t tableVa32 = 0;
+            if (available >= offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, DynamicValueRelocTable) + sizeof(uint32_t))
+            {
+                std::memcpy(
+                    &tableVa32,
+                    loadConfig.data() + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, DynamicValueRelocTable),
+                    sizeof(tableVa32));
+                tableVa = tableVa32;
+            }
+            if (available >= offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, DynamicValueRelocTableSection) + sizeof(uint16_t))
+            {
+                std::memcpy(
+                    &tableOffset,
+                    loadConfig.data() + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, DynamicValueRelocTableOffset),
+                    sizeof(tableOffset));
+                std::memcpy(
+                    &tableSection,
+                    loadConfig.data() + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, DynamicValueRelocTableSection),
+                    sizeof(tableSection));
+            }
+        }
+
+        uint32_t tableRva = 0;
+        bool located = false;
+        if (tableVa != 0 &&
+            metadata->ImageBase != 0 &&
+            tableVa >= metadata->ImageBase &&
+            tableVa - metadata->ImageBase <= std::numeric_limits<uint32_t>::max())
+        {
+            tableRva = static_cast<uint32_t>(tableVa - metadata->ImageBase);
+            located = true;
+        }
+        else if (tableSection != 0 &&
+                 tableSection <= metadata->Sections.size())
+        {
+            const DiskPeSection& section = metadata->Sections[tableSection - 1];
+            const uint64_t candidate = static_cast<uint64_t>(section.VirtualAddress) + tableOffset;
+            const uint64_t sectionSpan = std::max(section.VirtualSize, section.SizeOfRawData);
+            if (tableOffset < sectionSpan &&
+                candidate <= std::numeric_limits<uint32_t>::max())
+            {
+                tableRva = static_cast<uint32_t>(candidate);
+                located = true;
+            }
+        }
+
+        if (!located)
+        {
+            // An older load-config can legitimately predate DVRT fields.
+            if (tableVa == 0 && tableOffset == 0 && tableSection == 0)
+            {
+                return;
+            }
+
+            metadata->DynamicRelocationTablePresent = true;
+            metadata->DynamicRelocationTableComplete = false;
+            return;
+        }
+
+        metadata->DynamicRelocationTablePresent = true;
+        std::vector<uint8_t> tableHeader;
+        if (!ReadDiskBytesForRva(
+                file,
+                *metadata,
+                tableRva,
+                sizeof(IMAGE_DYNAMIC_RELOCATION_TABLE),
+                &tableHeader) ||
+            tableHeader.size() < sizeof(IMAGE_DYNAMIC_RELOCATION_TABLE))
+        {
+            metadata->DynamicRelocationTableComplete = false;
+            return;
+        }
+
+        IMAGE_DYNAMIC_RELOCATION_TABLE table = {};
+        std::memcpy(&table, tableHeader.data(), sizeof(table));
+        constexpr uint32_t kMaxDynamicRelocationTableBytes = 16u * 1024u * 1024u;
+        if (table.Size > kMaxDynamicRelocationTableBytes)
+        {
+            metadata->DynamicRelocationTableComplete = false;
+            return;
+        }
+
+        const uint64_t totalSize = static_cast<uint64_t>(sizeof(table)) + table.Size;
+        if (totalSize > std::numeric_limits<uint32_t>::max())
+        {
+            metadata->DynamicRelocationTableComplete = false;
+            return;
+        }
+
+        std::vector<uint8_t> tableBytes;
+        if (!ReadDiskBytesForRva(
+                file,
+                *metadata,
+                tableRva,
+                static_cast<uint32_t>(totalSize),
+                &tableBytes) ||
+            tableBytes.size() != totalSize ||
+            !ParseDynamicRelocationTable(
+                tableBytes,
+                pe64,
+                metadata->SizeOfImage,
+                &metadata->DynamicRelocationRanges))
+        {
+            metadata->DynamicRelocationTableComplete = false;
+            metadata->DynamicRelocationRanges.clear();
+            return;
+        }
+
+        for (const DiskPeMutableRange& range : metadata->DynamicRelocationRanges)
+        {
+            const uint64_t rangeEnd = static_cast<uint64_t>(range.Rva) + range.Size;
+            if (metadata->SizeOfImage == 0 || rangeEnd > metadata->SizeOfImage)
+            {
+                metadata->DynamicRelocationTableComplete = false;
+                metadata->DynamicRelocationRanges.clear();
+                return;
+            }
+        }
     }
 
     bool ReadDiskPeMetadata(const std::wstring& rawPath, DiskPeMetadata* metadata, std::wstring* error)
@@ -4410,7 +5855,15 @@ namespace
 
             *metadata = {};
             std::wstring path = Win32FilePathFromMaybeNtPath(rawPath);
-            file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            file = CreateFileW(
+                path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL |
+                    FILE_FLAG_SEQUENTIAL_SCAN,
+                nullptr);
             if (file == INVALID_HANDLE_VALUE)
             {
                 if (error != nullptr)
@@ -4430,10 +5883,10 @@ namespace
                 break;
             }
 
-            const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(header.data());
-            if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
-                dos->e_lfanew <= 0 ||
-                static_cast<size_t>(dos->e_lfanew) + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER) > header.size())
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, header.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE ||
+                dos.e_lfanew <= 0)
             {
                 if (error != nullptr)
                 {
@@ -4441,9 +5894,54 @@ namespace
                 }
                 break;
             }
+            metadata->HasFileIdentity =
+                GetFileInformationByHandle(
+                    file,
+                    &metadata->FileIdentity) != FALSE;
+            metadata->HasFileBasicIdentity =
+                GetFileInformationByHandleEx(
+                    file,
+                    FileBasicInfo,
+                    &metadata->FileBasicIdentity,
+                    sizeof(metadata->FileBasicIdentity)) != FALSE;
 
-            size_t ntOffset = static_cast<size_t>(dos->e_lfanew);
-            uint32_t signature = *reinterpret_cast<const uint32_t*>(header.data() + ntOffset);
+            size_t ntOffset = static_cast<size_t>(dos.e_lfanew);
+            constexpr size_t kMaximumPeHeaderSpan =
+                16u * 1024u * 1024u;
+            const size_t minimumNtBytes =
+                sizeof(uint32_t) +
+                sizeof(IMAGE_FILE_HEADER);
+            if (ntOffset >
+                    kMaximumPeHeaderSpan -
+                        minimumNtBytes)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"disk image NT header offset exceeds the parser cap";
+                }
+                break;
+            }
+            const size_t minimumNtEnd =
+                ntOffset + minimumNtBytes;
+            if (minimumNtEnd > header.size() &&
+                (!ReadFileBytesAt(
+                     file,
+                     0,
+                     static_cast<uint32_t>(minimumNtEnd),
+                     &header) ||
+                 header.size() < minimumNtEnd))
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"read disk image NT header failed";
+                }
+                break;
+            }
+
+            uint32_t signature = 0;
+            std::memcpy(&signature, header.data() + ntOffset, sizeof(signature));
             if (signature != IMAGE_NT_SIGNATURE)
             {
                 if (error != nullptr)
@@ -4453,11 +5951,37 @@ namespace
                 break;
             }
 
-            const IMAGE_FILE_HEADER* fileHeader =
-                reinterpret_cast<const IMAGE_FILE_HEADER*>(header.data() + ntOffset + sizeof(uint32_t));
+            IMAGE_FILE_HEADER fileHeader = {};
+            std::memcpy(
+                &fileHeader,
+                header.data() + ntOffset + sizeof(uint32_t),
+                sizeof(fileHeader));
+            const uint16_t numberOfSections = fileHeader.NumberOfSections;
+            const uint16_t optionalHeaderSize = fileHeader.SizeOfOptionalHeader;
             size_t optionalOffset = ntOffset + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
-            size_t sectionOffset = optionalOffset + fileHeader->SizeOfOptionalHeader;
-            size_t required = sectionOffset + static_cast<size_t>(fileHeader->NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+            constexpr uint16_t kMaximumPeSectionCount = 96;
+            if (optionalHeaderSize < sizeof(uint16_t) ||
+                numberOfSections == 0 ||
+                numberOfSections > kMaximumPeSectionCount)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"disk image has invalid optional-header or section count";
+                }
+                break;
+            }
+
+            size_t sectionOffset = optionalOffset + optionalHeaderSize;
+            size_t required = sectionOffset + static_cast<size_t>(numberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+            if (required > kMaximumPeHeaderSpan)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"disk image section table exceeds the parser cap";
+                }
+                break;
+            }
             if (required > header.size())
             {
                 if (!ReadFileBytesAt(file, 0, static_cast<uint32_t>(required), &header) || header.size() < required)
@@ -4472,41 +5996,144 @@ namespace
 
             uint32_t relocRva = 0;
             uint32_t relocSize = 0;
-            uint16_t magic = *reinterpret_cast<const uint16_t*>(header.data() + optionalOffset);
+            uint32_t loadConfigRva = 0;
+            uint32_t loadConfigSize = 0;
+            uint32_t managedRva = 0;
+            uint32_t managedSize = 0;
+            bool pe64 = false;
+            uint16_t magic = 0;
+            std::memcpy(&magic, header.data() + optionalOffset, sizeof(magic));
             if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
             {
-                const IMAGE_OPTIONAL_HEADER64* optional =
-                    reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(header.data() + optionalOffset);
-                metadata->ImageBase = optional->ImageBase;
-                metadata->EntryPointRva = optional->AddressOfEntryPoint;
-                metadata->SizeOfHeaders = optional->SizeOfHeaders;
-                metadata->SizeOfImage = optional->SizeOfImage;
-                AddLoaderMutableDirectoryPages(
-                    &metadata->LoaderMutablePages,
-                    optional->DataDirectory,
-                    optional->NumberOfRvaAndSizes);
-                if (optional->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
+                constexpr size_t kPe64FixedOptionalBytes =
+                    offsetof(
+                        IMAGE_OPTIONAL_HEADER64,
+                        DataDirectory);
+                if (optionalHeaderSize <
+                    kPe64FixedOptionalBytes)
                 {
-                    relocRva = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
-                    relocSize = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                    if (error != nullptr)
+                    {
+                        *error = L"truncated PE32+ optional header";
+                    }
+                    break;
+                }
+
+                pe64 = true;
+                IMAGE_OPTIONAL_HEADER64 optional = {};
+                std::memcpy(
+                    &optional,
+                    header.data() + optionalOffset,
+                    std::min<size_t>(
+                        optionalHeaderSize,
+                        sizeof(optional)));
+                const size_t availableDirectories =
+                    (optionalHeaderSize -
+                     kPe64FixedOptionalBytes) /
+                        sizeof(IMAGE_DATA_DIRECTORY);
+                if (optional.NumberOfRvaAndSizes >
+                        IMAGE_NUMBEROF_DIRECTORY_ENTRIES ||
+                    optional.NumberOfRvaAndSizes >
+                        availableDirectories)
+                {
+                    if (error != nullptr)
+                    {
+                        *error =
+                            L"PE32+ data-directory count exceeds the declared optional header";
+                    }
+                    break;
+                }
+
+                metadata->ImageBase = optional.ImageBase;
+                metadata->EntryPointRva = optional.AddressOfEntryPoint;
+                metadata->SizeOfHeaders = optional.SizeOfHeaders;
+                metadata->SizeOfImage = optional.SizeOfImage;
+                AddLoaderMutableDirectoryRanges(
+                    &metadata->LoaderMutableRanges,
+                    optional.DataDirectory,
+                    optional.NumberOfRvaAndSizes);
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
+                {
+                    relocRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+                    relocSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                }
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+                {
+                    loadConfigRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress;
+                    loadConfigSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size;
+                }
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)
+                {
+                    const IMAGE_DATA_DIRECTORY& managed =
+                        optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR];
+                    managedRva = managed.VirtualAddress;
+                    managedSize = managed.Size;
                 }
             }
             else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
             {
-                const IMAGE_OPTIONAL_HEADER32* optional =
-                    reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(header.data() + optionalOffset);
-                metadata->ImageBase = optional->ImageBase;
-                metadata->EntryPointRva = optional->AddressOfEntryPoint;
-                metadata->SizeOfHeaders = optional->SizeOfHeaders;
-                metadata->SizeOfImage = optional->SizeOfImage;
-                AddLoaderMutableDirectoryPages(
-                    &metadata->LoaderMutablePages,
-                    optional->DataDirectory,
-                    optional->NumberOfRvaAndSizes);
-                if (optional->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
+                constexpr size_t kPe32FixedOptionalBytes =
+                    offsetof(
+                        IMAGE_OPTIONAL_HEADER32,
+                        DataDirectory);
+                if (optionalHeaderSize <
+                    kPe32FixedOptionalBytes)
                 {
-                    relocRva = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
-                    relocSize = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                    if (error != nullptr)
+                    {
+                        *error = L"truncated PE32 optional header";
+                    }
+                    break;
+                }
+
+                IMAGE_OPTIONAL_HEADER32 optional = {};
+                std::memcpy(
+                    &optional,
+                    header.data() + optionalOffset,
+                    std::min<size_t>(
+                        optionalHeaderSize,
+                        sizeof(optional)));
+                const size_t availableDirectories =
+                    (optionalHeaderSize -
+                     kPe32FixedOptionalBytes) /
+                        sizeof(IMAGE_DATA_DIRECTORY);
+                if (optional.NumberOfRvaAndSizes >
+                        IMAGE_NUMBEROF_DIRECTORY_ENTRIES ||
+                    optional.NumberOfRvaAndSizes >
+                        availableDirectories)
+                {
+                    if (error != nullptr)
+                    {
+                        *error =
+                            L"PE32 data-directory count exceeds the declared optional header";
+                    }
+                    break;
+                }
+
+                metadata->ImageBase = optional.ImageBase;
+                metadata->EntryPointRva = optional.AddressOfEntryPoint;
+                metadata->SizeOfHeaders = optional.SizeOfHeaders;
+                metadata->SizeOfImage = optional.SizeOfImage;
+                AddLoaderMutableDirectoryRanges(
+                    &metadata->LoaderMutableRanges,
+                    optional.DataDirectory,
+                    optional.NumberOfRvaAndSizes);
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
+                {
+                    relocRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+                    relocSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                }
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+                {
+                    loadConfigRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress;
+                    loadConfigSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size;
+                }
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)
+                {
+                    const IMAGE_DATA_DIRECTORY& managed =
+                        optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR];
+                    managedRva = managed.VirtualAddress;
+                    managedSize = managed.Size;
                 }
             }
             else
@@ -4518,24 +6145,70 @@ namespace
                 break;
             }
 
+            if (metadata->SizeOfImage == 0 ||
+                metadata->SizeOfHeaders > metadata->SizeOfImage ||
+                (metadata->EntryPointRva != 0 &&
+                 metadata->EntryPointRva >= metadata->SizeOfImage))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"PE image/header/entrypoint bounds are invalid";
+                }
+                break;
+            }
+
+            bool directoryRangesValid = true;
+            for (const DiskPeMutableRange& range : metadata->LoaderMutableRanges)
+            {
+                if (range.Rva >= metadata->SizeOfImage ||
+                    range.Size > metadata->SizeOfImage - range.Rva)
+                {
+                    directoryRangesValid = false;
+                    break;
+                }
+            }
+            if (!directoryRangesValid)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"PE loader-mutable data directory is outside the image";
+                }
+                break;
+            }
+
             metadata->HasEntryPoint = metadata->EntryPointRva != 0;
 
-            const IMAGE_SECTION_HEADER* sections =
-                reinterpret_cast<const IMAGE_SECTION_HEADER*>(header.data() + sectionOffset);
-            for (uint16_t index = 0; index < fileHeader->NumberOfSections; ++index)
+            bool sectionRangesValid = true;
+            for (uint16_t index = 0; index < numberOfSections; ++index)
             {
+                IMAGE_SECTION_HEADER rawSection = {};
+                std::memcpy(
+                    &rawSection,
+                    header.data() + sectionOffset + static_cast<size_t>(index) * sizeof(rawSection),
+                    sizeof(rawSection));
                 DiskPeSection section = {};
                 char sectionName[9] = {};
-                std::memcpy(sectionName, sections[index].Name, IMAGE_SIZEOF_SHORT_NAME);
+                std::memcpy(sectionName, rawSection.Name, IMAGE_SIZEOF_SHORT_NAME);
                 std::string narrowName(sectionName);
                 section.Name.assign(narrowName.begin(), narrowName.end());
-                section.VirtualAddress = sections[index].VirtualAddress;
-                section.VirtualSize = sections[index].Misc.VirtualSize;
-                section.PointerToRawData = sections[index].PointerToRawData;
-                section.SizeOfRawData = sections[index].SizeOfRawData;
-                section.Characteristics = sections[index].Characteristics;
+                section.VirtualAddress = rawSection.VirtualAddress;
+                section.VirtualSize = rawSection.Misc.VirtualSize;
+                section.PointerToRawData = rawSection.PointerToRawData;
+                section.SizeOfRawData = rawSection.SizeOfRawData;
+                section.Characteristics = rawSection.Characteristics;
                 section.Executable = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
                 section.Writable = (section.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+                const uint64_t mappedSpan =
+                    std::max(section.VirtualSize, section.SizeOfRawData);
+                if (mappedSpan != 0 &&
+                    (section.VirtualAddress >= metadata->SizeOfImage ||
+                     mappedSpan >
+                         static_cast<uint64_t>(metadata->SizeOfImage) -
+                             section.VirtualAddress))
+                {
+                    sectionRangesValid = false;
+                    break;
+                }
                 metadata->Sections.push_back(section);
 
                 if (!metadata->HasExecutableSection &&
@@ -4545,10 +6218,74 @@ namespace
                     metadata->HasExecutableSection = true;
                 }
             }
+            if (!sectionRangesValid)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"PE section range is outside the image";
+                }
+                break;
+            }
+
+            if (managedRva != 0 &&
+                managedSize >= sizeof(IMAGE_COR20_HEADER) &&
+                static_cast<uint64_t>(managedRva) + managedSize <= metadata->SizeOfImage)
+            {
+                std::vector<uint8_t> corHeaderBytes;
+                if (ReadDiskBytesForRva(
+                        file,
+                        *metadata,
+                        managedRva,
+                        sizeof(IMAGE_COR20_HEADER),
+                        &corHeaderBytes) &&
+                    corHeaderBytes.size() >= sizeof(IMAGE_COR20_HEADER))
+                {
+                    IMAGE_COR20_HEADER corHeader = {};
+                    std::memcpy(
+                        &corHeader,
+                        corHeaderBytes.data(),
+                        sizeof(corHeader));
+                    if (corHeader.cb >= sizeof(IMAGE_COR20_HEADER) &&
+                        corHeader.cb <= managedSize &&
+                        corHeader.MetaData.VirtualAddress != 0 &&
+                        corHeader.MetaData.Size >= sizeof(uint32_t) &&
+                        static_cast<uint64_t>(corHeader.MetaData.VirtualAddress) +
+                                corHeader.MetaData.Size <=
+                            metadata->SizeOfImage)
+                    {
+                        std::vector<uint8_t> metadataSignatureBytes;
+                        uint32_t metadataSignature = 0;
+                        if (ReadDiskBytesForRva(
+                                file,
+                                *metadata,
+                                corHeader.MetaData.VirtualAddress,
+                                sizeof(metadataSignature),
+                                &metadataSignatureBytes) &&
+                            metadataSignatureBytes.size() >= sizeof(metadataSignature))
+                        {
+                            std::memcpy(
+                                &metadataSignature,
+                                metadataSignatureBytes.data(),
+                                sizeof(metadataSignature));
+                            metadata->ManagedImage =
+                                metadataSignature == 0x424a5342u;
+                            metadata->ManagedIlOnly =
+                                metadata->ManagedImage &&
+                                (corHeader.Flags & kComImageFlagsIlOnly) != 0;
+                        }
+                    }
+                }
+            }
 
             metadata->BaserelocRva = relocRva;
             metadata->BaserelocSize = relocSize;
             PopulateRelocationPages(file, metadata, relocRva, relocSize);
+            PopulateDynamicRelocationRanges(
+                file,
+                metadata,
+                loadConfigRva,
+                loadConfigSize,
+                pe64);
 
             ok = true;
         } while (false);
@@ -4561,144 +6298,161 @@ namespace
         return ok;
     }
 
-    bool ApplyBaseRelocationsToDiskPage(
+    bool DiskFileIdentityMatches(
         HANDLE file,
+        const DiskPeMetadata& metadata)
+    {
+        if (file == INVALID_HANDLE_VALUE ||
+            !metadata.HasFileIdentity)
+        {
+            return false;
+        }
+
+        BY_HANDLE_FILE_INFORMATION current = {};
+        if (!GetFileInformationByHandle(
+                file,
+                &current))
+        {
+            return false;
+        }
+
+        const BY_HANDLE_FILE_INFORMATION& expected =
+            metadata.FileIdentity;
+        bool matches =
+            current.dwVolumeSerialNumber ==
+                expected.dwVolumeSerialNumber &&
+            current.nFileIndexHigh ==
+                expected.nFileIndexHigh &&
+            current.nFileIndexLow ==
+                expected.nFileIndexLow &&
+            current.nFileSizeHigh ==
+                expected.nFileSizeHigh &&
+            current.nFileSizeLow ==
+                expected.nFileSizeLow &&
+            current.ftCreationTime.dwHighDateTime ==
+                expected.ftCreationTime.dwHighDateTime &&
+            current.ftCreationTime.dwLowDateTime ==
+                expected.ftCreationTime.dwLowDateTime &&
+            current.ftLastWriteTime.dwHighDateTime ==
+                expected.ftLastWriteTime.dwHighDateTime &&
+            current.ftLastWriteTime.dwLowDateTime ==
+                expected.ftLastWriteTime.dwLowDateTime;
+        if (!matches ||
+            !metadata.HasFileBasicIdentity)
+        {
+            return matches;
+        }
+
+        FILE_BASIC_INFO currentBasic = {};
+        return GetFileInformationByHandleEx(
+                   file,
+                   FileBasicInfo,
+                   &currentBasic,
+                   sizeof(currentBasic)) != FALSE &&
+            currentBasic.CreationTime.QuadPart ==
+                metadata.FileBasicIdentity.CreationTime.QuadPart &&
+            currentBasic.LastWriteTime.QuadPart ==
+                metadata.FileBasicIdentity.LastWriteTime.QuadPart &&
+            currentBasic.ChangeTime.QuadPart ==
+                metadata.FileBasicIdentity.ChangeTime.QuadPart;
+    }
+
+    bool ApplyBaseRelocationsToDiskPage(
         const DiskPeMetadata& metadata,
         uint32_t pageRva,
         uint64_t imageDelta,
         std::vector<uint8_t>* pageBytes,
         std::vector<uint8_t>* nextPageBytes)
     {
-        bool ok = false;
-
-        do
+        if (pageBytes == nullptr ||
+            pageBytes->size() < kPageSize ||
+            !metadata.BaseRelocationTableComplete ||
+            metadata.BaseRelocations.empty())
         {
-            if (file == INVALID_HANDLE_VALUE ||
-                pageBytes == nullptr ||
-                pageBytes->size() < kPageSize ||
-                metadata.BaserelocRva == 0 ||
-                metadata.BaserelocSize < sizeof(IMAGE_BASE_RELOCATION))
+            return false;
+        }
+
+        const uint64_t pageStart = pageRva;
+        const uint64_t pageEnd = pageStart + pageBytes->size();
+        auto first = std::lower_bound(
+            metadata.BaseRelocations.begin(),
+            metadata.BaseRelocations.end(),
+            pageStart,
+            [](const DiskPeBaseRelocation& relocation, uint64_t address)
             {
-                break;
+                return static_cast<uint64_t>(relocation.Rva) +
+                    relocation.Width <= address;
+            });
+
+        for (auto current = first;
+             current != metadata.BaseRelocations.end() &&
+                 current->Rva < pageEnd;
+             ++current)
+        {
+            const uint64_t fixupStart = current->Rva;
+            const uint64_t fixupEnd = fixupStart + current->Width;
+            if (fixupEnd <= pageStart)
+            {
+                continue;
             }
 
-            const uint32_t pageEnd = pageRva + static_cast<uint32_t>(kPageSize);
-            uint32_t parsed = 0;
-            bool failed = false;
-
-            while (parsed + sizeof(IMAGE_BASE_RELOCATION) <= metadata.BaserelocSize)
+            // A relocation beginning on the preceding page is masked at its
+            // exact byte range after normalization; the preceding bytes are
+            // not available here to reconstruct its full integer value.
+            if (fixupStart < pageStart)
             {
-                std::vector<uint8_t> blockHeader;
-                if (!ReadDiskBytesForRva(
-                        file,
-                        metadata,
-                        metadata.BaserelocRva + parsed,
-                        sizeof(IMAGE_BASE_RELOCATION),
-                        &blockHeader) ||
-                    blockHeader.size() < sizeof(IMAGE_BASE_RELOCATION))
-                {
-                    failed = true;
-                    break;
-                }
-
-                const IMAGE_BASE_RELOCATION* block =
-                    reinterpret_cast<const IMAGE_BASE_RELOCATION*>(blockHeader.data());
-                if (block->VirtualAddress == 0 ||
-                    block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
-                    parsed + block->SizeOfBlock > metadata.BaserelocSize)
-                {
-                    break;
-                }
-
-                const uint32_t entryBytes = block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
-                std::vector<uint8_t> entries;
-                if (entryBytes != 0 &&
-                    (!ReadDiskBytesForRva(
-                         file,
-                         metadata,
-                         metadata.BaserelocRva + parsed + sizeof(IMAGE_BASE_RELOCATION),
-                         entryBytes,
-                         &entries) ||
-                     entries.size() < entryBytes))
-                {
-                    failed = true;
-                    break;
-                }
-
-                const size_t entryCount = entryBytes / sizeof(uint16_t);
-                for (size_t index = 0; index < entryCount; ++index)
-                {
-                    uint16_t entry = 0;
-                    std::memcpy(&entry, entries.data() + index * sizeof(uint16_t), sizeof(entry));
-                    const uint16_t type = static_cast<uint16_t>(entry >> 12);
-                    const uint16_t offset = static_cast<uint16_t>(entry & 0x0fffu);
-                    if (type == IMAGE_REL_BASED_ABSOLUTE)
-                    {
-                        continue;
-                    }
-
-                    const uint32_t fixupRva = block->VirtualAddress + offset;
-                    if (fixupRva < pageRva || fixupRva >= pageEnd)
-                    {
-                        continue;
-                    }
-
-                    const uint32_t pageOffset = fixupRva - pageRva;
-                    uint32_t width = 0;
-                    if (type == IMAGE_REL_BASED_DIR64)
-                    {
-                        width = sizeof(uint64_t);
-                    }
-                    else if (type == IMAGE_REL_BASED_HIGHLOW)
-                    {
-                        width = sizeof(uint32_t);
-                    }
-                    else
-                    {
-                        failed = true;
-                        break;
-                    }
-
-                    if (pageOffset + width <= pageBytes->size())
-                    {
-                        uint64_t value = 0;
-                        std::memcpy(&value, pageBytes->data() + pageOffset, width);
-                        value += imageDelta;
-                        std::memcpy(pageBytes->data() + pageOffset, &value, width);
-                        continue;
-                    }
-
-                    const uint32_t first = static_cast<uint32_t>(pageBytes->size() - pageOffset);
-                    const uint32_t second = width - first;
-                    if (nextPageBytes == nullptr || nextPageBytes->size() < second)
-                    {
-                        failed = true;
-                        break;
-                    }
-
-                    uint8_t raw[8] = {};
-                    std::memcpy(raw, pageBytes->data() + pageOffset, first);
-                    std::memcpy(raw + first, nextPageBytes->data(), second);
-                    uint64_t value = 0;
-                    std::memcpy(&value, raw, width);
-                    value += imageDelta;
-                    std::memcpy(raw, &value, width);
-                    std::memcpy(pageBytes->data() + pageOffset, raw, first);
-                    std::memcpy(nextPageBytes->data(), raw + first, second);
-                }
-
-                if (failed)
-                {
-                    break;
-                }
-
-                parsed += block->SizeOfBlock;
+                continue;
             }
 
-            ok = !failed;
-        } while (false);
+            const size_t pageOffset =
+                static_cast<size_t>(fixupStart - pageStart);
+            if (pageOffset + current->Width <= pageBytes->size())
+            {
+                uint64_t value = 0;
+                std::memcpy(
+                    &value,
+                    pageBytes->data() + pageOffset,
+                    current->Width);
+                value += imageDelta;
+                std::memcpy(
+                    pageBytes->data() + pageOffset,
+                    &value,
+                    current->Width);
+                continue;
+            }
 
-        return ok;
+            const size_t firstBytes = pageBytes->size() - pageOffset;
+            const size_t secondBytes = current->Width - firstBytes;
+            if (nextPageBytes == nullptr ||
+                nextPageBytes->size() < secondBytes)
+            {
+                return false;
+            }
+
+            uint8_t raw[8] = {};
+            std::memcpy(
+                raw,
+                pageBytes->data() + pageOffset,
+                firstBytes);
+            std::memcpy(
+                raw + firstBytes,
+                nextPageBytes->data(),
+                secondBytes);
+            uint64_t value = 0;
+            std::memcpy(&value, raw, current->Width);
+            value += imageDelta;
+            std::memcpy(raw, &value, current->Width);
+            std::memcpy(
+                pageBytes->data() + pageOffset,
+                raw,
+                firstBytes);
+            std::memcpy(
+                nextPageBytes->data(),
+                raw + firstBytes,
+                secondBytes);
+        }
+
+        return true;
     }
 
     bool CopyRawBytesIntoMappedPage(
@@ -4779,12 +6533,31 @@ namespace
             page->assign(static_cast<size_t>(kPageSize), 0);
 
             std::wstring path = Win32FilePathFromMaybeNtPath(rawPath);
-            file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            file = CreateFileW(
+                path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL |
+                    FILE_FLAG_RANDOM_ACCESS,
+                nullptr);
             if (file == INVALID_HANDLE_VALUE)
             {
                 if (error != nullptr)
                 {
                     *error = L"open disk image failed";
+                }
+                break;
+            }
+            if (!DiskFileIdentityMatches(
+                    file,
+                    metadata))
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"disk image changed after PE metadata capture";
                 }
                 break;
             }
@@ -4919,14 +6692,32 @@ namespace
             ULONG length = 0x20000;
             std::vector<uint8_t> buffer;
             LONG status = 0;
+            ULONG returnedLength = 0;
+            constexpr uint64_t kMaximumProcessInformationBytes =
+                256ull * 1024ull * 1024ull;
             for (uint32_t attempt = 0; attempt < 8; ++attempt)
             {
                 buffer.assign(length, 0);
-                ULONG returned = 0;
-                status = query(kSystemProcessInformation, buffer.data(), length, &returned);
+                returnedLength = 0;
+                status = query(
+                    kSystemProcessInformation,
+                    buffer.data(),
+                    length,
+                    &returnedLength);
                 if (status == kStatusInfoLengthMismatch || status == kStatusBufferTooSmall)
                 {
-                    length = returned != 0 ? returned + 0x10000 : length * 2;
+                    const uint64_t reported =
+                        static_cast<uint64_t>(returnedLength) + 0x10000ull;
+                    const uint64_t doubled =
+                        static_cast<uint64_t>(length) * 2ull;
+                    const uint64_t requested =
+                        std::max(reported, doubled);
+                    if (requested > kMaximumProcessInformationBytes ||
+                        requested > std::numeric_limits<ULONG>::max())
+                    {
+                        break;
+                    }
+                    length = static_cast<ULONG>(requested);
                     continue;
                 }
                 break;
@@ -4941,19 +6732,92 @@ namespace
                 break;
             }
 
+            if (returnedLength == 0 ||
+                returnedLength > buffer.size())
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"NtQuerySystemInformation returned an invalid process buffer length";
+                }
+                break;
+            }
+
+            const size_t validLength =
+                static_cast<size_t>(returnedLength);
+            const uintptr_t bufferStart =
+                reinterpret_cast<uintptr_t>(buffer.data());
+            if (validLength >
+                std::numeric_limits<uintptr_t>::max() - bufferStart)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"NtQuerySystemInformation process buffer address overflow";
+                }
+                break;
+            }
+            const uintptr_t bufferEnd = bufferStart + validLength;
+
             size_t offset = 0;
-            while (offset + sizeof(HuntSystemProcessInformation) <= buffer.size())
+            bool malformed = false;
+            bool terminalEntrySeen = false;
+            while (offset <= validLength &&
+                   sizeof(HuntSystemProcessInformation) <=
+                       validLength - offset)
             {
                 const HuntSystemProcessInformation* spi =
                     reinterpret_cast<const HuntSystemProcessInformation*>(buffer.data() + offset);
 
                 ApiProcessRecord record = {};
-                record.ProcessId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(spi->UniqueProcessId));
-                record.ParentProcessId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(spi->InheritedFromUniqueProcessId));
-                record.HasParentProcessId = spi->InheritedFromUniqueProcessId != nullptr;
-                if (spi->ImageName.Buffer != nullptr && spi->ImageName.Length != 0)
+                const uintptr_t processId =
+                    reinterpret_cast<uintptr_t>(
+                        spi->UniqueProcessId);
+                const uintptr_t parentProcessId =
+                    reinterpret_cast<uintptr_t>(
+                        spi->InheritedFromUniqueProcessId);
+                if (processId >
+                        std::numeric_limits<uint32_t>::max() ||
+                    parentProcessId >
+                        std::numeric_limits<uint32_t>::max())
                 {
-                    record.ImageName.assign(spi->ImageName.Buffer, spi->ImageName.Length / sizeof(wchar_t));
+                    malformed = true;
+                    break;
+                }
+                record.ProcessId =
+                    static_cast<uint32_t>(processId);
+                record.ParentProcessId =
+                    static_cast<uint32_t>(parentProcessId);
+                record.HasParentProcessId = spi->InheritedFromUniqueProcessId != nullptr;
+                if ((spi->ImageName.Length % sizeof(wchar_t)) != 0 ||
+                    spi->ImageName.MaximumLength <
+                        spi->ImageName.Length ||
+                    (spi->ImageName.Length != 0 &&
+                     spi->ImageName.Buffer == nullptr))
+                {
+                    malformed = true;
+                    break;
+                }
+                if (spi->ImageName.Buffer != nullptr &&
+                    spi->ImageName.Length != 0)
+                {
+                    const uintptr_t imageStart =
+                        reinterpret_cast<uintptr_t>(
+                            spi->ImageName.Buffer);
+                    const size_t imageBytes =
+                        spi->ImageName.Length;
+                    if (imageStart < bufferStart ||
+                        imageStart > bufferEnd ||
+                        imageBytes >
+                            static_cast<size_t>(
+                                bufferEnd - imageStart))
+                    {
+                        malformed = true;
+                        break;
+                    }
+                    record.ImageName.assign(
+                        spi->ImageName.Buffer,
+                        imageBytes / sizeof(wchar_t));
                 }
                 else if (record.ProcessId == 0)
                 {
@@ -4964,14 +6828,42 @@ namespace
                     record.ImageName = L"System";
                 }
 
-                (*processes)[record.ProcessId] = record;
-
-                if (spi->NextEntryOffset == 0)
+                if (!processes->emplace(
+                        record.ProcessId,
+                        std::move(record)).second)
                 {
+                    malformed = true;
                     break;
                 }
 
-                offset += spi->NextEntryOffset;
+                if (spi->NextEntryOffset == 0)
+                {
+                    terminalEntrySeen = true;
+                    break;
+                }
+
+                const size_t nextOffset =
+                    spi->NextEntryOffset;
+                if (nextOffset <
+                        sizeof(HuntSystemProcessInformation) ||
+                    (nextOffset % alignof(void*)) != 0 ||
+                    nextOffset > validLength - offset)
+                {
+                    malformed = true;
+                    break;
+                }
+                offset += nextOffset;
+            }
+
+            if (malformed || !terminalEntrySeen)
+            {
+                processes->clear();
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"NtQuerySystemInformation returned a malformed process inventory";
+                }
+                break;
             }
 
             ok = true;
@@ -5016,18 +6908,43 @@ namespace
                 break;
             }
 
-            do
+            for (;;)
             {
                 ApiProcessRecord record = {};
                 record.ProcessId = entry.th32ProcessID;
                 record.ParentProcessId = entry.th32ParentProcessID;
                 record.HasParentProcessId = true;
                 record.ImageName = entry.szExeFile;
-                (*processes)[record.ProcessId] = record;
+                if (!processes->emplace(
+                        record.ProcessId,
+                        std::move(record)).second)
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"Toolhelp returned a duplicate process identifier";
+                    }
+                    break;
+                }
                 entry.dwSize = sizeof(entry);
-            } while (Process32NextW(snapshot, &entry));
+                if (Process32NextW(snapshot, &entry))
+                {
+                    continue;
+                }
 
-            ok = true;
+                const DWORD enumerationError = GetLastError();
+                if (enumerationError == ERROR_NO_MORE_FILES)
+                {
+                    ok = true;
+                }
+                else if (warning != nullptr)
+                {
+                    *warning =
+                        L"Process32NextW failed gle=" +
+                        std::to_wstring(enumerationError);
+                }
+                break;
+            }
         } while (false);
 
         if (snapshot != INVALID_HANDLE_VALUE)
@@ -5035,13 +6952,74 @@ namespace
             CloseHandle(snapshot);
         }
 
+        if (!ok && processes != nullptr)
+        {
+            processes->clear();
+        }
         return ok;
     }
 
-    void QueryProcessPublicDetails(HuntProcessRecord* process)
+    bool ProcessHandleMatchesSnapshot(
+        HANDLE handle,
+        const SnapshotProcessRecord& snapshot,
+        bool* lifecycleChanged)
+    {
+        if (lifecycleChanged != nullptr)
+        {
+            *lifecycleChanged = false;
+        }
+        if (handle == nullptr ||
+            handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        FILETIME createTime = {};
+        FILETIME exitTime = {};
+        FILETIME kernelTime = {};
+        FILETIME userTime = {};
+        if (!GetProcessTimes(
+                handle,
+                &createTime,
+                &exitTime,
+                &kernelTime,
+                &userTime))
+        {
+            return false;
+        }
+
+        DWORD exitCode = 0;
+        if (!GetExitCodeProcess(handle, &exitCode))
+        {
+            return false;
+        }
+
+        ULARGE_INTEGER observedCreate = {};
+        observedCreate.LowPart = createTime.dwLowDateTime;
+        observedCreate.HighPart = createTime.dwHighDateTime;
+
+        const bool changed =
+            exitCode != STILL_ACTIVE ||
+            (snapshot.HasCreateTime &&
+             (snapshot.CreateTime == 0 ||
+              observedCreate.QuadPart != snapshot.CreateTime));
+        if (changed && lifecycleChanged != nullptr)
+        {
+            *lifecycleChanged = true;
+        }
+        return !changed;
+    }
+
+    void QueryProcessPublicDetails(
+        HuntProcessRecord* process,
+        bool* lifecycleChanged)
     {
         HANDLE handle = nullptr;
 
+        if (lifecycleChanged != nullptr)
+        {
+            *lifecycleChanged = false;
+        }
         do
         {
             if (process == nullptr || process->ProcessId == 0)
@@ -5050,16 +7028,44 @@ namespace
             }
 
             DWORD sessionId = 0;
-            if (ProcessIdToSessionId(process->ProcessId, &sessionId))
-            {
-                process->SessionId = sessionId;
-                process->HasSessionId = true;
-            }
+            const bool sessionIdAvailable =
+                ProcessIdToSessionId(
+                    process->ProcessId,
+                    &sessionId) != FALSE;
 
             handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process->ProcessId);
             if (handle == nullptr)
             {
+                const DWORD openError = GetLastError();
+                if (HasExactProcessIdentity(process->Kernel) &&
+                    (openError == ERROR_INVALID_PARAMETER ||
+                     openError == ERROR_INVALID_HANDLE ||
+                     openError == ERROR_NOT_FOUND) &&
+                    lifecycleChanged != nullptr)
+                {
+                    *lifecycleChanged = true;
+                }
                 break;
+            }
+
+            bool handleLifecycleChanged = false;
+            if (!ProcessHandleMatchesSnapshot(
+                    handle,
+                    process->Kernel,
+                    &handleLifecycleChanged))
+            {
+                if (handleLifecycleChanged &&
+                    lifecycleChanged != nullptr)
+                {
+                    *lifecycleChanged = true;
+                }
+                break;
+            }
+
+            if (sessionIdAvailable)
+            {
+                process->SessionId = sessionId;
+                process->HasSessionId = true;
             }
 
             std::vector<wchar_t> buffer(32768);
@@ -5080,6 +7086,7 @@ namespace
     {
         bool ok = false;
         HANDLE snapshot = INVALID_HANDLE_VALUE;
+        DWORD snapshotError = ERROR_SUCCESS;
 
         do
         {
@@ -5088,12 +7095,37 @@ namespace
                 break;
             }
 
-            snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process->ProcessId);
+            // The Toolhelp contract explicitly permits transient
+            // ERROR_BAD_LENGTH while loader lists are changing. Treating the
+            // first one as permanent makes WOW64 inventories unnecessarily
+            // flaky.
+            constexpr size_t kMaxModuleSnapshotAttempts = 8;
+            for (size_t attempt = 0;
+                 attempt < kMaxModuleSnapshotAttempts;
+                 ++attempt)
+            {
+                snapshot = CreateToolhelp32Snapshot(
+                    TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                    process->ProcessId);
+                if (snapshot != INVALID_HANDLE_VALUE)
+                {
+                    break;
+                }
+
+                snapshotError = GetLastError();
+                if (snapshotError != ERROR_BAD_LENGTH)
+                {
+                    break;
+                }
+                SwitchToThread();
+            }
             if (snapshot == INVALID_HANDLE_VALUE)
             {
                 if (warning != nullptr)
                 {
-                    *warning = L"toolhelp module snapshot failed gle=" + std::to_wstring(GetLastError());
+                    *warning =
+                        L"toolhelp module snapshot failed gle=" +
+                        std::to_wstring(snapshotError);
                 }
                 break;
             }
@@ -5109,7 +7141,7 @@ namespace
                 break;
             }
 
-            do
+            for (;;)
             {
                 HuntModuleRecord module = {};
                 module.Base = reinterpret_cast<uint64_t>(entry.modBaseAddr);
@@ -5119,10 +7151,25 @@ namespace
                 module.ToolhelpSeen = true;
                 MergeModule(&process->Modules, module);
                 entry.dwSize = sizeof(entry);
-            } while (Module32NextW(snapshot, &entry));
+                if (Module32NextW(snapshot, &entry))
+                {
+                    continue;
+                }
 
-            process->ToolhelpModuleEnumerated = true;
-            ok = true;
+                const DWORD enumerationError = GetLastError();
+                if (enumerationError == ERROR_NO_MORE_FILES)
+                {
+                    process->ToolhelpModuleEnumerated = true;
+                    ok = true;
+                }
+                else if (warning != nullptr)
+                {
+                    *warning =
+                        L"toolhelp module enumeration failed gle=" +
+                        std::to_wstring(enumerationError);
+                }
+                break;
+            }
         } while (false);
 
         if (snapshot != INVALID_HANDLE_VALUE)
@@ -5140,7 +7187,8 @@ namespace
             if (process == nullptr ||
                 !process->Kernel.HasPeb ||
                 process->Kernel.Peb == 0 ||
-                TargetUserDtb(process->Kernel) == 0)
+                (TargetUserDtb(process->Kernel) == 0 &&
+                 !HasExactProcessIdentity(process->Kernel)))
             {
                 break;
             }
@@ -5197,24 +7245,47 @@ namespace
             uint64_t current = 0;
             if (!ReadProcessU64(device, process->Kernel, listHead, &current))
             {
+                AddUnique(
+                    &process->Warnings,
+                    L"PEB LDR " + source + L" list head read failed");
                 break;
             }
 
-            ok = true;
             std::set<uint64_t> visited;
             size_t scanned = 0;
+            bool traversalFailed = false;
             while (current != 0 && current != listHead && scanned < kMaxLdrModules)
             {
+                if (!IsUserAddress(current) || current < listEntryOffset)
+                {
+                    AddUnique(
+                        &process->Warnings,
+                        L"PEB LDR " + source + L" list contains an invalid entry pointer");
+                    traversalFailed = true;
+                    break;
+                }
                 if (visited.find(current) != visited.end())
                 {
-                    AddUnique(&process->Warnings, L"PEB LDR list loop detected");
+                    AddUnique(
+                        &process->Warnings,
+                        L"PEB LDR " + source + L" list loop detected");
+                    traversalFailed = true;
                     break;
                 }
 
                 visited.insert(current);
                 uint64_t entryBase = current - listEntryOffset;
                 HuntModuleRecord module = {};
-                ReadProcessU64(device, process->Kernel, entryBase + 0x30, &module.Base);
+                if (!ReadProcessU64(device, process->Kernel, entryBase + 0x30, &module.Base) ||
+                    !IsUserAddress(module.Base))
+                {
+                    AddUnique(
+                        &process->Warnings,
+                        L"PEB LDR " + source + L" module base read failed");
+                    traversalFailed = true;
+                    break;
+                }
+
                 uint32_t size = 0;
                 if (ReadProcessU32(device, process->Kernel, entryBase + 0x40, &size))
                 {
@@ -5236,21 +7307,47 @@ namespace
                     module.LdrInitSeen = true;
                 }
 
-                MergeModule(&process->Modules, module);
-
                 uint64_t next = 0;
                 if (!ReadProcessU64(device, process->Kernel, current, &next))
                 {
+                    AddUnique(
+                        &process->Warnings,
+                        L"PEB LDR " + source + L" list link read failed");
+                    traversalFailed = true;
+                    break;
+                }
+                if (next != listHead && !IsUserAddress(next))
+                {
+                    AddUnique(
+                        &process->Warnings,
+                        L"PEB LDR " + source + L" list contains an invalid next pointer");
+                    traversalFailed = true;
                     break;
                 }
 
+                MergeModule(&process->Modules, module);
                 current = next;
                 ++scanned;
             }
 
             if (scanned >= kMaxLdrModules)
             {
-                AddUnique(&process->Warnings, L"PEB LDR list traversal hit the module limit");
+                AddUnique(
+                    &process->Warnings,
+                    L"PEB LDR " + source + L" list traversal hit the module limit");
+                traversalFailed = true;
+            }
+            if (current == 0)
+            {
+                AddUnique(
+                    &process->Warnings,
+                    L"PEB LDR " + source + L" list terminated at a null link");
+                traversalFailed = true;
+            }
+
+            if (!traversalFailed && current == listHead)
+            {
+                ok = true;
             }
         } while (false);
 
@@ -5264,7 +7361,8 @@ namespace
             if (process == nullptr ||
                 !process->Kernel.HasPeb ||
                 process->Kernel.Peb == 0 ||
-                TargetUserDtb(process->Kernel) == 0)
+                (TargetUserDtb(process->Kernel) == 0 &&
+                 !HasExactProcessIdentity(process->Kernel)))
             {
                 break;
             }
@@ -5278,16 +7376,61 @@ namespace
                 break;
             }
 
-            bool loadSeen = WalkPebLdrList(device, process, ldr + 0x10, 0x00, L"load");
-            bool memorySeen = WalkPebLdrList(device, process, ldr + 0x20, 0x10, L"memory");
-            bool initSeen = WalkPebLdrList(device, process, ldr + 0x30, 0x20, L"init");
-            process->PebLdrLoadEnumerated = loadSeen;
-            process->PebLdrMemoryEnumerated = memorySeen;
-            process->PebLdrInitEnumerated = initSeen;
-            process->PebLdrEnumerated = loadSeen && memorySeen;
+            std::vector<std::wstring> lastWarnings;
+            for (uint32_t attempt = 1; attempt <= kHuntTriageStabilityAttempts; ++attempt)
+            {
+                HuntProcessRecord snapshot = {};
+                snapshot.Kernel = process->Kernel;
+                snapshot.ProcessId = process->ProcessId;
+
+                bool loadSeen = WalkPebLdrList(device, &snapshot, ldr + 0x10, 0x00, L"load");
+                bool memorySeen = WalkPebLdrList(device, &snapshot, ldr + 0x20, 0x10, L"memory");
+                bool initSeen = WalkPebLdrList(device, &snapshot, ldr + 0x30, 0x20, L"init");
+                lastWarnings = snapshot.Warnings;
+                if (!loadSeen || !memorySeen)
+                {
+                    continue;
+                }
+
+                if (!initSeen)
+                {
+                    for (HuntModuleRecord& module : snapshot.Modules)
+                    {
+                        module.LdrInitSeen = false;
+                    }
+                }
+
+                for (const HuntModuleRecord& module : snapshot.Modules)
+                {
+                    MergeModule(&process->Modules, module);
+                }
+                process->Warnings.insert(
+                    process->Warnings.end(),
+                    snapshot.Warnings.begin(),
+                    snapshot.Warnings.end());
+                process->PebLdrLoadEnumerated = true;
+                process->PebLdrMemoryEnumerated = true;
+                process->PebLdrInitEnumerated = initSeen;
+                process->PebLdrEnumerated = true;
+                if (attempt > 1)
+                {
+                    AddUnique(
+                        &process->Warnings,
+                        L"PEB LDR core list collection stabilized after " +
+                            std::to_wstring(attempt) + L" attempts");
+                }
+                break;
+            }
+
             if (!process->PebLdrEnumerated)
             {
-                AddUnique(&process->Warnings, L"PEB LDR core list heads could not be read");
+                process->Warnings.insert(
+                    process->Warnings.end(),
+                    lastWarnings.begin(),
+                    lastWarnings.end());
+                AddUnique(
+                    &process->Warnings,
+                    L"PEB LDR core list collection remained incomplete after retries");
             }
         } while (false);
     }
@@ -5301,8 +7444,214 @@ namespace
         target.UserDirectoryTableBase = process.UserDirectoryTableBase;
         target.Peb = process.Peb;
         target.HasPeb = process.HasPeb;
+        target.CreateTime = process.CreateTime;
+        target.HasCreateTime = process.HasCreateTime;
         target.ImageName = process.ImageName;
         return target;
+    }
+
+    bool SameHiddenPteEvidence(
+        const std::vector<ProcessHiddenVadPteRecord>& left,
+        const std::vector<ProcessHiddenVadPteRecord>& right)
+    {
+        if (left.size() != right.size())
+        {
+            return false;
+        }
+
+        for (size_t index = 0; index < left.size(); ++index)
+        {
+            const ProcessHiddenVadPteRecord& a = left[index];
+            const ProcessHiddenVadPteRecord& b = right[index];
+            if (a.StartAddress != b.StartAddress ||
+                a.EndAddress != b.EndAddress ||
+                a.PageSize != b.PageSize ||
+                a.Writable != b.Writable ||
+                a.Executable != b.Executable ||
+                a.UserAccessible != b.UserAccessible)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool VadScanHasTransientSnapshotFailure(const ProcessVadScanResult& result)
+    {
+        if (result.PageTableReadFailures != 0 || result.HiddenPteTruncated)
+        {
+            return true;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            if (warning.find(L"VAD node is not kernel-canonical") != std::wstring::npos ||
+                warning.find(L"failed to read VAD node") != std::wstring::npos ||
+                warning.find(L"VAD cycle detected") != std::wstring::npos ||
+                warning.find(L"VAD root is empty") != std::wstring::npos ||
+                warning.find(L"page-table walk had read failures") != std::wstring::npos)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void SuppressUnconfirmedHiddenPteEvidence(ProcessVadScanResult* result)
+    {
+        if (result == nullptr)
+        {
+            return;
+        }
+
+        result->HiddenPteRecords.clear();
+        result->HiddenPteRanges = 0;
+        result->HiddenPteBytes = 0;
+        result->HiddenPteExecutableCount = 0;
+        result->HiddenPteWxCount = 0;
+        result->HiddenPteTruncated = false;
+        result->Incomplete = true;
+        result->CoverageComplete = false;
+        result->Warnings.push_back(
+            L"hidden PTE evidence suppressed because it was not stable across fresh scans");
+    }
+
+    bool ScanVadForHunt(
+        ProcessTriageScanner& triage,
+        const ProcessVadScanOptions& options,
+        ProcessVadScanResult* result,
+        uint32_t* attemptsUsed,
+        std::wstring* error)
+    {
+        bool anySuccess = false;
+        std::vector<ProcessHiddenVadPteRecord> previousHidden;
+        std::wstring lastError;
+
+        if (attemptsUsed != nullptr)
+        {
+            *attemptsUsed = 0;
+        }
+
+        for (uint32_t attempt = 1; attempt <= kHuntTriageStabilityAttempts; ++attempt)
+        {
+            if (attemptsUsed != nullptr)
+            {
+                *attemptsUsed = attempt;
+            }
+
+            ProcessVadScanResult candidate = {};
+            std::wstring scanError;
+            if (!triage.ScanVad(options, &candidate, &scanError))
+            {
+                lastError = scanError;
+                continue;
+            }
+
+            anySuccess = true;
+            bool transientFailure = VadScanHasTransientSnapshotFailure(candidate);
+            bool hiddenStable =
+                !candidate.HiddenPteRecords.empty() &&
+                !previousHidden.empty() &&
+                SameHiddenPteEvidence(previousHidden, candidate.HiddenPteRecords);
+
+            *result = std::move(candidate);
+            if (!transientFailure && result->HiddenPteRecords.empty())
+            {
+                if (attempt > 1)
+                {
+                    result->Warnings.push_back(
+                        L"VAD/page-table collection stabilized after " + std::to_wstring(attempt) + L" attempts");
+                }
+                return true;
+            }
+            if (!transientFailure && hiddenStable)
+            {
+                result->Warnings.push_back(
+                    L"hidden PTE evidence confirmed across fresh scans");
+                return true;
+            }
+
+            if (!transientFailure && !result->HiddenPteRecords.empty())
+            {
+                previousHidden = result->HiddenPteRecords;
+            }
+            else
+            {
+                previousHidden.clear();
+            }
+        }
+
+        if (anySuccess)
+        {
+            if (!result->HiddenPteRecords.empty())
+            {
+                SuppressUnconfirmedHiddenPteEvidence(result);
+            }
+            return true;
+        }
+
+        if (error != nullptr)
+        {
+            *error = lastError;
+        }
+        return false;
+    }
+
+    bool ScanThreadsForHunt(
+        ProcessTriageScanner& triage,
+        const ProcessThreadScanOptions& options,
+        ProcessThreadScanResult* result,
+        uint32_t* attemptsUsed,
+        std::wstring* error)
+    {
+        bool anySuccess = false;
+        std::wstring lastError;
+
+        if (attemptsUsed != nullptr)
+        {
+            *attemptsUsed = 0;
+        }
+
+        for (uint32_t attempt = 1; attempt <= kHuntTriageStabilityAttempts; ++attempt)
+        {
+            if (attemptsUsed != nullptr)
+            {
+                *attemptsUsed = attempt;
+            }
+
+            ProcessThreadScanResult candidate = {};
+            std::wstring scanError;
+            if (!triage.ScanThreads(options, &candidate, &scanError))
+            {
+                lastError = scanError;
+                continue;
+            }
+
+            anySuccess = true;
+            *result = std::move(candidate);
+            if (!result->Truncated && !result->Incomplete && result->CoverageComplete)
+            {
+                if (attempt > 1)
+                {
+                    result->Warnings.push_back(
+                        L"thread collection stabilized after " + std::to_wstring(attempt) + L" attempts");
+                }
+                return true;
+            }
+        }
+
+        if (anySuccess)
+        {
+            return true;
+        }
+
+        if (error != nullptr)
+        {
+            *error = lastError;
+        }
+        return false;
     }
 
     std::wstring BestProcessImageName(const HuntProcessRecord& process)
@@ -5327,22 +7676,60 @@ namespace
         }
         if (image.empty())
         {
-            image = process.ToolhelpImageName;
-        }
-        if (image.empty())
-        {
-            image = process.SystemProcessImageName;
-        }
-        if (image.empty())
-        {
             image = LeafName(process.ApiImagePath);
         }
         if (image.empty())
         {
             image = LeafName(process.PebImagePath);
         }
+        if (image.empty())
+        {
+            image = process.ToolhelpImageName;
+        }
+        if (image.empty())
+        {
+            image = process.SystemProcessImageName;
+        }
 
         return image;
+    }
+
+    bool CommandLineImageIsComparable(
+        const std::wstring& image)
+    {
+        // CreateProcess can resolve an extensionless bare token such as
+        // "ping" through PATH/PATHEXT.  Treating that token as a literal
+        // image leaf produces ping vs ping.exe false positives.
+        return LeafHasAnySuffix(
+            image,
+            {
+                L".exe",
+                L".com",
+                L".scr"
+            });
+    }
+
+    bool CanUseParentProcessIdentity(
+        const HuntProcessRecord& child,
+        const HuntProcessRecord& parent)
+    {
+        return !parent.KernelImageName.empty() &&
+            child.Kernel.HasCreateTime &&
+            child.Kernel.CreateTime != 0 &&
+            parent.Kernel.HasCreateTime &&
+            parent.Kernel.CreateTime != 0 &&
+            parent.Kernel.CreateTime <=
+                child.Kernel.CreateTime;
+    }
+
+    bool HasUnresolvedApiOnlyProcessView(
+        const HuntProcessRecord& process)
+    {
+        return process.ProcessId > 4 &&
+            !process.ActiveProcessLinksSeen &&
+            (process.SystemProcessInformationSeen ||
+             process.ToolhelpProcessSeen) &&
+            !process.ActiveProcessLinksStableUnlinked;
     }
 
     std::wstring BestProcessImagePath(const HuntProcessRecord& process)
@@ -6383,6 +8770,128 @@ namespace
         return high;
     }
 
+    enum class ActiveProcessLinkMembership
+    {
+        Unknown,
+        Linked,
+        StableUnlinked
+    };
+
+    bool ActiveProcessLinksNeighborsConsistent(
+        uint64_t entryAddress,
+        uint64_t flink,
+        uint64_t blink,
+        uint64_t flinkBlink,
+        uint64_t blinkFlink)
+    {
+        return IsKernelAddress(entryAddress) &&
+            IsKernelAddress(flink) &&
+            IsKernelAddress(blink) &&
+            flink != entryAddress &&
+            blink != entryAddress &&
+            flinkBlink == entryAddress &&
+            blinkFlink == entryAddress;
+    }
+
+    ActiveProcessLinkMembership RevalidateActiveProcessLinks(
+        DeviceClient& device,
+        uint64_t eprocess,
+        uint32_t activeProcessLinksOffset)
+    {
+        if (!IsKernelAddress(eprocess) ||
+            activeProcessLinksOffset == 0 ||
+            activeProcessLinksOffset > 0x4000)
+        {
+            return ActiveProcessLinkMembership::Unknown;
+        }
+
+        uint64_t entryAddress = 0;
+        if (!TryAdd(
+                eprocess,
+                activeProcessLinksOffset,
+                &entryAddress) ||
+            !IsKernelAddress(entryAddress))
+        {
+            return ActiveProcessLinkMembership::Unknown;
+        }
+
+        constexpr size_t kAttempts = 3;
+        size_t conclusiveUnlinked = 0;
+        for (size_t attempt = 0;
+             attempt < kAttempts;
+             ++attempt)
+        {
+            uint64_t entryBlinkAddress = 0;
+            if (!TryAdd(
+                    entryAddress,
+                    sizeof(uint64_t),
+                    &entryBlinkAddress))
+            {
+                return ActiveProcessLinkMembership::Unknown;
+            }
+            uint64_t flink = 0;
+            uint64_t blink = 0;
+            if (!ReadKernelPointer(
+                    device,
+                    entryAddress,
+                    &flink,
+                    nullptr) ||
+                !ReadKernelPointer(
+                    device,
+                    entryBlinkAddress,
+                    &blink,
+                    nullptr))
+            {
+                continue;
+            }
+
+            if (!IsKernelAddress(flink) ||
+                !IsKernelAddress(blink) ||
+                flink == entryAddress ||
+                blink == entryAddress)
+            {
+                ++conclusiveUnlinked;
+                continue;
+            }
+
+            uint64_t flinkBlink = 0;
+            uint64_t blinkFlink = 0;
+            uint64_t flinkBlinkAddress = 0;
+            if (!TryAdd(
+                    flink,
+                    sizeof(uint64_t),
+                    &flinkBlinkAddress) ||
+                !ReadKernelPointer(
+                    device,
+                    flinkBlinkAddress,
+                    &flinkBlink,
+                    nullptr) ||
+                !ReadKernelPointer(
+                    device,
+                    blink,
+                    &blinkFlink,
+                    nullptr))
+            {
+                continue;
+            }
+            if (ActiveProcessLinksNeighborsConsistent(
+                    entryAddress,
+                    flink,
+                    blink,
+                    flinkBlink,
+                    blinkFlink))
+            {
+                return ActiveProcessLinkMembership::Linked;
+            }
+
+            ++conclusiveUnlinked;
+        }
+
+        return conclusiveUnlinked == kAttempts
+            ? ActiveProcessLinkMembership::StableUnlinked
+            : ActiveProcessLinkMembership::Unknown;
+    }
+
     // Known-PID CID lookup via driver ResolveProcess (PsLookupProcessByProcessId).
     // This is NOT a full PspCidTable enumeration: PIDs absent from the starting
     // process map are never discovered. Only annotates HasCidTableView /
@@ -6391,12 +8900,23 @@ namespace
         DeviceClient& device,
         SymbolEngine& symbols,
         std::map<uint32_t, HuntProcessRecord>* processes,
-        std::wstring* warning)
+        std::wstring* warning,
+        uint32_t* directoryTableBaseOffset,
+        uint32_t* userDirectoryTableBaseOffset)
     {
         bool ok = false;
 
         do
         {
+            if (directoryTableBaseOffset != nullptr)
+            {
+                *directoryTableBaseOffset = 0;
+            }
+            if (userDirectoryTableBaseOffset != nullptr)
+            {
+                *userDirectoryTableBaseOffset = 0;
+            }
+
             if (processes == nullptr)
             {
                 if (warning != nullptr)
@@ -6472,8 +8992,61 @@ namespace
                 }
             }
 
+            TypeFieldInfo activeLinksField = {};
+            uint32_t activeLinksOffset = 0;
+            if ((symbols.FindField(
+                     L"nt!_EPROCESS",
+                     L"ActiveProcessLinks",
+                     &activeLinksField,
+                     nullptr) ||
+                 FindFieldRecursive(
+                     symbols,
+                     {L"nt!_EPROCESS", L"_EPROCESS"},
+                     L"ActiveProcessLinks",
+                     &activeLinksField)) &&
+                activeLinksField.Offset != 0 &&
+                activeLinksField.Offset <= 0x4000)
+            {
+                activeLinksOffset =
+                    static_cast<uint32_t>(
+                        activeLinksField.Offset);
+            }
+
+            TypeFieldInfo createTimeField = {};
+            uint32_t createTimeOffset = 0;
+            if ((symbols.FindField(
+                     L"nt!_EPROCESS",
+                     L"CreateTime",
+                     &createTimeField,
+                     nullptr) ||
+                 FindFieldRecursive(
+                     symbols,
+                     {L"nt!_EPROCESS", L"_EPROCESS"},
+                     L"CreateTime",
+                     &createTimeField)) &&
+                createTimeField.Offset != 0 &&
+                createTimeField.Offset <= 0x4000)
+            {
+                createTimeOffset =
+                    static_cast<uint32_t>(
+                        createTimeField.Offset);
+            }
+
+            if (directoryTableBaseOffset != nullptr)
+            {
+                *directoryTableBaseOffset = static_cast<uint32_t>(dtbField.Offset);
+            }
+            if (userDirectoryTableBaseOffset != nullptr)
+            {
+                *userDirectoryTableBaseOffset = userDtbOffset;
+            }
+
             uint32_t lookedUp = 0;
             uint32_t present = 0;
+            uint32_t linksRecovered = 0;
+            uint32_t linksStableUnlinked = 0;
+            uint32_t linksUnknown = 0;
+            uint32_t identitiesRecovered = 0;
             for (auto& item : *processes)
             {
                 const uint32_t pid = item.first;
@@ -6515,6 +9088,59 @@ namespace
                     {
                         process.Kernel.UserDirectoryTableBase = ctx.UserDirectoryTableBase;
                     }
+                    if (!process.Kernel.HasCreateTime &&
+                        createTimeOffset != 0)
+                    {
+                        uint64_t createTimeAddress = 0;
+                        uint64_t createTime = 0;
+                        if (TryAdd(
+                                ctx.Eprocess,
+                                createTimeOffset,
+                                &createTimeAddress) &&
+                            ReadKernelInteger(
+                                device,
+                                createTimeAddress,
+                                sizeof(uint64_t),
+                                &createTime,
+                                nullptr) &&
+                            createTime != 0)
+                        {
+                            process.Kernel.CreateTime =
+                                createTime;
+                            process.Kernel.HasCreateTime = true;
+                            ++identitiesRecovered;
+                        }
+                    }
+
+                    if (!process.ActiveProcessLinksSeen)
+                    {
+                        const ActiveProcessLinkMembership membership =
+                            RevalidateActiveProcessLinks(
+                                device,
+                                ctx.Eprocess,
+                                activeLinksOffset);
+                        if (membership ==
+                            ActiveProcessLinkMembership::Linked)
+                        {
+                            process.ActiveProcessLinksSeen = true;
+                            process.ActiveProcessLinksRevalidated = true;
+                            ++linksRecovered;
+                        }
+                        else if (membership ==
+                                 ActiveProcessLinkMembership::StableUnlinked)
+                        {
+                            process.ActiveProcessLinksRevalidated = true;
+                            process.ActiveProcessLinksStableUnlinked = true;
+                            ++linksStableUnlinked;
+                        }
+                        else
+                        {
+                            AddUnique(
+                                &process.Warnings,
+                                L"post-inventory ActiveProcessLinks membership could not be revalidated; temporal mismatch evidence was not escalated");
+                            ++linksUnknown;
+                        }
+                    }
                 }
                 else
                 {
@@ -6528,6 +9154,14 @@ namespace
                     L"cid known-pid lookup (not full PspCidTable enumeration): looked_up=" +
                     std::to_wstring(lookedUp) +
                     L" present=" + std::to_wstring(present) +
+                    L" links_recovered=" +
+                    std::to_wstring(linksRecovered) +
+                    L" links_stable_unlinked=" +
+                    std::to_wstring(linksStableUnlinked) +
+                    L" links_unknown=" +
+                    std::to_wstring(linksUnknown) +
+                    L" identities_recovered=" +
+                    std::to_wstring(identitiesRecovered) +
                     L" via PsLookupProcessByProcessId; PIDs absent from other views are not discovered";
             }
             ok = lookedUp != 0;
@@ -6555,6 +9189,14 @@ namespace
             evidence[L"system_process_information_seen"] = process.SystemProcessInformationSeen ? L"true" : L"false";
             evidence[L"toolhelp_seen"] = process.ToolhelpProcessSeen ? L"true" : L"false";
             evidence[L"cid_table_seen"] = process.HasCidTableView ? (process.CidTableSeen ? L"true" : L"false") : L"null";
+            evidence[L"active_process_links_revalidated"] =
+                process.ActiveProcessLinksRevalidated
+                    ? L"true"
+                    : L"false";
+            evidence[L"active_process_links_stable_unlinked"] =
+                process.ActiveProcessLinksStableUnlinked
+                    ? L"true"
+                    : L"false";
             evidence[L"eprocess"] = process.Kernel.Eprocess != 0 ? HuntHex(process.Kernel.Eprocess, 16) : L"0x0";
             evidence[L"image_name"] = !process.KernelImageName.empty() ? process.KernelImageName : process.ToolhelpImageName;
 
@@ -6587,7 +9229,9 @@ namespace
                     evidence);
             }
             else if (!process.ActiveProcessLinksSeen &&
-                     (process.SystemProcessInformationSeen || process.ToolhelpProcessSeen))
+                     (process.SystemProcessInformationSeen || process.ToolhelpProcessSeen) &&
+                     process.ActiveProcessLinksRevalidated &&
+                     process.ActiveProcessLinksStableUnlinked)
             {
                 const bool cidConfirms =
                     process.HasCidTableView && process.CidTableSeen;
@@ -6710,6 +9354,8 @@ namespace
 
             if (!process.PebImagePath.empty() &&
                 !commandImage.empty() &&
+                CommandLineImageIsComparable(
+                    commandImage) &&
                 !SameNonEmptyLeaf(process.PebImagePath, commandImage))
             {
                 AddFinding(
@@ -7770,22 +10416,17 @@ namespace
             }
             if (options.ThreatIntelEvents.empty())
             {
-                // Deep mode expects TI correlation. Missing events must not look
-                // like "no TI findings because nothing suspicious happened".
-                if (options.Mode == HuntMode::Deep)
+                // Zero events from an active/available, non-dropping ring is a
+                // valid clean observation.  Only absence of the collection
+                // surface makes deep correlation incomplete.
+                if (options.Mode == HuntMode::Deep &&
+                    !options.ThreatIntelActive &&
+                    !options.ThreatIntelAvailable)
                 {
                     result->ThreatIntelCorrelationIncomplete = true;
                     result->CoverageComplete = false;
-                    if (!options.ThreatIntelActive)
-                    {
-                        result->Warnings.push_back(
-                            L"threat_intel correlation incomplete: deep mode without active !ti session or supplied events; TI behavioral correlation skipped");
-                    }
-                    else
-                    {
-                        result->Warnings.push_back(
-                            L"threat_intel correlation incomplete: TI session active but no ring events were available for this scan");
-                    }
+                    result->Warnings.push_back(
+                        L"threat_intel correlation incomplete: deep mode without active !ti session or supplied events; TI behavioral correlation skipped");
                 }
                 break;
             }
@@ -8046,22 +10687,123 @@ namespace
         return address != 0 && end >= start && address >= start && address <= end;
     }
 
-    bool VadHasExecutionEvidence(const HuntProcessRecord& process, const ProcessVadRecord& vad)
+    const ProcessVadProtectionRange* FindVadEffectiveProtection(
+        const ProcessVadRecord& vad,
+        uint64_t address)
+    {
+        auto after = std::upper_bound(
+            vad.EffectiveProtectionRanges.begin(),
+            vad.EffectiveProtectionRanges.end(),
+            address,
+            [](uint64_t value, const ProcessVadProtectionRange& range)
+            {
+                return value < range.StartAddress;
+            });
+        if (after == vad.EffectiveProtectionRanges.begin())
+        {
+            return nullptr;
+        }
+
+        --after;
+        return AddressInsideInclusiveRange(
+            address,
+            after->StartAddress,
+            after->EndAddress)
+            ? &*after
+            : nullptr;
+    }
+
+    bool VadAddressIsExecutable(const ProcessVadRecord& vad, uint64_t address)
+    {
+        if (!vad.EffectiveProtectionComplete)
+        {
+            return vad.Executable;
+        }
+
+        const ProcessVadProtectionRange* range =
+            FindVadEffectiveProtection(vad, address);
+        return range != nullptr && range->Committed && range->Executable;
+    }
+
+    bool VadAddressIsWritableExecutable(const ProcessVadRecord& vad, uint64_t address)
+    {
+        if (!vad.EffectiveProtectionComplete)
+        {
+            return vad.WritableExecutable;
+        }
+
+        const ProcessVadProtectionRange* range =
+            FindVadEffectiveProtection(vad, address);
+        return range != nullptr &&
+            range->Committed &&
+            range->WritableExecutable;
+    }
+
+    bool VadRangeHasExecutionEvidence(
+        const HuntProcessRecord& process,
+        const ProcessVadRecord& vad,
+        uint64_t rangeStart,
+        uint64_t rangeEnd,
+        bool includeStackReferences,
+        bool requireWritableExecutable);
+
+    bool VadHasExecutionEvidence(
+        const HuntProcessRecord& process,
+        const ProcessVadRecord& vad,
+        bool includeStackReferences,
+        bool requireWritableExecutable)
+    {
+        return VadRangeHasExecutionEvidence(
+            process,
+            vad,
+            vad.StartAddress,
+            vad.EndAddress,
+            includeStackReferences,
+            requireWritableExecutable);
+    }
+
+    bool VadRangeHasExecutionEvidence(
+        const HuntProcessRecord& process,
+        const ProcessVadRecord& vad,
+        uint64_t rangeStart,
+        uint64_t rangeEnd,
+        bool includeStackReferences,
+        bool requireWritableExecutable)
     {
         bool observed = false;
+        auto matchesProtection =
+            [&vad, rangeStart, rangeEnd, requireWritableExecutable](
+                uint64_t address)
+        {
+            if (!AddressInsideInclusiveRange(address, rangeStart, rangeEnd))
+            {
+                return false;
+            }
+            if (!AddressInsideInclusiveRange(
+                    address,
+                    vad.StartAddress,
+                    vad.EndAddress))
+            {
+                return false;
+            }
+
+            return requireWritableExecutable
+                ? VadAddressIsWritableExecutable(vad, address)
+                : VadAddressIsExecutable(vad, address);
+        };
 
         do
         {
             for (const ProcessThreadRecord& thread : process.ThreadRecords)
             {
                 if (thread.HasStartAddress &&
-                    AddressInsideInclusiveRange(thread.StartAddress, vad.StartAddress, vad.EndAddress))
+                    matchesProtection(thread.StartAddress))
                 {
                     observed = true;
                     break;
                 }
                 if (thread.HasWin32StartAddress &&
-                    AddressInsideInclusiveRange(thread.Win32StartAddress, vad.StartAddress, vad.EndAddress))
+                    matchesProtection(thread.Win32StartAddress))
                 {
                     observed = true;
                     break;
@@ -8071,8 +10813,9 @@ namespace
                 {
                     for (const ProcessApcEntryRecord& apc : queue.Entries)
                     {
-                        if (AddressInsideInclusiveRange(apc.NormalRoutine, vad.StartAddress, vad.EndAddress) ||
-                            AddressInsideInclusiveRange(apc.KernelRoutine, vad.StartAddress, vad.EndAddress))
+                        if (matchesProtection(apc.NormalRoutine) ||
+                            matchesProtection(apc.UserRoutine) ||
+                            matchesProtection(apc.KernelRoutine))
                         {
                             observed = true;
                             break;
@@ -8090,9 +10833,14 @@ namespace
                     break;
                 }
 
+                if (!includeStackReferences)
+                {
+                    continue;
+                }
+
                 for (const ProcessStackReferenceRecord& ref : thread.StackReferences)
                 {
-                    if (AddressInsideInclusiveRange(ref.Value, vad.StartAddress, vad.EndAddress))
+                    if (matchesProtection(ref.Value))
                     {
                         observed = true;
                         break;
@@ -8107,6 +10855,27 @@ namespace
         } while (false);
 
         return observed;
+    }
+
+    bool ShouldSkipExpectedManagedLoaderlessDeepComparison(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module)
+    {
+        if (!IsExpectedManagedLoaderlessMapping(
+                process,
+                module))
+        {
+            return false;
+        }
+
+        const ProcessVadRecord* vad =
+            FindVadContaining(process, module.Base);
+        return vad != nullptr &&
+            !VadHasExecutionEvidence(
+                process,
+                *vad,
+                false,
+                false);
     }
 
     void AddVadFindings(DeviceClient& device, SymbolEngine& symbols, HuntResult* result, HuntProcessRecord* process)
@@ -8127,10 +10896,17 @@ namespace
             {
                 bool privateMemory = vad.HasPrivateMemory && vad.PrivateMemory;
                 bool privateExecutable = vad.Executable && privateMemory;
-                bool wx = vad.Executable && vad.Writable;
-                bool executableCopyOnWrite = vad.Executable && vad.CopyOnWrite;
-                bool largePrivateExecutable = privateExecutable && vad.Size >= kLargePrivateExecThreshold;
-                bool privatePe = privateMemory && vad.PeHeaderFound;
+                bool wx = vad.WritableExecutable;
+                bool executableCopyOnWrite = vad.CopyOnWriteExecutable;
+                uint64_t executableBytes = vad.EffectiveProtectionComplete
+                    ? vad.EffectiveExecutableBytes
+                    : (vad.Executable ? vad.Size : 0);
+                bool largePrivateExecutable =
+                    privateMemory &&
+                    executableBytes >= kLargePrivateExecThreshold;
+                bool privatePe = privateMemory && vad.Executable && vad.PeHeaderFound;
+                bool executablePrivatePeSuspicious =
+                    privateMemory && vad.Executable && vad.PeHeaderSuspicious;
                 bool sectionBackedExecutable = vad.Executable &&
                     vad.HasSubsection &&
                     vad.Subsection != 0 &&
@@ -8174,80 +10950,267 @@ namespace
 
                     if (metadataReady)
                     {
-                        uint32_t rva = static_cast<uint32_t>(vad.StartAddress - loaderOwner->Base);
-                        const DiskPeSection* section = FindDiskSectionForRva(metadata, rva);
-                        if (section != nullptr)
+                        const uint64_t vadRva64 = vad.StartAddress - loaderOwner->Base;
+                        const uint64_t vadEndRva64 =
+                            vad.Size <= std::numeric_limits<uint64_t>::max() - vadRva64
+                                ? vadRva64 + vad.Size
+                                : std::numeric_limits<uint64_t>::max();
+                        const bool vadRvaRangeValid =
+                            vadRva64 <= std::numeric_limits<uint32_t>::max() &&
+                            vadEndRva64 <=
+                                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1ull;
+                        const uint32_t vadRva = vadRvaRangeValid
+                            ? static_cast<uint32_t>(vadRva64)
+                            : 0;
+                        const uint64_t ownerEnd =
+                            loaderOwner->Size <=
+                                    std::numeric_limits<uint64_t>::max() - loaderOwner->Base
+                                ? loaderOwner->Base + loaderOwner->Size
+                                : std::numeric_limits<uint64_t>::max();
+                        const DiskPeSection* evidenceSection = nullptr;
+                        uint32_t evidenceRva = 0;
+                        uint64_t evidenceEndRva = 0;
+                        uint64_t evidenceLiveStart = 0;
+                        uint64_t evidenceLiveEnd = 0;
+                        uint32_t evidenceLiveProtection = 0;
+
+                        auto assessLiveRange =
+                            [&](uint64_t liveStart,
+                                uint64_t liveEnd,
+                                uint32_t liveProtection,
+                                bool liveExecutable,
+                                bool liveWritableExecutable,
+                                bool liveCopyOnWriteExecutable)
                         {
-                            bool liveWritableExecutable = vad.Executable && vad.Writable;
-                            bool liveWriteCapableExecutable = vad.Executable && (vad.Writable || vad.CopyOnWrite);
-                            bool executePermissionDrift = vad.Executable && !section->Executable;
-                            bool writePermissionDrift = liveWritableExecutable && section->Executable && !section->Writable;
-                            bool defaultWritableExecutableSection = liveWriteCapableExecutable && section->Executable && section->Writable;
-                            bool vadRvaRangeValid = vad.Size <= std::numeric_limits<uint32_t>::max() &&
-                                rva <= std::numeric_limits<uint32_t>::max() - static_cast<uint32_t>(vad.Size);
-                            uint32_t vadEndRva = vadRvaRangeValid
-                                ? rva + static_cast<uint32_t>(vad.Size)
-                                : std::numeric_limits<uint32_t>::max();
-                            bool entrypointInsideVad =
+                            if (liveEnd < liveStart ||
+                                liveEnd < loaderOwner->Base ||
+                                liveStart >= ownerEnd)
+                            {
+                                return;
+                            }
+
+                            liveStart = std::max(liveStart, loaderOwner->Base);
+                            liveEnd = std::min(liveEnd, ownerEnd - 1);
+                            const uint64_t liveRvaStart =
+                                liveStart - loaderOwner->Base;
+                            const uint64_t liveRvaEnd =
+                                liveEnd - loaderOwner->Base + 1;
+                            if (liveRvaStart > std::numeric_limits<uint32_t>::max() ||
+                                liveRvaEnd >
+                                    static_cast<uint64_t>(
+                                        std::numeric_limits<uint32_t>::max()) +
+                                        1ull)
+                            {
+                                return;
+                            }
+
+                            for (const DiskPeSection& section : metadata.Sections)
+                            {
+                                const uint64_t sectionStart = section.VirtualAddress;
+                                const uint64_t sectionSpan =
+                                    std::max(section.VirtualSize, section.SizeOfRawData);
+                                const uint64_t sectionEnd = sectionStart + sectionSpan;
+                                if (sectionSpan == 0 ||
+                                    sectionEnd < sectionStart ||
+                                    liveRvaEnd <= sectionStart ||
+                                    liveRvaStart >= sectionEnd)
+                                {
+                                    continue;
+                                }
+
+                                const uint64_t overlapStart =
+                                    std::max(liveRvaStart, sectionStart);
+                                const uint64_t overlapEnd =
+                                    std::min(liveRvaEnd, sectionEnd);
+                                const uint64_t overlapLiveStart =
+                                    loaderOwner->Base + overlapStart;
+                                const uint64_t overlapLiveEndExclusive =
+                                    loaderOwner->Base + overlapEnd;
+                                if (overlapLiveStart < loaderOwner->Base ||
+                                    overlapLiveEndExclusive <=
+                                        overlapLiveStart)
+                                {
+                                    continue;
+                                }
+                                const bool permissionRangeExecutionObserved =
+                                    VadRangeHasExecutionEvidence(
+                                        *process,
+                                        vad,
+                                        overlapLiveStart,
+                                        overlapLiveEndExclusive - 1,
+                                        false,
+                                        false);
+                                const bool executePermissionDrift =
+                                    liveExecutable &&
+                                    !section.Executable &&
+                                    permissionRangeExecutionObserved;
+                                const bool writePermissionDrift =
+                                    liveWritableExecutable &&
+                                    section.Executable &&
+                                    !section.Writable &&
+                                    permissionRangeExecutionObserved;
+                                const bool defaultWritableExecutableSection =
+                                    (liveWritableExecutable ||
+                                     liveCopyOnWriteExecutable) &&
+                                    section.Executable &&
+                                    section.Writable;
+                                const bool entrypointWritePermissionDrift =
+                                    liveWritableExecutable &&
+                                    section.Executable &&
+                                    !section.Writable &&
+                                    permissionRangeExecutionObserved &&
+                                    metadata.HasEntryPoint &&
+                                    metadata.EntryPointRva >= overlapStart &&
+                                    metadata.EntryPointRva < overlapEnd;
+
+                                if (!executePermissionDrift &&
+                                    !writePermissionDrift &&
+                                    !defaultWritableExecutableSection &&
+                                    !entrypointWritePermissionDrift)
+                                {
+                                    continue;
+                                }
+
+                                if (evidenceSection == nullptr)
+                                {
+                                    evidenceSection = &section;
+                                    evidenceRva =
+                                        static_cast<uint32_t>(overlapStart);
+                                    evidenceEndRva = overlapEnd;
+                                    evidenceLiveStart = liveStart;
+                                    evidenceLiveEnd = liveEnd;
+                                    evidenceLiveProtection = liveProtection;
+                                    imageSectionEvidence[
+                                        L"permission_range_execution_observed"] =
+                                        permissionRangeExecutionObserved
+                                            ? L"true"
+                                            : L"false";
+                                }
+
+                                if (executePermissionDrift)
+                                {
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"image_section_execute_permission_drift");
+                                }
+                                if (writePermissionDrift)
+                                {
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"image_section_write_permission_drift");
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"module_stomping_permission_evidence");
+                                }
+                                if (entrypointWritePermissionDrift)
+                                {
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"module_entrypoint_write_permission_drift");
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"module_stomping_permission_evidence");
+                                }
+                                if (defaultWritableExecutableSection)
+                                {
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"image_rwx_section_vad");
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"mockingjay_rwx_section_candidate");
+                                    AddUnique(
+                                        &imageSectionReasons,
+                                        L"module_stomping_permission_evidence");
+                                }
+                            }
+                        };
+
+                        if (vad.EffectiveProtectionComplete)
+                        {
+                            for (const ProcessVadProtectionRange& range :
+                                 vad.EffectiveProtectionRanges)
+                            {
+                                if (!range.Committed)
+                                {
+                                    continue;
+                                }
+                                assessLiveRange(
+                                    range.StartAddress,
+                                    range.EndAddress,
+                                    range.Protection,
+                                    range.Executable,
+                                    range.WritableExecutable,
+                                    range.CopyOnWriteExecutable);
+                            }
+                        }
+                        else if (vadRvaRangeValid)
+                        {
+                            const DiskPeSection* section =
+                                FindDiskSectionForRva(metadata, vadRva);
+                            if (section != nullptr)
+                            {
+                                const uint64_t sectionEnd =
+                                    static_cast<uint64_t>(section->VirtualAddress) +
+                                    std::max(
+                                        section->VirtualSize,
+                                        section->SizeOfRawData);
+                                // Without an address-granular VirtualQueryEx
+                                // view, only compare a VAD wholly contained in
+                                // one section. Aggregated VAD flags must not be
+                                // attributed to every section in an image.
+                                if (vadEndRva64 <= sectionEnd)
+                                {
+                                    assessLiveRange(
+                                        vad.StartAddress,
+                                        vad.EndAddress,
+                                        vad.Protection,
+                                        vad.Executable,
+                                        vad.WritableExecutable,
+                                        vad.CopyOnWriteExecutable);
+                                }
+                            }
+                        }
+
+                        if (evidenceSection != nullptr)
+                        {
+                            const bool entrypointInsideVad =
+                                vadRvaRangeValid &&
                                 metadata.HasEntryPoint &&
-                                metadata.EntryPointRva >= rva &&
-                                metadata.EntryPointRva < vadEndRva;
-                            bool firstExecutableSectionInsideVad =
+                                metadata.EntryPointRva >= vadRva64 &&
+                                metadata.EntryPointRva < vadEndRva64;
+                            const bool firstExecutableSectionInsideVad =
+                                vadRvaRangeValid &&
                                 metadata.HasExecutableSection &&
-                                metadata.FirstExecutableSectionRva >= rva &&
-                                metadata.FirstExecutableSectionRva < vadEndRva;
-                            bool entrypointWritePermissionDrift =
-                                liveWriteCapableExecutable &&
-                                section->Executable &&
-                                !section->Writable &&
-                                entrypointInsideVad;
-
-                            if (executePermissionDrift)
-                            {
-                                AddUnique(&imageSectionReasons, L"image_section_execute_permission_drift");
-                            }
-                            if (writePermissionDrift)
-                            {
-                                AddUnique(&imageSectionReasons, L"image_section_write_permission_drift");
-                                AddUnique(&imageSectionReasons, L"module_stomping_permission_evidence");
-                            }
-                            if (entrypointWritePermissionDrift)
-                            {
-                                AddUnique(&imageSectionReasons, L"module_entrypoint_write_permission_drift");
-                                AddUnique(&imageSectionReasons, L"module_stomping_permission_evidence");
-                            }
-                            if (defaultWritableExecutableSection)
-                            {
-                                AddUnique(&imageSectionReasons, L"image_rwx_section_vad");
-                                AddUnique(&imageSectionReasons, L"mockingjay_rwx_section_candidate");
-                                AddUnique(&imageSectionReasons, L"module_stomping_permission_evidence");
-                            }
-
-                            if (!imageSectionReasons.empty())
-                            {
-                                imageSectionEvidence[L"owner_module"] = loaderOwner->Name;
-                                imageSectionEvidence[L"owner_module_base"] = HuntHex(loaderOwner->Base, 16);
-                                imageSectionEvidence[L"owner_module_path"] = loaderOwner->Path;
-                                imageSectionEvidence[L"disk_section_name"] = section->Name;
-                                imageSectionEvidence[L"disk_section_rva"] = HuntHex(section->VirtualAddress, 8);
-                                imageSectionEvidence[L"disk_section_executable"] = section->Executable ? L"true" : L"false";
-                                imageSectionEvidence[L"disk_section_writable"] = section->Writable ? L"true" : L"false";
-                                imageSectionEvidence[L"vad_rva"] = HuntHex(rva, 8);
-                                imageSectionEvidence[L"vad_end_rva"] = HuntHex(vadEndRva, 8);
-                                imageSectionEvidence[L"entrypoint_inside_vad"] = entrypointInsideVad ? L"true" : L"false";
-                                imageSectionEvidence[L"first_executable_section_inside_vad"] = firstExecutableSectionInsideVad ? L"true" : L"false";
-                                imageSectionEvidence[L"vad_executable"] = vad.Executable ? L"true" : L"false";
-                                imageSectionEvidence[L"vad_writable"] = vad.Writable ? L"true" : L"false";
-                                imageSectionEvidence[L"vad_copy_on_write"] = vad.CopyOnWrite ? L"true" : L"false";
-                            }
+                                metadata.FirstExecutableSectionRva >= vadRva64 &&
+                                metadata.FirstExecutableSectionRva < vadEndRva64;
+                            imageSectionEvidence[L"owner_module"] = loaderOwner->Name;
+                            imageSectionEvidence[L"owner_module_base"] = HuntHex(loaderOwner->Base, 16);
+                            imageSectionEvidence[L"owner_module_path"] = loaderOwner->Path;
+                            imageSectionEvidence[L"disk_section_name"] = evidenceSection->Name;
+                            imageSectionEvidence[L"disk_section_rva"] = HuntHex(evidenceSection->VirtualAddress, 8);
+                            imageSectionEvidence[L"disk_section_executable"] = evidenceSection->Executable ? L"true" : L"false";
+                            imageSectionEvidence[L"disk_section_writable"] = evidenceSection->Writable ? L"true" : L"false";
+                            imageSectionEvidence[L"vad_rva"] = HuntHex(vadRva64, 8);
+                            imageSectionEvidence[L"vad_end_rva"] = HuntHex(vadEndRva64, 8);
+                            imageSectionEvidence[L"compared_rva"] = HuntHex(evidenceRva, 8);
+                            imageSectionEvidence[L"compared_end_rva"] = HuntHex(evidenceEndRva, 8);
+                            imageSectionEvidence[L"live_range_start"] = HuntHex(evidenceLiveStart, 16);
+                            imageSectionEvidence[L"live_range_end"] = HuntHex(evidenceLiveEnd, 16);
+                            imageSectionEvidence[L"live_range_protection"] = HuntHex(evidenceLiveProtection, 8);
+                            imageSectionEvidence[L"entrypoint_inside_vad"] = entrypointInsideVad ? L"true" : L"false";
+                            imageSectionEvidence[L"first_executable_section_inside_vad"] = firstExecutableSectionInsideVad ? L"true" : L"false";
+                            imageSectionEvidence[L"vad_executable"] = vad.Executable ? L"true" : L"false";
+                            imageSectionEvidence[L"vad_writable"] = vad.Writable ? L"true" : L"false";
+                            imageSectionEvidence[L"vad_copy_on_write"] = vad.CopyOnWrite ? L"true" : L"false";
                         }
                     }
                 }
 
                 if (sectionBackedExecutable &&
                     !loaderCovered &&
-                    process->PebLdrEnumerated &&
-                    process->ToolhelpModuleEnumerated)
+                    ProcessHasCompleteUserModuleInventory(
+                        *process))
                 {
                     std::wstring backingPath;
                     std::wstring backingState = L"unresolved";
@@ -8273,6 +11236,7 @@ namespace
                     if (imageSection || peLikeBackingName)
                     {
                         uint64_t moduleSize = vad.Size;
+                        bool managedImage = false;
                         if (backingOpenable && !backingPath.empty())
                         {
                             DiskPeMetadata metadata = {};
@@ -8280,6 +11244,7 @@ namespace
                             if (ReadDiskPeMetadata(backingPath, &metadata, &metadataError) && metadata.SizeOfImage != 0)
                             {
                                 moduleSize = metadata.SizeOfImage;
+                                managedImage = metadata.ManagedImage;
                             }
                         }
 
@@ -8289,6 +11254,7 @@ namespace
                         module.Name = backingPath.empty() ? L"section-image" : LeafName(backingPath);
                         module.Path = backingPath;
                         module.VadImageSeen = true;
+                        module.VadBackingManagedImage = managedImage;
                         module.VadAddress = vad.VadAddress;
                         module.VadBackingPath = backingPath;
                         module.VadBackingState = backingState;
@@ -8320,20 +11286,58 @@ namespace
                 bool strongVadEvidence =
                     largePrivateExecutable ||
                     privatePe ||
-                    vad.PeHeaderSuspicious ||
+                    executablePrivatePeSuspicious ||
                     imageExecutePermissionDrift ||
                     imageWritePermissionDrift ||
                     moduleStompingPermissionEvidence ||
                     defaultImageRwxSection;
-                bool executionObserved = VadHasExecutionEvidence(*process, vad);
+                // Raw stack slots routinely contain legitimate JIT and
+                // emulator return addresses.  Treat them as execution
+                // corroboration only after the VAD already has PE/header,
+                // large-region, or image-permission evidence.  Thread starts
+                // and queued APC routines remain strong enough on their own.
+                bool executionObserved = VadHasExecutionEvidence(
+                    *process,
+                    vad,
+                    strongVadEvidence,
+                    false);
                 bool genericWxOnly = wx && !strongVadEvidence;
                 bool weakPrivateExecutableOnly = privateExecutable && !wx && !strongVadEvidence;
+                bool writableExecutableExecutionObserved =
+                    genericWxOnly &&
+                    VadHasExecutionEvidence(
+                        *process,
+                        vad,
+                        false,
+                        true);
+                bool relevantExecutionObserved =
+                    genericWxOnly
+                        ? writableExecutableExecutionObserved
+                        : executionObserved;
+                bool identityCorroborated =
+                    process->BuiltinProfileMatched &&
+                    !process->BuiltinProfileViolations.empty();
                 if (!privateExecutable &&
                     !wx &&
                     !largePrivateExecutable &&
                     !privatePe &&
-                    !vad.PeHeaderSuspicious &&
+                    !executablePrivatePeSuspicious &&
                     !imageSectionPermissionSuspicious)
+                {
+                    continue;
+                }
+
+                // Private RX and W+X regions are normal runtime primitives for
+                // JIT engines, antimalware emulators, and other dynamic-code
+                // hosts.  Preserve them in the per-process VAD counters and
+                // raw !vad surface, but do not promote the primitive alone to
+                // a hunt finding.  Thread/APC correlation, stack correlation
+                // on stronger code provenance, PE/header evidence, large
+                // size, image permission drift, or a violated built-in
+                // identity profile still promotes the region below.
+                if ((genericWxOnly || weakPrivateExecutableOnly) &&
+                    !relevantExecutionObserved &&
+                    !identityCorroborated)
                 {
                     continue;
                 }
@@ -8364,8 +11368,15 @@ namespace
                 if (privatePe)
                 {
                     reasons.push_back(L"private_pe_mapping");
+                    if (ProcessHasCompleteUserModuleInventory(
+                            *process))
+                    {
+                        AddUnique(
+                            &reasons,
+                            L"private_pe_without_loader_entry");
+                    }
                 }
-                if (vad.PeHeaderSuspicious)
+                if (executablePrivatePeSuspicious)
                 {
                     reasons.push_back(L"wiped_pe_header");
                 }
@@ -8405,6 +11416,26 @@ namespace
                 evidence[L"end"] = HuntHex(vad.EndAddress, 16);
                 evidence[L"size"] = std::to_wstring(vad.Size);
                 evidence[L"protection"] = vad.ProtectionText;
+                evidence[L"effective_protection_queried"] =
+                    vad.EffectiveProtectionQueried ? L"true" : L"false";
+                evidence[L"effective_protection_complete"] =
+                    vad.EffectiveProtectionComplete ? L"true" : L"false";
+                if (vad.EffectiveProtectionQueried)
+                {
+                    evidence[L"effective_protection"] = vad.EffectiveProtectionText;
+                    evidence[L"effective_committed_bytes"] =
+                        std::to_wstring(vad.EffectiveCommittedBytes);
+                    evidence[L"effective_executable_bytes"] =
+                        std::to_wstring(vad.EffectiveExecutableBytes);
+                    evidence[L"effective_writable_bytes"] =
+                        std::to_wstring(vad.EffectiveWritableBytes);
+                    evidence[L"effective_copy_on_write_bytes"] =
+                        std::to_wstring(vad.EffectiveCopyOnWriteBytes);
+                    evidence[L"effective_wx_bytes"] =
+                        std::to_wstring(vad.EffectiveWritableExecutableBytes);
+                    evidence[L"effective_x_cow_bytes"] =
+                        std::to_wstring(vad.EffectiveCopyOnWriteExecutableBytes);
+                }
                 evidence[L"private"] = privateMemory ? L"true" : L"false";
                 evidence[L"copy_on_write"] = executableCopyOnWrite ? L"true" : L"false";
                 evidence[L"pe_like"] = vad.PeHeaderFound ? L"true" : L"false";
@@ -8415,7 +11446,9 @@ namespace
                     evidence[item.first] = item.second;
                 }
                 evidence[L"strong_code_provenance"] = strongVadEvidence ? L"true" : L"false";
-                evidence[L"execution_observed"] = executionObserved ? L"true" : L"false";
+                evidence[L"execution_observed"] = relevantExecutionObserved ? L"true" : L"false";
+                evidence[L"wx_execution_observed"] =
+                    writableExecutableExecutionObserved ? L"true" : L"false";
                 if (vad.PeProbeAttempted)
                 {
                     evidence[L"pe_mz_wiped"] = vad.PeProbe.MzWiped ? L"true" : L"false";
@@ -8423,11 +11456,15 @@ namespace
                     evidence[L"pe_elfanew_mismatch"] = vad.PeProbe.ELfanewMismatch ? L"true" : L"false";
                     evidence[L"pe_size_of_image"] = std::to_wstring(vad.PeProbe.SizeOfImage);
                 }
-                AddBuiltinInjectionReasonIfNeeded(*process, &reasons, &evidence, strongVadEvidence);
+                AddBuiltinInjectionReasonIfNeeded(
+                    *process,
+                    &reasons,
+                    &evidence,
+                    strongVadEvidence || identityCorroborated);
 
                 std::wstring risk = L"medium";
                 std::wstring confidence = L"medium";
-                bool peBackedPrivateCode = privatePe || vad.PeHeaderSuspicious;
+                bool peBackedPrivateCode = privatePe || executablePrivatePeSuspicious;
                 if (largePrivateExecutable ||
                     imageExecutePermissionDrift ||
                     imageWritePermissionDrift ||
@@ -8555,6 +11592,46 @@ namespace
         return strong;
     }
 
+    bool HasNonCanonicalKernelApcRoutine(
+        const ProcessApcEntryRecord& apc)
+    {
+        return apc.HasKernelRoutine &&
+            apc.KernelRoutine != 0 &&
+            !IsKernelAddress(apc.KernelRoutine);
+    }
+
+    uint64_t SelectApcFindingAddress(
+        const ProcessApcEntryRecord& apc)
+    {
+        if (HasNonCanonicalKernelApcRoutine(apc))
+        {
+            return apc.KernelRoutine;
+        }
+        if (apc.UserRoutine != 0)
+        {
+            return apc.UserRoutine;
+        }
+        return apc.NormalRoutine != 0
+            ? apc.NormalRoutine
+            : apc.KernelRoutine;
+    }
+
+    std::wstring SelectApcFindingModule(
+        const ProcessApcEntryRecord& apc)
+    {
+        if (HasNonCanonicalKernelApcRoutine(apc))
+        {
+            return apc.KernelRoutineModule;
+        }
+        if (apc.UserRoutine != 0)
+        {
+            return apc.UserRoutineModule;
+        }
+        return apc.NormalRoutine != 0
+            ? apc.NormalRoutineModule
+            : apc.KernelRoutineModule;
+    }
+
     void AddThreadFindings(HuntResult* result, const HuntProcessRecord& process)
     {
         do
@@ -8589,7 +11666,35 @@ namespace
                     evidence[L"notes"] = thread.Notes;
 
                     std::vector<std::wstring> reasons = {L"suspicious_thread_start"};
+                    if (thread.StartInPrivateExecVad)
+                    {
+                        AddUnique(&reasons, L"private_executable_vad");
+                    }
+                    if (thread.StartInWxVad)
+                    {
+                        AddUnique(&reasons, L"wx_user_vad");
+                    }
                     bool strongThreadEvidence = VadClassificationHasStrongCodeEvidence(thread.VadClassification);
+                    bool identityCorroborated =
+                        process.BuiltinProfileMatched &&
+                        !process.BuiltinProfileViolations.empty();
+                    bool noncanonicalStart =
+                        findingAddress != 0 &&
+                        !IsUserAddress(findingAddress) &&
+                        !IsKernelAddress(findingAddress);
+                    if (!thread.StartInPrivateExecVad &&
+                        !thread.StartInWxVad &&
+                        !strongThreadEvidence &&
+                        !identityCorroborated &&
+                        !noncanonicalStart)
+                    {
+                        // A loader-view miss alone is weak on WOW64 and other
+                        // processes whose user module walk can be partial.
+                        // Keep it in raw thread telemetry, but require exact
+                        // suspicious page provenance or another corroborator
+                        // before promoting it to a hunt finding.
+                        continue;
+                    }
                     AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, strongThreadEvidence);
 
                     std::wstring risk = strongThreadEvidence ? L"high" : L"low";
@@ -8651,10 +11756,24 @@ namespace
                         AddUnique(&reasons, L"stack_reference_to_user_executable_outside_module");
                     }
                     bool strongStackEvidence = VadClassificationHasStrongCodeEvidence(ref.VadClassification);
-                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, strongStackEvidence);
+                    bool identityCorroborated =
+                        process.BuiltinProfileMatched &&
+                        !process.BuiltinProfileViolations.empty();
+                    if (!strongStackEvidence && !identityCorroborated)
+                    {
+                        // Preserve the raw stack-reference record and counters,
+                        // but a pointer to ordinary JIT/dynamic code is not an
+                        // anomaly without stronger provenance.
+                        continue;
+                    }
+                    AddBuiltinInjectionReasonIfNeeded(
+                        process,
+                        &reasons,
+                        &evidence,
+                        strongStackEvidence || identityCorroborated);
 
-                    std::wstring risk = strongStackEvidence ? L"high" : L"low";
-                    std::wstring confidence = strongStackEvidence ? L"high" : L"low";
+                    std::wstring risk = strongStackEvidence || identityCorroborated ? L"high" : L"low";
+                    std::wstring confidence = strongStackEvidence ? L"high" : L"medium";
                     AddFinding(
                         result,
                         process,
@@ -8678,12 +11797,12 @@ namespace
                             continue;
                         }
 
-                        uint64_t findingAddress = apc.NormalRoutine != 0
-                            ? apc.NormalRoutine
-                            : apc.KernelRoutine;
-                        std::wstring findingModule = apc.NormalRoutine != 0
-                            ? apc.NormalRoutineModule
-                            : apc.KernelRoutineModule;
+                        const bool nonCanonicalKernelRoutine =
+                            HasNonCanonicalKernelApcRoutine(apc);
+                        uint64_t findingAddress =
+                            SelectApcFindingAddress(apc);
+                        std::wstring findingModule =
+                            SelectApcFindingModule(apc);
 
                         std::map<std::wstring, std::wstring> evidence;
                         evidence[L"ethread"] = HuntHex(thread.Ethread, 16);
@@ -8692,11 +11811,43 @@ namespace
                         evidence[L"kapc"] = HuntHex(apc.KapcAddress, 16);
                         evidence[L"kernel_routine"] = HuntHex(apc.KernelRoutine, 16);
                         evidence[L"normal_routine"] = HuntHex(apc.NormalRoutine, 16);
+                        evidence[L"normal_context"] = HuntHex(apc.NormalContext, 16);
+                        evidence[L"system_argument1"] = HuntHex(apc.SystemArgument1, 16);
+                        evidence[L"system_argument2"] = HuntHex(apc.SystemArgument2, 16);
                         evidence[L"kernel_routine_module"] = apc.KernelRoutineModule;
                         evidence[L"normal_routine_module"] = apc.NormalRoutineModule;
+                        evidence[L"normal_routine_vad"] =
+                            apc.NormalRoutineVadClassification;
+                        evidence[L"normal_routine_private_exec"] =
+                            apc.NormalRoutineInPrivateExecVad ? L"true" : L"false";
+                        evidence[L"normal_routine_wx"] =
+                            apc.NormalRoutineInWxVad ? L"true" : L"false";
+                        evidence[L"user_routine"] = HuntHex(apc.UserRoutine, 16);
+                        evidence[L"user_routine_source"] = apc.UserRoutineSource;
+                        evidence[L"user_routine_module"] = apc.UserRoutineModule;
+                        evidence[L"user_routine_vad"] =
+                            apc.UserRoutineVadClassification;
+                        evidence[L"user_routine_private_exec"] =
+                            apc.UserRoutineInPrivateExecVad ? L"true" : L"false";
+                        evidence[L"user_routine_wx"] =
+                            apc.UserRoutineInWxVad ? L"true" : L"false";
                         evidence[L"notes"] = apc.Notes;
 
                         std::vector<std::wstring> reasons = {L"suspicious_apc_routine"};
+                        if (nonCanonicalKernelRoutine)
+                        {
+                            AddUnique(
+                                &reasons,
+                                L"noncanonical_kernel_routine");
+                        }
+                        if (apc.UserRoutineInPrivateExecVad)
+                        {
+                            AddUnique(&reasons, L"private_executable_vad");
+                        }
+                        if (apc.UserRoutineInWxVad)
+                        {
+                            AddUnique(&reasons, L"wx_user_vad");
+                        }
                         AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence);
 
                         AddFinding(
@@ -8746,11 +11897,17 @@ namespace
                 }
                 evidence[L"vad_backing_path"] = module.VadBackingPath;
                 evidence[L"vad_backing_state"] = module.VadBackingState;
+                evidence[L"vad_backing_managed_image"] = module.VadBackingManagedImage ? L"true" : L"false";
+                bool expectedManagedMapping = IsExpectedManagedLoaderlessMapping(process, module);
+                evidence[L"vad_backing_expected_managed_mapping"] =
+                    expectedManagedMapping ? L"true" : L"false";
 
-                if (module.VadImageSeen && process.PebLdrEnumerated && process.ToolhelpModuleEnumerated)
+                if (module.VadImageSeen &&
+                    ProcessHasCompleteUserModuleInventory(
+                        process))
                 {
                     bool covered = LoaderModuleCoversAddress(process, module.Base, &module);
-                    if (!covered)
+                    if (!covered && !expectedManagedMapping)
                     {
                         bool backingWeakButOpenable = module.VadBackingState == L"resolved" &&
                             !module.VadBackingPath.empty();
@@ -8779,7 +11936,9 @@ namespace
                     }
                 }
 
-                if (module.PrivatePeVadSeen && process.PebLdrEnumerated && process.ToolhelpModuleEnumerated)
+                if (module.PrivatePeVadSeen &&
+                    ProcessHasCompleteUserModuleInventory(
+                        process))
                 {
                     bool covered = false;
                     for (const HuntModuleRecord& other : process.Modules)
@@ -8923,7 +12082,9 @@ namespace
                     module.Path.empty() ||
                     IsMainImageModule(process, module) ||
                     !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)) ||
-                    IsWindowsBackedModulePath(module.Path))
+                    IsWindowsBackedModulePath(module.Path) ||
+                    IsTrustedMicrosoftWindowsAppRuntimeModule(
+                        module.Path))
                 {
                     continue;
                 }
@@ -9434,7 +12595,10 @@ namespace
             cache->LimitReached = false;
 
             uint64_t dtb = TargetUserDtb(process.Kernel);
-            if (dtb == 0)
+            const bool exactIdentityAvailable =
+                HasExactProcessIdentity(process.Kernel);
+            if (dtb == 0 &&
+                !exactIdentityAvailable)
             {
                 break;
             }
@@ -9482,7 +12646,13 @@ namespace
                     std::vector<uint8_t> bytes;
                     std::wstring ignored;
                     uint32_t chunkSize = static_cast<uint32_t>(chunkEnd - current);
-                    if (ReadProcessMemoryByDtb(device, dtb, current, chunkSize, &bytes, &ignored))
+                    if (ReadHuntProcessMemory(
+                            device,
+                            process.Kernel,
+                            current,
+                            chunkSize,
+                            &bytes,
+                            &ignored))
                     {
                         for (size_t offset = 0;
                              offset + sizeof(uint64_t) <= bytes.size() && !cache->LimitReached;
@@ -9665,8 +12835,23 @@ namespace
                 {
                     for (const ProcessApcEntryRecord& apc : queue.Entries)
                     {
-                        if (apc.NormalRoutine >= pageStart &&
-                            apc.NormalRoutine < pageEnd)
+                        const uint64_t apcTargets[] =
+                        {
+                            apc.UserRoutine,
+                            apc.NormalRoutine,
+                            apc.KernelRoutine
+                        };
+                        bool targetInPage = false;
+                        for (uint64_t apcTarget : apcTargets)
+                        {
+                            if (apcTarget >= pageStart &&
+                                apcTarget < pageEnd)
+                            {
+                                targetInPage = true;
+                                break;
+                            }
+                        }
+                        if (targetInPage)
                         {
                             AddUnique(&apcThreadIds, std::to_wstring(thread.ThreadId));
                         }
@@ -9733,7 +12918,8 @@ namespace
 
         do
         {
-            if (metadata.ImageBase == 0 ||
+            if (metadata.ManagedIlOnly ||
+                metadata.ImageBase == 0 ||
                 module.Base == 0 ||
                 module.Base == metadata.ImageBase)
             {
@@ -9746,15 +12932,320 @@ namespace
         return relocated;
     }
 
-    bool PageHasExpectedLoaderMutableData(const DiskPeMetadata& metadata, uint32_t pageRva)
+    void MaskMutableRangeBytes(
+        const DiskPeMutableRange& range,
+        uint64_t pageStart,
+        uint64_t pageEnd,
+        std::vector<uint8_t>* livePage,
+        std::vector<uint8_t>* diskPage)
     {
-        return metadata.LoaderMutablePages.find(pageRva) != metadata.LoaderMutablePages.end();
+        const uint64_t rangeStart = range.Rva;
+        const uint64_t rangeEnd = rangeStart + range.Size;
+        const uint64_t overlapStart = std::max(pageStart, rangeStart);
+        const uint64_t overlapEnd = std::min(pageEnd, rangeEnd);
+        if (overlapStart >= overlapEnd)
+        {
+            return;
+        }
+
+        const size_t offset = static_cast<size_t>(overlapStart - pageStart);
+        const size_t length = static_cast<size_t>(overlapEnd - overlapStart);
+        std::fill(
+            livePage->begin() + offset,
+            livePage->begin() + offset + length,
+            static_cast<uint8_t>(0));
+        std::fill(
+            diskPage->begin() + offset,
+            diskPage->begin() + offset + length,
+            static_cast<uint8_t>(0));
+    }
+
+    void MaskExpectedLoaderMutableBytes(
+        const DiskPeMetadata& metadata,
+        uint32_t pageRva,
+        std::vector<uint8_t>* livePage,
+        std::vector<uint8_t>* diskPage)
+    {
+        if (livePage == nullptr || diskPage == nullptr)
+        {
+            return;
+        }
+
+        const uint64_t pageStart = pageRva;
+        const uint64_t pageEnd =
+            pageStart + std::min(livePage->size(), diskPage->size());
+        for (const DiskPeMutableRange& range : metadata.LoaderMutableRanges)
+        {
+            MaskMutableRangeBytes(
+                range,
+                pageStart,
+                pageEnd,
+                livePage,
+                diskPage);
+        }
+    }
+
+    void MaskExpectedCrossPageRelocationBytes(
+        const DiskPeMetadata& metadata,
+        uint32_t pageRva,
+        std::vector<uint8_t>* livePage,
+        std::vector<uint8_t>* diskPage)
+    {
+        if (livePage == nullptr || diskPage == nullptr)
+        {
+            return;
+        }
+
+        const uint64_t pageStart = pageRva;
+        const uint64_t pageEnd =
+            pageStart + std::min(livePage->size(), diskPage->size());
+        for (const DiskPeMutableRange& range :
+             metadata.CrossPageRelocationRanges)
+        {
+            // The page where the relocation starts is fully normalized using
+            // bytes from the following page, so preserve it for comparison.
+            // Only the continuation bytes on the following page lack the
+            // preceding bytes needed to reconstruct the integer.
+            if (range.Rva >= pageStart)
+            {
+                continue;
+            }
+            MaskMutableRangeBytes(
+                range,
+                pageStart,
+                pageEnd,
+                livePage,
+                diskPage);
+        }
+    }
+
+    void MaskExpectedDynamicRelocationBytes(
+        const DiskPeMetadata& metadata,
+        uint32_t pageRva,
+        std::vector<uint8_t>* livePage,
+        std::vector<uint8_t>* diskPage)
+    {
+        if (livePage == nullptr || diskPage == nullptr)
+        {
+            return;
+        }
+
+        const uint64_t pageStart = pageRva;
+        const uint64_t pageEnd = pageStart + std::min(livePage->size(), diskPage->size());
+        auto first = std::lower_bound(
+            metadata.DynamicRelocationRanges.begin(),
+            metadata.DynamicRelocationRanges.end(),
+            pageStart,
+            [](const DiskPeMutableRange& range, uint64_t address)
+            {
+                return static_cast<uint64_t>(range.Rva) + range.Size <= address;
+            });
+        for (auto current = first;
+             current != metadata.DynamicRelocationRanges.end() &&
+                 current->Rva < pageEnd;
+             ++current)
+        {
+            MaskMutableRangeBytes(
+                *current,
+                pageStart,
+                pageEnd,
+                livePage,
+                diskPage);
+        }
+    }
+
+    bool DeepProcessLifecycleChanged(
+        const HuntProcessRecord& process)
+    {
+        if (process.ProcessId == 0 ||
+            !process.Kernel.HasCreateTime)
+        {
+            return false;
+        }
+
+        HANDLE handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            process.ProcessId);
+        if (handle == nullptr)
+        {
+            const DWORD error = GetLastError();
+            return error == ERROR_INVALID_PARAMETER ||
+                error == ERROR_INVALID_HANDLE ||
+                error == ERROR_NOT_FOUND;
+        }
+
+        bool lifecycleChanged = false;
+        const bool matched =
+            ProcessHandleMatchesSnapshot(
+                handle,
+                process.Kernel,
+                &lifecycleChanged);
+        CloseHandle(handle);
+        return !matched && lifecycleChanged;
+    }
+
+    HANDLE OpenVerifiedDeepProcessReadHandle(
+        const HuntProcessRecord& process,
+        bool* lifecycleChanged)
+    {
+        if (lifecycleChanged != nullptr)
+        {
+            *lifecycleChanged = false;
+        }
+        if (process.ProcessId == 0 ||
+            !process.Kernel.HasCreateTime)
+        {
+            return nullptr;
+        }
+
+        HANDLE handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            FALSE,
+            process.ProcessId);
+        if (handle == nullptr)
+        {
+            return nullptr;
+        }
+
+        bool handleLifecycleChanged = false;
+        if (!ProcessHandleMatchesSnapshot(
+                handle,
+                process.Kernel,
+                &handleLifecycleChanged))
+        {
+            if (handleLifecycleChanged &&
+                lifecycleChanged != nullptr)
+            {
+                *lifecycleChanged = true;
+            }
+            CloseHandle(handle);
+            return nullptr;
+        }
+
+        return handle;
+    }
+
+    bool ReadDeepProcessPage(
+        DeviceClient& device,
+        HANDLE processRead,
+        const HuntProcessRecord& process,
+        uint64_t address,
+        uint32_t length,
+        std::vector<uint8_t>* bytes,
+        std::wstring* error)
+    {
+        std::wstring userReadError;
+        if (processRead != nullptr &&
+            processRead != INVALID_HANDLE_VALUE &&
+            bytes != nullptr)
+        {
+            bytes->assign(length, 0);
+            SIZE_T bytesRead = 0;
+            if (ReadProcessMemory(
+                    processRead,
+                    reinterpret_cast<LPCVOID>(
+                        static_cast<uintptr_t>(address)),
+                    bytes->data(),
+                    length,
+                    &bytesRead) &&
+                bytesRead == length)
+            {
+                return true;
+            }
+
+            userReadError =
+                L"ReadProcessMemory failed gle=" +
+                std::to_wstring(GetLastError()) +
+                L" bytes=" +
+                std::to_wstring(bytesRead);
+            bytes->clear();
+        }
+
+        std::wstring driverProcessReadError;
+        const bool exactIdentityAvailable =
+            HasExactProcessIdentity(process.Kernel);
+        if (exactIdentityAvailable &&
+            device.ReadProcessVirtual(
+                process.ProcessId,
+                process.Kernel.Eprocess,
+                process.Kernel.HasCreateTime
+                    ? process.Kernel.CreateTime
+                    : 0,
+                address,
+                length,
+                bytes,
+                &driverProcessReadError))
+        {
+            return true;
+        }
+
+        if (error != nullptr)
+        {
+            *error = userReadError;
+            if (!exactIdentityAvailable)
+            {
+                if (!error->empty())
+                {
+                    *error += L"; ";
+                }
+                *error +=
+                    L"exact process identity is unavailable";
+            }
+            if (!driverProcessReadError.empty())
+            {
+                if (!error->empty())
+                {
+                    *error += L"; ";
+                }
+                *error +=
+                    L"driver process read: " +
+                    driverProcessReadError;
+            }
+        }
+        return false;
+    }
+
+    bool MarkDeepComparisonFailure(
+        HuntResult* result,
+        HuntProcessRecord* process,
+        const HuntModuleRecord& module,
+        const std::wstring& detail,
+        const std::wstring& error)
+    {
+        if (result == nullptr || process == nullptr)
+        {
+            return false;
+        }
+
+        if (DeepProcessLifecycleChanged(*process))
+        {
+            process->LifecycleChangedBeforeTriage = true;
+            AddUnique(
+                &process->Warnings,
+                L"process ended or PID was reused during deep image comparison; remaining stale evidence was skipped");
+            return true;
+        }
+
+        result->DeepImageComparisonCoverageIncomplete = true;
+        result->CoverageComplete = false;
+        std::wstring warning =
+            (module.Name.empty() ? module.Path : module.Name) +
+            L": " +
+            detail;
+        if (!error.empty())
+        {
+            warning += L" (" + error + L")";
+        }
+        AddUnique(&process->Warnings, warning);
+        return false;
     }
 
     void CompareModulePage(
         DeviceClient& device,
         HuntResult* result,
-        const HuntProcessRecord& process,
+        HuntProcessRecord* process,
+        HANDLE processRead,
         const HuntModuleRecord& module,
         const DiskPeMetadata& metadata,
         const std::wstring& pageName,
@@ -9764,28 +13255,52 @@ namespace
     {
         do
         {
-            uint32_t pageRva = rva & 0xfffff000u;
-            if (PageHasExpectedLoaderMutableData(metadata, pageRva))
+            if (result == nullptr || process == nullptr)
             {
                 break;
             }
 
+            uint32_t pageRva = rva & 0xfffff000u;
             std::vector<uint8_t> livePage;
-            std::wstring ignored;
-            if (!ReadProcessMemoryByDtb(
+            std::wstring readError;
+            if (module.Base >
+                    std::numeric_limits<uint64_t>::max() -
+                        pageRva ||
+                !ReadDeepProcessPage(
                     device,
-                    TargetUserDtb(process.Kernel),
+                    processRead,
+                    *process,
                     module.Base + pageRva,
                     static_cast<uint32_t>(kPageSize),
                     &livePage,
-                    &ignored))
+                    &readError))
             {
+                MarkDeepComparisonFailure(
+                    result,
+                    process,
+                    module,
+                    L"deep live page read failed at rva=0x" +
+                        HuntHex(pageRva, 8),
+                    readError);
                 break;
             }
 
             std::vector<uint8_t> diskPage;
-            if (!ReadDiskPageForRva(module.Path, metadata, pageRva, &diskPage, &ignored))
+            readError.clear();
+            if (!ReadDiskPageForRva(
+                    module.Path,
+                    metadata,
+                    pageRva,
+                    &diskPage,
+                    &readError))
             {
+                MarkDeepComparisonFailure(
+                    result,
+                    process,
+                    module,
+                    L"deep disk page read failed at rva=0x" +
+                        HuntHex(pageRva, 8),
+                    readError);
                 break;
             }
 
@@ -9794,61 +13309,76 @@ namespace
                 module.Base != metadata.ImageBase)
             {
                 const uint64_t imageDelta = module.Base - metadata.ImageBase;
-                std::wstring path = Win32FilePathFromMaybeNtPath(module.Path);
-                HANDLE relocFile = CreateFileW(
-                    path.c_str(),
-                    GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    nullptr,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    nullptr);
                 std::vector<uint8_t> diskNextPage;
                 std::wstring nextIgnored;
-                if (relocFile != INVALID_HANDLE_VALUE)
+                if (pageRva <=
+                    std::numeric_limits<uint32_t>::max() -
+                        static_cast<uint32_t>(kPageSize))
                 {
-                    ReadDiskPageForRva(module.Path, metadata, pageRva + static_cast<uint32_t>(kPageSize), &diskNextPage, &nextIgnored);
+                    ReadDiskPageForRva(
+                        module.Path,
+                        metadata,
+                        pageRva + static_cast<uint32_t>(kPageSize),
+                        &diskNextPage,
+                        &nextIgnored);
                 }
-                if (relocFile == INVALID_HANDLE_VALUE ||
-                    !ApplyBaseRelocationsToDiskPage(
-                        relocFile,
+                if (!ApplyBaseRelocationsToDiskPage(
                         metadata,
                         pageRva,
                         imageDelta,
                         &diskPage,
                         diskNextPage.empty() ? nullptr : &diskNextPage))
                 {
-                    if (relocFile != INVALID_HANDLE_VALUE)
-                    {
-                        CloseHandle(relocFile);
-                    }
                     // Reloc normalize failed: do not skip the page as "expected
                     // delta" (that hid live patches). Treat as incomplete coverage.
-                    if (result != nullptr)
-                    {
-                        result->CoverageComplete = false;
-                        result->Warnings.push_back(
-                            module.Name + L": deep page compare reloc normalize failed at rva=0x" +
-                            HuntHex(pageRva, 8));
-                    }
+                    MarkDeepComparisonFailure(
+                        result,
+                        process,
+                        module,
+                        L"deep page compare reloc normalize failed at rva=0x" +
+                            HuntHex(pageRva, 8),
+                        L"");
                     break;
                 }
-                CloseHandle(relocFile);
             }
 
             if (livePage.size() != diskPage.size())
             {
-                size_t shorter = std::min(livePage.size(), diskPage.size());
-                livePage.resize(shorter);
-                diskPage.resize(shorter);
+                MarkDeepComparisonFailure(
+                    result,
+                    process,
+                    module,
+                    L"deep page read returned inconsistent lengths at rva=0x" +
+                        HuntHex(pageRva, 8),
+                    L"");
+                break;
             }
+
+            MaskExpectedLoaderMutableBytes(
+                metadata,
+                pageRva,
+                &livePage,
+                &diskPage);
+            if (!metadata.ManagedIlOnly)
+            {
+                MaskExpectedCrossPageRelocationBytes(
+                    metadata,
+                    pageRva,
+                    &livePage,
+                    &diskPage);
+            }
+            MaskExpectedDynamicRelocationBytes(
+                metadata,
+                pageRva,
+                &livePage,
+                &diskPage);
 
             if (!livePage.empty() && livePage != diskPage)
             {
                 AddDeepPageCompareFinding(
                     device,
                     result,
-                    process,
+                    *process,
                     module,
                     pageName,
                     sectionName,
@@ -9864,7 +13394,10 @@ namespace
     {
         do
         {
-            if (result == nullptr || process == nullptr || TargetUserDtb(process->Kernel) == 0)
+            if (result == nullptr ||
+                process == nullptr ||
+                (TargetUserDtb(process->Kernel) == 0 &&
+                 !HasExactProcessIdentity(process->Kernel)))
             {
                 break;
             }
@@ -9872,6 +13405,20 @@ namespace
             size_t compared = 0;
             size_t pagesCompared = 0;
             DeepStackReferenceCache stackReferenceCache = {};
+            bool lifecycleChanged = false;
+            ScopedHuntHandle processRead(
+                OpenVerifiedDeepProcessReadHandle(
+                    *process,
+                    &lifecycleChanged));
+            if (lifecycleChanged)
+            {
+                process->LifecycleChangedBeforeTriage = true;
+                AddUnique(
+                    &process->Warnings,
+                    L"process ended or PID was reused before deep image comparison; stale evidence was skipped");
+                break;
+            }
+
             std::vector<const HuntModuleRecord*> modules;
             modules.reserve(process->Modules.size());
             for (const HuntModuleRecord& module : process->Modules)
@@ -9890,11 +13437,11 @@ namespace
                         {
                             return 4;
                         }
-                        if (module->VadImageSeen)
+                        if (IsMainImageModule(*process, *module))
                         {
                             return 0;
                         }
-                        if (IsMainImageModule(*process, *module))
+                        if (module->VadImageSeen)
                         {
                             return 1;
                         }
@@ -9926,11 +13473,46 @@ namespace
                 {
                     continue;
                 }
+                if (ShouldSkipExpectedManagedLoaderlessDeepComparison(
+                        *process,
+                        module))
+                {
+                    continue;
+                }
 
                 DiskPeMetadata metadata = {};
                 std::wstring metadataError;
                 if (!ReadDiskPeMetadata(module.Path, &metadata, &metadataError))
                 {
+                    if (MarkDeepComparisonFailure(
+                            result,
+                            process,
+                            module,
+                            L"deep disk PE metadata read failed",
+                            metadataError))
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if (metadata.BaseRelocationTablePresent &&
+                    !metadata.BaseRelocationTableComplete)
+                {
+                    result->DeepImageComparisonCoverageIncomplete = true;
+                    result->CoverageComplete = false;
+                    AddUnique(
+                        &process->Warnings,
+                        module.Name + L": malformed base relocation table");
+                    continue;
+                }
+                if (metadata.DynamicRelocationTablePresent &&
+                    !metadata.DynamicRelocationTableComplete)
+                {
+                    result->DeepImageComparisonCoverageIncomplete = true;
+                    result->CoverageComplete = false;
+                    AddUnique(
+                        &process->Warnings,
+                        module.Name + L": unsupported or malformed dynamic relocation table");
                     continue;
                 }
 
@@ -9945,13 +13527,18 @@ namespace
                         CompareModulePage(
                             device,
                             result,
-                            *process,
+                            process,
+                            processRead.Value,
                             module,
                             metadata,
                             L"entrypoint",
                             L"",
                             metadata.EntryPointRva,
                             &stackReferenceCache);
+                        if (process->LifecycleChangedBeforeTriage)
+                        {
+                            return;
+                        }
                         comparedPageRvas.insert(pageRva);
                         ++pagesCompared;
                     }
@@ -10009,13 +13596,18 @@ namespace
                         CompareModulePage(
                             device,
                             result,
-                            *process,
+                            process,
+                            processRead.Value,
                             module,
                             metadata,
                             L"executable_section",
                             section.Name,
                             pageRva,
                             &stackReferenceCache);
+                        if (process->LifecycleChangedBeforeTriage)
+                        {
+                            return;
+                        }
                         comparedPageRvas.insert(pageRva);
                         ++sectionPagesCompared;
                         ++pagesCompared;
@@ -10403,8 +13995,14 @@ namespace
 
             std::vector<DriverServiceRecord> services;
             std::vector<std::wstring> warnings;
-            CollectDriverServices(&services, &warnings);
+            const bool serviceCoverageComplete =
+                CollectDriverServices(&services, &warnings);
             result->DriverServiceCount = services.size();
+            if (!serviceCoverageComplete)
+            {
+                result->DriverServiceCoverageIncomplete = true;
+                result->CoverageComplete = false;
+            }
 
             for (const std::wstring& warning : warnings)
             {
@@ -10898,6 +14496,1061 @@ namespace
     }
 }
 
+std::wstring HuntFirstCommandLineImage(const std::wstring& commandLine)
+{
+    return FirstCommandLineImage(commandLine);
+}
+
+bool HuntProcessLifecycleSelfTest()
+{
+    const uint64_t entry =
+        kKernelAddressMin + 0x1000;
+    const uint64_t flink =
+        kKernelAddressMin + 0x2000;
+    const uint64_t blink =
+        kKernelAddressMin + 0x3000;
+    if (!ActiveProcessLinksNeighborsConsistent(
+            entry,
+            flink,
+            blink,
+            entry,
+            entry) ||
+        ActiveProcessLinksNeighborsConsistent(
+            entry,
+            entry,
+            blink,
+            entry,
+            entry) ||
+        ActiveProcessLinksNeighborsConsistent(
+            entry,
+            flink,
+            blink,
+            entry + sizeof(uint64_t),
+            entry))
+    {
+        return false;
+    }
+
+    HuntProcessRecord apiPreferred = {};
+    apiPreferred.ToolhelpImageName = L"stale.exe";
+    apiPreferred.SystemProcessImageName = L"stale-system.exe";
+    apiPreferred.ApiImagePath = L"C:\\verified\\current.exe";
+    if (BestProcessImageName(apiPreferred) !=
+        L"current.exe")
+    {
+        return false;
+    }
+
+    HuntProcessRecord child = {};
+    HuntProcessRecord parent = {};
+    child.Kernel.HasCreateTime = true;
+    child.Kernel.CreateTime = 200;
+    parent.Kernel.HasCreateTime = true;
+    parent.Kernel.CreateTime = 100;
+    parent.KernelImageName = L"parent.exe";
+    if (!CanUseParentProcessIdentity(
+            child,
+            parent))
+    {
+        return false;
+    }
+    parent.Kernel.CreateTime = 300;
+    if (CanUseParentProcessIdentity(
+            child,
+            parent))
+    {
+        return false;
+    }
+
+    HuntProcessRecord idle = {};
+    idle.ProcessId = 0;
+    idle.SystemProcessInformationSeen = true;
+    idle.ToolhelpProcessSeen = true;
+    if (HasUnresolvedApiOnlyProcessView(idle))
+    {
+        return false;
+    }
+    HuntProcessRecord apiOnly = idle;
+    apiOnly.ProcessId = 100;
+    if (!HasUnresolvedApiOnlyProcessView(apiOnly))
+    {
+        return false;
+    }
+    apiOnly.ActiveProcessLinksStableUnlinked = true;
+    if (HasUnresolvedApiOnlyProcessView(apiOnly))
+    {
+        return false;
+    }
+
+    if (!CommandLineImageIsComparable(
+            L"C:\\Windows\\System32\\ping.exe") ||
+        !CommandLineImageIsComparable(
+            L"tool.com") ||
+        CommandLineImageIsComparable(
+            L"ping") ||
+        CommandLineImageIsComparable(
+            L"C:\\Windows\\System32\\ping"))
+    {
+        return false;
+    }
+
+    bool ok = false;
+    FILETIME createTime = {};
+    FILETIME exitTime = {};
+    FILETIME kernelTime = {};
+    FILETIME userTime = {};
+    HANDLE currentProcess = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        FALSE,
+        GetCurrentProcessId());
+    do
+    {
+        if (currentProcess == nullptr ||
+            !GetProcessTimes(
+                currentProcess,
+                &createTime,
+                &exitTime,
+                &kernelTime,
+                &userTime))
+        {
+            break;
+        }
+
+        ULARGE_INTEGER observedCreate = {};
+        observedCreate.LowPart = createTime.dwLowDateTime;
+        observedCreate.HighPart = createTime.dwHighDateTime;
+        if (observedCreate.QuadPart == 0)
+        {
+            break;
+        }
+
+        SnapshotProcessRecord exact = {};
+        exact.ProcessId = GetCurrentProcessId();
+        exact.CreateTime = observedCreate.QuadPart;
+        exact.HasCreateTime = true;
+        bool lifecycleChanged = true;
+        if (!ProcessHandleMatchesSnapshot(
+                currentProcess,
+                exact,
+                &lifecycleChanged) ||
+            lifecycleChanged)
+        {
+            break;
+        }
+
+        SnapshotProcessRecord wrong = exact;
+        wrong.CreateTime =
+            observedCreate.QuadPart ==
+                std::numeric_limits<uint64_t>::max()
+            ? observedCreate.QuadPart - 1
+            : observedCreate.QuadPart + 1;
+        lifecycleChanged = false;
+        if (ProcessHandleMatchesSnapshot(
+                currentProcess,
+                wrong,
+                &lifecycleChanged) ||
+            !lifecycleChanged)
+        {
+            break;
+        }
+
+        SnapshotProcessRecord noExactIdentity = {};
+        lifecycleChanged = true;
+        ok = ProcessHandleMatchesSnapshot(
+                currentProcess,
+                noExactIdentity,
+                &lifecycleChanged) &&
+            !lifecycleChanged;
+    } while (false);
+
+    if (currentProcess != nullptr)
+    {
+        CloseHandle(currentProcess);
+    }
+    return ok;
+}
+
+bool HuntDiskPeBoundsSelfTest()
+{
+    wchar_t tempDirectory[MAX_PATH + 1] = {};
+    DWORD tempLength = GetTempPathW(
+        static_cast<DWORD>(_countof(tempDirectory)),
+        tempDirectory);
+    if (tempLength == 0 || tempLength >= _countof(tempDirectory))
+    {
+        return false;
+    }
+
+    wchar_t tempPath[MAX_PATH + 1] = {};
+    if (GetTempFileNameW(tempDirectory, L"kpe", 0, tempPath) == 0)
+    {
+        return false;
+    }
+
+    auto writeImage =
+        [&](const std::vector<uint8_t>& bytes) -> bool
+        {
+            if (bytes.empty() ||
+                bytes.size() > std::numeric_limits<DWORD>::max())
+            {
+                return false;
+            }
+
+            HANDLE file = CreateFileW(
+                tempPath,
+                GENERIC_WRITE,
+                0,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_TEMPORARY,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+
+            DWORD written = 0;
+            const DWORD byteCount =
+                static_cast<DWORD>(bytes.size());
+            const bool writeOk =
+                WriteFile(
+                    file,
+                    bytes.data(),
+                    byteCount,
+                    &written,
+                    nullptr) != FALSE &&
+                written == byteCount;
+            CloseHandle(file);
+            return writeOk;
+        };
+
+    bool malformedRejected = false;
+    std::vector<uint8_t> malformedBytes(0x1000, 0);
+    IMAGE_DOS_HEADER malformedDos = {};
+    malformedDos.e_magic = IMAGE_DOS_SIGNATURE;
+    malformedDos.e_lfanew = static_cast<LONG>(
+        malformedBytes.size() -
+        sizeof(uint32_t) -
+        sizeof(IMAGE_FILE_HEADER));
+    std::memcpy(
+        malformedBytes.data(),
+        &malformedDos,
+        sizeof(malformedDos));
+
+    const size_t malformedNtOffset =
+        static_cast<size_t>(malformedDos.e_lfanew);
+    const uint32_t signature = IMAGE_NT_SIGNATURE;
+    std::memcpy(
+        malformedBytes.data() + malformedNtOffset,
+        &signature,
+        sizeof(signature));
+    IMAGE_FILE_HEADER malformedFileHeader = {};
+    std::memcpy(
+        malformedBytes.data() +
+            malformedNtOffset +
+            sizeof(signature),
+        &malformedFileHeader,
+        sizeof(malformedFileHeader));
+
+    if (writeImage(malformedBytes))
+    {
+        DiskPeMetadata metadata = {};
+        std::wstring error;
+        malformedRejected =
+            !ReadDiskPeMetadata(tempPath, &metadata, &error);
+    }
+
+    constexpr size_t kExtendedNtOffset = 0x1800;
+    constexpr size_t kFixedOptionalBytes =
+        offsetof(IMAGE_OPTIONAL_HEADER64, DataDirectory);
+    const size_t optionalOffset =
+        kExtendedNtOffset +
+        sizeof(uint32_t) +
+        sizeof(IMAGE_FILE_HEADER);
+    const size_t sectionOffset =
+        optionalOffset + kFixedOptionalBytes;
+    std::vector<uint8_t> validBytes(
+        std::max<size_t>(
+            0x2000,
+            sectionOffset + sizeof(IMAGE_SECTION_HEADER)),
+        0);
+
+    IMAGE_DOS_HEADER validDos = {};
+    validDos.e_magic = IMAGE_DOS_SIGNATURE;
+    validDos.e_lfanew =
+        static_cast<LONG>(kExtendedNtOffset);
+    std::memcpy(
+        validBytes.data(),
+        &validDos,
+        sizeof(validDos));
+    std::memcpy(
+        validBytes.data() + kExtendedNtOffset,
+        &signature,
+        sizeof(signature));
+
+    IMAGE_FILE_HEADER validFileHeader = {};
+    validFileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    validFileHeader.NumberOfSections = 1;
+    validFileHeader.SizeOfOptionalHeader =
+        static_cast<WORD>(kFixedOptionalBytes);
+    validFileHeader.Characteristics =
+        IMAGE_FILE_EXECUTABLE_IMAGE |
+        IMAGE_FILE_LARGE_ADDRESS_AWARE;
+    std::memcpy(
+        validBytes.data() +
+            kExtendedNtOffset +
+            sizeof(signature),
+        &validFileHeader,
+        sizeof(validFileHeader));
+
+    IMAGE_OPTIONAL_HEADER64 validOptional = {};
+    validOptional.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    validOptional.AddressOfEntryPoint = 0x2000;
+    validOptional.ImageBase = 0x140000000ull;
+    validOptional.SectionAlignment = 0x1000;
+    validOptional.FileAlignment = 0x200;
+    validOptional.SizeOfImage = 0x3000;
+    validOptional.SizeOfHeaders = 0x2000;
+    validOptional.NumberOfRvaAndSizes = 0;
+    std::memcpy(
+        validBytes.data() + optionalOffset,
+        &validOptional,
+        kFixedOptionalBytes);
+
+    IMAGE_SECTION_HEADER validSection = {};
+    const char textName[] = ".text";
+    std::memcpy(
+        validSection.Name,
+        textName,
+        sizeof(textName) - 1);
+    validSection.Misc.VirtualSize = 0x1000;
+    validSection.VirtualAddress = 0x2000;
+    validSection.Characteristics =
+        IMAGE_SCN_CNT_CODE |
+        IMAGE_SCN_MEM_EXECUTE |
+        IMAGE_SCN_MEM_READ;
+    std::memcpy(
+        validBytes.data() + sectionOffset,
+        &validSection,
+        sizeof(validSection));
+
+    bool extendedHeaderAccepted = false;
+    DiskPeMetadata capturedMetadata = {};
+    if (writeImage(validBytes))
+    {
+        std::wstring error;
+        extendedHeaderAccepted =
+            ReadDiskPeMetadata(
+                tempPath,
+                &capturedMetadata,
+                &error) &&
+            capturedMetadata.HasFileIdentity &&
+            capturedMetadata.ImageBase == validOptional.ImageBase &&
+            capturedMetadata.EntryPointRva ==
+                validOptional.AddressOfEntryPoint &&
+            capturedMetadata.SizeOfImage == validOptional.SizeOfImage &&
+            capturedMetadata.SizeOfHeaders ==
+                validOptional.SizeOfHeaders &&
+            capturedMetadata.HasEntryPoint &&
+            capturedMetadata.HasExecutableSection &&
+            capturedMetadata.FirstExecutableSectionRva ==
+                validSection.VirtualAddress &&
+            capturedMetadata.Sections.size() == 1;
+    }
+
+    bool undeclaredDirectoryRejected = false;
+    bool changedFileRejected = false;
+    validOptional.NumberOfRvaAndSizes = 1;
+    std::memcpy(
+        validBytes.data() + optionalOffset,
+        &validOptional,
+        kFixedOptionalBytes);
+    if (writeImage(validBytes))
+    {
+        std::vector<uint8_t> stalePage;
+        std::wstring staleError;
+        changedFileRejected =
+            !ReadDiskPageForRva(
+                tempPath,
+                capturedMetadata,
+                0,
+                &stalePage,
+                &staleError);
+
+        DiskPeMetadata metadata = {};
+        std::wstring error;
+        undeclaredDirectoryRejected =
+            !ReadDiskPeMetadata(tempPath, &metadata, &error);
+    }
+
+    DeleteFileW(tempPath);
+    return
+        malformedRejected &&
+        extendedHeaderAccepted &&
+        changedFileRejected &&
+        undeclaredDirectoryRejected;
+}
+
+bool HuntBaseRelocationMaskSelfTest()
+{
+    if (!BytesAreAllZero({0, 0, 0, 0}) ||
+        BytesAreAllZero({0, 0, 1, 0}))
+    {
+        return false;
+    }
+
+    IMAGE_DATA_DIRECTORY directories[IMAGE_NUMBEROF_DIRECTORY_ENTRIES] = {};
+    directories[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0x1000, 0x40};
+    directories[IMAGE_DIRECTORY_ENTRY_IAT] = {0x2000, 0x80};
+    directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT] = {0x3000, 0x40};
+    directories[IMAGE_DIRECTORY_ENTRY_TLS] = {0x4000, 0x40};
+    directories[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG] = {0x5000, 0x40};
+    std::vector<DiskPeMutableRange> loaderMutableRanges;
+    AddLoaderMutableDirectoryRanges(
+        &loaderMutableRanges,
+        directories,
+        _countof(directories));
+    if (loaderMutableRanges.size() != 1 ||
+        loaderMutableRanges[0].Rva != 0x2000 ||
+        loaderMutableRanges[0].Size != 0x80)
+    {
+        return false;
+    }
+
+    DiskPeMetadata metadata = {};
+    metadata.BaseRelocationTablePresent = true;
+    metadata.BaseRelocationTableComplete = true;
+    metadata.BaseRelocations =
+    {
+        {0x1010, sizeof(uint64_t)},
+        {0x1ffc, sizeof(uint64_t)},
+        {0x2008, sizeof(uint32_t)}
+    };
+    metadata.CrossPageRelocationRanges =
+    {
+        {0x1ffc, sizeof(uint64_t)}
+    };
+    metadata.ImageBase = 0x10000000ull;
+    metadata.RelocationPages.insert(0x1000);
+    HuntModuleRecord relocatedModule = {};
+    relocatedModule.Base = 0x20000000ull;
+    if (!PageHasExpectedRelocationDelta(
+            relocatedModule,
+            metadata,
+            0x1000))
+    {
+        return false;
+    }
+    metadata.ManagedIlOnly = true;
+    if (PageHasExpectedRelocationDelta(
+            relocatedModule,
+            metadata,
+            0x1000))
+    {
+        return false;
+    }
+    metadata.ManagedIlOnly = false;
+
+    std::vector<uint8_t> firstPage(
+        static_cast<size_t>(kPageSize),
+        0);
+    std::vector<uint8_t> secondPage(
+        static_cast<size_t>(kPageSize),
+        0);
+    const uint64_t firstValue = 0x0000000012345000ull;
+    const uint64_t crossValue = 0x0000000076543000ull;
+    const uint32_t secondValue = 0x12345000u;
+    std::memcpy(
+        firstPage.data() + 0x10,
+        &firstValue,
+        sizeof(firstValue));
+    std::memcpy(
+        firstPage.data() + 0xffc,
+        &crossValue,
+        sizeof(uint32_t));
+    std::memcpy(
+        secondPage.data(),
+        reinterpret_cast<const uint8_t*>(&crossValue) +
+            sizeof(uint32_t),
+        sizeof(uint32_t));
+    std::memcpy(
+        secondPage.data() + 0x8,
+        &secondValue,
+        sizeof(secondValue));
+
+    if (!ApplyBaseRelocationsToDiskPage(
+            metadata,
+            0x1000,
+            0x2000,
+            &firstPage,
+            &secondPage))
+    {
+        return false;
+    }
+
+    uint64_t relocatedFirst = 0;
+    uint8_t relocatedCrossBytes[sizeof(uint64_t)] = {};
+    uint64_t relocatedCross = 0;
+    std::memcpy(
+        &relocatedFirst,
+        firstPage.data() + 0x10,
+        sizeof(relocatedFirst));
+    std::memcpy(
+        relocatedCrossBytes,
+        firstPage.data() + 0xffc,
+        sizeof(uint32_t));
+    std::memcpy(
+        relocatedCrossBytes + sizeof(uint32_t),
+        secondPage.data(),
+        sizeof(uint32_t));
+    std::memcpy(
+        &relocatedCross,
+        relocatedCrossBytes,
+        sizeof(relocatedCross));
+    if (relocatedFirst != firstValue + 0x2000 ||
+        relocatedCross != crossValue + 0x2000)
+    {
+        return false;
+    }
+
+    if (!ApplyBaseRelocationsToDiskPage(
+            metadata,
+            0x2000,
+            0x2000,
+            &secondPage,
+            nullptr))
+    {
+        return false;
+    }
+    uint32_t relocatedSecond = 0;
+    std::memcpy(
+        &relocatedSecond,
+        secondPage.data() + 0x8,
+        sizeof(relocatedSecond));
+    if (relocatedSecond != secondValue + 0x2000)
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> live(
+        static_cast<size_t>(kPageSize),
+        0);
+    std::vector<uint8_t> disk(
+        static_cast<size_t>(kPageSize),
+        0);
+    live[0xffb] = 0x7f;
+    live[0xffc] = 0x11;
+    disk[0xffb] = 0x7f;
+    MaskExpectedCrossPageRelocationBytes(
+        metadata,
+        0x1000,
+        &live,
+        &disk);
+    if (live[0xffb] != 0x7f ||
+        live[0xffc] != 0x11 ||
+        live == disk)
+    {
+        return false;
+    }
+    live[0] = 0x22;
+    disk[0] = 0x33;
+    MaskExpectedCrossPageRelocationBytes(
+        metadata,
+        0x2000,
+        &live,
+        &disk);
+    if (live[0] != 0 ||
+        disk[0] != 0)
+    {
+        return false;
+    }
+
+    metadata.BaseRelocationTableComplete = false;
+    const std::vector<uint8_t> before = firstPage;
+    return !ApplyBaseRelocationsToDiskPage(
+               metadata,
+               0x1000,
+               0x1000,
+               &firstPage,
+               &secondPage) &&
+        firstPage == before;
+}
+
+bool HuntDynamicRelocationMaskSelfTest()
+{
+    std::vector<uint8_t> table;
+    auto append16 = [&table](uint16_t value)
+    {
+        const size_t offset = table.size();
+        table.resize(offset + sizeof(value));
+        std::memcpy(table.data() + offset, &value, sizeof(value));
+    };
+    auto append32 = [&table](uint32_t value)
+    {
+        const size_t offset = table.size();
+        table.resize(offset + sizeof(value));
+        std::memcpy(table.data() + offset, &value, sizeof(value));
+    };
+    auto append64 = [&table](uint64_t value)
+    {
+        const size_t offset = table.size();
+        table.resize(offset + sizeof(value));
+        std::memcpy(table.data() + offset, &value, sizeof(value));
+    };
+
+    append32(1); // IMAGE_DYNAMIC_RELOCATION_TABLE.Version
+    append32(0); // Size is back-filled below.
+    append64(IMAGE_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE);
+    append32(0x84); // Entry payload size.
+    append32(0x40); // Two function override records.
+    append32(0x8340); // Original RVA.
+    append32(0); // BDD offset.
+    append32(sizeof(uint32_t)); // One overriding RVA.
+    append32(0x0c); // One 12-byte relocation block.
+    append32(0x8340); // Overriding RVA.
+    append32(0x9000); // Fixup page RVA.
+    append32(0x0c); // Block size.
+    append16(static_cast<uint16_t>((IMAGE_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x11));
+    append16(0); // Four-byte block padding.
+    append32(0x8440); // Original RVA.
+    append32(0x20); // Second BDD offset.
+    append32(sizeof(uint32_t)); // One overriding RVA.
+    append32(0x0c); // One 12-byte relocation block.
+    append32(0x8440); // Overriding RVA.
+    append32(0xa000); // Fixup page RVA.
+    append32(0x0c); // Block size.
+    append16(static_cast<uint16_t>((IMAGE_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x21));
+    append16(0); // Four-byte block padding.
+    append32(1); // BDD version.
+    append32(0x18); // Three IMAGE_BDD_DYNAMIC_RELOCATION nodes.
+    for (size_t index = 0; index < 3; ++index)
+    {
+        append16(0);
+        append16(0);
+        append32(0);
+    }
+    append32(1); // Second BDD version.
+    append32(0x18); // Three IMAGE_BDD_DYNAMIC_RELOCATION nodes.
+    for (size_t index = 0; index < 3; ++index)
+    {
+        append16(0);
+        append16(0);
+        append32(0);
+    }
+
+    const uint32_t tablePayloadSize =
+        static_cast<uint32_t>(table.size() - sizeof(IMAGE_DYNAMIC_RELOCATION_TABLE));
+    std::memcpy(table.data() + sizeof(uint32_t), &tablePayloadSize, sizeof(tablePayloadSize));
+
+    DiskPeMetadata metadata = {};
+    if (!ParseDynamicRelocationTable(
+            table,
+            true,
+            0x20000,
+            &metadata.DynamicRelocationRanges) ||
+        metadata.DynamicRelocationRanges.size() != 2 ||
+        metadata.DynamicRelocationRanges[0].Rva != 0x9011 ||
+        metadata.DynamicRelocationRanges[0].Size != sizeof(uint32_t) ||
+        metadata.DynamicRelocationRanges[1].Rva != 0xa021 ||
+        metadata.DynamicRelocationRanges[1].Size != sizeof(uint32_t))
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> live(static_cast<size_t>(kPageSize), 0);
+    std::vector<uint8_t> disk(static_cast<size_t>(kPageSize), 0);
+    live[0x11] = 0x11;
+    live[0x12] = 0x22;
+    live[0x13] = 0x33;
+    live[0x14] = 0x44;
+    MaskExpectedDynamicRelocationBytes(metadata, 0x9000, &live, &disk);
+    if (live != disk)
+    {
+        return false;
+    }
+
+    live[0x20] = 0x7f;
+    MaskExpectedDynamicRelocationBytes(metadata, 0x9000, &live, &disk);
+    if (live == disk)
+    {
+        return false;
+    }
+
+    const size_t entryOffset = sizeof(IMAGE_DYNAMIC_RELOCATION_TABLE);
+    const size_t payloadOffset = entryOffset + sizeof(IMAGE_DYNAMIC_RELOCATION64);
+    const size_t recordOffset = payloadOffset + sizeof(IMAGE_FUNCTION_OVERRIDE_HEADER);
+    constexpr uint32_t kTestImageSize = 0x20000;
+
+    std::vector<uint8_t> invalidOriginalRva = table;
+    std::memcpy(
+        invalidOriginalRva.data() +
+            recordOffset +
+            offsetof(
+                IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION,
+                OriginalRva),
+        &kTestImageSize,
+        sizeof(kTestImageSize));
+    std::vector<DiskPeMutableRange> transactionalRanges =
+    {
+        {0x1234, sizeof(uint32_t)}
+    };
+    if (ParseDynamicRelocationTable(
+            invalidOriginalRva,
+            true,
+            kTestImageSize,
+            &transactionalRanges) ||
+        transactionalRanges.size() != 1 ||
+        transactionalRanges[0].Rva != 0x1234 ||
+        transactionalRanges[0].Size != sizeof(uint32_t))
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> invalidOverrideRva = table;
+    std::memcpy(
+        invalidOverrideRva.data() +
+            recordOffset +
+            sizeof(
+                IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION),
+        &kTestImageSize,
+        sizeof(kTestImageSize));
+    std::vector<DiskPeMutableRange> invalidOverrideRanges;
+    if (ParseDynamicRelocationTable(
+            invalidOverrideRva,
+            true,
+            kTestImageSize,
+            &invalidOverrideRanges))
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> invalidBddOffset = table;
+    const uint32_t outOfBoundsBddOffset = 0xffffffffu;
+    std::memcpy(
+        invalidBddOffset.data() +
+            recordOffset +
+            offsetof(IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION, BDDOffset),
+        &outOfBoundsBddOffset,
+        sizeof(outOfBoundsBddOffset));
+    std::vector<DiskPeMutableRange> invalidBddOffsetRanges;
+    if (ParseDynamicRelocationTable(
+            invalidBddOffset,
+            true,
+            kTestImageSize,
+            &invalidBddOffsetRanges))
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> invalidBddSize = table;
+    const size_t bddSizeOffset =
+        invalidBddSize.size() -
+        3 * sizeof(IMAGE_BDD_DYNAMIC_RELOCATION) -
+        sizeof(uint32_t);
+    const uint32_t shortBddSize =
+        2 * static_cast<uint32_t>(sizeof(IMAGE_BDD_DYNAMIC_RELOCATION));
+    std::memcpy(
+        invalidBddSize.data() + bddSizeOffset,
+        &shortBddSize,
+        sizeof(shortBddSize));
+    std::vector<DiskPeMutableRange> invalidBddSizeRanges;
+    if (ParseDynamicRelocationTable(
+            invalidBddSize,
+            true,
+            kTestImageSize,
+            &invalidBddSizeRanges))
+    {
+        return false;
+    }
+
+    table.pop_back();
+    std::vector<DiskPeMutableRange> truncatedRanges;
+    return !ParseDynamicRelocationTable(
+        table,
+        true,
+        kTestImageSize,
+        &truncatedRanges);
+}
+
+bool HuntEffectiveVadProtectionSelfTest()
+{
+    ProcessVadRecord vad = {};
+    vad.StartAddress = 0x1000;
+    vad.EndAddress = 0x2fff;
+    vad.Executable = true;
+    vad.WritableExecutable = true;
+    vad.EffectiveProtectionComplete = true;
+
+    ProcessVadProtectionRange rx = {};
+    rx.StartAddress = 0x1000;
+    rx.EndAddress = 0x1fff;
+    rx.Committed = true;
+    rx.Executable = true;
+    vad.EffectiveProtectionRanges.push_back(rx);
+
+    ProcessVadProtectionRange wx = {};
+    wx.StartAddress = 0x2000;
+    wx.EndAddress = 0x2fff;
+    wx.Committed = true;
+    wx.Executable = true;
+    wx.Writable = true;
+    wx.WritableExecutable = true;
+    vad.EffectiveProtectionRanges.push_back(wx);
+
+    HuntProcessRecord process = {};
+    ProcessThreadRecord thread = {};
+    thread.HasStartAddress = true;
+    thread.StartAddress = 0x1100;
+    process.ThreadRecords.push_back(thread);
+
+    if (!VadAddressIsExecutable(vad, 0x1100) ||
+        VadAddressIsWritableExecutable(vad, 0x1100) ||
+        VadHasExecutionEvidence(process, vad, false, true))
+    {
+        return false;
+    }
+
+    process.ThreadRecords[0].StartAddress = 0x2100;
+    if (!VadAddressIsWritableExecutable(vad, 0x2100) ||
+        !VadHasExecutionEvidence(process, vad, false, true) ||
+        VadRangeHasExecutionEvidence(
+            process,
+            vad,
+            0x1000,
+            0x1fff,
+            false,
+            false) ||
+        !VadRangeHasExecutionEvidence(
+            process,
+            vad,
+            0x2000,
+            0x2fff,
+            false,
+            true))
+    {
+        return false;
+    }
+
+    vad.EffectiveProtectionComplete = false;
+    if (!VadAddressIsWritableExecutable(vad, 0x1100))
+    {
+        return false;
+    }
+
+    ProcessApcEntryRecord kernelApc = {};
+    kernelApc.HasKernelRoutine = true;
+    kernelApc.KernelRoutine = 0x1234;
+    kernelApc.KernelRoutineModule = L"invalid-kernel";
+    kernelApc.NormalRoutine = 0x00007fff00001000ull;
+    kernelApc.NormalRoutineModule = L"normal.dll";
+    if (SelectApcFindingAddress(kernelApc) !=
+            kernelApc.KernelRoutine ||
+        SelectApcFindingModule(kernelApc) !=
+            kernelApc.KernelRoutineModule)
+    {
+        return false;
+    }
+
+    ProcessApcEntryRecord userApc = {};
+    userApc.HasKernelRoutine = true;
+    userApc.KernelRoutine = 0xfffff80000001000ull;
+    userApc.UserRoutine = 0x00007fff00002000ull;
+    userApc.UserRoutineModule = L"user.dll";
+    return SelectApcFindingAddress(userApc) ==
+            userApc.UserRoutine &&
+        SelectApcFindingModule(userApc) ==
+            userApc.UserRoutineModule;
+}
+
+bool HuntEdrKillerProfileSelfTest()
+{
+    const std::wstring windowsApps =
+        L"C:\\Program Files\\WindowsApps";
+    if (!IsMicrosoftWindowsAppRuntimeModulePathShape(
+            windowsApps,
+            L"C:\\Program Files\\WindowsApps\\Microsoft.WindowsAppRuntime.1.8_8000.1.0_x64__8wekyb3d8bbwe\\WindowsAppRuntime.DeploymentExtensions.OneCore.dll") ||
+        !IsMicrosoftWindowsAppRuntimeModulePathShape(
+            windowsApps,
+            L"C:\\Program Files\\WindowsApps\\Microsoft.WindowsAppRuntime.2_2.3.1.0_x64__8wekyb3d8bbwe\\WindowsAppSdk.AppxDeploymentExtensions.Desktop.dll") ||
+        IsMicrosoftWindowsAppRuntimeModulePathShape(
+            windowsApps,
+            L"C:\\Program Files\\WindowsAppsBackup\\Microsoft.WindowsAppRuntime.1.8_8000.1.0_x64__8wekyb3d8bbwe\\WindowsAppRuntime.DeploymentExtensions.OneCore.dll") ||
+        IsMicrosoftWindowsAppRuntimeModulePathShape(
+            windowsApps,
+            L"C:\\Program Files\\WindowsApps\\Microsoft.WindowsAppRuntime.1.8_8000.1.0_x64__thirdparty\\WindowsAppRuntime.DeploymentExtensions.OneCore.dll") ||
+        IsMicrosoftWindowsAppRuntimeModulePathShape(
+            windowsApps,
+            L"C:\\Program Files\\WindowsApps\\Microsoft.WindowsAppRuntime.1.8_8000.1.0_x64__8wekyb3d8bbwe\\evil.dll"))
+    {
+        return false;
+    }
+
+    std::wstring oxideOptions;
+    if (!OxideHarvestCommandLineShape(
+            L"buildx64.exe -i in -u user -p pass -t target -o out",
+            &oxideOptions) ||
+        OxideHarvestCommandLineShape(
+            L"buildx64.exe -i -x value -u user -p pass -t target -o out",
+            &oxideOptions) ||
+        OxideHarvestCommandLineShape(
+            L"buildx64.exe -i /x -u user -p pass -t target -o out",
+            &oxideOptions))
+    {
+        return false;
+    }
+
+    if (!PathContainsGentlemenCollection(
+            L"C:\\Temp\\GentlemenCollection\\Kasps1.exe") ||
+        !PathContainsGentlemenCollection(
+            L"\"C:\\Temp\\GentlemenCollection\\Kasps1.exe\" -x") ||
+        !PathContainsGentlemenCollection(
+            L"C:\\Temp\\knhunt-123-GentlemenCollection\\Kasps1.exe") ||
+        PathContainsGentlemenCollection(
+            L"C:\\Temp\\GentlemenCollectionBackup\\Kasps1.exe") ||
+        PathContainsGentlemenCollection(
+            L"C:\\Temp\\Not-GentlemenCollection\\Kasps1.exe") ||
+        PathContainsGentlemenCollection(
+            L"C:\\Temp\\knhunt-x-GentlemenCollection\\Kasps1.exe") ||
+        PathContainsGentlemenCollection(
+            L"C:\\Temp\\xGentlemenCollection\\Kasps1.exe") ||
+        PathContainsGentlemenCollection(
+            L"C:\\Temp\\GentlemenCollection.exe"))
+    {
+        return false;
+    }
+
+    if (DriverServiceBinaryImagePath(
+            L"C:\\Temp\\folder.sys\\vgk.sys -arg") !=
+            L"C:\\Temp\\folder.sys\\vgk.sys" ||
+        DriverServiceBinaryImagePath(
+            L"\"C:\\Program Files\\Driver\\vgk.sys\" -arg") !=
+            L"C:\\Program Files\\Driver\\vgk.sys" ||
+        LeafName(DriverServiceBinaryImagePath(
+            L"C:\\Temp\\vgk.sysbackup\\legit.exe")) !=
+            L"legit.exe" ||
+        LeafName(DriverServiceBinaryImagePath(
+            L"\\??\\C:\\Temp\\GentlemenCollection\\PoisonX /x")) !=
+            L"poisonx")
+    {
+        return false;
+    }
+
+    const std::wstring stableSystemDriver =
+        WindowsDirectory() +
+        L"\\System32\\drivers\\example.sys";
+    if (ExpandEnvironmentText(
+            L"%SystemRoot%\\System32\\drivers\\example.sys") !=
+            stableSystemDriver ||
+        ExpandEnvironmentText(
+            L"%TEMP%\\GentlemenCollection\\example.sys") !=
+            L"%TEMP%\\GentlemenCollection\\example.sys")
+    {
+        return false;
+    }
+
+    const EdrKillerProcessProfile* weak =
+        FindEdrKillerProcessProfileByLeaf(L"avast.exe");
+    bool suffixNormalized = false;
+    bool suffixContextRequired = false;
+    const EdrKillerProcessProfile* compact =
+        FindEdrKillerProcessProfileByLeaf(
+            L"mb2clear.exe",
+            &suffixNormalized,
+            nullptr,
+            &suffixContextRequired,
+            nullptr);
+    return weak != nullptr &&
+        !weak->StrongNameSignal &&
+        compact != nullptr &&
+        suffixNormalized &&
+        suffixContextRequired;
+}
+
+bool HuntManagedLoaderlessMappingSelfTest()
+{
+    HuntModuleRecord mapped = {};
+    mapped.VadBackingManagedImage = true;
+    mapped.VadBackingState = L"resolved";
+    mapped.VadBackingPath = L"C:\\Temp\\managed.dll";
+
+    HuntProcessRecord process = {};
+    process.PebLdrEnumerated = true;
+    if (IsExpectedManagedLoaderlessMapping(process, mapped))
+    {
+        return false;
+    }
+
+    HuntModuleRecord runtime = {};
+    runtime.Name = L"coreclr.dll";
+    runtime.ToolhelpSeen = true;
+    process.Modules.push_back(runtime);
+    if (IsExpectedManagedLoaderlessMapping(process, mapped))
+    {
+        return false;
+    }
+
+    process.Modules[0].LdrLoadSeen = true;
+    if (!IsExpectedManagedLoaderlessMapping(process, mapped))
+    {
+        return false;
+    }
+
+    process.Modules[0].LdrLoadSeen = false;
+    HuntModuleRecord wow64 = {};
+    wow64.Name = L"wow64.dll";
+    wow64.LdrMemorySeen = true;
+    process.Modules.push_back(wow64);
+    process.ToolhelpModuleEnumerated = true;
+    if (!IsExpectedManagedLoaderlessMapping(process, mapped))
+    {
+        return false;
+    }
+
+    process.ToolhelpModuleEnumerated = false;
+    if (IsExpectedManagedLoaderlessMapping(process, mapped))
+    {
+        return false;
+    }
+    process.ToolhelpModuleEnumerated = true;
+
+    process.PebLdrEnumerated = false;
+    if (IsExpectedManagedLoaderlessMapping(process, mapped))
+    {
+        return false;
+    }
+
+    process.PebLdrEnumerated = true;
+    mapped.Base = 0x1000;
+    mapped.Size = 0x2000;
+    ProcessVadRecord mappedVad = {};
+    mappedVad.StartAddress = mapped.Base;
+    mappedVad.EndAddress =
+        mapped.Base + mapped.Size - 1;
+    mappedVad.Executable = true;
+    process.VadRecords.push_back(mappedVad);
+    mapped.VadBackingManagedImage = false;
+    if (IsExpectedManagedLoaderlessMapping(process, mapped))
+    {
+        return false;
+    }
+
+    mapped.VadBackingManagedImage = true;
+    if (!ShouldSkipExpectedManagedLoaderlessDeepComparison(
+            process,
+            mapped))
+    {
+        return false;
+    }
+
+    ProcessThreadRecord execution = {};
+    execution.HasStartAddress = true;
+    execution.StartAddress = mapped.Base + 0x100;
+    process.ThreadRecords.push_back(execution);
+    return !ShouldSkipExpectedManagedLoaderlessDeepComparison(
+        process,
+        mapped);
+}
+
 std::wstring HuntModeToText(HuntMode mode)
 {
     std::wstring text = L"default";
@@ -10981,6 +15634,15 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         else if (!warning.empty())
         {
             result->Warnings.push_back(warning);
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
+        }
+        else
+        {
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"SystemProcessInformation inventory failed without diagnostic detail");
         }
 
         std::map<uint32_t, ApiProcessRecord> toolhelpProcesses;
@@ -11004,26 +15666,31 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         else if (!warning.empty())
         {
             result->Warnings.push_back(warning);
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
         }
-
-        for (auto& item : processes)
+        else
         {
-            HuntProcessRecord& process = item.second;
-            if (process.HasParentProcessId)
-            {
-                auto parent = processes.find(process.ParentProcessId);
-                if (parent != processes.end())
-                {
-                    process.ParentImageName = BestProcessImageName(parent->second);
-                }
-            }
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"Toolhelp process inventory failed without diagnostic detail");
         }
 
         // Known-PID CID lookup only (not full PspCidTable enumeration).
         result->CidTableLookupOnly = true;
         result->CidTableFullEnumeration = false;
+        uint32_t processDtbOffset = 0;
+        uint32_t processUserDtbOffset = 0;
         warning.clear();
-        if (!ApplyCidTableLookupView(device_, symbols_, &processes, &warning) && !warning.empty())
+        if (!ApplyCidTableLookupView(
+                device_,
+                symbols_,
+                &processes,
+                &warning,
+                &processDtbOffset,
+                &processUserDtbOffset) &&
+            !warning.empty())
         {
             result->Warnings.push_back(warning);
         }
@@ -11035,25 +15702,111 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             L"cid coverage: known-PID lookup only; full PspCidTable enumeration is not available "
             L"(hidden PIDs absent from other views will not be discovered)");
 
+        for (auto& item : processes)
+        {
+            HuntProcessRecord& process = item.second;
+            if (!process.HasParentProcessId)
+            {
+                continue;
+            }
+
+            const auto parent =
+                processes.find(
+                    process.ParentProcessId);
+            if (parent != processes.end() &&
+                CanUseParentProcessIdentity(
+                    process,
+                    parent->second))
+            {
+                process.ParentImageName =
+                    BestProcessImageName(
+                        parent->second);
+            }
+        }
+
         ProcessTriageScanner triage(device_, symbols_);
         std::map<std::wstring, FileSha1CacheEntry> processSha1Cache;
 
         for (auto& item : processes)
         {
             HuntProcessRecord& process = item.second;
-            if (process.ProcessId == 0 && process.Kernel.ProcessId == 0)
+            if (process.Kernel.ProcessId == 0)
             {
                 process.Kernel.ProcessId = process.ProcessId;
             }
 
-            QueryProcessPublicDetails(&process);
+            if (process.ProcessId > 4 && processDtbOffset != 0)
+            {
+                ProcessAddressContext refreshed = {};
+                std::wstring refreshError;
+                if (!device_.ResolveProcess(
+                        process.ProcessId,
+                        processDtbOffset,
+                        processUserDtbOffset,
+                        &refreshed,
+                        &refreshError))
+                {
+                    process.LifecycleChangedBeforeTriage = true;
+                    AddUnique(
+                        &process.Warnings,
+                        L"process ended before deep triage; stale snapshot evidence was skipped");
+                    continue;
+                }
+
+                process.AddressContextRefreshed = true;
+                if (process.Kernel.Eprocess != 0 &&
+                    process.Kernel.Eprocess != refreshed.Eprocess)
+                {
+                    process.LifecycleChangedBeforeTriage = true;
+                    AddUnique(
+                        &process.Warnings,
+                        L"PID was reused before deep triage; stale process identity was skipped");
+                    continue;
+                }
+
+                process.Kernel.Eprocess = refreshed.Eprocess;
+                process.Kernel.DirectoryTableBase = refreshed.DirectoryTableBase;
+                process.Kernel.UserDirectoryTableBase = refreshed.UserDirectoryTableBase;
+            }
+
+            if (IsTerminatingProcessSnapshot(process.Kernel))
+            {
+                AddUnique(
+                    &process.Warnings,
+                    L"process was already terminating at kernel inventory capture; cross-view and deep triage skipped");
+                continue;
+            }
+
+            bool publicLifecycleChanged = false;
+            QueryProcessPublicDetails(
+                &process,
+                &publicLifecycleChanged);
+            if (publicLifecycleChanged)
+            {
+                process.LifecycleChangedBeforeTriage = true;
+                AddUnique(
+                    &process.Warnings,
+                    L"process exited or its PID was reused before public identity triage; stale evidence was skipped");
+                continue;
+            }
+
+            if (HasUnresolvedApiOnlyProcessView(
+                    process))
+            {
+                AddUnique(
+                    &process.Warnings,
+                    L"API-only process view was not a stable ActiveProcessLinks unlink; temporal mismatch finding was suppressed");
+                result->ProcessInventoryIncomplete = true;
+                result->CoverageComplete = false;
+            }
             AddProcessViewFindings(result, process);
 
             // Deep triage needs EPROCESS. Prefer ActiveProcessLinks inventory;
             // also accept CID-recovered EPROCESS for API-only / unlinked processes
             // without disabling the original path for list-visible processes.
             if (process.Kernel.Eprocess != 0 &&
-                (process.ActiveProcessLinksSeen || process.CidTableSeen))
+                (process.ActiveProcessLinksSeen || process.CidTableSeen) &&
+                HasExactProcessIdentity(process.Kernel))
             {
                 CollectPebIdentity(device_, &process);
                 ApplyBuiltinProfile(&process);
@@ -11077,7 +15830,12 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
 
                 ProcessVadScanResult vadResult = {};
                 std::wstring scanError;
-                if (triage.ScanVad(vadOptions, &vadResult, &scanError))
+                if (ScanVadForHunt(
+                        triage,
+                        vadOptions,
+                        &vadResult,
+                        &process.VadScanAttempts,
+                        &scanError))
                 {
                     process.VadRecords = std::move(vadResult.Records);
                     process.HiddenPteRecords = std::move(vadResult.HiddenPteRecords);
@@ -11088,6 +15846,9 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     process.PeLikeVadCount = vadResult.PeLikeCount;
                     process.HiddenPteRanges = vadResult.HiddenPteRanges;
                     process.HiddenPteBytes = vadResult.HiddenPteBytes;
+                    process.PageTablePagesRead = vadResult.PageTablePagesRead;
+                    process.PageTableReadFailures = vadResult.PageTableReadFailures;
+                    process.PagingLevels = vadResult.PagingLevels;
                     process.Warnings.insert(process.Warnings.end(), vadResult.Warnings.begin(), vadResult.Warnings.end());
                     if (vadResult.HiddenPteTruncated ||
                         vadResult.Incomplete ||
@@ -11117,12 +15878,38 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
 
                 ProcessThreadScanOptions threadOptions = {};
                 threadOptions.Target = BuildTriageTarget(process.Kernel);
+                for (const HuntModuleRecord& module :
+                     process.Modules)
+                {
+                    if (module.Base == 0 ||
+                        module.Size == 0 ||
+                        !ModuleHasLoaderView(module))
+                    {
+                        continue;
+                    }
+
+                    ProcessUserModuleRange range = {};
+                    range.Base = module.Base;
+                    range.Size = module.Size;
+                    range.ImageName = module.Name;
+                    range.ImagePath = module.Path;
+                    threadOptions.UserModules.push_back(
+                        std::move(range));
+                }
+                threadOptions.UserModuleEnumerationComplete =
+                    ProcessHasCompleteUserModuleInventory(
+                        process);
                 threadOptions.IncludeApc = true;
                 threadOptions.IncludeStacks = options.Mode == HuntMode::Deep;
 
                 ProcessThreadScanResult threadResult = {};
                 scanError.clear();
-                if (triage.ScanThreads(threadOptions, &threadResult, &scanError))
+                if (ScanThreadsForHunt(
+                        triage,
+                        threadOptions,
+                        &threadResult,
+                        &process.ThreadScanAttempts,
+                        &scanError))
                 {
                     process.ThreadRecords = std::move(threadResult.Records);
                     process.ThreadsVisited = threadResult.ThreadsVisited;
@@ -11172,6 +15959,17 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             }
             else
             {
+                if (process.Kernel.Eprocess != 0 &&
+                    (process.ActiveProcessLinksSeen ||
+                     process.CidTableSeen) &&
+                    !HasExactProcessIdentity(process.Kernel))
+                {
+                    AddUnique(
+                        &process.Warnings,
+                        L"deep process triage skipped because exact PID, EPROCESS, and create-time identity was unavailable");
+                    result->ProcessTriageCoverageIncomplete = true;
+                    result->CoverageComplete = false;
+                }
                 ApplyBuiltinProfile(&process);
                 AddIdentityFindings(result, process);
                 AddEdrKillerProcessProfileFindings(result, process);
@@ -11234,6 +16032,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"suspicious_driver_objects\":" << result.SuspiciousDriverObjectCount;
     json << L",\"driver_services\":" << result.DriverServiceCount;
     json << L",\"edr_killer_driver_services\":" << result.EdrKillerDriverServiceCount;
+    json << L",\"driver_service_coverage_incomplete\":"
+         << (result.DriverServiceCoverageIncomplete ? L"true" : L"false");
     json << L",\"wfp_filters\":" << result.WfpFilterCount;
     json << L",\"suspicious_wfp_filters\":" << result.SuspiciousWfpFilterCount;
     json << L",\"threat_intel_active\":" << (result.ThreatIntelActive ? L"true" : L"false");
@@ -11245,6 +16045,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"cid_table_full_enumeration\":" << (result.CidTableFullEnumeration ? L"true" : L"false");
     json << L",\"cid_table_lookup_only\":" << (result.CidTableLookupOnly ? L"true" : L"false");
     json << L",\"process_triage_coverage_incomplete\":" << (result.ProcessTriageCoverageIncomplete ? L"true" : L"false");
+    json << L",\"deep_image_comparison_coverage_incomplete\":"
+         << (result.DeepImageComparisonCoverageIncomplete ? L"true" : L"false");
     json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
     json << L"},\n";
 
@@ -11297,9 +16099,34 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L"    {";
         json << L"\"pid\":" << process.ProcessId;
         json << L",\"eprocess\":\"" << HuntHex(process.Kernel.Eprocess, 16) << L"\"";
+        json << L",\"directory_table_base\":\"" << HuntHex(process.Kernel.DirectoryTableBase, 16) << L"\"";
+        json << L",\"user_directory_table_base\":\"" << HuntHex(process.Kernel.UserDirectoryTableBase, 16) << L"\"";
+        json << L",\"terminating_snapshot\":" << (IsTerminatingProcessSnapshot(process.Kernel) ? L"true" : L"false");
+        json << L",\"active_threads\":";
+        if (process.Kernel.HasActiveThreads)
+        {
+            json << process.Kernel.ActiveThreads;
+        }
+        else
+        {
+            json << L"null";
+        }
+        json << L",\"exit_time\":";
+        if (process.Kernel.HasExitTime)
+        {
+            json << L"\"" << HuntHex(process.Kernel.ExitTime, 16) << L"\"";
+        }
+        else
+        {
+            json << L"null";
+        }
         json << L",\"active_process_links_seen\":" << (process.ActiveProcessLinksSeen ? L"true" : L"false");
+        json << L",\"active_process_links_revalidated\":" << (process.ActiveProcessLinksRevalidated ? L"true" : L"false");
+        json << L",\"active_process_links_stable_unlinked\":" << (process.ActiveProcessLinksStableUnlinked ? L"true" : L"false");
         json << L",\"system_process_information_seen\":" << (process.SystemProcessInformationSeen ? L"true" : L"false");
         json << L",\"toolhelp_seen\":" << (process.ToolhelpProcessSeen ? L"true" : L"false");
+        json << L",\"address_context_refreshed\":" << (process.AddressContextRefreshed ? L"true" : L"false");
+        json << L",\"lifecycle_changed_before_triage\":" << (process.LifecycleChangedBeforeTriage ? L"true" : L"false");
         json << L",\"cid_table_seen\":";
         if (process.HasCidTableView)
         {
@@ -11414,7 +16241,13 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"wx_vads\":" << process.WxVadCount;
         json << L",\"pe_like_vads\":" << process.PeLikeVadCount;
         json << L",\"hidden_pte_ranges\":" << process.HiddenPteRanges;
+        json << L",\"page_table_pages_read\":" << process.PageTablePagesRead;
+        json << L",\"page_table_read_failures\":" << process.PageTableReadFailures;
+        json << L",\"paging_levels\":" << process.PagingLevels;
+        json << L",\"vad_scan_attempts\":" << process.VadScanAttempts;
+        json << L",\"thread_scan_attempts\":" << process.ThreadScanAttempts;
         json << L",\"suspicious_thread_starts\":" << process.SuspiciousThreadStarts;
+        json << L",\"nonempty_apc_queues\":" << process.NonEmptyApcQueues;
         json << L",\"stack_references\":" << process.StackReferenceCount;
         json << L"},\"warnings\":";
         AppendJsonStringArray(json, process.Warnings);

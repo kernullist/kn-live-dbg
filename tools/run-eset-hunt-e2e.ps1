@@ -3,10 +3,13 @@ param(
 
     [string]$Configuration = "Release",
 
+    [ValidateRange(30, 86400)]
     [int]$Seconds = 300,
 
+    [ValidateRange(30, 3600)]
     [int]$KnLiveDbgTimeoutSeconds = 180,
 
+    [ValidateRange(15, 3600)]
     [int]$TargetLifetimePaddingSeconds = 60,
 
     [switch]$Build,
@@ -14,6 +17,8 @@ param(
     [switch]$ReuseExistingTarget,
 
     [string]$ExistingStopEventName = "",
+
+    [string]$OutputDirectory = "",
 
     [string]$ArticleHtml = "",
 
@@ -38,6 +43,58 @@ function Write-RunnerMessage
     if (-not [string]::IsNullOrWhiteSpace($script:RunnerLogPath))
     {
         Add-Content -LiteralPath $script:RunnerLogPath -Encoding UTF8 -Value $Message
+    }
+}
+
+function Enter-KnLiveDbgHuntRunnerMutex
+{
+    $mutex = $null
+    try
+    {
+        $mutex = [System.Threading.Mutex]::new(
+            $false,
+            "Global\KnLiveDbg-Hunt-Runner-v1")
+        $acquired = $false
+        try
+        {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException]
+        {
+            $acquired = $true
+        }
+
+        if (-not $acquired)
+        {
+            throw "another KnLiveDbg hunt runner is active on this machine"
+        }
+
+        return $mutex
+    }
+    catch
+    {
+        if ($null -ne $mutex)
+        {
+            $mutex.Dispose()
+        }
+        throw
+    }
+}
+
+function Exit-KnLiveDbgHuntRunnerMutex
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Threading.Mutex]$Mutex
+    )
+
+    try
+    {
+        [void]$Mutex.ReleaseMutex()
+    }
+    finally
+    {
+        $Mutex.Dispose()
     }
 }
 
@@ -302,37 +359,87 @@ function Start-ProcessWithRedirects
         [string]$StandardErrorPath
     )
 
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.WorkingDirectory = Split-Path -Parent $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardInput = -not [string]::IsNullOrWhiteSpace($StandardInputPath)
     $argumentText = ConvertTo-ProcessArguments -Arguments $Arguments
-    $startParams = @{
-        FilePath = $FilePath
-        WorkingDirectory = Split-Path -Parent $FilePath
-        RedirectStandardOutput = $StandardOutputPath
-        RedirectStandardError = $StandardErrorPath
-        WindowStyle = "Hidden"
-        PassThru = $true
-    }
-
     if (-not [string]::IsNullOrWhiteSpace($argumentText))
     {
-        $startParams["ArgumentList"] = $argumentText
+        $startInfo.Arguments = $argumentText
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($StandardInputPath))
+    $process = [System.Diagnostics.Process]::new()
+    $handle = $null
+    try
     {
-        $startParams["RedirectStandardInput"] = $StandardInputPath
-    }
+        $process.StartInfo = $startInfo
+        if (-not $process.Start())
+        {
+            throw "failed to start process: $FilePath"
+        }
 
-    $process = Start-Process @startParams
-    if ($null -eq $process)
+        $handle = [pscustomobject]@{
+            Process = $process
+            OutputTask = $process.StandardOutput.ReadToEndAsync()
+            ErrorTask = $process.StandardError.ReadToEndAsync()
+            StandardOutputPath = $StandardOutputPath
+            StandardErrorPath = $StandardErrorPath
+            OutputCaptured = $false
+        }
+        if ($startInfo.RedirectStandardInput)
+        {
+            $process.StandardInput.Write(
+                [System.IO.File]::ReadAllText(
+                    $StandardInputPath,
+                    [System.Text.Encoding]::ASCII))
+            $process.StandardInput.Close()
+        }
+
+        return $handle
+    }
+    catch
     {
-        throw "failed to start process: $FilePath"
+        $startException = $_
+        if ($null -ne $handle)
+        {
+            try
+            {
+                Stop-ProcessHandle -Handle $handle -Name ([System.IO.Path]::GetFileName($FilePath))
+            }
+            catch
+            {
+            }
+        }
+        else
+        {
+            $process.Dispose()
+        }
+        throw $startException
+    }
+}
+
+function Complete-ProcessOutput
+{
+    param(
+        [object]$Handle
+    )
+
+    if ($null -eq $Handle -or $Handle.OutputCaptured)
+    {
+        return
     }
 
-    return [pscustomobject]@{
-        Process = $process
-        OutputWriter = $null
-        ErrorWriter = $null
-    }
+    $stdout = $Handle.OutputTask.GetAwaiter().GetResult()
+    $stderr = $Handle.ErrorTask.GetAwaiter().GetResult()
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($Handle.StandardOutputPath, $stdout, $utf8)
+    [System.IO.File]::WriteAllText($Handle.StandardErrorPath, $stderr, $utf8)
+    $Handle.OutputCaptured = $true
 }
 
 function Close-ProcessHandle
@@ -360,18 +467,358 @@ function Close-ProcessHandle
         }
     }
 
-    if ($null -ne $Handle.OutputWriter)
-    {
-        $Handle.OutputWriter.Dispose()
-    }
-    if ($null -ne $Handle.ErrorWriter)
-    {
-        $Handle.ErrorWriter.Dispose()
-    }
     if ($null -ne $Handle.Process)
     {
-        $Handle.Process.Dispose()
+        if (-not $Handle.Process.HasExited)
+        {
+            throw "refusing to dispose a live process handle: pid=$($Handle.Process.Id)"
+        }
+        try
+        {
+            Complete-ProcessOutput -Handle $Handle
+        }
+        finally
+        {
+            $Handle.Process.Dispose()
+        }
     }
+}
+
+function Stop-ProcessHandle
+{
+    param(
+        [object]$Handle,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [int]$TimeoutMilliseconds = 10000
+    )
+
+    if ($null -eq $Handle -or $null -eq $Handle.Process)
+    {
+        return
+    }
+
+    $process = $Handle.Process
+    if (-not $process.HasExited)
+    {
+        $processId = $process.Id
+        Write-RunnerMessage "[eset-hunt-e2e] force_stop name=$Name pid=$processId"
+        try
+        {
+            $process.Kill()
+        }
+        catch [System.InvalidOperationException]
+        {
+        }
+        if (-not $process.WaitForExit($TimeoutMilliseconds))
+        {
+            throw "$Name process did not exit after exact-PID termination: pid=$processId"
+        }
+    }
+    $process.WaitForExit()
+    Close-ProcessHandle -Handle $Handle
+}
+
+function Remove-KnLiveDbgService
+{
+    $service = Get-Service -Name "KnLiveDbg" -ErrorAction SilentlyContinue
+    if ($null -eq $service)
+    {
+        return $false
+    }
+
+    Write-RunnerMessage "[eset-hunt-e2e] exact_service_cleanup name=KnLiveDbg state=$($service.Status)"
+    if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped)
+    {
+        & sc.exe stop KnLiveDbg | Out-Null
+    }
+    & sc.exe delete KnLiveDbg | Out-Null
+
+    for ($attempt = 0; $attempt -lt 100; ++$attempt)
+    {
+        if ($null -eq (Get-Service -Name "KnLiveDbg" -ErrorAction SilentlyContinue))
+        {
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "KnLiveDbg service could not be removed by exact cleanup"
+}
+
+function Test-OwnedHuntTargetProcessPath
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory = $true)]
+        [int]$TargetProcessId
+    )
+
+    $pidText = [regex]::Escape([string]$TargetProcessId)
+    $pattern =
+        "^knhunt-$pidText-(GentlemenCollection|WeakVendorControl|SystemCopyControl)\\[^\\]+$"
+    return [regex]::IsMatch(
+        $RelativePath,
+        $pattern,
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+}
+
+function Test-OwnedHuntTargetEntryPath
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory = $true)]
+        [int]$TargetProcessId
+    )
+
+    $pidText = [regex]::Escape([string]$TargetProcessId)
+    $pattern =
+        "^knhunt-$pidText-(GentlemenCollection|WeakVendorControl|SystemCopyControl)$|" +
+        "^knhunt-$pidText-(secimg|stpimg)-[0-9]+-[0-9]+\.dll$"
+    return [regex]::IsMatch(
+        $RelativePath,
+        $pattern,
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+}
+
+function Remove-OwnedHuntTargetArtifacts
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath,
+
+        [Parameter(Mandatory = $true)]
+        [int]$TargetProcessId
+    )
+
+    $cleanupActions = 0
+    $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+    $manifestDocument = $null
+    $ownedPrefix = "knhunt-$TargetProcessId-"
+    $servicePrefix = "KnLiveDbgHuntTargetEdrSvc$TargetProcessId" + "_"
+    $tempRoot = [System.IO.Path]::GetFullPath(
+        [System.IO.Path]::GetTempPath())
+    if ($tempRoot.Length -gt 3)
+    {
+        $tempRoot = $tempRoot.TrimEnd('\')
+    }
+    $tempRootPrefix = if ($tempRoot.EndsWith('\'))
+    {
+        $tempRoot
+    }
+    else
+    {
+        $tempRoot + "\"
+    }
+
+    if (Test-Path -LiteralPath $ManifestPath -PathType Leaf)
+    {
+        try
+        {
+            $manifestDocument = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+        }
+        catch
+        {
+            $cleanupErrors.Add("fixture manifest parse failed during cleanup: $($_.Exception.Message)")
+        }
+    }
+
+    $serviceNames = @()
+    if ($null -ne $manifestDocument)
+    {
+        $serviceNames += @(
+            $manifestDocument.scenarios |
+                ForEach-Object { [string]$_.expected_evidence.service_name }
+        )
+    }
+    $serviceNames += @(
+        Get-Service -Name "$servicePrefix*" -ErrorAction SilentlyContinue |
+            ForEach-Object { [string]$_.Name }
+    )
+    $servicePattern = '^' + [regex]::Escape($servicePrefix) + '[0-9]+$'
+    $serviceNames = @(
+        $serviceNames |
+            Where-Object { $_ -match $servicePattern } |
+            Sort-Object -Unique
+    )
+    foreach ($serviceName in $serviceNames)
+    {
+        try
+        {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($null -eq $service)
+            {
+                continue
+            }
+
+            Write-RunnerMessage "[eset-hunt-e2e] exact_fixture_service_cleanup name=$serviceName state=$($service.Status)"
+            if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped)
+            {
+                & sc.exe stop $serviceName | Out-Null
+            }
+            & sc.exe delete $serviceName | Out-Null
+            for ($attempt = 0; $attempt -lt 100; ++$attempt)
+            {
+                if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue))
+                {
+                    break
+                }
+                Start-Sleep -Milliseconds 100
+            }
+            if ($null -ne (Get-Service -Name $serviceName -ErrorAction SilentlyContinue))
+            {
+                throw "fixture service could not be removed: $serviceName"
+            }
+            ++$cleanupActions
+        }
+        catch
+        {
+            $cleanupErrors.Add("fixture service cleanup failed name=$serviceName error=$($_.Exception.Message)")
+        }
+    }
+
+    $childIds = @()
+    if ($null -ne $manifestDocument)
+    {
+        $childIds += @(
+            $manifestDocument.scenarios |
+                ForEach-Object { $_.pid } |
+                Where-Object { $_ -is [int] -or $_ -is [long] } |
+                ForEach-Object { [int]$_ }
+        )
+    }
+    foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue))
+    {
+        $candidatePath = ""
+        try
+        {
+            $candidatePath = [System.IO.Path]::GetFullPath([string]$candidate.Path)
+        }
+        catch
+        {
+        }
+        $relativeCandidate = if ($candidatePath.StartsWith($tempRootPrefix, [StringComparison]::OrdinalIgnoreCase))
+        {
+            $candidatePath.Substring($tempRootPrefix.Length)
+        }
+        else
+        {
+            ""
+        }
+        if (-not [string]::IsNullOrWhiteSpace($relativeCandidate) -and
+            (Test-OwnedHuntTargetProcessPath `
+                -RelativePath $relativeCandidate `
+                -TargetProcessId $TargetProcessId))
+        {
+            $childIds += [int]$candidate.Id
+        }
+    }
+    $childIds = @(
+        $childIds |
+            Where-Object { $_ -gt 0 -and $_ -ne $TargetProcessId } |
+            Sort-Object -Unique
+    )
+    foreach ($childId in $childIds)
+    {
+        try
+        {
+            $child = Get-Process -Id $childId -ErrorAction SilentlyContinue
+            if ($null -eq $child)
+            {
+                continue
+            }
+
+            $childPath = ""
+            try
+            {
+                $childPath = [System.IO.Path]::GetFullPath([string]$child.Path)
+            }
+            catch
+            {
+            }
+            $relativeChild = if ($childPath.StartsWith($tempRootPrefix, [StringComparison]::OrdinalIgnoreCase))
+            {
+                $childPath.Substring($tempRootPrefix.Length)
+            }
+            else
+            {
+                ""
+            }
+            if ([string]::IsNullOrWhiteSpace($relativeChild) -or
+                -not (Test-OwnedHuntTargetProcessPath `
+                    -RelativePath $relativeChild `
+                    -TargetProcessId $TargetProcessId))
+            {
+                Write-RunnerMessage "[eset-hunt-e2e] skip_reused_manifest_pid pid=$childId path=$childPath"
+                continue
+            }
+
+            Write-RunnerMessage "[eset-hunt-e2e] exact_fixture_child_cleanup pid=$childId path=$childPath"
+            Stop-Process -Id $childId -Force -ErrorAction Stop
+            Wait-Process -Id $childId -Timeout 10 -ErrorAction SilentlyContinue
+            if ($null -ne (Get-Process -Id $childId -ErrorAction SilentlyContinue))
+            {
+                throw "fixture child process could not be stopped: pid=$childId"
+            }
+            ++$cleanupActions
+        }
+        catch
+        {
+            $cleanupErrors.Add("fixture child cleanup failed pid=$childId error=$($_.Exception.Message)")
+        }
+    }
+
+    $ownedEntries = @(
+        Get-ChildItem -LiteralPath $tempRoot -Filter "$ownedPrefix*" -Force -ErrorAction SilentlyContinue
+    )
+    foreach ($entry in $ownedEntries)
+    {
+        try
+        {
+            $fullPath = [System.IO.Path]::GetFullPath($entry.FullName)
+            $relativePath = if ($fullPath.StartsWith($tempRootPrefix, [StringComparison]::OrdinalIgnoreCase))
+            {
+                $fullPath.Substring($tempRootPrefix.Length)
+            }
+            else
+            {
+                ""
+            }
+            if ([string]::IsNullOrWhiteSpace($relativePath) -or
+                -not (Test-OwnedHuntTargetEntryPath `
+                    -RelativePath $relativePath `
+                    -TargetProcessId $TargetProcessId))
+            {
+                throw "refusing to remove an artifact outside the exact fixture naming contract: $fullPath"
+            }
+            if (($entry.Attributes -band
+                    [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+            {
+                throw "refusing to recursively remove a fixture reparse point: $fullPath"
+            }
+
+            Write-RunnerMessage "[eset-hunt-e2e] exact_fixture_artifact_cleanup path=$fullPath"
+            Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop
+            ++$cleanupActions
+        }
+        catch
+        {
+            $cleanupErrors.Add("fixture artifact cleanup failed path=$($entry.FullName) error=$($_.Exception.Message)")
+        }
+    }
+
+    if ($cleanupErrors.Count -ne 0)
+    {
+        throw ($cleanupErrors -join "; ")
+    }
+    return $cleanupActions
 }
 
 function Resolve-OptionalRootedPath
@@ -396,12 +843,58 @@ function Resolve-OptionalRootedPath
 }
 
 $rootPath = (Resolve-Path -LiteralPath $Root).Path
+if (-not $ReuseExistingTarget -and
+    -not [string]::IsNullOrWhiteSpace($ExistingStopEventName))
+{
+    throw "-ExistingStopEventName is valid only with -ReuseExistingTarget"
+}
+
 $useArticleCurrentnessValidation = (-not [string]::IsNullOrWhiteSpace($ArticleHtml)) -or (-not [string]::IsNullOrWhiteSpace($ArticleUrl))
 $resolvedArticleHtml = Resolve-OptionalRootedPath -RootPath $rootPath -Path $ArticleHtml
 $resolvedArticleOutPath = Resolve-OptionalRootedPath -RootPath $rootPath -Path $ArticleOutPath
 
-$outputDir = Join-Path $rootPath ".build\eset-hunt-e2e"
+$outputDir = if ([string]::IsNullOrWhiteSpace($OutputDirectory))
+{
+    Join-Path $rootPath ".build\eset-hunt-e2e"
+}
+else
+{
+    Resolve-OptionalRootedPath `
+        -RootPath $rootPath `
+        -Path $OutputDirectory
+}
+$outputDir = [System.IO.Path]::GetFullPath($outputDir)
 New-DirectoryIfMissing -Path $outputDir
+$runnerLockPath = Join-Path $outputDir ".runner.lock"
+$runnerLock = $null
+try
+{
+    $runnerLock = [System.IO.File]::Open(
+        $runnerLockPath,
+        [System.IO.FileMode]::OpenOrCreate,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None)
+}
+catch
+{
+    throw "another ESET hunt E2E runner owns the output directory: $outputDir"
+}
+
+$machineRunMutex = $null
+try
+{
+    $machineRunMutex = Enter-KnLiveDbgHuntRunnerMutex
+}
+catch
+{
+    $runnerLock.Dispose()
+    $runnerLock = $null
+    throw
+}
+
+$targetStopEvent = $null
+try
+{
 if ($useArticleCurrentnessValidation -and
     -not [string]::IsNullOrWhiteSpace($ArticleUrl) -and
     [string]::IsNullOrWhiteSpace($resolvedArticleHtml) -and
@@ -454,6 +947,48 @@ if (-not $isAdministrator)
     $adminError = "administrator rights are required for the live ESET hunt E2E because the driver-service fixture creates SCM SERVICE_KERNEL_DRIVER records and KnLiveDbg must open the kernel driver device"
     Write-RunnerMessage "[eset-hunt-e2e] failed: $adminError"
     throw $adminError
+}
+
+$preexistingKnLiveDbgService = Get-Service -Name "KnLiveDbg" -ErrorAction SilentlyContinue
+if ($null -ne $preexistingKnLiveDbgService)
+{
+    throw "refusing to start while a pre-existing KnLiveDbg service is registered: state=$($preexistingKnLiveDbgService.Status)"
+}
+$preexistingKnLiveDbgProcesses = @(
+    Get-Process -Name "KnLiveDbg" -ErrorAction SilentlyContinue
+)
+if ($preexistingKnLiveDbgProcesses.Count -ne 0)
+{
+    $processIds =
+        @($preexistingKnLiveDbgProcesses |
+            ForEach-Object { $_.Id }) -join ","
+    throw "refusing to start while a pre-existing KnLiveDbg process is running: process_ids=$processIds"
+}
+if (-not $ReuseExistingTarget)
+{
+    $preexistingFixtureServices = @(
+        Get-Service `
+            -Name "KnLiveDbgHuntTargetEdrSvc*" `
+            -ErrorAction SilentlyContinue
+    )
+    $preexistingFixtureProcesses = @(
+        Get-Process `
+            -Name "KnLiveDbgHuntTarget" `
+            -ErrorAction SilentlyContinue
+    )
+    if ($preexistingFixtureServices.Count -ne 0 -or
+        $preexistingFixtureProcesses.Count -ne 0)
+    {
+        $serviceNames = @(
+            $preexistingFixtureServices |
+                ForEach-Object { $_.Name }
+        ) -join ","
+        $processIds = @(
+            $preexistingFixtureProcesses |
+                ForEach-Object { $_.Id }
+        ) -join ","
+        throw "refusing to start with pre-existing hunt fixture state: services=$serviceNames process_ids=$processIds"
+    }
 }
 
 if (-not $ReuseExistingTarget -and $Seconds -lt 30)
@@ -509,7 +1044,6 @@ if ($useArticleCurrentnessValidation -and -not (Test-Path -LiteralPath $iocValid
 }
 
 $stopEventName = ""
-$targetStopEvent = $null
 if (-not $ReuseExistingTarget)
 {
     $stopEventName = "Local\KnLiveDbgHuntE2E-$PID-$([Guid]::NewGuid().ToString('N'))"
@@ -545,6 +1079,10 @@ if (-not $ReuseExistingTarget)
 
 $targetHandle = $null
 $knHandle = $null
+$targetProcessId = 0
+$knProcessStarted = $false
+$runCompleted = $false
+$cleanupFailures = [System.Collections.Generic.List[string]]::new()
 try
 {
     if ($ReuseExistingTarget)
@@ -570,6 +1108,7 @@ try
             -Arguments $targetArgs `
             -StandardOutputPath $targetOut `
             -StandardErrorPath $targetErr
+        $targetProcessId = [int]$targetHandle.Process.Id
         Write-RunnerMessage "[eset-hunt-e2e] target_pid=$($targetHandle.Process.Id)"
         Write-RunnerMessage "[eset-hunt-e2e] wait target manifest=$manifest expected_scenarios=$script:EsetHuntE2EExpectedScenarios"
     }
@@ -589,12 +1128,13 @@ try
         -StandardInputPath $commands `
         -StandardOutputPath $knOut `
         -StandardErrorPath $knErr
+    $knProcessStarted = $true
 
     $knProcess = $knHandle.Process
     if (-not $knProcess.WaitForExit($KnLiveDbgTimeoutSeconds * 1000))
     {
-        Stop-Process -Id $knProcess.Id -Force -ErrorAction SilentlyContinue
-        $knProcess.WaitForExit()
+        Stop-ProcessHandle -Handle $knHandle -Name "KnLiveDbg"
+        $knHandle = $null
         throw "KnLiveDbg did not exit within $KnLiveDbgTimeoutSeconds seconds; stdout=$knOut stderr=$knErr"
     }
     $knProcess.WaitForExit()
@@ -650,25 +1190,55 @@ try
         }
         Write-TextFileTail -Path $articleValidatorLog -Label "article-validator" -Lines 20
     }
+    $runCompleted = $true
 }
 catch
 {
     Write-RunnerMessage "[eset-hunt-e2e] failed: $($_.Exception.Message)"
     Write-RunnerMessage "[eset-hunt-e2e] artifacts output_dir=$outputDir manifest=$manifest hunt_json=$huntJson"
     Write-ProcessSnapshot -Names @("KnLiveDbg", "KnLiveDbgHuntTarget")
-    Write-TextFileTail -Path $targetOut -Label "target.stdout"
-    Write-TextFileTail -Path $targetErr -Label "target.stderr"
-    Write-TextFileTail -Path $knOut -Label "knlivedbg.stdout"
-    Write-TextFileTail -Path $knErr -Label "knlivedbg.stderr"
-    Write-TextFileTail -Path $validatorLog -Label "validator"
-    Write-TextFileTail -Path $articleValidatorLog -Label "article-validator"
     throw
 }
 finally
 {
     if ($null -ne $knHandle)
     {
-        Close-ProcessHandle -Handle $knHandle
+        try
+        {
+            if ($knHandle.Process.HasExited)
+            {
+                Close-ProcessHandle -Handle $knHandle
+            }
+            else
+            {
+                Stop-ProcessHandle -Handle $knHandle -Name "KnLiveDbg"
+            }
+        }
+        catch
+        {
+            $cleanupFailures.Add("KnLiveDbg process cleanup failed: $($_.Exception.Message)")
+        }
+        $knHandle = $null
+    }
+
+    if ($knProcessStarted)
+    {
+        try
+        {
+            $serviceWasPresent = $null -ne (Get-Service -Name "KnLiveDbg" -ErrorAction SilentlyContinue)
+            if ($serviceWasPresent)
+            {
+                [void](Remove-KnLiveDbgService)
+                if ($runCompleted)
+                {
+                    $cleanupFailures.Add("KnLiveDbg left its service registered after a successful run")
+                }
+            }
+        }
+        catch
+        {
+            $cleanupFailures.Add("KnLiveDbg service cleanup failed: $($_.Exception.Message)")
+        }
     }
 
     $targetProcess = if ($null -ne $targetHandle) { $targetHandle.Process } else { $null }
@@ -681,18 +1251,54 @@ finally
         }
 
         Write-RunnerMessage "[eset-hunt-e2e] waiting for target cleanup"
-        if (-not $targetProcess.WaitForExit(30000))
+        if (-not $targetProcess.WaitForExit(60000))
         {
-            Write-Warning "target process did not exit in time; services may require manual cleanup. pid=$($targetProcess.Id)"
-            if (-not [string]::IsNullOrWhiteSpace($script:RunnerLogPath))
+            $targetTimeoutPid = $targetProcess.Id
+            try
             {
-                Add-Content -LiteralPath $script:RunnerLogPath -Encoding UTF8 -Value "[eset-hunt-e2e] target cleanup timeout pid=$($targetProcess.Id)"
+                Stop-ProcessHandle -Handle $targetHandle -Name "hunt target"
+                $targetHandle = $null
             }
+            catch
+            {
+                $cleanupFailures.Add("hunt target forced cleanup failed: $($_.Exception.Message)")
+            }
+            $cleanupFailures.Add("hunt target did not exit within 60 seconds after the stop event: pid=$targetTimeoutPid")
         }
     }
     if ($null -ne $targetHandle)
     {
-        Close-ProcessHandle -Handle $targetHandle
+        try
+        {
+            $targetHandle.Process.WaitForExit()
+            $targetHandle.Process.Refresh()
+            $targetExitCode = [int]$targetHandle.Process.ExitCode
+            Close-ProcessHandle -Handle $targetHandle
+            if ($runCompleted -and $targetExitCode -ne 0)
+            {
+                $cleanupFailures.Add("hunt target exited with code $targetExitCode during cleanup")
+            }
+        }
+        catch
+        {
+            $cleanupFailures.Add("hunt target output/handle cleanup failed: $($_.Exception.Message)")
+        }
+        $targetHandle = $null
+    }
+    if (-not $ReuseExistingTarget -and $targetProcessId -gt 0)
+    {
+        try
+        {
+            $targetCleanupActions = Remove-OwnedHuntTargetArtifacts -ManifestPath $manifest -TargetProcessId $targetProcessId
+            if ($runCompleted -and $targetCleanupActions -ne 0)
+            {
+                $cleanupFailures.Add("hunt target left $targetCleanupActions owned service/process/file artifact(s) after a successful run")
+            }
+        }
+        catch
+        {
+            $cleanupFailures.Add("hunt target artifact cleanup failed: $($_.Exception.Message)")
+        }
     }
     if ($null -ne $targetStopEvent)
     {
@@ -710,7 +1316,7 @@ finally
         }
         catch
         {
-            Write-RunnerMessage "[eset-hunt-e2e] warning: failed to signal existing stop event: $($_.Exception.Message)"
+            $cleanupFailures.Add("failed to signal existing target stop event: $($_.Exception.Message)")
         }
         finally
         {
@@ -720,6 +1326,26 @@ finally
             }
         }
     }
+
+    if (-not $runCompleted)
+    {
+        Write-TextFileTail -Path $targetOut -Label "target.stdout"
+        Write-TextFileTail -Path $targetErr -Label "target.stderr"
+        Write-TextFileTail -Path $knOut -Label "knlivedbg.stdout"
+        Write-TextFileTail -Path $knErr -Label "knlivedbg.stderr"
+        Write-TextFileTail -Path $validatorLog -Label "validator"
+        Write-TextFileTail -Path $articleValidatorLog -Label "article-validator"
+    }
+
+    foreach ($cleanupFailure in $cleanupFailures)
+    {
+        Write-RunnerMessage "[eset-hunt-e2e] cleanup_failure=$cleanupFailure"
+    }
+}
+
+if ($cleanupFailures.Count -ne 0)
+{
+    throw "ESET hunt E2E cleanup failed: $($cleanupFailures -join '; ')"
 }
 
 Write-RunnerMessage "[eset-hunt-e2e] passed"
@@ -731,4 +1357,29 @@ if ($useArticleCurrentnessValidation)
     Write-RunnerMessage "[eset-hunt-e2e] article_validator_log=$articleValidatorLog"
 }
 Write-RunnerMessage "[eset-hunt-e2e] runner_log=$runnerLog"
+}
+finally
+{
+    try
+    {
+        if ($null -ne $targetStopEvent)
+        {
+            $targetStopEvent.Dispose()
+            $targetStopEvent = $null
+        }
+        if ($null -ne $runnerLock)
+        {
+            $runnerLock.Dispose()
+            $runnerLock = $null
+        }
+    }
+    finally
+    {
+        if ($null -ne $machineRunMutex)
+        {
+            Exit-KnLiveDbgHuntRunnerMutex -Mutex $machineRunMutex
+            $machineRunMutex = $null
+        }
+    }
+}
 exit 0

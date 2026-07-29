@@ -44,6 +44,8 @@ struct HuntOptions
     uint32_t RenderLimit = 40;
     std::vector<SnapshotProcessRecord> Processes;
     bool ThreatIntelActive = false;
+    // True when the TI collection surface was successfully available.  An
+    // available ring can legitimately contain zero events on a quiet host.
     bool ThreatIntelAvailable = false;
     std::vector<HuntTelemetryEvent> ThreatIntelEvents;
     // Ring overflow / eviction count from the TI subscriber for this scan window.
@@ -62,6 +64,7 @@ struct HuntModuleRecord
     bool LdrInitSeen = false;
     bool PrivatePeVadSeen = false;
     bool VadImageSeen = false;
+    bool VadBackingManagedImage = false;
     uint64_t VadAddress = 0;
     std::wstring VadBackingPath;
     std::wstring VadBackingState;
@@ -76,6 +79,8 @@ struct HuntProcessRecord
     bool HasParentProcessId = false;
     bool HasSessionId = false;
     bool ActiveProcessLinksSeen = false;
+    bool ActiveProcessLinksRevalidated = false;
+    bool ActiveProcessLinksStableUnlinked = false;
     bool SystemProcessInformationSeen = false;
     bool ToolhelpProcessSeen = false;
     // True when known-PID CID lookup was attempted for this process (not a full
@@ -83,6 +88,8 @@ struct HuntProcessRecord
     // succeeded for that PID.
     bool HasCidTableView = false;
     bool CidTableSeen = false;
+    bool AddressContextRefreshed = false;
+    bool LifecycleChangedBeforeTriage = false;
     std::wstring KernelImageName;
     std::wstring SystemProcessImageName;
     std::wstring ToolhelpImageName;
@@ -125,6 +132,11 @@ struct HuntProcessRecord
     uint64_t PeLikeVadCount = 0;
     uint64_t HiddenPteRanges = 0;
     uint64_t HiddenPteBytes = 0;
+    uint64_t PageTablePagesRead = 0;
+    uint64_t PageTableReadFailures = 0;
+    uint32_t PagingLevels = 0;
+    uint32_t VadScanAttempts = 0;
+    uint32_t ThreadScanAttempts = 0;
     uint64_t ThreadsVisited = 0;
     uint64_t SuspiciousThreadStarts = 0;
     uint64_t NonEmptyApcQueues = 0;
@@ -169,11 +181,15 @@ struct HuntResult
     uint64_t SuspiciousDriverObjectCount = 0;
     uint64_t DriverServiceCount = 0;
     uint64_t EdrKillerDriverServiceCount = 0;
+    // The SCM driver-service inventory could not be enumerated to completion.
+    // A zero IOC count is not a whole-host clean result when this is true.
+    bool DriverServiceCoverageIncomplete = false;
     uint64_t WfpFilterCount = 0;
     uint64_t SuspiciousWfpFilterCount = 0;
     bool ThreatIntelActive = false;
     bool ThreatIntelAvailable = false;
-    // Deep-mode TI correlation could not run with usable events.
+    // Deep-mode TI correlation could not observe a usable collection surface,
+    // or the ring dropped events.
     bool ThreatIntelCorrelationIncomplete = false;
     // Kernel ActiveProcessLinks inventory was partial (poisoned nodes skipped
     // or walk stopped early). Findings must not be read as whole-system clean.
@@ -183,6 +199,9 @@ struct HuntResult
     bool CidTableLookupOnly = true;
     // VAD / hidden-PTE / thread collection surfaces reported incompleteness.
     bool ProcessTriageCoverageIncomplete = false;
+    // Deep live-vs-disk comparison rejected a required relocation structure
+    // or could not normalize an intended comparison page safely.
+    bool DeepImageComparisonCoverageIncomplete = false;
     // Aggregate coverage flag: false when any critical collection surface was
     // incomplete (process inventory, TI drops, triage truncation, etc.).
     bool CoverageComplete = true;
@@ -211,4 +230,12 @@ private:
 };
 
 std::wstring HuntModeToText(HuntMode mode);
+std::wstring HuntFirstCommandLineImage(const std::wstring& commandLine);
+bool HuntProcessLifecycleSelfTest();
+bool HuntDiskPeBoundsSelfTest();
+bool HuntBaseRelocationMaskSelfTest();
+bool HuntDynamicRelocationMaskSelfTest();
+bool HuntEffectiveVadProtectionSelfTest();
+bool HuntEdrKillerProfileSelfTest();
+bool HuntManagedLoaderlessMappingSelfTest();
 std::wstring BuildHuntJson(const HuntResult& result);
