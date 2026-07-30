@@ -28,6 +28,7 @@ struct SnapshotDiffDomainSummary
     std::wstring Domain;
     uint64_t Added = 0;
     uint64_t Escalated = 0;
+    uint64_t Removed = 0;
     uint64_t High = 0;
     uint64_t Medium = 0;
     uint64_t PoolPeSuspect = 0;
@@ -49,6 +50,7 @@ struct SnapshotDiffResult
     bool SameBoot = true;
     uint64_t Added = 0;
     uint64_t Escalated = 0;
+    uint64_t Removed = 0;
     uint64_t High = 0;
     std::vector<std::wstring> Warnings;
     std::vector<SnapshotDiffFinding> Findings;
@@ -63,3 +65,4 @@ bool BuildSnapshotDiff(
     std::wstring* error);
 
 bool SnapshotDriverDispatchDiffSelfTest();
+bool SnapshotMinifilterAttachmentDiffSelfTest();

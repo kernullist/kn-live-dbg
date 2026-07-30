@@ -116,7 +116,8 @@ public:
         uint32_t directoryTableBaseOffset,
         uint32_t userDirectoryTableBaseOffset,
         ProcessAddressContext* context,
-        std::wstring* error);
+        std::wstring* error,
+        DWORD* deviceError = nullptr);
     bool SetWriteMode(bool enabled, std::wstring* error);
     bool ReadMemory(
         uint64_t address,
@@ -209,7 +210,14 @@ public:
         std::wstring* error);
 
 private:
-    bool Ioctl(DWORD code, void* buffer, DWORD inLength, DWORD outLength, DWORD* returned, std::wstring* error);
+    bool Ioctl(
+        DWORD code,
+        void* buffer,
+        DWORD inLength,
+        DWORD outLength,
+        DWORD* returned,
+        std::wstring* error,
+        DWORD* deviceError = nullptr);
 
     HANDLE device_;
 };

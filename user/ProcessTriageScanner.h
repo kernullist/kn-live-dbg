@@ -230,6 +230,8 @@ struct ProcessThreadRecord
     uint64_t StackLimit = 0;
     uint64_t UserStackBase = 0;
     uint64_t UserStackLimit = 0;
+    uint32_t SuspendCount = 0;
+    uint32_t FreezeCount = 0;
     std::wstring StartModule;
     std::wstring StartSymbol;
     std::wstring Win32StartModule;
@@ -241,6 +243,8 @@ struct ProcessThreadRecord
     bool HasTeb = false;
     bool HasStackBounds = false;
     bool HasUserStackBounds = false;
+    bool HasSuspendCount = false;
+    bool HasFreezeCount = false;
     bool StartInUserModule = false;
     bool StartInPrivateExecVad = false;
     bool StartInWxVad = false;
@@ -259,6 +263,10 @@ struct ProcessThreadScanOptions
     bool UserModuleEnumerationComplete = false;
     bool IncludeApc = false;
     bool IncludeStacks = false;
+    // Hunt enables this only for known security-product processes. A missing
+    // suspend/freeze field or read then participates in retry/incomplete
+    // coverage instead of being treated as unrelated thread telemetry.
+    bool RequireSuspensionCoverage = false;
     uint32_t Limit = 0;
 };
 
@@ -270,6 +278,8 @@ struct ProcessThreadScanResult
     uint64_t ThreadsVisited = 0;
     uint64_t MatchingRecords = 0;
     uint64_t SuspiciousStartCount = 0;
+    uint64_t SuspensionStateResolvedCount = 0;
+    uint64_t SuspendedThreadCount = 0;
     uint64_t ApcNonEmptyCount = 0;
     uint64_t StackReferenceCount = 0;
     bool Truncated = false;
@@ -277,6 +287,12 @@ struct ProcessThreadScanResult
     // unreadable entries (not a clean complete thread inventory).
     bool Incomplete = false;
     bool CoverageComplete = true;
+    // Independent from VAD/module correlation coverage. This proves that the
+    // EPROCESS thread list itself was walked to a stable tail.
+    bool InventoryComplete = false;
+    // True only when both suspend and freeze fields were resolved and read for
+    // every visited thread retained by an uncapped inventory.
+    bool SuspensionStateCoverageComplete = false;
     std::wstring LayoutSource;
 };
 

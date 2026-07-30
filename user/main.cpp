@@ -1,8 +1,10 @@
 #include "AddressInspector.h"
 #include "AiProvider.h"
 #include "AlpcScanner.h"
+#include "BindFilterScanner.h"
 #include "ByovdScanner.h"
 #include "CallbackScanner.h"
+#include "CloudFileScanner.h"
 #include "CommandRegistry.h"
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
@@ -14,9 +16,11 @@
 #include "McpServer.h"
 #include "McpSelfTest.h"
 #include "MemoryDumper.h"
+#include "MinifilterAttachmentScanner.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
 #include "ProcessTriageScanner.h"
+#include "QosPolicyScanner.h"
 #include "SnapshotCollector.h"
 #include "SnapshotDiff.h"
 #include "SnapshotJson.h"
@@ -792,24 +796,26 @@ static void AddCommandHistory(DebuggerState* state, const std::wstring& line)
 {
     static constexpr size_t kCommandHistoryLimit = 256;
 
-    do
+    if (state == nullptr)
     {
-        if (state == nullptr || TrimWhitespace(line).empty())
-        {
-            break;
-        }
+        return;
+    }
+    if (TrimWhitespace(line).empty())
+    {
+        return;
+    }
 
-        if (!state->CommandHistory.empty() && state->CommandHistory.back() == line)
-        {
-            break;
-        }
+    if (!state->CommandHistory.empty() &&
+        state->CommandHistory.back() == line)
+    {
+        return;
+    }
 
-        state->CommandHistory.push_back(line);
-        while (state->CommandHistory.size() > kCommandHistoryLimit)
-        {
-            state->CommandHistory.erase(state->CommandHistory.begin());
-        }
-    } while (false);
+    state->CommandHistory.push_back(line);
+    while (state->CommandHistory.size() > kCommandHistoryLimit)
+    {
+        state->CommandHistory.erase(state->CommandHistory.begin());
+    }
 }
 
 static std::wstring NormalizeInputCommand(const std::wstring& value)
@@ -8642,7 +8648,7 @@ static bool WritePhysicalQword(DeviceClient& device, uint64_t physicalAddress, u
 }
 
 // Re-translate and require the same physical frame / page size as `expected`.
-// Closes the translate→physical-write TOCTOU window without refusing CoW/R-O
+// Closes the translate->physical-write TOCTOU window without refusing CoW/R-O
 // shared-frame patches (those keep the same PFN by design).
 static bool ConfirmPhysicalMappingUnchanged(
     DeviceClient& device,
@@ -9018,7 +9024,7 @@ static bool WriteProcessVirtualMemory(
 
             // User VA path writes through the translated physical frame after an
             // optional temporary Write-bit flip. That skips the processor CoW
-            // fault path and intentionally patches the shared frame — this is a
+            // fault path and intentionally patches the shared frame - this is a
             // primary patch workflow for EXE/DLL WriteCopy pages. Warn once.
             if (!writeViaKernelVirtualAddress)
             {
@@ -10862,7 +10868,8 @@ static bool QueryProbeInfo(KNDBG_PROBE_INFO_RESPONSE* response, std::wstring* er
         ok = true;
     } while (false);
 
-    if (device != INVALID_HANDLE_VALUE)
+    if (device != nullptr &&
+        device != INVALID_HANDLE_VALUE)
     {
         CloseHandle(device);
     }
@@ -10904,7 +10911,8 @@ static bool ResetProbePattern(std::wstring* error)
         ok = true;
     } while (false);
 
-    if (device != INVALID_HANDLE_VALUE)
+    if (device != nullptr &&
+        device != INVALID_HANDLE_VALUE)
     {
         CloseHandle(device);
     }
@@ -12146,25 +12154,26 @@ static void ApplyCallbackModuleFilter(
     const std::wstring& moduleFilter,
     KernelCallbackScanResult* result)
 {
-    do
+    if (result == nullptr)
     {
-        if (result == nullptr || TrimWhitespace(moduleFilter).empty())
-        {
-            break;
-        }
+        return;
+    }
+    if (TrimWhitespace(moduleFilter).empty())
+    {
+        return;
+    }
 
-        std::vector<KernelCallbackRecord> filtered;
-        filtered.reserve(result->Records.size());
-        for (const KernelCallbackRecord& record : result->Records)
+    std::vector<KernelCallbackRecord> filtered;
+    filtered.reserve(result->Records.size());
+    for (const KernelCallbackRecord& record : result->Records)
+    {
+        if (CallbackRecordMatchesModuleFilter(record, moduleFilter))
         {
-            if (CallbackRecordMatchesModuleFilter(record, moduleFilter))
-            {
-                filtered.push_back(record);
-            }
+            filtered.push_back(record);
         }
+    }
 
-        result->Records.swap(filtered);
-    } while (false);
+    result->Records.swap(filtered);
 }
 
 static WORD CallbackKindColor(const std::wstring& kind)
@@ -22829,7 +22838,7 @@ static void PrintSessionHelp(const std::wstring& command)
 static void PrintQueryHelp()
 {
     std::wcout << L"query command:\n";
-    std::wcout << L"  query <address|symbol> [length]  (procctx for user VA; write_gate≠pte_writable)\n";
+    std::wcout << L"  query <address|symbol> [length]  (procctx for user VA; write_gate!=pte_writable)\n";
     std::wcout << L"  Ask the driver for a native virtual-address range summary.\n";
     std::wcout << L"  length is bytes and defaults to one byte.\n";
 }
@@ -23462,6 +23471,10 @@ static int RunConsoleSurfaceSelfTest()
             L"hunt-process-handle-lifecycle-identity");
         CheckConsoleSurfaceSelfTest(
             &context,
+            HuntCidTableAnchorSelfTest(),
+            L"hunt-cid-table-anchor-cross-function");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             HuntDiskPeBoundsSelfTest(),
             L"hunt-disk-pe-bounds");
         CheckConsoleSurfaceSelfTest(
@@ -23482,6 +23495,46 @@ static int RunConsoleSurfaceSelfTest()
             L"hunt-edr-killer-profile-boundaries");
         CheckConsoleSurfaceSelfTest(
             &context,
+            HuntSecurityProcessFreezeSelfTest(),
+            L"hunt-security-process-freeze-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            WfpScannerSelfTest(),
+            L"wfp-filter-parser-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntWfpPolicySelfTest(),
+            L"hunt-wfp-security-target-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            QosPolicyScannerSelfTest(),
+            L"qos-policy-throttle-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntQosPolicySelfTest(),
+            L"hunt-qos-security-target-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            BindFilterScannerSelfTest(),
+            L"bindflt-mapping-parser-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntBindFilterMappingSelfTest(),
+            L"hunt-bindflt-mapping-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            CloudFileScannerSelfTest(),
+            L"cloudfiles-placeholder-metadata-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            MinifilterAttachmentScannerSelfTest(),
+            L"minifilter-attachment-parser-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntCloudFilePlaceholderSelfTest(),
+            L"hunt-cloudfiles-ffi-decision-boundaries");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             HuntManagedLoaderlessMappingSelfTest(),
             L"hunt-managed-loaderless-runtime-gate");
         CheckConsoleSurfaceSelfTest(
@@ -23491,7 +23544,11 @@ static int RunConsoleSurfaceSelfTest()
         CheckConsoleSurfaceSelfTest(
             &context,
             SnapshotDriverDispatchDiffSelfTest(),
-            L"snapshot-driver-dispatch-same-boot-delta");
+            L"snapshot-temporal-tampering-deltas");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            SnapshotMinifilterAttachmentDiffSelfTest(),
+            L"snapshot-minifilter-attachment-deltas");
         CheckConsoleSurfaceSelfTest(
             &context,
             SnapshotJsonStrictParsingSelfTest(),
@@ -23683,6 +23740,197 @@ static int RunConsoleSurfaceSelfTest()
     } while (false);
 
     return exitCode;
+}
+
+static int RunCloudFileQuerySelfTest(
+    const std::wstring& path)
+{
+    CloudFileScanner scanner;
+    CloudFilePlaceholderRecord record = {};
+    std::wstring error;
+    if (!scanner.QueryPlaceholder(
+            path,
+            &record,
+            &error))
+    {
+        std::wcerr
+            << L"[cloudfiles.query] failed path=\""
+            << path
+            << L"\" error=\""
+            << error
+            << L"\"\n";
+        return 1;
+    }
+
+    std::wcout
+        << L"[cloudfiles.query]"
+        << L" path=\"" << path << L"\""
+        << L" cloud="
+        << (record.IsCloudPlaceholder
+                ? L"yes"
+                : L"no")
+        << L" cloud_tag="
+        << (record.CloudReparseTag
+                ? L"yes"
+                : L"no")
+        << L" metadata_complete="
+        << (record.MetadataCoverageComplete
+                ? L"yes"
+                : L"no")
+        << L" attributes="
+        << HexTextWidth(
+               record.FileAttributes,
+               8,
+               true)
+        << L" reparse_tag="
+        << HexTextWidth(
+               record.ReparseTag,
+               8,
+               true)
+        << L" fsctl_tag_fallback="
+        << (record.FsctlReparseTagFallbackUsed
+                ? L"yes"
+                : L"no")
+        << L" fsctl_tag_error="
+        << record.FsctlReparseTagQueryError
+        << L" placeholder_info_fallback="
+        << (record.PlaceholderInfoIdentificationFallbackUsed
+                ? L"yes"
+                : L"no")
+        << L" inspection_complete="
+        << (record.PlaceholderInspectionComplete
+                ? L"yes"
+                : L"no")
+        << L" placeholder_info_status="
+        << HexTextWidth(
+               record.PlaceholderInfoQueryStatus,
+               8,
+               true)
+        << L" placeholder_state="
+        << HexTextWidth(
+               record.PlaceholderState,
+               8,
+               true)
+        << L" on_disk_data_size="
+        << record.OnDiskDataSize
+        << L" validated_data_size="
+        << record.ValidatedDataSize
+        << L" modified_data_size="
+        << record.ModifiedDataSize
+        << L" properties_size="
+        << record.PropertiesSize
+        << L" pin_state="
+        << record.PinState
+        << L" in_sync_state="
+        << record.InSyncState
+        << L" file_identity_length="
+        << record.FileIdentityLength;
+    if (!record.Warning.empty())
+    {
+        std::wcout
+            << L" warning=\""
+            << record.Warning
+            << L"\"";
+    }
+    std::wcout << L"\n";
+
+    if (!record.IsCloudPlaceholder)
+    {
+        return 3;
+    }
+    return record.MetadataCoverageComplete
+        ? 0
+        : 4;
+}
+
+static int RunMinifilterAttachmentQuerySelfTest()
+{
+    MinifilterAttachmentScanner scanner;
+    MinifilterAttachmentScanResult result = {};
+    std::wstring error;
+    if (!scanner.Scan(
+            &result,
+            &error))
+    {
+        std::wcerr
+            << L"[minifilter.attachments] failed error=\""
+            << error
+            << L"\"\n";
+        return 1;
+    }
+
+    uint64_t detached = 0;
+    for (const MinifilterAttachmentRecord& record :
+         result.Records)
+    {
+        if (record.DetachedVolume)
+        {
+            ++detached;
+        }
+    }
+    std::wcout
+        << L"[minifilter.attachments]"
+        << L" volumes=" << result.Volumes.size()
+        << L" records=" << result.Records.size()
+        << L" detached=" << detached
+        << L" coverage_complete="
+        << (result.Incomplete ? L"no" : L"yes")
+        << L" warnings=" << result.Warnings.size()
+        << L"\n";
+    constexpr size_t kDisplayRecordLimit = 256;
+    const size_t displayRecordCount =
+        (std::min)(
+            result.Records.size(),
+            kDisplayRecordLimit);
+    for (size_t i = 0; i < displayRecordCount; ++i)
+    {
+        const MinifilterAttachmentRecord& record =
+            result.Records[i];
+        std::wcout
+            << L"[minifilter.attachment]"
+            << L" kind="
+            << (record.IsMinifilter
+                    ? L"minifilter"
+                    : L"legacy")
+            << L" filter=\"" << record.FilterName
+            << L"\" instance=\"" << record.InstanceName
+            << L"\" altitude=\"" << record.Altitude
+            << L"\" volume=\"" << record.VolumeName
+            << L"\" detached="
+            << (record.DetachedVolume
+                    ? L"yes"
+                    : L"no")
+            << L" frame=" << record.FrameId
+            << L" filesystem_type="
+            << record.VolumeFileSystemType
+            << L" flags="
+            << HexTextWidth(
+                   record.InstanceFlags,
+                   8,
+                   true)
+            << L"\n";
+    }
+    if (displayRecordCount < result.Records.size())
+    {
+        std::wcout
+            << L"[minifilter.attachments] omitted_records="
+            << (result.Records.size() -
+                displayRecordCount)
+            << L" display_limit="
+            << kDisplayRecordLimit
+            << L"\n";
+    }
+    for (const std::wstring& warning :
+         result.Warnings)
+    {
+        std::wcout
+            << L"[minifilter.attachments.warning] "
+            << warning
+            << L"\n";
+    }
+    return result.Incomplete
+        ? 4
+        : 0;
 }
 
 static bool ParseDecimalIndex(const std::wstring& value, size_t* output)
@@ -29456,6 +29704,15 @@ static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeSta
         std::wcout << L" teb=" << HexTextWidth(record.Teb, 16, true);
     }
 
+    if (record.HasSuspendCount)
+    {
+        std::wcout << L" suspend=" << record.SuspendCount;
+    }
+    if (record.HasFreezeCount)
+    {
+        std::wcout << L" freeze=" << record.FreezeCount;
+    }
+
     if (includeStacks && record.HasStackBounds)
     {
         std::wcout << L" stack=" << HexTextWidth(record.StackLimit, 16, true)
@@ -29539,7 +29796,11 @@ static void PrintThreadScanResult(const ProcessThreadScanResult& result, bool in
     std::wcout << L" visited=" << result.ThreadsVisited
                << L" records=" << result.MatchingRecords
                << L" suspicious_start=" << result.SuspiciousStartCount
+               << L" suspend_state=" << result.SuspensionStateResolvedCount
+               << L" suspended=" << result.SuspendedThreadCount
                << L" nonempty_apc_queues=" << result.ApcNonEmptyCount
+               << L" inventory_complete=" << (result.InventoryComplete ? L"yes" : L"no")
+               << L" suspend_coverage=" << (result.SuspensionStateCoverageComplete ? L"yes" : L"no")
                << L" truncated=" << (result.Truncated ? L"yes" : L"no")
                << L"\n";
 }
@@ -29649,9 +29910,20 @@ static std::wstring HuntConsoleClassLabel(const std::wstring& className)
     {
         label = L"defense_evasion_driver_service";
     }
-    else if (lowered == L"network_filter_tampering")
+    else if (lowered == L"network_filter_tampering" ||
+             lowered == L"network_policy_tampering")
     {
         label = L"security_communication_blocking";
+    }
+    else if (lowered ==
+             L"filesystem_virtualization_tampering")
+    {
+        label = L"bind_link_tampering";
+    }
+    else if (lowered ==
+             L"cloudfiles_false_file_immutability")
+    {
+        label = L"cloudfiles_ffi_tampering";
     }
 
     return label;
@@ -30091,6 +30363,58 @@ static std::wstring HuntConsoleReasonLabel(const std::wstring& reason)
     {
         label = L"security_tool_communication_blocking";
     }
+    else if (lowered == L"security_tool_communication_throttling")
+    {
+        label = L"security_tool_communication_throttling";
+    }
+    else if (lowered == L"qos_security_product_throttle_policy")
+    {
+        label = L"qos_security_product_throttle_policy";
+    }
+    else if (lowered == L"edrchoker_state")
+    {
+        label = L"edrchoker_state";
+    }
+    else if (lowered == L"bindflt_active_global_mapping")
+    {
+        label = L"bindflt_active_global_mapping";
+    }
+    else if (lowered == L"bind_link_security_product_path")
+    {
+        label = L"bind_link_security_product_path";
+    }
+    else if (lowered == L"bind_link_security_artifact_path")
+    {
+        label = L"bind_link_security_artifact_path";
+    }
+    else if (lowered == L"bind_link_protected_to_user_path")
+    {
+        label = L"bind_link_protected_to_user_path";
+    }
+    else if (lowered == L"bind_link_inverse_trust_mapping")
+    {
+        label = L"bind_link_inverse_trust_mapping";
+    }
+    else if (lowered == L"bind_link_protected_image_redirect")
+    {
+        label = L"bind_link_protected_image_redirect";
+    }
+    else if (lowered == L"bind_link_inverse_image_redirect")
+    {
+        label = L"bind_link_inverse_image_redirect";
+    }
+    else if (lowered == L"bind_link_process_binding_state")
+    {
+        label = L"bind_link_process_binding_state";
+    }
+    else if (lowered == L"bind_link_process_backing_correlation")
+    {
+        label = L"bind_link_process_backing_correlation";
+    }
+    else if (lowered == L"bind_link_inverse_pair")
+    {
+        label = L"bind_link_inverse_pair";
+    }
     else if (lowered == L"wfp_security_product_block_filter")
     {
         label = L"wfp_security_product_block_filter";
@@ -30282,6 +30606,23 @@ static uint32_t HuntConsoleSignalPriority(const std::wstring& signal)
              lowered == L"image_vad_hidden_from_loader" ||
              lowered == L"manual_mapped_private_pe" ||
              lowered == L"security_tool_communication_blocking" ||
+             lowered == L"security_tool_communication_throttling" ||
+             lowered == L"qos_security_product_throttle_policy" ||
+             lowered == L"edrchoker_state" ||
+             lowered == L"bindflt_active_global_mapping" ||
+             lowered == L"bind_link_security_product_path" ||
+             lowered == L"bind_link_security_artifact_path" ||
+             lowered == L"bind_link_protected_to_user_path" ||
+             lowered == L"bind_link_inverse_trust_mapping" ||
+             lowered == L"bind_link_protected_image_redirect" ||
+             lowered == L"bind_link_inverse_image_redirect" ||
+             lowered == L"bind_link_process_binding_state" ||
+             lowered == L"bind_link_process_backing_correlation" ||
+             lowered == L"bind_link_inverse_pair" ||
+             lowered == L"cloudfiles_executable_placeholder_mapping" ||
+             lowered == L"cloudfiles_ffi_ppl_image_mapping" ||
+             lowered == L"cloudfiles_placeholder_modified_data" ||
+             lowered == L"cloudfiles_ffi_live_disk_mismatch" ||
              lowered == L"wfp_security_product_block_filter" ||
              lowered == L"wfp_anticheat_block_filter" ||
              lowered == L"wfp_appid_block_condition" ||
@@ -30406,10 +30747,60 @@ static std::wstring HuntAssessmentKindForFinding(
     }
     else if (classLabel == L"security_communication_blocking" ||
              HuntLabelsContain(labels, L"security_tool_communication_blocking") ||
+             HuntLabelsContain(labels, L"security_tool_communication_throttling") ||
+             HuntLabelsContain(labels, L"qos_security_product_throttle_policy") ||
+             HuntLabelsContain(labels, L"edrchoker_state") ||
              HuntLabelsContain(labels, L"wfp_security_product_block_filter") ||
              HuntLabelsContain(labels, L"wfp_anticheat_block_filter"))
     {
         kind = L"security_communication_blocking";
+    }
+    else if (classLabel == L"bind_link_tampering" ||
+             HuntLabelsContain(
+                 labels,
+                 L"bindflt_active_global_mapping") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_security_product_path") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_security_artifact_path") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_protected_to_user_path") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_inverse_trust_mapping") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_protected_image_redirect") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_inverse_image_redirect") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_process_binding_state") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_process_backing_correlation") ||
+             HuntLabelsContain(
+                 labels,
+                 L"bind_link_inverse_pair"))
+    {
+        kind = L"bind_link_tampering";
+    }
+    else if (classLabel == L"cloudfiles_ffi_tampering" ||
+             HuntLabelsContain(
+                 labels,
+                 L"cloudfiles_ffi_ppl_image_mapping") ||
+             HuntLabelsContain(
+                 labels,
+                 L"cloudfiles_placeholder_modified_data") ||
+             HuntLabelsContain(
+                 labels,
+                 L"cloudfiles_ffi_live_disk_mismatch"))
+    {
+        kind = L"cloudfiles_ffi_tampering";
     }
     else if (classLabel == L"defense_evasion_process_profile" ||
              HuntLabelsContain(labels, L"known_defense_evasion_tool_name") ||
@@ -30506,6 +30897,14 @@ static uint32_t HuntAssessmentPriority(const std::wstring& kind)
     {
         priority = 45;
     }
+    else if (kind == L"bind_link_tampering")
+    {
+        priority = 12;
+    }
+    else if (kind == L"cloudfiles_ffi_tampering")
+    {
+        priority = 11;
+    }
     else if (kind == L"module_stomping")
     {
         priority = 50;
@@ -30575,7 +30974,15 @@ static std::wstring HuntAssessmentTechniqueText(const std::wstring& kind)
     }
     else if (kind == L"security_communication_blocking")
     {
-        technique = L"installed a WFP block filter against security or anti-cheat communication";
+        technique = L"installed a network policy that blocks or throttles security-product communication";
+    }
+    else if (kind == L"bind_link_tampering")
+    {
+        technique = L"redirected a security-sensitive path through an active Bind Filter mapping";
+    }
+    else if (kind == L"cloudfiles_ffi_tampering")
+    {
+        technique = L"mapped mutable Cloud Files placeholder backing as executable image code";
     }
     else if (kind == L"defense_evasion_process_profile")
     {
@@ -30786,6 +31193,74 @@ static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
     {
         phrase = L"WFP policy blocks security or anti-cheat communication";
     }
+    else if (lowered == L"security_tool_communication_throttling")
+    {
+        phrase = L"QoS policy throttles security-product communication";
+    }
+    else if (lowered == L"qos_security_product_throttle_policy")
+    {
+        phrase = L"QoS policy severely throttles a security-product process";
+    }
+    else if (lowered == L"edrchoker_state")
+    {
+        phrase = L"EDRChoker-style active QoS throttle state";
+    }
+    else if (lowered == L"bindflt_active_global_mapping")
+    {
+        phrase = L"active global bindflt mapping";
+    }
+    else if (lowered == L"bind_link_security_product_path")
+    {
+        phrase = L"Bind Link intersects a known security-product path";
+    }
+    else if (lowered == L"bind_link_security_artifact_path")
+    {
+        phrase = L"Bind Link intersects a security-sensitive artifact";
+    }
+    else if (lowered == L"bind_link_protected_to_user_path")
+    {
+        phrase = L"protected path redirects to a user-controlled path";
+    }
+    else if (lowered == L"bind_link_inverse_trust_mapping")
+    {
+        phrase = L"user-controlled path redirects back to a protected path";
+    }
+    else if (lowered == L"bind_link_protected_image_redirect")
+    {
+        phrase = L"protected executable image path redirects to a different image";
+    }
+    else if (lowered == L"bind_link_inverse_image_redirect")
+    {
+        phrase = L"unprotected image path redirects back to a protected image";
+    }
+    else if (lowered == L"bind_link_process_binding_state")
+    {
+        phrase = L"active Bind Link is reflected in a running process";
+    }
+    else if (lowered == L"bind_link_process_backing_correlation")
+    {
+        phrase = L"visible process image path and two independent backing views correlate to opposite sides of the mapping";
+    }
+    else if (lowered == L"bind_link_inverse_pair")
+    {
+        phrase = L"inverse Bind Link pair is active";
+    }
+    else if (lowered == L"cloudfiles_executable_placeholder_mapping")
+    {
+        phrase = L"SEC_IMAGE is backed by a Cloud Files placeholder";
+    }
+    else if (lowered == L"cloudfiles_ffi_ppl_image_mapping")
+    {
+        phrase = L"PP or PPL maps Cloud Files placeholder image backing";
+    }
+    else if (lowered == L"cloudfiles_placeholder_modified_data")
+    {
+        phrase = L"mapped Cloud Files placeholder reports modified data";
+    }
+    else if (lowered == L"cloudfiles_ffi_live_disk_mismatch")
+    {
+        phrase = L"Cloud Files placeholder correlates with executable live-versus-disk divergence";
+    }
     else if (lowered == L"wfp_security_product_block_filter")
     {
         phrase = L"WFP block filter targets a security-product process";
@@ -30975,6 +31450,23 @@ static bool IsHuntHighSignalReason(const std::wstring& reason)
             lowered == L"module_stomping_permission_evidence" ||
             lowered == L"module_entrypoint_write_permission_drift" ||
             lowered == L"security_tool_communication_blocking" ||
+            lowered == L"security_tool_communication_throttling" ||
+            lowered == L"qos_security_product_throttle_policy" ||
+            lowered == L"edrchoker_state" ||
+            lowered == L"bindflt_active_global_mapping" ||
+            lowered == L"bind_link_security_product_path" ||
+            lowered == L"bind_link_security_artifact_path" ||
+            lowered == L"bind_link_protected_to_user_path" ||
+            lowered == L"bind_link_inverse_trust_mapping" ||
+            lowered == L"bind_link_protected_image_redirect" ||
+            lowered == L"bind_link_inverse_image_redirect" ||
+            lowered == L"bind_link_process_binding_state" ||
+            lowered == L"bind_link_process_backing_correlation" ||
+            lowered == L"bind_link_inverse_pair" ||
+            lowered == L"cloudfiles_executable_placeholder_mapping" ||
+            lowered == L"cloudfiles_ffi_ppl_image_mapping" ||
+            lowered == L"cloudfiles_placeholder_modified_data" ||
+            lowered == L"cloudfiles_ffi_live_disk_mismatch" ||
             lowered == L"wfp_security_product_block_filter" ||
             lowered == L"wfp_anticheat_block_filter" ||
             lowered == L"wfp_appid_block_condition")
@@ -31309,6 +31801,36 @@ static void PrintHuntSummaryLine(const HuntResult& result)
         std::wcout << L" wfp_filters=" << result.WfpFilterCount
                    << L" suspicious_wfp_filters=" << result.SuspiciousWfpFilterCount;
     }
+    if (result.WfpFilterCoverageIncomplete)
+    {
+        std::wcout << L" wfp_filter_coverage_incomplete=yes";
+    }
+    if (result.QosPolicyCount != 0 ||
+        result.SuspiciousQosPolicyCount != 0)
+    {
+        std::wcout << L" qos_policies=" << result.QosPolicyCount
+                   << L" suspicious_qos_policies="
+                   << result.SuspiciousQosPolicyCount;
+    }
+    if (result.BindFilterMappingCount != 0 ||
+        result.SuspiciousBindFilterMappingCount != 0 ||
+        result.BindFilterProcessBindingCount != 0)
+    {
+        std::wcout << L" bindflt_global_mappings="
+                   << result.BindFilterMappingCount
+                   << L" suspicious_bindflt_global_mappings="
+                   << result.SuspiciousBindFilterMappingCount
+                   << L" bindflt_process_bindings="
+                   << result.BindFilterProcessBindingCount;
+    }
+    if (result.CloudFilePlaceholderImageCount != 0 ||
+        result.SuspiciousCloudFileImageCount != 0)
+    {
+        std::wcout << L" cloudfiles_placeholder_images="
+                   << result.CloudFilePlaceholderImageCount
+                   << L" suspicious_cloudfiles_images="
+                   << result.SuspiciousCloudFileImageCount;
+    }
     if (result.ThreatIntelActive || result.ThreatIntelAvailable || result.ThreatIntelEventCount != 0 || result.ThreatIntelCorrelationCount != 0)
     {
         std::wcout << L" ti_active=" << (result.ThreatIntelActive ? L"yes" : L"no")
@@ -31333,9 +31855,75 @@ static void PrintHuntSummaryLine(const HuntResult& result)
     {
         std::wcout << L" cid_lookup_only=yes";
     }
+    else if (result.CidTableFullProcessEnumeration ||
+             result.CidTableDirectEntryEnumeration)
+    {
+        std::wcout << L" cid_process_full="
+                   << (result.CidTableFullProcessEnumeration
+                           ? L"complete"
+                           : L"incomplete")
+                   << L" cid_direct_entry="
+                   << (result.CidTableDirectEntryEnumeration
+                           ? L"complete"
+                           : L"incomplete")
+                   << L" cid_thread_full="
+                   << (result.CidTableFullThreadEnumeration
+                           ? L"complete"
+                           : L"incomplete")
+                   << L" cid_processes="
+                   << result.CidTableProcessCount
+                   << L" cid_discovered="
+                   << result.CidTableDiscoveredProcessCount
+                   << L" cid_level="
+                   << result.CidTableLevel
+                   << L" cid_leaves="
+                   << result.CidTableAllocatedLeafCount
+                   << L" cid_capacity="
+                   << result.CidTableAllocatedHandleCapacity
+                   << L" cid_probes="
+                   << result.CidTableProbeCount
+                   << L" cid_api_misses="
+                   << result.CidTablePersistentApiMissCount
+                   << L" cid_direct_entries="
+                   << result.CidTableDirectEntryCount
+                   << L" cid_direct_processes="
+                   << result.CidTableDirectProcessCount
+                   << L" cid_direct_threads="
+                   << result.CidTableDirectThreadCount
+                   << L" system_threads="
+                   << result.SystemProcessInfoThreadCount
+                   << L" toolhelp_threads="
+                   << result.ToolhelpThreadCount
+                   << L" cid_unclassified="
+                   << result.CidTableUnclassifiedEntryCount
+                   << L" cid_thread_findings="
+                   << result.CidTableThreadFindingCount
+                   << L" cid_thread_view_misses="
+                   << result.CidTablePersistentThreadViewMissCount
+                   << L" cid_thread_cross_view="
+                   << (result.CidTableThreadCrossViewComplete
+                           ? L"complete"
+                           : L"incomplete")
+                   << L" cid_whole_table="
+                   << (result.CidTableFullEnumeration
+                           ? L"complete"
+                           : L"incomplete");
+    }
     if (result.ThreatIntelCorrelationIncomplete)
     {
         std::wcout << L" ti_correlation_incomplete=yes";
+    }
+    if (result.BindFilterProcessCorrelationCoverageIncomplete)
+    {
+        std::wcout << L" bindflt_process_correlation_incomplete=yes";
+    }
+    if (result.CloudFilePlaceholderCoverageIncomplete)
+    {
+        std::wcout << L" cloudfiles_placeholder_incomplete=yes";
+    }
+    if (result.CloudFileProtectionCorrelationIncomplete)
+    {
+        std::wcout << L" cloudfiles_protection_correlation_incomplete=yes";
     }
     std::wcout << L"\n";
 }
@@ -31459,7 +32047,15 @@ static std::wstring HuntAssessmentWhatText(const std::wstring& kind)
     }
     else if (kind == L"security_communication_blocking")
     {
-        text = L"WFP block policy targets security or anti-cheat communication";
+        text = L"network policy blocks or throttles security-product communication";
+    }
+    else if (kind == L"bind_link_tampering")
+    {
+        text = L"active Bind Filter mapping redirects a security-sensitive filesystem path";
+    }
+    else if (kind == L"cloudfiles_ffi_tampering")
+    {
+        text = L"executable image mapping uses Cloud Files placeholder backing with PPL, modified-data, or live-page divergence evidence";
     }
     else if (kind == L"defense_evasion_process_profile")
     {
@@ -31507,7 +32103,15 @@ static std::wstring HuntAssessmentNextText(const HuntConsoleAssessmentSummary& s
     }
     else if (summary.Kind == L"security_communication_blocking")
     {
-        next = L"run !wfp filters and review filter provider, AppId, and conditions in /json";
+        next = L"review WFP filters plus ActiveStore QoS policy targets and rates in /json";
+    }
+    else if (summary.Kind == L"bind_link_tampering")
+    {
+        next = L"compare virtual/backing paths and process main-section file identity in /json";
+    }
+    else if (summary.Kind == L"cloudfiles_ffi_tampering")
+    {
+        next = L"review placeholder state, modified-data size, process protection, and live-vs-disk evidence in /json";
     }
     else if (summary.Kind == L"defense_evasion_process_profile")
     {
@@ -40461,6 +41065,20 @@ int wmain(int argc, wchar_t** argv)
         {
             return RunConsoleSurfaceSelfTest();
         }
+        if (argc >= 4 &&
+            ToLower(argv[2]) ==
+                L"cloudfiles-query")
+        {
+            return RunCloudFileQuerySelfTest(
+                argv[3]);
+        }
+        if (argc >= 3 &&
+            ToLower(argv[2]) ==
+                L"minifilter-attachments-query")
+        {
+            return
+                RunMinifilterAttachmentQuerySelfTest();
+        }
         if (argc >= 3 && ToLower(argv[2]) == L"all")
         {
             int timelineExit = RunTimelineSelfTest();
@@ -40469,7 +41087,7 @@ int wmain(int argc, wchar_t** argv)
             return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|cloudfiles-query <path>|minifilter-attachments-query|all\n";
         return 2;
     }
 

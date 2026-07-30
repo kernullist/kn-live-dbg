@@ -1340,6 +1340,479 @@ namespace
         return true;
     }
 
+    bool ValidateMinifilterAttachmentContract(
+        const SnapshotDocument& document)
+    {
+        static const wchar_t* kCoverageComplete =
+            L"minifilter_attachments_coverage_complete";
+        static const wchar_t* kRecordCount =
+            L"minifilter_attachment_record_count";
+        static const wchar_t* kVolumeCount =
+            L"minifilter_attachment_volume_count";
+        static const wchar_t* kDetachedCount =
+            L"minifilter_attachment_detached_count";
+        const auto identityPart =
+            [](const std::wstring& value)
+            {
+                const std::wstring normalized =
+                    SnapshotToLower(value);
+                return std::to_wstring(
+                           normalized.size()) +
+                    L":" +
+                    normalized;
+            };
+
+        const auto hasMetadata =
+            [&](const wchar_t* key)
+            {
+                return document.Metadata.find(key) !=
+                    document.Metadata.end();
+            };
+        const bool hasAnyMetadata =
+            hasMetadata(kCoverageComplete) ||
+            hasMetadata(kRecordCount) ||
+            hasMetadata(kVolumeCount) ||
+            hasMetadata(kDetachedCount);
+
+        uint64_t attachmentRecords = 0;
+        uint64_t volumeRecords = 0;
+        uint64_t detachedRecords = 0;
+        bool hasAnyRecord = false;
+        for (const SnapshotRecord& record :
+             document.Records)
+        {
+            const bool domainMatches =
+                record.Domain ==
+                L"minifilter-attachments";
+            const bool volumeTag =
+                SnapshotRecordHasTag(
+                    record,
+                    L"minifilter-volume");
+            const bool attachmentTag =
+                SnapshotRecordHasTag(
+                    record,
+                    L"minifilter-attachment");
+            const bool minifilterTag =
+                SnapshotRecordHasTag(
+                    record,
+                    L"minifilter");
+            const bool legacyTag =
+                SnapshotRecordHasTag(
+                    record,
+                    L"legacy-filter");
+            const bool detachedTag =
+                SnapshotRecordHasTag(
+                    record,
+                    L"detached-volume");
+            if (!domainMatches &&
+                !volumeTag &&
+                !attachmentTag &&
+                !legacyTag &&
+                !detachedTag)
+            {
+                continue;
+            }
+            hasAnyRecord = true;
+            if (!domainMatches ||
+                volumeTag == attachmentTag ||
+                record.Identity.empty() ||
+                record.Identity.find(L'\0') !=
+                    std::wstring::npos)
+            {
+                return false;
+            }
+            for (const auto& item :
+                 record.Evidence)
+            {
+                if (item.first.empty() ||
+                    item.first.find(L'\0') !=
+                        std::wstring::npos ||
+                    item.second.find(L'\0') !=
+                        std::wstring::npos)
+                {
+                    return false;
+                }
+            }
+
+            const auto evidence =
+                [&](const wchar_t* key)
+                    -> const std::wstring*
+                {
+                    const auto item =
+                        record.Evidence.find(key);
+                    return item ==
+                            record.Evidence.end()
+                        ? nullptr
+                        : &item->second;
+                };
+            const std::wstring* volumeName =
+                evidence(L"volume_name");
+            if (volumeName == nullptr ||
+                volumeName->empty())
+            {
+                return false;
+            }
+
+            if (volumeTag)
+            {
+                if (minifilterTag ||
+                    legacyTag ||
+                    detachedTag ||
+                    record.Identity !=
+                        L"minifilter-volume:" +
+                            identityPart(
+                                *volumeName))
+                {
+                    return false;
+                }
+                ++volumeRecords;
+                continue;
+            }
+
+            const std::wstring* kind =
+                evidence(L"kind");
+            const std::wstring* filterName =
+                evidence(L"filter_name");
+            const std::wstring* instanceName =
+                evidence(L"instance_name");
+            const std::wstring* altitude =
+                evidence(L"altitude");
+            const std::wstring* detachedText =
+                evidence(L"detached_volume");
+            if (kind == nullptr ||
+                filterName == nullptr ||
+                filterName->empty() ||
+                instanceName == nullptr ||
+                altitude == nullptr ||
+                detachedText == nullptr)
+            {
+                return false;
+            }
+
+            const std::wstring normalizedKind =
+                SnapshotToLower(*kind);
+            if ((normalizedKind == L"minifilter" &&
+                 (!minifilterTag || legacyTag)) ||
+                (normalizedKind == L"legacy" &&
+                 (!legacyTag || minifilterTag)) ||
+                (normalizedKind != L"minifilter" &&
+                 normalizedKind != L"legacy"))
+            {
+                return false;
+            }
+            if (record.Identity !=
+                L"minifilter-attachment:" +
+                    identityPart(normalizedKind) +
+                    identityPart(*filterName) +
+                    identityPart(*instanceName) +
+                    identityPart(*volumeName) +
+                    identityPart(*altitude))
+            {
+                return false;
+            }
+
+            bool detached = false;
+            if (*detachedText == L"true")
+            {
+                detached = true;
+            }
+            else if (*detachedText != L"false")
+            {
+                return false;
+            }
+            if (detached != detachedTag)
+            {
+                return false;
+            }
+
+            static const wchar_t* kNumericEvidence[] =
+            {
+                L"aggregate_flags",
+                L"instance_flags",
+                L"frame_id",
+                L"volume_filesystem_type",
+                L"supported_features"
+            };
+            for (const wchar_t* key :
+                 kNumericEvidence)
+            {
+                const std::wstring* text =
+                    evidence(key);
+                uint64_t value = 0;
+                if (text == nullptr ||
+                    !TryParseUint64Strict(
+                        *text,
+                        &value))
+                {
+                    return false;
+                }
+            }
+
+            ++attachmentRecords;
+            if (detached)
+            {
+                ++detachedRecords;
+            }
+        }
+
+        if (!hasAnyMetadata)
+        {
+            return !hasAnyRecord;
+        }
+        if (!hasMetadata(kCoverageComplete) ||
+            !hasMetadata(kRecordCount) ||
+            !hasMetadata(kVolumeCount) ||
+            !hasMetadata(kDetachedCount))
+        {
+            return false;
+        }
+
+        const std::wstring& coverageText =
+            document.Metadata.at(
+                kCoverageComplete);
+        if (coverageText != L"true" &&
+            coverageText != L"false")
+        {
+            return false;
+        }
+
+        uint64_t expectedAttachments = 0;
+        uint64_t expectedVolumes = 0;
+        uint64_t expectedDetached = 0;
+        return TryParseUint64Strict(
+                   document.Metadata.at(
+                       kRecordCount),
+                   &expectedAttachments) &&
+            TryParseUint64Strict(
+                document.Metadata.at(
+                    kVolumeCount),
+                &expectedVolumes) &&
+            TryParseUint64Strict(
+                document.Metadata.at(
+                    kDetachedCount),
+                &expectedDetached) &&
+            expectedAttachments ==
+                attachmentRecords &&
+            expectedVolumes == volumeRecords &&
+            expectedDetached == detachedRecords;
+    }
+
+    bool ValidateProcessProtectionEvidence(
+        const SnapshotRecord& record)
+    {
+        if (record.Domain != L"process-security" ||
+            !SnapshotRecordHasTag(
+                record,
+                L"process-protection"))
+        {
+            return true;
+        }
+
+        const auto parseEvidence =
+            [&](const std::wstring& key,
+                uint64_t* value)
+            {
+                const auto item =
+                    record.Evidence.find(key);
+                return item !=
+                        record.Evidence.end() &&
+                    TryParseUint64Strict(
+                        item->second,
+                        value);
+            };
+
+        uint64_t raw = 0;
+        uint64_t hex = 0;
+        uint64_t type = 0;
+        uint64_t audit = 0;
+        uint64_t signer = 0;
+        return parseEvidence(
+                   L"protection_raw",
+                   &raw) &&
+            parseEvidence(
+                L"protection_hex",
+                &hex) &&
+            parseEvidence(
+                L"protection_type",
+                &type) &&
+            parseEvidence(
+                L"protection_audit",
+                &audit) &&
+            parseEvidence(
+                L"protection_signer",
+                &signer) &&
+            raw <=
+                std::numeric_limits<uint8_t>::max() &&
+            hex == raw &&
+            type == (raw & 0x7ull) &&
+            audit == ((raw >> 3) & 0x1ull) &&
+            signer == ((raw >> 4) & 0xfull);
+    }
+
+    bool ValidateProcessSecurityContract(
+        const SnapshotDocument& document)
+    {
+        static const wchar_t*
+            kProtectionResolved =
+                L"process_security_protection_resolved";
+        static const wchar_t*
+            kReadsAttempted =
+                L"process_security_reads_attempted";
+        static const wchar_t*
+            kReadsSucceeded =
+                L"process_security_reads_succeeded";
+        static const wchar_t*
+            kCoverageComplete =
+                L"process_security_coverage_complete";
+
+        const auto hasMetadata =
+            [&](const wchar_t* key)
+            {
+                return document.Metadata.find(key) !=
+                    document.Metadata.end();
+            };
+        const bool hasAnyMetadata =
+            hasMetadata(kProtectionResolved) ||
+            hasMetadata(kReadsAttempted) ||
+            hasMetadata(kReadsSucceeded) ||
+            hasMetadata(kCoverageComplete);
+
+        std::set<std::wstring>
+            processIdentities;
+        for (const SnapshotRecord& record :
+             document.Records)
+        {
+            if (record.Domain == L"process")
+            {
+                processIdentities.insert(
+                    record.Identity);
+            }
+        }
+
+        uint64_t protectionRecords = 0;
+        for (const SnapshotRecord& record :
+             document.Records)
+        {
+            const bool domainSecurity =
+                record.Domain ==
+                    L"process-security";
+            const bool securityTag =
+                SnapshotRecordHasTag(
+                    record,
+                    L"process-security");
+            const bool protectionTag =
+                SnapshotRecordHasTag(
+                    record,
+                    L"process-protection");
+            if (!domainSecurity &&
+                !securityTag &&
+                !protectionTag)
+            {
+                continue;
+            }
+            if (!domainSecurity ||
+                !securityTag ||
+                !protectionTag ||
+                !ValidateProcessProtectionEvidence(
+                    record))
+            {
+                return false;
+            }
+
+            static const std::wstring prefix =
+                L"process-security:";
+            if (record.Identity.size() <=
+                    prefix.size() ||
+                record.Identity.compare(
+                    0,
+                    prefix.size(),
+                    prefix) != 0 ||
+                processIdentities.find(
+                    record.Identity.substr(
+                        prefix.size())) ==
+                    processIdentities.end())
+            {
+                return false;
+            }
+            ++protectionRecords;
+        }
+
+        if (!hasAnyMetadata)
+        {
+            return protectionRecords == 0;
+        }
+        if (!hasMetadata(kProtectionResolved) ||
+            !hasMetadata(kReadsAttempted) ||
+            !hasMetadata(kReadsSucceeded) ||
+            !hasMetadata(kCoverageComplete))
+        {
+            return false;
+        }
+
+        const auto readBool =
+            [&](const wchar_t* key,
+                bool* value)
+            {
+                const std::wstring& text =
+                    document.Metadata.at(key);
+                if (text == L"true")
+                {
+                    *value = true;
+                    return true;
+                }
+                if (text == L"false")
+                {
+                    *value = false;
+                    return true;
+                }
+                return false;
+            };
+        const auto readInteger =
+            [&](const wchar_t* key,
+                uint64_t* value)
+            {
+                return TryParseUint64Strict(
+                    document.Metadata.at(key),
+                    value);
+            };
+
+        bool protectionResolved = false;
+        bool coverageComplete = false;
+        uint64_t readsAttempted = 0;
+        uint64_t readsSucceeded = 0;
+        if (!readBool(
+                kProtectionResolved,
+                &protectionResolved) ||
+            !readBool(
+                kCoverageComplete,
+                &coverageComplete) ||
+            !readInteger(
+                kReadsAttempted,
+                &readsAttempted) ||
+            !readInteger(
+                kReadsSucceeded,
+                &readsSucceeded))
+        {
+            return false;
+        }
+
+        const uint64_t processCount =
+            static_cast<uint64_t>(
+                document.Processes.size());
+        return readsSucceeded ==
+                protectionRecords &&
+            readsSucceeded <=
+                readsAttempted &&
+            readsAttempted ==
+                (protectionResolved
+                     ? processCount
+                     : 0) &&
+            coverageComplete ==
+                (protectionResolved &&
+                 readsAttempted ==
+                     readsSucceeded);
+    }
+
     bool JsonContainsKey(
         const std::wstring& json,
         const std::wstring& key)
@@ -2172,6 +2645,17 @@ bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, 
                 processInventoryValid = false;
                 break;
             }
+            if (!ValidateProcessProtectionEvidence(
+                    record))
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        L"snapshot process-protection evidence is missing, malformed, out of range, or internally inconsistent";
+                }
+                processInventoryValid = false;
+                break;
+            }
             document->Records.push_back(record);
         }
         if (!processInventoryValid)
@@ -2189,6 +2673,26 @@ bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, 
                 *error =
                     L"snapshot contains duplicate " +
                     duplicateIdentity;
+            }
+            break;
+        }
+        if (!ValidateMinifilterAttachmentContract(
+                *document))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot minifilter attachment metadata, records, tags, and evidence are inconsistent";
+            }
+            break;
+        }
+        if (!ValidateProcessSecurityContract(
+                *document))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    L"snapshot process-security metadata, records, and process inventory are inconsistent";
             }
             break;
         }
@@ -2518,6 +3022,239 @@ bool SnapshotJsonStrictParsingSelfTest()
     if (SnapshotDocumentIdentitiesUnique(
             duplicateRecord,
             &duplicate))
+    {
+        return false;
+    }
+
+    SnapshotRecord protection = {};
+    protection.Domain = L"process-security";
+    protection.Tags =
+        {L"process-security", L"process-protection"};
+    protection.Evidence[L"protection_raw"] =
+        L"49";
+    protection.Evidence[L"protection_hex"] =
+        L"0x31";
+    protection.Evidence[L"protection_type"] =
+        L"1";
+    protection.Evidence[L"protection_audit"] =
+        L"0";
+    protection.Evidence[L"protection_signer"] =
+        L"3";
+    if (!ValidateProcessProtectionEvidence(
+            protection))
+    {
+        return false;
+    }
+    protection.Evidence[L"protection_raw"] =
+        L"49junk";
+    if (ValidateProcessProtectionEvidence(
+            protection))
+    {
+        return false;
+    }
+    protection.Evidence[L"protection_raw"] =
+        L"49";
+    protection.Evidence[L"protection_signer"] =
+        L"4";
+    if (ValidateProcessProtectionEvidence(
+            protection))
+    {
+        return false;
+    }
+
+    protection.Evidence[L"protection_signer"] =
+        L"3";
+    protection.Identity =
+        L"process-security:process-1";
+    SnapshotRecord process = {};
+    process.Domain = L"process";
+    process.Identity = L"process-1";
+    SnapshotDocument securityContract = {};
+    securityContract.Processes.resize(1);
+    securityContract.Records =
+        {process, protection};
+    securityContract.Metadata[
+        L"process_security_protection_resolved"] =
+            L"true";
+    securityContract.Metadata[
+        L"process_security_reads_attempted"] =
+            L"1";
+    securityContract.Metadata[
+        L"process_security_reads_succeeded"] =
+            L"1";
+    securityContract.Metadata[
+        L"process_security_coverage_complete"] =
+            L"true";
+    if (!ValidateProcessSecurityContract(
+            securityContract))
+    {
+        return false;
+    }
+
+    SnapshotDocument missingTag =
+        securityContract;
+    missingTag.Records[1].Tags =
+        {L"process-security"};
+    if (ValidateProcessSecurityContract(
+            missingTag))
+    {
+        return false;
+    }
+
+    SnapshotDocument countMismatch =
+        securityContract;
+    countMismatch.Metadata[
+        L"process_security_reads_succeeded"] =
+            L"0";
+    if (ValidateProcessSecurityContract(
+            countMismatch))
+    {
+        return false;
+    }
+
+    SnapshotDocument invalidCoverage =
+        securityContract;
+    invalidCoverage.Metadata[
+        L"process_security_coverage_complete"] =
+            L"false";
+    if (ValidateProcessSecurityContract(
+            invalidCoverage))
+    {
+        return false;
+    }
+
+    SnapshotRecord minifilterVolume = {};
+    minifilterVolume.Domain =
+        L"minifilter-attachments";
+    minifilterVolume.Identity =
+        L"minifilter-volume:23:\\device\\harddiskvolume3";
+    minifilterVolume.Tags =
+        {L"minifilter-volume"};
+    minifilterVolume.Evidence[L"volume_name"] =
+        L"\\Device\\HarddiskVolume3";
+
+    SnapshotRecord minifilterAttachment = {};
+    minifilterAttachment.Domain =
+        L"minifilter-attachments";
+    minifilterAttachment.Identity =
+        L"minifilter-attachment:"
+        L"10:minifilter"
+        L"14:selftestfilter"
+        L"17:selftest instance"
+        L"23:\\device\\harddiskvolume3"
+        L"6:370000";
+    minifilterAttachment.Tags =
+        {
+            L"minifilter-attachment",
+            L"minifilter"
+        };
+    minifilterAttachment.Evidence[L"kind"] =
+        L"minifilter";
+    minifilterAttachment.Evidence[L"filter_name"] =
+        L"SelfTestFilter";
+    minifilterAttachment.Evidence[L"instance_name"] =
+        L"SelfTest Instance";
+    minifilterAttachment.Evidence[L"altitude"] =
+        L"370000";
+    minifilterAttachment.Evidence[L"volume_name"] =
+        L"\\Device\\HarddiskVolume3";
+    minifilterAttachment.Evidence[L"detached_volume"] =
+        L"false";
+    minifilterAttachment.Evidence[L"aggregate_flags"] =
+        L"0x00000001";
+    minifilterAttachment.Evidence[L"instance_flags"] =
+        L"0x00000000";
+    minifilterAttachment.Evidence[L"frame_id"] =
+        L"0";
+    minifilterAttachment.Evidence[
+        L"volume_filesystem_type"] =
+            L"2";
+    minifilterAttachment.Evidence[
+        L"supported_features"] =
+            L"0x00000000";
+
+    SnapshotDocument minifilterContract = {};
+    minifilterContract.Records =
+        {
+            minifilterVolume,
+            minifilterAttachment
+        };
+    minifilterContract.Metadata[
+        L"minifilter_attachments_coverage_complete"] =
+            L"true";
+    minifilterContract.Metadata[
+        L"minifilter_attachment_record_count"] =
+            L"1";
+    minifilterContract.Metadata[
+        L"minifilter_attachment_volume_count"] =
+            L"1";
+    minifilterContract.Metadata[
+        L"minifilter_attachment_detached_count"] =
+            L"0";
+    if (!ValidateMinifilterAttachmentContract(
+            minifilterContract))
+    {
+        return false;
+    }
+
+    SnapshotDocument minifilterCountMismatch =
+        minifilterContract;
+    minifilterCountMismatch.Metadata[
+        L"minifilter_attachment_record_count"] =
+            L"0";
+    if (ValidateMinifilterAttachmentContract(
+            minifilterCountMismatch))
+    {
+        return false;
+    }
+
+    SnapshotDocument minifilterIdentityMismatch =
+        minifilterContract;
+    minifilterIdentityMismatch.Records[1].
+        Identity += L"-spoofed";
+    if (ValidateMinifilterAttachmentContract(
+            minifilterIdentityMismatch))
+    {
+        return false;
+    }
+
+    SnapshotDocument minifilterDetachedMismatch =
+        minifilterContract;
+    minifilterDetachedMismatch.Records[1].
+        Tags.push_back(L"detached-volume");
+    if (ValidateMinifilterAttachmentContract(
+            minifilterDetachedMismatch))
+    {
+        return false;
+    }
+
+    SnapshotDocument minifilterMissingMetadata =
+        minifilterContract;
+    minifilterMissingMetadata.Metadata.erase(
+        L"minifilter_attachment_volume_count");
+    if (ValidateMinifilterAttachmentContract(
+            minifilterMissingMetadata))
+    {
+        return false;
+    }
+
+    SnapshotDocument minifilterWrongDomain =
+        minifilterContract;
+    minifilterWrongDomain.Records[1].Domain =
+        L"callbacks";
+    if (ValidateMinifilterAttachmentContract(
+            minifilterWrongDomain))
+    {
+        return false;
+    }
+
+    SnapshotDocument minifilterEmbeddedNull =
+        minifilterContract;
+    minifilterEmbeddedNull.Records[1].
+        Evidence[L"filter_name"].push_back(
+            L'\0');
+    if (ValidateMinifilterAttachmentContract(
+            minifilterEmbeddedNull))
     {
         return false;
     }

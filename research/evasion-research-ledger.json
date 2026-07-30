@@ -1,0 +1,1033 @@
+{
+  "schema": "kn-live-dbg.evasion-research-ledger.v1",
+  "title": "KNLiveDbg Windows defense-evasion research and claim ledger",
+  "reviewed_through": "2026-07-30",
+  "scope": {
+    "platform": "Windows x64 kernel, process, file-system, telemetry, and security-product impairment",
+    "start_date": "2023-01-01",
+    "interpretation": "Systematic public-source coverage of the listed technique families; it is not a claim that private or unpublished research is enumerable.",
+    "exclusions": [
+      "weaponized exploit execution",
+      "private threat-intelligence feeds",
+      "remote EDR control-plane authorization",
+      "claims inferred only from an adjacent telemetry source"
+    ]
+  },
+  "refresh_policy": {
+    "max_review_age_days": 45,
+    "max_source_verification_age_days": 45,
+    "minimum_source_types": [
+      "vendor-research",
+      "academic-paper",
+      "official-doc",
+      "open-test",
+      "detection-strategy",
+      "reference-source"
+    ],
+    "discovery_endpoints": [
+      {
+        "id": "bitdefender-labs",
+        "url": "https://www.bitdefender.com/en-gb/blog/businessinsights/",
+        "last_checked_on": "2026-07-30"
+      },
+      {
+        "id": "elastic-security-labs",
+        "url": "https://www.elastic.co/security-labs/category/internals",
+        "last_checked_on": "2026-07-30"
+      },
+      {
+        "id": "eset-research",
+        "url": "https://www.welivesecurity.com/en/eset-research/",
+        "last_checked_on": "2026-07-30"
+      },
+      {
+        "id": "google-threat-intelligence",
+        "url": "https://cloud.google.com/blog/topics/threat-intelligence",
+        "last_checked_on": "2026-07-30"
+      },
+      {
+        "id": "mitre-attack-updates",
+        "url": "https://attack.mitre.org/resources/updates/",
+        "last_checked_on": "2026-07-30"
+      },
+      {
+        "id": "safebreach-research",
+        "url": "https://www.safebreach.com/resources/research/",
+        "last_checked_on": "2026-07-30"
+      },
+      {
+        "id": "arxiv-security-recent",
+        "url": "https://arxiv.org/list/cs.CR/recent",
+        "last_checked_on": "2026-07-30"
+      },
+      {
+        "id": "atomic-red-team-t1685",
+        "url": "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/T1685/T1685.yaml",
+        "last_checked_on": "2026-07-30"
+      }
+    ]
+  },
+  "sources": [
+    {
+      "id": "bitdefender-bind-link-2026",
+      "title": "Bind Link Abuse: One Windows Feature, Many Ways to Blind Your EDR",
+      "publisher": "Bitdefender Labs",
+      "published_on": "2026-07-15",
+      "verified_on": "2026-07-30",
+      "url": "https://www.bitdefender.com/en-gb/blog/businessinsights/bind-link-abuses-windows-feature-edr-evasion-technique",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Research article and linked author tooling describe File-Binding, Process-Binding, and Silo-Binding.",
+      "primitive": "bindflt mappings can decouple visible paths from the file object and image backing used for execution"
+    },
+    {
+      "id": "elastic-cloudfiles-ffi-2026",
+      "title": "The Immutable Illusion: Pwning Your Kernel with Cloud Files",
+      "publisher": "Elastic Security Labs",
+      "published_on": "2026-02-20",
+      "verified_on": "2026-07-30",
+      "url": "https://www.elastic.co/security-labs/immutable-illusion",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Author research documents Cloud Filter-backed False File Immutability and Redux/GodFault-Redux.",
+      "primitive": "CloudFiles state changes can violate executable file immutability after a trust decision"
+    },
+    {
+      "id": "eset-edr-killers-2026",
+      "title": "EDR killers explained: Beyond the drivers",
+      "publisher": "ESET Research",
+      "published_on": "2026-03-19",
+      "verified_on": "2026-07-30",
+      "url": "https://www.welivesecurity.com/en/eset-research/edr-killers-explained-beyond-the-drivers/",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Telemetry-backed study of almost 90 EDR killers and driverless impairment techniques.",
+      "primitive": "security products are terminated, suspended, disconnected, or impaired through reusable driver and driverless primitives"
+    },
+    {
+      "id": "atomic-red-team-qos-2026",
+      "title": "T1685 Throttle Cybersecurity Agent Network Traffic via QoS Policy",
+      "publisher": "Red Canary Atomic Red Team",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/T1685/T1685.yaml",
+      "source_type": "open-test",
+      "primary": true,
+      "version_note": "Living upstream test reviewed at the QoS policy atomic GUID 7dd05b3e-0803-4852-9345-c494eb3e40fe.",
+      "primitive": "an ActiveStore per-application QoS rule can throttle a security agent to eight bits per second"
+    },
+    {
+      "id": "elastic-abyssworker-2025",
+      "title": "Shedding light on the ABYSSWORKER driver",
+      "publisher": "Elastic Security Labs",
+      "published_on": "2025-03-20",
+      "verified_on": "2026-07-30",
+      "url": "https://www.elastic.co/security-labs/abyssworker",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Reverse engineering enumerates callback removal, dispatch replacement, minifilter detach, and thread/process termination handlers.",
+      "primitive": "a kernel driver can remove callbacks, replace dispatch tables, detach filter devices, and terminate security threads"
+    },
+    {
+      "id": "safebreach-poolparty-2023",
+      "title": "Process Injection Using Windows Thread Pools",
+      "publisher": "SafeBreach Labs",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://www.safebreach.com/blog/process-injection-using-windows-thread-pools/",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Black Hat Europe 2023 research page describing eight PoolParty variants.",
+      "primitive": "worker-factory, task, completion, and timer queue objects can retain dormant cross-process execution callbacks"
+    },
+    {
+      "id": "safebreach-windows-downdate-2024",
+      "title": "Update on Windows Downdate",
+      "publisher": "SafeBreach Labs",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://www.safebreach.com/blog/update-on-windows-downdate-downgrade-attacks/",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Follow-on to the Black Hat USA 2024 and DEF CON 32 Windows Downdate research.",
+      "primitive": "trusted Windows update flows can roll back CI, kernel, secure-kernel, and hypervisor components while normal version posture appears current"
+    },
+    {
+      "id": "mitre-kernelcallbacktable-det0577",
+      "title": "Detection Strategy DET0577 for KernelCallbackTable hijacking",
+      "publisher": "MITRE ATT&CK",
+      "published_on": "2025-10-21",
+      "verified_on": "2026-07-30",
+      "url": "https://attack.mitre.org/detectionstrategies/DET0577/",
+      "source_type": "detection-strategy",
+      "primary": true,
+      "version_note": "Version 1.0; page last modified 2026-05-12.",
+      "primitive": "unexpected PEB KernelCallbackTable modification followed by GUI callback execution"
+    },
+    {
+      "id": "mitre-tls-callback-det0467",
+      "title": "Detection Strategy DET0467 for TLS callback injection",
+      "publisher": "MITRE ATT&CK",
+      "published_on": "2025-10-21",
+      "verified_on": "2026-07-30",
+      "url": "https://attack.mitre.org/detectionstrategies/DET0467/",
+      "source_type": "detection-strategy",
+      "primary": true,
+      "version_note": "Version 1.0; page last modified 2026-05-12.",
+      "primitive": "PE TLS-directory modification and hollowing can redirect execution before the nominal entry point"
+    },
+    {
+      "id": "springer-byovd-detector-2026",
+      "title": "Finding vulnerable drivers with hooking and reading result verification",
+      "publisher": "Springer Cybersecurity",
+      "published_on": "2026-05-13",
+      "verified_on": "2026-07-30",
+      "url": "https://link.springer.com/article/10.1186/s42400-025-00434-w",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "Open-access BYOVD Detector paper, volume 9 article 166.",
+      "primitive": "dispatch discovery plus symbolic reachability and read-result verification can identify unknown vulnerable IOCTL paths with fewer false positives"
+    },
+    {
+      "id": "ndss-byovd-threats-2026",
+      "title": "Unveiling BYOVD Threats: Malware's Use and Abuse of Kernel Drivers",
+      "publisher": "NDSS Symposium",
+      "published_on": "2026-02-23",
+      "verified_on": "2026-07-30",
+      "url": "https://www.ndss-symposium.org/wp-content/uploads/2026-s1491-paper.pdf",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "NDSS 2026 paper DOI 10.14722/ndss.2026.231491; authors report a virtualization-based end-to-end kernel trace over 8,779 malware samples and 773 signed drivers.",
+      "primitive": "correlating the originating user request with dispatch, indirect kernel control flow, and resulting sensitive actions exposes previously unknown BYOVD behavior"
+    },
+    {
+      "id": "microsoft-pslookup-process-doc",
+      "title": "PsLookupProcessByProcessId function",
+      "publisher": "Microsoft Learn",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-pslookupprocessbyprocessid",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "WDK contract documents referenced EPROCESS return semantics and STATUS_INVALID_CID for absent client IDs on Windows Vista and later.",
+      "primitive": "a candidate process ID can be independently converted to a referenced EPROCESS or rejected as an invalid client ID"
+    },
+    {
+      "id": "microsoft-pslookup-thread-doc",
+      "title": "PsLookupThreadByThreadId function",
+      "publisher": "Microsoft Learn",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-pslookupthreadbythreadid",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "WDK contract documents referenced ETHREAD return semantics and STATUS_INVALID_PARAMETER when a thread ID is absent.",
+      "primitive": "a thread client ID can be resolved to a referenced ETHREAD, providing an exported comparison surface for direct CID-entry decoding"
+    },
+    {
+      "id": "volatility3-handle-table-walk-2026",
+      "title": "Volatility 3 Windows handle-table traversal",
+      "publisher": "Volatility Foundation",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://github.com/volatilityfoundation/volatility3/blob/fffd844b8ed7df500e74115a0ee6f818e6afa59f/volatility3/framework/plugins/windows/handles.py",
+      "source_type": "reference-source",
+      "primary": true,
+      "version_note": "Pinned develop commit fffd844b8ed7df500e74115a0ee6f818e6afa59f; the current parser masks the low three TableCode bits and recursively walks 4 KiB pointer or entry arrays.",
+      "primitive": "handle-table levels and allocated pointer pages provide an independent structural bound instead of trusting only a scalar high-water field"
+    },
+    {
+      "id": "reactos-handle-table-layout-2026",
+      "title": "ReactOS executive handle-table implementation",
+      "publisher": "ReactOS",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://github.com/reactos/reactos/blob/c606fd79b1c879bad37e49a69e71986dfbc2052e/ntoskrnl/ex/handle.c",
+      "source_type": "reference-source",
+      "primary": true,
+      "version_note": "Pinned master commit c606fd79b1c879bad37e49a69e71986dfbc2052e; the implementation documents level 0/1/2 lookup, tag-bit clearing, and NextHandleNeedingPool as the allocated-range bound.",
+      "primitive": "a valid handle-table allocation grows through contiguous low-level pages whose capacity and lookup bound must agree"
+    },
+    {
+      "id": "arxiv-rx-int-2025",
+      "title": "RX-INT: A Kernel Engine for Real-Time Detection and Analysis of In-Memory Threats",
+      "publisher": "arXiv",
+      "published_on": "2025-08-05",
+      "verified_on": "2026-07-30",
+      "url": "https://arxiv.org/abs/2508.03879",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "arXiv v1.",
+      "primitive": "event-driven thread creation plus stateful VAD and memory hashing reduces TOCTOU gaps for manual maps and module stomping"
+    },
+    {
+      "id": "arxiv-lase-2025",
+      "title": "An In-kernel Forensics Engine for Investigating Evasive Attacks",
+      "publisher": "arXiv",
+      "published_on": "2025-05-10",
+      "verified_on": "2026-07-30",
+      "url": "https://arxiv.org/abs/2505.06498",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "arXiv v2 reviewed.",
+      "primitive": "low-artifact longitudinal kernel provenance provides process, thread, IRP, and Fast-I/O evidence before attackers clean up"
+    },
+    {
+      "id": "arxiv-trace-times-2025",
+      "title": "Trace of the Times: Rootkit Detection through Temporal Anomalies in Kernel Activity",
+      "publisher": "arXiv",
+      "published_on": "2025-03-04",
+      "verified_on": "2026-07-30",
+      "url": "https://arxiv.org/abs/2503.02402",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "arXiv v1.",
+      "primitive": "kernel hook execution can create statistically detectable shifts in function timing distributions"
+    },
+    {
+      "id": "usenix-eviledr-2025",
+      "title": "EvilEDR: Repurposing EDR as an Offensive Tool",
+      "publisher": "USENIX Security 2025",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://www.usenix.org/conference/usenixsecurity25/presentation/alachkar",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "USENIX Security 2025 paper and artifact page.",
+      "primitive": "trusted EDR response consoles can be abused for command execution, transfer, collection, and exfiltration"
+    },
+    {
+      "id": "mandiant-attestation-malware-2022",
+      "title": "I Solemnly Swear My Driver Is Up to No Good: Hunting for Attestation Signed Malware",
+      "publisher": "Mandiant",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://cloud.google.com/blog/topics/threat-intelligence/hunting-attestation-signed-malware",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Mandiant research page and hunting-rule discussion.",
+      "primitive": "Microsoft attestation signatures do not establish benign driver behavior"
+    },
+    {
+      "id": "microsoft-bindlink-doc",
+      "title": "Bindlink overview",
+      "publisher": "Microsoft Learn",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/bindlink/",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "Living Windows API documentation.",
+      "primitive": "bind links provide file-system redirection with documented creation and removal APIs"
+    },
+    {
+      "id": "microsoft-filtermanager-enumeration-doc",
+      "title": "FilterVolumeInstanceFindFirst",
+      "publisher": "Microsoft Learn",
+      "published_on": null,
+      "verified_on": "2026-07-30",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/api/fltuser/nf-fltuser-filtervolumeinstancefindfirst",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "Living Filter Manager user-mode enumeration documentation.",
+      "primitive": "Filter Manager exposes a documented volume-instance aggregate enumeration view"
+    }
+  ],
+  "techniques": [
+    {
+      "id": "callback-registration-removal",
+      "title": "Security callback removal with owner persistence",
+      "family": "kernel-defense-tampering",
+      "status": "covered",
+      "claim": "supported",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "elastic-abyssworker-2025",
+        "eset-edr-killers-2026"
+      ],
+      "observable": "A stable callback identity disappears in the same boot while current callback/module coverage is complete and the owning image remains loaded.",
+      "detector_anchors": [
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "L\"callback-removed\""
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "callbackResult.Removed != 1"
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "callback removal comparison skipped because current"
+        },
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "callbackReregisteredResult.Removed != 0"
+        }
+      ],
+      "validation_commands": [
+        ".\\x64\\Release\\KnLiveDbg.exe --self-test all",
+        ".\\tools\\validate-hunt-readiness.ps1 -Root . -SkipSmoke"
+      ],
+      "limitations": [],
+      "next_action": ""
+    },
+    {
+      "id": "process-protection-delta",
+      "title": "Same-identity EPROCESS protection change or evidence removal",
+      "family": "kernel-defense-tampering",
+      "status": "covered",
+      "claim": "supported",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "elastic-cloudfiles-ffi-2026",
+        "eset-edr-killers-2026"
+      ],
+      "observable": "The exact EPROCESS protection byte changes for a stable same-boot process identity, or its protection record disappears while the process remains.",
+      "detector_anchors": [
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "L\"baseline-protection-change\""
+        },
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "L\"process-protection-evidence-removed\""
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "ProcessProtectionChanged("
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "process protection removal comparison skipped because current process-security coverage is incomplete"
+        }
+      ],
+      "validation_commands": [
+        ".\\x64\\Release\\KnLiveDbg.exe --self-test all"
+      ],
+      "limitations": [],
+      "next_action": ""
+    },
+    {
+      "id": "security-process-suspend-freeze",
+      "title": "Whole-security-process suspend or freeze",
+      "family": "security-product-impairment",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "eset-edr-killers-2026"
+      ],
+      "observable": "Every thread of a known security process has resolved nonzero SuspendCount or FreezeCount in two stable fresh scans with complete inventory.",
+      "detector_anchors": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "L\"all_observed_threads_suspended\""
+        },
+        {
+          "path": "user/ProcessTriageScanner.cpp",
+          "contains": "L\"thread suspend/freeze state coverage is incomplete\""
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "bool HuntSecurityProcessFreezeSelfTest()"
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "all-thread suspend/freeze evidence was not stable across fresh scans"
+        }
+      ],
+      "validation_commands": [
+        ".\\x64\\Release\\KnLiveDbg.exe --self-test all",
+        ".\\tools\\run-evasion-external-gate.ps1 -Root . -CleanRunCount 3 -NoElevation"
+      ],
+      "limitations": [
+        "A live fixture must not suspend a real security product; only non-destructive host observation and isolated synthetic controls are permitted."
+      ],
+      "next_action": "Add an isolated expendable process fixture for whole-process suspension semantics without targeting an installed security product."
+    },
+    {
+      "id": "wfp-security-communication-block",
+      "title": "WFP security-product communication blocking",
+      "family": "security-product-impairment",
+      "status": "covered",
+      "claim": "supported",
+      "priority": "P1",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "eset-edr-killers-2026"
+      ],
+      "observable": "An enabled WFP block or bitmask-block filter contains a decoded application identity targeting a known security product or anti-cheat process.",
+      "detector_anchors": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "L\"wfp_security_product_block_filter\""
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "result->WfpFilterCoverageIncomplete ="
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "bool HuntWfpPolicySelfTest()"
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "permit.ActionText = L\"Permit\";"
+        }
+      ],
+      "validation_commands": [
+        ".\\tools\\validate-eset-hunt-iocs.ps1 -Root .",
+        ".\\tools\\validate-hunt-readiness.ps1 -Root . -SkipSmoke"
+      ],
+      "limitations": [],
+      "next_action": ""
+    },
+    {
+      "id": "known-byovd-artifact-correlation",
+      "title": "Known BYOVD and EDR-killer artifact correlation",
+      "family": "byovd",
+      "status": "covered",
+      "claim": "supported",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "eset-edr-killers-2026",
+        "elastic-abyssworker-2025",
+        "mandiant-attestation-malware-2022"
+      ],
+      "observable": "Loaded drivers, driver services, process images, hashes, and security-product impairment behavior match a curated published artifact or profile.",
+      "detector_anchors": [
+        {
+          "path": "user/main.cpp",
+          "contains": "known_defense_evasion_driver_service"
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "bool HuntEdrKillerProfileSelfTest()"
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "L\"C:\\\\Temp\\\\GentlemenCollectionBackup\\\\Kasps1.exe\""
+        }
+      ],
+      "validation_commands": [
+        ".\\tools\\validate-eset-hunt-iocs.ps1 -Root .",
+        ".\\tools\\validate-hunt-readiness.ps1 -Root . -SkipSmoke"
+      ],
+      "limitations": [],
+      "next_action": ""
+    },
+    {
+      "id": "qos-security-agent-throttle",
+      "title": "Policy-based QoS throttling of security agents",
+      "family": "security-product-impairment",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "atomic-red-team-qos-2026",
+        "eset-edr-killers-2026"
+      ],
+      "observable": "A Policy-based QoS rule with an extreme throttle targets a known security-product executable and exposes complete policy-store metadata.",
+      "detector_anchors": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "L\"qos_security_product_throttle_policy\""
+        },
+        {
+          "path": "user/QosPolicyScanner.cpp",
+          "contains": "MSFT_NetQosPolicySettingData"
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "tools/validate-qos-bind-e2e-selftest.ps1",
+          "contains": "\"qos_security_product_throttle_policy\""
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "tools/validate-qos-bind-e2e-selftest.ps1",
+          "contains": "qos-incomplete"
+        }
+      ],
+      "validation_commands": [
+        ".\\tools\\validate-qos-bind-e2e-selftest.ps1 -Root .",
+        ".\\tools\\run-evasion-external-gate.ps1 -Root . -CleanRunCount 3 -NoElevation"
+      ],
+      "limitations": [
+        "The detector covers Policy-based QoS state; independent traffic shaping outside the NetQos policy surfaces remains a separate technique."
+      ],
+      "next_action": "Add a separately attributable control for non-NetQos traffic shaping before extending the detector claim."
+    },
+    {
+      "id": "bind-link-global-file-process",
+      "title": "Global Bind Filter File-Binding and Process-Binding",
+      "family": "file-identity-evasion",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "bitdefender-bind-link-2026",
+        "microsoft-bindlink-doc"
+      ],
+      "observable": "An active global mapping crosses a protected/security boundary or an exact visible process source disagrees with two agreeing kernel-backed image identities.",
+      "detector_anchors": [
+        {
+          "path": "user/BindFilterScanner.cpp",
+          "contains": "BfGetMappings"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "L\"bind_link_process_binding_state\""
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "tools/validate-qos-bind-e2e-selftest.ps1",
+          "contains": "\"bind_link_process_backing_correlation\""
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "tools/validate-qos-bind-e2e-selftest.ps1",
+          "contains": "bind-process-incomplete"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "bindflt_silo_coverage_unsupported"
+        }
+      ],
+      "validation_commands": [
+        ".\\x64\\Release\\KnLiveDbgBindFixture.exe --self-test",
+        ".\\tools\\validate-qos-bind-e2e-selftest.ps1 -Root .",
+        ".\\tools\\run-evasion-external-gate.ps1 -Root . -CleanRunCount 3 -NoElevation"
+      ],
+      "limitations": [
+        "Silo-scoped mapping enumeration and in-silo file identity remain unsupported."
+      ],
+      "next_action": "Design silo Job discovery and in-silo mapping enumeration without inferring either from the host-global view."
+    },
+    {
+      "id": "cloudfiles-ffi-current-state",
+      "title": "CloudFiles False File Immutability current-state provenance",
+      "family": "file-identity-evasion",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "elastic-cloudfiles-ffi-2026"
+      ],
+      "observable": "A SEC_IMAGE backing is a CloudFiles placeholder and correlates with PP/PPL state, modified data, or an independent deep live-versus-disk mismatch.",
+      "detector_anchors": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "L\"cloudfiles_false_file_immutability\""
+        },
+        {
+          "path": "user/CloudFileScanner.cpp",
+          "contains": "FSCTL_GET_REPARSE_POINT"
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "tools/validate-cloudfiles-hunt-e2e-selftest.ps1",
+          "contains": "modified-positive"
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "tools/validate-cloudfiles-hunt-e2e-selftest.ps1",
+          "contains": "in-sync-negative"
+        },
+        {
+          "path": "tools/validate-cloudfiles-hunt-e2e-selftest.ps1",
+          "contains": "coverage-incomplete"
+        }
+      ],
+      "validation_commands": [
+        ".\\tools\\validate-cloudfiles-hunt-e2e-selftest.ps1 -Root .",
+        ".\\tools\\run-evasion-external-gate.ps1 -Root . -CleanRunCount 3 -NoElevation"
+      ],
+      "limitations": [
+        "Current state does not reconstruct dehydrate/rehydrate callbacks or immutable file-generation history."
+      ],
+      "next_action": "Add file-generation provenance only when an independent read-only observable becomes available."
+    },
+    {
+      "id": "minifilter-attachment-removal",
+      "title": "Filter Manager attachment detach or disappearance",
+      "family": "storage-stack-tampering",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P0",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "elastic-abyssworker-2025",
+        "microsoft-filtermanager-enumeration-doc"
+      ],
+      "observable": "A documented Filter Manager instance becomes detached or disappears in the same boot while the volume and independently registered filter persist and coverage is complete.",
+      "detector_anchors": [
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "L\"minifilter-attachment-removed\""
+        },
+        {
+          "path": "user/MinifilterAttachmentScanner.cpp",
+          "contains": "FilterVolumeInstanceFindFirst"
+        },
+        {
+          "path": "user/SnapshotJson.cpp",
+          "contains": "ValidateMinifilterAttachmentContract"
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "tools/validate-minifilter-detach-e2e-selftest.ps1",
+          "contains": "removed=1 high=0 medium=1"
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "tools/validate-minifilter-detach-e2e-selftest.ps1",
+          "contains": "attachment-incomplete"
+        },
+        {
+          "path": "user/SnapshotDiff.cpp",
+          "contains": "minifilter attachment removal comparison skipped because current attachment or callback coverage is incomplete"
+        }
+      ],
+      "validation_commands": [
+        ".\\tools\\validate-minifilter-detach-e2e-selftest.ps1 -Root .",
+        ".\\tools\\run-evasion-external-gate.ps1 -Root . -CleanRunCount 3 -NoElevation"
+      ],
+      "limitations": [
+        "The documented Filter Manager view does not prove arbitrary legacy device-stack topology or causal attribution."
+      ],
+      "next_action": "Retain arbitrary legacy device-stack topology as a separate unsupported technique until an independent bounded inventory exists."
+    },
+    {
+      "id": "stateful-in-memory-evasion",
+      "title": "Manual map, module stomping, and transient executable-memory provenance",
+      "family": "process-injection",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P1",
+      "release_gate": "backlog",
+      "source_ids": [
+        "arxiv-rx-int-2025",
+        "arxiv-lase-2025"
+      ],
+      "observable": "Executable VAD/page state, loader and backing-file cross-views, thread/APC/stack provenance, and live-versus-disk bytes disagree.",
+      "detector_anchors": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "module_stomping_permission_evidence"
+        },
+        {
+          "path": "user/ProcessTriageScanner.cpp",
+          "contains": "thread suspend/freeze state coverage is incomplete"
+        }
+      ],
+      "positive_controls": [
+        {
+          "path": "user/main.cpp",
+          "contains": "hunt-managed-loaderless-runtime-gate"
+        }
+      ],
+      "negative_controls": [
+        {
+          "path": "user/ProcessTriageScanner.cpp",
+          "contains": "EXECUTE_WRITECOPY"
+        }
+      ],
+      "validation_commands": [
+        ".\\x64\\Release\\KnLiveDbg.exe --self-test all"
+      ],
+      "limitations": [
+        "Periodic collection leaves a TOCTOU gap compared with event-driven stateful hashing.",
+        "Headerless kernel executable pages are not yet covered by a full ownership sweep."
+      ],
+      "next_action": "Add event-driven or higher-frequency provenance capture and a header-independent executable-page ownership corpus."
+    },
+    {
+      "id": "pspcidtable-full-cross-view",
+      "title": "Full PspCidTable process and thread cross-view",
+      "family": "kernel-object-hiding",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P1",
+      "release_gate": "satisfied",
+      "source_ids": [
+        "arxiv-lase-2025",
+        "eset-edr-killers-2026",
+        "microsoft-pslookup-process-doc",
+        "microsoft-pslookup-thread-doc",
+        "volatility3-handle-table-walk-2026",
+        "reactos-handle-table-layout-2026"
+      ],
+      "observable": "Stable typed process or thread objects decoded directly from every allocated PspCidTable entry disagree with ActiveProcessLinks, both EPROCESS/KPROCESS thread lists, SystemProcessInformation, Toolhelp, or the exported lookup views for the same live PID/TID, object address, owner, create time, and lifecycle.",
+      "detector_anchors": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "cid full process enumeration"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "cid_only_process"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "NextHandleNeedingPool disagrees with the independently walked allocated-leaf capacity"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "cid direct enumeration: entries="
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "L\"thread_cross_view\""
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "thread_owner_process_missing"
+        }
+      ],
+      "positive_controls": [
+    {
+      "path": "user/main.cpp",
+      "contains": "hunt-cid-table-anchor-cross-function"
+    }
+      ],
+      "negative_controls": [
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "CidIdentityRevalidated = false"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "visibleNegative"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "sparsePointers"
+        },
+        {
+          "path": "tools/validate-hunt-clean-host-selftest.ps1",
+          "contains": "cid-topology-mismatch"
+        },
+        {
+          "path": "tools/validate-hunt-clean-host-selftest.ps1",
+          "contains": "cid-thread-identity-unstable"
+        },
+        {
+          "path": "user/UserModeHunter.cpp",
+          "contains": "IsCoherentCidThreadLifecycleTransition"
+        }
+      ],
+      "validation_commands": [
+        ".\\x64\\Release\\KnLiveDbg.exe --self-test all",
+        ".\\tools\\validate-hunt-clean-host-selftest.ps1 -Root .",
+        ".\\tools\\analyze-hunt-clean-host-selftest.ps1 -Root .",
+        ".\\tools\\validate-hunt-readiness.ps1 -Configuration Release -SkipSmoke",
+        ".\\tools\\run-evasion-external-gate.ps1 -Configuration Release -Volume C: -CleanRunCount 3"
+      ],
+      "limitations": [
+        "The dual-function RIP-relative anchor is fail-closed when public code layout or validated handle-table metadata is ambiguous.",
+        "The live sweep is a bounded multi-snapshot comparison rather than an atomic kernel snapshot; coherent create/exit transitions are suppressed and partial or identity-changing views fail coverage.",
+        "Direct object typing depends on matching public PDB geometry and current x64 object-header encoding; unsupported builds fail closed instead of using fixed offsets."
+      ],
+      "next_action": "Add an offline mutation corpus for restored CID and thread-list unlink combinations without modifying the live host."
+    },
+    {
+      "id": "poolparty-dormant-threadpool-objects",
+      "title": "Dormant Windows thread-pool object graph injection",
+      "family": "process-injection",
+      "status": "missing",
+      "claim": "unsupported",
+      "priority": "P1",
+      "release_gate": "backlog",
+      "source_ids": [
+        "safebreach-poolparty-2023"
+      ],
+      "observable": "Worker-factory start routines, TP task/timer queues, IOCP completion keys, and ALPC/job/wait callbacks point to unowned executable memory before execution.",
+      "detector_anchors": [],
+      "positive_controls": [],
+      "negative_controls": [],
+      "validation_commands": [],
+      "limitations": [
+        "Current VAD/thread/APC/stack evidence generally observes these variants only after execution."
+      ],
+      "next_action": "Build a read-only worker-factory and thread-pool object graph collector with benign thread-pool negative controls."
+    },
+    {
+      "id": "unknown-byovd-semantic-reachability",
+      "title": "Unknown signed-driver sensitive IOCTL reachability",
+      "family": "byovd",
+      "status": "missing",
+      "claim": "unsupported",
+      "priority": "P1",
+      "release_gate": "backlog",
+      "source_ids": [
+        "springer-byovd-detector-2026",
+        "ndss-byovd-threats-2026",
+        "mandiant-attestation-malware-2022"
+      ],
+      "observable": "A user-reachable IOCTL path controls or returns sensitive MSR, CR, I/O-port, physical-memory, or privileged kernel API state.",
+      "detector_anchors": [],
+      "positive_controls": [],
+      "negative_controls": [],
+      "validation_commands": [],
+      "limitations": [
+        "The current BYOVD catalog is artifact- and metadata-driven and cannot characterize a previously unknown driver's IOCTL semantics."
+      ],
+      "next_action": "Add an offline analyzer interface and labeled public-driver corpus before integrating any semantic risk claim."
+    },
+    {
+      "id": "windows-component-rollback-attestation",
+      "title": "Windows component rollback and downgrade attestation",
+      "family": "platform-integrity",
+      "status": "missing",
+      "claim": "unsupported",
+      "priority": "P1",
+      "release_gate": "backlog",
+      "source_ids": [
+        "safebreach-windows-downdate-2024"
+      ],
+      "observable": "Booted CI, kernel, secure-kernel, hypervisor, and VBS component versions or measurements fall below an independently trusted installed policy baseline.",
+      "detector_anchors": [],
+      "positive_controls": [],
+      "negative_controls": [],
+      "validation_commands": [],
+      "limitations": [
+        "Current CI/VBS state reports configuration but does not attest component version history against an external baseline."
+      ],
+      "next_action": "Design an offline signed-component baseline and boot-measurement comparison that cannot trust the inspected installation alone."
+    },
+    {
+      "id": "kernelcallbacktable-invariant",
+      "title": "KernelCallbackTable ownership invariant",
+      "family": "process-injection",
+      "status": "missing",
+      "claim": "unsupported",
+      "priority": "P2",
+      "release_gate": "backlog",
+      "source_ids": [
+        "mitre-kernelcallbacktable-det0577"
+      ],
+      "observable": "A GUI process PEB callback entry changes or points outside the expected executable module ownership and correlates with write or message execution.",
+      "detector_anchors": [],
+      "positive_controls": [],
+      "negative_controls": [],
+      "validation_commands": [],
+      "limitations": [
+        "Generic VAD and write provenance do not enumerate or baseline the KernelCallbackTable itself."
+      ],
+      "next_action": "Add a per-process PEB callback-table snapshot with module ownership and same-identity temporal controls."
+    },
+    {
+      "id": "tls-callback-invariant",
+      "title": "TLS callback directory ownership invariant",
+      "family": "process-injection",
+      "status": "missing",
+      "claim": "unsupported",
+      "priority": "P2",
+      "release_gate": "backlog",
+      "source_ids": [
+        "mitre-tls-callback-det0467"
+      ],
+      "observable": "A loaded image TLS directory or callback array changes after load, points outside expected executable ownership, or precedes anomalous thread execution.",
+      "detector_anchors": [],
+      "positive_controls": [],
+      "negative_controls": [],
+      "validation_commands": [],
+      "limitations": [
+        "Generic PE/VAD integrity does not retain a dedicated TLS callback baseline."
+      ],
+      "next_action": "Add bounded TLS-directory parsing and same-image baseline controls with ordinary static TLS as negatives."
+    },
+    {
+      "id": "transient-kernel-hook-timing",
+      "title": "Transient kernel hook timing anomaly",
+      "family": "kernel-hooking",
+      "status": "missing",
+      "claim": "unsupported",
+      "priority": "P3",
+      "release_gate": "backlog",
+      "source_ids": [
+        "arxiv-trace-times-2025"
+      ],
+      "observable": "Repeated controlled kernel function measurements exhibit a statistically significant timing-distribution shift.",
+      "detector_anchors": [],
+      "positive_controls": [],
+      "negative_controls": [],
+      "validation_commands": [],
+      "limitations": [
+        "Current periodic static reads do not collect calibrated function timing distributions."
+      ],
+      "next_action": "Keep as a research prototype until hardware, load, power-state, and virtualization false-positive controls are available."
+    },
+    {
+      "id": "evil-edr-control-plane-abuse",
+      "title": "Trusted EDR response control-plane abuse",
+      "family": "control-plane-abuse",
+      "status": "out_of_scope",
+      "claim": "unsupported",
+      "priority": "P2",
+      "release_gate": "not_applicable",
+      "source_ids": [
+        "usenix-eviledr-2025"
+      ],
+      "observable": "An authenticated response action lacks valid operator, policy, tenant, and approval provenance despite executing through the trusted EDR.",
+      "detector_anchors": [],
+      "positive_controls": [],
+      "negative_controls": [],
+      "validation_commands": [],
+      "limitations": [
+        "Local kernel memory cannot establish remote control-plane authorization or operator intent."
+      ],
+      "next_action": "Require product-side control-plane audit logs and authorization evidence outside KNLiveDbg's local-memory scope."
+    }
+  ],
+  "completion_gate": {
+    "required_technique_ids": [
+      "callback-registration-removal",
+      "process-protection-delta",
+      "security-process-suspend-freeze",
+      "qos-security-agent-throttle",
+      "bind-link-global-file-process",
+      "cloudfiles-ffi-current-state",
+      "minifilter-attachment-removal",
+      "known-byovd-artifact-correlation"
+    ],
+    "external_gate_required": true,
+    "external_gate_schema": "kn-live-dbg.evasion-external-gate.v1",
+    "minimum_clean_runs": 3
+  }
+}

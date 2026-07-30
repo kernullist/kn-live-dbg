@@ -76,3 +76,4 @@ public:
 };
 
 std::wstring BuildWfpJson(const WfpScanResult& result);
+bool WfpScannerSelfTest();

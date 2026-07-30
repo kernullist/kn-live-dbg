@@ -25,7 +25,13 @@
     <ClCompile Include="AlpcScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="BindFilterScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ByovdScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CloudFileScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="CallbackScanner.cpp">
@@ -79,10 +85,16 @@
     <ClCompile Include="MemoryDumper.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="MinifilterAttachmentScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PoolPeHunter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="ProcessTriageScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="QosPolicyScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="UserModeHunter.cpp">
@@ -153,7 +165,13 @@
     <ClInclude Include="AlpcScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="BindFilterScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ByovdScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CloudFileScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CallbackScanner.h">
@@ -213,10 +231,16 @@
     <ClInclude Include="MemoryDumper.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="MinifilterAttachmentScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="PoolPeHunter.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ProcessTriageScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="QosPolicyScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="UserModeHunter.h">

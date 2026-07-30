@@ -26,11 +26,14 @@ kn-live-dbg/
   shared/KnLiveDbgProbeIoctl.h  positive-control probe ABI
   driver/Driver.cpp             WDM driver with virtual/physical memory IOCTLs
   probe_driver/ProbeDriver.cpp  WDM positive-control test buffer driver
+  minifilter_fixture_driver/    no-op minifilter detach/reattach positive control
+  bind_fixture_controller/      temp-only QoS/Bind positive-control controller
   user/*.cpp                    elevated TUI, SCM lifecycle, DbgHelp symbols
   tools/build.ps1               Release/Debug x64 build helper
   tools/release.ps1             build and zip release package helper
   tools/validate-timeline-selftest.ps1  driver-free timeline regression check
   tools/validate-console-surface.ps1    driver-free help/completion regression check
+  research/evasion-research-ledger.json  source-to-detector claim ledger
 ```
 
 ## Current Capabilities
@@ -64,7 +67,7 @@ kn-live-dbg/
 27. Checks live module and driver-object integrity with `!module integrity` and `!driver integrity` -- reading live PE headers/sections for loaded modules, validating PE/section invariants with reason codes, flagging static/effective W+X evidence or live SizeOfImage drift, walking `\Driver` objects through Object Manager metadata, and annotating `DRIVER_OBJECT.MajorFunction[]` dispatch targets with module/symbol ownership.
 28. Scans loaded kernel modules for BYOVD risk with `byovd` / `!byovd` -- maintaining a local catalog from the Microsoft vulnerable driver blocklist plus LOLDrivers hash/YARA feeds, auto-refreshing it when older than 24 hours, hashing loaded module images on disk, optionally running LOLDrivers YARA rules through an operator-supplied `yara64.exe` / `yara.exe`, and reporting exact hash/YARA matches as `HIGH` confidence plus Microsoft file-name/version blocklist hints as `MEDIUM` confidence. A benign no-op fixture driver (`amdryzenmasterdriver.sys`) can be loaded with `byovd fixture load` to exercise the Microsoft name/version positive-control path without shipping an actual vulnerable driver.
 29. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), W+X page attributes (`/wx`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
-30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, focusing diff output on records that were absent from the baseline but present later, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first.
+30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, reporting added/escalated records plus coverage-gated callback removal and `_EPROCESS.Protection` changes, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first.
 31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
 32. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
 33. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
@@ -77,6 +80,10 @@ kn-live-dbg/
 40. Detects IDT (interrupt descriptor table) hooks with `!idt` -- reading the boot processor IDTR through the read-only `IOCTL_KNDBG_READ_IDT` primitive (ABI version 10; `__sidt` under the same per-CPU affinity-pinned pattern), walking the gate descriptors from live kernel memory, rebuilding each handler from its split offset fields (`OffsetLow | OffsetMiddle << 16 | OffsetHigh << 32`), and flagging any present gate whose handler falls outside every loaded kernel module as interrupt-hook evidence. It also cross-checks every active processor's IDT against the boot processor and flags per-CPU handler divergence as a single-core interrupt-hook signal. Clean tables print a one-line summary. The MSR/CR/IDT primitives read across all processor groups, so machines with more than 64 logical processors are covered.
 41. Resolves kernel-mode WFP callout function pointers with `!wfp kernelcallouts` -- the user-mode Base Filtering Engine does not expose the classify/notify/flowDelete pointers, which are the actual hook surface for network filter drivers. The scanner anchors on the public symbol `netio!gWfpGlobal`, scores documented candidate callout-table layouts (e.g. array at `+0x198` with `0x50`-byte slots, or `+0x550` with `0x40`-byte slots; classify at `+0x10`) against live pointers -- the same guarded-fallback discipline used by the firmware-table and WNF scanners, with a bounded offset-scan fallback for build drift -- then walks the callout array, recovers each slot's classify/notify/flowDelete pointers, joins them to the user-mode callout metadata (name/layer/provider) by callout id, and flags any classify target outside every loaded kernel module. No new driver IOCTL is required (it reuses the existing memory-read primitive); netio.sys symbols and an open driver device are required, and the command reports cleanly when the layout cannot be located so offsets can be refined per build.
 42. Maintains a bounded evidence timeline with `!timeline` -- the plain command is now the normal operator path: it asks whether to enable TI ETW and kernel live process/image/thread callbacks, starts the requested collection paths, then refreshes recent TI, snapshot baseline, and active live-callback evidence. Recent TI ingest uses a timestamp cursor and explicit advanced `all` mode remains available for deliberate ring rescans. TI events are enriched with task-name actions and triage risk (`info`/`warning`/`critical`) before graphing/dashboard rendering. `!timeline dashboard` opens the self-contained visual dashboard with in-page filters, live/auto-drain status, matched-rule cards, related-event focus, TI task selection, and a JSONL export button, while `!timeline reset` clears the in-memory timeline. Advanced compatibility commands remain under `!timeline help advanced`, including manual live callback controls for explicit status/off/clear/drain cases. The driver live channel stays thin and bounded; enrichment, graphing, reconciliation, dashboard rendering, and JSON live in user mode.
+43. Detects EDRChoker-style Policy-based QoS throttling during default/deep `!hunt` scans by enumerating `MSFT_NetQosPolicySettingData` directly in `ROOT\StandardCimv2`, including nonpersistent `ActiveStore` policies. A high-confidence finding requires both a known security-product executable target and a present nonzero throttle of at most 64 KiB/s; near-zero throttles of at most 1 KiB/s are high risk. The JSON summary preserves total/suspicious policy counts and an explicit coverage-incomplete flag. This collector is independent of WFP filter enumeration because Pacer/QoS throttling does not require a WFP Block filter. The safe QoS/Bind E2E fixture creates a uniquely named 64-bit/s `ActiveStore` policy for its temporary `MsSense.exe` path and never targets an installed security product.
+44. Enumerates active global Bind Filter mappings on every mounted local fixed/removable/RAM volume during default/deep `!hunt` by dynamically calling the system `bindfltapi!BfGetMappings` interface. Drive-letter and mounted-folder-only volumes are discovered through the volume GUID/mount-path APIs; a partial volume walk leaves global coverage incomplete. Root-relative mapping paths are anchored to the specific enumerated volume, preventing a mapping on another volume from correlating with the Windows volume. Exact mapping records are promoted only when they intersect a known security-product path, `amsi.dll`/event-log artifacts, an authoritative Windows/Program Files-to-user path boundary, its inverse, a Windows system-image redirect, or a same-volume two-way mapping pair. Global Process-Binding is promoted separately only when a running process exposes the mapping source through an exact API/PEB/module path match while both the `_EPROCESS.SectionObject` and main-image VAD independently resolve to the same mapped target. Missing either backing view sets an explicit correlation-coverage-incomplete state instead of producing clean proof. Buffer offsets, lengths, counts, structural regions, returned size, exact success statuses, and growth are fail-closed and size-bounded. `KnLiveDbgBindFixture.exe` is constrained to two fixed mappings under one direct `%TEMP%\KnLiveDbgBindFixture-<GUID>` child and cannot target Windows or installed-product paths; cleanup can remove those exact mappings even if fixture files were lost, and only `S_OK` or an already-missing mapping is accepted as complete. `tools\run-qos-bind-e2e.ps1` verifies redirected content and image hashes, keeps the copied benign backing process alive for one hunt, and independently validates exact mapping, PID, two-backing-view, policy, rate, and counter evidence before exact cleanup. JSON distinguishes global enumeration and Process-Binding correlation completeness from the remaining unsupported silo-scoped mapping query; a clean global result is not presented as Silo-Binding coverage.
+45. Detects current-state CloudFiles False File Immutability evidence during default/deep `!hunt`. For each resolved SEC_IMAGE VAD backing, an attribute-only handle dynamically queries bounded `CF_PLACEHOLDER_STANDARD_INFO` metadata without requesting file data. The scanner recognizes the complete `IO_REPARSE_TAG_CLOUD` family when the tag is visible and records a bounded `FSCTL_GET_REPARSE_POINT` cross-view. Some current `cldflt` builds mask the tag from both views; successful `CfGetPlaceholderInfo` is therefore also an authoritative placeholder identity signal, with the fallback and failed FSCTL error preserved as evidence. A PP/PPL mapping or a placeholder correlated with an already-normalized deep executable live-versus-disk mismatch is high risk/high confidence; positive `ModifiedDataSize` on a mapped placeholder is medium risk/high confidence. An in-sync, unmodified, non-PP/PPL placeholder is a negative control. Missing CloudFiles metadata suppresses the derived claim; unresolved process protection cannot establish clean or PP/PPL evidence and is exposed as incomplete correlation, while independent modified-data or deep-mismatch evidence remains eligible. Every metadata-complete observation is retained in the additive `cloudfiles_images` JSON array with exact PID, module/VAD identity, raw state, protection correlation, decision, and reasons, including clean observations. This is current-state provenance detection, not a claim that rehydration history or file-generation history is reconstructed.
+46. Captures Filter Manager volume and instance attachment state in every `!snapshot` through the documented `FltLib` enumeration APIs. Each bounded, strictly parsed record preserves filter, instance, altitude, volume, frame, filesystem, supported-feature, and raw attachment flags, including `FLTFL_IASIM_DETACHED_VOLUME`; failed or partial enumeration leaves explicit incomplete coverage instead of a clean result. Same-boot `!diff` promotes a stable attachment's attached-to-detached transition. It also reports a missing attachment only when attachment and callback coverage are complete, the same volume remains enumerated, and the same minifilter remains registered in the independent kernel callback view. A clean attachment for the same filter, volume, and altitude suppresses the removal signal even when the instance name changes; when altitude is unavailable, the instance name is the fallback discriminator. A different-altitude decoy attachment no longer masks removal. Static detached state, cross-boot comparison, filter unload, volume removal, and incomplete coverage remain non-findings. Imported snapshot JSON must keep attachment/volume/detached counters, coverage state, record tags, and evidence mutually consistent before removal logic can use it. The bundled no-op minifilter fixture and `tools\run-minifilter-detach-e2e.ps1` exercise the supported attach/detach/reattach path and independently validate the raw snapshots plus positive and recovery diffs. This closes the documented Filter Manager view of ABYSSWORKER-style detach behavior; it does not claim full arbitrary device-stack topology or causal attribution.
 
 ## Design Notes
 
@@ -109,11 +116,28 @@ Driver-free regression checks after a build:
 .\tools\validate-mcp-tool-catalog.ps1 -Configuration Release
 .\tools\validate-console-surface.ps1 -Configuration Release
 .\tools\validate-hunt-clean-host-selftest.ps1
+.\tools\analyze-hunt-clean-host-selftest.ps1
+.\tools\validate-cloudfiles-hunt-e2e-selftest.ps1
+.\tools\validate-minifilter-detach-e2e-selftest.ps1
+.\x64\Release\KnLiveDbgBindFixture.exe --self-test
+.\tools\validate-qos-bind-e2e-selftest.ps1
+.\tools\validate-evasion-external-gate-selftest.ps1
+.\tools\validate-evasion-research-ledger.ps1
+.\tools\validate-evasion-research-ledger-selftest.ps1
 ```
 
 The hunt clean-host self-test is driver-free. It proves that the whole-host
 negative-control gate accepts a complete zero-finding hunt JSON and rejects
-non-empty, incomplete, mistyped, or malformed evidence.
+non-empty, incomplete, mistyped, or malformed evidence. The CloudFiles E2E
+self-test independently proves the exact process/path attribution and
+positive/negative contract without requiring a driver or sync root. The
+minifilter E2E validator self-test uses synthetic snapshots and diff logs to
+prove the same-boot, complete-coverage, exact-identity, persistent-filter and
+recovery controls without loading a driver. The constrained Bind controller
+self-test proves that only one direct GUID-named Windows temporary directory is
+accepted, and the QoS/Bind validator corpus proves exact policy, path, PID,
+dual-backing, counter, incomplete-coverage, and explicit Silo-unsupported
+contracts without creating a policy or mapping.
 
 Refresh the pinned Debugging Tools runtime from the newest complete local x64 set:
 
@@ -121,8 +145,8 @@ Refresh the pinned Debugging Tools runtime from the newest complete local x64 se
 .\tools\sync-debugging-tools-runtime.ps1
 ```
 
-The driver projects use WDK `TestSign` for Debug and Release x64 builds. The build helper verifies that both `KnLiveDbg.sys` and `KnLiveDbgProbe.sys` have Authenticode signers and prints signature status/thumbprints after MSBuild completes.
-Normal scripted builds reuse the highest current PE version found in `.build\version-state.json`, the existing output file, or an exact `vX.Y.Z` Git tag reachable from `HEAD`, and do not increment it. This keeps a clean checkout from restarting at `0.0.1` after releases have already been tagged. Use `.\tools\build.ps1 -Configuration Release -BumpVersion` only when a new build version should be minted; with no previous state, PE, or reachable version tag, the baseline is `0.0.0`, so the first bumped build stamps `0.0.1` into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys`. The generated resource header is written under `.build\generated`, while `shared\KnLiveDbgVersion.h` remains a `0.0.0` fallback for direct Visual Studio builds that do not run the helper script.
+The driver projects use WDK `TestSign` for Debug and Release x64 builds. The build helper verifies that `KnLiveDbg.sys`, `KnLiveDbgProbe.sys`, `amdryzenmasterdriver.sys`, and `KnLiveDbgMiniFilterFixture.sys` have Authenticode signers and prints signature status/thumbprints after MSBuild completes.
+Normal scripted builds reuse the highest current PE version found in `.build\version-state.json`, the existing output file, or an exact `vX.Y.Z` Git tag reachable from `HEAD`, and do not increment it. This keeps a clean checkout from restarting at `0.0.1` after releases have already been tagged. Use `.\tools\build.ps1 -Configuration Release -BumpVersion` only when a new build version should be minted; with no previous state, PE, or reachable version tag, the baseline is `0.0.0`, so the first bumped build stamps `0.0.1` into `KnLiveDbg.exe`, `KnLiveDbg.sys`, `KnLiveDbgProbe.sys`, `KnLiveDbgMiniFilterFixture.sys`, and `KnLiveDbgBindFixture.exe`. The BYOVD metadata fixture keeps its intentional fixed `1.0.0.0` version. The generated resource header is written under `.build\generated`, while `shared\KnLiveDbgVersion.h` remains a `0.0.0` fallback for direct Visual Studio builds that do not run the helper script.
 The build helper also stages the pinned `vendor\debugging-tools\x64` runtime beside the EXE (`dbghelp.dll`, `dbgeng.dll`, `dbgcore.dll`, `DbgModel.dll`, `msdia140.dll`, `symsrv.dll`, `srcsrv.dll`, and `symsrv.yes`) so DbgHelp and DbgEng can use the Microsoft symbol server instead of falling back to the limited System32 runtime. If the vendor pair is missing, the script falls back to the locally installed Windows Kits Debugging Tools copy. DIA include/lib paths are passed to MSBuild from the discovered Visual Studio installation instead of relying on a fixed VS edition path. If `symsrv.dll` is staged but `symsrv.yes` is missing, the sync script, build script, and EXE startup path create `symsrv.yes` before symbol loading. Startup creates `<exe-dir>\symbols` and uses it as the downstream symbol store, so downloaded PDBs stay with the runnable EXE bundle rather than going to `C:\Symbols`. When `msdia140.dll` is staged, startup registers it automatically with `DllRegisterServer` before symbol initialization. The symbol engine also has a no-reg fallback that loads the staged `msdia*.dll` directly and creates `IDiaDataSource` through `DllGetClassObject`, so type fallback can still work when COM registration is unavailable.
 
 Create a release zip:
@@ -131,7 +155,7 @@ Create a release zip:
 .\tools\release.ps1 -Configuration Release
 ```
 
-The build helper copies `tools\update-byovd-intel.ps1` into `x64\<Configuration>\tools\` so direct build outputs can refresh the BYOVD catalog. The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, the BYOVD positive-control fixture driver, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the vendored runtime manifest when present, `tools\update-byovd-intel.ps1`, and `kn-live-dbg-version.json`. YARA binaries are intentionally not packaged.
+The build helper copies `tools\update-byovd-intel.ps1` into `x64\<Configuration>\tools\` so direct build outputs can refresh the BYOVD catalog. The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, the BYOVD and minifilter positive-control fixture drivers, the constrained Bind fixture controller, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the vendored runtime manifest when present, the BYOVD updater, the clean-hunt runner/validator/analyzer, the CloudFiles, QoS/Bind, and minifilter fixture runners and validators, the aggregate elevated external gate and validator, and `kn-live-dbg-version.json`. YARA binaries are intentionally not packaged.
 
 Expected outputs:
 
@@ -139,6 +163,9 @@ Expected outputs:
 x64\Release\KnLiveDbg.exe
 x64\Release\KnLiveDbg.sys
 x64\Release\KnLiveDbgProbe.sys
+x64\Release\amdryzenmasterdriver.sys
+x64\Release\KnLiveDbgMiniFilterFixture.sys
+x64\Release\KnLiveDbgBindFixture.exe
 x64\Release\dbghelp.dll
 x64\Release\DbgModel.dll
 x64\Release\symsrv.dll
@@ -559,8 +586,8 @@ The command resolves PID 4 through the driver, uses PDB metadata for `_EPROCESS.
 
 ## No-Target User-Mode Hunt
 
-`!hunt` scans visible live user processes without requiring a target PID. The
-default mode correlates process cross-view state, image path/profile evidence,
+`!hunt` scans live whole-system process state without requiring a target PID.
+The default mode correlates process cross-view state, image path/profile evidence,
 VAD-backed mapped code, module loader/VAD cross-view mismatches, thread/APC
 execution provenance, WFP block filters that target security or anti-cheat
 AppId conditions, and bounded stack references into suspicious executable
@@ -575,6 +602,50 @@ Gentlemen process/staging indicators that performed driver I/O or repeated
 process-impairment activity. The TI correlation path also raises a behavioral
 finding when one caller repeatedly controls or terminates known security-product
 processes from the GentleKiller target list, even if the caller name was changed.
+The current-state thread pass resolves PDB-backed `_ETHREAD.SuspendCount` and
+`FreezeCount`; it reports `security_tool_impairment` only when the thread-list
+inventory and suspend-state reads are complete, every observed thread of a
+known security-product process is suspended or frozen, and the same per-ETHREAD
+counts are reproduced by a second fresh scan. A single suspended
+thread, a mixed runnable/suspended process, an unstable all-suspended sample,
+an unknown process name, or partial
+coverage remains raw telemetry rather than a finding.
+The process/thread cross-view does not treat
+`PsLookupProcessByProcessId` over already-known PIDs as a complete CID view. It
+derives a candidate `PspCidTable` anchor only when the process and thread CID
+lookup routines share the same repeated RIP-relative 64-bit load (or a direct
+symbol agrees), validates PDB-resolved `_HANDLE_TABLE` geometry, and
+independently walks every allocated level-0/1/2 entry page.
+`NextHandleNeedingPool` must exactly equal the allocated-leaf capacity.
+The direct pass extracts the PDB-described 44-bit
+`_HANDLE_TABLE_ENTRY.ObjectPointerBits`, decodes the object header, validates
+the encoded `TypeIndex` with `ObHeaderCookie` and `ObTypeIndexTable`, and accepts
+only exact `PsProcessType` or `PsThreadType` objects. Allocation topology is
+sampled before and after the pass, and each nonempty entry is reread immediately
+after its object body is decoded; every accepted slot must be typed and its
+PID/TID, owner, create time, exit state, and object address must validate. The
+legacy exported-lookup sweep is retained as an additional
+cross-view, but a failed or hooked `PsLookupProcessByProcessId` no longer
+prevents direct EPROCESS-address revalidation.
+
+Thread objects are compared twice against the direct CID entries,
+`_EPROCESS.ThreadListHead`, `_KPROCESS.ThreadListHead`, the thread array in
+`SystemProcessInformation`, and Toolhelp. Stable CID-only threads, threads
+missing from CID while both kernel lists and APIs agree, individual executive
+or scheduler list unlinks, and threads hidden from both APIs produce bounded
+`thread_cross_view` findings. A live EPROCESS whose process record is absent
+can also be recovered from a stable thread owner and reported instead of being
+silently dropped. Coherent create/exit transitions are suppressed, while
+identity disagreement, partial view drift, unreadable topology, or unclassified
+entries clears aggregate coverage.
+
+JSON exposes the direct entry/process/thread counts, unclassified count,
+thread finding/persistent-miss counts, all completeness flags, and a
+`cid_threads` evidence array. `cid_table_full_enumeration=true` is emitted only
+when direct entry enumeration, full process and thread enumeration, and the
+thread cross-view all complete. The clean-host gate requires those flags,
+zero unclassified entries/findings/persistent misses, exact typed-entry count
+agreement, and a revalidated record for every directly decoded thread.
 Main-image integrity also cross-checks the EPROCESS main `SectionObject` backing
 through `_SECTION_OBJECT.Segment -> _SEGMENT.ControlArea -> FilePointer` against
 the main VAD section backing, Toolhelp main module path, PEB image path, and API
@@ -586,6 +657,193 @@ flags) and `SECTION_OBJECT_POINTERS.ImageSectionObject`, so primitive process
 tampering evidence such as delete-pending image files, write/delete-capable main
 image file objects, or file section-object pointer mismatches is surfaced as
 `process_tampering_primitive_evidence`.
+For resolved SEC_IMAGE VAD backing paths, default/deep mode also performs a
+read-only Cloud Files provenance check. It opens for attributes only while
+leaving `cldflt` in the path, recognizes the full Cloud reparse-tag family when
+visible, and records a bounded FSCTL tag cross-view. Because current `cldflt`
+builds can mask the tag from both attribute and FSCTL views, a successful
+`CfGetPlaceholderInfo` query is also accepted as authoritative placeholder
+identity; the JSON evidence distinguishes this metadata fallback from an
+observed reparse tag. The scanner queries placeholder state plus
+`OnDiskDataSize`, `ValidatedDataSize`,
+`ModifiedDataSize`, pin/sync state, file identity length, file id, and sync-root
+file id through dynamically resolved `cldapi` entry points. The rule emits
+`cloudfiles_false_file_immutability` only for PP/PPL placeholder mappings,
+mapped placeholders with modified-data state, or placeholders already
+correlated with a normalized deep executable live-versus-disk mismatch. A
+non-PP/PPL, in-sync, unmodified placeholder remains clean. JSON exposes
+`cloudfiles_placeholder_images`, `suspicious_cloudfiles_images`,
+`cloudfiles_placeholder_coverage_incomplete`, and
+`cloudfiles_protection_correlation_incomplete`; unavailable metadata never
+becomes a positive. The additive `cloudfiles_images` array preserves every
+metadata-complete observation, including negative controls, with exact PID,
+module/VAD paths, placeholder state and sizes, process protection, mismatch
+correlation, the final suspicious decision, and its reasons. Its counts must
+agree exactly with the summary. The current collector does not reconstruct
+prior dehydrate/rehydrate callbacks or an immutable generation history.
+
+Use the following safe, fully local live checks:
+
+```powershell
+.\tools\run-cloudfiles-placeholder-fixture.ps1 -Scenario InSyncNegative
+.\tools\run-cloudfiles-placeholder-fixture.ps1 -Scenario ModifiedPositive
+```
+
+The fixture registers an `ALWAYS_FULL` sync root, converts a copied Windows
+executable without dehydration, verifies the metadata contract, and briefly
+maps it as an image. The modified case appends a harmless PE overlay before
+launch and requires a positive `ModifiedDataSize`; it does not perform in-use
+mutation or an FFI exploit. From an elevated PowerShell session, append
+`-ValidateHunt` to run one Deep hunt while the exact fixture PID is alive and
+validate the saved evidence automatically:
+
+```powershell
+.\tools\run-cloudfiles-placeholder-fixture.ps1 -Scenario InSyncNegative -HoldSeconds 1 -ValidateHunt
+.\tools\run-cloudfiles-placeholder-fixture.ps1 -Scenario ModifiedPositive -HoldSeconds 1 -ValidateHunt
+```
+
+`tools\validate-cloudfiles-hunt-e2e.ps1` rejects missing or ambiguous
+PID/path attribution, incomplete metadata/protection coverage, counter drift,
+or a positive/negative decision that contradicts the raw observation. With
+`-ValidateHunt`, the fixture writes
+`cloudfiles-fixture-manifest.json` only after the process, sync root, and
+temporary directory have been removed successfully.
+
+### Safe QoS And Bind Filter E2E
+
+The July 2026
+[Bitdefender Bind Link research](https://businessinsights.bitdefender.com/bind-link-abuses-windows-feature-edr-evasion-technique)
+shows why path identity alone is insufficient for File-, Process-, and
+Silo-Binding. Use a disposable Windows test VM and an elevated PowerShell
+session to exercise KNLiveDbg's current global File-/Process-Binding and QoS
+coverage:
+
+```powershell
+.\tools\run-qos-bind-e2e.ps1 -Configuration Release
+.\tools\validate-qos-bind-e2e-selftest.ps1
+```
+
+The runner does not bundle or invoke a general-purpose bind utility.
+`KnLiveDbgBindFixture.exe` accepts only `apply` or `remove` for the fixed
+`amsi.dll -> backing.dll` and
+`MsSense.exe -> ProcessBindingBacking.exe` pairs under one direct
+`%TEMP%\KnLiveDbgBindFixture-<32 hex>` child. It rejects other parents, nested
+directories, reparse-point fixture roots/files, missing endpoints, and
+same-file endpoints. The runner supplies harmless text files plus copied
+Windows `where.exe`/`ping.exe` binaries, verifies the redirected content and
+SHA-256 views, and briefly keeps the mapped copy of `ping.exe` alive.
+
+The same run creates a uniquely named, nonpersistent 64-bit/s `ActiveStore`
+QoS policy for only that temporary `MsSense.exe` path. It captures one Default
+hunt and invokes `tools\validate-qos-bind-e2e.ps1`, which requires the exact
+policy/rate/path finding, both exact global mappings, the exact live PID, and
+two independently resolved backing paths that agree with the mapped target.
+Relevant collection warnings, mistyped counters, incomplete QoS/global/process
+coverage, and any attempt to claim Silo-Binding support are rejected.
+
+Cleanup removes the exact QoS policy, exact PID, both mappings, and only the
+GUID-named temporary directory. It verifies the original file contents and
+image hash after removal, and writes a passed manifest only after cleanup
+succeeds. This fixture does not construct a silo, inverse link, policy bypass,
+or mapping against a real security product. `bindflt_silo_coverage_unsupported`
+must remain `true`.
+
+### Safe Minifilter Detach E2E
+
+Use a disposable test-signing VM and an elevated PowerShell session to exercise
+the Filter Manager attachment-loss detector:
+
+```powershell
+.\tools\run-minifilter-detach-e2e.ps1 -Configuration Release -Volume C:
+.\tools\validate-minifilter-detach-e2e-selftest.ps1
+```
+
+`KnLiveDbgMiniFilterFixture.sys` is a test-signed, no-op minifilter. Automatic
+attachment is suppressed. The runner creates only its exact demand-start test
+service, attaches only `KnLiveDbgMiniFilterFixture.Instance` to the selected
+local NTFS/ReFS volume, and registers only an `IRP_MJ_CREATE` pre-operation
+callback that returns `FLT_PREOP_SUCCESS_NO_CALLBACK`. It has no device,
+IOCTL, read/write transformation, or arbitrary detach primitive.
+
+The runner uses the supported debugging attach/detach path to capture
+attached, detached, and reattached snapshots. The detached snapshot must keep
+both the exact Filter Manager volume and the independently enumerated
+registered-minifilter callback view while the instance is absent. It then runs
+an offline positive diff and a recovery diff.
+`tools\validate-minifilter-detach-e2e.ps1` independently rejects cross-boot
+input, incomplete attachment or callback coverage, raw-counter drift,
+duplicate identities, filter unload, volume loss, a still-attached current
+instance, a missing exact removal finding, or recovery that still reports the
+fixture. The runner detaches, unloads, and deletes only its named fixture
+service in `finally`; any cleanup failure is a failed run.
+
+This is a safe observation fixture, not an implementation of the direct device
+stack manipulation described in ABYSSWORKER research. A load failure is first
+a test-signing, Secure Boot, HVCI, or local driver-policy result; it is not
+detector evidence. The temporary altitude is used only by this debugging
+fixture and an existing service, filter, instance, or altitude collision causes
+the run to fail visibly.
+
+### Evasion Research And Claim Ledger
+
+`research\evasion-research-ledger.json` is the machine-readable boundary
+between a published primitive and a KNLiveDbg support claim. Each technique
+records primary sources, its observable, current `covered`, `partial`,
+`missing`, or `out_of_scope` state, literal code anchors, positive and negative
+controls, limitations, and the remaining release gate. A `covered` row cannot
+carry a limitation, while an unsupported row cannot borrow implementation or
+test evidence.
+
+Run the structural and freshness gate, then its mutation suite:
+
+```powershell
+.\tools\validate-evasion-research-ledger.ps1 `
+    -ReportPath .\.build\evasion-research-ledger-validation.json
+.\tools\validate-evasion-research-ledger-selftest.ps1
+```
+
+The ledger intentionally expires after its configured review interval. The
+validator also rejects stale source checks, non-primary or non-HTTPS sources,
+dangling references, contradictory status/claim pairs, repository-path
+escapes, missing literal anchors, unsafe validation commands, and a completion
+set containing unsupported techniques. Passing this gate validates the
+research-to-code traceability; it does not replace the elevated live evidence
+below and never promotes `external_pending` to `satisfied`.
+The current `pspcidtable-full-cross-view` row is deliberately `partial`: its
+bounded process-CID implementation and corpus are present, while thread-CID
+enumeration remains the next independent view. The clean-host validator
+requires `cid_table_full_process_enumeration=true`, rejects the known-PID-only
+fallback and whole-table overclaim, and cross-checks the reported anchor,
+allocated leaves, handle capacity, probe count, process counts, and failures.
+
+### Elevated External Evasion Gate
+
+On a disposable test-signing VM, the remaining live acceptance gate can be run
+as one ordered command:
+
+```powershell
+.\tools\run-evasion-external-gate.ps1 -Configuration Release -Volume C: -CleanRunCount 3
+```
+
+The runner requests elevation once, then executes the constrained QoS/global
+File- and Process-Binding positive, CloudFiles in-sync negative and
+modified-data positive, minifilter detach/reattach positive, and three Deep
+clean-host runs with Threat Intelligence required. Each child completes its
+exact cleanup before returning. The final clean-host run is last, so it also
+checks for findings or incomplete coverage after every fixture has been
+removed.
+
+The gate writes `manifest.json` only after all child cleanup and explicit
+process, service, and QoS-policy residue checks. It records SHA-256 hashes for
+the child manifests and clean-host analysis, then invokes
+`tools\validate-evasion-external-gate.ps1`. The independent validator requires
+the exact artifact layout, both CloudFiles decisions, passed child cleanup,
+at least three complete zero-finding Deep runs, active Threat Intelligence, and
+the explicit `silo_binding_coverage_unsupported=true` limitation. Use
+`tools\validate-evasion-external-gate-selftest.ps1` for driver-free positive
+and mutation controls. `-NoElevation` is available for automation and fails
+visibly without creating a passed manifest.
+
 The ESET prose says the private GentleKiller list exceeds 400 processes; the
 public Table 2 HTML currently exposes 274 unique lower-case image names, and the
 validator pins that public, independently auditable set.
@@ -678,7 +936,10 @@ history-based. It enumerates BFE filters, decodes condition text and
 `security_tool_communication_blocking` only when an enabled Block/BitmaskBlock
 filter targets a known security-product or anti-cheat process through AppId or
 strong filter metadata. Persistent, clear-action-right, and high-weight block
-filters are preserved as supporting evidence in the same finding.
+filters are preserved as supporting evidence in the same finding. A failed or
+warning-bearing BFE filter enumeration sets
+`wfp_filter_coverage_incomplete=true` and clears aggregate
+`coverage_complete`, so zero WFP findings cannot be promoted to clean proof.
 Console output is conclusion-first and short by default: `!hunt` prints
 `[hunt.conclusion]`, `[hunt.assessment]`, and `[hunt.summary]`, then suppresses
 raw detail. The assessment section prints the operator answer as
@@ -1067,7 +1328,7 @@ Requirements and caveats:
 
 ## Session Baseline Diffing
 
-`!snapshot` and `!diff` turn the existing native scanners into a same-boot evidence baseline workflow. `!snapshot baseline` captures process inventory plus the high-value domains, stores the baseline in memory, and writes JSON plus a Markdown snapshot report. `!diff baseline` captures a fresh current snapshot, compares it against the in-memory baseline, writes the current JSON plus Markdown reports, and prints a compact new-focused summary.
+`!snapshot` and `!diff` turn the existing native scanners into a same-boot evidence baseline workflow. `!snapshot baseline` captures process inventory plus the high-value domains, stores the baseline in memory, and writes JSON plus a Markdown snapshot report. `!diff baseline` captures a fresh current snapshot, compares it against the in-memory baseline, writes the current JSON plus Markdown reports, and prints a compact new/tamper-focused summary.
 
 ```text
 !snapshot baseline [/all] [/name <label>]
@@ -1079,16 +1340,16 @@ Requirements and caveats:
 
 Default files are written under the EXE directory's `.kn-live-dbg\snapshots` and `.kn-live-dbg\reports` trees. The JSON schema is `kn-live-dbg.snapshot.v1`; reports are Markdown and are generated automatically for both baseline snapshots and diffs.
 
-The diff is intentionally biased toward what appeared after the baseline:
+The diff is intentionally biased toward new or defense-relevant state changes:
 
 1. Added records are shown when the identity was absent from the baseline and present in the current snapshot.
-2. Escalations are shown when an existing identity becomes high-risk, such as driver dispatch redirection, ETW GetCpuClock tampering, pool records gaining W+X/PE evidence, or VAD DKOM hidden-PTE evidence.
-3. Removed records are not shown by default; this keeps launch-time and post-event triage focused on new attack surface.
+2. Escalations are shown when an existing identity becomes high-risk or a same-boot stable field changes, such as driver dispatch redirection, `_EPROCESS.Protection` downgrade/strip, a Filter Manager attachment changing from attached to detached, ETW GetCpuClock tampering, pool records gaining W+X/PE evidence, or VAD DKOM hidden-PTE evidence.
+3. Removed records are not shown generally. The deliberate exceptions are a callback that disappears while its owner module remains loaded, a process-protection record that disappears while its process remains present, and a minifilter attachment that disappears while the same Filter Manager volume and independently enumerated registered minifilter remain present. They require same-boot comparison and complete current coverage for their domain. Process-security metadata/counts are cross-checked against the process inventory when snapshot JSON is imported. Semantic callback re-registration or a clean attachment for the same filter/volume and stable altitude (instance-name fallback only when altitude is absent) suppresses the corresponding removal signal.
 4. Pool output is ordered as pool-PE suspect first, pool-PE hit second, W+X NonPaged third, then large NonPaged by descending size.
 5. `!diff baseline` scans VAD DKOM hidden-PTE evidence for every process that is new since the baseline and still alive at diff time.
 6. Low-risk child records implied by a newly added parent, such as a new driver's routine dispatch entries, are folded by default and counted as `hiddenChildren`; add `/details` to expand them.
 
-The `/all` option is accepted for explicitness; the current native baseline captures the full implemented domain set by default: modules, drivers, callbacks, ETW, NMI, cpu-state (SYSCALL MSRs / control registers / SSDT / IDT), firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, BYOVD, and process inventory. BYOVD catalog auto-update is allowed for `!snapshot baseline` and `!snapshot save`, but `!diff baseline` reuses the local catalog in no-update mode and emits a warning if the catalog fingerprint differs between snapshots. YARA is not run by the snapshot path unless the standalone `byovd scan /yara` command is used.
+The `/all` option is accepted for explicitness; the current native baseline captures the full implemented domain set by default: modules, drivers, callbacks, Filter Manager minifilter attachments and volumes, ETW, NMI, cpu-state (SYSCALL MSRs / control registers / SSDT / IDT), firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, BYOVD, process inventory, and a separate `process-security` record for each readable `_EPROCESS.Protection` byte. Minifilter attachment capture uses read-only `FilterVolumeFind*` and `FilterVolumeInstanceFind*` calls; `--self-test minifilter-attachments-query` exposes the live enumeration contract and fails visibly when the token lacks the required access. BYOVD catalog auto-update is allowed for `!snapshot baseline` and `!snapshot save`, but `!diff baseline` reuses the local catalog in no-update mode and emits a warning if the catalog fingerprint differs between snapshots. YARA is not run by the snapshot path unless the standalone `byovd scan /yara` command is used.
 
 Typical clean-baseline flow:
 

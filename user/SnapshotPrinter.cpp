@@ -178,6 +178,7 @@ void PrintSnapshotDiff(const SnapshotDiffResult& diff, const SnapshotDiffOptions
                << L" sameBoot=" << (diff.SameBoot ? L"yes" : L"no")
                << L" added=" << diff.Added
                << L" escalated=" << diff.Escalated
+               << L" removed=" << diff.Removed
                << L" high=" << diff.High;
     if (!diff.ReportPath.empty())
     {
@@ -209,6 +210,7 @@ void PrintSnapshotDiff(const SnapshotDiffResult& diff, const SnapshotDiffOptions
                 shown = PrintedLimit(options);
             }
             std::wcout << L"[diff.pool] added=" << domain.Added
+                       << L" removed=" << domain.Removed
                        << L" peSuspect=" << domain.PoolPeSuspect
                        << L" pe=" << domain.PoolPe
                        << L" wx=" << domain.PoolWx
@@ -227,6 +229,7 @@ void PrintSnapshotDiff(const SnapshotDiffResult& diff, const SnapshotDiffOptions
         {
             std::wcout << L"[diff." << domain.Domain << L"] added=" << domain.Added
                        << L" escalated=" << domain.Escalated
+                       << L" removed=" << domain.Removed
                        << L" high=" << domain.High
                        << L" medium=" << domain.Medium;
             if (domain.HiddenChildFindings != 0)
@@ -258,7 +261,12 @@ void PrintSnapshotDiff(const SnapshotDiffResult& diff, const SnapshotDiffOptions
         ++printed;
 
         const SnapshotRecord& record = finding.NewRecord;
-        std::wcout << L"  " << (finding.Kind == L"added" ? L"+" : L"~")
+        std::wcout << L"  "
+                   << (finding.Kind == L"added"
+                           ? L"+"
+                           : (finding.Kind == L"removed"
+                                  ? L"-"
+                                  : L"~"))
                    << L" [" << record.Risk << L"] "
                    << record.Domain << L" " << record.Display << L"\n";
         std::wcout << L"    identity=" << record.Identity << L"\n";
@@ -382,6 +390,7 @@ std::wstring BuildSnapshotDiffMarkdown(const SnapshotDiffResult& diff, const Sna
     stream << L"- same boot: `" << (diff.SameBoot ? L"yes" : L"no") << L"`\n";
     stream << L"- added: `" << diff.Added << L"`\n";
     stream << L"- escalated: `" << diff.Escalated << L"`\n";
+    stream << L"- removed: `" << diff.Removed << L"`\n";
     stream << L"- high: `" << diff.High << L"`\n\n";
 
     stream << L"## Domain Summary\n\n";
@@ -390,6 +399,7 @@ std::wstring BuildSnapshotDiffMarkdown(const SnapshotDiffResult& diff, const Sna
         const SnapshotDiffDomainSummary& domain = item.second;
         stream << L"- `" << domain.Domain << L"` added=" << domain.Added
                << L" escalated=" << domain.Escalated
+               << L" removed=" << domain.Removed
                << L" high=" << domain.High
                << L" medium=" << domain.Medium;
         if (domain.HiddenChildFindings != 0)

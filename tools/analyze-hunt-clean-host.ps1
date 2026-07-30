@@ -112,6 +112,33 @@ function Get-RequiredJsonBoolean
     return [bool]$property.Value
 }
 
+function Get-RequiredJsonNonzeroHex64
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Container,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Context
+    )
+
+    $property = $Container.PSObject.Properties[$Name]
+    if ($null -eq $property)
+    {
+        throw "$Context.$Name is missing"
+    }
+    if ($property.Value -isnot [string] -or
+        [string]$property.Value -notmatch '^0x[0-9a-fA-F]{16}$' -or
+        [string]$property.Value -match '^0x0{16}$')
+    {
+        throw "$Context.$Name must be a nonzero 16-digit hexadecimal string"
+    }
+    return [string]$property.Value
+}
+
 function Get-NormalizedLeaf
 {
     param(
@@ -228,26 +255,264 @@ for ($runIndex = 0; $runIndex -lt $resolvedInputs.Count; ++$runIndex)
     $kernelProcesses = Get-RequiredJsonInteger -Container $document.summary -Name "kernel_processes" -Context "summary"
     $systemProcesses = Get-RequiredJsonInteger -Container $document.summary -Name "system_process_information_processes" -Context "summary"
     $toolhelpProcesses = Get-RequiredJsonInteger -Container $document.summary -Name "toolhelp_processes" -Context "summary"
+    $systemThreads = Get-RequiredJsonInteger -Container $document.summary -Name "system_process_information_threads" -Context "summary"
+    $toolhelpThreads = Get-RequiredJsonInteger -Container $document.summary -Name "toolhelp_threads" -Context "summary"
     $scannedProcesses = Get-RequiredJsonInteger -Container $document.summary -Name "scanned_processes" -Context "summary"
     $summaryFindings = Get-RequiredJsonInteger -Container $document.summary -Name "findings" -Context "summary"
     $summaryHigh = Get-RequiredJsonInteger -Container $document.summary -Name "high" -Context "summary"
     $summaryMedium = Get-RequiredJsonInteger -Container $document.summary -Name "medium" -Context "summary"
     $summaryLow = Get-RequiredJsonInteger -Container $document.summary -Name "low" -Context "summary"
     $summaryInfo = Get-RequiredJsonInteger -Container $document.summary -Name "info" -Context "summary"
+    $wfpFilters = Get-RequiredJsonInteger -Container $document.summary -Name "wfp_filters" -Context "summary"
+    $suspiciousWfpFilters = Get-RequiredJsonInteger -Container $document.summary -Name "suspicious_wfp_filters" -Context "summary"
+    $qosPolicies = Get-RequiredJsonInteger -Container $document.summary -Name "qos_policies" -Context "summary"
+    $suspiciousQosPolicies = Get-RequiredJsonInteger -Container $document.summary -Name "suspicious_qos_policies" -Context "summary"
+    $bindMappings = Get-RequiredJsonInteger -Container $document.summary -Name "bindflt_global_mappings" -Context "summary"
+    $suspiciousBindMappings = Get-RequiredJsonInteger -Container $document.summary -Name "suspicious_bindflt_global_mappings" -Context "summary"
+    $bindProcessBindings = Get-RequiredJsonInteger -Container $document.summary -Name "bindflt_process_bindings" -Context "summary"
+    $cloudFileImages = Get-RequiredJsonInteger -Container $document.summary -Name "cloudfiles_placeholder_images" -Context "summary"
+    $suspiciousCloudFileImages = Get-RequiredJsonInteger -Container $document.summary -Name "suspicious_cloudfiles_images" -Context "summary"
+    $cidFullEnumeration = Get-RequiredJsonBoolean -Container $document.summary -Name "cid_table_full_enumeration" -Context "summary"
+    $cidFullProcessEnumeration = Get-RequiredJsonBoolean -Container $document.summary -Name "cid_table_full_process_enumeration" -Context "summary"
+    $cidDirectEntryEnumeration = Get-RequiredJsonBoolean -Container $document.summary -Name "cid_table_direct_entry_enumeration" -Context "summary"
+    $cidFullThreadEnumeration = Get-RequiredJsonBoolean -Container $document.summary -Name "cid_table_full_thread_enumeration" -Context "summary"
+    $cidThreadCrossViewComplete = Get-RequiredJsonBoolean -Container $document.summary -Name "cid_table_thread_cross_view_complete" -Context "summary"
+    $cidLookupOnly = Get-RequiredJsonBoolean -Container $document.summary -Name "cid_table_lookup_only" -Context "summary"
+    $cidAnchor = [string]$document.summary.cid_table_anchor
+    $cidTableAddress = [string]$document.summary.cid_table_address
+    $cidTableCode = [string]$document.summary.cid_table_code
+    $cidLevel = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_level" -Context "summary"
+    $cidNextHandle = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_next_handle" -Context "summary"
+    $cidAllocatedLeaves = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_allocated_leaves" -Context "summary"
+    $cidAllocatedCapacity = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_allocated_handle_capacity" -Context "summary"
+    $cidProbes = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_probes" -Context "summary"
+    $cidProcesses = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_processes" -Context "summary"
+    $cidDiscoveredProcesses = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_discovered_processes" -Context "summary"
+    $cidDirectEntries = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_direct_entries" -Context "summary"
+    $cidDirectProcesses = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_direct_processes" -Context "summary"
+    $cidDirectThreads = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_direct_threads" -Context "summary"
+    $cidUnclassifiedEntries = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_unclassified_entries" -Context "summary"
+    $cidThreadFindings = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_thread_findings" -Context "summary"
+    $cidPersistentThreadViewMisses = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_persistent_thread_view_misses" -Context "summary"
+    $cidProbeFailures = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_probe_failures" -Context "summary"
+    $cidPersistentApiMisses = Get-RequiredJsonInteger -Container $document.summary -Name "cid_table_persistent_api_misses" -Context "summary"
     $coverageComplete = Get-RequiredJsonBoolean -Container $document.summary -Name "coverage_complete" -Context "summary"
     $inventoryIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "process_inventory_incomplete" -Context "summary"
     $triageIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "process_triage_coverage_incomplete" -Context "summary"
     $deepImageIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "deep_image_comparison_coverage_incomplete" -Context "summary"
     $driverServiceIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "driver_service_coverage_incomplete" -Context "summary"
+    $wfpIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "wfp_filter_coverage_incomplete" -Context "summary"
+    $qosIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "qos_policy_coverage_incomplete" -Context "summary"
+    $bindGlobalIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "bindflt_global_coverage_incomplete" -Context "summary"
+    $bindProcessIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "bindflt_process_correlation_coverage_incomplete" -Context "summary"
+    $bindSiloUnsupported = Get-RequiredJsonBoolean -Container $document.summary -Name "bindflt_silo_coverage_unsupported" -Context "summary"
+    $cloudMetadataIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "cloudfiles_placeholder_coverage_incomplete" -Context "summary"
+    $cloudProtectionIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "cloudfiles_protection_correlation_incomplete" -Context "summary"
     $threatIntelActive = Get-RequiredJsonBoolean -Container $document.summary -Name "threat_intel_active" -Context "summary"
     $threatIntelAvailable = Get-RequiredJsonBoolean -Container $document.summary -Name "threat_intel_available" -Context "summary"
     $threatIntelIncomplete = Get-RequiredJsonBoolean -Container $document.summary -Name "threat_intel_correlation_incomplete" -Context "summary"
+
+    $cidThreadsProperty =
+        $document.PSObject.Properties["cid_threads"]
+    if ($null -eq $cidThreadsProperty -or
+        $cidThreadsProperty.Value -isnot [System.Array])
+    {
+        throw "cid_threads must be a JSON array in $path"
+    }
+    $cidThreads = @($cidThreadsProperty.Value)
+    $seenThreadIds =
+        [System.Collections.Generic.HashSet[uint32]]::new()
+    $directThreadRecords = 0
+    $suspiciousThreadRecords = 0
+    foreach ($record in $cidThreads)
+    {
+        if ($null -eq $record)
+        {
+            throw "cid_threads contains a null item in $path"
+        }
+        $threadId = Get-RequiredJsonInteger -Container $record -Name "tid" -Context "cid_threads"
+        $processId = Get-RequiredJsonInteger -Container $record -Name "pid" -Context "cid_threads"
+        if ($threadId -le 0 -or
+            $threadId -gt [uint32]::MaxValue -or
+            $processId -gt [uint32]::MaxValue)
+        {
+            throw "cid_threads has an out-of-range TID or PID in $path"
+        }
+        if (-not $seenThreadIds.Add([uint32]$threadId))
+        {
+            throw "cid_threads contains duplicate tid=$threadId in $path"
+        }
+
+        $directSeen = Get-RequiredJsonBoolean -Container $record -Name "direct_cid_seen" -Context "cid_threads"
+        $identityRevalidated = Get-RequiredJsonBoolean -Container $record -Name "identity_revalidated" -Context "cid_threads"
+        $viewsRevalidated = Get-RequiredJsonBoolean -Container $record -Name "views_revalidated" -Context "cid_threads"
+        $lifecycleChanged = Get-RequiredJsonBoolean -Container $record -Name "lifecycle_changed" -Context "cid_threads"
+        $suspicious = Get-RequiredJsonBoolean -Container $record -Name "suspicious" -Context "cid_threads"
+        foreach ($field in @(
+            "terminated",
+            "executive_thread_list_seen",
+            "scheduler_thread_list_seen",
+            "system_process_information_seen",
+            "toolhelp_seen"
+        ))
+        {
+            $null = Get-RequiredJsonBoolean -Container $record -Name $field -Context "cid_threads"
+        }
+        foreach ($field in @(
+            "object_header",
+            "ethread",
+            "eprocess"
+        ))
+        {
+            $property = $record.PSObject.Properties[$field]
+            if ($null -eq $property -or
+                $property.Value -isnot [string] -or
+                [string]$property.Value -notmatch '^0x[0-9a-fA-F]{16}$')
+            {
+                throw "cid_threads.$field must be a 16-digit hexadecimal string in $path"
+            }
+        }
+        foreach ($field in @("reasons", "warnings"))
+        {
+            $property = $record.PSObject.Properties[$field]
+            if ($null -eq $property -or
+                $property.Value -isnot [System.Array])
+            {
+                throw "cid_threads.$field must be a JSON array in $path"
+            }
+        }
+
+        if ($directSeen)
+        {
+            ++$directThreadRecords
+        }
+        if ($suspicious)
+        {
+            ++$suspiciousThreadRecords
+        }
+        if ($cidThreadCrossViewComplete -and
+            (-not $identityRevalidated -or
+             -not $viewsRevalidated))
+        {
+            throw "complete CID thread cross-view contains an unstable identity for tid=$threadId in $path"
+        }
+    }
+    if (($cidFullThreadEnumeration -or
+         $cidThreadCrossViewComplete) -and
+        ($cidThreads.Count -lt $cidDirectThreads -or
+         $directThreadRecords -ne $cidDirectThreads))
+    {
+        throw "cid_threads does not cover every direct CID thread entry in $path"
+    }
+    if ($suspiciousThreadRecords -ne $cidThreadFindings -or
+        $suspiciousThreadRecords -ne
+            $cidPersistentThreadViewMisses)
+    {
+        throw "CID thread finding, persistent-miss, and suspicious-record counts disagree in $path"
+    }
+    $threadCrossViewFindings =
+        @($findings | Where-Object {
+            [string]$_.class -eq "thread_cross_view"
+        }).Count
+    if ($threadCrossViewFindings -ne $cidThreadFindings)
+    {
+        throw "CID thread finding count does not match thread_cross_view findings in $path"
+    }
+
     if ($coverageComplete -and
         ($inventoryIncomplete -or $triageIncomplete -or
             $deepImageIncomplete -or $driverServiceIncomplete -or
+            $wfpIncomplete -or $qosIncomplete -or
+            $bindGlobalIncomplete -or
+            $bindProcessIncomplete -or $cloudMetadataIncomplete -or
+            $cloudProtectionIncomplete -or
             $threatIntelIncomplete))
     {
         throw "summary coverage flags are inconsistent in $path"
+    }
+    if ($coverageComplete -and
+        (-not $cidFullEnumeration -or
+         -not $cidFullProcessEnumeration -or
+         -not $cidDirectEntryEnumeration -or
+         -not $cidFullThreadEnumeration -or
+         -not $cidThreadCrossViewComplete))
+    {
+        throw "complete coverage requires direct process-and-thread CID enumeration with a complete thread cross-view in $path"
+    }
+    if ($cidLookupOnly -and
+        ($cidFullEnumeration -or
+         $cidFullProcessEnumeration -or
+         $cidDirectEntryEnumeration -or
+         $cidFullThreadEnumeration -or
+         $cidThreadCrossViewComplete))
+    {
+        throw "lookup-only CID mode conflicts with full/direct CID coverage flags in $path"
+    }
+    if ($cidFullEnumeration -or
+        $cidFullProcessEnumeration -or
+        $cidDirectEntryEnumeration -or
+        $cidFullThreadEnumeration -or
+        $cidThreadCrossViewComplete)
+    {
+        $cidAnchor = Get-RequiredJsonNonzeroHex64 -Container $document.summary -Name "cid_table_anchor" -Context "summary"
+        $cidTableAddress = Get-RequiredJsonNonzeroHex64 -Container $document.summary -Name "cid_table_address" -Context "summary"
+        $cidTableCode = Get-RequiredJsonNonzeroHex64 -Container $document.summary -Name "cid_table_code" -Context "summary"
+        if ($cidLevel -lt 0 -or $cidLevel -gt 2)
+        {
+            throw "summary.cid_table_level must be 0, 1, or 2 in $path"
+        }
+        if ($cidNextHandle -lt 8 -or ($cidNextHandle % 4) -ne 0)
+        {
+            throw "summary.cid_table_next_handle is not an aligned allocated CID bound in $path"
+        }
+        if ($cidAllocatedLeaves -le 0 -or
+            $cidAllocatedCapacity -ne $cidNextHandle)
+        {
+            throw "CID allocated-leaf topology is inconsistent in $path"
+        }
+        if ($cidProbes -lt (($cidNextHandle / 4) - 1))
+        {
+            throw "CID probe count does not cover the validated range in $path"
+        }
+        if ($cidProcesses -le 0 -or
+            $cidDiscoveredProcesses -gt $cidProcesses)
+        {
+            throw "CID process counts are inconsistent in $path"
+        }
+        if ($cidProbeFailures -ne 0)
+        {
+            throw "CID probe failures are nonzero in $path"
+        }
+        if ($cidPersistentApiMisses -ne 0)
+        {
+            throw "persistent API-visible CID misses are nonzero in $path"
+        }
+        if ($cidDirectEntryEnumeration -and
+            ($cidDirectEntries -le 0 -or
+            $cidDirectProcesses -le 0 -or
+             $cidDirectThreads -le 0))
+        {
+            throw "direct CID typed inventory is empty in $path"
+        }
+        if ($cidDirectEntryEnumeration -and
+            $cidDirectEntries -ne
+                ($cidDirectProcesses + $cidDirectThreads))
+        {
+            throw "direct CID entry count does not equal typed process plus thread entries in $path"
+        }
+        if ($cidDirectEntryEnumeration -and
+            $cidUnclassifiedEntries -ne 0)
+        {
+            throw "direct CID enumeration has unclassified entries in $path"
+        }
+        if (($cidFullThreadEnumeration -or
+             $cidThreadCrossViewComplete) -and
+            ($systemThreads -le 0 -or
+             $toolhelpThreads -le 0 -or
+             $cidDirectThreads -le 0))
+        {
+            throw "complete CID thread cross-view has an empty API or direct thread inventory in $path"
+        }
     }
     if ($threatIntelActive -and -not $threatIntelAvailable)
     {
@@ -275,6 +540,53 @@ for ($runIndex = 0; $runIndex -lt $resolvedInputs.Count; ++$runIndex)
     {
         throw "summary/findings count mismatch in $path"
     }
+    if ($suspiciousWfpFilters -gt $wfpFilters)
+    {
+        throw "suspicious WFP filter count exceeds total in $path"
+    }
+    if ($suspiciousQosPolicies -gt $qosPolicies)
+    {
+        throw "suspicious QoS policy count exceeds total in $path"
+    }
+    if ($suspiciousBindMappings -gt $bindMappings)
+    {
+        throw "suspicious bindflt mapping count exceeds total in $path"
+    }
+    if ($suspiciousCloudFileImages -gt $cloudFileImages)
+    {
+        throw "suspicious CloudFiles image count exceeds total in $path"
+    }
+    if ($null -eq $document.PSObject.Properties["cloudfiles_images"] -or
+        $document.cloudfiles_images -isnot [System.Array])
+    {
+        throw "cloudfiles_images must be a JSON array: $path"
+    }
+    $cloudFileRecords = @($document.cloudfiles_images)
+    $actualSuspiciousCloudFileImages = 0
+    foreach ($record in $cloudFileRecords)
+    {
+        if ($null -eq $record)
+        {
+            throw "null CloudFiles observation in $path"
+        }
+        $suspiciousProperty =
+            $record.PSObject.Properties["suspicious"]
+        if ($null -eq $suspiciousProperty -or
+            $suspiciousProperty.Value -isnot [bool])
+        {
+            throw "CloudFiles observation suspicious flag is missing or invalid in $path"
+        }
+        if ($suspiciousProperty.Value)
+        {
+            ++$actualSuspiciousCloudFileImages
+        }
+    }
+    if ($cloudFileImages -ne $cloudFileRecords.Count -or
+        $suspiciousCloudFileImages -ne
+            $actualSuspiciousCloudFileImages)
+    {
+        throw "CloudFiles observation counts do not match summary in $path"
+    }
 
     $runId = "{0:D2}:{1}" -f ($runIndex + 1), [System.IO.Path]::GetFileName($path)
     $actualRiskCounts = @{
@@ -283,12 +595,35 @@ for ($runIndex = 0; $runIndex -lt $resolvedInputs.Count; ++$runIndex)
         low = 0
         info = 0
     }
+    $actualSuspiciousWfpFilters = 0
+    $actualSuspiciousQosPolicies = 0
+    $actualSuspiciousBindMappings = 0
+    $actualBindProcessBindings = 0
+    $actualCloudFileFindings = 0
 
     foreach ($finding in $findings)
     {
         if ($null -eq $finding)
         {
             throw "null finding in $path"
+        }
+        $reasonsProperty =
+            $finding.PSObject.Properties["reasons"]
+        if ($null -eq $reasonsProperty -or
+            $reasonsProperty.Value -isnot
+                [System.Array])
+        {
+            throw "finding reasons must be a JSON array in $path"
+        }
+        foreach ($reason in
+            @($reasonsProperty.Value))
+        {
+            if ($reason -isnot [string] -or
+                [string]::IsNullOrWhiteSpace(
+                    [string]$reason))
+            {
+                throw "finding reasons must contain non-empty strings in $path"
+            }
         }
 
         $risk = ([string]$finding.risk).ToLowerInvariant()
@@ -297,6 +632,35 @@ for ($runIndex = 0; $runIndex -lt $resolvedInputs.Count; ++$runIndex)
             throw "unsupported finding risk '$($finding.risk)' in $path"
         }
         $actualRiskCounts[$risk] = [int]$actualRiskCounts[$risk] + 1
+
+        $reasonCodes = @($finding.reasons)
+        if (($reasonCodes -contains
+                "wfp_security_product_block_filter") -or
+            ($reasonCodes -contains
+                "wfp_anticheat_block_filter"))
+        {
+            ++$actualSuspiciousWfpFilters
+        }
+        if ($reasonCodes -contains
+            "qos_security_product_throttle_policy")
+        {
+            ++$actualSuspiciousQosPolicies
+        }
+        if ($reasonCodes -contains
+            "bind_link_process_binding_state")
+        {
+            ++$actualBindProcessBindings
+        }
+        elseif ($reasonCodes -contains
+            "bindflt_active_global_mapping")
+        {
+            ++$actualSuspiciousBindMappings
+        }
+        if ([string]$finding.class -eq
+            "cloudfiles_false_file_immutability")
+        {
+            ++$actualCloudFileFindings
+        }
 
         $identity = Get-FindingIdentity -Finding $finding
         if (-not $groups.ContainsKey($identity.Canonical))
@@ -335,6 +699,20 @@ for ($runIndex = 0; $runIndex -lt $resolvedInputs.Count; ++$runIndex)
         }
     }
 
+    if ($suspiciousWfpFilters -ne
+            $actualSuspiciousWfpFilters -or
+        $suspiciousQosPolicies -ne
+            $actualSuspiciousQosPolicies -or
+        $suspiciousBindMappings -ne
+            $actualSuspiciousBindMappings -or
+        $bindProcessBindings -ne
+            $actualBindProcessBindings -or
+        $suspiciousCloudFileImages -ne
+            $actualCloudFileFindings)
+    {
+        throw "detector summary counters do not match findings in $path"
+    }
+
     foreach ($risk in @("high", "medium", "low", "info"))
     {
         $summaryRisk = switch ($risk)
@@ -358,12 +736,54 @@ for ($runIndex = 0; $runIndex -lt $resolvedInputs.Count; ++$runIndex)
         kernel_processes = $kernelProcesses
         system_process_information_processes = $systemProcesses
         toolhelp_processes = $toolhelpProcesses
+        system_process_information_threads = $systemThreads
+        toolhelp_threads = $toolhelpThreads
         scanned_processes = $scannedProcesses
         findings = $summaryFindings
         high = $summaryHigh
         medium = $summaryMedium
         low = $summaryLow
         info = $summaryInfo
+        wfp_filters = $wfpFilters
+        suspicious_wfp_filters = $suspiciousWfpFilters
+        wfp_filter_coverage_incomplete = $wfpIncomplete
+        qos_policies = $qosPolicies
+        suspicious_qos_policies = $suspiciousQosPolicies
+        qos_policy_coverage_incomplete = $qosIncomplete
+        bindflt_global_mappings = $bindMappings
+        suspicious_bindflt_global_mappings = $suspiciousBindMappings
+        bindflt_process_bindings = $bindProcessBindings
+        bindflt_global_coverage_incomplete = $bindGlobalIncomplete
+        bindflt_process_correlation_coverage_incomplete = $bindProcessIncomplete
+        bindflt_silo_coverage_unsupported = $bindSiloUnsupported
+        cloudfiles_placeholder_images = $cloudFileImages
+        suspicious_cloudfiles_images = $suspiciousCloudFileImages
+        cloudfiles_placeholder_coverage_incomplete = $cloudMetadataIncomplete
+        cloudfiles_protection_correlation_incomplete = $cloudProtectionIncomplete
+        cid_table_full_enumeration = $cidFullEnumeration
+        cid_table_full_process_enumeration = $cidFullProcessEnumeration
+        cid_table_direct_entry_enumeration = $cidDirectEntryEnumeration
+        cid_table_full_thread_enumeration = $cidFullThreadEnumeration
+        cid_table_thread_cross_view_complete = $cidThreadCrossViewComplete
+        cid_table_lookup_only = $cidLookupOnly
+        cid_table_anchor = $cidAnchor
+        cid_table_address = $cidTableAddress
+        cid_table_code = $cidTableCode
+        cid_table_level = $cidLevel
+        cid_table_next_handle = $cidNextHandle
+        cid_table_allocated_leaves = $cidAllocatedLeaves
+        cid_table_allocated_handle_capacity = $cidAllocatedCapacity
+        cid_table_probes = $cidProbes
+        cid_table_processes = $cidProcesses
+        cid_table_discovered_processes = $cidDiscoveredProcesses
+        cid_table_direct_entries = $cidDirectEntries
+        cid_table_direct_processes = $cidDirectProcesses
+        cid_table_direct_threads = $cidDirectThreads
+        cid_table_unclassified_entries = $cidUnclassifiedEntries
+        cid_table_thread_findings = $cidThreadFindings
+        cid_table_persistent_thread_view_misses = $cidPersistentThreadViewMisses
+        cid_table_probe_failures = $cidProbeFailures
+        cid_table_persistent_api_misses = $cidPersistentApiMisses
         process_inventory_incomplete = $inventoryIncomplete
         process_triage_coverage_incomplete = $triageIncomplete
         deep_image_comparison_coverage_incomplete = $deepImageIncomplete

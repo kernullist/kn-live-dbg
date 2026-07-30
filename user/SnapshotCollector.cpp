@@ -6,6 +6,7 @@
 #include "EtwScanner.h"
 #include "FirmwareTableScanner.h"
 #include "IntegrityScanner.h"
+#include "MinifilterAttachmentScanner.h"
 #include "NmiScanner.h"
 #include "MsrScanner.h"
 #include "CrScanner.h"
@@ -22,8 +23,10 @@
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <sstream>
+#include <vector>
 
 namespace
 {
@@ -165,6 +168,17 @@ namespace
         return text;
     }
 
+    std::wstring SnapshotIdentityPart(
+        const std::wstring& value)
+    {
+        const std::wstring normalized =
+            SnapshotToLower(value);
+        return std::to_wstring(
+                   normalized.size()) +
+            L":" +
+            normalized;
+    }
+
     std::wstring FingerprintFileFnv64(const std::wstring& path)
     {
         std::wstring result;
@@ -191,10 +205,26 @@ namespace
             }
 
             uint64_t hash = 14695981039346656037ull;
-            uint8_t buffer[32768] = {};
+            std::vector<uint8_t> buffer(32768);
             DWORD read = 0;
-            while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read != 0)
+            bool readComplete = false;
+            for (;;)
             {
+                if (!ReadFile(
+                        file,
+                        buffer.data(),
+                        static_cast<DWORD>(buffer.size()),
+                        &read,
+                        nullptr))
+                {
+                    break;
+                }
+                if (read == 0)
+                {
+                    readComplete = true;
+                    break;
+                }
+
                 for (DWORD i = 0; i < read; ++i)
                 {
                     hash ^= buffer[i];
@@ -202,7 +232,10 @@ namespace
                 }
             }
 
-            result = SnapshotHex(hash, 16);
+            if (readComplete)
+            {
+                result = SnapshotHex(hash, 16);
+            }
         } while (false);
 
         if (file != INVALID_HANDLE_VALUE)
@@ -273,13 +306,70 @@ namespace
         return target;
     }
 
-    void CaptureProcessInventory(const SnapshotCaptureOptions& options, SnapshotDocument* document)
+    bool ResolveProcessProtectionField(
+        SymbolEngine& symbols,
+        TypeFieldInfo* field,
+        std::wstring* error)
+    {
+        if (field == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid _EPROCESS.Protection field output";
+            }
+            return false;
+        }
+
+        std::wstring firstError;
+        if (symbols.FindField(
+                L"nt!_EPROCESS",
+                L"Protection",
+                field,
+                &firstError))
+        {
+            return true;
+        }
+
+        std::wstring secondError;
+        if (symbols.FindField(
+                L"_EPROCESS",
+                L"Protection",
+                field,
+                &secondError))
+        {
+            return true;
+        }
+
+        if (error != nullptr)
+        {
+            *error = !secondError.empty() ? secondError : firstError;
+        }
+        return false;
+    }
+
+    void CaptureProcessInventory(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const SnapshotCaptureOptions& options,
+        SnapshotDocument* document)
     {
         if (document == nullptr)
         {
             return;
         }
 
+        TypeFieldInfo protectionField = {};
+        std::wstring protectionFieldError;
+        const bool protectionFieldResolved =
+            ResolveProcessProtectionField(
+                symbols,
+                &protectionField,
+                &protectionFieldError);
+        document->Metadata[L"process_security_protection_resolved"] =
+            BoolText(protectionFieldResolved);
+
+        uint64_t protectionReadsAttempted = 0;
+        uint64_t protectionReadsSucceeded = 0;
         document->Processes = options.Processes;
         for (SnapshotProcessRecord& process : document->Processes)
         {
@@ -312,16 +402,114 @@ namespace
             record.Evidence[L"has_create_time"] = BoolText(process.HasCreateTime);
             record.Evidence[L"create_time"] = SnapshotHex(process.CreateTime, 16);
             AddRecord(document, std::move(record));
+
+            if (!protectionFieldResolved)
+            {
+                continue;
+            }
+
+            ++protectionReadsAttempted;
+            uint64_t protectionAddress = 0;
+            if (process.Eprocess == 0 ||
+                process.Eprocess >
+                    std::numeric_limits<uint64_t>::max() -
+                        protectionField.Offset)
+            {
+                continue;
+            }
+            protectionAddress =
+                process.Eprocess + protectionField.Offset;
+
+            std::vector<uint8_t> protectionBytes;
+            std::wstring readError;
+            if (!device.ReadMemory(
+                    protectionAddress,
+                    sizeof(uint8_t),
+                    &protectionBytes,
+                    &readError) ||
+                protectionBytes.size() != sizeof(uint8_t))
+            {
+                continue;
+            }
+
+            ++protectionReadsSucceeded;
+            const uint8_t protection = protectionBytes[0];
+            SnapshotRecord securityRecord;
+            securityRecord.Domain = L"process-security";
+            securityRecord.Identity =
+                L"process-security:" + process.Identity;
+            securityRecord.Display =
+                process.ImageName + L" pid=" +
+                std::to_wstring(process.ProcessId) +
+                L" protection=" +
+                SnapshotHex(protection, 2);
+            securityRecord.Risk = L"info";
+            securityRecord.Tags =
+                {L"process-security", L"process-protection"};
+            securityRecord.Evidence[L"pid"] =
+                DecText(process.ProcessId);
+            securityRecord.Evidence[L"image"] =
+                process.ImageName;
+            securityRecord.Evidence[L"eprocess"] =
+                SnapshotHex(process.Eprocess, 16);
+            securityRecord.Evidence[L"protection_raw"] =
+                DecText(protection);
+            securityRecord.Evidence[L"protection_hex"] =
+                SnapshotHex(protection, 2);
+            securityRecord.Evidence[L"protection_type"] =
+                DecText(protection & 0x7u);
+            securityRecord.Evidence[L"protection_audit"] =
+                DecText((protection >> 3) & 0x1u);
+            securityRecord.Evidence[L"protection_signer"] =
+                DecText((protection >> 4) & 0xfu);
+            AddRecord(document, std::move(securityRecord));
+        }
+
+        document->Metadata[L"process_security_reads_attempted"] =
+            DecText(protectionReadsAttempted);
+        document->Metadata[L"process_security_reads_succeeded"] =
+            DecText(protectionReadsSucceeded);
+        const bool protectionCoverageComplete =
+            protectionFieldResolved &&
+            protectionReadsAttempted == protectionReadsSucceeded;
+        document->Metadata[L"process_security_coverage_complete"] =
+            BoolText(protectionCoverageComplete);
+        if (!protectionFieldResolved)
+        {
+            AddWarning(
+                document,
+                L"process-security",
+                L"_EPROCESS.Protection unavailable; process protection "
+                L"delta detection is disabled: " +
+                    protectionFieldError);
+        }
+        else if (!protectionCoverageComplete)
+        {
+            AddWarning(
+                document,
+                L"process-security",
+                L"_EPROCESS.Protection coverage incomplete: read " +
+                    DecText(protectionReadsSucceeded) +
+                    L" of " +
+                    DecText(protectionReadsAttempted) +
+                    L" process records");
         }
     }
 
     void CaptureModules(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
     {
+        if (document == nullptr)
+        {
+            return;
+        }
+
         IntegrityScanner scanner(device, symbols);
         ModuleIntegrityOptions options = {};
         ModuleIntegrityResult result = {};
         std::wstring error;
 
+        document->Metadata[L"modules_coverage_complete"] =
+            L"false";
         if (!scanner.ScanModules(options, &result, &error))
         {
             AddWarning(document, L"modules", error);
@@ -329,6 +517,8 @@ namespace
             return;
         }
 
+        document->Metadata[L"modules_coverage_complete"] =
+            BoolText(!result.Truncated);
         AddWarnings(document, L"modules", result.Warnings);
         for (const ModuleIntegrityRecord& module : result.Records)
         {
@@ -429,10 +619,19 @@ namespace
 
     void CaptureCallbacks(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
     {
+        if (document == nullptr)
+        {
+            return;
+        }
+
         KernelCallbackScanner scanner(device, symbols);
         KernelCallbackScanResult result = {};
         std::wstring error;
 
+        document->Metadata[L"callbacks_coverage_complete"] =
+            L"false";
+        document->Metadata[L"callbacks_record_count"] =
+            L"0";
         if (!scanner.Scan(L"all", &result, &error))
         {
             AddWarning(document, L"callbacks", error);
@@ -440,6 +639,10 @@ namespace
             return;
         }
 
+        document->Metadata[L"callbacks_coverage_complete"] =
+            BoolText(!result.Incomplete);
+        document->Metadata[L"callbacks_record_count"] =
+            DecText(result.Records.size());
         AddWarnings(document, L"callbacks", result.Warnings);
         for (const KernelCallbackRecord& cb : result.Records)
         {
@@ -468,6 +671,175 @@ namespace
             record.Evidence[L"notes"] = cb.Notes;
             AddRecord(document, std::move(record));
         }
+    }
+
+    void CaptureMinifilterAttachments(
+        SnapshotDocument* document)
+    {
+        if (document == nullptr)
+        {
+            return;
+        }
+
+        document->Metadata[
+            L"minifilter_attachments_coverage_complete"] =
+                L"false";
+        document->Metadata[
+            L"minifilter_attachment_record_count"] =
+                L"0";
+        document->Metadata[
+            L"minifilter_attachment_volume_count"] =
+                L"0";
+        document->Metadata[
+            L"minifilter_attachment_detached_count"] =
+                L"0";
+
+        MinifilterAttachmentScanner scanner;
+        MinifilterAttachmentScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(
+                &result,
+                &error))
+        {
+            AddWarning(
+                document,
+                L"minifilter-attachments",
+                error.empty()
+                    ? L"Filter Manager attachment enumeration failed"
+                    : error);
+            return;
+        }
+
+        document->Metadata[
+            L"minifilter_attachments_coverage_complete"] =
+                BoolText(!result.Incomplete);
+        document->Metadata[
+            L"minifilter_attachment_record_count"] =
+                DecText(result.Records.size());
+        document->Metadata[
+            L"minifilter_attachment_volume_count"] =
+                DecText(result.Volumes.size());
+        AddWarnings(
+            document,
+            L"minifilter-attachments",
+            result.Warnings);
+
+        for (const std::wstring& volume :
+             result.Volumes)
+        {
+            SnapshotRecord record;
+            record.Domain =
+                L"minifilter-attachments";
+            record.Identity =
+                L"minifilter-volume:" +
+                SnapshotIdentityPart(volume);
+            record.Display =
+                L"Filter Manager volume " +
+                volume;
+            record.Risk = L"low";
+            record.Tags =
+                {L"minifilter-volume"};
+            record.Evidence[L"volume_name"] =
+                volume;
+            AddRecord(
+                document,
+                std::move(record));
+        }
+
+        uint64_t detachedCount = 0;
+        for (const MinifilterAttachmentRecord&
+                 attachment :
+             result.Records)
+        {
+            SnapshotRecord record;
+            record.Domain =
+                L"minifilter-attachments";
+            record.Identity =
+                L"minifilter-attachment:" +
+                SnapshotIdentityPart(
+                    attachment.IsMinifilter
+                        ? L"minifilter"
+                        : L"legacy") +
+                SnapshotIdentityPart(
+                    attachment.FilterName) +
+                SnapshotIdentityPart(
+                    attachment.InstanceName) +
+                SnapshotIdentityPart(
+                    attachment.VolumeName) +
+                SnapshotIdentityPart(
+                    attachment.Altitude);
+            record.Display =
+                (attachment.IsMinifilter
+                     ? L"minifilter "
+                     : L"legacy filter ") +
+                attachment.FilterName +
+                (attachment.InstanceName.empty()
+                     ? L""
+                     : L" [" +
+                           attachment.InstanceName +
+                           L"]") +
+                L" on " +
+                attachment.VolumeName;
+            // DETACHED_VOLUME can occur during legitimate teardown. Preserve
+            // the raw state here and promote only a same-boot transition or a
+            // coverage-gated removal while the filter and volume persist.
+            record.Risk = L"low";
+            record.Tags =
+                {L"minifilter-attachment"};
+            record.Tags.push_back(
+                attachment.IsMinifilter
+                    ? L"minifilter"
+                    : L"legacy-filter");
+            if (attachment.DetachedVolume)
+            {
+                ++detachedCount;
+                record.Tags.push_back(
+                    L"detached-volume");
+            }
+            record.Evidence[L"kind"] =
+                attachment.IsMinifilter
+                    ? L"minifilter"
+                    : L"legacy";
+            record.Evidence[L"filter_name"] =
+                attachment.FilterName;
+            record.Evidence[L"instance_name"] =
+                attachment.InstanceName;
+            record.Evidence[L"altitude"] =
+                attachment.Altitude;
+            record.Evidence[L"volume_name"] =
+                attachment.VolumeName;
+            record.Evidence[L"detached_volume"] =
+                BoolText(
+                    attachment.DetachedVolume);
+            record.Evidence[L"aggregate_flags"] =
+                SnapshotHex(
+                    attachment.AggregateFlags,
+                    8);
+            record.Evidence[L"instance_flags"] =
+                SnapshotHex(
+                    attachment.InstanceFlags,
+                    8);
+            record.Evidence[L"frame_id"] =
+                DecText(
+                    attachment.FrameId);
+            record.Evidence[
+                L"volume_filesystem_type"] =
+                    DecText(
+                        attachment.
+                            VolumeFileSystemType);
+            record.Evidence[
+                L"supported_features"] =
+                    SnapshotHex(
+                        attachment.
+                            SupportedFeatures,
+                        8);
+            AddRecord(
+                document,
+                std::move(record));
+        }
+        document->Metadata[
+            L"minifilter_attachment_detached_count"] =
+                DecText(detachedCount);
     }
 
     void CaptureEtw(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
@@ -1312,6 +1684,10 @@ SnapshotCollector::SnapshotCollector(DeviceClient& device, SymbolEngine& symbols
 bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotDocument* document, std::wstring* error)
 {
     bool ok = false;
+    if (error != nullptr)
+    {
+        error->clear();
+    }
 
     do
     {
@@ -1334,7 +1710,7 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
         document->Metadata[L"vad_dkom_new_process_mode"] = BoolText(options.CaptureVadDkomForNewProcesses);
         document->Metadata[L"byovd_auto_update"] = BoolText(options.AllowByovdAutoUpdate);
 
-        CaptureProcessInventory(options, document);
+        CaptureProcessInventory(device_, symbols_, options, document);
 
         if (!options.IncludeAll)
         {
@@ -1345,6 +1721,7 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
         CaptureModules(device_, symbols_, document);
         CaptureDrivers(device_, symbols_, document);
         CaptureCallbacks(device_, symbols_, document);
+        CaptureMinifilterAttachments(document);
         CaptureEtw(device_, symbols_, document);
         CaptureNmi(device_, symbols_, document);
         CaptureCpuState(device_, symbols_, document);

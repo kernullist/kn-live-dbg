@@ -10,6 +10,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgProbeDriver", "pro
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgByovdFixtureDriver", "byovd_fixture_driver\KnLiveDbgByovdFixtureDriver.vcxproj", "{E2F0BB6F-9A18-4E95-89BC-ED32A4C1101E}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgMiniFilterFixture", "minifilter_fixture_driver\KnLiveDbgMiniFilterFixture.vcxproj", "{F3A56E8B-3303-41E7-B0CA-F72E9D425045}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgBindFixture", "bind_fixture_controller\KnLiveDbgBindFixture.vcxproj", "{909CF1B8-1B7A-4E0E-9ED8-1C8B235F55EB}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgHuntTarget", "hunt_test_target\KnLiveDbgHuntTarget.vcxproj", "{D01E26B9-7A2E-4FC7-99CC-9BAA2EAD65F7}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgHuntTargetDll", "hunt_test_target\KnLiveDbgHuntTargetDll.vcxproj", "{A2C36B8C-C53F-4E35-A8F5-B2E2AB5BDE61}"
@@ -36,6 +40,14 @@ Global
 		{E2F0BB6F-9A18-4E95-89BC-ED32A4C1101E}.Debug|x64.Build.0 = Debug|x64
 		{E2F0BB6F-9A18-4E95-89BC-ED32A4C1101E}.Release|x64.ActiveCfg = Release|x64
 		{E2F0BB6F-9A18-4E95-89BC-ED32A4C1101E}.Release|x64.Build.0 = Release|x64
+		{F3A56E8B-3303-41E7-B0CA-F72E9D425045}.Debug|x64.ActiveCfg = Debug|x64
+		{F3A56E8B-3303-41E7-B0CA-F72E9D425045}.Debug|x64.Build.0 = Debug|x64
+		{F3A56E8B-3303-41E7-B0CA-F72E9D425045}.Release|x64.ActiveCfg = Release|x64
+		{F3A56E8B-3303-41E7-B0CA-F72E9D425045}.Release|x64.Build.0 = Release|x64
+		{909CF1B8-1B7A-4E0E-9ED8-1C8B235F55EB}.Debug|x64.ActiveCfg = Debug|x64
+		{909CF1B8-1B7A-4E0E-9ED8-1C8B235F55EB}.Debug|x64.Build.0 = Debug|x64
+		{909CF1B8-1B7A-4E0E-9ED8-1C8B235F55EB}.Release|x64.ActiveCfg = Release|x64
+		{909CF1B8-1B7A-4E0E-9ED8-1C8B235F55EB}.Release|x64.Build.0 = Release|x64
 		{D01E26B9-7A2E-4FC7-99CC-9BAA2EAD65F7}.Debug|x64.ActiveCfg = Debug|x64
 		{D01E26B9-7A2E-4FC7-99CC-9BAA2EAD65F7}.Debug|x64.Build.0 = Debug|x64
 		{D01E26B9-7A2E-4FC7-99CC-9BAA2EAD65F7}.Release|x64.ActiveCfg = Release|x64

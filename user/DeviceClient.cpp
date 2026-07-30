@@ -77,14 +77,30 @@ bool DeviceClient::IsOpen() const
     return device_ != INVALID_HANDLE_VALUE;
 }
 
-bool DeviceClient::Ioctl(DWORD code, void* buffer, DWORD inLength, DWORD outLength, DWORD* returned, std::wstring* error)
+bool DeviceClient::Ioctl(
+    DWORD code,
+    void* buffer,
+    DWORD inLength,
+    DWORD outLength,
+    DWORD* returned,
+    std::wstring* error,
+    DWORD* deviceError)
 {
     bool ok = false;
 
     do
     {
+        if (deviceError != nullptr)
+        {
+            *deviceError = ERROR_SUCCESS;
+        }
+
         if (device_ == INVALID_HANDLE_VALUE)
         {
+            if (deviceError != nullptr)
+            {
+                *deviceError = ERROR_INVALID_HANDLE;
+            }
             if (error != nullptr)
             {
                 *error = L"Device is not open";
@@ -95,9 +111,14 @@ bool DeviceClient::Ioctl(DWORD code, void* buffer, DWORD inLength, DWORD outLeng
         DWORD localReturned = 0;
         if (!DeviceIoControl(device_, code, buffer, inLength, buffer, outLength, &localReturned, nullptr))
         {
+            const DWORD lastError = GetLastError();
+            if (deviceError != nullptr)
+            {
+                *deviceError = lastError;
+            }
             if (error != nullptr)
             {
-                *error = DeviceErrorText(L"DeviceIoControl failed", GetLastError());
+                *error = DeviceErrorText(L"DeviceIoControl failed", lastError);
             }
             break;
         }
@@ -533,14 +554,24 @@ bool DeviceClient::ResolveProcess(
     uint32_t directoryTableBaseOffset,
     uint32_t userDirectoryTableBaseOffset,
     ProcessAddressContext* context,
-    std::wstring* error)
+    std::wstring* error,
+    DWORD* deviceError)
 {
     bool ok = false;
 
     do
     {
+        if (deviceError != nullptr)
+        {
+            *deviceError = ERROR_SUCCESS;
+        }
+
         if (context == nullptr || processId == 0 || directoryTableBaseOffset == 0)
         {
+            if (deviceError != nullptr)
+            {
+                *deviceError = ERROR_INVALID_PARAMETER;
+            }
             if (error != nullptr)
             {
                 *error = L"Invalid process resolve request";
@@ -566,13 +597,18 @@ bool DeviceClient::ResolveProcess(
                 sizeof(KNDBG_PROCESS_RESOLVE_REQUEST),
                 sizeof(KNDBG_PROCESS_RESOLVE_RESPONSE),
                 &returned,
-                error))
+                error,
+                deviceError))
         {
             break;
         }
 
         if (returned < sizeof(KNDBG_PROCESS_RESOLVE_RESPONSE))
         {
+            if (deviceError != nullptr)
+            {
+                *deviceError = ERROR_INSUFFICIENT_BUFFER;
+            }
             if (error != nullptr)
             {
                 *error = L"Short process resolve response";

@@ -1587,7 +1587,10 @@ namespace
 
         if (snapshot != INVALID_HANDLE_VALUE)
         {
-            CloseHandle(snapshot);
+            if (snapshot != nullptr)
+            {
+                CloseHandle(snapshot);
+            }
         }
         return ok;
     }
@@ -2502,6 +2505,8 @@ namespace
         TypeFieldInfo Teb = {};
         TypeFieldInfo StackBase = {};
         TypeFieldInfo StackLimit = {};
+        TypeFieldInfo SuspendCount = {};
+        TypeFieldInfo FreezeCount = {};
         TypeFieldInfo ApcState = {};
         TypeFieldInfo ApcListHead = {};
         TypeFieldInfo KapcListEntry = {};
@@ -2517,6 +2522,8 @@ namespace
         bool HasTeb = false;
         bool HasStackBase = false;
         bool HasStackLimit = false;
+        bool HasSuspendCount = false;
+        bool HasFreezeCount = false;
         bool HasApcState = false;
         bool HasApcListHead = false;
         bool HasKapcLayout = false;
@@ -2557,6 +2564,10 @@ namespace
                 FindFieldRecursive(symbols, {L"nt!_ETHREAD", L"_ETHREAD"}, L"StackBase", &layout->StackBase, nullptr);
             layout->HasStackLimit =
                 FindFieldRecursive(symbols, {L"nt!_ETHREAD", L"_ETHREAD"}, L"StackLimit", &layout->StackLimit, nullptr);
+            layout->HasSuspendCount =
+                FindFieldRecursive(symbols, {L"nt!_ETHREAD", L"_ETHREAD"}, L"SuspendCount", &layout->SuspendCount, nullptr);
+            layout->HasFreezeCount =
+                FindFieldRecursive(symbols, {L"nt!_ETHREAD", L"_ETHREAD"}, L"FreezeCount", &layout->FreezeCount, nullptr);
 
             if (!layout->HasUniqueThread)
             {
@@ -2565,6 +2576,13 @@ namespace
             if (!layout->HasStartAddress && !layout->HasWin32StartAddress)
             {
                 layout->Warnings.push_back(L"thread start address fields not found");
+            }
+            if (!layout->HasSuspendCount ||
+                !layout->HasFreezeCount)
+            {
+                layout->Warnings.push_back(
+                    L"_ETHREAD suspend/freeze layout is incomplete; "
+                    L"security-process freeze detection is unavailable");
             }
 
             if (needApc)
@@ -3214,6 +3232,10 @@ bool ProcessTriageScanner::ScanVad(
     std::wstring* error)
 {
     bool ok = false;
+    if (error != nullptr)
+    {
+        error->clear();
+    }
 
     do
     {
@@ -3517,6 +3539,10 @@ bool ProcessTriageScanner::ScanThreads(
     std::wstring* error)
 {
     bool ok = false;
+    if (error != nullptr)
+    {
+        error->clear();
+    }
 
     do
     {
@@ -3540,6 +3566,9 @@ bool ProcessTriageScanner::ScanThreads(
 
         result->Warnings.insert(result->Warnings.end(), layout.Warnings.begin(), layout.Warnings.end());
         result->LayoutSource = L"PDB/DIA";
+        const bool suspensionLayoutComplete =
+            layout.HasSuspendCount &&
+            layout.HasFreezeCount;
         if ((!layout.HasStartAddress &&
              !layout.HasWin32StartAddress) ||
             (options.IncludeApc &&
@@ -3702,6 +3731,46 @@ bool ProcessTriageScanner::ScanThreads(
             bool hasStackLimit = false;
             ReadOptionalPointerField(device_, ethread, layout.StackLimit, layout.HasStackLimit, &record.StackLimit, &hasStackLimit);
             record.HasStackBounds = record.HasStackBounds && hasStackLimit;
+
+            if (layout.HasSuspendCount &&
+                ReadFieldInteger(
+                    device_,
+                    ethread,
+                    layout.SuspendCount,
+                    sizeof(uint8_t),
+                    &value,
+                    nullptr))
+            {
+                record.SuspendCount =
+                    static_cast<uint32_t>(value);
+                record.HasSuspendCount = true;
+            }
+            if (layout.HasFreezeCount &&
+                ReadFieldInteger(
+                    device_,
+                    ethread,
+                    layout.FreezeCount,
+                    sizeof(uint8_t),
+                    &value,
+                    nullptr))
+            {
+                record.FreezeCount =
+                    static_cast<uint32_t>(value);
+                record.HasFreezeCount = true;
+            }
+            const bool suspensionStateResolved =
+                suspensionLayoutComplete &&
+                record.HasSuspendCount &&
+                record.HasFreezeCount;
+            if (suspensionStateResolved)
+            {
+                ++result->SuspensionStateResolvedCount;
+                if (record.SuspendCount != 0 ||
+                    record.FreezeCount != 0)
+                {
+                    ++result->SuspendedThreadCount;
+                }
+            }
 
             if (options.IncludeStacks &&
                 (userDtb != 0 ||
@@ -3901,15 +3970,39 @@ bool ProcessTriageScanner::ScanThreads(
             }
         }
 
-        if (ThreadTraversalHitNodeLimit(
+        const bool threadTraversalHitNodeLimit =
+            ThreadTraversalHitNodeLimit(
                 result->ThreadsVisited,
                 current,
-                listHead))
+                listHead);
+        if (threadTraversalHitNodeLimit)
         {
             result->Truncated = true;
             result->Incomplete = true;
             result->CoverageComplete = false;
             result->Warnings.push_back(L"thread traversal hit the node limit");
+        }
+
+        result->InventoryComplete =
+            !threadListLinkFailure &&
+            !threadTraversalHitNodeLimit &&
+            current == listHead &&
+            previous == headBlink;
+        result->SuspensionStateCoverageComplete =
+            suspensionLayoutComplete &&
+            result->InventoryComplete &&
+            !result->Truncated &&
+            result->SuspensionStateResolvedCount ==
+                result->ThreadsVisited;
+        if (!result->SuspensionStateCoverageComplete)
+        {
+            result->Warnings.push_back(
+                L"thread suspend/freeze state coverage is incomplete");
+            if (options.RequireSuspensionCoverage)
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+            }
         }
 
         if (result->Incomplete)
@@ -4036,10 +4129,14 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
     json << L"  \"summary\":{\"threads_visited\":" << result.ThreadsVisited
          << L",\"records\":" << result.MatchingRecords
          << L",\"suspicious_start\":" << result.SuspiciousStartCount
+         << L",\"suspension_state_resolved\":" << result.SuspensionStateResolvedCount
+         << L",\"suspended_threads\":" << result.SuspendedThreadCount
          << L",\"nonempty_apc_queues\":" << result.ApcNonEmptyCount
          << L",\"stack_references\":" << result.StackReferenceCount
          << L",\"truncated\":" << (result.Truncated ? L"true" : L"false")
          << L",\"incomplete\":" << (result.Incomplete ? L"true" : L"false")
+         << L",\"inventory_complete\":" << (result.InventoryComplete ? L"true" : L"false")
+         << L",\"suspension_state_coverage_complete\":" << (result.SuspensionStateCoverageComplete ? L"true" : L"false")
          << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false")
          << L"},\n";
     json << L"  \"warnings\":[";
@@ -4065,7 +4162,11 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
              << L"\",\"stack_limit\":\"" << Hex(r.StackLimit, 16)
              << L"\",\"user_stack_base\":\"" << Hex(r.UserStackBase, 16)
              << L"\",\"user_stack_limit\":\"" << Hex(r.UserStackLimit, 16)
-             << L"\",\"start_module\":\"" << JsonEscape(r.StartModule)
+             << L"\",\"suspend_count\":" << r.SuspendCount
+             << L",\"freeze_count\":" << r.FreezeCount
+             << L",\"has_suspend_count\":" << (r.HasSuspendCount ? L"true" : L"false")
+             << L",\"has_freeze_count\":" << (r.HasFreezeCount ? L"true" : L"false")
+             << L",\"start_module\":\"" << JsonEscape(r.StartModule)
              << L"\",\"win32_start_module\":\"" << JsonEscape(r.Win32StartModule)
              << L"\",\"vad\":\"" << JsonEscape(r.VadClassification)
              << L"\",\"suspicious_start\":" << (r.SuspiciousStart ? L"true" : L"false")
