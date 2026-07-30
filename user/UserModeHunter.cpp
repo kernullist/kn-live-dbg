@@ -1,8 +1,12 @@
 #include "UserModeHunter.h"
 
+#include "BindFilterScanner.h"
 #include "ByovdScanner.h"
+#include "CloudFileScanner.h"
 #include "IntegrityScanner.h"
+#include "QosPolicyScanner.h"
 #include "WfpScanner.h"
+#include "Zydis.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -13,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <iomanip>
 #include <limits>
@@ -34,6 +39,13 @@ namespace
     constexpr size_t kMaxLdrModules = 1024;
     constexpr uint32_t kHuntHiddenPteRecordLimitPerProcess = 64;
     constexpr uint32_t kHuntTriageStabilityAttempts = 3;
+    // A full process-CID scan is bounded independently of attacker-controlled
+    // handle-table metadata. Exceeding this is incomplete coverage, never a
+    // clean result. 262,144 live CID slots is well above normal workstation
+    // and server concurrency while keeping worst-case IOCTL work finite.
+    constexpr uint32_t kMaxCidProcessProbeCount = 262144;
+    constexpr uint32_t kCidAnchorCodeBytes = 0x200;
+    constexpr uint32_t kCidAnchorMaxInstructions = 96;
     constexpr size_t kMaxDeepModuleComparisonsPerProcess = 96;
     constexpr size_t kMaxDeepPagesPerProcess = 512;
     constexpr size_t kMaxSampledExecPagesPerSection = 2;
@@ -76,7 +88,32 @@ namespace
         LONG BasePriority;
         HANDLE UniqueProcessId;
         HANDLE InheritedFromUniqueProcessId;
+        // The documented x64 SYSTEM_PROCESS_INFORMATION prefix is 0x100
+        // bytes. The variable SYSTEM_THREAD_INFORMATION array begins
+        // immediately after it.
+        BYTE ReservedAfterParentProcessId[0xa0];
     };
+
+    struct HuntSystemThreadInformation
+    {
+        LARGE_INTEGER Reserved1[3];
+        ULONG Reserved2;
+        PVOID StartAddress;
+        PVOID UniqueProcess;
+        PVOID UniqueThread;
+        LONG Priority;
+        LONG BasePriority;
+        ULONG Reserved3;
+        ULONG ThreadState;
+        ULONG WaitReason;
+    };
+
+    static_assert(
+        sizeof(HuntSystemProcessInformation) == 0x100,
+        "x64 SYSTEM_PROCESS_INFORMATION prefix changed");
+    static_assert(
+        sizeof(HuntSystemThreadInformation) == 0x50,
+        "x64 SYSTEM_THREAD_INFORMATION layout changed");
 
     struct DeepStackPointerSample
     {
@@ -129,6 +166,22 @@ namespace
         bool HasParentProcessId = false;
         std::wstring ImageName;
     };
+
+    struct ApiThreadRecord
+    {
+        uint32_t ThreadId = 0;
+        uint32_t ProcessId = 0;
+    };
+
+    bool IsReservedCidZeroThread(
+        uint64_t threadId,
+        uint64_t processId)
+    {
+        // The PID 0 Idle pseudo-process can expose one or more CPU idle
+        // records with CLIENT_ID {0, 0}. Handle-table slot zero is reserved,
+        // so these records have no allocatable PspCidTable counterpart.
+        return threadId == 0 && processId == 0;
+    }
 
     struct DiskPeSection
     {
@@ -340,6 +393,7 @@ namespace
         TypeFieldInfo EprocessSectionObject = {};
         TypeFieldInfo SectionObjectSegment = {};
         TypeFieldInfo SegmentControlArea = {};
+        TypeFieldInfo ControlAreaSegment = {};
         TypeFieldInfo ControlAreaFilePointer = {};
         TypeFieldInfo ControlAreaImageFlag = {};
         TypeFieldInfo FileObjectFileName = {};
@@ -355,6 +409,7 @@ namespace
         bool HasEprocessSectionObject = false;
         bool HasSectionObjectSegment = false;
         bool HasSegmentControlArea = false;
+        bool HasControlAreaSegment = false;
         bool HasControlAreaFilePointer = false;
         bool HasControlAreaImageFlag = false;
         bool HasFileObjectFileName = false;
@@ -1890,9 +1945,13 @@ namespace
             }
 
             DWORD required = 0;
-            QueryServiceConfigW(service, nullptr, 0, &required);
-            DWORD error = GetLastError();
-            if (required == 0 || error != ERROR_INSUFFICIENT_BUFFER)
+            SetLastError(ERROR_SUCCESS);
+            const BOOL sizingSucceeded =
+                QueryServiceConfigW(service, nullptr, 0, &required);
+            const DWORD error = GetLastError();
+            if (sizingSucceeded ||
+                required == 0 ||
+                error != ERROR_INSUFFICIENT_BUFFER)
             {
                 break;
             }
@@ -2836,6 +2895,36 @@ namespace
         return L"C:\\Program Files";
     }
 
+    std::wstring ProgramFilesX86Directory()
+    {
+        PWSTR knownPath = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(
+                FOLDERID_ProgramFilesX86,
+                KF_FLAG_DEFAULT,
+                nullptr,
+                &knownPath)) &&
+            knownPath != nullptr)
+        {
+            std::wstring result = knownPath;
+            CoTaskMemFree(knownPath);
+            return result;
+        }
+        if (knownPath != nullptr)
+        {
+            CoTaskMemFree(knownPath);
+        }
+
+        const std::wstring windows =
+            WindowsDirectory();
+        if (windows.size() >= 2 &&
+            windows[1] == L':')
+        {
+            return windows.substr(0, 2) +
+                L"\\Program Files (x86)";
+        }
+        return L"C:\\Program Files (x86)";
+    }
+
     std::wstring SystemDirectory()
     {
         std::wstring result;
@@ -2895,6 +2984,38 @@ namespace
         } while (false);
 
         return same;
+    }
+
+    std::wstring OpenPathForResolvedBacking(
+        const std::wstring& backingPath,
+        const std::wstring& driveHintPath)
+    {
+        std::wstring openPath =
+            DosPathFromDevicePath(
+                Win32FilePathFromMaybeNtPath(
+                    backingPath));
+        if (!IsRootRelativePath(openPath) ||
+            driveHintPath.empty())
+        {
+            return openPath;
+        }
+
+        const std::wstring hintPath =
+            DosPathFromDevicePath(
+                Win32FilePathFromMaybeNtPath(
+                    driveHintPath));
+        if (!IsDriveQualifiedPath(hintPath) ||
+            !SameCanonicalPath(
+                openPath,
+                hintPath))
+        {
+            return openPath;
+        }
+
+        // FILE_OBJECT.FileName commonly omits its volume. Use a loader/API
+        // path only as the drive selector after the complete root-relative
+        // suffix agrees; this avoids accidentally opening the current drive.
+        return hintPath;
     }
 
     bool MatchesAnyCanonicalPath(const std::wstring& actual, const std::vector<std::wstring>& expected)
@@ -3503,8 +3624,9 @@ namespace
             if (layout->Resolved)
             {
                 ok = layout->HasEprocessSectionObject &&
-                    layout->HasSectionObjectSegment &&
                     layout->HasSegmentControlArea &&
+                    (layout->HasSectionObjectSegment ||
+                     layout->HasControlAreaSegment) &&
                     layout->HasControlAreaFilePointer &&
                     layout->HasFileObjectFileName;
                 break;
@@ -3518,6 +3640,8 @@ namespace
                 FindFieldRecursive(symbols, {L"nt!_SECTION_OBJECT", L"_SECTION_OBJECT", L"nt!_SECTION", L"_SECTION"}, L"Segment", &layout->SectionObjectSegment);
             layout->HasSegmentControlArea =
                 FindFieldRecursive(symbols, {L"nt!_SEGMENT", L"_SEGMENT"}, L"ControlArea", &layout->SegmentControlArea);
+            layout->HasControlAreaSegment =
+                FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"Segment", &layout->ControlAreaSegment);
             layout->HasControlAreaFilePointer =
                 FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"FilePointer", &layout->ControlAreaFilePointer);
             layout->HasControlAreaImageFlag =
@@ -3547,9 +3671,12 @@ namespace
             {
                 layout->Warnings.push_back(L"_EPROCESS.SectionObject field unavailable");
             }
-            if (!layout->HasSectionObjectSegment)
+            if (!layout->HasSectionObjectSegment &&
+                !layout->HasControlAreaSegment)
             {
-                layout->Warnings.push_back(L"_SECTION_OBJECT.Segment field unavailable");
+                layout->Warnings.push_back(
+                    L"neither _SECTION_OBJECT.Segment nor "
+                    L"_CONTROL_AREA.Segment is available");
             }
             if (!layout->HasSegmentControlArea)
             {
@@ -3565,8 +3692,9 @@ namespace
             }
 
             ok = layout->HasEprocessSectionObject &&
-                layout->HasSectionObjectSegment &&
                 layout->HasSegmentControlArea &&
+                (layout->HasSectionObjectSegment ||
+                 layout->HasControlAreaSegment) &&
                 layout->HasControlAreaFilePointer &&
                 layout->HasFileObjectFileName;
         } while (false);
@@ -3911,6 +4039,195 @@ namespace
         return ok;
     }
 
+    bool ValidateMainSectionLinkCandidate(
+        DeviceClient& device,
+        const MainSectionObjectLayout& layout,
+        uint64_t candidate,
+        bool candidateIsControlArea,
+        uint64_t* segment,
+        uint64_t* controlArea)
+    {
+        if (segment == nullptr ||
+            controlArea == nullptr ||
+            !layout.HasSegmentControlArea ||
+            !layout.HasControlAreaSegment ||
+            !IsKernelAddress(candidate) ||
+            (candidate & 0x7ull) != 0)
+        {
+            return false;
+        }
+
+        uint64_t localSegment = 0;
+        uint64_t localControlArea = 0;
+        std::wstring ignored;
+        if (candidateIsControlArea)
+        {
+            localControlArea = candidate;
+            if (!ReadFieldInteger(
+                    device,
+                    localControlArea,
+                    layout.ControlAreaSegment,
+                    sizeof(uint64_t),
+                    &localSegment,
+                    &ignored))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            localSegment = candidate;
+            if (!ReadFieldInteger(
+                    device,
+                    localSegment,
+                    layout.SegmentControlArea,
+                    sizeof(uint64_t),
+                    &localControlArea,
+                    &ignored))
+            {
+                return false;
+            }
+        }
+        if (!IsKernelAddress(localSegment) ||
+            !IsKernelAddress(localControlArea) ||
+            (localSegment & 0x7ull) != 0 ||
+            (localControlArea & 0x7ull) != 0)
+        {
+            return false;
+        }
+
+        uint64_t controlAreaFromSegment = 0;
+        uint64_t segmentFromControlArea = 0;
+        if (!ReadFieldInteger(
+                device,
+                localSegment,
+                layout.SegmentControlArea,
+                sizeof(uint64_t),
+                &controlAreaFromSegment,
+                &ignored) ||
+            !ReadFieldInteger(
+                device,
+                localControlArea,
+                layout.ControlAreaSegment,
+                sizeof(uint64_t),
+                &segmentFromControlArea,
+                &ignored) ||
+            controlAreaFromSegment != localControlArea ||
+            segmentFromControlArea != localSegment)
+        {
+            return false;
+        }
+
+        std::wstring candidatePath;
+        std::wstring candidateState;
+        if (!ResolveControlAreaBackingPath(
+                device,
+                localControlArea,
+                layout.ControlAreaFilePointer,
+                layout.FileObjectFileName,
+                &candidatePath,
+                &candidateState,
+                &ignored) ||
+            candidateState != L"resolved" ||
+            candidatePath.empty())
+        {
+            return false;
+        }
+
+        *segment = localSegment;
+        *controlArea = localControlArea;
+        return true;
+    }
+
+    bool DiscoverMainSectionLink(
+        DeviceClient& device,
+        uint64_t sectionObject,
+        const MainSectionObjectLayout& layout,
+        uint64_t* segment,
+        uint64_t* controlArea,
+        std::wstring* warning)
+    {
+        if (segment == nullptr ||
+            controlArea == nullptr ||
+            !IsKernelAddress(sectionObject))
+        {
+            return false;
+        }
+        *segment = 0;
+        *controlArea = 0;
+
+        constexpr uint32_t kSectionLinkScanBytes =
+            0x40;
+        bool found = false;
+        for (uint32_t offset = 0;
+             offset < kSectionLinkScanBytes;
+             offset += sizeof(uint64_t))
+        {
+            uint64_t address = 0;
+            if (!TryAdd(
+                    sectionObject,
+                    offset,
+                    &address))
+            {
+                break;
+            }
+
+            uint64_t candidate = 0;
+            std::wstring ignored;
+            if (!ReadKernelPointer(
+                    device,
+                    address,
+                    &candidate,
+                    &ignored))
+            {
+                continue;
+            }
+
+            for (const bool candidateIsControlArea :
+                 {true, false})
+            {
+                uint64_t candidateSegment = 0;
+                uint64_t candidateControlArea = 0;
+                if (!ValidateMainSectionLinkCandidate(
+                        device,
+                        layout,
+                        candidate,
+                        candidateIsControlArea,
+                        &candidateSegment,
+                        &candidateControlArea))
+                {
+                    continue;
+                }
+                if (found &&
+                    (*segment != candidateSegment ||
+                     *controlArea !=
+                         candidateControlArea))
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"section object link discovery is ambiguous";
+                    }
+                    return false;
+                }
+
+                *segment = candidateSegment;
+                *controlArea =
+                    candidateControlArea;
+                found = true;
+            }
+        }
+
+        if (!found && warning != nullptr)
+        {
+            *warning =
+                L"section object has no validated "
+                L"segment/control-area backlink in its "
+                L"bounded link region";
+        }
+        return found;
+    }
+
     bool ResolveVadSectionBackingPath(
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -3934,6 +4251,10 @@ namespace
 
             path->clear();
             *state = L"unavailable";
+            if (warning != nullptr)
+            {
+                warning->clear();
+            }
             if (imageSection != nullptr)
             {
                 *imageSection = false;
@@ -4067,6 +4388,10 @@ namespace
 
             path->clear();
             *state = L"unavailable";
+            if (warning != nullptr)
+            {
+                warning->clear();
+            }
             if (sectionObject != nullptr)
             {
                 *sectionObject = 0;
@@ -4139,11 +4464,91 @@ namespace
             }
 
             uint64_t localSegment = 0;
-            if (!ReadFieldInteger(device, localSectionObject, layout.SectionObjectSegment, sizeof(uint64_t), &localSegment, warning))
+            uint64_t localControlArea = 0;
+            if (layout.HasSectionObjectSegment)
             {
-                if (warning != nullptr && warning->empty())
+                if (!ReadFieldInteger(
+                        device,
+                        localSectionObject,
+                        layout.SectionObjectSegment,
+                        sizeof(uint64_t),
+                        &localSegment,
+                        warning))
                 {
-                    *warning = L"failed to read section object segment";
+                    if (warning != nullptr &&
+                        warning->empty())
+                    {
+                        *warning =
+                            L"failed to read section object segment";
+                    }
+                    break;
+                }
+                if (localSegment == 0)
+                {
+                    *state = L"no_segment";
+                    if (details != nullptr)
+                    {
+                        details->State = L"no_segment";
+                    }
+                    ok = true;
+                    break;
+                }
+                if (!IsKernelAddress(localSegment))
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"section object segment is not a kernel address";
+                    }
+                    break;
+                }
+
+                if (!ReadFieldInteger(
+                        device,
+                        localSegment,
+                        layout.SegmentControlArea,
+                        sizeof(uint64_t),
+                        &localControlArea,
+                        warning))
+                {
+                    if (warning != nullptr &&
+                        warning->empty())
+                    {
+                        *warning =
+                            L"failed to read segment control area";
+                    }
+                    break;
+                }
+                if (localControlArea == 0)
+                {
+                    *state = L"no_control_area";
+                    if (details != nullptr)
+                    {
+                        details->State =
+                            L"no_control_area";
+                    }
+                    ok = true;
+                    break;
+                }
+            }
+            else if (!DiscoverMainSectionLink(
+                         device,
+                         localSectionObject,
+                         layout,
+                         &localSegment,
+                         &localControlArea,
+                         warning))
+            {
+                break;
+            }
+
+            if (!IsKernelAddress(localSegment) ||
+                !IsKernelAddress(localControlArea))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"main section link contains a non-kernel address";
                 }
                 break;
             }
@@ -4151,55 +4556,9 @@ namespace
             {
                 *segment = localSegment;
             }
-            if (localSegment == 0)
-            {
-                *state = L"no_segment";
-                if (details != nullptr)
-                {
-                    details->State = L"no_segment";
-                }
-                ok = true;
-                break;
-            }
-            if (!IsKernelAddress(localSegment))
-            {
-                if (warning != nullptr)
-                {
-                    *warning = L"section object segment is not a kernel address";
-                }
-                break;
-            }
-
-            uint64_t localControlArea = 0;
-            if (!ReadFieldInteger(device, localSegment, layout.SegmentControlArea, sizeof(uint64_t), &localControlArea, warning))
-            {
-                if (warning != nullptr && warning->empty())
-                {
-                    *warning = L"failed to read segment control area";
-                }
-                break;
-            }
             if (controlArea != nullptr)
             {
                 *controlArea = localControlArea;
-            }
-            if (localControlArea == 0)
-            {
-                *state = L"no_control_area";
-                if (details != nullptr)
-                {
-                    details->State = L"no_control_area";
-                }
-                ok = true;
-                break;
-            }
-            if (!IsKernelAddress(localControlArea))
-            {
-                if (warning != nullptr)
-                {
-                    *warning = L"segment control area is not a kernel address";
-                }
-                break;
             }
 
             if (imageSection != nullptr && layout.HasControlAreaImageFlag)
@@ -4404,6 +4763,9 @@ namespace
             target->LdrInitSeen = target->LdrInitSeen || incoming.LdrInitSeen;
             target->PrivatePeVadSeen = target->PrivatePeVadSeen || incoming.PrivatePeVadSeen;
             target->VadImageSeen = target->VadImageSeen || incoming.VadImageSeen;
+            target->VadSectionSeen =
+                target->VadSectionSeen ||
+                incoming.VadSectionSeen;
             target->VadBackingManagedImage =
                 target->VadBackingManagedImage || incoming.VadBackingManagedImage;
             if (target->VadAddress == 0)
@@ -6655,7 +7017,8 @@ namespace
 
     bool CollectSystemProcessInformation(
         std::map<uint32_t, ApiProcessRecord>* processes,
-        std::wstring* warning)
+        std::wstring* warning,
+        std::map<uint32_t, ApiThreadRecord>* threads = nullptr)
     {
         bool ok = false;
 
@@ -6667,6 +7030,10 @@ namespace
             }
 
             processes->clear();
+            if (threads != nullptr)
+            {
+                threads->clear();
+            }
 
             HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
             if (ntdll == nullptr)
@@ -6769,6 +7136,24 @@ namespace
                 const HuntSystemProcessInformation* spi =
                     reinterpret_cast<const HuntSystemProcessInformation*>(buffer.data() + offset);
 
+                const size_t entryLength =
+                    spi->NextEntryOffset != 0
+                        ? static_cast<size_t>(
+                              spi->NextEntryOffset)
+                        : validLength - offset;
+                if (entryLength <
+                        sizeof(HuntSystemProcessInformation) ||
+                    entryLength > validLength - offset ||
+                    spi->NumberOfThreads >
+                        (entryLength -
+                         sizeof(HuntSystemProcessInformation)) /
+                            sizeof(
+                                HuntSystemThreadInformation))
+                {
+                    malformed = true;
+                    break;
+                }
+
                 ApiProcessRecord record = {};
                 const uintptr_t processId =
                     reinterpret_cast<uintptr_t>(
@@ -6828,6 +7213,70 @@ namespace
                     record.ImageName = L"System";
                 }
 
+                if (threads != nullptr)
+                {
+                    const HuntSystemThreadInformation*
+                        threadArray =
+                            reinterpret_cast<
+                                const HuntSystemThreadInformation*>(
+                                reinterpret_cast<
+                                    const uint8_t*>(spi) +
+                                sizeof(
+                                    HuntSystemProcessInformation));
+                    for (ULONG threadIndex = 0;
+                         threadIndex < spi->NumberOfThreads;
+                         ++threadIndex)
+                    {
+                        const uintptr_t threadId =
+                            reinterpret_cast<uintptr_t>(
+                                threadArray[threadIndex].
+                                    UniqueThread);
+                        const uintptr_t ownerProcessId =
+                            reinterpret_cast<uintptr_t>(
+                                threadArray[threadIndex].
+                                    UniqueProcess);
+                        if (IsReservedCidZeroThread(
+                                threadId,
+                                ownerProcessId) &&
+                            processId == 0)
+                        {
+                            continue;
+                        }
+                        if (threadId == 0 ||
+                            threadId >
+                                std::numeric_limits<
+                                    uint32_t>::max() ||
+                            ownerProcessId >
+                                std::numeric_limits<
+                                    uint32_t>::max() ||
+                            ownerProcessId != processId)
+                        {
+                            malformed = true;
+                            break;
+                        }
+
+                        ApiThreadRecord thread = {};
+                        thread.ThreadId =
+                            static_cast<uint32_t>(threadId);
+                        thread.ProcessId =
+                            static_cast<uint32_t>(
+                                ownerProcessId);
+                        if (threads->size() >=
+                                kMaxCidProcessProbeCount ||
+                            !threads->emplace(
+                                thread.ThreadId,
+                                thread).second)
+                        {
+                            malformed = true;
+                            break;
+                        }
+                    }
+                    if (malformed)
+                    {
+                        break;
+                    }
+                }
+
                 if (!processes->emplace(
                         record.ProcessId,
                         std::move(record)).second)
@@ -6858,6 +7307,10 @@ namespace
             if (malformed || !terminalEntrySeen)
             {
                 processes->clear();
+                if (threads != nullptr)
+                {
+                    threads->clear();
+                }
                 if (warning != nullptr)
                 {
                     *warning =
@@ -6869,6 +7322,17 @@ namespace
             ok = true;
         } while (false);
 
+        if (!ok)
+        {
+            if (processes != nullptr)
+            {
+                processes->clear();
+            }
+            if (threads != nullptr)
+            {
+                threads->clear();
+            }
+        }
         return ok;
     }
 
@@ -6949,12 +7413,136 @@ namespace
 
         if (snapshot != INVALID_HANDLE_VALUE)
         {
-            CloseHandle(snapshot);
+            if (snapshot != nullptr)
+            {
+                CloseHandle(snapshot);
+            }
         }
 
         if (!ok && processes != nullptr)
         {
             processes->clear();
+        }
+        return ok;
+    }
+
+    bool CollectToolhelpThreads(
+        std::map<uint32_t, ApiThreadRecord>* threads,
+        std::wstring* warning)
+    {
+        bool ok = false;
+        HANDLE snapshot = INVALID_HANDLE_VALUE;
+
+        do
+        {
+            if (threads == nullptr)
+            {
+                break;
+            }
+
+            threads->clear();
+            snapshot = CreateToolhelp32Snapshot(
+                TH32CS_SNAPTHREAD,
+                0);
+            if (snapshot == INVALID_HANDLE_VALUE)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) failed gle=" +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+
+            THREADENTRY32 entry = {};
+            entry.dwSize = sizeof(entry);
+            if (!Thread32First(snapshot, &entry))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"Thread32First failed gle=" +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+
+            for (;;)
+            {
+                const bool reservedCidZeroThread =
+                    IsReservedCidZeroThread(
+                        entry.th32ThreadID,
+                        entry.th32OwnerProcessID);
+                if (entry.th32ThreadID == 0 &&
+                    !reservedCidZeroThread)
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"Toolhelp returned a zero thread identifier";
+                    }
+                    break;
+                }
+
+                if (!reservedCidZeroThread)
+                {
+                    ApiThreadRecord record = {};
+                    record.ThreadId = entry.th32ThreadID;
+                    record.ProcessId =
+                        entry.th32OwnerProcessID;
+                    if (threads->size() >=
+                            kMaxCidProcessProbeCount ||
+                        !threads->emplace(
+                            record.ThreadId,
+                            record).second)
+                    {
+                        if (warning != nullptr)
+                        {
+                            *warning =
+                                threads->size() >=
+                                        kMaxCidProcessProbeCount
+                                    ? L"Toolhelp thread inventory exceeded the bounded CID/thread budget"
+                                    : L"Toolhelp returned a duplicate thread identifier";
+                        }
+                        break;
+                    }
+                }
+
+                entry.dwSize = sizeof(entry);
+                if (Thread32Next(snapshot, &entry))
+                {
+                    continue;
+                }
+
+                const DWORD enumerationError =
+                    GetLastError();
+                if (enumerationError ==
+                    ERROR_NO_MORE_FILES)
+                {
+                    ok = true;
+                }
+                else if (warning != nullptr)
+                {
+                    *warning =
+                        L"Thread32Next failed gle=" +
+                        std::to_wstring(
+                            enumerationError);
+                }
+                break;
+            }
+        } while (false);
+
+        if (snapshot != INVALID_HANDLE_VALUE)
+        {
+            if (snapshot != nullptr)
+            {
+                CloseHandle(snapshot);
+            }
+        }
+        if (!ok && threads != nullptr)
+        {
+            threads->clear();
         }
         return ok;
     }
@@ -7174,7 +7762,10 @@ namespace
 
         if (snapshot != INVALID_HANDLE_VALUE)
         {
-            CloseHandle(snapshot);
+            if (snapshot != nullptr)
+            {
+                CloseHandle(snapshot);
+            }
         }
 
         return ok;
@@ -7599,6 +8190,62 @@ namespace
         return false;
     }
 
+    bool SameThreadSuspensionEvidence(
+        const ProcessThreadScanResult& left,
+        const ProcessThreadScanResult& right)
+    {
+        if (!left.SuspensionStateCoverageComplete ||
+            !right.SuspensionStateCoverageComplete ||
+            left.ThreadsVisited == 0 ||
+            left.ThreadsVisited !=
+                right.ThreadsVisited ||
+            left.Records.size() !=
+                left.ThreadsVisited ||
+            right.Records.size() !=
+                right.ThreadsVisited)
+        {
+            return false;
+        }
+
+        std::map<
+            uint64_t,
+            std::pair<uint32_t, uint32_t>>
+            expected;
+        for (const ProcessThreadRecord& record :
+             left.Records)
+        {
+            if (record.Ethread == 0 ||
+                !record.HasSuspendCount ||
+                !record.HasFreezeCount ||
+                !expected.emplace(
+                    record.Ethread,
+                    std::make_pair(
+                        record.SuspendCount,
+                        record.FreezeCount)).second)
+            {
+                return false;
+            }
+        }
+        for (const ProcessThreadRecord& record :
+             right.Records)
+        {
+            const auto item =
+                expected.find(record.Ethread);
+            if (item == expected.end() ||
+                !record.HasSuspendCount ||
+                !record.HasFreezeCount ||
+                item->second.first !=
+                    record.SuspendCount ||
+                item->second.second !=
+                    record.FreezeCount)
+            {
+                return false;
+            }
+            expected.erase(item);
+        }
+        return expected.empty();
+    }
+
     bool ScanThreadsForHunt(
         ProcessTriageScanner& triage,
         const ProcessThreadScanOptions& options,
@@ -7608,6 +8255,9 @@ namespace
     {
         bool anySuccess = false;
         std::wstring lastError;
+        ProcessThreadScanResult
+            previousSuspended = {};
+        bool hasPreviousSuspended = false;
 
         if (attemptsUsed != nullptr)
         {
@@ -7630,8 +8280,37 @@ namespace
             }
 
             anySuccess = true;
+            const bool collectionComplete =
+                !candidate.Truncated &&
+                !candidate.Incomplete &&
+                candidate.CoverageComplete;
+            const bool allThreadsSuspended =
+                options.RequireSuspensionCoverage &&
+                collectionComplete &&
+                candidate.ThreadsVisited != 0 &&
+                candidate.SuspendedThreadCount ==
+                    candidate.ThreadsVisited;
+            if (allThreadsSuspended)
+            {
+                if (hasPreviousSuspended &&
+                    SameThreadSuspensionEvidence(
+                        previousSuspended,
+                        candidate))
+                {
+                    candidate.Warnings.push_back(
+                        L"all-thread suspend/freeze evidence confirmed across fresh scans");
+                    *result = std::move(candidate);
+                    return true;
+                }
+
+                previousSuspended = candidate;
+                hasPreviousSuspended = true;
+                *result = std::move(candidate);
+                continue;
+            }
+
             *result = std::move(candidate);
-            if (!result->Truncated && !result->Incomplete && result->CoverageComplete)
+            if (collectionComplete)
             {
                 if (attempt > 1)
                 {
@@ -7644,6 +8323,22 @@ namespace
 
         if (anySuccess)
         {
+            if (options.RequireSuspensionCoverage &&
+                !result->Truncated &&
+                !result->Incomplete &&
+                result->CoverageComplete &&
+                result->ThreadsVisited != 0 &&
+                result->SuspendedThreadCount ==
+                    result->ThreadsVisited)
+            {
+                result->
+                    SuspensionStateCoverageComplete =
+                        false;
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(
+                    L"all-thread suspend/freeze evidence was not stable across fresh scans");
+            }
             return true;
         }
 
@@ -7707,6 +8402,104 @@ namespace
                 L".com",
                 L".scr"
             });
+    }
+
+    bool IsWindowsTerminalExecutionAliasShape(
+        const std::wstring& pebImagePath,
+        const std::wstring& apiImagePath,
+        const std::wstring& commandImage)
+    {
+        if (LeafName(commandImage) != L"wt.exe" ||
+            LeafName(pebImagePath) !=
+                L"windowsterminal.exe" ||
+            apiImagePath.empty() ||
+            !SameCanonicalPath(
+                pebImagePath,
+                apiImagePath))
+        {
+            return false;
+        }
+
+        const std::wstring windowsAppsRoot =
+            EnsureTrailingSlash(
+                CanonicalPathForCompare(
+                    EnsureTrailingSlash(
+                        ProgramFilesDirectory()) +
+                    L"WindowsApps"));
+        const std::wstring imagePath =
+            CanonicalPathForCompare(
+                pebImagePath);
+        if (windowsAppsRoot.empty() ||
+            imagePath.size() <=
+                windowsAppsRoot.size() ||
+            imagePath.compare(
+                0,
+                windowsAppsRoot.size(),
+                windowsAppsRoot) != 0)
+        {
+            return false;
+        }
+
+        const std::wstring relative =
+            imagePath.substr(
+                windowsAppsRoot.size());
+        const size_t separator =
+            relative.find(L'\\');
+        if (separator == std::wstring::npos ||
+            relative.substr(separator + 1) !=
+                L"windowsterminal.exe")
+        {
+            return false;
+        }
+
+        const std::wstring packageDirectory =
+            relative.substr(0, separator);
+        const bool knownPackage =
+            packageDirectory.compare(
+                0,
+                std::wcslen(
+                    L"microsoft.windowsterminal_"),
+                L"microsoft.windowsterminal_") ==
+                0 ||
+            packageDirectory.compare(
+                0,
+                std::wcslen(
+                    L"microsoft.windowsterminalpreview_"),
+                L"microsoft.windowsterminalpreview_") ==
+                0;
+        constexpr wchar_t kMicrosoftPublisherId[] =
+            L"_8wekyb3d8bbwe";
+        return knownPackage &&
+            packageDirectory.size() >
+                std::wcslen(
+                    kMicrosoftPublisherId) &&
+            packageDirectory.compare(
+                packageDirectory.size() -
+                    std::wcslen(
+                        kMicrosoftPublisherId),
+                std::wcslen(
+                    kMicrosoftPublisherId),
+                kMicrosoftPublisherId) == 0;
+    }
+
+    bool IsTrustedWindowsTerminalExecutionAlias(
+        const HuntProcessRecord& process,
+        const std::wstring& commandImage)
+    {
+        if (!IsWindowsTerminalExecutionAliasShape(
+                process.PebImagePath,
+                process.ApiImagePath,
+                commandImage))
+        {
+            return false;
+        }
+
+        ImageMetadataRecord metadata = {};
+        return VerifyImageAuthenticodeSignature(
+                   process.PebImagePath,
+                   &metadata) &&
+            metadata.SignatureChecked &&
+            metadata.SignatureValid;
     }
 
     bool CanUseParentProcessIdentity(
@@ -8770,6 +9563,4439 @@ namespace
         return high;
     }
 
+    struct CidAnchorReferenceSet
+    {
+        std::map<uint64_t, uint32_t> RipRelativeQwordLoads;
+        uint32_t InstructionsDecoded = 0;
+        bool ReachedReturn = false;
+    };
+
+    struct CidTableLayout
+    {
+        TypeFieldInfo NextHandleNeedingPool = {};
+        TypeFieldInfo TableCode = {};
+        uint64_t EntrySize = 0;
+    };
+
+    struct CidTableSnapshot
+    {
+        uint64_t AnchorAddress = 0;
+        uint64_t TableAddress = 0;
+        uint64_t TableCode = 0;
+        uint32_t TableLevel = 0;
+        uint32_t NextHandle = 0;
+        uint32_t AllocatedLeafCount = 0;
+        uint64_t AllocatedHandleCapacity = 0;
+        std::vector<uint64_t> LeafPages;
+    };
+
+    struct CidEnumeratedProcess
+    {
+        ProcessAddressContext Context = {};
+        uint64_t CreateTime = 0;
+        uint64_t ExitTime = 0;
+        uint64_t Peb = 0;
+        uint32_t ActiveThreads = 0;
+        bool HasCreateTime = false;
+        bool HasExitTime = false;
+        bool HasPeb = false;
+        bool HasActiveThreads = false;
+        std::wstring ImageName;
+    };
+
+    struct CidEprocessLayout
+    {
+        TypeFieldInfo UniqueProcessId = {};
+        TypeFieldInfo CreateTime = {};
+        TypeFieldInfo ImageFileName = {};
+        TypeFieldInfo ExitTime = {};
+        TypeFieldInfo ActiveThreads = {};
+        TypeFieldInfo Peb = {};
+        bool HasImageFileName = false;
+        bool HasExitTime = false;
+        bool HasActiveThreads = false;
+        bool HasPeb = false;
+    };
+
+    struct CidDirectThread
+    {
+        uint32_t ThreadId = 0;
+        uint32_t ProcessId = 0;
+        uint64_t ObjectHeader = 0;
+        uint64_t Ethread = 0;
+        uint64_t Eprocess = 0;
+        uint64_t CreateTime = 0;
+        uint64_t ExitTime = 0;
+        bool HasCreateTime = false;
+        bool HasExitTime = false;
+        bool Terminated = false;
+    };
+
+    struct CidDirectProcess
+    {
+        uint32_t ProcessId = 0;
+        uint64_t ObjectHeader = 0;
+        CidEnumeratedProcess Process = {};
+    };
+
+    struct CidDirectLayout
+    {
+        TypeFieldInfo ObjectPointerBits = {};
+        TypeFieldInfo ObjectHeaderTypeIndex = {};
+        TypeFieldInfo ObjectHeaderBody = {};
+        TypeFieldInfo ObjectTypeIndex = {};
+        TypeFieldInfo EprocessPcb = {};
+        TypeFieldInfo EprocessThreadListHead = {};
+        TypeFieldInfo KprocessThreadListHead = {};
+        TypeFieldInfo EthreadTcb = {};
+        TypeFieldInfo EthreadUniqueThread = {};
+        TypeFieldInfo EthreadUniqueProcess = {};
+        TypeFieldInfo EthreadCreateTime = {};
+        TypeFieldInfo EthreadExitTime = {};
+        TypeFieldInfo EthreadTerminated = {};
+        TypeFieldInfo EthreadThreadListEntry = {};
+        TypeFieldInfo KthreadProcess = {};
+        TypeFieldInfo KthreadThreadListEntry = {};
+        uint64_t ObHeaderCookieAddress = 0;
+        uint64_t ObTypeIndexTableAddress = 0;
+        uint64_t PsProcessTypeAddress = 0;
+        uint64_t PsThreadTypeAddress = 0;
+    };
+
+    struct CidDirectEnumerationResult
+    {
+        bool Complete = false;
+        bool Stable = false;
+        CidTableSnapshot Snapshot = {};
+        uint64_t NonEmptyEntryCount = 0;
+        uint64_t UnclassifiedEntryCount = 0;
+        uint64_t ReadFailureCount = 0;
+        std::map<uint32_t, CidDirectProcess> Processes;
+        std::map<uint32_t, CidDirectThread> Threads;
+        std::wstring Summary;
+    };
+
+    struct CidProcessEnumerationResult
+    {
+        bool Complete = false;
+        bool AnchorResolved = false;
+        bool Stable = false;
+        CidTableSnapshot Snapshot = {};
+        uint64_t ProbeCount = 0;
+        uint64_t ProcessCount = 0;
+        uint64_t DiscoveredProcessCount = 0;
+        uint64_t ProbeFailureCount = 0;
+        uint64_t MembershipIncompleteCount = 0;
+        std::wstring Summary;
+    };
+
+    bool ExtractCidAnchorReferences(
+        uint64_t functionAddress,
+        const std::vector<uint8_t>& code,
+        CidAnchorReferenceSet* references)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (references == nullptr ||
+                !IsKernelAddress(functionAddress) ||
+                code.empty())
+            {
+                break;
+            }
+
+            *references = {};
+            size_t offset = 0;
+            uint64_t pc = functionAddress;
+            while (offset < code.size() &&
+                   references->InstructionsDecoded <
+                       kCidAnchorMaxInstructions)
+            {
+                ZydisDisassembledInstruction instruction = {};
+                const ZyanStatus status =
+                    ZydisDisassembleIntel(
+                        ZYDIS_MACHINE_MODE_LONG_64,
+                        pc,
+                        code.data() + offset,
+                        code.size() - offset,
+                        &instruction);
+                if (!ZYAN_SUCCESS(status) ||
+                    instruction.info.length == 0 ||
+                    instruction.info.length > 15 ||
+                    offset + instruction.info.length >
+                        code.size())
+                {
+                    break;
+                }
+
+                ++references->InstructionsDecoded;
+                if (instruction.info.mnemonic ==
+                        ZYDIS_MNEMONIC_MOV &&
+                    instruction.info.operand_count >= 2 &&
+                    instruction.operands[0].type ==
+                        ZYDIS_OPERAND_TYPE_REGISTER)
+                {
+                    for (uint8_t operandIndex = 1;
+                         operandIndex <
+                             instruction.info.operand_count;
+                         ++operandIndex)
+                    {
+                        const ZydisDecodedOperand& operand =
+                            instruction.operands[operandIndex];
+                        if (operand.type !=
+                                ZYDIS_OPERAND_TYPE_MEMORY ||
+                            operand.mem.base !=
+                                ZYDIS_REGISTER_RIP ||
+                            !operand.mem.disp.has_displacement ||
+                            operand.size != 64)
+                        {
+                            continue;
+                        }
+
+                        const int64_t displacement =
+                            operand.mem.disp.value;
+                        const uint64_t target =
+                            pc +
+                            instruction.info.length +
+                            static_cast<uint64_t>(
+                                displacement);
+                        if (IsKernelAddress(target))
+                        {
+                            ++references->
+                                RipRelativeQwordLoads[
+                                    target];
+                        }
+                    }
+                }
+
+                const ZydisMnemonic mnemonic =
+                    instruction.info.mnemonic;
+                offset += instruction.info.length;
+                pc += instruction.info.length;
+                if (mnemonic == ZYDIS_MNEMONIC_RET)
+                {
+                    references->ReachedReturn = true;
+                    break;
+                }
+                if (mnemonic == ZYDIS_MNEMONIC_UD2 ||
+                    mnemonic == ZYDIS_MNEMONIC_HLT)
+                {
+                    break;
+                }
+            }
+
+            ok =
+                references->ReachedReturn &&
+                references->InstructionsDecoded != 0;
+        } while (false);
+
+        return ok;
+    }
+
+    bool AddressInsideKernelModule(
+        const std::vector<KernelModuleInfo>& modules,
+        uint64_t address,
+        const std::wstring& requiredLeaf)
+    {
+        bool inside = false;
+        const std::wstring loweredRequired =
+            HuntToLower(requiredLeaf);
+
+        for (const KernelModuleInfo& module : modules)
+        {
+            if (module.Base == 0 || module.Size == 0)
+            {
+                continue;
+            }
+
+            const std::wstring leaf =
+                HuntToLower(LeafName(module.ImageName));
+            const bool kernelAlias =
+                loweredRequired == L"ntoskrnl.exe" &&
+                (leaf == L"ntoskrnl.exe" ||
+                 leaf == L"ntkrnlmp.exe" ||
+                 leaf == L"ntkrnlpa.exe" ||
+                 leaf == L"ntkrpamp.exe");
+            if (!loweredRequired.empty() &&
+                leaf != loweredRequired &&
+                !kernelAlias)
+            {
+                continue;
+            }
+
+            uint64_t end = 0;
+            if (TryAdd(module.Base, module.Size, &end) &&
+                address >= module.Base &&
+                address < end)
+            {
+                inside = true;
+                break;
+            }
+        }
+
+        return inside;
+    }
+
+    bool ResolveCidTableLayout(
+        SymbolEngine& symbols,
+        CidTableLayout* layout,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (layout == nullptr)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: invalid layout output";
+                }
+                break;
+            }
+
+            *layout = {};
+            std::wstring error;
+            if (!symbols.FindField(
+                    L"nt!_HANDLE_TABLE",
+                    L"NextHandleNeedingPool",
+                    &layout->NextHandleNeedingPool,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_HANDLE_TABLE",
+                    L"TableCode",
+                    &layout->TableCode,
+                    &error))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: _HANDLE_TABLE fields unavailable: " +
+                        error;
+                }
+                break;
+            }
+
+            TypeLayoutInfo entryLayout = {};
+            if (!symbols.GetTypeLayout(
+                    L"nt!_HANDLE_TABLE_ENTRY",
+                    &entryLayout,
+                    &error))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: _HANDLE_TABLE_ENTRY unavailable: " +
+                        error;
+                }
+                break;
+            }
+
+            if (layout->NextHandleNeedingPool.Offset >
+                    0x1000 ||
+                FieldStorageWidth(
+                    layout->NextHandleNeedingPool,
+                    sizeof(uint32_t)) !=
+                    sizeof(uint32_t) ||
+                layout->TableCode.Offset > 0x1000 ||
+                FieldStorageWidth(
+                    layout->TableCode,
+                    sizeof(uint64_t)) !=
+                    sizeof(uint64_t) ||
+                entryLayout.Size < 8 ||
+                entryLayout.Size > 64 ||
+                (kPageSize % entryLayout.Size) != 0)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: handle-table layout is outside bounded x64 expectations";
+                }
+                break;
+            }
+
+            layout->EntrySize = entryLayout.Size;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadCidPointerPage(
+        DeviceClient& device,
+        uint64_t address,
+        std::vector<uint64_t>* pointers)
+    {
+        if (pointers == nullptr ||
+            !IsKernelAddress(address) ||
+            (address & (kPageSize - 1)) != 0)
+        {
+            return false;
+        }
+
+        std::vector<uint8_t> bytes;
+        if (!ReadKernelBytes(
+                device,
+                address,
+                static_cast<uint32_t>(kPageSize),
+                &bytes,
+                nullptr) ||
+            bytes.size() != kPageSize)
+        {
+            return false;
+        }
+
+        pointers->assign(
+            kPageSize / sizeof(uint64_t),
+            0);
+        for (size_t index = 0;
+             index < pointers->size();
+             ++index)
+        {
+            std::memcpy(
+                &(*pointers)[index],
+                bytes.data() +
+                    index * sizeof(uint64_t),
+                sizeof(uint64_t));
+        }
+        return true;
+    }
+
+    bool CollectContiguousCidPointerPrefix(
+        const std::vector<uint64_t>& pointers,
+        std::vector<uint64_t>* allocated)
+    {
+        if (allocated == nullptr)
+        {
+            return false;
+        }
+
+        allocated->clear();
+        bool sawZero = false;
+        for (uint64_t pointer : pointers)
+        {
+            if (pointer == 0)
+            {
+                sawZero = true;
+                continue;
+            }
+            if (sawZero)
+            {
+                allocated->clear();
+                return false;
+            }
+            allocated->push_back(pointer);
+        }
+        return !allocated->empty();
+    }
+
+    bool ResolveCidAllocatedLeafPages(
+        DeviceClient& device,
+        uint64_t tableBase,
+        uint32_t tableLevel,
+        uint64_t entrySize,
+        std::vector<uint64_t>* leafPages,
+        uint64_t* handleCapacity,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (leafPages == nullptr ||
+                handleCapacity == nullptr ||
+                !IsKernelAddress(tableBase) ||
+                (tableBase & (kPageSize - 1)) != 0 ||
+                entrySize == 0 ||
+                (kPageSize % entrySize) != 0 ||
+                tableLevel > 2)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: invalid handle-table allocation topology input";
+                }
+                break;
+            }
+
+            leafPages->clear();
+            *handleCapacity = 0;
+            const uint64_t leafEntries =
+                kPageSize / entrySize;
+            const uint64_t maxLeafPages =
+                kMaxCidProcessProbeCount /
+                leafEntries;
+            if (maxLeafPages == 0)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: handle-table entry geometry exceeds probe budget";
+                }
+                break;
+            }
+
+            std::set<uint64_t> allocatedPages;
+            allocatedPages.insert(tableBase);
+            auto appendLeaf =
+                [&](uint64_t page) -> bool
+                {
+                    if (!IsKernelAddress(page) ||
+                        (page & (kPageSize - 1)) != 0 ||
+                        leafPages->size() >=
+                            maxLeafPages ||
+                        !allocatedPages.insert(page).
+                            second)
+                    {
+                        return false;
+                    }
+                    leafPages->push_back(page);
+                    return true;
+                };
+
+            if (tableLevel == 0)
+            {
+                leafPages->push_back(tableBase);
+            }
+            else
+            {
+                std::vector<uint64_t> rootPointers;
+                if (!ReadCidPointerPage(
+                        device,
+                        tableBase,
+                        &rootPointers))
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"cid full enumeration: root pointer page is unreadable";
+                    }
+                    break;
+                }
+
+                std::vector<uint64_t>
+                    rootAllocated;
+                if (!CollectContiguousCidPointerPrefix(
+                        rootPointers,
+                        &rootAllocated))
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"cid full enumeration: empty or non-contiguous root allocation topology";
+                    }
+                    break;
+                }
+
+                if (tableLevel == 1)
+                {
+                    bool childrenValid = true;
+                    for (size_t index = 0;
+                         index < rootAllocated.size();
+                         ++index)
+                    {
+                        if (!appendLeaf(
+                                rootAllocated[index]))
+                        {
+                            childrenValid = false;
+                            break;
+                        }
+                    }
+                    if (!childrenValid)
+                    {
+                        if (warning != nullptr)
+                        {
+                            *warning =
+                                L"cid full enumeration: invalid or over-budget leaf allocation topology";
+                        }
+                        break;
+                    }
+                }
+                else
+                {
+                    bool topologyValid = true;
+                    for (size_t rootIndex = 0;
+                         rootIndex <
+                                 rootAllocated.size() &&
+                         topologyValid;
+                         ++rootIndex)
+                    {
+                        const uint64_t middlePage =
+                            rootAllocated[rootIndex];
+                        if (!IsKernelAddress(
+                                middlePage) ||
+                            (middlePage &
+                             (kPageSize - 1)) != 0 ||
+                            !allocatedPages.insert(
+                                middlePage).second)
+                        {
+                            topologyValid = false;
+                            break;
+                        }
+
+                        std::vector<uint64_t>
+                            middlePointers;
+                        if (!ReadCidPointerPage(
+                                device,
+                                middlePage,
+                                &middlePointers))
+                        {
+                            topologyValid = false;
+                            break;
+                        }
+
+                        std::vector<uint64_t>
+                            middleAllocated;
+                        if (!CollectContiguousCidPointerPrefix(
+                                middlePointers,
+                                &middleAllocated) ||
+                            (rootIndex + 1 <
+                                 rootAllocated.size() &&
+                             middleAllocated.size() !=
+                                 middlePointers.size()))
+                        {
+                            topologyValid = false;
+                            break;
+                        }
+
+                        for (size_t middleIndex = 0;
+                             middleIndex <
+                                 middleAllocated.size();
+                             ++middleIndex)
+                        {
+                            if (!appendLeaf(
+                                    middleAllocated[
+                                        middleIndex]))
+                            {
+                                topologyValid =
+                                    false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!topologyValid)
+                    {
+                        if (warning != nullptr)
+                        {
+                            *warning =
+                                L"cid full enumeration: invalid, sparse, duplicate, unreadable, or over-budget level-2 allocation topology";
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (leafPages->empty() ||
+                leafPages->size() >
+                    std::numeric_limits<uint32_t>::max() ||
+                leafEntries >
+                    std::numeric_limits<uint64_t>::max() /
+                        leafPages->size() /
+                        4ull)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: allocated leaf capacity overflow";
+                }
+                break;
+            }
+
+            *handleCapacity =
+                leafPages->size() *
+                leafEntries *
+                4ull;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadCidTableSnapshot(
+        DeviceClient& device,
+        const CidTableLayout& layout,
+        uint64_t anchorAddress,
+        uint32_t highestKnownPid,
+        CidTableSnapshot* snapshot,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (snapshot == nullptr ||
+                !IsKernelAddress(anchorAddress))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: invalid anchor candidate";
+                }
+                break;
+            }
+
+            *snapshot = {};
+            snapshot->AnchorAddress = anchorAddress;
+            if (!ReadKernelPointer(
+                    device,
+                    anchorAddress,
+                    &snapshot->TableAddress,
+                    nullptr) ||
+                !IsKernelAddress(snapshot->TableAddress))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: candidate does not reference a kernel handle table";
+                }
+                break;
+            }
+
+            uint64_t nextAddress = 0;
+            uint64_t tableCodeAddress = 0;
+            uint64_t nextHandle = 0;
+            if (!TryAdd(
+                    snapshot->TableAddress,
+                    layout.NextHandleNeedingPool.Offset,
+                    &nextAddress) ||
+                !TryAdd(
+                    snapshot->TableAddress,
+                    layout.TableCode.Offset,
+                    &tableCodeAddress) ||
+                !ReadKernelInteger(
+                    device,
+                    nextAddress,
+                    sizeof(uint32_t),
+                    &nextHandle,
+                    nullptr) ||
+                !ReadKernelInteger(
+                    device,
+                    tableCodeAddress,
+                    sizeof(uint64_t),
+                    &snapshot->TableCode,
+                    nullptr))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: handle-table metadata read failed";
+                }
+                break;
+            }
+
+            if (nextHandle > std::numeric_limits<uint32_t>::max())
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: NextHandleNeedingPool overflow";
+                }
+                break;
+            }
+            snapshot->NextHandle =
+                static_cast<uint32_t>(nextHandle);
+            snapshot->TableLevel =
+                static_cast<uint32_t>(
+                    snapshot->TableCode & 0x3ull);
+
+            const uint64_t tableBase =
+                snapshot->TableCode & ~0x7ull;
+            const uint64_t probeCount =
+                snapshot->NextHandle / 4u;
+            if (snapshot->NextHandle < 8 ||
+                (snapshot->NextHandle & 0x3u) != 0 ||
+                probeCount > kMaxCidProcessProbeCount ||
+                highestKnownPid >= snapshot->NextHandle ||
+                (snapshot->TableCode & 0x7ull) > 2 ||
+                !IsKernelAddress(tableBase) ||
+                (tableBase & (kPageSize - 1)) != 0)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: candidate metadata failed bounds, level, or known-PID validation";
+                }
+                break;
+            }
+
+            if (!ResolveCidAllocatedLeafPages(
+                    device,
+                    tableBase,
+                    snapshot->TableLevel,
+                    layout.EntrySize,
+                    &snapshot->LeafPages,
+                    &snapshot->
+                        AllocatedHandleCapacity,
+                    warning))
+            {
+                break;
+            }
+            snapshot->AllocatedLeafCount =
+                static_cast<uint32_t>(
+                    snapshot->LeafPages.size());
+            if (snapshot->
+                    AllocatedHandleCapacity !=
+                snapshot->NextHandle)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: NextHandleNeedingPool disagrees with the independently walked allocated-leaf capacity";
+                }
+                break;
+            }
+
+            const uint64_t leafEntries =
+                kPageSize / layout.EntrySize;
+            const uint64_t pointerEntries =
+                kPageSize / sizeof(uint64_t);
+            const uint64_t levelZeroCapacity =
+                leafEntries * 4ull;
+            const uint64_t levelOneCapacity =
+                leafEntries * pointerEntries * 4ull;
+            if ((snapshot->TableLevel == 0 &&
+                 snapshot->NextHandle >
+                     levelZeroCapacity) ||
+                (snapshot->TableLevel == 1 &&
+                 snapshot->NextHandle >
+                     levelOneCapacity))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: table level cannot cover NextHandleNeedingPool";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ResolveCidTableAnchor(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const CidTableLayout& layout,
+        uint32_t highestKnownPid,
+        CidTableSnapshot* snapshot,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (snapshot == nullptr)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: invalid anchor snapshot output";
+                }
+                break;
+            }
+
+            std::set<uint64_t> directCandidates;
+            uint64_t directSymbol = 0;
+            if (symbols.ResolveSymbol(
+                    L"nt!PspCidTable",
+                    &directSymbol,
+                    nullptr) &&
+                IsKernelAddress(directSymbol))
+            {
+                directCandidates.insert(directSymbol);
+            }
+
+            uint64_t processLookup = 0;
+            uint64_t threadLookup = 0;
+            std::set<uint64_t> codeCandidates;
+            if (symbols.ResolveSymbol(
+                    L"nt!PsLookupProcessByProcessId",
+                    &processLookup,
+                    nullptr) &&
+                symbols.ResolveSymbol(
+                    L"nt!PsLookupThreadByThreadId",
+                    &threadLookup,
+                    nullptr))
+            {
+                std::vector<uint8_t> processCode;
+                std::vector<uint8_t> threadCode;
+                CidAnchorReferenceSet processReferences = {};
+                CidAnchorReferenceSet threadReferences = {};
+                if (ReadKernelBytes(
+                        device,
+                        processLookup,
+                        kCidAnchorCodeBytes,
+                        &processCode,
+                        nullptr) &&
+                    ReadKernelBytes(
+                        device,
+                        threadLookup,
+                        kCidAnchorCodeBytes,
+                        &threadCode,
+                        nullptr) &&
+                    ExtractCidAnchorReferences(
+                        processLookup,
+                        processCode,
+                        &processReferences) &&
+                    ExtractCidAnchorReferences(
+                        threadLookup,
+                        threadCode,
+                        &threadReferences))
+                {
+                    for (const auto& processReference :
+                         processReferences.RipRelativeQwordLoads)
+                    {
+                        const auto threadReference =
+                            threadReferences.
+                                RipRelativeQwordLoads.find(
+                                    processReference.first);
+                        if (processReference.second >= 2 &&
+                            threadReference !=
+                                threadReferences.
+                                    RipRelativeQwordLoads.end() &&
+                            threadReference->second >= 2)
+                        {
+                            codeCandidates.insert(
+                                processReference.first);
+                        }
+                    }
+                }
+            }
+
+            if (!directCandidates.empty() &&
+                !codeCandidates.empty() &&
+                directCandidates != codeCandidates)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: direct symbol and dual-function anchor disagree";
+                }
+                break;
+            }
+
+            std::set<uint64_t> candidates =
+                !codeCandidates.empty()
+                    ? codeCandidates
+                    : directCandidates;
+            std::vector<CidTableSnapshot> valid;
+            for (uint64_t candidate : candidates)
+            {
+                if (!AddressInsideKernelModule(
+                        symbols.Modules(),
+                        candidate,
+                        L"ntoskrnl.exe"))
+                {
+                    continue;
+                }
+
+                CidTableSnapshot candidateSnapshot = {};
+                if (ReadCidTableSnapshot(
+                        device,
+                        layout,
+                        candidate,
+                        highestKnownPid,
+                        &candidateSnapshot,
+                        nullptr))
+                {
+                    valid.push_back(candidateSnapshot);
+                }
+            }
+
+            if (valid.size() != 1)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        valid.empty()
+                            ? L"cid full enumeration: no validated PspCidTable anchor"
+                            : L"cid full enumeration: multiple validated PspCidTable anchors";
+                }
+                break;
+            }
+
+            *snapshot = valid.front();
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadCidProcessField(
+        DeviceClient& device,
+        uint64_t eprocess,
+        const TypeFieldInfo& field,
+        size_t fallbackWidth,
+        uint64_t* value)
+    {
+        uint64_t address = 0;
+        return
+            TryAdd(eprocess, field.Offset, &address) &&
+            ReadKernelInteger(
+                device,
+                address,
+                FieldStorageWidth(
+                    field,
+                    fallbackWidth),
+                value,
+                nullptr);
+    }
+
+    std::wstring ReadCidProcessImageName(
+        DeviceClient& device,
+        uint64_t eprocess,
+        const TypeFieldInfo& field)
+    {
+        std::wstring image;
+        uint64_t address = 0;
+        size_t length =
+            field.Length == 0 ||
+                    field.Length >
+                        kEprocessImageNameMaxChars
+                ? kEprocessImageNameMaxChars
+                : static_cast<size_t>(field.Length);
+        std::vector<uint8_t> bytes;
+        if (!TryAdd(eprocess, field.Offset, &address) ||
+            !ReadKernelBytes(
+                device,
+                address,
+                static_cast<uint32_t>(length),
+                &bytes,
+                nullptr))
+        {
+            return image;
+        }
+
+        for (uint8_t value : bytes)
+        {
+            if (value == 0)
+            {
+                break;
+            }
+            if (value < 0x20 || value > 0x7e)
+            {
+                image.clear();
+                break;
+            }
+            image.push_back(
+                static_cast<wchar_t>(value));
+        }
+        return image;
+    }
+
+    bool ResolveCidEprocessLayout(
+        SymbolEngine& symbols,
+        CidEprocessLayout* layout,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (layout == nullptr)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: invalid EPROCESS layout output";
+                }
+                break;
+            }
+
+            *layout = {};
+            std::wstring error;
+            if (!(symbols.FindField(
+                      L"nt!_EPROCESS",
+                      L"UniqueProcessId",
+                      &layout->UniqueProcessId,
+                      &error) ||
+                  FindFieldRecursive(
+                      symbols,
+                      {L"nt!_EPROCESS",
+                       L"_EPROCESS"},
+                      L"UniqueProcessId",
+                      &layout->UniqueProcessId)) ||
+                !(symbols.FindField(
+                      L"nt!_EPROCESS",
+                      L"CreateTime",
+                      &layout->CreateTime,
+                      &error) ||
+                  FindFieldRecursive(
+                      symbols,
+                      {L"nt!_EPROCESS",
+                       L"_EPROCESS"},
+                      L"CreateTime",
+                      &layout->CreateTime)))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: required EPROCESS identity fields unavailable: " +
+                        error;
+                }
+                break;
+            }
+
+            if (layout->UniqueProcessId.Offset >
+                    0x4000 ||
+                layout->CreateTime.Offset >
+                    0x4000 ||
+                FieldStorageWidth(
+                    layout->UniqueProcessId,
+                    sizeof(uint64_t)) >
+                    sizeof(uint64_t) ||
+                FieldStorageWidth(
+                    layout->CreateTime,
+                    sizeof(uint64_t)) !=
+                    sizeof(uint64_t))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: EPROCESS identity layout is outside bounded expectations";
+                }
+                break;
+            }
+
+            layout->HasImageFileName =
+                symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"ImageFileName",
+                    &layout->ImageFileName,
+                    nullptr) ||
+                FindFieldRecursive(
+                    symbols,
+                    {L"nt!_EPROCESS",
+                     L"_EPROCESS"},
+                    L"ImageFileName",
+                    &layout->ImageFileName);
+            layout->HasExitTime =
+                symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"ExitTime",
+                    &layout->ExitTime,
+                    nullptr) ||
+                FindFieldRecursive(
+                    symbols,
+                    {L"nt!_EPROCESS",
+                     L"_EPROCESS"},
+                    L"ExitTime",
+                    &layout->ExitTime);
+            layout->HasActiveThreads =
+                symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"ActiveThreads",
+                    &layout->ActiveThreads,
+                    nullptr) ||
+                FindFieldRecursive(
+                    symbols,
+                    {L"nt!_EPROCESS",
+                     L"_EPROCESS"},
+                    L"ActiveThreads",
+                    &layout->ActiveThreads);
+            layout->HasPeb =
+                symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"Peb",
+                    &layout->Peb,
+                    nullptr) ||
+                FindFieldRecursive(
+                    symbols,
+                    {L"nt!_EPROCESS",
+                     L"_EPROCESS"},
+                     L"Peb",
+                     &layout->Peb);
+
+            if (!layout->HasExitTime ||
+                !layout->HasActiveThreads ||
+                layout->ExitTime.Offset >
+                    0x4000 ||
+                layout->ActiveThreads.Offset >
+                    0x4000 ||
+                FieldStorageWidth(
+                    layout->ExitTime,
+                    sizeof(uint64_t)) !=
+                    sizeof(uint64_t) ||
+                FieldStorageWidth(
+                    layout->ActiveThreads,
+                    sizeof(uint32_t)) !=
+                    sizeof(uint32_t))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid full enumeration: required EPROCESS lifecycle fields are unavailable or outside bounded expectations";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool CaptureCidEnumeratedProcess(
+        DeviceClient& device,
+        const CidEprocessLayout& layout,
+        uint32_t processId,
+        const ProcessAddressContext& context,
+        CidEnumeratedProcess* process)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (process == nullptr ||
+                processId == 0 ||
+                context.ProcessId != processId ||
+                !IsKernelAddress(context.Eprocess) ||
+                context.DirectoryTableBase == 0)
+            {
+                break;
+            }
+
+            *process = {};
+            process->Context = context;
+
+            uint64_t kernelProcessId = 0;
+            if (!ReadCidProcessField(
+                    device,
+                    context.Eprocess,
+                    layout.UniqueProcessId,
+                    sizeof(uint64_t),
+                    &kernelProcessId) ||
+                kernelProcessId != processId)
+            {
+                break;
+            }
+
+            process->HasCreateTime =
+                ReadCidProcessField(
+                    device,
+                    context.Eprocess,
+                    layout.CreateTime,
+                    sizeof(uint64_t),
+                    &process->CreateTime);
+            if (!process->HasCreateTime ||
+                (processId > 4 &&
+                 process->CreateTime == 0))
+            {
+                break;
+            }
+
+            if (layout.HasImageFileName &&
+                layout.ImageFileName.Offset <=
+                    0x4000)
+            {
+                process->ImageName =
+                    ReadCidProcessImageName(
+                        device,
+                        context.Eprocess,
+                        layout.ImageFileName);
+            }
+            if (layout.HasExitTime &&
+                layout.ExitTime.Offset <= 0x4000)
+            {
+                process->HasExitTime =
+                    ReadCidProcessField(
+                        device,
+                        context.Eprocess,
+                        layout.ExitTime,
+                        sizeof(uint64_t),
+                        &process->ExitTime);
+            }
+            if (layout.HasActiveThreads &&
+                layout.ActiveThreads.Offset <=
+                    0x4000)
+            {
+                uint64_t activeThreads = 0;
+                process->HasActiveThreads =
+                    ReadCidProcessField(
+                        device,
+                        context.Eprocess,
+                        layout.ActiveThreads,
+                        sizeof(uint32_t),
+                        &activeThreads);
+                if (process->HasActiveThreads)
+                {
+                    process->ActiveThreads =
+                        static_cast<uint32_t>(
+                            activeThreads);
+                }
+            }
+            if (layout.HasPeb &&
+                layout.Peb.Offset <= 0x4000)
+            {
+                process->HasPeb =
+                    ReadCidProcessField(
+                        device,
+                        context.Eprocess,
+                        layout.Peb,
+                        sizeof(uint64_t),
+                    &process->Peb);
+            }
+
+            if (!process->HasExitTime ||
+                !process->HasActiveThreads)
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool CidTableSnapshotsEqual(
+        const CidTableSnapshot& left,
+        const CidTableSnapshot& right)
+    {
+        return
+            left.AnchorAddress == right.AnchorAddress &&
+            left.TableAddress == right.TableAddress &&
+            left.TableCode == right.TableCode &&
+            left.TableLevel == right.TableLevel &&
+            left.NextHandle == right.NextHandle &&
+            left.AllocatedLeafCount ==
+                right.AllocatedLeafCount &&
+            left.AllocatedHandleCapacity ==
+                right.AllocatedHandleCapacity &&
+            left.LeafPages == right.LeafPages;
+    }
+
+    bool ResolveCidDirectLayout(
+        SymbolEngine& symbols,
+        CidDirectLayout* layout,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (layout == nullptr)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid direct enumeration: invalid layout output";
+                }
+                break;
+            }
+
+            *layout = {};
+            std::wstring error;
+            if (!symbols.FindField(
+                    L"nt!_HANDLE_TABLE_ENTRY",
+                    L"ObjectPointerBits",
+                    &layout->ObjectPointerBits,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_OBJECT_HEADER",
+                    L"TypeIndex",
+                    &layout->ObjectHeaderTypeIndex,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_OBJECT_HEADER",
+                    L"Body",
+                    &layout->ObjectHeaderBody,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_OBJECT_TYPE",
+                    L"Index",
+                    &layout->ObjectTypeIndex,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"Pcb",
+                    &layout->EprocessPcb,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"ThreadListHead",
+                    &layout->EprocessThreadListHead,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_KPROCESS",
+                    L"ThreadListHead",
+                    &layout->KprocessThreadListHead,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_ETHREAD",
+                    L"Tcb",
+                    &layout->EthreadTcb,
+                    &error) ||
+                !FindFieldRecursive(
+                    symbols,
+                    {L"nt!_ETHREAD", L"_ETHREAD"},
+                    L"UniqueThread",
+                    &layout->EthreadUniqueThread) ||
+                !FindFieldRecursive(
+                    symbols,
+                    {L"nt!_ETHREAD", L"_ETHREAD"},
+                    L"UniqueProcess",
+                    &layout->EthreadUniqueProcess) ||
+                !symbols.FindField(
+                    L"nt!_ETHREAD",
+                    L"CreateTime",
+                    &layout->EthreadCreateTime,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_ETHREAD",
+                    L"ExitTime",
+                    &layout->EthreadExitTime,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_ETHREAD",
+                    L"Terminated",
+                    &layout->EthreadTerminated,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_ETHREAD",
+                    L"ThreadListEntry",
+                    &layout->EthreadThreadListEntry,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_KTHREAD",
+                    L"Process",
+                    &layout->KthreadProcess,
+                    &error) ||
+                !symbols.FindField(
+                    L"nt!_KTHREAD",
+                    L"ThreadListEntry",
+                    &layout->KthreadThreadListEntry,
+                    &error) ||
+                !symbols.ResolveSymbol(
+                    L"nt!ObHeaderCookie",
+                    &layout->ObHeaderCookieAddress,
+                    &error) ||
+                !symbols.ResolveSymbol(
+                    L"nt!ObTypeIndexTable",
+                    &layout->ObTypeIndexTableAddress,
+                    &error) ||
+                !symbols.ResolveSymbol(
+                    L"nt!PsProcessType",
+                    &layout->PsProcessTypeAddress,
+                    &error) ||
+                !symbols.ResolveSymbol(
+                    L"nt!PsThreadType",
+                    &layout->PsThreadTypeAddress,
+                    &error))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid direct enumeration: required PDB field or object-type symbol unavailable: " +
+                        error;
+                }
+                break;
+            }
+
+            const TypeFieldInfo* boundedFields[] = {
+                &layout->ObjectHeaderTypeIndex,
+                &layout->ObjectHeaderBody,
+                &layout->ObjectTypeIndex,
+                &layout->EprocessThreadListHead,
+                &layout->KprocessThreadListHead,
+                &layout->EthreadUniqueThread,
+                &layout->EthreadUniqueProcess,
+                &layout->EthreadCreateTime,
+                &layout->EthreadExitTime,
+                &layout->EthreadTerminated,
+                &layout->EthreadThreadListEntry,
+                &layout->KthreadProcess,
+                &layout->KthreadThreadListEntry
+            };
+            bool fieldsBounded = true;
+            for (const TypeFieldInfo* field :
+                 boundedFields)
+            {
+                if (field == nullptr ||
+                    field->Offset > 0x4000)
+                {
+                    fieldsBounded = false;
+                    break;
+                }
+            }
+
+            if (!layout->ObjectPointerBits.IsBitField ||
+                layout->ObjectPointerBits.Length != 44 ||
+                layout->ObjectPointerBits.BitPosition >
+                    64 -
+                        layout->ObjectPointerBits.Length ||
+                layout->ObjectHeaderBody.Offset < 0x20 ||
+                layout->ObjectHeaderBody.Offset > 0x100 ||
+                (layout->ObjectHeaderBody.Offset &
+                 0xfull) != 0 ||
+                layout->EprocessPcb.Offset != 0 ||
+                layout->EthreadTcb.Offset != 0 ||
+                !layout->EthreadTerminated.IsBitField ||
+                layout->EthreadTerminated.Length != 1 ||
+                !fieldsBounded ||
+                !IsKernelAddress(
+                    layout->ObHeaderCookieAddress) ||
+                !IsKernelAddress(
+                    layout->ObTypeIndexTableAddress) ||
+                !IsKernelAddress(
+                    layout->PsProcessTypeAddress) ||
+                !IsKernelAddress(
+                    layout->PsThreadTypeAddress))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid direct enumeration: PDB geometry is outside bounded x64 object expectations";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool DecodeCidObjectAddresses(
+        uint64_t objectPointerBits,
+        uint64_t objectHeaderBodyOffset,
+        uint64_t* objectHeader,
+        uint64_t* objectBody)
+    {
+        if (objectHeader == nullptr ||
+            objectBody == nullptr ||
+            objectPointerBits == 0 ||
+            objectPointerBits >= (1ull << 44) ||
+            objectHeaderBodyOffset < 0x10 ||
+            objectHeaderBodyOffset > 0x100 ||
+            (objectHeaderBodyOffset & 0xfull) != 0)
+        {
+            return false;
+        }
+
+        uint64_t body = objectPointerBits << 4;
+        if ((body & (1ull << 47)) != 0)
+        {
+            body |= 0xffff000000000000ull;
+        }
+        if (!IsKernelAddress(body) ||
+            (body & 0xfull) != 0 ||
+            body < objectHeaderBodyOffset)
+        {
+            return false;
+        }
+
+        const uint64_t header =
+            body - objectHeaderBodyOffset;
+        if (!IsKernelAddress(header) ||
+            (header & 0xfull) != 0)
+        {
+            return false;
+        }
+
+        *objectHeader = header;
+        *objectBody = body;
+        return true;
+    }
+
+    bool ExtractCidObjectPointerBits(
+        const std::vector<uint8_t>& page,
+        uint64_t entrySize,
+        uint64_t entryIndex,
+        const TypeFieldInfo& field,
+        uint64_t* objectPointerBits)
+    {
+        if (objectPointerBits == nullptr ||
+            entrySize == 0 ||
+            entryIndex >= kPageSize / entrySize ||
+            !field.IsBitField ||
+            field.Length == 0 ||
+            field.Length > 64 ||
+            field.BitPosition >= 64 ||
+            field.Length >
+                64 - field.BitPosition)
+        {
+            return false;
+        }
+
+        const size_t width =
+            FieldStorageWidth(field, sizeof(uint64_t));
+        const uint64_t entryOffset =
+            entryIndex * entrySize;
+        const uint64_t fieldOffset =
+            entryOffset + field.Offset;
+        if (width == 0 ||
+            width > sizeof(uint64_t) ||
+            fieldOffset > page.size() ||
+            width > page.size() - fieldOffset)
+        {
+            return false;
+        }
+
+        uint64_t raw = DecodeInteger(
+            page.data() +
+                static_cast<size_t>(fieldOffset),
+            width);
+        const uint64_t mask =
+            field.Length == 64
+                ? std::numeric_limits<uint64_t>::max()
+                : ((1ull << field.Length) - 1ull);
+        *objectPointerBits =
+            (raw >> field.BitPosition) & mask;
+        return true;
+    }
+
+    bool ReadCidPointerBitSnapshot(
+        DeviceClient& device,
+        const CidTableLayout& tableLayout,
+        const CidDirectLayout& directLayout,
+        const CidTableSnapshot& snapshot,
+        std::vector<uint64_t>* pointerBits,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (pointerBits == nullptr ||
+                tableLayout.EntrySize == 0 ||
+                snapshot.NextHandle < 8 ||
+                snapshot.LeafPages.empty())
+            {
+                break;
+            }
+
+            const uint64_t entriesPerLeaf =
+                kPageSize / tableLayout.EntrySize;
+            const uint64_t expectedEntries =
+                snapshot.NextHandle / 4ull;
+            if (entriesPerLeaf == 0 ||
+                snapshot.LeafPages.size() >
+                    std::numeric_limits<uint64_t>::max() /
+                        entriesPerLeaf ||
+                snapshot.LeafPages.size() *
+                        entriesPerLeaf !=
+                    expectedEntries)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid direct enumeration: leaf geometry does not cover the validated handle range";
+                }
+                break;
+            }
+
+            pointerBits->clear();
+            pointerBits->reserve(
+                static_cast<size_t>(expectedEntries));
+            bool readComplete = true;
+            for (uint64_t leafPage :
+                 snapshot.LeafPages)
+            {
+                std::vector<uint8_t> page;
+                if (!ReadKernelBytes(
+                        device,
+                        leafPage,
+                        static_cast<uint32_t>(
+                            kPageSize),
+                        &page,
+                        nullptr) ||
+                    page.size() != kPageSize)
+                {
+                    readComplete = false;
+                    break;
+                }
+
+                for (uint64_t entryIndex = 0;
+                     entryIndex < entriesPerLeaf;
+                     ++entryIndex)
+                {
+                    uint64_t bits = 0;
+                    if (!ExtractCidObjectPointerBits(
+                            page,
+                            tableLayout.EntrySize,
+                            entryIndex,
+                            directLayout.
+                                ObjectPointerBits,
+                            &bits))
+                    {
+                        readComplete = false;
+                        break;
+                    }
+                    pointerBits->push_back(bits);
+                }
+                if (!readComplete)
+                {
+                    break;
+                }
+            }
+
+            if (!readComplete ||
+                pointerBits->size() !=
+                    expectedEntries)
+            {
+                pointerBits->clear();
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid direct enumeration: allocated entry-page read or bitfield extraction failed";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadCidEntryObjectPointerBits(
+        DeviceClient& device,
+        const CidTableLayout& tableLayout,
+        const CidDirectLayout& directLayout,
+        const CidTableSnapshot& snapshot,
+        uint64_t slot,
+        uint64_t* objectPointerBits)
+    {
+        if (objectPointerBits == nullptr ||
+            tableLayout.EntrySize == 0)
+        {
+            return false;
+        }
+
+        const uint64_t entriesPerLeaf =
+            kPageSize / tableLayout.EntrySize;
+        if (entriesPerLeaf == 0)
+        {
+            return false;
+        }
+        const uint64_t leafIndex =
+            slot / entriesPerLeaf;
+        const uint64_t entryIndex =
+            slot % entriesPerLeaf;
+        if (leafIndex >= snapshot.LeafPages.size() ||
+            entryIndex >
+                std::numeric_limits<uint64_t>::max() /
+                    tableLayout.EntrySize)
+        {
+            return false;
+        }
+
+        uint64_t entryAddress = 0;
+        if (!TryAdd(
+                snapshot.LeafPages[
+                    static_cast<size_t>(leafIndex)],
+                entryIndex * tableLayout.EntrySize,
+                &entryAddress) ||
+            !IsKernelAddress(entryAddress))
+        {
+            return false;
+        }
+
+        uint64_t bits = 0;
+        if (!ReadFieldInteger(
+                device,
+                entryAddress,
+                directLayout.ObjectPointerBits,
+                sizeof(uint64_t),
+                &bits,
+                nullptr) ||
+            bits >= (1ull << 44))
+        {
+            return false;
+        }
+
+        *objectPointerBits = bits;
+        return true;
+    }
+
+    bool CidPointerSnapshotHasAllocatableSlots(
+        const std::vector<uint64_t>& pointerBits)
+    {
+        // Handle value zero is reserved. Its table entry is also used for
+        // free-list bookkeeping and is not required to contain zero object
+        // bits on current kernels. Only slots 1..N map to valid CID values.
+        return pointerBits.size() > 1;
+    }
+
+    enum class CidDirectObjectType
+    {
+        Unknown,
+        Process,
+        Thread
+    };
+
+    bool ResolveCidDirectObjectType(
+        DeviceClient& device,
+        const CidDirectLayout& layout,
+        uint8_t headerCookie,
+        uint64_t processType,
+        uint64_t threadType,
+        uint64_t objectHeader,
+        CidDirectObjectType* objectType)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (objectType == nullptr ||
+                !IsKernelAddress(objectHeader) ||
+                !IsKernelAddress(processType) ||
+                !IsKernelAddress(threadType) ||
+                processType == threadType)
+            {
+                break;
+            }
+            *objectType = CidDirectObjectType::Unknown;
+
+            uint64_t encodedTypeIndex = 0;
+            if (!ReadFieldInteger(
+                    device,
+                    objectHeader,
+                    layout.ObjectHeaderTypeIndex,
+                    sizeof(uint8_t),
+                    &encodedTypeIndex,
+                    nullptr) ||
+                encodedTypeIndex >
+                    std::numeric_limits<uint8_t>::max())
+            {
+                break;
+            }
+
+            const uint8_t decodedTypeIndex =
+                static_cast<uint8_t>(
+                    encodedTypeIndex) ^
+                headerCookie ^
+                static_cast<uint8_t>(
+                    objectHeader >> 8);
+            if (decodedTypeIndex == 0)
+            {
+                break;
+            }
+
+            uint64_t typeEntryAddress = 0;
+            uint64_t typePointer = 0;
+            if (!TryAdd(
+                    layout.ObTypeIndexTableAddress,
+                    static_cast<uint64_t>(
+                        decodedTypeIndex) *
+                        sizeof(uint64_t),
+                    &typeEntryAddress) ||
+                !ReadKernelPointer(
+                    device,
+                    typeEntryAddress,
+                    &typePointer,
+                    nullptr) ||
+                !IsKernelAddress(typePointer))
+            {
+                break;
+            }
+
+            uint64_t objectTypeIndex = 0;
+            if (!ReadFieldInteger(
+                    device,
+                    typePointer,
+                    layout.ObjectTypeIndex,
+                    sizeof(uint8_t),
+                    &objectTypeIndex,
+                    nullptr) ||
+                objectTypeIndex !=
+                    decodedTypeIndex)
+            {
+                break;
+            }
+
+            if (typePointer == processType)
+            {
+                *objectType =
+                    CidDirectObjectType::Process;
+            }
+            else if (typePointer == threadType)
+            {
+                *objectType =
+                    CidDirectObjectType::Thread;
+            }
+            else
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool CidDirectThreadIdentityFieldsPlausible(
+        uint32_t expectedThreadId,
+        uint64_t observedThreadId,
+        uint64_t observedProcessId,
+        uint64_t ownerProcess,
+        uint64_t createTime,
+        uint64_t terminated)
+    {
+        return
+            observedThreadId == expectedThreadId &&
+            (expectedThreadId != 0 ||
+             observedProcessId == 0) &&
+            observedProcessId <=
+                std::numeric_limits<uint32_t>::max() &&
+            IsKernelAddress(ownerProcess) &&
+            (createTime != 0 || observedProcessId == 0) &&
+            terminated <= 1;
+    }
+
+    uint64_t CidThreadExitTimeForState(
+        uint64_t rawExitTime,
+        uint64_t terminated)
+    {
+        return terminated != 0 ? rawExitTime : 0;
+    }
+
+    bool CaptureCidDirectThread(
+        DeviceClient& device,
+        const CidDirectLayout& layout,
+        const CidEprocessLayout& processLayout,
+        uint32_t threadId,
+        uint64_t objectHeader,
+        uint64_t ethread,
+        CidDirectThread* thread)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (thread == nullptr ||
+                (objectHeader != 0 &&
+                 !IsKernelAddress(objectHeader)) ||
+                !IsKernelAddress(ethread))
+            {
+                break;
+            }
+            *thread = {};
+
+            uint64_t observedThreadId = 0;
+            uint64_t observedProcessId = 0;
+            uint64_t ownerProcess = 0;
+            uint64_t createTime = 0;
+            uint64_t exitTime = 0;
+            uint64_t terminated = 0;
+            if (!ReadFieldInteger(
+                    device,
+                    ethread,
+                    layout.EthreadUniqueThread,
+                    sizeof(uint64_t),
+                    &observedThreadId,
+                    nullptr) ||
+                !ReadFieldInteger(
+                    device,
+                    ethread,
+                    layout.EthreadUniqueProcess,
+                    sizeof(uint64_t),
+                    &observedProcessId,
+                    nullptr) ||
+                !ReadFieldInteger(
+                    device,
+                    ethread,
+                    layout.KthreadProcess,
+                    sizeof(uint64_t),
+                    &ownerProcess,
+                    nullptr) ||
+                !ReadFieldInteger(
+                    device,
+                    ethread,
+                    layout.EthreadCreateTime,
+                    sizeof(uint64_t),
+                    &createTime,
+                    nullptr) ||
+                !ReadFieldInteger(
+                    device,
+                    ethread,
+                    layout.EthreadExitTime,
+                    sizeof(uint64_t),
+                    &exitTime,
+                    nullptr) ||
+                !ReadFieldInteger(
+                    device,
+                    ethread,
+                    layout.EthreadTerminated,
+                    sizeof(uint32_t),
+                    &terminated,
+                    nullptr) ||
+                !CidDirectThreadIdentityFieldsPlausible(
+                    threadId,
+                    observedThreadId,
+                    observedProcessId,
+                    ownerProcess,
+                    createTime,
+                    terminated))
+            {
+                break;
+            }
+
+            uint64_t ownerProcessId = 0;
+            if (!ReadFieldInteger(
+                    device,
+                    ownerProcess,
+                    processLayout.UniqueProcessId,
+                    sizeof(uint64_t),
+                    &ownerProcessId,
+                    nullptr) ||
+                ownerProcessId != observedProcessId)
+            {
+                break;
+            }
+
+            thread->ThreadId = threadId;
+            thread->ProcessId =
+                static_cast<uint32_t>(
+                    observedProcessId);
+            thread->ObjectHeader = objectHeader;
+            thread->Ethread = ethread;
+            thread->Eprocess = ownerProcess;
+            thread->CreateTime = createTime;
+            // ETHREAD overlays ExitTime with live-thread bookkeeping on
+            // current kernels. The value has exit-time semantics only after
+            // the Terminated bit is set.
+            thread->ExitTime =
+                CidThreadExitTimeForState(
+                    exitTime,
+                    terminated);
+            thread->HasCreateTime = true;
+            thread->HasExitTime = true;
+            thread->Terminated = terminated != 0;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool CaptureCidProcessAtAddress(
+        DeviceClient& device,
+        const CidEprocessLayout& processLayout,
+        uint32_t directoryTableBaseOffset,
+        uint32_t userDirectoryTableBaseOffset,
+        uint32_t processId,
+        uint64_t eprocess,
+        CidEnumeratedProcess* process)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (process == nullptr ||
+                processId == 0 ||
+                directoryTableBaseOffset == 0 ||
+                directoryTableBaseOffset > 0x4000 ||
+                userDirectoryTableBaseOffset > 0x4000 ||
+                !IsKernelAddress(eprocess))
+            {
+                break;
+            }
+
+            ProcessAddressContext context = {};
+            context.ProcessId = processId;
+            context.Eprocess = eprocess;
+            uint64_t dtbAddress = 0;
+            if (!TryAdd(
+                    eprocess,
+                    directoryTableBaseOffset,
+                    &dtbAddress) ||
+                !ReadKernelInteger(
+                    device,
+                    dtbAddress,
+                    sizeof(uint64_t),
+                    &context.DirectoryTableBase,
+                    nullptr))
+            {
+                break;
+            }
+            context.DirectoryTableBase &=
+                0x000ffffffffff000ull;
+            if (context.DirectoryTableBase == 0)
+            {
+                break;
+            }
+
+            if (userDirectoryTableBaseOffset != 0)
+            {
+                uint64_t userDtbAddress = 0;
+                if (!TryAdd(
+                        eprocess,
+                        userDirectoryTableBaseOffset,
+                        &userDtbAddress) ||
+                    !ReadKernelInteger(
+                        device,
+                        userDtbAddress,
+                        sizeof(uint64_t),
+                        &context.
+                            UserDirectoryTableBase,
+                        nullptr))
+                {
+                    break;
+                }
+                context.UserDirectoryTableBase &=
+                    0x000ffffffffff000ull;
+            }
+
+            if (!CaptureCidEnumeratedProcess(
+                    device,
+                    processLayout,
+                    processId,
+                    context,
+                    process))
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool CaptureCidDirectProcess(
+        DeviceClient& device,
+        const CidEprocessLayout& processLayout,
+        uint32_t directoryTableBaseOffset,
+        uint32_t userDirectoryTableBaseOffset,
+        uint32_t processId,
+        uint64_t objectHeader,
+        uint64_t eprocess,
+        CidDirectProcess* process)
+    {
+        if (process == nullptr ||
+            !IsKernelAddress(objectHeader))
+        {
+            return false;
+        }
+
+        CidEnumeratedProcess captured = {};
+        if (!CaptureCidProcessAtAddress(
+                device,
+                processLayout,
+                directoryTableBaseOffset,
+                userDirectoryTableBaseOffset,
+                processId,
+                eprocess,
+                &captured))
+        {
+            return false;
+        }
+
+        process->ProcessId = processId;
+        process->ObjectHeader = objectHeader;
+        process->Process = std::move(captured);
+        return true;
+    }
+
+    bool ApplyCidTableDirectObjectView(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint32_t directoryTableBaseOffset,
+        uint32_t userDirectoryTableBaseOffset,
+        uint32_t highestKnownPid,
+        CidDirectEnumerationResult* result)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+            *result = {};
+
+            CidTableLayout tableLayout = {};
+            if (!ResolveCidTableLayout(
+                    symbols,
+                    &tableLayout,
+                    &result->Summary))
+            {
+                break;
+            }
+
+            CidEprocessLayout processLayout = {};
+            if (!ResolveCidEprocessLayout(
+                    symbols,
+                    &processLayout,
+                    &result->Summary))
+            {
+                break;
+            }
+
+            CidDirectLayout directLayout = {};
+            if (!ResolveCidDirectLayout(
+                    symbols,
+                    &directLayout,
+                    &result->Summary))
+            {
+                break;
+            }
+            if (directLayout.ObjectPointerBits.Offset >
+                    tableLayout.EntrySize ||
+                FieldStorageWidth(
+                    directLayout.ObjectPointerBits,
+                    sizeof(uint64_t)) >
+                    tableLayout.EntrySize -
+                        directLayout.
+                            ObjectPointerBits.Offset)
+            {
+                result->Summary =
+                    L"cid direct enumeration: ObjectPointerBits exceeds the PDB entry geometry";
+                break;
+            }
+
+            uint64_t headerCookie = 0;
+            uint64_t processType = 0;
+            uint64_t threadType = 0;
+            if (!ReadKernelInteger(
+                    device,
+                    directLayout.ObHeaderCookieAddress,
+                    sizeof(uint8_t),
+                    &headerCookie,
+                    nullptr) ||
+                !ReadKernelPointer(
+                    device,
+                    directLayout.PsProcessTypeAddress,
+                    &processType,
+                    nullptr) ||
+                !ReadKernelPointer(
+                    device,
+                    directLayout.PsThreadTypeAddress,
+                    &threadType,
+                    nullptr) ||
+                headerCookie >
+                    std::numeric_limits<uint8_t>::max() ||
+                !IsKernelAddress(processType) ||
+                !IsKernelAddress(threadType) ||
+                processType == threadType)
+            {
+                result->Summary =
+                    L"cid direct enumeration: object-header cookie or Process/Thread object types are unavailable";
+                break;
+            }
+
+            constexpr uint32_t kSnapshotAttempts = 3;
+            for (uint32_t attempt = 0;
+                 attempt < kSnapshotAttempts;
+                 ++attempt)
+            {
+                result->Processes.clear();
+                result->Threads.clear();
+                result->NonEmptyEntryCount = 0;
+                result->UnclassifiedEntryCount = 0;
+                result->ReadFailureCount = 0;
+
+                CidTableSnapshot before = {};
+                if (!ResolveCidTableAnchor(
+                        device,
+                        symbols,
+                        tableLayout,
+                        highestKnownPid,
+                        &before,
+                        &result->Summary))
+                {
+                    break;
+                }
+
+                std::vector<uint64_t> firstBits;
+                if (!ReadCidPointerBitSnapshot(
+                        device,
+                        tableLayout,
+                        directLayout,
+                        before,
+                        &firstBits,
+                        &result->Summary))
+                {
+                    ++result->ReadFailureCount;
+                    continue;
+                }
+
+                CidTableSnapshot after = {};
+                if (!ReadCidTableSnapshot(
+                        device,
+                        tableLayout,
+                        before.AnchorAddress,
+                        highestKnownPid,
+                        &after,
+                        nullptr) ||
+                    !CidTableSnapshotsEqual(
+                        before,
+                        after))
+                {
+                    result->Summary =
+                        L"cid direct enumeration: allocation topology changed during entry-page capture; retrying";
+                    continue;
+                }
+
+                bool decoded =
+                    CidPointerSnapshotHasAllocatableSlots(
+                        firstBits);
+                std::wstring decodeFailure;
+                const auto setDecodeFailure =
+                    [&decodeFailure](
+                        uint32_t cid,
+                        const std::wstring& stage,
+                        uint64_t value)
+                    {
+                        if (!decodeFailure.empty())
+                        {
+                            return;
+                        }
+                        decodeFailure =
+                            L"cid=" +
+                            std::to_wstring(cid) +
+                            L" stage=" + stage +
+                            L" value=" +
+                            HuntHex(value, 16);
+                    };
+                if (!decoded)
+                {
+                    ++result->ReadFailureCount;
+                    result->Summary =
+                        L"cid direct enumeration: pointer snapshot contains no allocatable CID slots";
+                }
+                for (size_t slot = 1;
+                     decoded && slot < firstBits.size();
+                     ++slot)
+                {
+                    const uint64_t pointerBits =
+                        firstBits[slot];
+                    if (pointerBits == 0)
+                    {
+                        continue;
+                    }
+                    ++result->NonEmptyEntryCount;
+
+                    if (slot >
+                        std::numeric_limits<uint32_t>::
+                            max() /
+                            4ull)
+                    {
+                        decoded = false;
+                        ++result->
+                            UnclassifiedEntryCount;
+                        setDecodeFailure(
+                            0,
+                            L"slot_overflow",
+                            slot);
+                        break;
+                    }
+                    const uint32_t cid =
+                        static_cast<uint32_t>(
+                            slot * 4ull);
+
+                    uint64_t objectHeader = 0;
+                    uint64_t objectBody = 0;
+                    CidDirectObjectType objectType =
+                        CidDirectObjectType::Unknown;
+                    if (!DecodeCidObjectAddresses(
+                            pointerBits,
+                            directLayout.
+                                ObjectHeaderBody.Offset,
+                            &objectHeader,
+                            &objectBody))
+                    {
+                        decoded = false;
+                        ++result->
+                            UnclassifiedEntryCount;
+                        setDecodeFailure(
+                            cid,
+                            L"pointer_decode",
+                            pointerBits);
+                        continue;
+                    }
+                    if (!ResolveCidDirectObjectType(
+                            device,
+                            directLayout,
+                            static_cast<uint8_t>(
+                                headerCookie),
+                            processType,
+                            threadType,
+                            objectHeader,
+                            &objectType))
+                    {
+                        decoded = false;
+                        ++result->
+                            UnclassifiedEntryCount;
+                        setDecodeFailure(
+                            cid,
+                            L"object_type",
+                            objectHeader);
+                        continue;
+                    }
+
+                    bool objectCaptured = false;
+                    if (objectType ==
+                        CidDirectObjectType::Process)
+                    {
+                        CidDirectProcess process = {};
+                        objectCaptured =
+                            CaptureCidDirectProcess(
+                                device,
+                                processLayout,
+                                directoryTableBaseOffset,
+                                userDirectoryTableBaseOffset,
+                                cid,
+                                objectHeader,
+                                objectBody,
+                                &process) &&
+                            result->Processes.emplace(
+                                cid,
+                                std::move(process)).
+                                second;
+                    }
+                    else
+                    {
+                        CidDirectThread thread = {};
+                        objectCaptured =
+                            CaptureCidDirectThread(
+                                device,
+                                directLayout,
+                                processLayout,
+                                cid,
+                                objectHeader,
+                                objectBody,
+                                &thread) &&
+                            result->Threads.emplace(
+                                cid,
+                                std::move(thread)).
+                                second;
+                    }
+
+                    uint64_t currentPointerBits = 0;
+                    if (!objectCaptured ||
+                        !ReadCidEntryObjectPointerBits(
+                            device,
+                            tableLayout,
+                            directLayout,
+                            after,
+                            slot,
+                            &currentPointerBits) ||
+                        currentPointerBits != pointerBits)
+                    {
+                        if (objectType ==
+                            CidDirectObjectType::Process)
+                        {
+                            result->Processes.erase(cid);
+                        }
+                        else
+                        {
+                            result->Threads.erase(cid);
+                        }
+                        decoded = false;
+                        ++result->
+                            UnclassifiedEntryCount;
+                        setDecodeFailure(
+                            cid,
+                            !objectCaptured
+                                ? (objectType ==
+                                           CidDirectObjectType::Process
+                                       ? L"process_identity_capture"
+                                       : L"thread_identity_capture")
+                                : L"entry_revalidation",
+                            objectBody);
+                    }
+                }
+
+                CidTableSnapshot verifiedAfter = {};
+                if (decoded &&
+                    (!ReadCidTableSnapshot(
+                         device,
+                         tableLayout,
+                         after.AnchorAddress,
+                         highestKnownPid,
+                         &verifiedAfter,
+                         nullptr) ||
+                     !CidTableSnapshotsEqual(
+                         after,
+                         verifiedAfter)))
+                {
+                    decoded = false;
+                    ++result->ReadFailureCount;
+                    result->Summary =
+                        L"cid direct enumeration: allocation topology changed while object bodies were being decoded; retrying";
+                }
+
+                if (!decoded ||
+                    result->UnclassifiedEntryCount != 0 ||
+                    result->Processes.empty() ||
+                    result->Threads.empty() ||
+                    result->Processes.find(4) ==
+                        result->Processes.end() ||
+                    result->Processes.size() +
+                            result->Threads.size() !=
+                        result->NonEmptyEntryCount)
+                {
+                    result->Summary =
+                        L"cid direct enumeration: one or more stable non-empty entries could not be typed and identity-validated; retrying" +
+                        (decodeFailure.empty()
+                             ? L""
+                             : L"; first_failure=" +
+                                   decodeFailure);
+                    continue;
+                }
+
+                result->Snapshot = verifiedAfter;
+                result->Stable = true;
+                result->Complete = true;
+                result->Summary =
+                    L"cid direct enumeration: entries=" +
+                    std::to_wstring(
+                        result->NonEmptyEntryCount) +
+                    L" processes=" +
+                    std::to_wstring(
+                        result->Processes.size()) +
+                    L" threads=" +
+                    std::to_wstring(
+                        result->Threads.size());
+                ok = true;
+                break;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool MergeCidDirectProcessView(
+        const CidDirectEnumerationResult& direct,
+        std::map<uint32_t, HuntProcessRecord>* processes,
+        uint64_t* discoveredProcesses,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        if (discoveredProcesses != nullptr)
+        {
+            *discoveredProcesses = 0;
+        }
+        if (warning != nullptr)
+        {
+            warning->clear();
+        }
+
+        do
+        {
+            if (!direct.Complete ||
+                !direct.Stable ||
+                processes == nullptr)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid direct process merge: direct entry enumeration is incomplete";
+                }
+                break;
+            }
+
+            // Validate every pre-existing identity before mutating any record.
+            // A late mismatch must not leave an earlier PID partially merged.
+            bool identitiesConsistent = true;
+            for (const auto& item : direct.Processes)
+            {
+                const auto existing =
+                    processes->find(item.first);
+                if (existing == processes->end())
+                {
+                    continue;
+                }
+
+                const HuntProcessRecord& process =
+                    existing->second;
+                const CidDirectProcess& cid =
+                    item.second;
+                if ((process.Kernel.Eprocess != 0 &&
+                     process.Kernel.Eprocess !=
+                         cid.Process.Context.Eprocess) ||
+                    (process.Kernel.HasCreateTime &&
+                     process.Kernel.CreateTime !=
+                         cid.Process.CreateTime))
+                {
+                    identitiesConsistent = false;
+                    break;
+                }
+            }
+            if (!identitiesConsistent)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid direct process merge: one or more seeded identities disagreed";
+                }
+                break;
+            }
+
+            for (const auto& item : direct.Processes)
+            {
+                const uint32_t processId = item.first;
+                const CidDirectProcess& cid =
+                    item.second;
+                auto existing =
+                    processes->find(processId);
+                const bool discovered =
+                    existing == processes->end();
+                if (discovered)
+                {
+                    HuntProcessRecord record = {};
+                    record.ProcessId = processId;
+                    existing = processes->emplace(
+                        processId,
+                        std::move(record)).first;
+                    if (discoveredProcesses != nullptr)
+                    {
+                        ++(*discoveredProcesses);
+                    }
+                }
+
+                HuntProcessRecord& process =
+                    existing->second;
+                const bool lookupSeen =
+                    process.CidTableSeen;
+
+                process.ProcessId = processId;
+                process.HasCidTableView = true;
+                process.CidTableEnumerated = true;
+                process.CidTableSeen = true;
+                process.CidDirectEntrySeen = true;
+                process.CidLookupDirectAgreed =
+                    lookupSeen &&
+                    (process.Kernel.Eprocess == 0 ||
+                     process.Kernel.Eprocess ==
+                         cid.Process.Context.Eprocess);
+                process.CidTableDiscovered =
+                    process.CidTableDiscovered ||
+                    discovered;
+                process.Kernel.ProcessId = processId;
+                process.Kernel.Eprocess =
+                    cid.Process.Context.Eprocess;
+                process.Kernel.DirectoryTableBase =
+                    cid.Process.Context.DirectoryTableBase;
+                process.Kernel.UserDirectoryTableBase =
+                    cid.Process.Context.
+                        UserDirectoryTableBase;
+                process.Kernel.CreateTime =
+                    cid.Process.CreateTime;
+                process.Kernel.HasCreateTime =
+                    cid.Process.HasCreateTime;
+                process.Kernel.ExitTime =
+                    cid.Process.ExitTime;
+                process.Kernel.HasExitTime =
+                    cid.Process.HasExitTime;
+                process.Kernel.ActiveThreads =
+                    cid.Process.ActiveThreads;
+                process.Kernel.HasActiveThreads =
+                    cid.Process.HasActiveThreads;
+                process.Kernel.Peb = cid.Process.Peb;
+                process.Kernel.HasPeb =
+                    cid.Process.HasPeb;
+                if (!cid.Process.ImageName.empty())
+                {
+                    process.Kernel.ImageName =
+                        cid.Process.ImageName;
+                    process.KernelImageName =
+                        cid.Process.ImageName;
+                }
+                if (!lookupSeen)
+                {
+                    AddUnique(
+                        &process.Warnings,
+                        L"direct typed CID entry was not returned by the exported process lookup view");
+                }
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    uint64_t MarkPostTriageProcessArrivals(
+        const std::set<uint32_t>& preTriageProcessIds,
+        const CidDirectEnumerationResult& direct,
+        std::map<uint32_t, HuntProcessRecord>* processes)
+    {
+        if (processes == nullptr)
+        {
+            return 0;
+        }
+
+        uint64_t marked = 0;
+        for (const auto& item : direct.Processes)
+        {
+            if (preTriageProcessIds.find(item.first) !=
+                preTriageProcessIds.end())
+            {
+                continue;
+            }
+            auto late = processes->find(item.first);
+            if (late == processes->end())
+            {
+                continue;
+            }
+            late->second.LifecycleChangedBeforeTriage =
+                true;
+            AddUnique(
+                &late->second.Warnings,
+                L"process appeared after the bounded per-process triage cutoff; current thread views were validated and full process triage is deferred to a subsequent hunt");
+            ++marked;
+        }
+        return marked;
+    }
+
+    bool CidThreadIdentityEqual(
+        const CidDirectThread& left,
+        const CidDirectThread& right)
+    {
+        return
+            left.ThreadId == right.ThreadId &&
+            left.ProcessId == right.ProcessId &&
+            left.Ethread == right.Ethread &&
+            left.Eprocess == right.Eprocess &&
+            left.CreateTime == right.CreateTime;
+    }
+
+    bool CidThreadMapsEqual(
+        const std::map<uint32_t, CidDirectThread>& left,
+        const std::map<uint32_t, CidDirectThread>& right)
+    {
+        if (left.size() != right.size())
+        {
+            return false;
+        }
+
+        auto leftItem = left.begin();
+        auto rightItem = right.begin();
+        for (; leftItem != left.end();
+             ++leftItem, ++rightItem)
+        {
+            if (leftItem->first != rightItem->first ||
+                !CidThreadIdentityEqual(
+                    leftItem->second,
+                    rightItem->second) ||
+                leftItem->second.ExitTime !=
+                    rightItem->second.ExitTime ||
+                leftItem->second.Terminated !=
+                    rightItem->second.Terminated)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool CollectCidThreadListOnce(
+        DeviceClient& device,
+        const CidDirectLayout& layout,
+        const CidEprocessLayout& processLayout,
+        uint32_t processId,
+        uint64_t eprocess,
+        bool schedulerList,
+        std::map<uint32_t, CidDirectThread>* threads,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (threads == nullptr ||
+                !IsKernelAddress(eprocess))
+            {
+                break;
+            }
+            threads->clear();
+
+            const uint64_t headOffset =
+                schedulerList
+                    ? layout.KprocessThreadListHead.Offset
+                    : layout.EprocessThreadListHead.Offset;
+            const uint64_t entryOffset =
+                schedulerList
+                    ? layout.KthreadThreadListEntry.Offset
+                    : layout.EthreadThreadListEntry.Offset;
+            uint64_t listHead = 0;
+            if (!TryAdd(
+                    eprocess,
+                    headOffset,
+                    &listHead) ||
+                !IsKernelAddress(listHead) ||
+                entryOffset > 0x4000)
+            {
+                break;
+            }
+
+            uint64_t headBlinkAddress = 0;
+            uint64_t headFlink = 0;
+            uint64_t headBlink = 0;
+            if (!TryAdd(
+                    listHead,
+                    sizeof(uint64_t),
+                    &headBlinkAddress) ||
+                !ReadKernelPointer(
+                    device,
+                    listHead,
+                    &headFlink,
+                    nullptr) ||
+                !ReadKernelPointer(
+                    device,
+                    headBlinkAddress,
+                    &headBlink,
+                    nullptr) ||
+                !IsKernelAddress(headFlink) ||
+                !IsKernelAddress(headBlink))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        schedulerList
+                            ? L"scheduler thread-list head is unreadable"
+                            : L"executive thread-list head is unreadable";
+                }
+                break;
+            }
+
+            if ((headFlink == listHead) !=
+                (headBlink == listHead))
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"thread-list empty-state links disagree";
+                }
+                break;
+            }
+
+            std::set<uint64_t> visited;
+            uint64_t current = headFlink;
+            uint64_t previous = listHead;
+            bool complete = false;
+            while (current != listHead &&
+                   visited.size() <
+                       kMaxCidProcessProbeCount)
+            {
+                if (!IsKernelAddress(current) ||
+                    current < entryOffset ||
+                    !visited.insert(current).second)
+                {
+                    break;
+                }
+
+                uint64_t blinkAddress = 0;
+                uint64_t next = 0;
+                uint64_t blink = 0;
+                if (!TryAdd(
+                        current,
+                        sizeof(uint64_t),
+                        &blinkAddress) ||
+                    !ReadKernelPointer(
+                        device,
+                        current,
+                        &next,
+                        nullptr) ||
+                    !ReadKernelPointer(
+                        device,
+                        blinkAddress,
+                        &blink,
+                        nullptr) ||
+                    !IsKernelAddress(next) ||
+                    blink != previous)
+                {
+                    break;
+                }
+
+                const uint64_t ethread =
+                    current - entryOffset;
+                uint64_t threadId = 0;
+                if (!ReadFieldInteger(
+                        device,
+                        ethread,
+                        layout.EthreadUniqueThread,
+                        sizeof(uint64_t),
+                        &threadId,
+                        nullptr) ||
+                    threadId >
+                        std::numeric_limits<
+                            uint32_t>::max())
+                {
+                    break;
+                }
+
+                CidDirectThread thread = {};
+                if (!CaptureCidDirectThread(
+                        device,
+                        layout,
+                        processLayout,
+                        static_cast<uint32_t>(
+                            threadId),
+                        0,
+                         ethread,
+                         &thread) ||
+                    thread.ProcessId != processId ||
+                    thread.Eprocess != eprocess)
+                {
+                    break;
+                }
+                const bool reservedCidZeroThread =
+                    IsReservedCidZeroThread(
+                        thread.ThreadId,
+                        thread.ProcessId);
+                if (!reservedCidZeroThread &&
+                    !threads->emplace(
+                        thread.ThreadId,
+                        std::move(thread)).second)
+                {
+                    break;
+                }
+
+                previous = current;
+                current = next;
+            }
+            if (current == listHead &&
+                previous == headBlink)
+            {
+                complete = true;
+            }
+            if (!complete)
+            {
+                threads->clear();
+                if (warning != nullptr)
+                {
+                    *warning =
+                        schedulerList
+                            ? L"scheduler thread-list walk was cyclic, inconsistent, unreadable, or over budget"
+                            : L"executive thread-list walk was cyclic, inconsistent, unreadable, or over budget";
+                }
+                break;
+            }
+
+            uint64_t finalFlink = 0;
+            uint64_t finalBlink = 0;
+            if (!ReadKernelPointer(
+                    device,
+                    listHead,
+                    &finalFlink,
+                    nullptr) ||
+                !ReadKernelPointer(
+                    device,
+                    headBlinkAddress,
+                    &finalBlink,
+                    nullptr) ||
+                finalFlink != headFlink ||
+                finalBlink != headBlink)
+            {
+                threads->clear();
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"thread-list head changed during walk";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool CollectStableCidThreadList(
+        DeviceClient& device,
+        const CidDirectLayout& layout,
+        const CidEprocessLayout& processLayout,
+        uint32_t processId,
+        uint64_t eprocess,
+        bool schedulerList,
+        std::map<uint32_t, CidDirectThread>* threads,
+        std::wstring* warning)
+    {
+        if (threads == nullptr)
+        {
+            return false;
+        }
+
+        constexpr uint32_t kAttempts = 3;
+        for (uint32_t attempt = 0;
+             attempt < kAttempts;
+             ++attempt)
+        {
+            std::map<uint32_t, CidDirectThread> first;
+            std::map<uint32_t, CidDirectThread> second;
+            if (CollectCidThreadListOnce(
+                    device,
+                    layout,
+                    processLayout,
+                    processId,
+                    eprocess,
+                    schedulerList,
+                    &first,
+                    nullptr) &&
+                CollectCidThreadListOnce(
+                    device,
+                    layout,
+                    processLayout,
+                    processId,
+                    eprocess,
+                    schedulerList,
+                    &second,
+                    nullptr) &&
+                CidThreadMapsEqual(first, second))
+            {
+                *threads = std::move(second);
+                return true;
+            }
+            SwitchToThread();
+        }
+
+        threads->clear();
+        if (warning != nullptr)
+        {
+            *warning =
+                schedulerList
+                    ? L"scheduler thread list did not stabilize after retries"
+                    : L"executive thread list did not stabilize after retries";
+        }
+        return false;
+    }
+
+    struct CidThreadViewSnapshot
+    {
+        bool Complete = false;
+        std::map<uint32_t, ApiThreadRecord>
+            SystemThreads;
+        std::map<uint32_t, ApiThreadRecord>
+            ToolhelpThreads;
+        std::map<uint32_t, CidDirectThread>
+            ExecutiveThreads;
+        std::map<uint32_t, CidDirectThread>
+            SchedulerThreads;
+        std::wstring Warning;
+    };
+
+    bool CanUseSeededProcessAsThreadOwner(
+        const HuntProcessRecord& process,
+        bool currentApiOwnerSeen)
+    {
+        return
+            currentApiOwnerSeen &&
+            !process.LifecycleChangedBeforeTriage &&
+            !IsTerminatingProcessSnapshot(
+                process.Kernel) &&
+            process.Kernel.Eprocess != 0;
+    }
+
+    bool CollectCidThreadKernelViews(
+        DeviceClient& device,
+        const CidDirectLayout& layout,
+        const CidEprocessLayout& processLayout,
+        const CidDirectEnumerationResult& direct,
+        const std::map<uint32_t, HuntProcessRecord>&
+            processes,
+        const std::set<uint32_t>& currentApiOwnerIds,
+        std::map<uint32_t, CidDirectThread>*
+            executiveThreads,
+        std::map<uint32_t, CidDirectThread>*
+            schedulerThreads,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (executiveThreads == nullptr ||
+                schedulerThreads == nullptr ||
+                !direct.Complete)
+            {
+                break;
+            }
+            executiveThreads->clear();
+            schedulerThreads->clear();
+
+            std::map<uint32_t, uint64_t> owners;
+            bool ownersValid = true;
+            bool ownersOverBudget = false;
+            for (const auto& item : direct.Threads)
+            {
+                const CidDirectThread& thread =
+                    item.second;
+                if (owners.find(thread.ProcessId) ==
+                        owners.end() &&
+                    owners.size() >=
+                        kMaxCidProcessProbeCount)
+                {
+                    ownersValid = false;
+                    ownersOverBudget = true;
+                    break;
+                }
+                const auto inserted = owners.emplace(
+                    thread.ProcessId,
+                    thread.Eprocess);
+                if (!inserted.second &&
+                    inserted.first->second !=
+                        thread.Eprocess)
+                {
+                    ownersValid = false;
+                    break;
+                }
+            }
+            if (!ownersValid)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        ownersOverBudget
+                            ? L"thread owner inventory exceeded the bounded CID/thread budget"
+                            : L"thread CID owners disagree on EPROCESS identity";
+                }
+                break;
+            }
+
+            for (const auto& item : direct.Processes)
+            {
+                const uint64_t eprocess =
+                    item.second.Process.Context.Eprocess;
+                if ((owners.find(item.first) ==
+                         owners.end() &&
+                     owners.size() >=
+                         kMaxCidProcessProbeCount) ||
+                    !IsKernelAddress(eprocess))
+                {
+                    ownersValid = false;
+                    ownersOverBudget =
+                        owners.size() >=
+                        kMaxCidProcessProbeCount;
+                    break;
+                }
+                const auto inserted = owners.emplace(
+                    item.first,
+                    eprocess);
+                if (!inserted.second &&
+                    inserted.first->second != eprocess)
+                {
+                    ownersValid = false;
+                    break;
+                }
+            }
+            if (!ownersValid)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        ownersOverBudget
+                            ? L"direct process and thread owner inventory exceeded the bounded CID/thread budget"
+                            : L"direct process and thread CID owners disagree on EPROCESS identity";
+                }
+                break;
+            }
+
+            for (const auto& item : processes)
+            {
+                const HuntProcessRecord& process =
+                    item.second;
+                if (CanUseSeededProcessAsThreadOwner(
+                        process,
+                        currentApiOwnerIds.find(
+                            item.first) !=
+                            currentApiOwnerIds.end()))
+                {
+                    if (owners.find(item.first) ==
+                            owners.end() &&
+                        owners.size() >=
+                            kMaxCidProcessProbeCount)
+                    {
+                        ownersValid = false;
+                        ownersOverBudget = true;
+                        break;
+                    }
+                    const auto inserted =
+                        owners.emplace(
+                            item.first,
+                            process.Kernel.Eprocess);
+                    if (!inserted.second &&
+                        inserted.first->second !=
+                            process.Kernel.Eprocess)
+                    {
+                        ownersValid = false;
+                        break;
+                    }
+                }
+            }
+            if (!ownersValid || owners.empty())
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        ownersOverBudget
+                            ? L"thread owner inventory exceeded the bounded CID/thread budget"
+                            : L"thread owner process identities are incomplete or inconsistent";
+                }
+                break;
+            }
+
+            bool listsComplete = true;
+            for (const auto& owner : owners)
+            {
+                std::map<uint32_t, CidDirectThread>
+                    executive;
+                std::map<uint32_t, CidDirectThread>
+                    scheduler;
+                std::wstring localWarning;
+                if (!CollectStableCidThreadList(
+                        device,
+                        layout,
+                        processLayout,
+                        owner.first,
+                        owner.second,
+                        false,
+                        &executive,
+                        &localWarning) ||
+                    !CollectStableCidThreadList(
+                        device,
+                        layout,
+                        processLayout,
+                        owner.first,
+                        owner.second,
+                        true,
+                        &scheduler,
+                        &localWarning))
+                {
+                    listsComplete = false;
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"thread list collection failed for pid=" +
+                            std::to_wstring(
+                                owner.first) +
+                            L": " +
+                            localWarning;
+                    }
+                    break;
+                }
+
+                if (executive.size() >
+                        kMaxCidProcessProbeCount -
+                            executiveThreads->size() ||
+                    scheduler.size() >
+                        kMaxCidProcessProbeCount -
+                            schedulerThreads->size())
+                {
+                    listsComplete = false;
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"aggregate kernel thread-list inventory exceeded the bounded CID/thread budget";
+                    }
+                    break;
+                }
+
+                for (auto& thread : executive)
+                {
+                    if (!executiveThreads->emplace(
+                            thread.first,
+                            std::move(thread.second)).
+                            second)
+                    {
+                        listsComplete = false;
+                        break;
+                    }
+                }
+                for (auto& thread : scheduler)
+                {
+                    if (!schedulerThreads->emplace(
+                            thread.first,
+                            std::move(thread.second)).
+                            second)
+                    {
+                        listsComplete = false;
+                        break;
+                    }
+                }
+                if (!listsComplete)
+                {
+                    if (warning != nullptr &&
+                        warning->empty())
+                    {
+                        *warning =
+                            L"duplicate thread identifier across owner process lists";
+                    }
+                    break;
+                }
+            }
+            if (!listsComplete)
+            {
+                executiveThreads->clear();
+                schedulerThreads->clear();
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool CollectCidThreadViewSnapshot(
+        DeviceClient& device,
+        const CidDirectLayout& layout,
+        const CidEprocessLayout& processLayout,
+        const CidDirectEnumerationResult& direct,
+        const std::map<uint32_t, HuntProcessRecord>&
+            processes,
+        CidThreadViewSnapshot* snapshot)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (snapshot == nullptr)
+            {
+                break;
+            }
+            *snapshot = {};
+
+            std::map<uint32_t, ApiProcessRecord>
+                systemProcesses;
+            std::wstring systemWarning;
+            std::wstring toolhelpWarning;
+            if (!CollectSystemProcessInformation(
+                    &systemProcesses,
+                    &systemWarning,
+                    &snapshot->SystemThreads) ||
+                !CollectToolhelpThreads(
+                    &snapshot->ToolhelpThreads,
+                    &toolhelpWarning))
+            {
+                snapshot->Warning =
+                    L"thread API snapshot failed: system=" +
+                    systemWarning +
+                    L" toolhelp=" +
+                    toolhelpWarning;
+                break;
+            }
+
+            std::set<uint32_t> currentApiOwnerIds;
+            for (const auto& item : systemProcesses)
+            {
+                currentApiOwnerIds.insert(item.first);
+            }
+            for (const auto& item :
+                 snapshot->ToolhelpThreads)
+            {
+                currentApiOwnerIds.insert(
+                    item.second.ProcessId);
+            }
+
+            if (!CollectCidThreadKernelViews(
+                    device,
+                    layout,
+                    processLayout,
+                    direct,
+                    processes,
+                    currentApiOwnerIds,
+                    &snapshot->ExecutiveThreads,
+                    &snapshot->SchedulerThreads,
+                    &snapshot->Warning))
+            {
+                break;
+            }
+
+            snapshot->Complete = true;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    enum class CidViewPresence
+    {
+        StableAbsent,
+        StableSeen,
+        Unstable
+    };
+
+    CidViewPresence GetStableCidKernelPresence(
+        const std::map<uint32_t, CidDirectThread>& first,
+        const std::map<uint32_t, CidDirectThread>& second,
+        uint32_t threadId,
+        const CidDirectThread** current)
+    {
+        if (current != nullptr)
+        {
+            *current = nullptr;
+        }
+        const auto firstItem = first.find(threadId);
+        const auto secondItem = second.find(threadId);
+        if (firstItem == first.end() &&
+            secondItem == second.end())
+        {
+            return CidViewPresence::StableAbsent;
+        }
+        if (firstItem == first.end() ||
+            secondItem == second.end() ||
+            !CidThreadIdentityEqual(
+                firstItem->second,
+                secondItem->second))
+        {
+            return CidViewPresence::Unstable;
+        }
+        if (current != nullptr)
+        {
+            *current = &secondItem->second;
+        }
+        return CidViewPresence::StableSeen;
+    }
+
+    CidViewPresence GetStableCidApiPresence(
+        const std::map<uint32_t, ApiThreadRecord>& first,
+        const std::map<uint32_t, ApiThreadRecord>& second,
+        uint32_t threadId,
+        uint32_t processId)
+    {
+        const auto firstItem = first.find(threadId);
+        const auto secondItem = second.find(threadId);
+        if (firstItem == first.end() &&
+            secondItem == second.end())
+        {
+            return CidViewPresence::StableAbsent;
+        }
+        if (firstItem == first.end() ||
+            secondItem == second.end() ||
+            firstItem->second.ProcessId != processId ||
+            secondItem->second.ProcessId != processId)
+        {
+            return CidViewPresence::Unstable;
+        }
+        return CidViewPresence::StableSeen;
+    }
+
+    const wchar_t* CidViewPresenceText(
+        CidViewPresence presence)
+    {
+        switch (presence)
+        {
+        case CidViewPresence::StableAbsent:
+            return L"stable_absent";
+        case CidViewPresence::StableSeen:
+            return L"stable_seen";
+        default:
+            return L"unstable";
+        }
+    }
+
+    enum class CidThreadCrossViewDecision
+    {
+        None,
+        DirectOnly,
+        MissingFromCid,
+        ExecutiveUnlinked,
+        SchedulerUnlinked,
+        ApiHidden,
+        ApiOnly,
+        OwnerProcessMissing
+    };
+
+    bool CidSeenKernelIdentityAgrees(
+        CidViewPresence presence,
+        const CidDirectThread* view,
+        const CidDirectThread* source)
+    {
+        if (presence != CidViewPresence::StableSeen)
+        {
+            return true;
+        }
+        return view != nullptr &&
+            source != nullptr &&
+            CidThreadIdentityEqual(*view, *source);
+    }
+
+    bool IsCoherentCidThreadLifecycleTransition(
+        bool hasChangingPresence,
+        bool currentKernelIdentitiesAgree,
+        bool apiProcessIdsDisagree)
+    {
+        return
+            hasChangingPresence &&
+            currentKernelIdentitiesAgree &&
+            !apiProcessIdsDisagree;
+    }
+
+    CidThreadCrossViewDecision
+    ClassifyCidThreadCrossView(
+        bool kernelIdentityRevalidated,
+        bool apiIdentityRevalidated,
+        bool viewsRevalidated,
+        bool hasLifecycle,
+        bool terminated,
+        uint64_t exitTime,
+        CidViewPresence direct,
+        CidViewPresence executive,
+        CidViewPresence scheduler,
+        CidViewPresence system,
+        CidViewPresence toolhelp)
+    {
+        const bool liveKernelIdentity =
+            kernelIdentityRevalidated &&
+            viewsRevalidated &&
+            hasLifecycle &&
+            !terminated &&
+            exitTime == 0;
+        if (liveKernelIdentity)
+        {
+            if (direct == CidViewPresence::StableSeen &&
+                executive == CidViewPresence::StableAbsent &&
+                scheduler == CidViewPresence::StableAbsent &&
+                system == CidViewPresence::StableAbsent &&
+                toolhelp == CidViewPresence::StableAbsent)
+            {
+                return CidThreadCrossViewDecision::DirectOnly;
+            }
+            if (direct == CidViewPresence::StableAbsent &&
+                executive == CidViewPresence::StableSeen &&
+                scheduler == CidViewPresence::StableSeen &&
+                system == CidViewPresence::StableSeen &&
+                toolhelp == CidViewPresence::StableSeen)
+            {
+                return CidThreadCrossViewDecision::MissingFromCid;
+            }
+            if (direct == CidViewPresence::StableSeen &&
+                executive == CidViewPresence::StableAbsent &&
+                scheduler == CidViewPresence::StableSeen &&
+                system == CidViewPresence::StableSeen &&
+                toolhelp == CidViewPresence::StableSeen)
+            {
+                return CidThreadCrossViewDecision::ExecutiveUnlinked;
+            }
+            if (direct == CidViewPresence::StableSeen &&
+                executive == CidViewPresence::StableSeen &&
+                scheduler == CidViewPresence::StableAbsent &&
+                system == CidViewPresence::StableSeen &&
+                toolhelp == CidViewPresence::StableSeen)
+            {
+                return CidThreadCrossViewDecision::SchedulerUnlinked;
+            }
+            if (direct == CidViewPresence::StableSeen &&
+                executive == CidViewPresence::StableSeen &&
+                scheduler == CidViewPresence::StableSeen &&
+                system == CidViewPresence::StableAbsent &&
+                toolhelp == CidViewPresence::StableAbsent)
+            {
+                return CidThreadCrossViewDecision::ApiHidden;
+            }
+        }
+
+        if (!kernelIdentityRevalidated &&
+            apiIdentityRevalidated &&
+            viewsRevalidated &&
+            direct == CidViewPresence::StableAbsent &&
+            executive == CidViewPresence::StableAbsent &&
+            scheduler == CidViewPresence::StableAbsent &&
+            system == CidViewPresence::StableSeen &&
+            toolhelp == CidViewPresence::StableSeen)
+        {
+            return CidThreadCrossViewDecision::ApiOnly;
+        }
+
+        return CidThreadCrossViewDecision::None;
+    }
+
+    bool ApplyCidThreadCrossView(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint32_t directoryTableBaseOffset,
+        uint32_t userDirectoryTableBaseOffset,
+        std::map<uint32_t, HuntProcessRecord>* processes,
+        HuntResult* huntResult,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (processes == nullptr ||
+                huntResult == nullptr ||
+                directoryTableBaseOffset == 0)
+            {
+                break;
+            }
+
+            uint32_t highestKnownPid = 0;
+            for (const auto& item : *processes)
+            {
+                highestKnownPid =
+                    (std::max)(
+                        highestKnownPid,
+                        item.first);
+            }
+
+            CidEprocessLayout processLayout = {};
+            CidDirectLayout directLayout = {};
+            std::wstring localWarning;
+            if (!ResolveCidEprocessLayout(
+                    symbols,
+                    &processLayout,
+                    &localWarning) ||
+                !ResolveCidDirectLayout(
+                    symbols,
+                    &directLayout,
+                    &localWarning))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = localWarning;
+                }
+                break;
+            }
+
+            CidDirectEnumerationResult firstDirect = {};
+            CidThreadViewSnapshot firstViews = {};
+            CidDirectEnumerationResult secondDirect = {};
+            CidThreadViewSnapshot secondViews = {};
+            std::wstring captureFailure;
+            bool captureComplete = false;
+            constexpr uint32_t kCaptureAttempts = 3;
+            for (uint32_t attempt = 0;
+                 attempt < kCaptureAttempts;
+                 ++attempt)
+            {
+                firstDirect = {};
+                firstViews = {};
+                secondDirect = {};
+                secondViews = {};
+                captureFailure.clear();
+
+                if (!ApplyCidTableDirectObjectView(
+                        device,
+                        symbols,
+                        directoryTableBaseOffset,
+                        userDirectoryTableBaseOffset,
+                        highestKnownPid,
+                        &firstDirect))
+                {
+                    captureFailure = firstDirect.Summary;
+                }
+                else if (!CollectCidThreadViewSnapshot(
+                             device,
+                             directLayout,
+                             processLayout,
+                             firstDirect,
+                             *processes,
+                             &firstViews))
+                {
+                    captureFailure = firstViews.Warning;
+                }
+                else if (!ApplyCidTableDirectObjectView(
+                             device,
+                             symbols,
+                             directoryTableBaseOffset,
+                             userDirectoryTableBaseOffset,
+                             highestKnownPid,
+                             &secondDirect))
+                {
+                    captureFailure = secondDirect.Summary;
+                }
+                else if (!CollectCidThreadViewSnapshot(
+                             device,
+                             directLayout,
+                             processLayout,
+                             secondDirect,
+                             *processes,
+                             &secondViews))
+                {
+                    captureFailure = secondViews.Warning;
+                }
+                else
+                {
+                    captureComplete = true;
+                    break;
+                }
+
+                if (attempt + 1 < kCaptureAttempts)
+                {
+                    SwitchToThread();
+                }
+            }
+            if (!captureComplete)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"thread cross-view capture did not stabilize after retries: " +
+                        captureFailure;
+                }
+                break;
+            }
+
+            std::set<uint32_t> preTriageProcessIds;
+            for (const auto& item : *processes)
+            {
+                preTriageProcessIds.insert(item.first);
+            }
+            uint64_t lateProcesses = 0;
+            if (!MergeCidDirectProcessView(
+                    secondDirect,
+                    processes,
+                    &lateProcesses,
+                    &localWarning))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = localWarning;
+                }
+                break;
+            }
+            if (MarkPostTriageProcessArrivals(
+                    preTriageProcessIds,
+                    secondDirect,
+                    processes) != lateProcesses)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"thread CID cross-view could not account for every post-triage process arrival";
+                }
+                break;
+            }
+
+            huntResult->CidTableAnchorAddress =
+                secondDirect.Snapshot.AnchorAddress;
+            huntResult->CidTableAddress =
+                secondDirect.Snapshot.TableAddress;
+            huntResult->CidTableCode =
+                secondDirect.Snapshot.TableCode;
+            huntResult->CidTableLevel =
+                secondDirect.Snapshot.TableLevel;
+            huntResult->CidTableNextHandle =
+                secondDirect.Snapshot.NextHandle;
+            huntResult->CidTableAllocatedLeafCount =
+                secondDirect.Snapshot.
+                    AllocatedLeafCount;
+            huntResult->
+                CidTableAllocatedHandleCapacity =
+                    secondDirect.Snapshot.
+                        AllocatedHandleCapacity;
+            huntResult->CidTableDirectEntryCount =
+                secondDirect.NonEmptyEntryCount;
+            huntResult->CidTableDirectProcessCount =
+                secondDirect.Processes.size();
+            huntResult->CidTableDirectThreadCount =
+                secondDirect.Threads.size();
+            huntResult->CidTableUnclassifiedEntryCount =
+                secondDirect.UnclassifiedEntryCount;
+            huntResult->SystemProcessInfoThreadCount =
+                secondViews.SystemThreads.size();
+            huntResult->ToolhelpThreadCount =
+                secondViews.ToolhelpThreads.size();
+            huntResult->CidThreads.clear();
+
+            std::set<uint32_t> threadIds;
+            const auto addKeys =
+                [&threadIds](const auto& values)
+                {
+                    for (const auto& item : values)
+                    {
+                        threadIds.insert(item.first);
+                    }
+                };
+            addKeys(firstDirect.Threads);
+            addKeys(secondDirect.Threads);
+            addKeys(firstViews.ExecutiveThreads);
+            addKeys(secondViews.ExecutiveThreads);
+            addKeys(firstViews.SchedulerThreads);
+            addKeys(secondViews.SchedulerThreads);
+            addKeys(firstViews.SystemThreads);
+            addKeys(secondViews.SystemThreads);
+            addKeys(firstViews.ToolhelpThreads);
+            addKeys(secondViews.ToolhelpThreads);
+            if (threadIds.size() >
+                kMaxCidProcessProbeCount)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"thread cross-view union exceeded the bounded CID/thread budget";
+                }
+                break;
+            }
+
+            bool crossViewComplete = true;
+            uint64_t persistentMisses = 0;
+            uint64_t findings = 0;
+            for (uint32_t threadId : threadIds)
+            {
+                const CidDirectThread* directThread =
+                    nullptr;
+                const CidDirectThread* executiveThread =
+                    nullptr;
+                const CidDirectThread* schedulerThread =
+                    nullptr;
+                const CidViewPresence directPresence =
+                    GetStableCidKernelPresence(
+                        firstDirect.Threads,
+                        secondDirect.Threads,
+                        threadId,
+                        &directThread);
+
+                const auto currentDirect =
+                    secondDirect.Threads.find(threadId);
+                const auto currentExecutive =
+                    secondViews.ExecutiveThreads.find(
+                        threadId);
+                const auto currentScheduler =
+                    secondViews.SchedulerThreads.find(
+                        threadId);
+                const auto currentSystem =
+                    secondViews.SystemThreads.find(
+                        threadId);
+                const auto currentToolhelp =
+                    secondViews.ToolhelpThreads.find(
+                        threadId);
+                const bool anyCurrentView =
+                    currentDirect !=
+                        secondDirect.Threads.end() ||
+                    currentExecutive !=
+                        secondViews.ExecutiveThreads.end() ||
+                    currentScheduler !=
+                        secondViews.SchedulerThreads.end() ||
+                    currentSystem !=
+                        secondViews.SystemThreads.end() ||
+                    currentToolhelp !=
+                        secondViews.ToolhelpThreads.end();
+                if (!anyCurrentView)
+                {
+                    // The thread disappeared from every current view. It
+                    // cannot affect the second-snapshot inventory and is a
+                    // normal lifecycle transition, not incomplete coverage.
+                    continue;
+                }
+                const CidDirectThread* source = nullptr;
+                if (currentDirect !=
+                    secondDirect.Threads.end())
+                {
+                    source = &currentDirect->second;
+                }
+                else if (currentExecutive !=
+                         secondViews.ExecutiveThreads.end())
+                {
+                    source =
+                        &currentExecutive->second;
+                }
+                else if (currentScheduler !=
+                         secondViews.SchedulerThreads.end())
+                {
+                    source =
+                        &currentScheduler->second;
+                }
+
+                uint32_t sourceProcessId = 0;
+                bool sourceProcessIdResolved = false;
+                bool apiProcessIdsDisagree = false;
+                if (source != nullptr)
+                {
+                    sourceProcessId = source->ProcessId;
+                    sourceProcessIdResolved = true;
+                }
+                else
+                {
+                    if (currentSystem !=
+                        secondViews.SystemThreads.end())
+                    {
+                        sourceProcessId =
+                            currentSystem->second.ProcessId;
+                        sourceProcessIdResolved = true;
+                    }
+                    if (currentToolhelp !=
+                        secondViews.ToolhelpThreads.end())
+                    {
+                        if (sourceProcessIdResolved &&
+                            sourceProcessId !=
+                                currentToolhelp->second.
+                                    ProcessId)
+                        {
+                            apiProcessIdsDisagree = true;
+                        }
+                        else
+                        {
+                            sourceProcessId =
+                                currentToolhelp->second.
+                                    ProcessId;
+                            sourceProcessIdResolved = true;
+                        }
+                    }
+                }
+                if (!sourceProcessIdResolved)
+                {
+                    crossViewComplete = false;
+                    continue;
+                }
+
+                const CidViewPresence executivePresence =
+                    GetStableCidKernelPresence(
+                        firstViews.ExecutiveThreads,
+                        secondViews.ExecutiveThreads,
+                        threadId,
+                        &executiveThread);
+                const CidViewPresence schedulerPresence =
+                    GetStableCidKernelPresence(
+                        firstViews.SchedulerThreads,
+                        secondViews.SchedulerThreads,
+                        threadId,
+                        &schedulerThread);
+                const CidViewPresence systemPresence =
+                    GetStableCidApiPresence(
+                        firstViews.SystemThreads,
+                        secondViews.SystemThreads,
+                        threadId,
+                        sourceProcessId);
+                const CidViewPresence toolhelpPresence =
+                    GetStableCidApiPresence(
+                        firstViews.ToolhelpThreads,
+                        secondViews.ToolhelpThreads,
+                        threadId,
+                        sourceProcessId);
+                const bool currentKernelIdentitiesAgree =
+                    (source != nullptr &&
+                     (currentDirect ==
+                          secondDirect.Threads.end() ||
+                      CidThreadIdentityEqual(
+                          currentDirect->second,
+                          *source)) &&
+                     (currentExecutive ==
+                          secondViews.ExecutiveThreads.end() ||
+                      CidThreadIdentityEqual(
+                          currentExecutive->second,
+                          *source)) &&
+                     (currentScheduler ==
+                          secondViews.SchedulerThreads.end() ||
+                      CidThreadIdentityEqual(
+                          currentScheduler->second,
+                          *source))) ||
+                    (source == nullptr &&
+                     currentDirect ==
+                         secondDirect.Threads.end() &&
+                     currentExecutive ==
+                         secondViews.ExecutiveThreads.end() &&
+                     currentScheduler ==
+                         secondViews.SchedulerThreads.end());
+                const bool hasChangingPresence =
+                    directPresence ==
+                        CidViewPresence::Unstable ||
+                    executivePresence ==
+                        CidViewPresence::Unstable ||
+                    schedulerPresence ==
+                        CidViewPresence::Unstable ||
+                    systemPresence ==
+                        CidViewPresence::Unstable ||
+                    toolhelpPresence ==
+                        CidViewPresence::Unstable;
+                const bool coherentLifecycleTransition =
+                    IsCoherentCidThreadLifecycleTransition(
+                        hasChangingPresence,
+                        currentKernelIdentitiesAgree,
+                        apiProcessIdsDisagree);
+
+                HuntCidThreadRecord record = {};
+                record.ThreadId = threadId;
+                record.ProcessId = sourceProcessId;
+                if (source != nullptr)
+                {
+                    record.ObjectHeader =
+                        source->ObjectHeader;
+                    record.Ethread = source->Ethread;
+                    record.Eprocess = source->Eprocess;
+                    record.CreateTime = source->CreateTime;
+                    record.ExitTime = source->ExitTime;
+                    record.HasCreateTime =
+                        source->HasCreateTime;
+                    record.HasExitTime =
+                        source->HasExitTime;
+                    record.Terminated =
+                        source->Terminated;
+                }
+                record.DirectCidSeen =
+                    currentDirect !=
+                        secondDirect.Threads.end();
+                record.ExecutiveThreadListSeen =
+                    currentExecutive !=
+                        secondViews.ExecutiveThreads.end();
+                record.SchedulerThreadListSeen =
+                    currentScheduler !=
+                        secondViews.SchedulerThreads.end();
+                record.SystemProcessInformationSeen =
+                    currentSystem !=
+                        secondViews.SystemThreads.end() &&
+                    currentSystem->second.ProcessId ==
+                        sourceProcessId;
+                record.ToolhelpThreadSeen =
+                    currentToolhelp !=
+                        secondViews.ToolhelpThreads.end() &&
+                    currentToolhelp->second.ProcessId ==
+                        sourceProcessId;
+                const bool kernelIdentitiesAgree =
+                    currentKernelIdentitiesAgree &&
+                    CidSeenKernelIdentityAgrees(
+                        directPresence,
+                        directThread,
+                        source) &&
+                    CidSeenKernelIdentityAgrees(
+                        executivePresence,
+                        executiveThread,
+                        source) &&
+                    CidSeenKernelIdentityAgrees(
+                        schedulerPresence,
+                        schedulerThread,
+                        source);
+                const bool kernelIdentityRevalidated =
+                    source != nullptr &&
+                    kernelIdentitiesAgree &&
+                    ((directPresence ==
+                          CidViewPresence::StableSeen ||
+                     executivePresence ==
+                          CidViewPresence::StableSeen ||
+                     schedulerPresence ==
+                          CidViewPresence::StableSeen) ||
+                     coherentLifecycleTransition);
+                const bool apiIdentityRevalidated =
+                    source == nullptr &&
+                    !apiProcessIdsDisagree &&
+                    ((systemPresence ==
+                          CidViewPresence::StableSeen &&
+                      toolhelpPresence ==
+                          CidViewPresence::StableSeen) ||
+                     coherentLifecycleTransition);
+                record.IdentityRevalidated =
+                    kernelIdentityRevalidated ||
+                    apiIdentityRevalidated;
+                record.ViewsRevalidated =
+                    ((directPresence !=
+                          CidViewPresence::Unstable &&
+                     executivePresence !=
+                          CidViewPresence::Unstable &&
+                     schedulerPresence !=
+                          CidViewPresence::Unstable &&
+                     systemPresence !=
+                          CidViewPresence::Unstable &&
+                     toolhelpPresence !=
+                          CidViewPresence::Unstable) ||
+                     coherentLifecycleTransition) &&
+                    kernelIdentitiesAgree &&
+                    !apiProcessIdsDisagree;
+                record.LifecycleChanged =
+                    coherentLifecycleTransition ||
+                    !record.ViewsRevalidated ||
+                    !record.IdentityRevalidated ||
+                    (source != nullptr &&
+                     (source->Terminated ||
+                      source->ExitTime != 0));
+
+                if (!record.ViewsRevalidated ||
+                    (source == nullptr &&
+                     !apiIdentityRevalidated))
+                {
+                    crossViewComplete = false;
+                    record.Warnings.push_back(
+                        !record.ViewsRevalidated
+                            ? (kernelIdentitiesAgree
+                                   ? L"one or more thread views or API owner identities changed while the thread was being revalidated"
+                                   : L"stable thread views disagreed on ETHREAD, EPROCESS, or create-time identity")
+                            : L"API-only thread identity was not confirmed by both user API views");
+                }
+
+                const HuntProcessRecord* owner = nullptr;
+                auto ownerItem =
+                    processes->find(sourceProcessId);
+                if (ownerItem != processes->end() &&
+                    (source == nullptr ||
+                     ownerItem->second.Kernel.Eprocess ==
+                         source->Eprocess))
+                {
+                    owner = &ownerItem->second;
+                }
+
+                CidThreadCrossViewDecision decision =
+                    ClassifyCidThreadCrossView(
+                        kernelIdentityRevalidated,
+                        apiIdentityRevalidated,
+                        record.ViewsRevalidated,
+                        source != nullptr &&
+                            source->HasExitTime,
+                        source != nullptr &&
+                            source->Terminated,
+                        source != nullptr
+                            ? source->ExitTime
+                            : 0,
+                        directPresence,
+                        executivePresence,
+                        schedulerPresence,
+                        systemPresence,
+                        toolhelpPresence);
+                if (decision ==
+                        CidThreadCrossViewDecision::None &&
+                    ownerItem == processes->end() &&
+                    source != nullptr &&
+                    sourceProcessId != 0 &&
+                    kernelIdentityRevalidated &&
+                    record.ViewsRevalidated &&
+                    source->HasExitTime &&
+                    source->ExitTime == 0 &&
+                    !source->Terminated &&
+                    directPresence ==
+                        CidViewPresence::StableSeen &&
+                    executivePresence ==
+                        CidViewPresence::StableSeen &&
+                    schedulerPresence ==
+                        CidViewPresence::StableSeen &&
+                    systemPresence ==
+                        CidViewPresence::StableSeen &&
+                    toolhelpPresence ==
+                        CidViewPresence::StableSeen)
+                {
+                    CidEnumeratedProcess recovered = {};
+                    if (CaptureCidProcessAtAddress(
+                            device,
+                            processLayout,
+                            directoryTableBaseOffset,
+                            userDirectoryTableBaseOffset,
+                            sourceProcessId,
+                            source->Eprocess,
+                            &recovered) &&
+                        recovered.HasExitTime &&
+                        recovered.ExitTime == 0 &&
+                        recovered.HasActiveThreads &&
+                        recovered.ActiveThreads != 0)
+                    {
+                        HuntProcessRecord recoveredOwner = {};
+                        recoveredOwner.ProcessId =
+                            sourceProcessId;
+                        recoveredOwner.Kernel.ProcessId =
+                            sourceProcessId;
+                        recoveredOwner.Kernel.Eprocess =
+                            recovered.Context.Eprocess;
+                        recoveredOwner.Kernel.
+                            DirectoryTableBase =
+                                recovered.Context.
+                                    DirectoryTableBase;
+                        recoveredOwner.Kernel.
+                            UserDirectoryTableBase =
+                                recovered.Context.
+                                    UserDirectoryTableBase;
+                        recoveredOwner.Kernel.CreateTime =
+                            recovered.CreateTime;
+                        recoveredOwner.Kernel.HasCreateTime =
+                            recovered.HasCreateTime;
+                        recoveredOwner.Kernel.ExitTime =
+                            recovered.ExitTime;
+                        recoveredOwner.Kernel.HasExitTime =
+                            recovered.HasExitTime;
+                        recoveredOwner.Kernel.ActiveThreads =
+                            recovered.ActiveThreads;
+                        recoveredOwner.Kernel.
+                            HasActiveThreads =
+                                recovered.HasActiveThreads;
+                        recoveredOwner.Kernel.Peb =
+                            recovered.Peb;
+                        recoveredOwner.Kernel.HasPeb =
+                            recovered.HasPeb;
+                        recoveredOwner.Kernel.ImageName =
+                            recovered.ImageName;
+                        recoveredOwner.KernelImageName =
+                            recovered.ImageName;
+                        recoveredOwner.HasCidTableView = true;
+                        recoveredOwner.CidTableEnumerated =
+                            true;
+                        recoveredOwner.CidTableSeen = false;
+                        recoveredOwner.CidIdentityRevalidated =
+                            true;
+                        recoveredOwner.AddressContextRefreshed =
+                            true;
+                        recoveredOwner.Warnings.push_back(
+                            L"live EPROCESS was recovered only through stable thread ownership after its process CID and aggregate process views were absent");
+                        ownerItem = processes->emplace(
+                            sourceProcessId,
+                            std::move(recoveredOwner)).first;
+                        owner = &ownerItem->second;
+                        decision =
+                            CidThreadCrossViewDecision::
+                                OwnerProcessMissing;
+                        huntResult->
+                            ProcessInventoryIncomplete =
+                                true;
+                        huntResult->
+                            ProcessTriageCoverageIncomplete =
+                                true;
+                        huntResult->CoverageComplete = false;
+                    }
+                    else
+                    {
+                        crossViewComplete = false;
+                        record.Warnings.push_back(
+                            L"thread owner process was absent and its live EPROCESS lifecycle could not be revalidated");
+                    }
+                }
+
+                const bool ownerIdentityMismatch =
+                    source != nullptr &&
+                    ownerItem != processes->end() &&
+                    ownerItem->second.Kernel.Eprocess !=
+                        source->Eprocess;
+                if (sourceProcessId != 0 &&
+                    decision !=
+                        CidThreadCrossViewDecision::None &&
+                    owner == nullptr &&
+                    (source == nullptr ||
+                     ownerIdentityMismatch))
+                {
+                    crossViewComplete = false;
+                    record.Warnings.push_back(
+                        L"thread owner process identity was unavailable or disagreed");
+                    decision =
+                        CidThreadCrossViewDecision::None;
+                }
+                else if (sourceProcessId != 0 &&
+                         decision !=
+                             CidThreadCrossViewDecision::None &&
+                         owner == nullptr &&
+                         source != nullptr)
+                {
+                    record.Warnings.push_back(
+                        L"thread owner process is absent from the aggregate process inventory");
+                    huntResult->ProcessInventoryIncomplete =
+                        true;
+                    huntResult->
+                        ProcessTriageCoverageIncomplete =
+                            true;
+                    huntResult->CoverageComplete = false;
+                }
+
+                std::wstring risk;
+                std::wstring confidence;
+                std::wstring title;
+                if (decision ==
+                    CidThreadCrossViewDecision::DirectOnly)
+                {
+                    risk = L"high";
+                    confidence = L"high";
+                    title =
+                        L"live thread is present only in the direct CID entry view";
+                    record.Reasons = {
+                        L"cid_only_thread",
+                        L"missing_from_executive_thread_list",
+                        L"missing_from_scheduler_thread_list",
+                        L"missing_from_user_api_views",
+                        L"possible_thread_dkom"
+                    };
+                }
+                else if (decision ==
+                         CidThreadCrossViewDecision::
+                             MissingFromCid)
+                {
+                    risk = L"high";
+                    confidence = L"high";
+                    title =
+                        L"live thread is missing from the direct CID entry view";
+                    record.Reasons = {
+                        L"thread_missing_from_cid_table",
+                        L"executive_scheduler_lists_agree",
+                        L"user_api_views_agree",
+                        L"possible_cid_entry_dkom"
+                    };
+                }
+                else if (decision ==
+                         CidThreadCrossViewDecision::
+                             ExecutiveUnlinked)
+                {
+                    risk = L"medium";
+                    confidence = L"high";
+                    title =
+                        L"live thread is unlinked from the executive process thread list";
+                    record.Reasons = {
+                        L"executive_thread_list_unlink",
+                        L"cid_scheduler_api_views_agree"
+                    };
+                }
+                else if (decision ==
+                         CidThreadCrossViewDecision::
+                             SchedulerUnlinked)
+                {
+                    risk = L"medium";
+                    confidence = L"high";
+                    title =
+                        L"live thread is unlinked from the scheduler process thread list";
+                    record.Reasons = {
+                        L"scheduler_thread_list_unlink",
+                        L"cid_executive_api_views_agree"
+                    };
+                }
+                else if (decision ==
+                         CidThreadCrossViewDecision::ApiHidden)
+                {
+                    risk = L"medium";
+                    confidence = L"high";
+                    title =
+                        L"live kernel thread is absent from both user API views";
+                    record.Reasons = {
+                        L"thread_hidden_from_user_api_views",
+                        L"cid_executive_scheduler_views_agree"
+                    };
+                }
+                else if (decision ==
+                         CidThreadCrossViewDecision::ApiOnly)
+                {
+                    risk = L"medium";
+                    confidence = L"medium";
+                    title =
+                        L"thread is persistently visible to both user APIs but absent from CID and kernel thread lists";
+                    record.Reasons = {
+                        L"thread_api_only",
+                        L"missing_from_direct_cid",
+                        L"missing_from_executive_thread_list",
+                        L"missing_from_scheduler_thread_list",
+                        L"possible_api_injection_or_kernel_unlink"
+                    };
+                }
+                else if (decision ==
+                         CidThreadCrossViewDecision::
+                             OwnerProcessMissing)
+                {
+                    risk = L"high";
+                    confidence = L"high";
+                    title =
+                        L"live process is recoverable only through stable thread ownership";
+                    record.Reasons = {
+                        L"thread_owner_process_missing",
+                        L"process_missing_from_direct_cid",
+                        L"process_missing_from_aggregate_inventory",
+                        L"cid_executive_scheduler_thread_views_agree",
+                        L"user_thread_api_views_agree",
+                        L"possible_process_cid_dkom"
+                    };
+                }
+
+                if (!title.empty())
+                {
+                    if (owner == nullptr &&
+                        source != nullptr &&
+                        sourceProcessId != 0)
+                    {
+                        AddUnique(
+                            &record.Reasons,
+                            L"owner_process_inventory_missing");
+                    }
+                    std::map<std::wstring,
+                             std::wstring>
+                        evidence;
+                    evidence[L"thread_id"] =
+                        std::to_wstring(
+                            record.ThreadId);
+                    evidence[L"process_id"] =
+                        std::to_wstring(
+                            record.ProcessId);
+                    evidence[L"ethread"] =
+                        HuntHex(record.Ethread, 16);
+                    evidence[L"eprocess"] =
+                        HuntHex(record.Eprocess, 16);
+                    evidence[L"create_time"] =
+                        record.HasCreateTime
+                            ? HuntHex(
+                                  record.CreateTime,
+                                  16)
+                            : L"unavailable";
+                    evidence[L"direct_cid"] =
+                        CidViewPresenceText(
+                            directPresence);
+                    evidence[L"executive_list"] =
+                        CidViewPresenceText(
+                            executivePresence);
+                    evidence[L"scheduler_list"] =
+                        CidViewPresenceText(
+                            schedulerPresence);
+                    evidence[L"system_process_information"] =
+                        CidViewPresenceText(
+                            systemPresence);
+                    evidence[L"toolhelp"] =
+                        CidViewPresenceText(
+                            toolhelpPresence);
+                    evidence[L"identity_revalidated"] =
+                        record.IdentityRevalidated
+                            ? L"true"
+                            : L"false";
+
+                    bool findingAdded = false;
+                    if (owner != nullptr)
+                    {
+                        AddFinding(
+                            huntResult,
+                            *owner,
+                            risk,
+                            confidence,
+                            L"thread_cross_view",
+                            title,
+                            record.Ethread,
+                            L"",
+                            record.Reasons,
+                            evidence);
+                        findingAdded = true;
+                    }
+                    else if (source != nullptr ||
+                             record.ProcessId == 0)
+                    {
+                        AddSystemFinding(
+                            huntResult,
+                            risk,
+                            confidence,
+                            L"thread_cross_view",
+                            title,
+                            record.Ethread,
+                            L"",
+                            record.Reasons,
+                            evidence,
+                            {L"!threads 0 /apc /stacks /limit 40"});
+                        findingAdded = true;
+                    }
+
+                    if (findingAdded)
+                    {
+                        ++persistentMisses;
+                        ++findings;
+                        record.Suspicious = true;
+                    }
+                }
+
+                huntResult->CidThreads.push_back(
+                    std::move(record));
+            }
+
+            huntResult->CidTableDirectEntryEnumeration =
+                true;
+            huntResult->CidTableFullThreadEnumeration =
+                true;
+            huntResult->
+                CidTableThreadCrossViewComplete =
+                    crossViewComplete;
+            huntResult->CidTableThreadFindingCount =
+                findings;
+            huntResult->
+                CidTablePersistentThreadViewMissCount =
+                    persistentMisses;
+            if (!crossViewComplete)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"thread CID cross-view incomplete: one or more stable thread identities had a changing or missing comparison view";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     enum class ActiveProcessLinkMembership
     {
         Unknown,
@@ -8892,6 +14118,683 @@ namespace
             : ActiveProcessLinkMembership::Unknown;
     }
 
+    bool ApplyCidTableFullProcessView(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint32_t directoryTableBaseOffset,
+        uint32_t userDirectoryTableBaseOffset,
+        uint32_t activeProcessLinksOffset,
+        std::map<uint32_t, HuntProcessRecord>* processes,
+        CidProcessEnumerationResult* result)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+            *result = {};
+
+            if (processes == nullptr ||
+                directoryTableBaseOffset == 0 ||
+                directoryTableBaseOffset > 0x4000 ||
+                userDirectoryTableBaseOffset > 0x4000)
+            {
+                result->Summary =
+                    L"cid full enumeration unavailable: invalid process layout or map";
+                break;
+            }
+
+            CidTableLayout tableLayout = {};
+            if (!ResolveCidTableLayout(
+                    symbols,
+                    &tableLayout,
+                    &result->Summary))
+            {
+                break;
+            }
+
+            CidEprocessLayout processLayout = {};
+            if (!ResolveCidEprocessLayout(
+                    symbols,
+                    &processLayout,
+                    &result->Summary))
+            {
+                break;
+            }
+
+            uint32_t highestKnownPid = 0;
+            for (const auto& item : *processes)
+            {
+                highestKnownPid =
+                    (std::max)(
+                        highestKnownPid,
+                        item.first);
+            }
+
+            std::map<uint32_t, CidEnumeratedProcess>
+                enumerated;
+            CidTableSnapshot stableSnapshot = {};
+            bool stable = false;
+            uint64_t persistentFailures = 0;
+            constexpr uint32_t kSnapshotAttempts = 2;
+            for (uint32_t snapshotAttempt = 0;
+                 snapshotAttempt < kSnapshotAttempts;
+                 ++snapshotAttempt)
+            {
+                enumerated.clear();
+                persistentFailures = 0;
+
+                CidTableSnapshot before = {};
+                if (!ResolveCidTableAnchor(
+                        device,
+                        symbols,
+                        tableLayout,
+                        highestKnownPid,
+                        &before,
+                        &result->Summary))
+                {
+                    break;
+                }
+                result->AnchorResolved = true;
+                result->Snapshot = before;
+
+                std::vector<uint32_t> retryIds;
+                for (uint32_t processId = 4;
+                     processId < before.NextHandle;
+                     processId += 4)
+                {
+                    ++result->ProbeCount;
+                    ProcessAddressContext context = {};
+                    std::wstring resolveError;
+                    DWORD deviceError = ERROR_SUCCESS;
+                    if (device.ResolveProcess(
+                            processId,
+                            directoryTableBaseOffset,
+                            userDirectoryTableBaseOffset,
+                            &context,
+                            &resolveError,
+                            &deviceError))
+                    {
+                        CidEnumeratedProcess process = {};
+                        if (CaptureCidEnumeratedProcess(
+                                device,
+                                processLayout,
+                                processId,
+                                context,
+                                &process))
+                        {
+                            enumerated[processId] =
+                                std::move(process);
+                        }
+                        else
+                        {
+                            retryIds.push_back(
+                                processId);
+                        }
+                    }
+                    else if (deviceError !=
+                            ERROR_INVALID_PARAMETER)
+                    {
+                        // The driver maps STATUS_INVALID_CID to
+                        // ERROR_INVALID_PARAMETER. Every other failure can
+                        // represent an unreadable live EPROCESS and must be
+                        // retried rather than treated as an empty slot.
+                        retryIds.push_back(processId);
+                    }
+                }
+
+                constexpr uint32_t kRetryAttempts = 2;
+                for (uint32_t retryAttempt = 0;
+                     retryAttempt < kRetryAttempts &&
+                     !retryIds.empty();
+                     ++retryAttempt)
+                {
+                    std::vector<uint32_t> nextRetry;
+                    for (uint32_t processId : retryIds)
+                    {
+                        ++result->ProbeCount;
+                        ProcessAddressContext context = {};
+                        std::wstring resolveError;
+                        DWORD deviceError = ERROR_SUCCESS;
+                        if (device.ResolveProcess(
+                                processId,
+                                directoryTableBaseOffset,
+                                userDirectoryTableBaseOffset,
+                                &context,
+                                &resolveError,
+                                &deviceError))
+                        {
+                            CidEnumeratedProcess process = {};
+                            if (CaptureCidEnumeratedProcess(
+                                    device,
+                                    processLayout,
+                                    processId,
+                                    context,
+                                    &process))
+                            {
+                                enumerated[processId] =
+                                    std::move(process);
+                            }
+                            else
+                            {
+                                nextRetry.push_back(
+                                    processId);
+                            }
+                        }
+                        else if (deviceError !=
+                                 ERROR_INVALID_PARAMETER)
+                        {
+                            nextRetry.push_back(processId);
+                        }
+                    }
+                    retryIds = std::move(nextRetry);
+                }
+                persistentFailures = retryIds.size();
+
+                CidTableSnapshot after = {};
+                if (!ReadCidTableSnapshot(
+                        device,
+                        tableLayout,
+                        before.AnchorAddress,
+                        highestKnownPid,
+                        &after,
+                        nullptr))
+                {
+                    result->Summary =
+                        L"cid full enumeration: post-scan handle-table snapshot failed validation";
+                    continue;
+                }
+
+                if (before.AnchorAddress ==
+                        after.AnchorAddress &&
+                    before.TableAddress ==
+                        after.TableAddress &&
+                    before.TableCode ==
+                        after.TableCode &&
+                    before.NextHandle ==
+                        after.NextHandle &&
+                    before.AllocatedLeafCount ==
+                        after.AllocatedLeafCount &&
+                    before.AllocatedHandleCapacity ==
+                        after.AllocatedHandleCapacity &&
+                    before.LeafPages ==
+                        after.LeafPages)
+                {
+                    if (persistentFailures == 0)
+                    {
+                        stable = true;
+                        stableSnapshot = after;
+                        break;
+                    }
+                    result->Summary =
+                        L"cid full enumeration: stable table retained unreadable CID probes; retrying the complete range";
+                    continue;
+                }
+
+                result->Summary =
+                    L"cid full enumeration: handle table changed during scan; retrying";
+            }
+
+            result->Stable = stable;
+            result->ProbeFailureCount =
+                persistentFailures;
+            if (!stable)
+            {
+                if (result->Summary.empty())
+                {
+                    result->Summary =
+                        L"cid full enumeration: no stable handle-table snapshot";
+                }
+                break;
+            }
+            if (persistentFailures != 0)
+            {
+                result->Summary =
+                    L"cid full enumeration incomplete: " +
+                    std::to_wstring(
+                        persistentFailures) +
+                    L" CID probes remained unreadable after retries";
+                break;
+            }
+            if (enumerated.find(4) ==
+                    enumerated.end())
+            {
+                result->Summary =
+                    L"cid full enumeration incomplete: stable sweep did not recover the System process";
+                break;
+            }
+
+            result->Snapshot = stableSnapshot;
+            result->ProcessCount = enumerated.size();
+
+            for (auto& item : *processes)
+            {
+                HuntProcessRecord& process =
+                    item.second;
+                if (item.first != 0)
+                {
+                    process.HasCidTableView = true;
+                    process.CidTableEnumerated = true;
+                    process.CidTableSeen = false;
+                }
+            }
+
+            for (const auto& item : enumerated)
+            {
+                const uint32_t processId = item.first;
+                const CidEnumeratedProcess& cid =
+                    item.second;
+                auto existing =
+                    processes->find(processId);
+                const bool discovered =
+                    existing == processes->end();
+                if (discovered)
+                {
+                    HuntProcessRecord record = {};
+                    record.ProcessId = processId;
+                    existing =
+                        processes->emplace(
+                            processId,
+                            std::move(record)).first;
+                    ++result->
+                        DiscoveredProcessCount;
+                }
+
+                HuntProcessRecord& process =
+                    existing->second;
+                process.ProcessId = processId;
+                process.HasCidTableView = true;
+                process.CidTableEnumerated = true;
+
+                if ((process.Kernel.Eprocess != 0 &&
+                     process.Kernel.Eprocess !=
+                         cid.Context.Eprocess) ||
+                    (process.Kernel.HasCreateTime &&
+                     process.Kernel.CreateTime !=
+                         cid.CreateTime))
+                {
+                    process.LifecycleChangedBeforeTriage =
+                        true;
+                    AddUnique(
+                        &process.Warnings,
+                        L"PID identity changed between the seed views and full CID enumeration");
+                    continue;
+                }
+
+                process.CidTableSeen = true;
+                process.CidTableDiscovered =
+                    process.CidTableDiscovered ||
+                    discovered;
+                process.Kernel.ProcessId = processId;
+                process.Kernel.Eprocess =
+                    cid.Context.Eprocess;
+                process.Kernel.DirectoryTableBase =
+                    cid.Context.DirectoryTableBase;
+                process.Kernel.UserDirectoryTableBase =
+                    cid.Context.UserDirectoryTableBase;
+                process.Kernel.CreateTime =
+                    cid.CreateTime;
+                process.Kernel.HasCreateTime =
+                    cid.HasCreateTime;
+                process.Kernel.ExitTime =
+                    cid.ExitTime;
+                process.Kernel.HasExitTime =
+                    cid.HasExitTime;
+                process.Kernel.ActiveThreads =
+                    cid.ActiveThreads;
+                process.Kernel.HasActiveThreads =
+                    cid.HasActiveThreads;
+                process.Kernel.Peb = cid.Peb;
+                process.Kernel.HasPeb = cid.HasPeb;
+                if (!cid.ImageName.empty())
+                {
+                    process.Kernel.ImageName =
+                        cid.ImageName;
+                    process.KernelImageName =
+                        cid.ImageName;
+                }
+
+                if (!IsTerminatingProcessSnapshot(
+                        process.Kernel))
+                {
+                    const ActiveProcessLinkMembership
+                        membership =
+                            RevalidateActiveProcessLinks(
+                                device,
+                                cid.Context.Eprocess,
+                                activeProcessLinksOffset);
+                    if (membership ==
+                        ActiveProcessLinkMembership::Linked)
+                    {
+                        process.ActiveProcessLinksSeen =
+                            true;
+                        process.ActiveProcessLinksRevalidated =
+                            true;
+                        process.ActiveProcessLinksStableUnlinked =
+                            false;
+                    }
+                    else if (membership ==
+                             ActiveProcessLinkMembership::
+                                 StableUnlinked)
+                    {
+                        process.ActiveProcessLinksSeen =
+                            false;
+                        process.ActiveProcessLinksRevalidated =
+                            true;
+                        process.ActiveProcessLinksStableUnlinked =
+                            true;
+                    }
+                    else
+                    {
+                        ++result->
+                            MembershipIncompleteCount;
+                        AddUnique(
+                            &process.Warnings,
+                            L"full-CID process ActiveProcessLinks membership could not be revalidated");
+                    }
+                }
+            }
+
+            result->Complete = true;
+            result->Summary =
+                L"cid full process enumeration: anchor=" +
+                HuntHex(
+                    stableSnapshot.AnchorAddress,
+                    16) +
+                L" table=" +
+                HuntHex(
+                    stableSnapshot.TableAddress,
+                    16) +
+                L" level=" +
+                std::to_wstring(
+                    stableSnapshot.TableLevel) +
+                L" next_handle=" +
+                HuntHex(
+                    stableSnapshot.NextHandle,
+                    8) +
+                L" probes=" +
+                std::to_wstring(
+                    result->ProbeCount) +
+                L" processes=" +
+                std::to_wstring(
+                    result->ProcessCount) +
+                L" newly_discovered=" +
+                std::to_wstring(
+                    result->DiscoveredProcessCount) +
+                L" membership_incomplete=" +
+                std::to_wstring(
+                    result->MembershipIncompleteCount);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool RevalidateCidApiProcessViews(
+        DeviceClient& device,
+        uint32_t directoryTableBaseOffset,
+        uint32_t userDirectoryTableBaseOffset,
+        std::map<uint32_t, HuntProcessRecord>* processes,
+        uint64_t* persistentApiMisses,
+        std::wstring* warning)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (processes == nullptr)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid API revalidation: invalid process map";
+                }
+                break;
+            }
+            if (persistentApiMisses != nullptr)
+            {
+                *persistentApiMisses = 0;
+            }
+
+            std::map<uint32_t, ApiProcessRecord>
+                systemProcesses;
+            std::map<uint32_t, ApiProcessRecord>
+                toolhelpProcesses;
+            std::wstring systemWarning;
+            std::wstring toolhelpWarning;
+            const bool systemOk =
+                CollectSystemProcessInformation(
+                    &systemProcesses,
+                    &systemWarning);
+            const bool toolhelpOk =
+                CollectToolhelpProcesses(
+                    &toolhelpProcesses,
+                    &toolhelpWarning);
+            if (!systemOk || !toolhelpOk)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid API revalidation incomplete: system=" +
+                        (systemOk ? L"ok" : systemWarning) +
+                        L" toolhelp=" +
+                        (toolhelpOk ? L"ok" : toolhelpWarning);
+                }
+                break;
+            }
+
+            for (auto& item : *processes)
+            {
+                HuntProcessRecord& process =
+                    item.second;
+                if (!process.CidTableEnumerated)
+                {
+                    continue;
+                }
+
+                process.CidApiViewsRevalidated = true;
+                const auto system =
+                    systemProcesses.find(item.first);
+                if (system !=
+                    systemProcesses.end())
+                {
+                    process.SystemProcessInformationSeen =
+                        true;
+                    if (process.SystemProcessImageName.empty())
+                    {
+                        process.SystemProcessImageName =
+                            system->second.ImageName;
+                    }
+                }
+
+                const auto toolhelp =
+                    toolhelpProcesses.find(item.first);
+                if (toolhelp !=
+                    toolhelpProcesses.end())
+                {
+                    process.ToolhelpProcessSeen = true;
+                    if (process.ToolhelpImageName.empty())
+                    {
+                        process.ToolhelpImageName =
+                            toolhelp->second.ImageName;
+                    }
+                }
+            }
+
+            std::vector<uint32_t> unresolved;
+            uint64_t unexpectedFailures = 0;
+            for (auto& item : *processes)
+            {
+                HuntProcessRecord& process =
+                    item.second;
+                if (!process.CidTableEnumerated ||
+                    process.CidTableSeen ||
+                    (systemProcesses.find(item.first) ==
+                         systemProcesses.end() &&
+                     toolhelpProcesses.find(item.first) ==
+                         toolhelpProcesses.end()))
+                {
+                    continue;
+                }
+
+                bool resolved = false;
+                bool identityChanged = false;
+                bool unexpectedFailure = false;
+                constexpr uint32_t kAttempts = 3;
+                for (uint32_t attempt = 0;
+                     attempt < kAttempts;
+                     ++attempt)
+                {
+                    ProcessAddressContext context = {};
+                    std::wstring resolveError;
+                    DWORD deviceError = ERROR_SUCCESS;
+                    if (device.ResolveProcess(
+                            item.first,
+                            directoryTableBaseOffset,
+                            userDirectoryTableBaseOffset,
+                            &context,
+                            &resolveError,
+                            &deviceError))
+                    {
+                        if (process.Kernel.Eprocess != 0 &&
+                            process.Kernel.Eprocess !=
+                                context.Eprocess)
+                        {
+                            process.
+                                LifecycleChangedBeforeTriage =
+                                    true;
+                            identityChanged = true;
+                            AddUnique(
+                                &process.Warnings,
+                                L"PID identity changed during post-sweep CID/API reconciliation");
+                        }
+                        else
+                        {
+                            process.CidTableSeen = true;
+                            process.Kernel.ProcessId =
+                                item.first;
+                            process.Kernel.Eprocess =
+                                context.Eprocess;
+                            process.Kernel.
+                                DirectoryTableBase =
+                                    context.
+                                        DirectoryTableBase;
+                            process.Kernel.
+                                UserDirectoryTableBase =
+                                    context.
+                                        UserDirectoryTableBase;
+                        }
+                        resolved = true;
+                        break;
+                    }
+                    if (deviceError !=
+                        ERROR_INVALID_PARAMETER)
+                    {
+                        unexpectedFailure = true;
+                    }
+                    SwitchToThread();
+                }
+                if (!resolved && !identityChanged)
+                {
+                    unresolved.push_back(item.first);
+                    if (unexpectedFailure)
+                    {
+                        ++unexpectedFailures;
+                    }
+                }
+            }
+
+            if (!unresolved.empty())
+            {
+                std::map<uint32_t, ApiProcessRecord>
+                    secondSystem;
+                std::map<uint32_t, ApiProcessRecord>
+                    secondToolhelp;
+                std::wstring secondSystemWarning;
+                std::wstring secondToolhelpWarning;
+                if (!CollectSystemProcessInformation(
+                        &secondSystem,
+                        &secondSystemWarning) ||
+                    !CollectToolhelpProcesses(
+                        &secondToolhelp,
+                        &secondToolhelpWarning))
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"cid API revalidation incomplete: second process snapshots failed";
+                    }
+                    break;
+                }
+
+                uint64_t persistent = 0;
+                for (uint32_t processId : unresolved)
+                {
+                    auto process =
+                        processes->find(processId);
+                    if (process ==
+                        processes->end())
+                    {
+                        continue;
+                    }
+                    const bool stillVisible =
+                        secondSystem.find(processId) !=
+                            secondSystem.end() ||
+                        secondToolhelp.find(processId) !=
+                            secondToolhelp.end();
+                    if (!stillVisible ||
+                        IsTerminatingProcessSnapshot(
+                            process->second.Kernel))
+                    {
+                        continue;
+                    }
+
+                    ++persistent;
+                    AddUnique(
+                        &process->second.Warnings,
+                        L"live API-visible process remained absent from the full process-CID lookup surface");
+                }
+                if (persistentApiMisses != nullptr)
+                {
+                    *persistentApiMisses =
+                        persistent;
+                }
+                if (persistent != 0 ||
+                    unexpectedFailures != 0)
+                {
+                    if (warning != nullptr)
+                    {
+                        *warning =
+                            L"cid API revalidation incomplete: persistent_api_without_cid=" +
+                            std::to_wstring(persistent) +
+                            L" unexpected_lookup_failures=" +
+                            std::to_wstring(
+                                unexpectedFailures);
+                    }
+                    break;
+                }
+            }
+            else if (unexpectedFailures != 0)
+            {
+                if (warning != nullptr)
+                {
+                    *warning =
+                        L"cid API revalidation incomplete: unexpected_lookup_failures=" +
+                        std::to_wstring(
+                            unexpectedFailures);
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     // Known-PID CID lookup via driver ResolveProcess (PsLookupProcessByProcessId).
     // This is NOT a full PspCidTable enumeration: PIDs absent from the starting
     // process map are never discovered. Only annotates HasCidTableView /
@@ -8902,7 +14805,9 @@ namespace
         std::map<uint32_t, HuntProcessRecord>* processes,
         std::wstring* warning,
         uint32_t* directoryTableBaseOffset,
-        uint32_t* userDirectoryTableBaseOffset)
+        uint32_t* userDirectoryTableBaseOffset,
+        uint32_t* activeProcessLinksOffsetOutput,
+        uint32_t* createTimeOffsetOutput)
     {
         bool ok = false;
 
@@ -8915,6 +14820,14 @@ namespace
             if (userDirectoryTableBaseOffset != nullptr)
             {
                 *userDirectoryTableBaseOffset = 0;
+            }
+            if (activeProcessLinksOffsetOutput != nullptr)
+            {
+                *activeProcessLinksOffsetOutput = 0;
+            }
+            if (createTimeOffsetOutput != nullptr)
+            {
+                *createTimeOffsetOutput = 0;
             }
 
             if (processes == nullptr)
@@ -9039,6 +14952,16 @@ namespace
             if (userDirectoryTableBaseOffset != nullptr)
             {
                 *userDirectoryTableBaseOffset = userDtbOffset;
+            }
+            if (activeProcessLinksOffsetOutput != nullptr)
+            {
+                *activeProcessLinksOffsetOutput =
+                    activeLinksOffset;
+            }
+            if (createTimeOffsetOutput != nullptr)
+            {
+                *createTimeOffsetOutput =
+                    createTimeOffset;
             }
 
             uint32_t lookedUp = 0;
@@ -9197,10 +15120,69 @@ namespace
                 process.ActiveProcessLinksStableUnlinked
                     ? L"true"
                     : L"false";
+            evidence[L"cid_table_enumerated"] =
+                process.CidTableEnumerated
+                    ? L"true"
+                    : L"false";
+            evidence[L"cid_table_discovered"] =
+                process.CidTableDiscovered
+                    ? L"true"
+                    : L"false";
+            evidence[L"cid_direct_entry_seen"] =
+                process.CidDirectEntrySeen
+                    ? L"true"
+                    : L"false";
+            evidence[L"cid_lookup_direct_agreed"] =
+                process.CidLookupDirectAgreed
+                    ? L"true"
+                    : L"false";
+            evidence[L"cid_api_views_revalidated"] =
+                process.CidApiViewsRevalidated
+                    ? L"true"
+                    : L"false";
+            evidence[L"cid_identity_revalidated"] =
+                process.CidIdentityRevalidated
+                    ? L"true"
+                    : L"false";
             evidence[L"eprocess"] = process.Kernel.Eprocess != 0 ? HuntHex(process.Kernel.Eprocess, 16) : L"0x0";
             evidence[L"image_name"] = !process.KernelImageName.empty() ? process.KernelImageName : process.ToolhelpImageName;
 
-            if (process.ActiveProcessLinksSeen &&
+            if (process.CidTableDiscovered &&
+                process.CidTableEnumerated &&
+                process.HasCidTableView &&
+                process.CidTableSeen &&
+                process.Kernel.HasExitTime &&
+                process.Kernel.ExitTime == 0 &&
+                process.Kernel.HasActiveThreads &&
+                process.Kernel.ActiveThreads != 0 &&
+                !process.ActiveProcessLinksSeen &&
+                !process.SystemProcessInformationSeen &&
+                !process.ToolhelpProcessSeen &&
+                process.ActiveProcessLinksRevalidated &&
+                process.ActiveProcessLinksStableUnlinked &&
+                process.CidApiViewsRevalidated &&
+                process.CidIdentityRevalidated)
+            {
+                evidence[L"cid_view"] =
+                    L"full_process_enumeration";
+                evidence[L"snapshot_race_possible"] =
+                    L"false";
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"high",
+                    L"process_cross_view",
+                    L"process is present only in the full CID-table process view",
+                    0,
+                    L"",
+                    {L"cid_only_process",
+                     L"missing_from_active_process_links",
+                     L"missing_from_user_api_views",
+                     L"possible_full_process_dkom"},
+                    evidence);
+            }
+            else if (process.ActiveProcessLinksSeen &&
                 !process.SystemProcessInformationSeen &&
                 !process.ToolhelpProcessSeen)
             {
@@ -9209,7 +15191,10 @@ namespace
                 bool cidTableConfirmsHidden =
                     process.HasCidTableView &&
                     process.CidTableSeen;
-                evidence[L"cid_view"] = L"known_pid_lookup";
+                evidence[L"cid_view"] =
+                    process.CidTableEnumerated
+                        ? L"full_process_enumeration"
+                        : L"known_pid_lookup";
                 evidence[L"snapshot_race_possible"] = cidTableConfirmsHidden ? L"false" : L"true";
                 if (!cidTableConfirmsHidden)
                 {
@@ -9235,7 +15220,10 @@ namespace
             {
                 const bool cidConfirms =
                     process.HasCidTableView && process.CidTableSeen;
-                evidence[L"cid_view"] = L"known_pid_lookup";
+                evidence[L"cid_view"] =
+                    process.CidTableEnumerated
+                        ? L"full_process_enumeration"
+                        : L"known_pid_lookup";
                 evidence[L"snapshot_race_possible"] = cidConfirms ? L"false" : L"true";
                 if (cidConfirms)
                 {
@@ -9356,7 +15344,12 @@ namespace
                 !commandImage.empty() &&
                 CommandLineImageIsComparable(
                     commandImage) &&
-                !SameNonEmptyLeaf(process.PebImagePath, commandImage))
+                !SameNonEmptyLeaf(
+                    process.PebImagePath,
+                    commandImage) &&
+                !IsTrustedWindowsTerminalExecutionAlias(
+                    process,
+                    commandImage))
             {
                 AddFinding(
                     result,
@@ -10001,6 +15994,189 @@ namespace
         return text;
     }
 
+    bool AddWfpFilterRecordFinding(
+        HuntResult* result,
+        const WfpRecord& record)
+    {
+        if (result == nullptr ||
+            record.Kind != L"wfp.filter" ||
+            WfpFilterIsDisabled(record) ||
+            !WfpFilterBlocksTraffic(record))
+        {
+            return false;
+        }
+
+        const std::wstring appTarget =
+            record.HasAppIdCondition
+                ? record.AppIdText
+                : L"";
+        const std::wstring fullTargetText =
+            WfpRecordTargetText(record);
+        std::wstring securityTarget;
+        std::wstring antiCheatTarget;
+        const bool appTargetsSecurityProduct =
+            !appTarget.empty() &&
+            HuntTextTargetsKnownSecurityProduct(
+                appTarget,
+                &securityTarget);
+        const bool appTargetsAntiCheat =
+            !appTarget.empty() &&
+            HuntTextTargetsKnownAntiCheat(
+                appTarget,
+                &antiCheatTarget);
+        const bool textTargetsSecurityProduct =
+            !appTargetsSecurityProduct &&
+            HuntTextTargetsKnownSecurityProduct(
+                fullTargetText,
+                &securityTarget);
+        const bool textTargetsAntiCheat =
+            !appTargetsAntiCheat &&
+            HuntTextTargetsKnownAntiCheat(
+                fullTargetText,
+                &antiCheatTarget);
+        const bool targetsSecurityProduct =
+            appTargetsSecurityProduct ||
+            textTargetsSecurityProduct;
+        const bool targetsAntiCheat =
+            appTargetsAntiCheat ||
+            textTargetsAntiCheat;
+        if (!targetsSecurityProduct &&
+            !targetsAntiCheat)
+        {
+            return false;
+        }
+
+        const bool appIdBacked =
+            appTargetsSecurityProduct ||
+            appTargetsAntiCheat;
+        const std::wstring loweredFlags =
+            HuntToLower(record.FlagsText);
+        std::vector<std::wstring> reasons;
+        if (targetsSecurityProduct)
+        {
+            AddUnique(
+                &reasons,
+                L"wfp_security_product_block_filter");
+        }
+        if (targetsAntiCheat)
+        {
+            AddUnique(
+                &reasons,
+                L"wfp_anticheat_block_filter");
+        }
+        if (appIdBacked)
+        {
+            AddUnique(
+                &reasons,
+                L"wfp_appid_block_condition");
+        }
+        if (loweredFlags.find(
+                L"persistent") !=
+            std::wstring::npos)
+        {
+            AddUnique(
+                &reasons,
+                L"wfp_persistent_block_filter");
+        }
+        if (loweredFlags.find(
+                L"clearactionright") !=
+            std::wstring::npos)
+        {
+            AddUnique(
+                &reasons,
+                L"wfp_clear_action_right_block");
+        }
+        if (WfpFilterHasHighWeight(record))
+        {
+            AddUnique(
+                &reasons,
+                L"wfp_high_weight_block_filter");
+        }
+        AddUnique(
+            &reasons,
+            L"security_tool_communication_blocking");
+
+        std::map<std::wstring, std::wstring>
+            evidence;
+        evidence[L"filter_id"] =
+            std::to_wstring(record.Id);
+        evidence[L"filter_key"] =
+            record.Key;
+        evidence[L"filter_name"] =
+            record.Name;
+        evidence[L"filter_description"] =
+            record.Description;
+        evidence[L"action"] =
+            record.ActionText;
+        evidence[L"weight"] =
+            record.WeightText;
+        evidence[L"flags"] =
+            record.FlagsText;
+        evidence[L"layer"] =
+            record.LayerName;
+        evidence[L"layer_key"] =
+            record.LayerKey;
+        evidence[L"sublayer"] =
+            record.SubLayerName;
+        evidence[L"sublayer_key"] =
+            record.SubLayerKey;
+        evidence[L"provider"] =
+            record.ProviderName;
+        evidence[L"provider_service"] =
+            record.ProviderService;
+        evidence[L"provider_key"] =
+            record.ProviderKey;
+        evidence[L"app_id"] =
+            record.AppIdText;
+        evidence[L"conditions"] =
+            record.ConditionsText;
+        evidence[L"target_source"] =
+            appIdBacked
+                ? L"app_id_condition"
+                : L"filter_metadata";
+        evidence[L"matched_security_target"] =
+            securityTarget;
+        evidence[L"matched_anticheat_target"] =
+            antiCheatTarget;
+
+        const bool hardBlock =
+            appIdBacked &&
+            (loweredFlags.find(
+                 L"persistent") !=
+                 std::wstring::npos ||
+             loweredFlags.find(
+                 L"clearactionright") !=
+                 std::wstring::npos ||
+             WfpFilterHasHighWeight(record));
+        std::vector<std::wstring> followups;
+        if (!record.LayerName.empty())
+        {
+            followups.push_back(
+                L"!wfp filters /layer " +
+                record.LayerName);
+        }
+        if (!record.ProviderName.empty())
+        {
+            followups.push_back(
+                L"!wfp filters /provider " +
+                record.ProviderName);
+        }
+
+        AddSystemFinding(
+            result,
+            hardBlock ? L"high" : L"medium",
+            appIdBacked ? L"high" : L"medium",
+            L"network_filter_tampering",
+            L"WFP block filter targets security or anti-cheat process communication",
+            0,
+            L"",
+            reasons,
+            evidence,
+            followups);
+        ++result->SuspiciousWfpFilterCount;
+        return true;
+    }
+
     void AddWfpHuntFindings(HuntResult* result)
     {
         do
@@ -10016,126 +16192,1667 @@ namespace
 
             WfpScanResult scan = {};
             std::wstring error;
-            if (!scanner.Scan(options, &scan, &error))
+            const bool scanSucceeded =
+                scanner.Scan(
+                    options,
+                    &scan,
+                    &error);
+            result->WfpFilterCount =
+                scan.Records.size();
+            for (const std::wstring& warning :
+                 scan.Warnings)
             {
-                if (!error.empty())
+                AddUnique(
+                    &result->Warnings,
+                    L"WFP filter warning: " +
+                        warning);
+            }
+            if (!scanSucceeded ||
+                !scan.Warnings.empty())
+            {
+                result->WfpFilterCoverageIncomplete =
+                    true;
+                result->CoverageComplete = false;
+                AddUnique(
+                    &result->Warnings,
+                    error.empty()
+                        ? L"WFP filter scan failed or incomplete"
+                        : L"WFP filter scan failed or incomplete: " +
+                              error);
+                if (!scanSucceeded)
                 {
-                    AddUnique(&result->Warnings, L"WFP filter scan failed: " + error);
+                    break;
                 }
+            }
+
+            for (const WfpRecord& record :
+                 scan.Records)
+            {
+                AddWfpFilterRecordFinding(
+                    result,
+                    record);
+            }
+        } while (false);
+    }
+
+    bool AddQosPolicyRecordFinding(
+        HuntResult* result,
+        const QosPolicyRecord& record)
+    {
+        if (result == nullptr ||
+            !QosPolicyHasSevereThrottle(record))
+        {
+            return false;
+        }
+
+        std::wstring securityTarget;
+        if (!HuntTextTargetsKnownSecurityProduct(
+                record.AppPathName,
+                &securityTarget))
+        {
+            return false;
+        }
+
+        const bool nearZeroThrottle =
+            record.ThrottleRateBitsPerSecond <=
+                1024ull * 8ull;
+        std::map<std::wstring, std::wstring> evidence;
+        evidence[L"policy_name"] = record.Name;
+        evidence[L"instance_id"] = record.InstanceId;
+        evidence[L"owner"] = record.Owner;
+        evidence[L"app_path"] = record.AppPathName;
+        evidence[L"security_product_target"] =
+            securityTarget;
+        evidence[L"throttle_rate_bytes_per_second"] =
+            std::to_wstring(
+                record.ThrottleRateBitsPerSecond /
+                    8ull);
+        evidence[L"throttle_rate_bits_per_second"] =
+            std::to_wstring(
+                record.ThrottleRateBitsPerSecond);
+        evidence[L"near_zero_throttle"] =
+            nearZeroThrottle ? L"true" : L"false";
+        evidence[L"active_store"] =
+            record.FromActiveStore
+                ? L"true"
+                : L"false";
+        evidence[L"network_profile"] =
+            std::to_wstring(record.NetworkProfile);
+        evidence[L"precedence"] =
+            std::to_wstring(record.Precedence);
+
+        AddSystemFinding(
+            result,
+            nearZeroThrottle ? L"high" : L"medium",
+            L"high",
+            L"network_policy_tampering",
+            L"QoS policy severely throttles a known security-product process",
+            0,
+            L"pacer.sys",
+            {
+                L"qos_security_product_throttle_policy",
+                L"security_tool_communication_throttling",
+                L"edrchoker_state"
+            },
+            evidence,
+            {
+                L"Get-NetQosPolicy -PolicyStore ActiveStore",
+                L"Get-NetQosPolicy"
+            });
+        ++result->SuspiciousQosPolicyCount;
+        return true;
+    }
+
+    void AddQosPolicyHuntFindings(HuntResult* result)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
                 break;
             }
 
-            result->WfpFilterCount = scan.Records.size();
-            for (const std::wstring& warning : scan.Warnings)
+            QosPolicyScanner scanner;
+            QosPolicyScanResult scan = {};
+            std::wstring error;
+            const bool scanSucceeded =
+                scanner.Scan(&scan, &error);
+            for (const std::wstring& warning :
+                 scan.Warnings)
             {
-                AddUnique(&result->Warnings, L"WFP filter warning: " + warning);
+                AddUnique(
+                    &result->Warnings,
+                    L"QoS policy warning: " +
+                        warning);
+            }
+            if (!scanSucceeded ||
+                !scan.CoverageComplete)
+            {
+                result->QosPolicyCoverageIncomplete =
+                    true;
+                result->CoverageComplete = false;
+                AddUnique(
+                    &result->Warnings,
+                    error.empty()
+                        ? L"QoS policy scan failed or incomplete"
+                        : L"QoS policy scan failed or incomplete: " +
+                              error);
+                break;
             }
 
-            for (const WfpRecord& record : scan.Records)
+            result->QosPolicyCount =
+                scan.Records.size();
+            for (const QosPolicyRecord& record :
+                 scan.Records)
             {
-                if (record.Kind != L"wfp.filter" ||
-                    WfpFilterIsDisabled(record) ||
-                    !WfpFilterBlocksTraffic(record))
-                {
-                    continue;
-                }
-
-                std::wstring appTarget = record.HasAppIdCondition ? record.AppIdText : L"";
-                std::wstring fullTargetText = WfpRecordTargetText(record);
-                std::wstring securityTarget;
-                std::wstring antiCheatTarget;
-                bool appTargetsSecurityProduct = !appTarget.empty() &&
-                    HuntTextTargetsKnownSecurityProduct(appTarget, &securityTarget);
-                bool appTargetsAntiCheat = !appTarget.empty() &&
-                    HuntTextTargetsKnownAntiCheat(appTarget, &antiCheatTarget);
-                bool textTargetsSecurityProduct = !appTargetsSecurityProduct &&
-                    HuntTextTargetsKnownSecurityProduct(fullTargetText, &securityTarget);
-                bool textTargetsAntiCheat = !appTargetsAntiCheat &&
-                    HuntTextTargetsKnownAntiCheat(fullTargetText, &antiCheatTarget);
-                bool targetsSecurityProduct = appTargetsSecurityProduct || textTargetsSecurityProduct;
-                bool targetsAntiCheat = appTargetsAntiCheat || textTargetsAntiCheat;
-                if (!targetsSecurityProduct && !targetsAntiCheat)
-                {
-                    continue;
-                }
-
-                bool appIdBacked = appTargetsSecurityProduct || appTargetsAntiCheat;
-                std::vector<std::wstring> reasons;
-                if (targetsSecurityProduct)
-                {
-                    AddUnique(&reasons, L"wfp_security_product_block_filter");
-                }
-                if (targetsAntiCheat)
-                {
-                    AddUnique(&reasons, L"wfp_anticheat_block_filter");
-                }
-                if (appIdBacked)
-                {
-                    AddUnique(&reasons, L"wfp_appid_block_condition");
-                }
-                if (HuntToLower(record.FlagsText).find(L"persistent") != std::wstring::npos)
-                {
-                    AddUnique(&reasons, L"wfp_persistent_block_filter");
-                }
-                if (HuntToLower(record.FlagsText).find(L"clearactionright") != std::wstring::npos)
-                {
-                    AddUnique(&reasons, L"wfp_clear_action_right_block");
-                }
-                if (WfpFilterHasHighWeight(record))
-                {
-                    AddUnique(&reasons, L"wfp_high_weight_block_filter");
-                }
-                AddUnique(&reasons, L"security_tool_communication_blocking");
-
-                std::map<std::wstring, std::wstring> evidence;
-                evidence[L"filter_id"] = std::to_wstring(record.Id);
-                evidence[L"filter_key"] = record.Key;
-                evidence[L"filter_name"] = record.Name;
-                evidence[L"filter_description"] = record.Description;
-                evidence[L"action"] = record.ActionText;
-                evidence[L"weight"] = record.WeightText;
-                evidence[L"flags"] = record.FlagsText;
-                evidence[L"layer"] = record.LayerName;
-                evidence[L"layer_key"] = record.LayerKey;
-                evidence[L"sublayer"] = record.SubLayerName;
-                evidence[L"sublayer_key"] = record.SubLayerKey;
-                evidence[L"provider"] = record.ProviderName;
-                evidence[L"provider_service"] = record.ProviderService;
-                evidence[L"provider_key"] = record.ProviderKey;
-                evidence[L"app_id"] = record.AppIdText;
-                evidence[L"conditions"] = record.ConditionsText;
-                evidence[L"target_source"] = appIdBacked ? L"app_id_condition" : L"filter_metadata";
-                evidence[L"matched_security_target"] = securityTarget;
-                evidence[L"matched_anticheat_target"] = antiCheatTarget;
-
-                bool hardBlock = appIdBacked &&
-                    (HuntToLower(record.FlagsText).find(L"persistent") != std::wstring::npos ||
-                     HuntToLower(record.FlagsText).find(L"clearactionright") != std::wstring::npos ||
-                     WfpFilterHasHighWeight(record));
-                std::vector<std::wstring> followups;
-                if (!record.LayerName.empty())
-                {
-                    followups.push_back(L"!wfp filters /layer " + record.LayerName);
-                }
-                if (!record.ProviderName.empty())
-                {
-                    followups.push_back(L"!wfp filters /provider " + record.ProviderName);
-                }
-
-                AddSystemFinding(
-                    result,
-                    hardBlock ? L"high" : L"medium",
-                    appIdBacked ? L"high" : L"medium",
-                    L"network_filter_tampering",
-                    L"WFP block filter targets security or anti-cheat process communication",
-                    0,
-                    L"",
-                    reasons,
-                    evidence,
-                    followups);
-                ++result->SuspiciousWfpFilterCount;
+                AddQosPolicyRecordFinding(result, record);
             }
         } while (false);
+    }
+
+    std::wstring NormalizeBindFilterPath(
+        const std::wstring& value)
+    {
+        std::wstring normalized = HuntToLower(value);
+        std::replace(
+            normalized.begin(),
+            normalized.end(),
+            L'/',
+            L'\\');
+        while (normalized.size() > 3 &&
+               normalized.back() == L'\\')
+        {
+            normalized.pop_back();
+        }
+        return normalized;
+    }
+
+    std::vector<std::wstring>
+    BindFilterPathSegments(
+        const std::wstring& value)
+    {
+        const std::wstring path =
+            NormalizeBindFilterPath(value);
+        std::vector<std::wstring> segments;
+        size_t start = 0;
+        while (start <= path.size())
+        {
+            const size_t separator =
+                path.find(L'\\', start);
+            const size_t end =
+                separator == std::wstring::npos
+                    ? path.size()
+                    : separator;
+            const std::wstring segment =
+                path.substr(start, end - start);
+            if (!segment.empty() &&
+                segment != L".")
+            {
+                if (segment == L"..")
+                {
+                    if (!segments.empty() &&
+                        segments.back() != L"..")
+                    {
+                        segments.pop_back();
+                    }
+                    else
+                    {
+                        segments.push_back(segment);
+                    }
+                }
+                else
+                {
+                    segments.push_back(segment);
+                }
+            }
+
+            if (separator == std::wstring::npos)
+            {
+                break;
+            }
+            start = separator + 1;
+        }
+        return segments;
+    }
+
+    std::wstring BindFilterDevicePathInVolume(
+        const BindFilterMappingRecord& record,
+        const std::wstring& path)
+    {
+        if (record.VolumeRoot.size() >= 2 &&
+            record.VolumeRoot[1] == L':')
+        {
+            wchar_t drive[] =
+            {
+                record.VolumeRoot[0],
+                L':',
+                L'\0'
+            };
+            wchar_t targets[1024] = {};
+            const DWORD length = QueryDosDeviceW(
+                drive,
+                targets,
+                static_cast<DWORD>(
+                    _countof(targets)));
+            if (length != 0)
+            {
+                const std::wstring normalizedPath =
+                    NormalizeBindFilterPath(path);
+                const wchar_t* target = targets;
+                while (*target != L'\0')
+                {
+                    const size_t targetLength =
+                        std::wcslen(target);
+                    const std::wstring normalizedTarget =
+                        NormalizeBindFilterPath(target);
+                    if (normalizedPath.compare(
+                            0,
+                            normalizedTarget.size(),
+                            normalizedTarget) == 0 &&
+                        (normalizedPath.size() ==
+                             normalizedTarget.size() ||
+                         normalizedPath[
+                             normalizedTarget.size()] ==
+                             L'\\'))
+                    {
+                        return std::wstring(drive) +
+                            path.substr(targetLength);
+                    }
+                    target += targetLength + 1;
+                }
+            }
+        }
+        return DosPathFromDevicePath(path);
+    }
+
+    std::wstring BindFilterPathInVolume(
+        const BindFilterMappingRecord& record,
+        const std::wstring& value)
+    {
+        std::wstring path = value;
+        std::replace(
+            path.begin(),
+            path.end(),
+            L'/',
+            L'\\');
+
+        const std::wstring normalized =
+            NormalizeBindFilterPath(path);
+        if (normalized.compare(
+                0,
+                8,
+                L"\\device\\") == 0)
+        {
+            // BindFlt can return native device paths even when queried for a
+            // DOS volume. Convert mapped devices, but never reinterpret an
+            // unresolved "\Device\..." name as volume-root-relative.
+            return BindFilterDevicePathInVolume(
+                record,
+                path);
+        }
+        if (normalized.compare(
+                0,
+                4,
+                L"\\??\\") == 0 ||
+            normalized.compare(
+                0,
+                4,
+                L"\\\\?\\") == 0)
+        {
+            path = DosPathFromDevicePath(
+                Win32FilePathFromMaybeNtPath(path));
+        }
+        if (!IsRootRelativePath(path) ||
+            record.VolumeRoot.empty())
+        {
+            return path;
+        }
+
+        return EnsureTrailingSlash(
+                   record.VolumeRoot) +
+            path.substr(1);
+    }
+
+    bool BindFilterPathUnderDirectory(
+        const std::wstring& value,
+        const std::wstring& directory)
+    {
+        std::vector<std::wstring> path =
+            BindFilterPathSegments(
+                CanonicalPathForCompare(value));
+        std::vector<std::wstring> base =
+            BindFilterPathSegments(
+                CanonicalPathForCompare(directory));
+        if (path.empty() ||
+            base.empty())
+        {
+            return false;
+        }
+
+        size_t pathStart = 0;
+        size_t baseStart = 0;
+        if (path[0] != base[0])
+        {
+            const bool pathDrive =
+                path[0].size() == 2 &&
+                path[0][1] == L':';
+            const bool baseDrive =
+                base[0].size() == 2 &&
+                base[0][1] == L':';
+            if (pathDrive && !baseDrive)
+            {
+                pathStart = 1;
+            }
+            else if (!pathDrive && baseDrive)
+            {
+                baseStart = 1;
+            }
+        }
+
+        const size_t pathCount =
+            path.size() - pathStart;
+        const size_t baseCount =
+            base.size() - baseStart;
+        if (pathCount <= baseCount)
+        {
+            return false;
+        }
+        for (size_t index = 0;
+             index < baseCount;
+             ++index)
+        {
+            if (path[pathStart + index] !=
+                base[baseStart + index])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool BindFilterPathIsProtected(
+        const std::wstring& value)
+    {
+        return BindFilterPathUnderDirectory(
+                   value,
+                   EnsureTrailingSlash(
+                       WindowsDirectory()) +
+                       L"System32") ||
+            BindFilterPathUnderDirectory(
+                value,
+                EnsureTrailingSlash(
+                    WindowsDirectory()) +
+                    L"SysWOW64") ||
+            BindFilterPathUnderDirectory(
+                value,
+                ProgramFilesDirectory()) ||
+            BindFilterPathUnderDirectory(
+                value,
+                ProgramFilesX86Directory());
+    }
+
+    bool BindFilterPathIsWindowsSystem(
+        const std::wstring& value)
+    {
+        return BindFilterPathUnderDirectory(
+                   value,
+                   EnsureTrailingSlash(
+                       WindowsDirectory()) +
+                       L"System32") ||
+            BindFilterPathUnderDirectory(
+                value,
+                EnsureTrailingSlash(
+                    WindowsDirectory()) +
+                    L"SysWOW64");
+    }
+
+    bool BindFilterPathIsUserControlledShape(
+        const std::wstring& value)
+    {
+        const std::vector<std::wstring> segments =
+            BindFilterPathSegments(
+                CanonicalPathForCompare(value));
+        if (segments.empty())
+        {
+            return false;
+        }
+
+        size_t rootIndex = 0;
+        if (segments[0].size() == 2 &&
+            segments[0][1] == L':')
+        {
+            rootIndex = 1;
+        }
+        if (rootIndex >= segments.size())
+        {
+            return false;
+        }
+
+        const std::wstring& root =
+            segments[rootIndex];
+        if (root == L"users" ||
+            root == L"programdata" ||
+            root == L"temp")
+        {
+            return segments.size() >
+                rootIndex + 1;
+        }
+
+        return root == L"windows" &&
+            segments.size() > rootIndex + 2 &&
+            segments[rootIndex + 1] == L"temp";
+    }
+
+    bool BindFilterPathIsSensitiveArtifact(
+        const std::wstring& value)
+    {
+        const std::wstring leaf =
+            LeafName(value);
+        return leaf == L"amsi.dll" ||
+            (leaf.size() > 5 &&
+             leaf.compare(
+                 leaf.size() - 5,
+                 5,
+                 L".evtx") == 0);
+    }
+
+    bool BindFilterPathIsExecutableImage(
+        const std::wstring& value)
+    {
+        const std::wstring leaf = LeafName(value);
+        static const wchar_t* kExtensions[] =
+        {
+            L".exe",
+            L".dll",
+            L".sys"
+        };
+        for (const wchar_t* extension : kExtensions)
+        {
+            const size_t length =
+                std::wcslen(extension);
+            if (leaf.size() > length &&
+                leaf.compare(
+                    leaf.size() - length,
+                    length,
+                    extension) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool BindFilterPathIsProcessImage(
+        const std::wstring& value)
+    {
+        const std::wstring leaf = LeafName(value);
+        return leaf.size() > 4 &&
+            leaf.compare(
+                leaf.size() - 4,
+                4,
+                L".exe") == 0;
+    }
+
+    bool BindFilterPairIsProcessBindingCandidate(
+        const BindFilterMappingRecord& record,
+        const std::wstring& target)
+    {
+        const std::wstring sourcePath =
+            BindFilterPathInVolume(
+                record,
+                record.VirtualRoot);
+        const std::wstring targetPath =
+            BindFilterPathInVolume(
+                record,
+                target);
+        if (!BindFilterPathIsProcessImage(
+                sourcePath) ||
+            !BindFilterPathIsProcessImage(
+                targetPath) ||
+            SameCanonicalPath(
+                sourcePath,
+                targetPath) ||
+            LeafName(sourcePath) ==
+                LeafName(targetPath))
+        {
+            return false;
+        }
+
+        std::wstring securityTarget;
+        const bool securityPath =
+            HuntTextTargetsKnownSecurityProduct(
+                sourcePath + L" " +
+                    targetPath,
+                &securityTarget);
+        const bool trustBoundary =
+            (BindFilterPathIsProtected(
+                 sourcePath) &&
+             BindFilterPathIsUserControlledShape(
+                 targetPath)) ||
+            (BindFilterPathIsUserControlledShape(
+                 sourcePath) &&
+             BindFilterPathIsProtected(
+                 targetPath));
+        return BindFilterPathIsWindowsSystem(
+                   sourcePath) ||
+            BindFilterPathIsWindowsSystem(
+                targetPath) ||
+            securityPath ||
+            trustBoundary;
+    }
+
+    std::vector<std::wstring>
+    BindFilterVisibleSourceViews(
+        const HuntProcessRecord& process,
+        const std::wstring& source)
+    {
+        std::vector<std::wstring> views;
+        if (SameCanonicalPath(
+                process.ApiImagePath,
+                source))
+        {
+            views.push_back(L"api_image_path");
+        }
+        if (SameCanonicalPath(
+                process.PebImagePath,
+                source))
+        {
+            views.push_back(L"peb_image_path");
+        }
+        if (SameCanonicalPath(
+                process.DiskPath,
+                source))
+        {
+            views.push_back(L"disk_path");
+        }
+        return views;
+    }
+
+    bool BindFilterMappingHasInverse(
+        const BindFilterMappingRecord& record,
+        const std::vector<BindFilterMappingRecord>&
+            records)
+    {
+        const std::wstring resolvedSource =
+            NormalizeBindFilterPath(
+                BindFilterPathInVolume(
+                    record,
+                    record.VirtualRoot));
+        for (const std::wstring& target :
+             record.TargetRoots)
+        {
+            const std::wstring resolvedTarget =
+                NormalizeBindFilterPath(
+                    BindFilterPathInVolume(
+                        record,
+                        target));
+            for (const BindFilterMappingRecord& candidate :
+                 records)
+            {
+                const std::wstring candidateSource =
+                    NormalizeBindFilterPath(
+                        BindFilterPathInVolume(
+                            candidate,
+                            candidate.VirtualRoot));
+                if (candidateSource !=
+                    resolvedTarget)
+                {
+                    continue;
+                }
+                for (const std::wstring& candidateTarget :
+                     candidate.TargetRoots)
+                {
+                    if (NormalizeBindFilterPath(
+                            BindFilterPathInVolume(
+                                candidate,
+                                candidateTarget)) ==
+                        resolvedSource)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    bool AddBindFilterMappingRecordFinding(
+        HuntResult* result,
+        const BindFilterMappingRecord& record,
+        const std::vector<BindFilterMappingRecord>&
+            records)
+    {
+        if (result == nullptr ||
+            record.VirtualRoot.empty() ||
+            record.TargetRoots.empty())
+        {
+            return false;
+        }
+
+        std::wstring joinedTargets =
+            JoinWideValues(record.TargetRoots, L";");
+        const std::wstring resolvedSource =
+            BindFilterPathInVolume(
+                record,
+                record.VirtualRoot);
+        std::vector<std::wstring>
+            resolvedTargets;
+        resolvedTargets.reserve(
+            record.TargetRoots.size());
+        for (const std::wstring& target :
+             record.TargetRoots)
+        {
+            resolvedTargets.push_back(
+                BindFilterPathInVolume(
+                    record,
+                    target));
+        }
+        const std::wstring joinedResolvedTargets =
+            JoinWideValues(
+                resolvedTargets,
+                L";");
+        std::wstring securityTarget;
+        const bool securityPath =
+            HuntTextTargetsKnownSecurityProduct(
+                resolvedSource + L" " +
+                    joinedResolvedTargets,
+                &securityTarget);
+        bool sensitiveArtifact =
+            BindFilterPathIsSensitiveArtifact(
+                resolvedSource);
+        bool forwardTrustBoundary = false;
+        bool reverseTrustBoundary = false;
+        bool protectedFileRedirect = false;
+        bool inverseProtectedFileRedirect = false;
+        for (const std::wstring& target :
+             resolvedTargets)
+        {
+            sensitiveArtifact =
+                sensitiveArtifact ||
+                BindFilterPathIsSensitiveArtifact(
+                    target);
+            forwardTrustBoundary =
+                forwardTrustBoundary ||
+                (BindFilterPathIsProtected(
+                     resolvedSource) &&
+                 BindFilterPathIsUserControlledShape(
+                     target));
+            reverseTrustBoundary =
+                reverseTrustBoundary ||
+                (BindFilterPathIsUserControlledShape(
+                     resolvedSource) &&
+                 BindFilterPathIsProtected(target));
+            const bool distinctPath =
+                NormalizeBindFilterPath(
+                    resolvedSource) !=
+                NormalizeBindFilterPath(target);
+            const bool distinctImageLeaf =
+                LeafName(record.VirtualRoot) !=
+                LeafName(target);
+            protectedFileRedirect =
+                protectedFileRedirect ||
+                (distinctPath &&
+                 distinctImageLeaf &&
+                 BindFilterPathIsWindowsSystem(
+                     resolvedSource) &&
+                 BindFilterPathIsExecutableImage(
+                     resolvedSource) &&
+                 BindFilterPathIsExecutableImage(
+                     target));
+            inverseProtectedFileRedirect =
+                inverseProtectedFileRedirect ||
+                (distinctPath &&
+                 distinctImageLeaf &&
+                 !BindFilterPathIsWindowsSystem(
+                     resolvedSource) &&
+                 BindFilterPathIsExecutableImage(
+                     resolvedSource) &&
+                 BindFilterPathIsWindowsSystem(target) &&
+                 BindFilterPathIsExecutableImage(
+                     target));
+        }
+        const bool inversePair =
+            BindFilterMappingHasInverse(
+                record,
+                records);
+        if (!securityPath &&
+            !sensitiveArtifact &&
+            !forwardTrustBoundary &&
+            !reverseTrustBoundary &&
+            !protectedFileRedirect &&
+            !inverseProtectedFileRedirect &&
+            !inversePair)
+        {
+            return false;
+        }
+
+        std::vector<std::wstring> reasons =
+        {
+            L"bindflt_active_global_mapping"
+        };
+        if (securityPath)
+        {
+            AddUnique(
+                &reasons,
+                L"bind_link_security_product_path");
+        }
+        if (sensitiveArtifact)
+        {
+            AddUnique(
+                &reasons,
+                L"bind_link_security_artifact_path");
+        }
+        if (forwardTrustBoundary)
+        {
+            AddUnique(
+                &reasons,
+                L"bind_link_protected_to_user_path");
+        }
+        if (reverseTrustBoundary)
+        {
+            AddUnique(
+                &reasons,
+                L"bind_link_inverse_trust_mapping");
+        }
+        if (protectedFileRedirect)
+        {
+            AddUnique(
+                &reasons,
+                L"bind_link_protected_image_redirect");
+        }
+        if (inverseProtectedFileRedirect)
+        {
+            AddUnique(
+                &reasons,
+                L"bind_link_inverse_image_redirect");
+        }
+        if (inversePair)
+        {
+            AddUnique(
+                &reasons,
+                L"bind_link_inverse_pair");
+        }
+
+        std::map<std::wstring, std::wstring> evidence;
+        evidence[L"volume_root"] = record.VolumeRoot;
+        evidence[L"virtual_root"] =
+            record.VirtualRoot;
+        evidence[L"resolved_virtual_root"] =
+            resolvedSource;
+        evidence[L"target_roots"] =
+            joinedTargets;
+        evidence[L"resolved_target_roots"] =
+            joinedResolvedTargets;
+        evidence[L"target_count"] =
+            std::to_wstring(record.TargetRoots.size());
+        evidence[L"mapping_flags"] =
+            HuntHex(record.Flags, 8);
+        evidence[L"reparse_on_files"] =
+            (record.Flags & 0x8u) != 0
+                ? L"true"
+                : L"false";
+        evidence[L"security_product_target"] =
+            securityTarget;
+        evidence[L"global_mapping"] = L"true";
+        evidence[L"silo_mapping_coverage"] =
+            L"unsupported";
+
+        const bool decisive =
+            securityPath ||
+            sensitiveArtifact ||
+            forwardTrustBoundary ||
+            protectedFileRedirect ||
+            inversePair;
+        AddSystemFinding(
+            result,
+            decisive ? L"high" : L"medium",
+            decisive ? L"high" : L"medium",
+            L"filesystem_virtualization_tampering",
+            L"active Bind Filter mapping crosses a security-sensitive path boundary",
+            0,
+            L"bindflt.sys",
+            reasons,
+            evidence,
+            {
+                L"!hunt /deep /details",
+                L"inspect bindflt mapping source and backing file identities"
+            });
+        ++result->SuspiciousBindFilterMappingCount;
+        return true;
+    }
+
+    void AddBindFilterProcessBindingFindings(
+        HuntResult* result,
+        const std::vector<BindFilterMappingRecord>&
+            records,
+        const std::map<uint32_t, HuntProcessRecord>&
+            processes)
+    {
+        if (result == nullptr)
+        {
+            return;
+        }
+
+        std::set<std::wstring> emitted;
+        for (const BindFilterMappingRecord& record :
+             records)
+        {
+            for (const std::wstring& target :
+                 record.TargetRoots)
+            {
+                const std::wstring resolvedSource =
+                    BindFilterPathInVolume(
+                        record,
+                        record.VirtualRoot);
+                const std::wstring resolvedTarget =
+                    BindFilterPathInVolume(
+                        record,
+                        target);
+                if (!BindFilterPairIsProcessBindingCandidate(
+                        record,
+                        target))
+                {
+                    continue;
+                }
+
+                for (const auto& processItem :
+                     processes)
+                {
+                    const HuntProcessRecord& process =
+                        processItem.second;
+                    const std::vector<std::wstring>
+                        sourceViews =
+                            BindFilterVisibleSourceViews(
+                                process,
+                                resolvedSource);
+                    if (sourceViews.empty())
+                    {
+                        continue;
+                    }
+
+                    const bool mainSectionResolved =
+                        process.MainSectionBackingState ==
+                            L"resolved" &&
+                        !process.MainSectionBackingPath.empty();
+                    const bool vadSectionResolved =
+                        process.SectionBackingState ==
+                            L"resolved" &&
+                        !process.SectionBackingPath.empty();
+                    if (!mainSectionResolved ||
+                        !vadSectionResolved)
+                    {
+                        result->
+                            BindFilterProcessCorrelationCoverageIncomplete =
+                                true;
+                        result->CoverageComplete = false;
+                        AddUnique(
+                            &result->Warnings,
+                            L"bindflt Process-Binding correlation incomplete: a candidate mapping matched a visible process image path, but both independent image-backing views were not resolved");
+                        continue;
+                    }
+
+                    if (!SameCanonicalPath(
+                            process.MainSectionBackingPath,
+                            resolvedTarget) ||
+                        !SameCanonicalPath(
+                            process.SectionBackingPath,
+                            resolvedTarget) ||
+                        !SameCanonicalPath(
+                            process.MainSectionBackingPath,
+                            process.SectionBackingPath))
+                    {
+                        continue;
+                    }
+
+                    const std::wstring key =
+                        std::to_wstring(
+                            process.ProcessId) +
+                        L"|" +
+                        CanonicalPathForCompare(
+                            resolvedSource) +
+                        L"|" +
+                        CanonicalPathForCompare(
+                            resolvedTarget);
+                    if (!emitted.insert(key).second)
+                    {
+                        continue;
+                    }
+
+                    std::wstring securityTarget;
+                    HuntTextTargetsKnownSecurityProduct(
+                        resolvedSource + L" " +
+                            resolvedTarget,
+                        &securityTarget);
+                    std::map<std::wstring, std::wstring>
+                        evidence;
+                    evidence[L"volume_root"] =
+                        record.VolumeRoot;
+                    evidence[L"virtual_root"] =
+                        record.VirtualRoot;
+                    evidence[L"resolved_virtual_root"] =
+                        resolvedSource;
+                    evidence[L"matched_target_root"] =
+                        target;
+                    evidence[L"resolved_target_root"] =
+                        resolvedTarget;
+                    evidence[L"mapping_flags"] =
+                        HuntHex(record.Flags, 8);
+                    evidence[L"global_mapping"] = L"true";
+                    evidence[L"visible_source_views"] =
+                        JoinWideValues(sourceViews, L";");
+                    evidence[L"api_image_path"] =
+                        process.ApiImagePath;
+                    evidence[L"peb_image_path"] =
+                        process.PebImagePath;
+                    evidence[L"disk_path"] =
+                        process.DiskPath;
+                    evidence[L"main_section_backing_path"] =
+                        process.MainSectionBackingPath;
+                    evidence[L"main_section_backing_state"] =
+                        process.MainSectionBackingState;
+                    evidence[L"section_backing_path"] =
+                        process.SectionBackingPath;
+                    evidence[L"section_backing_state"] =
+                        process.SectionBackingState;
+                    evidence[L"main_section_object"] =
+                        HuntHex(
+                            process.MainSectionObject,
+                            16);
+                    evidence[L"main_section_segment"] =
+                        HuntHex(
+                            process.MainSectionSegment,
+                            16);
+                    evidence[L"main_section_control_area"] =
+                        HuntHex(
+                            process.MainSectionControlArea,
+                            16);
+                    evidence[L"security_product_target"] =
+                        securityTarget;
+                    evidence[
+                        L"independent_backing_views_agree"] =
+                            L"true";
+                    evidence[L"silo_mapping_coverage"] =
+                        L"unsupported";
+
+                    AddFinding(
+                        result,
+                        process,
+                        L"high",
+                        L"high",
+                        L"filesystem_virtualization_tampering",
+                        L"active Bind Filter mapping makes the visible process image path differ from its actual image backing",
+                        process.MainImageBase,
+                        LeafName(resolvedSource),
+                        {
+                            L"bindflt_active_global_mapping",
+                            L"bind_link_process_binding_state",
+                            L"bind_link_process_backing_correlation"
+                        },
+                        evidence);
+                    ++result->
+                        BindFilterProcessBindingCount;
+                }
+            }
+        }
+    }
+
+    void AddBindFilterHuntFindings(
+        HuntResult* result,
+        const std::map<uint32_t, HuntProcessRecord>&
+            processes)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            result->BindFilterSiloCoverageUnsupported =
+                true;
+            BindFilterScanner scanner;
+            BindFilterScanResult scan = {};
+            std::wstring error;
+            bool scanStarted =
+                scanner.ScanGlobal(&scan, &error);
+            result->BindFilterMappingCount =
+                scan.Records.size();
+            for (const std::wstring& warning :
+                 scan.Warnings)
+            {
+                AddUnique(
+                    &result->Warnings,
+                    L"bindflt mapping warning: " +
+                        warning);
+            }
+            if (!scanStarted ||
+                !scan.GlobalCoverageComplete)
+            {
+                result->BindFilterGlobalCoverageIncomplete =
+                    true;
+                result->CoverageComplete = false;
+                AddUnique(
+                    &result->Warnings,
+                    L"bindflt global mapping scan failed or incomplete: " +
+                        error);
+                break;
+            }
+
+            for (const BindFilterMappingRecord& record :
+                 scan.Records)
+            {
+                AddBindFilterMappingRecordFinding(
+                    result,
+                    record,
+                    scan.Records);
+            }
+            AddBindFilterProcessBindingFindings(
+                result,
+                scan.Records,
+            processes);
+        } while (false);
+    }
+
+    struct CloudFileMappingDecision
+    {
+        bool IsPlaceholder = false;
+        bool EmitFinding = false;
+        bool MetadataCoverageIncomplete = false;
+        bool ProtectionCoverageIncomplete = false;
+        std::wstring Risk;
+        std::wstring Confidence;
+        std::wstring Title;
+        std::vector<std::wstring> Reasons;
+    };
+
+    bool IsDeepImageMismatchReason(
+        const std::wstring& reason)
+    {
+        return
+            reason ==
+                L"disk_live_image_mismatch" ||
+            reason ==
+                L"main_image_entrypoint_mismatch" ||
+            reason ==
+                L"main_image_hash_mismatch" ||
+            reason ==
+                L"live_disk_exec_page_mismatch" ||
+            reason ==
+                L"module_entrypoint_mismatch" ||
+            reason ==
+                L"module_text_mismatch";
+    }
+
+    bool FindDeepImageMismatchForModule(
+        const HuntResult& result,
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module,
+        std::vector<std::wstring>* reasons,
+        uint64_t* address)
+    {
+        uint64_t moduleEnd = 0;
+        if (module.Base == 0 ||
+            module.Size == 0 ||
+            !TryAdd(
+                module.Base,
+                module.Size,
+                &moduleEnd))
+        {
+            return false;
+        }
+
+        bool matched = false;
+        for (const HuntFinding& finding :
+             result.Findings)
+        {
+            if (finding.ProcessId !=
+                    process.ProcessId ||
+                finding.Address <
+                    module.Base ||
+                finding.Address >=
+                    moduleEnd)
+            {
+                continue;
+            }
+
+            for (const std::wstring& reason :
+                 finding.ReasonCodes)
+            {
+                if (!IsDeepImageMismatchReason(
+                        reason))
+                {
+                    continue;
+                }
+
+                matched = true;
+                if (reasons != nullptr)
+                {
+                    AddUnique(
+                        reasons,
+                        reason);
+                }
+                if (address != nullptr &&
+                    *address == 0)
+                {
+                    *address =
+                        finding.Address;
+                }
+            }
+        }
+        return matched;
+    }
+
+    CloudFileMappingDecision
+    EvaluateCloudFileMapping(
+        const CloudFilePlaceholderRecord& placeholder,
+        bool hasProtection,
+        uint8_t protection,
+        bool hasDeepMismatch,
+        const std::vector<std::wstring>&
+            mismatchReasons)
+    {
+        CloudFileMappingDecision decision = {};
+        if (!placeholder.IsCloudPlaceholder)
+        {
+            return decision;
+        }
+
+        if (!placeholder.MetadataCoverageComplete ||
+            !placeholder.PlaceholderStateAvailable ||
+            !placeholder.PlaceholderInfoAvailable)
+        {
+            decision.MetadataCoverageIncomplete =
+                true;
+            return decision;
+        }
+
+        constexpr uint32_t kPlaceholderState =
+            0x00000001;
+        if ((placeholder.PlaceholderState &
+             kPlaceholderState) == 0)
+        {
+            return decision;
+        }
+
+        decision.IsPlaceholder = true;
+        const bool protectedProcess =
+            hasProtection &&
+            (protection & 0x7u) != 0;
+        const bool modified =
+            placeholder.ModifiedDataSize > 0;
+
+        if (hasDeepMismatch)
+        {
+            decision.EmitFinding = true;
+            decision.Risk = L"high";
+            decision.Confidence = L"high";
+            decision.Title =
+                L"Cloud Files executable placeholder has correlated live-versus-disk image divergence";
+            decision.Reasons =
+            {
+                L"cloudfiles_executable_placeholder_mapping",
+                L"cloudfiles_ffi_live_disk_mismatch"
+            };
+            for (const std::wstring& reason :
+                 mismatchReasons)
+            {
+                AddUnique(
+                    &decision.Reasons,
+                    reason);
+            }
+        }
+        else if (protectedProcess)
+        {
+            decision.EmitFinding = true;
+            decision.Risk = L"high";
+            decision.Confidence = L"high";
+            decision.Title =
+                L"protected process maps an executable Cloud Files placeholder";
+            decision.Reasons =
+            {
+                L"cloudfiles_executable_placeholder_mapping",
+                L"cloudfiles_ffi_ppl_image_mapping"
+            };
+        }
+        else if (modified)
+        {
+            decision.EmitFinding = true;
+            decision.Risk = L"medium";
+            decision.Confidence = L"high";
+            decision.Title =
+                L"mapped Cloud Files executable placeholder reports modified data";
+            decision.Reasons =
+            {
+                L"cloudfiles_executable_placeholder_mapping",
+                L"cloudfiles_placeholder_modified_data"
+            };
+        }
+        else if (!hasProtection)
+        {
+            // An in-sync, unmodified placeholder is a clean negative only when
+            // the process protection gate is known not to be PP/PPL.
+            decision.ProtectionCoverageIncomplete =
+                true;
+        }
+
+        if (decision.EmitFinding &&
+            protectedProcess)
+        {
+            AddUnique(
+                &decision.Reasons,
+                L"cloudfiles_ffi_ppl_image_mapping");
+        }
+        if (decision.EmitFinding &&
+            modified)
+        {
+            AddUnique(
+                &decision.Reasons,
+                L"cloudfiles_placeholder_modified_data");
+        }
+        return decision;
+    }
+
+    bool IsCloudFileImageCandidate(
+        const HuntModuleRecord& module)
+    {
+        return module.VadSectionSeen &&
+            module.VadBackingState == L"resolved" &&
+            !module.VadBackingPath.empty() &&
+            module.Base != 0 &&
+            module.Size != 0;
+    }
+
+    void AddCloudFileHuntFindings(
+        HuntResult* result,
+        const std::map<uint32_t, HuntProcessRecord>&
+            processes)
+    {
+        if (result == nullptr)
+        {
+            return;
+        }
+
+        struct CachedPlaceholder
+        {
+            bool QuerySucceeded = false;
+            std::wstring QueryError;
+            CloudFilePlaceholderRecord Record;
+        };
+
+        CloudFileScanner scanner;
+        std::map<std::wstring, CachedPlaceholder>
+            cache;
+        std::set<std::wstring> observed;
+        std::set<std::wstring> emitted;
+        bool queryFailureWarningAdded = false;
+        bool inspectionFailureWarningAdded = false;
+
+        for (const auto& processItem :
+             processes)
+        {
+            const HuntProcessRecord& process =
+                processItem.second;
+            for (const HuntModuleRecord& module :
+                 process.Modules)
+            {
+                if (!IsCloudFileImageCandidate(
+                        module))
+                {
+                    continue;
+                }
+
+                const std::wstring openPath =
+                    OpenPathForResolvedBacking(
+                        module.VadBackingPath,
+                        module.Path);
+                const std::wstring cacheKey =
+                    CanonicalPathForCompare(
+                        openPath);
+                if (cacheKey.empty())
+                {
+                    continue;
+                }
+
+                auto inserted =
+                    cache.emplace(
+                        cacheKey,
+                        CachedPlaceholder{});
+                CachedPlaceholder& cached =
+                    inserted.first->second;
+                if (inserted.second)
+                {
+                    cached.QuerySucceeded =
+                        scanner.QueryPlaceholder(
+                            openPath,
+                            &cached.Record,
+                            &cached.QueryError);
+                }
+                if (!cached.QuerySucceeded)
+                {
+                    result->
+                        CloudFilePlaceholderCoverageIncomplete =
+                            true;
+                    result->CoverageComplete = false;
+                    if (!queryFailureWarningAdded)
+                    {
+                        AddUnique(
+                            &result->Warnings,
+                            L"Cloud Files image inspection failed for " +
+                                module.VadBackingPath +
+                                L": " +
+                                (cached.QueryError.empty()
+                                     ? L"attribute query unavailable"
+                                     : cached.QueryError));
+                        queryFailureWarningAdded = true;
+                    }
+                    continue;
+                }
+                if (!cached.Record.
+                        PlaceholderInspectionComplete)
+                {
+                    result->
+                        CloudFilePlaceholderCoverageIncomplete =
+                            true;
+                    result->CoverageComplete = false;
+                    if (!inspectionFailureWarningAdded)
+                    {
+                        AddUnique(
+                            &result->Warnings,
+                            L"Cloud Files placeholder classification incomplete for " +
+                                module.VadBackingPath +
+                                L": " +
+                                (cached.Record.Warning.empty()
+                                     ? L"CfGetPlaceholderInfo did not produce an authoritative result"
+                                     : cached.Record.Warning));
+                        inspectionFailureWarningAdded =
+                            true;
+                    }
+                    continue;
+                }
+                if (!cached.Record.IsCloudPlaceholder)
+                {
+                    continue;
+                }
+
+                std::vector<std::wstring>
+                    mismatchReasons;
+                uint64_t mismatchAddress = 0;
+                const bool hasDeepMismatch =
+                    FindDeepImageMismatchForModule(
+                        *result,
+                        process,
+                        module,
+                        &mismatchReasons,
+                        &mismatchAddress);
+                const CloudFileMappingDecision
+                    decision =
+                        EvaluateCloudFileMapping(
+                            cached.Record,
+                            process.HasProtection,
+                            process.Protection,
+                            hasDeepMismatch,
+                            mismatchReasons);
+
+                if (decision.MetadataCoverageIncomplete)
+                {
+                    result->
+                        CloudFilePlaceholderCoverageIncomplete =
+                            true;
+                    result->CoverageComplete = false;
+                    AddUnique(
+                        &result->Warnings,
+                        L"Cloud Files image correlation incomplete for " +
+                            module.VadBackingPath +
+                            L": " +
+                            (cached.Record.Warning.empty()
+                                 ? L"placeholder metadata unavailable"
+                                 : cached.Record.Warning));
+                    continue;
+                }
+
+                if (!decision.IsPlaceholder)
+                {
+                    continue;
+                }
+
+                const std::wstring observationKey =
+                    std::to_wstring(
+                        process.ProcessId) +
+                    L"|" +
+                    HuntHex(
+                        module.Base,
+                        16) +
+                    L"|" +
+                    cacheKey;
+                if (!observed.insert(
+                        observationKey).second)
+                {
+                    continue;
+                }
+
+                ++result->
+                    CloudFilePlaceholderImageCount;
+                HuntCloudFileImageRecord observation = {};
+                observation.ProcessId =
+                    process.ProcessId;
+                observation.ModuleBase =
+                    module.Base;
+                observation.ModuleSize =
+                    module.Size;
+                observation.ImageName =
+                    BestProcessImageName(process);
+                observation.ModuleName =
+                    module.Name.empty()
+                        ? LeafName(
+                              module.VadBackingPath)
+                        : module.Name;
+                observation.VadBackingPath =
+                    module.VadBackingPath;
+                observation.NormalizedBackingPath =
+                    openPath;
+                observation.FileAttributes =
+                    cached.Record.FileAttributes;
+                observation.ReparseTag =
+                    cached.Record.ReparseTag;
+                observation.PlaceholderState =
+                    cached.Record.PlaceholderState;
+                observation.PinState =
+                    cached.Record.PinState;
+                observation.InSyncState =
+                    cached.Record.InSyncState;
+                observation.PlaceholderInfoQueryStatus =
+                    cached.Record.
+                        PlaceholderInfoQueryStatus;
+                observation.OnDiskDataSize =
+                    cached.Record.OnDiskDataSize;
+                observation.ValidatedDataSize =
+                    cached.Record.ValidatedDataSize;
+                observation.ModifiedDataSize =
+                    cached.Record.ModifiedDataSize;
+                observation.PropertiesSize =
+                    cached.Record.PropertiesSize;
+                observation.FileIdentityLength =
+                    cached.Record.FileIdentityLength;
+                observation.CloudReparseTagObserved =
+                    cached.Record.CloudReparseTag;
+                observation.
+                    PlaceholderInfoIdentificationFallbackUsed =
+                        cached.Record.
+                            PlaceholderInfoIdentificationFallbackUsed;
+                observation.ProcessProtectionResolved =
+                    process.HasProtection;
+                observation.ProcessProtection =
+                    process.Protection;
+                observation.DeepMismatchCorrelated =
+                    hasDeepMismatch;
+                observation.Suspicious =
+                    decision.EmitFinding;
+                observation.Reasons =
+                    decision.Reasons;
+                result->CloudFileImages.push_back(
+                    std::move(observation));
+
+                if (decision.ProtectionCoverageIncomplete)
+                {
+                    result->
+                        CloudFileProtectionCorrelationIncomplete =
+                            true;
+                    result->CoverageComplete = false;
+                    AddUnique(
+                        &result->Warnings,
+                        L"Cloud Files PP/PPL correlation incomplete: _EPROCESS.Protection was unavailable for pid " +
+                            std::to_wstring(
+                                process.ProcessId));
+                }
+                if (!decision.EmitFinding)
+                {
+                    continue;
+                }
+
+                const std::wstring emitKey =
+                    observationKey;
+                if (!emitted.insert(
+                        emitKey).second)
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring>
+                    evidence;
+                evidence[L"mapped_image_kind"] =
+                    L"SEC_IMAGE";
+                evidence[L"metadata_read_mode"] =
+                    L"FILE_READ_ATTRIBUTES";
+                evidence[L"vad_backing_path"] =
+                    module.VadBackingPath;
+                evidence[L"normalized_backing_path"] =
+                    openPath;
+                evidence[L"module_base"] =
+                    HuntHex(
+                        module.Base,
+                        16);
+                evidence[L"module_size"] =
+                    std::to_wstring(
+                        module.Size);
+                evidence[L"file_attributes"] =
+                    HuntHex(
+                        cached.Record.FileAttributes,
+                        8);
+                evidence[L"reparse_tag"] =
+                    HuntHex(
+                        cached.Record.ReparseTag,
+                        8);
+                evidence[L"cloud_reparse_tag_observed"] =
+                    cached.Record.CloudReparseTag
+                        ? L"true"
+                        : L"false";
+                evidence[L"fsctl_reparse_tag_fallback_used"] =
+                    cached.Record.FsctlReparseTagFallbackUsed
+                        ? L"true"
+                        : L"false";
+                evidence[L"fsctl_reparse_tag_query_error"] =
+                    std::to_wstring(
+                        cached.Record.
+                            FsctlReparseTagQueryError);
+                evidence[L"placeholder_info_identification_fallback_used"] =
+                    cached.Record.
+                            PlaceholderInfoIdentificationFallbackUsed
+                        ? L"true"
+                        : L"false";
+                evidence[L"placeholder_info_query_status"] =
+                    HuntHex(
+                        cached.Record.
+                            PlaceholderInfoQueryStatus,
+                        8);
+                evidence[L"placeholder_state"] =
+                    HuntHex(
+                        cached.Record.PlaceholderState,
+                        8);
+                evidence[L"on_disk_data_size"] =
+                    std::to_wstring(
+                        cached.Record.OnDiskDataSize);
+                evidence[L"validated_data_size"] =
+                    std::to_wstring(
+                        cached.Record.ValidatedDataSize);
+                evidence[L"modified_data_size"] =
+                    std::to_wstring(
+                        cached.Record.ModifiedDataSize);
+                evidence[L"properties_size"] =
+                    std::to_wstring(
+                        cached.Record.PropertiesSize);
+                evidence[L"pin_state"] =
+                    std::to_wstring(
+                        cached.Record.PinState);
+                evidence[L"in_sync_state"] =
+                    std::to_wstring(
+                        cached.Record.InSyncState);
+                evidence[L"file_id"] =
+                    HuntHex(
+                        static_cast<uint64_t>(
+                            cached.Record.FileId),
+                        16);
+                evidence[L"sync_root_file_id"] =
+                    HuntHex(
+                        static_cast<uint64_t>(
+                            cached.Record.SyncRootFileId),
+                        16);
+                evidence[L"file_identity_length"] =
+                    std::to_wstring(
+                        cached.Record.FileIdentityLength);
+                evidence[L"process_protection_resolved"] =
+                    process.HasProtection
+                        ? L"true"
+                        : L"false";
+                if (process.HasProtection)
+                {
+                    evidence[L"protection_raw"] =
+                        HuntHex(
+                            process.Protection,
+                            2);
+                    evidence[L"protection_type"] =
+                        std::to_wstring(
+                            process.Protection &
+                            0x7u);
+                    evidence[L"protection_audit"] =
+                        std::to_wstring(
+                            (process.Protection >>
+                             3) &
+                            0x1u);
+                    evidence[L"protection_signer"] =
+                        std::to_wstring(
+                            (process.Protection >>
+                             4) &
+                            0xfu);
+                }
+                evidence[L"deep_mismatch_correlated"] =
+                    hasDeepMismatch
+                        ? L"true"
+                        : L"false";
+                evidence[L"deep_mismatch_reasons"] =
+                    JoinWideValues(
+                        mismatchReasons,
+                        L";");
+
+                AddFinding(
+                    result,
+                    process,
+                    decision.Risk,
+                    decision.Confidence,
+                    L"cloudfiles_false_file_immutability",
+                    decision.Title,
+                    mismatchAddress != 0
+                        ? mismatchAddress
+                        : module.Base,
+                    module.Name.empty()
+                        ? LeafName(
+                              module.VadBackingPath)
+                        : module.Name,
+                    decision.Reasons,
+                    evidence);
+                ++result->
+                    SuspiciousCloudFileImageCount;
+            }
+        }
     }
 
     bool ThreatIntelEventLooksLikeDriverIo(const HuntTelemetryEvent& event)
@@ -10682,6 +18399,65 @@ namespace
         return openable;
     }
 
+    bool ResolveHuntProcessProtectionField(
+        SymbolEngine& symbols,
+        TypeFieldInfo* field)
+    {
+        if (field == nullptr)
+        {
+            return false;
+        }
+
+        std::wstring error;
+        if (symbols.FindField(
+                L"nt!_EPROCESS",
+                L"Protection",
+                field,
+                &error))
+        {
+            return true;
+        }
+
+        error.clear();
+        return symbols.FindField(
+            L"_EPROCESS",
+            L"Protection",
+            field,
+            &error);
+    }
+
+    bool ReadHuntProcessProtection(
+        DeviceClient& device,
+        const TypeFieldInfo& field,
+        HuntProcessRecord* process)
+    {
+        if (process == nullptr ||
+            process->Kernel.Eprocess == 0 ||
+            process->Kernel.Eprocess >
+                std::numeric_limits<uint64_t>::max() -
+                    field.Offset)
+        {
+            return false;
+        }
+
+        std::vector<uint8_t> bytes;
+        std::wstring error;
+        if (!device.ReadMemory(
+                process->Kernel.Eprocess +
+                    field.Offset,
+                sizeof(uint8_t),
+                &bytes,
+                &error) ||
+            bytes.size() != sizeof(uint8_t))
+        {
+            return false;
+        }
+
+        process->HasProtection = true;
+        process->Protection = bytes[0];
+        return true;
+    }
+
     bool AddressInsideInclusiveRange(uint64_t address, uint64_t start, uint64_t end)
     {
         return address != 0 && end >= start && address >= start && address <= end;
@@ -11207,10 +18983,7 @@ namespace
                     }
                 }
 
-                if (sectionBackedExecutable &&
-                    !loaderCovered &&
-                    ProcessHasCompleteUserModuleInventory(
-                        *process))
+                if (sectionBackedExecutable)
                 {
                     std::wstring backingPath;
                     std::wstring backingState = L"unresolved";
@@ -11221,13 +18994,21 @@ namespace
                     {
                         if (backingState == L"resolved" &&
                             !backingPath.empty() &&
-                            !CanOpenDiskImagePath(backingPath))
+                            !CanOpenDiskImagePath(
+                                OpenPathForResolvedBacking(
+                                    backingPath,
+                                    loaderOwner == nullptr
+                                        ? L""
+                                        : loaderOwner->Path)))
                         {
                             backingState = L"inaccessible";
                             backingOpenable = false;
                         }
                     }
-                    else if (!backingWarning.empty())
+                    else if (!loaderCovered &&
+                             ProcessHasCompleteUserModuleInventory(
+                                 *process) &&
+                             !backingWarning.empty())
                     {
                         AddUnique(&process->Warnings, L"VAD section backing failed: " + backingWarning);
                     }
@@ -11235,9 +19016,15 @@ namespace
                     bool peLikeBackingName = LooksLikePeImagePath(backingPath);
                     if (imageSection || peLikeBackingName)
                     {
-                        uint64_t moduleSize = vad.Size;
+                        uint64_t moduleSize =
+                            loaderOwner != nullptr &&
+                                loaderOwner->Size != 0
+                                ? loaderOwner->Size
+                                : vad.Size;
                         bool managedImage = false;
-                        if (backingOpenable && !backingPath.empty())
+                        if (!loaderCovered &&
+                            backingOpenable &&
+                            !backingPath.empty())
                         {
                             DiskPeMetadata metadata = {};
                             std::wstring metadataError;
@@ -11249,11 +19036,20 @@ namespace
                         }
 
                         HuntModuleRecord module = {};
-                        module.Base = vad.StartAddress;
+                        module.Base =
+                            loaderOwner == nullptr
+                                ? vad.StartAddress
+                                : loaderOwner->Base;
                         module.Size = moduleSize;
                         module.Name = backingPath.empty() ? L"section-image" : LeafName(backingPath);
                         module.Path = backingPath;
-                        module.VadImageSeen = true;
+                        // VadImageSeen retains its original cross-view
+                        // meaning: a VAD image not covered by a loader view.
+                        // VadSectionSeen tracks every independently resolved
+                        // SEC_IMAGE mapping for Cloud Files inspection.
+                        module.VadImageSeen =
+                            !loaderCovered;
+                        module.VadSectionSeen = true;
                         module.VadBackingManagedImage = managedImage;
                         module.VadAddress = vad.VadAddress;
                         module.VadBackingPath = backingPath;
@@ -11864,6 +19660,114 @@ namespace
                     }
                 }
             }
+
+            std::wstring securityTarget;
+            if (!process.ThreadInventoryComplete ||
+                !process.ThreadSuspensionStateCoverageComplete ||
+                process.ThreadsVisited == 0 ||
+                process.ThreadRecords.size() !=
+                    process.ThreadsVisited ||
+                process.SuspensionStateResolvedThreads !=
+                    process.ThreadsVisited ||
+                process.SuspendedThreads !=
+                    process.ThreadsVisited ||
+                process.ThreadRecords.empty() ||
+                !HuntTextTargetsKnownSecurityProduct(
+                    BestProcessImageName(process),
+                    &securityTarget))
+            {
+                break;
+            }
+
+            uint64_t resolvedThreads = 0;
+            uint64_t suspendedThreads = 0;
+            uint64_t suspendCountThreads = 0;
+            uint64_t freezeCountThreads = 0;
+            std::vector<std::wstring> suspendedThreadIds;
+            std::set<uint64_t> observedEthreads;
+            bool uniqueThreadEvidence = true;
+            for (const ProcessThreadRecord& thread :
+                 process.ThreadRecords)
+            {
+                if (thread.Ethread == 0 ||
+                    !observedEthreads.insert(
+                        thread.Ethread).second ||
+                    !thread.HasSuspendCount ||
+                    !thread.HasFreezeCount)
+                {
+                    uniqueThreadEvidence = false;
+                    continue;
+                }
+
+                ++resolvedThreads;
+                const bool suspendActive =
+                    thread.HasSuspendCount &&
+                    thread.SuspendCount != 0;
+                const bool freezeActive =
+                    thread.HasFreezeCount &&
+                    thread.FreezeCount != 0;
+                if (suspendActive)
+                {
+                    ++suspendCountThreads;
+                }
+                if (freezeActive)
+                {
+                    ++freezeCountThreads;
+                }
+                if (suspendActive || freezeActive)
+                {
+                    ++suspendedThreads;
+                    suspendedThreadIds.push_back(
+                        thread.HasThreadId
+                            ? std::to_wstring(thread.ThreadId)
+                            : HuntHex(thread.Ethread, 16));
+                }
+            }
+
+            const uint64_t observedThreads =
+                process.ThreadRecords.size();
+            if (!uniqueThreadEvidence ||
+                resolvedThreads != observedThreads ||
+                suspendedThreads != observedThreads)
+            {
+                break;
+            }
+
+            std::map<std::wstring, std::wstring> evidence;
+            evidence[L"security_product_target"] =
+                securityTarget;
+            evidence[L"thread_inventory_complete"] =
+                L"true";
+            evidence[L"suspension_state_coverage_complete"] =
+                L"true";
+            evidence[L"observed_threads"] =
+                std::to_wstring(observedThreads);
+            evidence[L"suspension_state_resolved_threads"] =
+                std::to_wstring(resolvedThreads);
+            evidence[L"suspended_threads"] =
+                std::to_wstring(suspendedThreads);
+            evidence[L"suspend_count_nonzero_threads"] =
+                std::to_wstring(suspendCountThreads);
+            evidence[L"freeze_count_nonzero_threads"] =
+                std::to_wstring(freezeCountThreads);
+            evidence[L"suspended_thread_ids"] =
+                JoinWideValues(suspendedThreadIds, L";");
+
+            AddFinding(
+                result,
+                process,
+                L"high",
+                L"high",
+                L"security_tool_impairment",
+                L"all observed threads of a known security process are suspended or frozen",
+                0,
+                L"",
+                {
+                    L"security_product_process_suspended",
+                    L"all_observed_threads_suspended",
+                    L"edr_freeze_state"
+                },
+                evidence);
         } while (false);
     }
 
@@ -14383,6 +22287,23 @@ namespace
                 lowered == L"module_stomping_permission_evidence" ||
                 lowered == L"module_entrypoint_write_permission_drift" ||
                 lowered == L"security_tool_communication_blocking" ||
+                lowered == L"security_tool_communication_throttling" ||
+                lowered == L"qos_security_product_throttle_policy" ||
+                lowered == L"edrchoker_state" ||
+                lowered == L"bindflt_active_global_mapping" ||
+                lowered == L"bind_link_security_product_path" ||
+                lowered == L"bind_link_security_artifact_path" ||
+                lowered == L"bind_link_protected_to_user_path" ||
+                lowered == L"bind_link_inverse_trust_mapping" ||
+                lowered == L"bind_link_protected_image_redirect" ||
+                lowered == L"bind_link_inverse_image_redirect" ||
+                lowered == L"bind_link_process_binding_state" ||
+                lowered == L"bind_link_process_backing_correlation" ||
+                lowered == L"bind_link_inverse_pair" ||
+                lowered == L"cloudfiles_executable_placeholder_mapping" ||
+                lowered == L"cloudfiles_ffi_ppl_image_mapping" ||
+                lowered == L"cloudfiles_placeholder_modified_data" ||
+                lowered == L"cloudfiles_ffi_live_disk_mismatch" ||
                 lowered == L"wfp_security_product_block_filter" ||
                 lowered == L"wfp_anticheat_block_filter" ||
                 lowered == L"wfp_appid_block_condition")
@@ -14593,6 +22514,33 @@ bool HuntProcessLifecycleSelfTest()
     {
         return false;
     }
+    const std::wstring terminalImage =
+        EnsureTrailingSlash(
+            ProgramFilesDirectory()) +
+        L"WindowsApps\\Microsoft.WindowsTerminal_1.24.1.0_x64__8wekyb3d8bbwe\\WindowsTerminal.exe";
+    if (!IsWindowsTerminalExecutionAliasShape(
+            terminalImage,
+            terminalImage,
+            L"wt.exe") ||
+        IsWindowsTerminalExecutionAliasShape(
+            terminalImage,
+            terminalImage,
+            L"cmd.exe") ||
+        IsWindowsTerminalExecutionAliasShape(
+            terminalImage,
+            L"C:\\Temp\\WindowsTerminal.exe",
+            L"wt.exe") ||
+        IsWindowsTerminalExecutionAliasShape(
+            EnsureTrailingSlash(
+                ProgramFilesDirectory()) +
+                L"WindowsApps\\Microsoft.WindowsTerminal_1.24.1.0_x64__attacker\\WindowsTerminal.exe",
+            EnsureTrailingSlash(
+                ProgramFilesDirectory()) +
+                L"WindowsApps\\Microsoft.WindowsTerminal_1.24.1.0_x64__attacker\\WindowsTerminal.exe",
+            L"wt.exe"))
+    {
+        return false;
+    }
 
     bool ok = false;
     FILETIME createTime = {};
@@ -14668,6 +22616,754 @@ bool HuntProcessLifecycleSelfTest()
         CloseHandle(currentProcess);
     }
     return ok;
+}
+
+bool HuntCidTableAnchorSelfTest()
+{
+    const uint64_t processBase =
+        kKernelAddressMin + 0x100000;
+    const uint64_t threadBase =
+        kKernelAddressMin + 0x200000;
+    const uint64_t sharedAnchor =
+        kKernelAddressMin + 0x500000;
+    const uint64_t processDecoy =
+        kKernelAddressMin + 0x600000;
+    const uint64_t threadDecoy =
+        kKernelAddressMin + 0x700000;
+
+    auto appendRipLoad =
+        [](std::vector<uint8_t>* code,
+           uint64_t base,
+           uint8_t modRm,
+           uint64_t target) -> bool
+        {
+            if (code == nullptr)
+            {
+                return false;
+            }
+            const uint64_t pc =
+                base + code->size();
+            const int64_t displacement =
+                static_cast<int64_t>(target) -
+                static_cast<int64_t>(pc + 7);
+            if (displacement <
+                    std::numeric_limits<int32_t>::min() ||
+                displacement >
+                    std::numeric_limits<int32_t>::max())
+            {
+                return false;
+            }
+
+            const int32_t disp32 =
+                static_cast<int32_t>(displacement);
+            code->push_back(0x48);
+            code->push_back(0x8b);
+            code->push_back(modRm);
+            for (size_t index = 0;
+                 index < sizeof(disp32);
+                 ++index)
+            {
+                code->push_back(
+                    static_cast<uint8_t>(
+                        (static_cast<uint32_t>(disp32) >>
+                         (index * 8)) &
+                        0xffu));
+            }
+            return true;
+        };
+
+    std::vector<uint8_t> processCode;
+    std::vector<uint8_t> threadCode;
+    if (!appendRipLoad(
+            &processCode,
+            processBase,
+            0x05,
+            sharedAnchor) ||
+        !appendRipLoad(
+            &processCode,
+            processBase,
+            0x0d,
+            sharedAnchor) ||
+        !appendRipLoad(
+            &processCode,
+            processBase,
+            0x15,
+            processDecoy) ||
+        !appendRipLoad(
+            &threadCode,
+            threadBase,
+            0x05,
+            sharedAnchor) ||
+        !appendRipLoad(
+            &threadCode,
+            threadBase,
+            0x0d,
+            sharedAnchor) ||
+        !appendRipLoad(
+            &threadCode,
+            threadBase,
+            0x15,
+            threadDecoy))
+    {
+        return false;
+    }
+    processCode.push_back(0xc3);
+    threadCode.push_back(0xc3);
+
+    CidAnchorReferenceSet processReferences = {};
+    CidAnchorReferenceSet threadReferences = {};
+    if (!ExtractCidAnchorReferences(
+            processBase,
+            processCode,
+            &processReferences) ||
+        !ExtractCidAnchorReferences(
+            threadBase,
+            threadCode,
+            &threadReferences) ||
+        processReferences.
+                RipRelativeQwordLoads[
+                    sharedAnchor] != 2 ||
+        threadReferences.
+                RipRelativeQwordLoads[
+                    sharedAnchor] != 2 ||
+        processReferences.
+                RipRelativeQwordLoads[
+                    processDecoy] != 1 ||
+        threadReferences.
+                RipRelativeQwordLoads[
+                    threadDecoy] != 1)
+    {
+        return false;
+    }
+
+    std::set<uint64_t> commonRepeated;
+    for (const auto& processReference :
+         processReferences.RipRelativeQwordLoads)
+    {
+        const auto threadReference =
+            threadReferences.
+                RipRelativeQwordLoads.find(
+                    processReference.first);
+        if (processReference.second >= 2 &&
+            threadReference !=
+                threadReferences.
+                    RipRelativeQwordLoads.end() &&
+            threadReference->second >= 2)
+        {
+            commonRepeated.insert(
+                processReference.first);
+        }
+    }
+    if (commonRepeated.size() != 1 ||
+        *commonRepeated.begin() != sharedAnchor)
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> truncated = processCode;
+    truncated.pop_back();
+    CidAnchorReferenceSet incomplete = {};
+    if (ExtractCidAnchorReferences(
+            processBase,
+            truncated,
+            &incomplete))
+    {
+        return false;
+    }
+
+    const uint64_t topologyPage0 =
+        kKernelAddressMin + 0xa00000;
+    const uint64_t topologyPage1 =
+        topologyPage0 + kPageSize;
+    std::vector<uint64_t> contiguousPointers =
+        {topologyPage0,
+         topologyPage1,
+         0,
+         0};
+    std::vector<uint64_t> allocatedPointers;
+    if (!CollectContiguousCidPointerPrefix(
+            contiguousPointers,
+            &allocatedPointers) ||
+        allocatedPointers.size() != 2 ||
+        allocatedPointers[0] != topologyPage0 ||
+        allocatedPointers[1] != topologyPage1)
+    {
+        return false;
+    }
+    std::vector<uint64_t> sparsePointers =
+        {topologyPage0,
+         0,
+         topologyPage1,
+         0};
+    if (CollectContiguousCidPointerPrefix(
+            sparsePointers,
+            &allocatedPointers) ||
+        !allocatedPointers.empty())
+    {
+        return false;
+    }
+    std::vector<uint64_t> emptyPointers(4, 0);
+    if (CollectContiguousCidPointerPrefix(
+            emptyPointers,
+            &allocatedPointers))
+    {
+        return false;
+    }
+
+    const uint64_t syntheticObjectBody =
+        kKernelAddressMin + 0xb00000;
+    const uint64_t syntheticPointerBits =
+        (syntheticObjectBody &
+         0x0000ffffffffffffull) >>
+        4;
+    uint64_t decodedObjectHeader = 0;
+    uint64_t decodedObjectBody = 0;
+    constexpr uint64_t syntheticBodyOffset = 0x30;
+    if (!DecodeCidObjectAddresses(
+            syntheticPointerBits,
+            syntheticBodyOffset,
+            &decodedObjectHeader,
+            &decodedObjectBody) ||
+        decodedObjectBody !=
+            syntheticObjectBody ||
+        decodedObjectHeader !=
+            syntheticObjectBody -
+                syntheticBodyOffset ||
+        DecodeCidObjectAddresses(
+            0,
+            syntheticBodyOffset,
+            &decodedObjectHeader,
+            &decodedObjectBody) ||
+        DecodeCidObjectAddresses(
+            1ull << 44,
+            syntheticBodyOffset,
+            &decodedObjectHeader,
+            &decodedObjectBody) ||
+        DecodeCidObjectAddresses(
+            0x1000,
+            syntheticBodyOffset,
+            &decodedObjectHeader,
+            &decodedObjectBody))
+    {
+        return false;
+    }
+    if (!CidDirectThreadIdentityFieldsPlausible(
+            32,
+            32,
+            0,
+            syntheticObjectBody,
+            0,
+            0) ||
+        !CidDirectThreadIdentityFieldsPlausible(
+            36,
+            36,
+            4,
+            syntheticObjectBody,
+            1,
+            0) ||
+        CidDirectThreadIdentityFieldsPlausible(
+            36,
+            36,
+            4,
+            syntheticObjectBody,
+            0,
+            0) ||
+        CidDirectThreadIdentityFieldsPlausible(
+            36,
+            40,
+            4,
+            syntheticObjectBody,
+            1,
+            0) ||
+        CidDirectThreadIdentityFieldsPlausible(
+            36,
+            36,
+            4,
+            syntheticObjectBody,
+            1,
+            2) ||
+        !CidDirectThreadIdentityFieldsPlausible(
+            0,
+            0,
+            0,
+            syntheticObjectBody,
+            0,
+            0) ||
+        CidDirectThreadIdentityFieldsPlausible(
+            0,
+            0,
+            4,
+            syntheticObjectBody,
+            1,
+            0) ||
+        CidThreadExitTimeForState(
+            syntheticObjectBody,
+            0) != 0 ||
+        CidThreadExitTimeForState(
+            syntheticObjectBody,
+            1) != syntheticObjectBody ||
+        !IsReservedCidZeroThread(0, 0) ||
+        IsReservedCidZeroThread(0, 4) ||
+        IsReservedCidZeroThread(4, 0))
+    {
+        return false;
+    }
+
+    TypeFieldInfo objectPointerBits = {};
+    objectPointerBits.Offset = 0;
+    objectPointerBits.Length = 44;
+    objectPointerBits.BitPosition = 20;
+    objectPointerBits.IsBitField = true;
+    constexpr uint64_t syntheticEntrySize = 16;
+    constexpr uint64_t syntheticEntryIndex = 7;
+    std::vector<uint8_t> syntheticEntryPage(
+        kPageSize,
+        0);
+    const uint64_t syntheticRawEntry =
+        syntheticPointerBits << 20;
+    std::memcpy(
+        syntheticEntryPage.data() +
+            syntheticEntryIndex *
+                syntheticEntrySize,
+        &syntheticRawEntry,
+        sizeof(syntheticRawEntry));
+    uint64_t extractedPointerBits = 0;
+    if (!ExtractCidObjectPointerBits(
+            syntheticEntryPage,
+            syntheticEntrySize,
+            syntheticEntryIndex,
+            objectPointerBits,
+            &extractedPointerBits) ||
+        extractedPointerBits !=
+            syntheticPointerBits ||
+        ExtractCidObjectPointerBits(
+            syntheticEntryPage,
+            syntheticEntrySize,
+            kPageSize /
+                syntheticEntrySize,
+            objectPointerBits,
+            &extractedPointerBits))
+    {
+        return false;
+    }
+    std::vector<uint8_t> truncatedEntryPage(
+        syntheticEntryPage.begin(),
+        syntheticEntryPage.begin() +
+            syntheticEntryIndex *
+                syntheticEntrySize);
+    if (ExtractCidObjectPointerBits(
+            truncatedEntryPage,
+            syntheticEntrySize,
+            syntheticEntryIndex,
+            objectPointerBits,
+            &extractedPointerBits))
+    {
+        return false;
+    }
+    if (!CidPointerSnapshotHasAllocatableSlots(
+            {0xfffull, syntheticPointerBits}) ||
+        CidPointerSnapshotHasAllocatableSlots(
+            {0xfffull}))
+    {
+        return false;
+    }
+
+    CidDirectEnumerationResult mergeDirect = {};
+    mergeDirect.Complete = true;
+    mergeDirect.Stable = true;
+    CidDirectProcess mergeFirst = {};
+    mergeFirst.ProcessId = 0x101;
+    mergeFirst.Process.Context.Eprocess =
+        kKernelAddressMin + 0xe00000;
+    mergeFirst.Process.CreateTime = 0x111;
+    mergeFirst.Process.HasCreateTime = true;
+    CidDirectProcess mergeSecond = {};
+    mergeSecond.ProcessId = 0x202;
+    mergeSecond.Process.Context.Eprocess =
+        kKernelAddressMin + 0xf00000;
+    mergeSecond.Process.CreateTime = 0x222;
+    mergeSecond.Process.HasCreateTime = true;
+    mergeDirect.Processes.emplace(
+        mergeFirst.ProcessId,
+        mergeFirst);
+    mergeDirect.Processes.emplace(
+        mergeSecond.ProcessId,
+        mergeSecond);
+
+    HuntProcessRecord seededFirst = {};
+    seededFirst.ProcessId = mergeFirst.ProcessId;
+    seededFirst.Kernel.Eprocess =
+        mergeFirst.Process.Context.Eprocess;
+    seededFirst.Kernel.CreateTime =
+        mergeFirst.Process.CreateTime;
+    seededFirst.Kernel.HasCreateTime = true;
+    HuntProcessRecord seededSecond = {};
+    seededSecond.ProcessId = mergeSecond.ProcessId;
+    seededSecond.Kernel.Eprocess =
+        mergeSecond.Process.Context.Eprocess + 0x1000;
+    seededSecond.Kernel.CreateTime =
+        mergeSecond.Process.CreateTime;
+    seededSecond.Kernel.HasCreateTime = true;
+    std::map<uint32_t, HuntProcessRecord>
+        mergeProcesses = {
+            {seededFirst.ProcessId, seededFirst},
+            {seededSecond.ProcessId, seededSecond}};
+    uint64_t mergeDiscovered = 99;
+    std::wstring mergeWarning = L"stale";
+    if (MergeCidDirectProcessView(
+            mergeDirect,
+            &mergeProcesses,
+            &mergeDiscovered,
+            &mergeWarning) ||
+        mergeDiscovered != 0 ||
+        mergeWarning !=
+            L"cid direct process merge: one or more seeded identities disagreed" ||
+        mergeProcesses[seededFirst.ProcessId].
+            HasCidTableView ||
+        mergeProcesses[seededSecond.ProcessId].
+            LifecycleChangedBeforeTriage ||
+        !mergeProcesses[seededFirst.ProcessId].
+            Warnings.empty() ||
+        !mergeProcesses[seededSecond.ProcessId].
+            Warnings.empty())
+    {
+        return false;
+    }
+    mergeProcesses[seededSecond.ProcessId].
+        Kernel.Eprocess =
+            mergeSecond.Process.Context.Eprocess;
+    if (!MergeCidDirectProcessView(
+            mergeDirect,
+            &mergeProcesses,
+            &mergeDiscovered,
+            &mergeWarning) ||
+        mergeDiscovered != 0 ||
+        !mergeWarning.empty() ||
+        !mergeProcesses[seededFirst.ProcessId].
+            HasCidTableView ||
+        !mergeProcesses[seededSecond.ProcessId].
+            HasCidTableView)
+    {
+        return false;
+    }
+
+    CidDirectThread identity = {};
+    identity.ThreadId = 100;
+    identity.ProcessId = 200;
+    identity.Ethread =
+        kKernelAddressMin + 0xc00000;
+    identity.Eprocess =
+        kKernelAddressMin + 0xd00000;
+    identity.CreateTime = 300;
+    identity.ExitTime = 0;
+    identity.HasCreateTime = true;
+    identity.HasExitTime = true;
+    std::map<uint32_t, CidDirectThread>
+        firstKernelView = {{identity.ThreadId, identity}};
+    std::map<uint32_t, CidDirectThread>
+        secondKernelView = firstKernelView;
+    const CidDirectThread* currentIdentity = nullptr;
+    if (GetStableCidKernelPresence(
+            firstKernelView,
+            secondKernelView,
+            identity.ThreadId,
+            &currentIdentity) !=
+            CidViewPresence::StableSeen ||
+        currentIdentity == nullptr ||
+        !CidThreadIdentityEqual(
+            *currentIdentity,
+            identity))
+    {
+        return false;
+    }
+    secondKernelView[identity.ThreadId].Ethread +=
+        0x1000;
+    if (GetStableCidKernelPresence(
+            firstKernelView,
+            secondKernelView,
+            identity.ThreadId,
+            &currentIdentity) !=
+            CidViewPresence::Unstable ||
+        CidSeenKernelIdentityAgrees(
+            CidViewPresence::StableSeen,
+            &secondKernelView[identity.ThreadId],
+            &identity))
+    {
+        return false;
+    }
+    firstKernelView.clear();
+    secondKernelView.clear();
+    if (GetStableCidKernelPresence(
+            firstKernelView,
+            secondKernelView,
+            identity.ThreadId,
+            &currentIdentity) !=
+            CidViewPresence::StableAbsent ||
+        !CidSeenKernelIdentityAgrees(
+            CidViewPresence::StableAbsent,
+            nullptr,
+            &identity))
+    {
+        return false;
+    }
+
+    const CidViewPresence seen =
+        CidViewPresence::StableSeen;
+    const CidViewPresence absent =
+        CidViewPresence::StableAbsent;
+    const CidViewPresence unstable =
+        CidViewPresence::Unstable;
+    if (!IsCoherentCidThreadLifecycleTransition(
+            true,
+            true,
+            false) ||
+        IsCoherentCidThreadLifecycleTransition(
+            false,
+            true,
+            false) ||
+        IsCoherentCidThreadLifecycleTransition(
+            true,
+            false,
+            false) ||
+        IsCoherentCidThreadLifecycleTransition(
+            true,
+            true,
+            true))
+    {
+        return false;
+    }
+    const auto classify =
+        [](bool kernelIdentity,
+           bool apiIdentity,
+           bool views,
+           bool lifecycle,
+           bool terminated,
+           uint64_t exitTime,
+           CidViewPresence direct,
+           CidViewPresence executive,
+           CidViewPresence scheduler,
+           CidViewPresence system,
+           CidViewPresence toolhelp)
+        {
+            return ClassifyCidThreadCrossView(
+                kernelIdentity,
+                apiIdentity,
+                views,
+                lifecycle,
+                terminated,
+                exitTime,
+                direct,
+                executive,
+                scheduler,
+                system,
+                toolhelp);
+        };
+    if (classify(
+            true, false, true, true, false, 0,
+            seen, absent, absent, absent, absent) !=
+            CidThreadCrossViewDecision::DirectOnly ||
+        classify(
+            true, false, true, true, false, 0,
+            absent, seen, seen, seen, seen) !=
+            CidThreadCrossViewDecision::MissingFromCid ||
+        classify(
+            true, false, true, true, false, 0,
+            seen, absent, seen, seen, seen) !=
+            CidThreadCrossViewDecision::ExecutiveUnlinked ||
+        classify(
+            true, false, true, true, false, 0,
+            seen, seen, absent, seen, seen) !=
+            CidThreadCrossViewDecision::SchedulerUnlinked ||
+        classify(
+            true, false, true, true, false, 0,
+            seen, seen, seen, absent, absent) !=
+            CidThreadCrossViewDecision::ApiHidden ||
+        classify(
+            false, true, true, false, false, 0,
+            absent, absent, absent, seen, seen) !=
+            CidThreadCrossViewDecision::ApiOnly ||
+        classify(
+            true, false, true, true, true, 0,
+            seen, absent, absent, absent, absent) !=
+            CidThreadCrossViewDecision::None ||
+        classify(
+            true, false, true, true, false, 1,
+            seen, absent, absent, absent, absent) !=
+            CidThreadCrossViewDecision::None ||
+        classify(
+            true, false, false, true, false, 0,
+            seen, absent, absent, absent, absent) !=
+            CidThreadCrossViewDecision::None ||
+        classify(
+            true, false, true, true, false, 0,
+            unstable, absent, absent, absent, absent) !=
+            CidThreadCrossViewDecision::None ||
+        classify(
+            false, false, true, false, false, 0,
+            absent, absent, absent, seen, seen) !=
+            CidThreadCrossViewDecision::None)
+    {
+        return false;
+    }
+
+    HuntProcessRecord cidOnly = {};
+    cidOnly.ProcessId = 4242;
+    cidOnly.Kernel.ProcessId = 4242;
+    cidOnly.Kernel.Eprocess =
+        kKernelAddressMin + 0x900000;
+    cidOnly.Kernel.HasCreateTime = true;
+    cidOnly.Kernel.CreateTime = 1;
+    cidOnly.Kernel.HasExitTime = true;
+    cidOnly.Kernel.ExitTime = 0;
+    cidOnly.Kernel.HasActiveThreads = true;
+    cidOnly.Kernel.ActiveThreads = 1;
+    cidOnly.HasCidTableView = true;
+    cidOnly.CidTableSeen = true;
+    cidOnly.CidTableEnumerated = true;
+    cidOnly.CidTableDiscovered = true;
+    cidOnly.CidApiViewsRevalidated = true;
+    cidOnly.CidIdentityRevalidated = true;
+    cidOnly.ActiveProcessLinksRevalidated = true;
+    cidOnly.ActiveProcessLinksStableUnlinked = true;
+    if (!CanUseSeededProcessAsThreadOwner(
+            cidOnly,
+            true) ||
+        CanUseSeededProcessAsThreadOwner(
+            cidOnly,
+            false))
+    {
+        return false;
+    }
+    constexpr uint32_t lateProcessId = 4244;
+    std::set<uint32_t> preTriageProcessIds = {
+        cidOnly.ProcessId};
+    CidDirectEnumerationResult arrivalView = {};
+    arrivalView.Processes.emplace(
+        cidOnly.ProcessId,
+        CidDirectProcess{});
+    arrivalView.Processes.emplace(
+        lateProcessId,
+        CidDirectProcess{});
+    std::map<uint32_t, HuntProcessRecord>
+        arrivalProcesses;
+    arrivalProcesses.emplace(
+        cidOnly.ProcessId,
+        cidOnly);
+    HuntProcessRecord lateProcess = {};
+    lateProcess.ProcessId = lateProcessId;
+    arrivalProcesses.emplace(
+        lateProcessId,
+        std::move(lateProcess));
+    if (MarkPostTriageProcessArrivals(
+            preTriageProcessIds,
+            arrivalView,
+            &arrivalProcesses) != 1 ||
+        arrivalProcesses[cidOnly.ProcessId].
+            LifecycleChangedBeforeTriage ||
+        !arrivalProcesses[lateProcessId].
+            LifecycleChangedBeforeTriage ||
+        arrivalProcesses[lateProcessId].
+            Warnings.empty())
+    {
+        return false;
+    }
+
+    HuntResult positive = {};
+    AddProcessViewFindings(
+        &positive,
+        cidOnly);
+    if (positive.Findings.size() != 1 ||
+        positive.Findings[0].Risk != L"high" ||
+        positive.Findings[0].Confidence != L"high" ||
+        !ContainsWideValue(
+            positive.Findings[0].ReasonCodes,
+            L"cid_only_process"))
+    {
+        return false;
+    }
+
+    HuntProcessRecord raceControl = cidOnly;
+    raceControl.CidIdentityRevalidated = false;
+    raceControl.LifecycleChangedBeforeTriage = true;
+    if (CanUseSeededProcessAsThreadOwner(
+            raceControl,
+            true))
+    {
+        return false;
+    }
+    HuntResult raceNegative = {};
+    AddProcessViewFindings(
+        &raceNegative,
+        raceControl);
+    if (!raceNegative.Findings.empty())
+    {
+        return false;
+    }
+
+    HuntProcessRecord visibleControl = cidOnly;
+    visibleControl.ActiveProcessLinksSeen = true;
+    visibleControl.SystemProcessInformationSeen = true;
+    visibleControl.ToolhelpProcessSeen = true;
+    HuntResult visibleNegative = {};
+    AddProcessViewFindings(
+        &visibleNegative,
+        visibleControl);
+    if (!visibleNegative.Findings.empty())
+    {
+        return false;
+    }
+
+    HuntResult cidJsonResult = {};
+    cidJsonResult.CidTableFullEnumeration = true;
+    cidJsonResult.CidTableFullProcessEnumeration = true;
+    cidJsonResult.CidTableDirectEntryEnumeration = true;
+    cidJsonResult.CidTableFullThreadEnumeration = true;
+    cidJsonResult.CidTableThreadCrossViewComplete = true;
+    cidJsonResult.SystemProcessInfoThreadCount = 10;
+    cidJsonResult.ToolhelpThreadCount = 10;
+    cidJsonResult.CidTableDirectEntryCount = 3;
+    cidJsonResult.CidTableDirectProcessCount = 2;
+    cidJsonResult.CidTableDirectThreadCount = 1;
+    HuntCidThreadRecord cidThreadJson = {};
+    cidThreadJson.ThreadId = identity.ThreadId;
+    cidThreadJson.ProcessId = identity.ProcessId;
+    cidThreadJson.ObjectHeader =
+        decodedObjectHeader;
+    cidThreadJson.Ethread = identity.Ethread;
+    cidThreadJson.Eprocess = identity.Eprocess;
+    cidThreadJson.CreateTime = identity.CreateTime;
+    cidThreadJson.ExitTime = identity.ExitTime;
+    cidThreadJson.HasCreateTime = true;
+    cidThreadJson.HasExitTime = true;
+    cidThreadJson.DirectCidSeen = true;
+    cidThreadJson.ExecutiveThreadListSeen = true;
+    cidThreadJson.SchedulerThreadListSeen = true;
+    cidThreadJson.SystemProcessInformationSeen = true;
+    cidThreadJson.ToolhelpThreadSeen = true;
+    cidThreadJson.IdentityRevalidated = true;
+    cidThreadJson.ViewsRevalidated = true;
+    cidJsonResult.CidThreads.push_back(cidThreadJson);
+    const std::wstring cidJson =
+        BuildHuntJson(cidJsonResult);
+    return
+        cidJson.find(
+            L"\"cid_table_full_enumeration\":true") !=
+            std::wstring::npos &&
+        cidJson.find(
+            L"\"cid_table_direct_entry_enumeration\":true") !=
+            std::wstring::npos &&
+        cidJson.find(
+            L"\"cid_table_direct_threads\":1") !=
+            std::wstring::npos &&
+        cidJson.find(
+            L"\"cid_threads\":[") !=
+            std::wstring::npos &&
+        cidJson.find(
+            L"\"tid\":100") !=
+            std::wstring::npos &&
+        cidJson.find(
+            L"\"identity_revalidated\":true") !=
+            std::wstring::npos;
 }
 
 bool HuntDiskPeBoundsSelfTest()
@@ -14865,6 +23561,9 @@ bool HuntDiskPeBoundsSelfTest()
         validBytes.data() + optionalOffset,
         &validOptional,
         kFixedOptionalBytes);
+    // Make the stale-metadata check deterministic even on filesystems whose
+    // last-write timestamp does not advance between two immediate writes.
+    validBytes.push_back(0);
     if (writeImage(validBytes))
     {
         std::vector<uint8_t> stalePage;
@@ -15466,6 +24165,1042 @@ bool HuntEdrKillerProfileSelfTest()
         suffixContextRequired;
 }
 
+bool HuntSecurityProcessFreezeSelfTest()
+{
+    auto makeThread =
+        [](uint64_t tid, uint32_t suspendCount)
+        {
+            ProcessThreadRecord thread = {};
+            thread.ThreadId = tid;
+            thread.HasThreadId = true;
+            thread.SuspendCount = suspendCount;
+            thread.HasSuspendCount = true;
+            thread.FreezeCount = 0;
+            thread.HasFreezeCount = true;
+            return thread;
+        };
+
+    HuntProcessRecord securityProcess = {};
+    securityProcess.ProcessId = 4321;
+    securityProcess.KernelImageName = L"MsMpEng.exe";
+    securityProcess.ThreadInventoryComplete = true;
+    securityProcess.ThreadSuspensionStateCoverageComplete =
+        true;
+    securityProcess.ThreadRecords =
+        {makeThread(10, 1), makeThread(11, 2)};
+    securityProcess.ThreadRecords[0].Ethread = 0xffff800000001000ull;
+    securityProcess.ThreadRecords[1].Ethread = 0xffff800000002000ull;
+    securityProcess.ThreadsVisited =
+        securityProcess.ThreadRecords.size();
+    securityProcess.SuspensionStateResolvedThreads =
+        securityProcess.ThreadRecords.size();
+    securityProcess.SuspendedThreads =
+        securityProcess.ThreadRecords.size();
+
+    HuntResult positive = {};
+    AddThreadFindings(&positive, securityProcess);
+    if (positive.Findings.size() != 1 ||
+        positive.Findings[0].ClassName !=
+            L"security_tool_impairment" ||
+        positive.Findings[0].Risk != L"high" ||
+        positive.Findings[0].Confidence != L"high" ||
+        std::find(
+            positive.Findings[0].ReasonCodes.begin(),
+            positive.Findings[0].ReasonCodes.end(),
+            L"all_observed_threads_suspended") ==
+            positive.Findings[0].ReasonCodes.end() ||
+        positive.Findings[0].Evidence[
+            L"suspended_threads"] != L"2")
+    {
+        return false;
+    }
+
+    HuntProcessRecord mixed = securityProcess;
+    mixed.ThreadRecords[1].SuspendCount = 0;
+    HuntResult mixedResult = {};
+    AddThreadFindings(&mixedResult, mixed);
+    if (!mixedResult.Findings.empty())
+    {
+        return false;
+    }
+
+    HuntProcessRecord unknown = securityProcess;
+    unknown.KernelImageName = L"business-agent.exe";
+    HuntResult unknownResult = {};
+    AddThreadFindings(&unknownResult, unknown);
+    if (!unknownResult.Findings.empty())
+    {
+        return false;
+    }
+
+    HuntProcessRecord incomplete = securityProcess;
+    incomplete.ThreadInventoryComplete = false;
+    HuntResult incompleteResult = {};
+    AddThreadFindings(&incompleteResult, incomplete);
+    if (!incompleteResult.Findings.empty())
+    {
+        return false;
+    }
+
+    HuntProcessRecord unresolved = securityProcess;
+    unresolved.ThreadRecords[1].HasFreezeCount = false;
+    HuntResult unresolvedResult = {};
+    AddThreadFindings(&unresolvedResult, unresolved);
+    if (!unresolvedResult.Findings.empty())
+    {
+        return false;
+    }
+
+    ProcessThreadScanResult stableLeft = {};
+    stableLeft.Records = securityProcess.ThreadRecords;
+    stableLeft.ThreadsVisited = stableLeft.Records.size();
+    stableLeft.SuspensionStateCoverageComplete = true;
+    ProcessThreadScanResult stableRight = stableLeft;
+    if (!SameThreadSuspensionEvidence(
+            stableLeft,
+            stableRight))
+    {
+        return false;
+    }
+
+    stableRight.Records[1].SuspendCount = 3;
+    if (SameThreadSuspensionEvidence(
+            stableLeft,
+            stableRight))
+    {
+        return false;
+    }
+
+    stableRight = stableLeft;
+    stableRight.Records[1].Ethread =
+        0xffff800000003000ull;
+    if (SameThreadSuspensionEvidence(
+            stableLeft,
+            stableRight))
+    {
+        return false;
+    }
+
+    stableRight = stableLeft;
+    stableRight.Records[1].Ethread =
+        stableRight.Records[0].Ethread;
+    if (SameThreadSuspensionEvidence(
+            stableLeft,
+            stableRight))
+    {
+        return false;
+    }
+
+    HuntProcessRecord duplicate =
+        securityProcess;
+    duplicate.ThreadRecords[1].Ethread =
+        duplicate.ThreadRecords[0].Ethread;
+    HuntResult duplicateResult = {};
+    AddThreadFindings(
+        &duplicateResult,
+        duplicate);
+    if (!duplicateResult.Findings.empty())
+    {
+        return false;
+    }
+
+    stableRight = stableLeft;
+    stableRight.SuspensionStateCoverageComplete =
+        false;
+    return !SameThreadSuspensionEvidence(
+        stableLeft,
+        stableRight);
+}
+
+bool HuntWfpPolicySelfTest()
+{
+    WfpRecord malicious = {};
+    malicious.Kind = L"wfp.filter";
+    malicious.Id = 4242;
+    malicious.Key =
+        L"{00000000-0000-0000-0000-000000000042}";
+    malicious.Name = L"kn-test-security-block";
+    malicious.ActionText = L"Block";
+    malicious.FlagsText =
+        L"persistent|clearActionRight";
+    malicious.WeightText =
+        L"0xffffffffffffffff";
+    malicious.LayerName =
+        L"FWPM_LAYER_ALE_AUTH_CONNECT_V4";
+    malicious.ProviderName =
+        L"kn-test-provider";
+    malicious.HasAppIdCondition = true;
+    malicious.AppIdText =
+        L"\\device\\harddiskvolume3\\mssense.exe";
+
+    HuntResult positive = {};
+    if (!AddWfpFilterRecordFinding(
+            &positive,
+            malicious) ||
+        positive.Findings.size() != 1 ||
+        positive.SuspiciousWfpFilterCount != 1 ||
+        positive.Findings[0].Risk != L"high" ||
+        positive.Findings[0].Confidence != L"high" ||
+        positive.Findings[0].ClassName !=
+            L"network_filter_tampering" ||
+        positive.Findings[0].Evidence[
+            L"target_source"] !=
+            L"app_id_condition")
+    {
+        return false;
+    }
+
+    const std::vector<std::wstring>& reasons =
+        positive.Findings[0].ReasonCodes;
+    static const wchar_t* kExpectedReasons[] =
+    {
+        L"wfp_security_product_block_filter",
+        L"wfp_appid_block_condition",
+        L"wfp_persistent_block_filter",
+        L"wfp_clear_action_right_block",
+        L"wfp_high_weight_block_filter",
+        L"security_tool_communication_blocking"
+    };
+    for (const wchar_t* expected :
+         kExpectedReasons)
+    {
+        if (std::find(
+                reasons.begin(),
+                reasons.end(),
+                expected) == reasons.end())
+        {
+            return false;
+        }
+    }
+
+    WfpRecord bitmaskBlock = malicious;
+    bitmaskBlock.ActionText = L"BitmaskBlock";
+    bitmaskBlock.FlagsText.clear();
+    bitmaskBlock.WeightText = L"1";
+    HuntResult bitmaskResult = {};
+    if (!AddWfpFilterRecordFinding(
+            &bitmaskResult,
+            bitmaskBlock) ||
+        bitmaskResult.Findings.size() != 1)
+    {
+        return false;
+    }
+
+    WfpRecord permit = malicious;
+    permit.ActionText = L"Permit";
+    HuntResult permitResult = {};
+    if (AddWfpFilterRecordFinding(
+            &permitResult,
+            permit) ||
+        !permitResult.Findings.empty())
+    {
+        return false;
+    }
+
+    WfpRecord disabled = malicious;
+    disabled.FlagsText = L"persistent|disabled";
+    HuntResult disabledResult = {};
+    if (AddWfpFilterRecordFinding(
+            &disabledResult,
+            disabled) ||
+        !disabledResult.Findings.empty())
+    {
+        return false;
+    }
+
+    WfpRecord unrelated = malicious;
+    unrelated.AppIdText =
+        L"\\device\\harddiskvolume3\\notepad.exe";
+    HuntResult unrelatedResult = {};
+    if (AddWfpFilterRecordFinding(
+            &unrelatedResult,
+            unrelated) ||
+        !unrelatedResult.Findings.empty())
+    {
+        return false;
+    }
+
+    HuntResult incomplete = {};
+    incomplete.WfpFilterCoverageIncomplete = true;
+    incomplete.CoverageComplete = false;
+    return BuildHuntJson(incomplete).find(
+               L"\"wfp_filter_coverage_incomplete\":true") !=
+        std::wstring::npos;
+}
+
+bool HuntQosPolicySelfTest()
+{
+    QosPolicyRecord malicious = {};
+    malicious.Name = L"kn-test-throttle";
+    malicious.InstanceId =
+        L"{00000000-0000-0000-0000-000000000000}"
+        L"\\kn-test-throttle";
+    malicious.AppPathName = L"MsSense.exe";
+    malicious.HasThrottleRate = true;
+    malicious.ThrottleRateBitsPerSecond = 64;
+    malicious.FromActiveStore = true;
+
+    HuntResult positive = {};
+    if (!AddQosPolicyRecordFinding(
+            &positive,
+            malicious) ||
+        positive.Findings.size() != 1 ||
+        positive.SuspiciousQosPolicyCount != 1 ||
+        positive.Findings[0].Risk != L"high" ||
+        positive.Findings[0].Confidence != L"high" ||
+        positive.Findings[0].ClassName !=
+            L"network_policy_tampering" ||
+        positive.Findings[0].Evidence[
+            L"active_store"] != L"true" ||
+        positive.Findings[0].Evidence[
+            L"throttle_rate_bits_per_second"] != L"64" ||
+        positive.Findings[0].Evidence[
+            L"throttle_rate_bytes_per_second"] != L"8")
+    {
+        return false;
+    }
+
+    QosPolicyRecord unrelated = malicious;
+    unrelated.AppPathName = L"OneDrive.exe";
+    HuntResult unrelatedResult = {};
+    if (AddQosPolicyRecordFinding(
+            &unrelatedResult,
+            unrelated) ||
+        !unrelatedResult.Findings.empty())
+    {
+        return false;
+    }
+
+    QosPolicyRecord ordinaryRate = malicious;
+    ordinaryRate.ThrottleRateBitsPerSecond =
+        1024ull * 1024ull * 8ull;
+    HuntResult ordinaryRateResult = {};
+    if (AddQosPolicyRecordFinding(
+            &ordinaryRateResult,
+            ordinaryRate) ||
+        !ordinaryRateResult.Findings.empty())
+    {
+        return false;
+    }
+
+    QosPolicyRecord missingAction = malicious;
+    missingAction.HasThrottleRate = false;
+    HuntResult missingActionResult = {};
+    return !AddQosPolicyRecordFinding(
+               &missingActionResult,
+               missingAction) &&
+        missingActionResult.Findings.empty();
+}
+
+bool HuntBindFilterMappingSelfTest()
+{
+    if (!BindFilterPathIsUserControlledShape(
+            L"C:\\Users\\Public\\payload.exe") ||
+        !BindFilterPathIsUserControlledShape(
+            L"C:\\ProgramData\\payload.exe") ||
+        !BindFilterPathIsUserControlledShape(
+            L"C:\\Temp\\payload.exe") ||
+        !BindFilterPathIsUserControlledShape(
+            L"C:\\Windows\\Temp\\payload.exe") ||
+        BindFilterPathIsUserControlledShape(
+            L"C:\\Program Files\\Vendor\\Temp\\payload.exe") ||
+        !BindFilterPathIsProtected(
+            L"C:\\Windows\\System32\\amsi.dll") ||
+        BindFilterPathIsProtected(
+            L"C:\\Windows\\System32Evil\\payload.dll") ||
+        BindFilterPathIsProtected(
+            L"C:\\Windows\\System32\\..\\Temp\\payload.dll") ||
+        BindFilterPathIsProtected(
+            L"C:\\Program Files Evil\\payload.dll") ||
+        BindFilterPathIsProtected(
+            L"C:\\Temp\\Windows\\System32\\payload.dll") ||
+        BindFilterPathIsProtected(
+            L"C:\\Temp\\Program Files\\payload.dll") ||
+        BindFilterPathIsWindowsSystem(
+            L"C:\\Windows\\System32\\..\\Temp\\payload.exe"))
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord malicious = {};
+    malicious.VolumeRoot = L"C:\\";
+    malicious.VirtualRoot =
+        L"C:\\Windows\\System32\\amsi.dll";
+    malicious.TargetRoots =
+        {L"C:\\Users\\Public\\amsi.dll"};
+    malicious.Flags = 0x8;
+    std::vector<BindFilterMappingRecord> records =
+        {malicious};
+
+    HuntResult positive = {};
+    if (!AddBindFilterMappingRecordFinding(
+            &positive,
+            malicious,
+            records) ||
+        positive.Findings.size() != 1 ||
+        positive.SuspiciousBindFilterMappingCount !=
+            1 ||
+        positive.Findings[0].Risk != L"high" ||
+        positive.Findings[0].ClassName !=
+            L"filesystem_virtualization_tampering" ||
+        positive.Findings[0].Evidence[
+            L"reparse_on_files"] != L"true")
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord processBinding = {};
+    processBinding.VolumeRoot = L"C:\\";
+    processBinding.VirtualRoot =
+        L"C:\\Windows\\System32\\winver.exe";
+    processBinding.TargetRoots =
+        {L"C:\\Windows\\System32\\cmd.exe"};
+    HuntResult processBindingResult = {};
+    if (!AddBindFilterMappingRecordFinding(
+            &processBindingResult,
+            processBinding,
+            {processBinding}) ||
+        processBindingResult.Findings.empty() ||
+        std::find(
+            processBindingResult.Findings[0].ReasonCodes.begin(),
+            processBindingResult.Findings[0].ReasonCodes.end(),
+            L"bind_link_protected_image_redirect") ==
+            processBindingResult.Findings[0].ReasonCodes.end())
+    {
+        return false;
+    }
+
+    HuntProcessRecord boundProcess = {};
+    boundProcess.ProcessId = 4242;
+    boundProcess.ApiImagePath =
+        processBinding.VirtualRoot;
+    boundProcess.PebImagePath =
+        processBinding.VirtualRoot;
+    boundProcess.DiskPath =
+        processBinding.VirtualRoot;
+    boundProcess.MainImageBase = 0x140000000ull;
+    boundProcess.MainSectionObject =
+        0xffff800000001000ull;
+    boundProcess.MainSectionSegment =
+        0xffff800000002000ull;
+    boundProcess.MainSectionControlArea =
+        0xffff800000003000ull;
+    boundProcess.MainSectionBackingPath =
+        processBinding.TargetRoots[0];
+    boundProcess.MainSectionBackingState =
+        L"resolved";
+    boundProcess.SectionBackingPath =
+        processBinding.TargetRoots[0];
+    boundProcess.SectionBackingState =
+        L"resolved";
+    std::map<uint32_t, HuntProcessRecord>
+        boundProcesses =
+        {
+            {
+                boundProcess.ProcessId,
+                boundProcess
+            }
+        };
+    HuntResult correlated = {};
+    AddBindFilterProcessBindingFindings(
+        &correlated,
+        {processBinding},
+        boundProcesses);
+    if (correlated.Findings.size() != 1 ||
+        correlated.BindFilterProcessBindingCount !=
+            1 ||
+        correlated.Findings[0].Risk != L"high" ||
+        correlated.Findings[0].Confidence !=
+            L"high" ||
+        correlated.Findings[0].ProcessId !=
+            boundProcess.ProcessId ||
+        correlated.Findings[0].Evidence[
+            L"independent_backing_views_agree"] !=
+            L"true" ||
+        std::find(
+            correlated.Findings[0].ReasonCodes.begin(),
+            correlated.Findings[0].ReasonCodes.end(),
+            L"bind_link_process_binding_state") ==
+            correlated.Findings[0].ReasonCodes.end() ||
+        std::find(
+            correlated.Findings[0].ReasonCodes.begin(),
+            correlated.Findings[0].ReasonCodes.end(),
+            L"bind_link_process_backing_correlation") ==
+            correlated.Findings[0].ReasonCodes.end() ||
+        BuildHuntJson(correlated).find(
+            L"\"bindflt_process_bindings\":1") ==
+            std::wstring::npos)
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord rootRelativeBinding =
+        processBinding;
+    rootRelativeBinding.VirtualRoot =
+        L"\\Windows\\System32\\winver.exe";
+    rootRelativeBinding.TargetRoots =
+        {L"\\Windows\\System32\\cmd.exe"};
+    HuntResult rootRelativeCorrelation = {};
+    AddBindFilterProcessBindingFindings(
+        &rootRelativeCorrelation,
+        {rootRelativeBinding},
+        boundProcesses);
+    if (rootRelativeCorrelation.Findings.size() !=
+            1 ||
+        rootRelativeCorrelation.
+                BindFilterProcessBindingCount !=
+            1)
+    {
+        return false;
+    }
+
+    std::vector<wchar_t> cDeviceBuffer(
+        1024,
+        L'\0');
+    if (QueryDosDeviceW(
+            L"C:",
+            cDeviceBuffer.data(),
+            static_cast<DWORD>(
+                cDeviceBuffer.size())) == 0)
+    {
+        return false;
+    }
+    const std::wstring cDevice =
+        cDeviceBuffer.data();
+    BindFilterMappingRecord devicePathBinding =
+        processBinding;
+    devicePathBinding.VirtualRoot =
+        cDevice +
+        L"\\Windows\\System32\\winver.exe";
+    devicePathBinding.TargetRoots =
+        {
+            cDevice +
+            L"\\Windows\\System32\\cmd.exe"
+        };
+    HuntResult devicePathCorrelation = {};
+    AddBindFilterProcessBindingFindings(
+        &devicePathCorrelation,
+        {devicePathBinding},
+        boundProcesses);
+    if (devicePathCorrelation.Findings.size() !=
+            1 ||
+        devicePathCorrelation.
+                BindFilterProcessBindingCount !=
+            1 ||
+        devicePathCorrelation.Findings[0].Evidence[
+            L"resolved_virtual_root"] !=
+            processBinding.VirtualRoot ||
+        devicePathCorrelation.Findings[0].Evidence[
+            L"resolved_target_root"] !=
+            processBinding.TargetRoots[0])
+    {
+        return false;
+    }
+
+    const std::wstring unmappedDevicePath =
+        L"\\Device\\KnLiveDbgMissingVolume"
+        L"\\Windows\\System32\\winver.exe";
+    if (BindFilterPathInVolume(
+            processBinding,
+            unmappedDevicePath) !=
+        unmappedDevicePath)
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord crossVolumeBinding =
+        rootRelativeBinding;
+    crossVolumeBinding.VolumeRoot = L"D:\\";
+    HuntResult crossVolumeCorrelation = {};
+    AddBindFilterProcessBindingFindings(
+        &crossVolumeCorrelation,
+        {crossVolumeBinding},
+        boundProcesses);
+    if (!crossVolumeCorrelation.Findings.empty() ||
+        crossVolumeCorrelation.
+                BindFilterProcessBindingCount !=
+            0 ||
+        !crossVolumeCorrelation.CoverageComplete)
+    {
+        return false;
+    }
+
+    HuntProcessRecord incompleteProcess =
+        boundProcess;
+    incompleteProcess.SectionBackingPath.clear();
+    incompleteProcess.SectionBackingState =
+        L"inaccessible";
+    HuntResult incompleteCorrelation = {};
+    AddBindFilterProcessBindingFindings(
+        &incompleteCorrelation,
+        {processBinding},
+        {
+            {
+                incompleteProcess.ProcessId,
+                incompleteProcess
+            }
+        });
+    if (!incompleteCorrelation.Findings.empty() ||
+        incompleteCorrelation.BindFilterProcessBindingCount != 0 ||
+        !incompleteCorrelation.BindFilterProcessCorrelationCoverageIncomplete ||
+        incompleteCorrelation.CoverageComplete ||
+        BuildHuntJson(incompleteCorrelation).find(
+            L"\"bindflt_process_correlation_coverage_incomplete\":true") ==
+            std::wstring::npos)
+    {
+        return false;
+    }
+
+    HuntProcessRecord conflictingProcess =
+        boundProcess;
+    conflictingProcess.SectionBackingPath =
+        L"C:\\Windows\\System32\\notepad.exe";
+    HuntResult conflictingCorrelation = {};
+    AddBindFilterProcessBindingFindings(
+        &conflictingCorrelation,
+        {processBinding},
+        {
+            {
+                conflictingProcess.ProcessId,
+                conflictingProcess
+            }
+        });
+    if (!conflictingCorrelation.Findings.empty() ||
+        conflictingCorrelation.BindFilterProcessBindingCount != 0 ||
+        conflictingCorrelation.BindFilterProcessCorrelationCoverageIncomplete ||
+        !conflictingCorrelation.CoverageComplete)
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord benign = {};
+    benign.VolumeRoot = L"C:\\";
+    benign.VirtualRoot =
+        L"C:\\Program Files\\WindowsApps\\PackageA";
+    benign.TargetRoots =
+        {L"C:\\Program Files\\WindowsApps\\PackageB"};
+    HuntResult benignResult = {};
+    if (AddBindFilterMappingRecordFinding(
+            &benignResult,
+            benign,
+            {benign}) ||
+        !benignResult.Findings.empty())
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord programFilesImages = {};
+    programFilesImages.VolumeRoot = L"C:\\";
+    programFilesImages.VirtualRoot =
+        L"C:\\Program Files\\Vendor\\Launcher.exe";
+    programFilesImages.TargetRoots =
+        {L"C:\\Program Files\\Vendor\\Helper.exe"};
+    HuntResult programFilesImagesResult = {};
+    if (AddBindFilterMappingRecordFinding(
+            &programFilesImagesResult,
+            programFilesImages,
+            {programFilesImages}) ||
+        !programFilesImagesResult.Findings.empty())
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord nestedTempImages =
+        programFilesImages;
+    nestedTempImages.TargetRoots =
+        {
+            L"C:\\Program Files\\Vendor\\Temp\\Helper.exe"
+        };
+    HuntResult nestedTempImagesResult = {};
+    if (AddBindFilterMappingRecordFinding(
+            &nestedTempImagesResult,
+            nestedTempImages,
+            {nestedTempImages}) ||
+        !nestedTempImagesResult.Findings.empty())
+    {
+        return false;
+    }
+
+    HuntProcessRecord programFilesProcess =
+        boundProcess;
+    programFilesProcess.ApiImagePath =
+        programFilesImages.VirtualRoot;
+    programFilesProcess.PebImagePath =
+        programFilesImages.VirtualRoot;
+    programFilesProcess.DiskPath =
+        programFilesImages.VirtualRoot;
+    programFilesProcess.MainSectionBackingPath =
+        programFilesImages.TargetRoots[0];
+    programFilesProcess.SectionBackingPath =
+        programFilesImages.TargetRoots[0];
+    HuntResult programFilesCorrelation = {};
+    AddBindFilterProcessBindingFindings(
+        &programFilesCorrelation,
+        {programFilesImages},
+        {
+            {
+                programFilesProcess.ProcessId,
+                programFilesProcess
+            }
+        });
+    if (!programFilesCorrelation.Findings.empty() ||
+        programFilesCorrelation.BindFilterProcessBindingCount != 0 ||
+        !programFilesCorrelation.CoverageComplete)
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord sameImageServicing = {};
+    sameImageServicing.VolumeRoot = L"C:\\";
+    sameImageServicing.VirtualRoot =
+        L"C:\\Windows\\System32\\ordinary.exe";
+    sameImageServicing.TargetRoots =
+        {L"C:\\Windows\\WinSxS\\ordinary.exe"};
+    HuntResult sameImageServicingResult = {};
+    if (AddBindFilterMappingRecordFinding(
+            &sameImageServicingResult,
+            sameImageServicing,
+            {sameImageServicing}) ||
+        !sameImageServicingResult.Findings.empty())
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord inverse = {};
+    inverse.VolumeRoot = L"C:\\";
+    inverse.VirtualRoot =
+        L"C:\\Users\\Public\\payload.exe";
+    inverse.TargetRoots =
+        {L"C:\\Windows\\System32\\winver.exe"};
+    BindFilterMappingRecord forward = {};
+    forward.VolumeRoot = L"C:\\";
+    forward.VirtualRoot =
+        L"C:\\Windows\\System32\\winver.exe";
+    forward.TargetRoots =
+        {L"C:\\Users\\Public\\payload.exe"};
+    records = {inverse, forward};
+    HuntResult inverseResult = {};
+    if (!AddBindFilterMappingRecordFinding(
+            &inverseResult,
+            inverse,
+            records) ||
+        inverseResult.Findings.empty() ||
+        std::find(
+            inverseResult.Findings[0].ReasonCodes.begin(),
+            inverseResult.Findings[0].ReasonCodes.end(),
+            L"bind_link_inverse_pair") ==
+            inverseResult.Findings[0].ReasonCodes.end())
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord crossVolumeInverseA = {};
+    crossVolumeInverseA.VolumeRoot = L"C:\\";
+    crossVolumeInverseA.VirtualRoot =
+        L"\\Lab\\source.exe";
+    crossVolumeInverseA.TargetRoots =
+        {L"\\Lab\\target.exe"};
+    BindFilterMappingRecord crossVolumeInverseB = {};
+    crossVolumeInverseB.VolumeRoot = L"D:\\";
+    crossVolumeInverseB.VirtualRoot =
+        L"\\Lab\\target.exe";
+    crossVolumeInverseB.TargetRoots =
+        {L"\\Lab\\source.exe"};
+    if (BindFilterMappingHasInverse(
+            crossVolumeInverseA,
+            {
+                crossVolumeInverseA,
+                crossVolumeInverseB
+            }))
+    {
+        return false;
+    }
+
+    BindFilterMappingRecord unrelated = {};
+    unrelated.VolumeRoot = L"C:\\";
+    unrelated.VirtualRoot =
+        L"C:\\Lab\\source.txt";
+    unrelated.TargetRoots =
+        {L"C:\\Lab\\target.txt"};
+    HuntResult unrelatedResult = {};
+    return !AddBindFilterMappingRecordFinding(
+               &unrelatedResult,
+               unrelated,
+               {unrelated}) &&
+        unrelatedResult.Findings.empty();
+}
+
+bool HuntCloudFilePlaceholderSelfTest()
+{
+    const std::wstring rootRelativeBacking =
+        L"\\fixture\\CloudFilesFixture.exe";
+    if (OpenPathForResolvedBacking(
+            rootRelativeBacking,
+            L"C:\\fixture\\CloudFilesFixture.exe") !=
+            L"C:\\fixture\\CloudFilesFixture.exe" ||
+        OpenPathForResolvedBacking(
+            rootRelativeBacking,
+            L"D:\\other\\CloudFilesFixture.exe") !=
+            rootRelativeBacking)
+    {
+        return false;
+    }
+
+    std::vector<HuntModuleRecord> mergedModules;
+    HuntModuleRecord loaderModule = {};
+    loaderModule.Base = 0x140000000;
+    loaderModule.Size = 45056;
+    loaderModule.Name = L"CloudFilesFixture.exe";
+    loaderModule.Path =
+        L"C:\\fixture\\CloudFilesFixture.exe";
+    loaderModule.ToolhelpSeen = true;
+    mergedModules.push_back(loaderModule);
+
+    HuntModuleRecord vadModule = {};
+    vadModule.Base = loaderModule.Base;
+    vadModule.Size = loaderModule.Size;
+    vadModule.VadSectionSeen = true;
+    vadModule.VadAddress = 0xffff800000001000;
+    vadModule.VadBackingPath =
+        rootRelativeBacking;
+    vadModule.VadBackingState = L"resolved";
+    MergeModule(
+        &mergedModules,
+        vadModule);
+    if (mergedModules.size() != 1 ||
+        mergedModules[0].VadImageSeen ||
+        !IsCloudFileImageCandidate(
+            mergedModules[0]) ||
+        OpenPathForResolvedBacking(
+            mergedModules[0].VadBackingPath,
+            mergedModules[0].Path) !=
+            loaderModule.Path)
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord placeholder = {};
+    placeholder.CloudReparseTag = true;
+    placeholder.IsCloudPlaceholder = true;
+    placeholder.PlaceholderStateAvailable = true;
+    placeholder.PlaceholderInfoAvailable = true;
+    placeholder.MetadataCoverageComplete = true;
+    placeholder.PlaceholderState = 0x00000001;
+    placeholder.InSyncState = 1;
+
+    const CloudFileMappingDecision benign =
+        EvaluateCloudFileMapping(
+            placeholder,
+            true,
+            0,
+            false,
+            {});
+    if (!benign.IsPlaceholder ||
+        benign.EmitFinding ||
+        benign.MetadataCoverageIncomplete ||
+        benign.ProtectionCoverageIncomplete)
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord tagMasked =
+        placeholder;
+    tagMasked.CloudReparseTag = false;
+    tagMasked.PlaceholderInfoIdentificationFallbackUsed =
+        true;
+    const CloudFileMappingDecision metadataIdentified =
+        EvaluateCloudFileMapping(
+            tagMasked,
+            true,
+            0,
+            false,
+            {});
+    if (!metadataIdentified.IsPlaceholder ||
+        metadataIdentified.EmitFinding ||
+        metadataIdentified.MetadataCoverageIncomplete ||
+        metadataIdentified.ProtectionCoverageIncomplete)
+    {
+        return false;
+    }
+
+    const CloudFileMappingDecision protectedImage =
+        EvaluateCloudFileMapping(
+            placeholder,
+            true,
+            0x31,
+            false,
+            {});
+    if (!protectedImage.EmitFinding ||
+        protectedImage.Risk != L"high" ||
+        protectedImage.Confidence != L"high" ||
+        std::find(
+            protectedImage.Reasons.begin(),
+            protectedImage.Reasons.end(),
+            L"cloudfiles_ffi_ppl_image_mapping") ==
+            protectedImage.Reasons.end())
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord modified =
+        placeholder;
+    modified.ModifiedDataSize = 4096;
+    const CloudFileMappingDecision modifiedImage =
+        EvaluateCloudFileMapping(
+            modified,
+            true,
+            0,
+            false,
+            {});
+    if (!modifiedImage.EmitFinding ||
+        modifiedImage.Risk != L"medium" ||
+        modifiedImage.Confidence != L"high" ||
+        std::find(
+            modifiedImage.Reasons.begin(),
+            modifiedImage.Reasons.end(),
+            L"cloudfiles_placeholder_modified_data") ==
+            modifiedImage.Reasons.end())
+    {
+        return false;
+    }
+
+    const CloudFileMappingDecision mismatch =
+        EvaluateCloudFileMapping(
+            placeholder,
+            false,
+            0,
+            true,
+            {L"module_text_mismatch"});
+    if (!mismatch.EmitFinding ||
+        mismatch.ProtectionCoverageIncomplete ||
+        std::find(
+            mismatch.Reasons.begin(),
+            mismatch.Reasons.end(),
+            L"cloudfiles_ffi_live_disk_mismatch") ==
+            mismatch.Reasons.end() ||
+        std::find(
+            mismatch.Reasons.begin(),
+            mismatch.Reasons.end(),
+            L"module_text_mismatch") ==
+            mismatch.Reasons.end())
+    {
+        return false;
+    }
+
+    const CloudFileMappingDecision unresolvedProtection =
+        EvaluateCloudFileMapping(
+            placeholder,
+            false,
+            0,
+            false,
+            {});
+    if (unresolvedProtection.EmitFinding ||
+        !unresolvedProtection.ProtectionCoverageIncomplete)
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord incomplete =
+        placeholder;
+    incomplete.PlaceholderInfoAvailable = false;
+    incomplete.MetadataCoverageComplete = false;
+    const CloudFileMappingDecision incompleteMetadata =
+        EvaluateCloudFileMapping(
+            incomplete,
+            true,
+            0x31,
+            false,
+            {});
+    if (incompleteMetadata.EmitFinding ||
+        !incompleteMetadata.MetadataCoverageIncomplete)
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord syncRootOnly =
+        placeholder;
+    syncRootOnly.PlaceholderState = 0x00000002;
+    const CloudFileMappingDecision notPlaceholder =
+        EvaluateCloudFileMapping(
+            syncRootOnly,
+            true,
+            0x31,
+            false,
+            {});
+    if (notPlaceholder.IsPlaceholder ||
+        notPlaceholder.EmitFinding)
+    {
+        return false;
+    }
+
+    HuntResult jsonResult = {};
+    jsonResult.CloudFilePlaceholderImageCount = 3;
+    jsonResult.SuspiciousCloudFileImageCount = 2;
+    jsonResult.CloudFilePlaceholderCoverageIncomplete =
+        true;
+    jsonResult.CloudFileProtectionCorrelationIncomplete =
+        true;
+    HuntProcessRecord jsonProcess = {};
+    jsonProcess.ProcessId = 42;
+    jsonProcess.HasProtection = true;
+    jsonProcess.Protection = 0x31;
+    jsonResult.Processes.push_back(jsonProcess);
+    HuntCloudFileImageRecord jsonCloud = {};
+    jsonCloud.ProcessId = 42;
+    jsonCloud.ModuleBase = 0x140000000;
+    jsonCloud.ModuleSize = 45056;
+    jsonCloud.ImageName = L"CloudFilesFixture.exe";
+    jsonCloud.ModuleName = L"CloudFilesFixture.exe";
+    jsonCloud.VadBackingPath =
+        L"\\Device\\HarddiskVolume3\\CloudFilesFixture.exe";
+    jsonCloud.NormalizedBackingPath =
+        L"C:\\CloudFilesFixture.exe";
+    jsonCloud.PlaceholderState = 1;
+    jsonCloud.ModifiedDataSize = 33;
+    jsonCloud.InSyncState = 0;
+    jsonCloud.PlaceholderInfoIdentificationFallbackUsed =
+        true;
+    jsonCloud.ProcessProtectionResolved = true;
+    jsonCloud.ProcessProtection = 0;
+    jsonCloud.Suspicious = true;
+    jsonCloud.Reasons =
+    {
+        L"cloudfiles_executable_placeholder_mapping",
+        L"cloudfiles_placeholder_modified_data"
+    };
+    jsonResult.CloudFileImages.push_back(
+        jsonCloud);
+    const std::wstring json =
+        BuildHuntJson(jsonResult);
+    return json.find(
+               L"\"cloudfiles_placeholder_images\":3") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"suspicious_cloudfiles_images\":2") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"cloudfiles_placeholder_coverage_incomplete\":true") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"cloudfiles_protection_correlation_incomplete\":true") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"cloudfiles_images\":[") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"modified_data_size\":33") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"suspicious\":true") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"cloudfiles_placeholder_modified_data\"") !=
+            std::wstring::npos &&
+        json.find(
+            L"\"protection\":{\"raw\":\"0x31\",\"type\":1,\"audit\":0,\"signer\":3}") !=
+            std::wstring::npos;
+}
+
 bool HuntManagedLoaderlessMappingSelfTest()
 {
     HuntModuleRecord mapped = {};
@@ -15580,6 +25315,10 @@ UserModeHunter::UserModeHunter(
 bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::wstring* error)
 {
     bool ok = false;
+    if (error != nullptr)
+    {
+        error->clear();
+    }
 
     do
     {
@@ -15677,30 +25416,247 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 L"Toolhelp process inventory failed without diagnostic detail");
         }
 
-        // Known-PID CID lookup only (not full PspCidTable enumeration).
+        // Seed the legacy known-PID view first so older/unsupported builds
+        // retain bounded evidence. Then derive and validate the CID-table
+        // anchor from both exported CID lookup routines and probe every
+        // process ID below the stable NextHandleNeedingPool bound.
         result->CidTableLookupOnly = true;
         result->CidTableFullEnumeration = false;
+        result->CidTableFullProcessEnumeration =
+            false;
         uint32_t processDtbOffset = 0;
         uint32_t processUserDtbOffset = 0;
-        warning.clear();
-        if (!ApplyCidTableLookupView(
+        uint32_t processActiveLinksOffset = 0;
+        uint32_t processCreateTimeOffset = 0;
+        std::wstring cidLookupWarning;
+        ApplyCidTableLookupView(
                 device_,
                 symbols_,
                 &processes,
-                &warning,
+                &cidLookupWarning,
                 &processDtbOffset,
-                &processUserDtbOffset) &&
-            !warning.empty())
+                &processUserDtbOffset,
+                &processActiveLinksOffset,
+                &processCreateTimeOffset);
+
+        CidProcessEnumerationResult cidEnumeration = {};
+        if (ApplyCidTableFullProcessView(
+                device_,
+                symbols_,
+                processDtbOffset,
+                processUserDtbOffset,
+                processActiveLinksOffset,
+                &processes,
+                &cidEnumeration))
         {
-            result->Warnings.push_back(warning);
+            result->CidTableLookupOnly = false;
+            result->CidTableFullProcessEnumeration =
+                true;
+            result->CidTableAnchorAddress =
+                cidEnumeration.Snapshot.AnchorAddress;
+            result->CidTableAddress =
+                cidEnumeration.Snapshot.TableAddress;
+            result->CidTableCode =
+                cidEnumeration.Snapshot.TableCode;
+            result->CidTableLevel =
+                cidEnumeration.Snapshot.TableLevel;
+            result->CidTableNextHandle =
+                cidEnumeration.Snapshot.NextHandle;
+            result->CidTableAllocatedLeafCount =
+                cidEnumeration.Snapshot.
+                    AllocatedLeafCount;
+            result->CidTableAllocatedHandleCapacity =
+                cidEnumeration.Snapshot.
+                    AllocatedHandleCapacity;
+            result->CidTableProbeCount =
+                cidEnumeration.ProbeCount;
+            result->CidTableProcessCount =
+                cidEnumeration.ProcessCount;
+            result->CidTableDiscoveredProcessCount =
+                cidEnumeration.DiscoveredProcessCount;
+            result->CidTableProbeFailureCount =
+                cidEnumeration.ProbeFailureCount;
+            if (!cidEnumeration.Summary.empty())
+            {
+                result->Warnings.push_back(
+                    cidEnumeration.Summary);
+            }
+
+            warning.clear();
+            if (!RevalidateCidApiProcessViews(
+                    device_,
+                    processDtbOffset,
+                    processUserDtbOffset,
+                    &processes,
+                    &result->
+                        CidTablePersistentApiMissCount,
+                    &warning))
+            {
+                if (!warning.empty())
+                {
+                    result->Warnings.push_back(
+                        warning);
+                }
+                result->ProcessInventoryIncomplete =
+                    true;
+                result->CoverageComplete = false;
+            }
+            if (cidEnumeration.
+                    MembershipIncompleteCount != 0)
+            {
+                result->ProcessInventoryIncomplete =
+                    true;
+                result->CoverageComplete = false;
+            }
         }
-        else if (!warning.empty())
+        else
         {
-            result->Warnings.push_back(warning);
+            result->CidTableProbeCount =
+                cidEnumeration.ProbeCount;
+            result->CidTableProcessCount =
+                cidEnumeration.ProcessCount;
+            result->CidTableProbeFailureCount =
+                cidEnumeration.ProbeFailureCount;
+            if (!cidEnumeration.Summary.empty())
+            {
+                result->Warnings.push_back(
+                    cidEnumeration.Summary);
+            }
+            if (!cidLookupWarning.empty())
+            {
+                result->Warnings.push_back(
+                    cidLookupWarning);
+            }
+            result->Warnings.push_back(
+                L"cid coverage incomplete: full bounded process-CID enumeration was not validated; "
+                L"the fallback can inspect only PIDs seeded by other views");
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
         }
-        result->Warnings.push_back(
-            L"cid coverage: known-PID lookup only; full PspCidTable enumeration is not available "
-            L"(hidden PIDs absent from other views will not be discovered)");
+
+        uint32_t highestKnownPid = 0;
+        for (const auto& item : processes)
+        {
+            highestKnownPid =
+                (std::max)(
+                    highestKnownPid,
+                    item.first);
+        }
+
+        bool directProcessMergeComplete = false;
+        CidDirectEnumerationResult directCidInitial = {};
+        if (processDtbOffset != 0 &&
+            ApplyCidTableDirectObjectView(
+                device_,
+                symbols_,
+                processDtbOffset,
+                processUserDtbOffset,
+                highestKnownPid,
+                &directCidInitial))
+        {
+            result->CidTableDirectEntryEnumeration =
+                true;
+            result->CidTableDirectEntryCount =
+                directCidInitial.NonEmptyEntryCount;
+            result->CidTableDirectProcessCount =
+                directCidInitial.Processes.size();
+            result->CidTableDirectThreadCount =
+                directCidInitial.Threads.size();
+            result->CidTableUnclassifiedEntryCount =
+                directCidInitial.
+                    UnclassifiedEntryCount;
+
+            uint64_t directDiscovered = 0;
+            warning.clear();
+            if (!MergeCidDirectProcessView(
+                    directCidInitial,
+                    &processes,
+                    &directDiscovered,
+                    &warning))
+            {
+                if (!warning.empty())
+                {
+                    result->Warnings.push_back(
+                        warning);
+                }
+                result->ProcessInventoryIncomplete =
+                    true;
+                result->CoverageComplete = false;
+            }
+            else
+            {
+                directProcessMergeComplete = true;
+                result->CidTableDiscoveredProcessCount +=
+                    directDiscovered;
+
+                uint64_t directPersistentApiMisses = 0;
+                warning.clear();
+                if (!RevalidateCidApiProcessViews(
+                        device_,
+                        processDtbOffset,
+                        processUserDtbOffset,
+                        &processes,
+                        &directPersistentApiMisses,
+                        &warning))
+                {
+                    if (!warning.empty())
+                    {
+                        result->Warnings.push_back(
+                            warning);
+                    }
+                    result->ProcessInventoryIncomplete =
+                        true;
+                    result->CoverageComplete = false;
+                }
+                result->CidTablePersistentApiMissCount =
+                    (std::max)(
+                        result->
+                            CidTablePersistentApiMissCount,
+                        directPersistentApiMisses);
+            }
+
+            if (!directCidInitial.Summary.empty())
+            {
+                result->Warnings.push_back(
+                    directCidInitial.Summary);
+            }
+        }
+        else
+        {
+            result->CidTableDirectEntryEnumeration =
+                false;
+            result->CidTableUnclassifiedEntryCount =
+                directCidInitial.
+                    UnclassifiedEntryCount;
+            if (!directCidInitial.Summary.empty())
+            {
+                result->Warnings.push_back(
+                    directCidInitial.Summary);
+            }
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
+        }
+
+        CidEprocessLayout directRevalidationLayout = {};
+        std::wstring directRevalidationWarning;
+        const bool directRevalidationLayoutResolved =
+            directProcessMergeComplete &&
+            ResolveCidEprocessLayout(
+                symbols_,
+                &directRevalidationLayout,
+                &directRevalidationWarning);
+        if (directProcessMergeComplete &&
+            !directRevalidationLayoutResolved)
+        {
+            directProcessMergeComplete = false;
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
+            if (!directRevalidationWarning.empty())
+            {
+                result->Warnings.push_back(
+                    directRevalidationWarning);
+            }
+        }
 
         for (auto& item : processes)
         {
@@ -15726,6 +25682,11 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
 
         ProcessTriageScanner triage(device_, symbols_);
         std::map<std::wstring, FileSha1CacheEntry> processSha1Cache;
+        TypeFieldInfo protectionField = {};
+        const bool protectionFieldResolved =
+            ResolveHuntProcessProtectionField(
+                symbols_,
+                &protectionField);
 
         for (auto& item : processes)
         {
@@ -15739,6 +25700,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             {
                 ProcessAddressContext refreshed = {};
                 std::wstring refreshError;
+                bool refreshedFromDirectAddress = false;
                 if (!device_.ResolveProcess(
                         process.ProcessId,
                         processDtbOffset,
@@ -15746,11 +25708,63 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                         &refreshed,
                         &refreshError))
                 {
-                    process.LifecycleChangedBeforeTriage = true;
-                    AddUnique(
-                        &process.Warnings,
-                        L"process ended before deep triage; stale snapshot evidence was skipped");
-                    continue;
+                    CidEnumeratedProcess directRefreshed = {};
+                    if (process.CidDirectEntrySeen &&
+                        directRevalidationLayoutResolved &&
+                        process.Kernel.Eprocess != 0 &&
+                        process.Kernel.HasCreateTime &&
+                        CaptureCidProcessAtAddress(
+                            device_,
+                            directRevalidationLayout,
+                            processDtbOffset,
+                            processUserDtbOffset,
+                            process.ProcessId,
+                            process.Kernel.Eprocess,
+                            &directRefreshed) &&
+                        directRefreshed.HasCreateTime &&
+                        directRefreshed.CreateTime ==
+                            process.Kernel.CreateTime)
+                    {
+                        refreshed =
+                            directRefreshed.Context;
+                        refreshedFromDirectAddress = true;
+                        process.CidIdentityRevalidated =
+                            true;
+                        process.Kernel.HasExitTime =
+                            directRefreshed.HasExitTime;
+                        process.Kernel.ExitTime =
+                            directRefreshed.ExitTime;
+                        process.Kernel.HasActiveThreads =
+                            directRefreshed.
+                                HasActiveThreads;
+                        process.Kernel.ActiveThreads =
+                            directRefreshed.ActiveThreads;
+                        process.Kernel.HasPeb =
+                            directRefreshed.HasPeb;
+                        process.Kernel.Peb =
+                            directRefreshed.Peb;
+                        if (!directRefreshed.
+                                ImageName.empty())
+                        {
+                            process.Kernel.ImageName =
+                                directRefreshed.ImageName;
+                            process.KernelImageName =
+                                directRefreshed.ImageName;
+                        }
+                        AddUnique(
+                            &process.Warnings,
+                            L"exported process lookup was unavailable; the direct CID EPROCESS identity and address context were revalidated without PsLookupProcessByProcessId");
+                    }
+                    else
+                    {
+                        process.
+                            LifecycleChangedBeforeTriage =
+                                true;
+                        AddUnique(
+                            &process.Warnings,
+                            L"process identity could not be revalidated by either exported lookup or the direct CID EPROCESS address; stale evidence was skipped");
+                        continue;
+                    }
                 }
 
                 process.AddressContextRefreshed = true;
@@ -15767,6 +25781,82 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 process.Kernel.Eprocess = refreshed.Eprocess;
                 process.Kernel.DirectoryTableBase = refreshed.DirectoryTableBase;
                 process.Kernel.UserDirectoryTableBase = refreshed.UserDirectoryTableBase;
+
+                if (process.CidTableDiscovered)
+                {
+                    uint64_t createTimeAddress = 0;
+                    uint64_t currentCreateTime = 0;
+                    if (!process.Kernel.HasCreateTime ||
+                        processCreateTimeOffset == 0 ||
+                        !TryAdd(
+                            refreshed.Eprocess,
+                            processCreateTimeOffset,
+                            &createTimeAddress) ||
+                        !ReadKernelInteger(
+                            device_,
+                            createTimeAddress,
+                            sizeof(uint64_t),
+                            &currentCreateTime,
+                            nullptr) ||
+                        currentCreateTime == 0 ||
+                        currentCreateTime !=
+                            process.Kernel.CreateTime)
+                    {
+                        process.LifecycleChangedBeforeTriage =
+                            true;
+                        AddUnique(
+                            &process.Warnings,
+                            L"full-CID process identity changed before post-view triage");
+                        continue;
+                    }
+                    process.CidIdentityRevalidated =
+                        true;
+
+                    const ActiveProcessLinkMembership
+                        membership =
+                            RevalidateActiveProcessLinks(
+                                device_,
+                                refreshed.Eprocess,
+                                processActiveLinksOffset);
+                    if (membership ==
+                        ActiveProcessLinkMembership::Linked)
+                    {
+                        process.ActiveProcessLinksSeen =
+                            true;
+                        process.ActiveProcessLinksRevalidated =
+                            true;
+                        process.ActiveProcessLinksStableUnlinked =
+                            false;
+                    }
+                    else if (membership ==
+                             ActiveProcessLinkMembership::
+                                 StableUnlinked)
+                    {
+                        process.ActiveProcessLinksSeen =
+                            false;
+                        process.ActiveProcessLinksRevalidated =
+                            true;
+                        process.ActiveProcessLinksStableUnlinked =
+                            true;
+                    }
+                    else
+                    {
+                        process.ActiveProcessLinksRevalidated =
+                            false;
+                        process.ActiveProcessLinksStableUnlinked =
+                            false;
+                        result->ProcessInventoryIncomplete =
+                            true;
+                        result->CoverageComplete = false;
+                        AddUnique(
+                            &process.Warnings,
+                            L"full-CID process ActiveProcessLinks membership changed during post-view revalidation");
+                    }
+                }
+                else if (refreshedFromDirectAddress)
+                {
+                    process.CidIdentityRevalidated = true;
+                }
             }
 
             if (IsTerminatingProcessSnapshot(process.Kernel))
@@ -15783,11 +25873,65 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 &publicLifecycleChanged);
             if (publicLifecycleChanged)
             {
-                process.LifecycleChangedBeforeTriage = true;
-                AddUnique(
-                    &process.Warnings,
-                    L"process exited or its PID was reused before public identity triage; stale evidence was skipped");
-                continue;
+                CidEnumeratedProcess directPublicRecheck = {};
+                const bool directIdentityStillLive =
+                    process.CidDirectEntrySeen &&
+                    directRevalidationLayoutResolved &&
+                    process.Kernel.Eprocess != 0 &&
+                    process.Kernel.HasCreateTime &&
+                    CaptureCidProcessAtAddress(
+                        device_,
+                        directRevalidationLayout,
+                        processDtbOffset,
+                        processUserDtbOffset,
+                        process.ProcessId,
+                        process.Kernel.Eprocess,
+                        &directPublicRecheck) &&
+                    directPublicRecheck.Context.Eprocess ==
+                        process.Kernel.Eprocess &&
+                    directPublicRecheck.HasCreateTime &&
+                    directPublicRecheck.CreateTime ==
+                        process.Kernel.CreateTime &&
+                    directPublicRecheck.HasExitTime &&
+                    directPublicRecheck.ExitTime == 0 &&
+                    directPublicRecheck.HasActiveThreads &&
+                    directPublicRecheck.ActiveThreads != 0;
+                if (directIdentityStillLive)
+                {
+                    process.CidIdentityRevalidated = true;
+                    process.Kernel.DirectoryTableBase =
+                        directPublicRecheck.Context.
+                            DirectoryTableBase;
+                    process.Kernel.UserDirectoryTableBase =
+                        directPublicRecheck.Context.
+                            UserDirectoryTableBase;
+                    process.Kernel.ExitTime =
+                        directPublicRecheck.ExitTime;
+                    process.Kernel.HasExitTime = true;
+                    process.Kernel.ActiveThreads =
+                        directPublicRecheck.ActiveThreads;
+                    process.Kernel.HasActiveThreads = true;
+                    AddUnique(
+                        &process.Warnings,
+                        L"public process-handle identity lookup disagreed with a fresh live direct-CID EPROCESS revalidation");
+                }
+                else
+                {
+                    process.LifecycleChangedBeforeTriage =
+                        true;
+                    AddUnique(
+                        &process.Warnings,
+                        L"process exited or its PID was reused before public identity triage; stale evidence was skipped");
+                    continue;
+                }
+            }
+
+            if (protectionFieldResolved)
+            {
+                ReadHuntProcessProtection(
+                    device_,
+                    protectionField,
+                    &process);
             }
 
             if (HasUnresolvedApiOnlyProcessView(
@@ -15901,6 +26045,10 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                         process);
                 threadOptions.IncludeApc = true;
                 threadOptions.IncludeStacks = options.Mode == HuntMode::Deep;
+                threadOptions.RequireSuspensionCoverage =
+                    HuntTextTargetsKnownSecurityProduct(
+                        BestProcessImageName(process),
+                        nullptr);
 
                 ProcessThreadScanResult threadResult = {};
                 scanError.clear();
@@ -15913,9 +26061,18 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 {
                     process.ThreadRecords = std::move(threadResult.Records);
                     process.ThreadsVisited = threadResult.ThreadsVisited;
+                    process.SuspensionStateResolvedThreads =
+                        threadResult.SuspensionStateResolvedCount;
+                    process.SuspendedThreads =
+                        threadResult.SuspendedThreadCount;
                     process.SuspiciousThreadStarts = threadResult.SuspiciousStartCount;
                     process.NonEmptyApcQueues = threadResult.ApcNonEmptyCount;
                     process.StackReferenceCount = threadResult.StackReferenceCount;
+                    process.ThreadInventoryComplete =
+                        threadResult.InventoryComplete &&
+                        !threadResult.Truncated;
+                    process.ThreadSuspensionStateCoverageComplete =
+                        threadResult.SuspensionStateCoverageComplete;
                     process.Warnings.insert(process.Warnings.end(), threadResult.Warnings.begin(), threadResult.Warnings.end());
                     if (threadResult.Truncated ||
                         threadResult.Incomplete ||
@@ -15931,6 +26088,21 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                         {
                             AddUnique(&process.Warnings, L"thread coverage incomplete for this process");
                         }
+                    }
+                    std::wstring securityTarget;
+                    if (HuntTextTargetsKnownSecurityProduct(
+                            BestProcessImageName(process),
+                            &securityTarget) &&
+                        (!process.ThreadInventoryComplete ||
+                         !process.ThreadSuspensionStateCoverageComplete))
+                    {
+                        result->ProcessTriageCoverageIncomplete =
+                            true;
+                        result->CoverageComplete = false;
+                        AddUnique(
+                            &process.Warnings,
+                            L"security-process suspend/freeze "
+                            L"detection coverage incomplete");
                     }
                     result->ThreadRecordCount += threadResult.MatchingRecords;
                 }
@@ -15979,9 +26151,57 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             result->ModuleRecordCount += process.Modules.size();
         }
 
+        warning.clear();
+        if (directProcessMergeComplete &&
+            ApplyCidThreadCrossView(
+                device_,
+                symbols_,
+                processDtbOffset,
+                processUserDtbOffset,
+                &processes,
+                result,
+                &warning))
+        {
+            result->CidTableLookupOnly = false;
+            result->CidTableFullProcessEnumeration =
+                true;
+            result->CidTableFullEnumeration =
+                result->CidTableDirectEntryEnumeration &&
+                result->CidTableFullThreadEnumeration &&
+                result->
+                    CidTableThreadCrossViewComplete;
+        }
+        else
+        {
+            result->CidTableFullEnumeration = false;
+            result->CidTableFullThreadEnumeration =
+                false;
+            result->CidTableThreadCrossViewComplete =
+                false;
+            result->ProcessInventoryIncomplete = true;
+            result->CoverageComplete = false;
+            if (!warning.empty())
+            {
+                result->Warnings.push_back(
+                    warning);
+            }
+            else if (!directProcessMergeComplete)
+            {
+                result->Warnings.push_back(
+                    L"thread CID cross-view unavailable because the direct process-CID merge was incomplete");
+            }
+        }
+
         if (options.Mode != HuntMode::Quick)
         {
             AddWfpHuntFindings(result);
+            AddQosPolicyHuntFindings(result);
+            AddBindFilterHuntFindings(
+                result,
+                processes);
+            AddCloudFileHuntFindings(
+                result,
+                processes);
         }
 
         if (options.Mode == HuntMode::Deep)
@@ -16016,6 +26236,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L"\"kernel_processes\":" << result.KernelProcessCount;
     json << L",\"system_process_information_processes\":" << result.SystemProcessInfoCount;
     json << L",\"toolhelp_processes\":" << result.ToolhelpProcessCount;
+    json << L",\"system_process_information_threads\":" << result.SystemProcessInfoThreadCount;
+    json << L",\"toolhelp_threads\":" << result.ToolhelpThreadCount;
     json << L",\"scanned_processes\":" << result.ScannedProcessCount;
     json << L",\"findings\":" << result.Findings.size();
     json << L",\"high\":" << result.HighFindings;
@@ -16036,6 +26258,32 @@ std::wstring BuildHuntJson(const HuntResult& result)
          << (result.DriverServiceCoverageIncomplete ? L"true" : L"false");
     json << L",\"wfp_filters\":" << result.WfpFilterCount;
     json << L",\"suspicious_wfp_filters\":" << result.SuspiciousWfpFilterCount;
+    json << L",\"wfp_filter_coverage_incomplete\":"
+         << (result.WfpFilterCoverageIncomplete ? L"true" : L"false");
+    json << L",\"qos_policies\":" << result.QosPolicyCount;
+    json << L",\"suspicious_qos_policies\":" << result.SuspiciousQosPolicyCount;
+    json << L",\"qos_policy_coverage_incomplete\":"
+         << (result.QosPolicyCoverageIncomplete ? L"true" : L"false");
+    json << L",\"bindflt_global_mappings\":"
+         << result.BindFilterMappingCount;
+    json << L",\"suspicious_bindflt_global_mappings\":"
+         << result.SuspiciousBindFilterMappingCount;
+    json << L",\"bindflt_process_bindings\":"
+         << result.BindFilterProcessBindingCount;
+    json << L",\"bindflt_global_coverage_incomplete\":"
+         << (result.BindFilterGlobalCoverageIncomplete ? L"true" : L"false");
+    json << L",\"bindflt_process_correlation_coverage_incomplete\":"
+         << (result.BindFilterProcessCorrelationCoverageIncomplete ? L"true" : L"false");
+    json << L",\"bindflt_silo_coverage_unsupported\":"
+         << (result.BindFilterSiloCoverageUnsupported ? L"true" : L"false");
+    json << L",\"cloudfiles_placeholder_images\":"
+         << result.CloudFilePlaceholderImageCount;
+    json << L",\"suspicious_cloudfiles_images\":"
+         << result.SuspiciousCloudFileImageCount;
+    json << L",\"cloudfiles_placeholder_coverage_incomplete\":"
+         << (result.CloudFilePlaceholderCoverageIncomplete ? L"true" : L"false");
+    json << L",\"cloudfiles_protection_correlation_incomplete\":"
+         << (result.CloudFileProtectionCorrelationIncomplete ? L"true" : L"false");
     json << L",\"threat_intel_active\":" << (result.ThreatIntelActive ? L"true" : L"false");
     json << L",\"threat_intel_available\":" << (result.ThreatIntelAvailable ? L"true" : L"false");
     json << L",\"threat_intel_events\":" << result.ThreatIntelEventCount;
@@ -16043,7 +26291,29 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L",\"threat_intel_correlation_incomplete\":" << (result.ThreatIntelCorrelationIncomplete ? L"true" : L"false");
     json << L",\"process_inventory_incomplete\":" << (result.ProcessInventoryIncomplete ? L"true" : L"false");
     json << L",\"cid_table_full_enumeration\":" << (result.CidTableFullEnumeration ? L"true" : L"false");
+    json << L",\"cid_table_full_process_enumeration\":" << (result.CidTableFullProcessEnumeration ? L"true" : L"false");
+    json << L",\"cid_table_direct_entry_enumeration\":" << (result.CidTableDirectEntryEnumeration ? L"true" : L"false");
+    json << L",\"cid_table_full_thread_enumeration\":" << (result.CidTableFullThreadEnumeration ? L"true" : L"false");
+    json << L",\"cid_table_thread_cross_view_complete\":" << (result.CidTableThreadCrossViewComplete ? L"true" : L"false");
     json << L",\"cid_table_lookup_only\":" << (result.CidTableLookupOnly ? L"true" : L"false");
+    json << L",\"cid_table_anchor\":\"" << HuntHex(result.CidTableAnchorAddress, 16) << L"\"";
+    json << L",\"cid_table_address\":\"" << HuntHex(result.CidTableAddress, 16) << L"\"";
+    json << L",\"cid_table_code\":\"" << HuntHex(result.CidTableCode, 16) << L"\"";
+    json << L",\"cid_table_level\":" << result.CidTableLevel;
+    json << L",\"cid_table_next_handle\":" << result.CidTableNextHandle;
+    json << L",\"cid_table_allocated_leaves\":" << result.CidTableAllocatedLeafCount;
+    json << L",\"cid_table_allocated_handle_capacity\":" << result.CidTableAllocatedHandleCapacity;
+    json << L",\"cid_table_probes\":" << result.CidTableProbeCount;
+    json << L",\"cid_table_processes\":" << result.CidTableProcessCount;
+    json << L",\"cid_table_discovered_processes\":" << result.CidTableDiscoveredProcessCount;
+    json << L",\"cid_table_direct_entries\":" << result.CidTableDirectEntryCount;
+    json << L",\"cid_table_direct_processes\":" << result.CidTableDirectProcessCount;
+    json << L",\"cid_table_direct_threads\":" << result.CidTableDirectThreadCount;
+    json << L",\"cid_table_unclassified_entries\":" << result.CidTableUnclassifiedEntryCount;
+    json << L",\"cid_table_thread_findings\":" << result.CidTableThreadFindingCount;
+    json << L",\"cid_table_persistent_thread_view_misses\":" << result.CidTablePersistentThreadViewMissCount;
+    json << L",\"cid_table_probe_failures\":" << result.CidTableProbeFailureCount;
+    json << L",\"cid_table_persistent_api_misses\":" << result.CidTablePersistentApiMissCount;
     json << L",\"process_triage_coverage_incomplete\":" << (result.ProcessTriageCoverageIncomplete ? L"true" : L"false");
     json << L",\"deep_image_comparison_coverage_incomplete\":"
          << (result.DeepImageComparisonCoverageIncomplete ? L"true" : L"false");
@@ -16092,6 +26362,204 @@ std::wstring BuildHuntJson(const HuntResult& result)
     }
     json << L"  ],\n";
 
+    json << L"  \"cloudfiles_images\":[\n";
+    for (size_t index = 0;
+         index < result.CloudFileImages.size();
+         ++index)
+    {
+        const HuntCloudFileImageRecord& record =
+            result.CloudFileImages[index];
+        json << L"    {";
+        json << L"\"pid\":" << record.ProcessId;
+        json << L",\"module_base\":\""
+             << HuntHex(record.ModuleBase, 16)
+             << L"\"";
+        json << L",\"module_size\":"
+             << record.ModuleSize;
+        json << L",\"image\":\""
+             << HuntJsonEscape(record.ImageName)
+             << L"\"";
+        json << L",\"module\":\""
+             << HuntJsonEscape(record.ModuleName)
+             << L"\"";
+        json << L",\"vad_backing_path\":\""
+             << HuntJsonEscape(
+                    record.VadBackingPath)
+             << L"\"";
+        json << L",\"normalized_backing_path\":\""
+             << HuntJsonEscape(
+                    record.NormalizedBackingPath)
+             << L"\"";
+        json << L",\"file_attributes\":\""
+             << HuntHex(record.FileAttributes, 8)
+             << L"\"";
+        json << L",\"reparse_tag\":\""
+             << HuntHex(record.ReparseTag, 8)
+             << L"\"";
+        json << L",\"cloud_reparse_tag_observed\":"
+             << (record.CloudReparseTagObserved
+                     ? L"true"
+                     : L"false");
+        json << L",\"placeholder_info_identification_fallback_used\":"
+             << (record.
+                         PlaceholderInfoIdentificationFallbackUsed
+                     ? L"true"
+                     : L"false");
+        json << L",\"placeholder_info_query_status\":\""
+             << HuntHex(
+                    record.PlaceholderInfoQueryStatus,
+                    8)
+             << L"\"";
+        json << L",\"placeholder_state\":\""
+             << HuntHex(record.PlaceholderState, 8)
+             << L"\"";
+        json << L",\"on_disk_data_size\":"
+             << record.OnDiskDataSize;
+        json << L",\"validated_data_size\":"
+             << record.ValidatedDataSize;
+        json << L",\"modified_data_size\":"
+             << record.ModifiedDataSize;
+        json << L",\"properties_size\":"
+             << record.PropertiesSize;
+        json << L",\"pin_state\":"
+             << record.PinState;
+        json << L",\"in_sync_state\":"
+             << record.InSyncState;
+        json << L",\"file_identity_length\":"
+             << record.FileIdentityLength;
+        json << L",\"process_protection_resolved\":"
+             << (record.ProcessProtectionResolved
+                     ? L"true"
+                     : L"false");
+        json << L",\"process_protection\":";
+        if (record.ProcessProtectionResolved)
+        {
+            json << L"\""
+                 << HuntHex(
+                        record.ProcessProtection,
+                        2)
+                 << L"\"";
+        }
+        else
+        {
+            json << L"null";
+        }
+        json << L",\"deep_mismatch_correlated\":"
+             << (record.DeepMismatchCorrelated
+                     ? L"true"
+                     : L"false");
+        json << L",\"suspicious\":"
+             << (record.Suspicious
+                     ? L"true"
+                     : L"false");
+        json << L",\"reasons\":";
+        AppendJsonStringArray(
+            json,
+            record.Reasons);
+        json << L"}";
+        if (index + 1 !=
+            result.CloudFileImages.size())
+        {
+            json << L",";
+        }
+        json << L"\n";
+    }
+    json << L"  ],\n";
+
+    json << L"  \"cid_threads\":[\n";
+    for (size_t index = 0;
+         index < result.CidThreads.size();
+         ++index)
+    {
+        const HuntCidThreadRecord& record =
+            result.CidThreads[index];
+        json << L"    {";
+        json << L"\"tid\":" << record.ThreadId;
+        json << L",\"pid\":" << record.ProcessId;
+        json << L",\"object_header\":\""
+             << HuntHex(record.ObjectHeader, 16)
+             << L"\"";
+        json << L",\"ethread\":\""
+             << HuntHex(record.Ethread, 16)
+             << L"\"";
+        json << L",\"eprocess\":\""
+             << HuntHex(record.Eprocess, 16)
+             << L"\"";
+        json << L",\"create_time\":";
+        if (record.HasCreateTime)
+        {
+            json << L"\""
+                 << HuntHex(record.CreateTime, 16)
+                 << L"\"";
+        }
+        else
+        {
+            json << L"null";
+        }
+        json << L",\"exit_time\":";
+        if (record.HasExitTime)
+        {
+            json << L"\""
+                 << HuntHex(record.ExitTime, 16)
+                 << L"\"";
+        }
+        else
+        {
+            json << L"null";
+        }
+        json << L",\"terminated\":"
+             << (record.Terminated
+                     ? L"true"
+                     : L"false");
+        json << L",\"direct_cid_seen\":"
+             << (record.DirectCidSeen
+                     ? L"true"
+                     : L"false");
+        json << L",\"executive_thread_list_seen\":"
+             << (record.ExecutiveThreadListSeen
+                     ? L"true"
+                     : L"false");
+        json << L",\"scheduler_thread_list_seen\":"
+             << (record.SchedulerThreadListSeen
+                     ? L"true"
+                     : L"false");
+        json << L",\"system_process_information_seen\":"
+             << (record.SystemProcessInformationSeen
+                     ? L"true"
+                     : L"false");
+        json << L",\"toolhelp_seen\":"
+             << (record.ToolhelpThreadSeen
+                     ? L"true"
+                     : L"false");
+        json << L",\"identity_revalidated\":"
+             << (record.IdentityRevalidated
+                     ? L"true"
+                     : L"false");
+        json << L",\"views_revalidated\":"
+             << (record.ViewsRevalidated
+                     ? L"true"
+                     : L"false");
+        json << L",\"lifecycle_changed\":"
+             << (record.LifecycleChanged
+                     ? L"true"
+                     : L"false");
+        json << L",\"suspicious\":"
+             << (record.Suspicious
+                     ? L"true"
+                     : L"false");
+        json << L",\"reasons\":";
+        AppendJsonStringArray(json, record.Reasons);
+        json << L",\"warnings\":";
+        AppendJsonStringArray(json, record.Warnings);
+        json << L"}";
+        if (index + 1 != result.CidThreads.size())
+        {
+            json << L",";
+        }
+        json << L"\n";
+    }
+    json << L"  ],\n";
+
     json << L"  \"processes\":[\n";
     for (size_t index = 0; index < result.Processes.size(); ++index)
     {
@@ -16127,6 +26595,23 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"toolhelp_seen\":" << (process.ToolhelpProcessSeen ? L"true" : L"false");
         json << L",\"address_context_refreshed\":" << (process.AddressContextRefreshed ? L"true" : L"false");
         json << L",\"lifecycle_changed_before_triage\":" << (process.LifecycleChangedBeforeTriage ? L"true" : L"false");
+        json << L",\"protection\":";
+        if (process.HasProtection)
+        {
+            json << L"{\"raw\":\""
+                 << HuntHex(process.Protection, 2)
+                 << L"\",\"type\":"
+                 << (process.Protection & 0x7u)
+                 << L",\"audit\":"
+                 << ((process.Protection >> 3) & 0x1u)
+                 << L",\"signer\":"
+                 << ((process.Protection >> 4) & 0xfu)
+                 << L"}";
+        }
+        else
+        {
+            json << L"null";
+        }
         json << L",\"cid_table_seen\":";
         if (process.HasCidTableView)
         {
@@ -16136,6 +26621,12 @@ std::wstring BuildHuntJson(const HuntResult& result)
         {
             json << L"null";
         }
+        json << L",\"cid_table_enumerated\":" << (process.CidTableEnumerated ? L"true" : L"false");
+        json << L",\"cid_table_discovered\":" << (process.CidTableDiscovered ? L"true" : L"false");
+        json << L",\"cid_direct_entry_seen\":" << (process.CidDirectEntrySeen ? L"true" : L"false");
+        json << L",\"cid_lookup_direct_agreed\":" << (process.CidLookupDirectAgreed ? L"true" : L"false");
+        json << L",\"cid_api_views_revalidated\":" << (process.CidApiViewsRevalidated ? L"true" : L"false");
+        json << L",\"cid_identity_revalidated\":" << (process.CidIdentityRevalidated ? L"true" : L"false");
         json << L",\"image_name\":\"" << HuntJsonEscape(process.KernelImageName) << L"\"";
         json << L",\"system_process_image\":\"" << HuntJsonEscape(process.SystemProcessImageName) << L"\"";
         json << L",\"toolhelp_image\":\"" << HuntJsonEscape(process.ToolhelpImageName) << L"\"";
@@ -16246,6 +26737,14 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"paging_levels\":" << process.PagingLevels;
         json << L",\"vad_scan_attempts\":" << process.VadScanAttempts;
         json << L",\"thread_scan_attempts\":" << process.ThreadScanAttempts;
+        json << L",\"thread_inventory_complete\":"
+             << (process.ThreadInventoryComplete ? L"true" : L"false");
+        json << L",\"thread_suspension_state_coverage_complete\":"
+             << (process.ThreadSuspensionStateCoverageComplete ? L"true" : L"false");
+        json << L",\"suspension_state_resolved_threads\":"
+             << process.SuspensionStateResolvedThreads;
+        json << L",\"suspended_threads\":"
+             << process.SuspendedThreads;
         json << L",\"suspicious_thread_starts\":" << process.SuspiciousThreadStarts;
         json << L",\"nonempty_apc_queues\":" << process.NonEmptyApcQueues;
         json << L",\"stack_references\":" << process.StackReferenceCount;

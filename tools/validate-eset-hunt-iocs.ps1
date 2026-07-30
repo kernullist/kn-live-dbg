@@ -985,12 +985,15 @@ Test-RequiredText -Text $hunter -Needle "main_section_object_file_section_object
 Test-RequiredText -Text $hunter -Needle "module_stomping_permission_evidence" -Name "hunt module-stomping permission evidence reason" -Failures $failures
 Test-RequiredText -Text $hunter -Needle "module_entrypoint_write_permission_drift" -Name "hunt module entrypoint write drift reason" -Failures $failures
 Test-RequiredText -Text $hunter -Needle "AddWfpHuntFindings" -Name "hunt WFP integration" -Failures $failures
+Test-RequiredText -Text $hunter -Needle "bool HuntWfpPolicySelfTest()" -Name "hunt WFP policy positive and negative controls" -Failures $failures
 Test-RequiredText -Text $hunter -Needle "security_tool_communication_blocking" -Name "hunt WFP communication-blocking reason" -Failures $failures
 Test-RequiredText -Text $hunter -Needle "wfp_security_product_block_filter" -Name "hunt WFP security-product block reason" -Failures $failures
 Test-RequiredText -Text $hunter -Needle "wfp_anticheat_block_filter" -Name "hunt WFP anti-cheat block reason" -Failures $failures
 Test-RequiredText -Text $hunter -Needle "wfp_appid_block_condition" -Name "hunt WFP AppId block reason" -Failures $failures
 Test-RequiredText -Text $hunter -Needle '\"suspicious_wfp_filters\"' -Name "hunt JSON suspicious WFP summary" -Failures $failures
+Test-RequiredText -Text $hunter -Needle '\"wfp_filter_coverage_incomplete\"' -Name "hunt JSON WFP coverage state" -Failures $failures
 Test-RequiredText -Text $wfpScannerHeader -Needle "AppIdText" -Name "WFP record AppId field" -Failures $failures
+Test-RequiredText -Text $wfpScannerHeader -Needle "bool WfpScannerSelfTest();" -Name "WFP parser self-test contract" -Failures $failures
 Test-RequiredText -Text $wfpScannerHeader -Needle "ConditionsText" -Name "WFP record condition text field" -Failures $failures
 Test-RequiredText -Text $wfpScanner -Needle "FWPM_CONDITION_ALE_APP_ID" -Name "WFP ALE AppId condition decoder" -Failures $failures
 Test-RequiredText -Text $wfpScanner -Needle "FormatFilterConditionsText" -Name "WFP filter condition formatter" -Failures $failures

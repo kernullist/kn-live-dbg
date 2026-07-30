@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <sstream>
 #include <utility>
@@ -613,8 +614,12 @@ namespace
             {
                 size_t charCount = blob->size / sizeof(wchar_t);
                 std::wstring candidate(
-                    reinterpret_cast<const wchar_t*>(blob->data),
-                    reinterpret_cast<const wchar_t*>(blob->data) + charCount);
+                    charCount,
+                    L'\0');
+                std::memcpy(
+                    candidate.data(),
+                    blob->data,
+                    blob->size);
 
                 while (!candidate.empty() && candidate.back() == L'\0')
                 {
@@ -622,6 +627,11 @@ namespace
                 }
 
                 size_t printable = 0;
+                const bool embeddedNull =
+                    std::find(
+                        candidate.begin(),
+                        candidate.end(),
+                        L'\0') != candidate.end();
                 for (wchar_t ch : candidate)
                 {
                     if (ch == L'\\' ||
@@ -637,7 +647,10 @@ namespace
                     }
                 }
 
-                if (!candidate.empty() && printable * 2 >= candidate.size())
+                if (!candidate.empty() &&
+                    !embeddedNull &&
+                    printable >=
+                        (candidate.size() + 1) / 2)
                 {
                     text = candidate;
                     break;
@@ -1277,6 +1290,10 @@ WfpScanner::WfpScanner()
 bool WfpScanner::Scan(const Options& options, WfpScanResult* result, std::wstring* error)
 {
     bool ok = false;
+    if (error != nullptr)
+    {
+        error->clear();
+    }
 
     do
     {
@@ -1829,4 +1846,78 @@ std::wstring BuildWfpJson(const WfpScanResult& result)
     out += L"]}";
 
     return out;
+}
+
+bool WfpScannerSelfTest()
+{
+    const std::wstring expected =
+        L"\\device\\harddiskvolume3\\mssense.exe";
+    std::vector<uint8_t> unalignedStorage(
+        1 +
+            (expected.size() + 1) *
+                sizeof(wchar_t),
+        0);
+    std::memcpy(
+        unalignedStorage.data() + 1,
+        expected.data(),
+        expected.size() * sizeof(wchar_t));
+    FWP_BYTE_BLOB unaligned = {};
+    unaligned.size =
+        static_cast<UINT32>(
+            (expected.size() + 1) *
+            sizeof(wchar_t));
+    unaligned.data =
+        unalignedStorage.data() + 1;
+    if (FormatByteBlobText(&unaligned) !=
+        expected)
+    {
+        return false;
+    }
+
+    const std::wstring prefix =
+        L"mssense.exe";
+    const std::wstring suffix =
+        L"ignored.exe";
+    std::vector<uint8_t> ambiguous(
+        (prefix.size() + 1 +
+         suffix.size()) *
+            sizeof(wchar_t),
+        0);
+    std::memcpy(
+        ambiguous.data(),
+        prefix.data(),
+        prefix.size() * sizeof(wchar_t));
+    std::memcpy(
+        ambiguous.data() +
+            (prefix.size() + 1) *
+                sizeof(wchar_t),
+        suffix.data(),
+        suffix.size() * sizeof(wchar_t));
+    FWP_BYTE_BLOB embeddedNull = {};
+    embeddedNull.size =
+        static_cast<UINT32>(
+            ambiguous.size());
+    embeddedNull.data =
+        ambiguous.data();
+    const std::wstring ambiguousText =
+        FormatByteBlobText(
+            &embeddedNull);
+    if (ambiguousText.compare(
+            0,
+            4,
+            L"hex:") != 0)
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> oddBytes =
+        {0x41, 0x00, 0x42};
+    FWP_BYTE_BLOB odd = {};
+    odd.size =
+        static_cast<UINT32>(
+            oddBytes.size());
+    odd.data =
+        oddBytes.data();
+    return FormatByteBlobText(&odd) ==
+        L"hex:410042";
 }

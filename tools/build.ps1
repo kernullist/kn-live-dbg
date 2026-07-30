@@ -12,6 +12,8 @@ $exePath = Join-Path $repo "x64\$Configuration\KnLiveDbg.exe"
 $sysPath = Join-Path $repo "x64\$Configuration\KnLiveDbg.sys"
 $probeSysPath = Join-Path $repo "x64\$Configuration\KnLiveDbgProbe.sys"
 $byovdFixtureSysPath = Join-Path $repo "x64\$Configuration\amdryzenmasterdriver.sys"
+$minifilterFixtureSysPath = Join-Path $repo "x64\$Configuration\KnLiveDbgMiniFilterFixture.sys"
+$bindFixtureExePath = Join-Path $repo "x64\$Configuration\KnLiveDbgBindFixture.exe"
 $outputDir = Join-Path $repo "x64\$Configuration"
 $vendorDebuggersDir = Join-Path $repo "vendor\debugging-tools\x64"
 $stateDir = Join-Path $repo ".build"
@@ -587,11 +589,14 @@ if ($LASTEXITCODE -ne 0)
 Assert-PEVersion -Path $exePath -Parts $versionParts
 Assert-PEVersion -Path $sysPath -Parts $versionParts
 Assert-PEVersion -Path $probeSysPath -Parts $versionParts
+Assert-PEVersion -Path $minifilterFixtureSysPath -Parts $versionParts
+Assert-PEVersion -Path $bindFixtureExePath -Parts $versionParts
 Assert-ByovdFixtureMetadata -Path $byovdFixtureSysPath
 
 Assert-DriverSignature -Path $sysPath
 Assert-DriverSignature -Path $probeSysPath
 Assert-DriverSignature -Path $byovdFixtureSysPath
+Assert-DriverSignature -Path $minifilterFixtureSysPath
 
 $runtimeSourceDir = $vendorDebuggersDir
 if (-not (Test-Path (Join-Path $runtimeSourceDir "dbghelp.dll")) -or
@@ -614,4 +619,6 @@ Write-Host "EXE: $exePath"
 Write-Host "SYS: $sysPath"
 Write-Host "PROBE SYS: $probeSysPath"
 Write-Host "BYOVD FIXTURE SYS: $byovdFixtureSysPath"
+Write-Host "MINIFILTER FIXTURE SYS: $minifilterFixtureSysPath"
+Write-Host "BIND FIXTURE EXE: $bindFixtureExePath"
 Write-Host "Version state: $statePath"

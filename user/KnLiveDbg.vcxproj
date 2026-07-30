@@ -70,7 +70,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -94,7 +94,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -104,8 +104,10 @@
     <ClCompile Include="AddressInspector.cpp" />
     <ClCompile Include="AiProvider.cpp" />
     <ClCompile Include="AlpcScanner.cpp" />
+    <ClCompile Include="BindFilterScanner.cpp" />
     <ClCompile Include="ByovdScanner.cpp" />
     <ClCompile Include="CallbackScanner.cpp" />
+    <ClCompile Include="CloudFileScanner.cpp" />
     <ClCompile Include="CommandRegistry.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
     <ClCompile Include="DeviceClient.cpp" />
@@ -121,8 +123,10 @@
     <ClCompile Include="McpServer.cpp" />
     <ClCompile Include="McpSelfTest.cpp" />
     <ClCompile Include="MemoryDumper.cpp" />
+    <ClCompile Include="MinifilterAttachmentScanner.cpp" />
     <ClCompile Include="PoolPeHunter.cpp" />
     <ClCompile Include="ProcessTriageScanner.cpp" />
+    <ClCompile Include="QosPolicyScanner.cpp" />
     <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
     <ClCompile Include="TimelineDashboard.cpp" />
@@ -153,8 +157,10 @@
     <ClInclude Include="AddressInspector.h" />
     <ClInclude Include="AiProvider.h" />
     <ClInclude Include="AlpcScanner.h" />
+    <ClInclude Include="BindFilterScanner.h" />
     <ClInclude Include="ByovdScanner.h" />
     <ClInclude Include="CallbackScanner.h" />
+    <ClInclude Include="CloudFileScanner.h" />
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />
@@ -173,8 +179,10 @@
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="NmiScanner.h" />
     <ClInclude Include="MemoryDumper.h" />
+    <ClInclude Include="MinifilterAttachmentScanner.h" />
     <ClInclude Include="PoolPeHunter.h" />
     <ClInclude Include="ProcessTriageScanner.h" />
+    <ClInclude Include="QosPolicyScanner.h" />
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="TimelineDashboard.h" />

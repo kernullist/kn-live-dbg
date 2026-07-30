@@ -49,6 +49,18 @@ function Test-JsonInteger
     }
 }
 
+function Test-JsonNonzeroHex64
+{
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    return $Value -is [string] -and
+        [string]$Value -match '^0x[0-9a-fA-F]{16}$' -and
+        [string]$Value -notmatch '^0x0{16}$'
+}
+
 function Get-FindingFingerprint
 {
     param(
@@ -119,13 +131,55 @@ if ($null -ne $document)
             "kernel_processes",
             "system_process_information_processes",
             "toolhelp_processes",
+            "system_process_information_threads",
+            "toolhelp_threads",
             "scanned_processes",
             "findings",
             "high",
             "medium",
             "low",
             "info",
+            "wfp_filters",
+            "suspicious_wfp_filters",
+            "qos_policies",
+            "suspicious_qos_policies",
+            "bindflt_global_mappings",
+            "suspicious_bindflt_global_mappings",
+            "bindflt_process_bindings",
+            "cloudfiles_placeholder_images",
+            "suspicious_cloudfiles_images",
+            "wfp_filter_coverage_incomplete",
+            "qos_policy_coverage_incomplete",
+            "bindflt_global_coverage_incomplete",
+            "bindflt_process_correlation_coverage_incomplete",
+            "bindflt_silo_coverage_unsupported",
+            "cloudfiles_placeholder_coverage_incomplete",
+            "cloudfiles_protection_correlation_incomplete",
             "process_inventory_incomplete",
+            "cid_table_full_enumeration",
+            "cid_table_full_process_enumeration",
+            "cid_table_direct_entry_enumeration",
+            "cid_table_full_thread_enumeration",
+            "cid_table_thread_cross_view_complete",
+            "cid_table_lookup_only",
+            "cid_table_anchor",
+            "cid_table_address",
+            "cid_table_code",
+            "cid_table_level",
+            "cid_table_next_handle",
+            "cid_table_allocated_leaves",
+            "cid_table_allocated_handle_capacity",
+            "cid_table_probes",
+            "cid_table_processes",
+            "cid_table_discovered_processes",
+            "cid_table_direct_entries",
+            "cid_table_direct_processes",
+            "cid_table_direct_threads",
+            "cid_table_unclassified_entries",
+            "cid_table_thread_findings",
+            "cid_table_persistent_thread_view_misses",
+            "cid_table_probe_failures",
+            "cid_table_persistent_api_misses",
             "process_triage_coverage_incomplete",
             "deep_image_comparison_coverage_incomplete",
             "driver_service_coverage_incomplete",
@@ -146,12 +200,38 @@ if ($null -ne $document)
             "kernel_processes",
             "system_process_information_processes",
             "toolhelp_processes",
+            "system_process_information_threads",
+            "toolhelp_threads",
             "scanned_processes",
             "findings",
             "high",
             "medium",
             "low",
-            "info"
+            "info",
+            "wfp_filters",
+            "suspicious_wfp_filters",
+            "qos_policies",
+            "suspicious_qos_policies",
+            "bindflt_global_mappings",
+            "suspicious_bindflt_global_mappings",
+            "bindflt_process_bindings",
+            "cloudfiles_placeholder_images",
+            "suspicious_cloudfiles_images",
+            "cid_table_level",
+            "cid_table_next_handle",
+            "cid_table_allocated_leaves",
+            "cid_table_allocated_handle_capacity",
+            "cid_table_probes",
+            "cid_table_processes",
+            "cid_table_discovered_processes",
+            "cid_table_direct_entries",
+            "cid_table_direct_processes",
+            "cid_table_direct_threads",
+            "cid_table_unclassified_entries",
+            "cid_table_thread_findings",
+            "cid_table_persistent_thread_view_misses",
+            "cid_table_probe_failures",
+            "cid_table_persistent_api_misses"
         )
         foreach ($field in $numericSummaryFields)
         {
@@ -167,10 +247,48 @@ if ($null -ne $document)
             }
         }
 
+        foreach ($pair in @(
+            @("suspicious_wfp_filters", "wfp_filters"),
+            @("suspicious_qos_policies", "qos_policies"),
+            @("suspicious_bindflt_global_mappings", "bindflt_global_mappings"),
+            @("suspicious_cloudfiles_images", "cloudfiles_placeholder_images")
+        ))
+        {
+            $subset = $pair[0]
+            $total = $pair[1]
+            if ((Test-JsonInteger -Value $document.summary.$subset) -and
+                (Test-JsonInteger -Value $document.summary.$total) -and
+                [int64]$document.summary.$subset -gt
+                    [int64]$document.summary.$total)
+            {
+                Add-Failure -Failures $failures -Message (
+                    "summary.$subset=$($document.summary.$subset) exceeds " +
+                    "summary.$total=$($document.summary.$total)")
+            }
+        }
+
+        foreach ($field in @(
+            "suspicious_wfp_filters",
+            "suspicious_qos_policies",
+            "suspicious_bindflt_global_mappings",
+            "bindflt_process_bindings",
+            "suspicious_cloudfiles_images"
+        ))
+        {
+            if ((Test-JsonInteger -Value $document.summary.$field) -and
+                [int64]$document.summary.$field -ne 0)
+            {
+                Add-Failure -Failures $failures -Message (
+                    "summary.$field=$($document.summary.$field), expected 0")
+            }
+        }
+
         foreach ($field in @(
             "kernel_processes",
             "system_process_information_processes",
             "toolhelp_processes",
+            "system_process_information_threads",
+            "toolhelp_threads",
             "scanned_processes"
         ))
         {
@@ -188,6 +306,19 @@ if ($null -ne $document)
             "process_triage_coverage_incomplete",
             "deep_image_comparison_coverage_incomplete",
             "driver_service_coverage_incomplete",
+            "wfp_filter_coverage_incomplete",
+            "qos_policy_coverage_incomplete",
+            "bindflt_global_coverage_incomplete",
+            "bindflt_process_correlation_coverage_incomplete",
+            "bindflt_silo_coverage_unsupported",
+            "cloudfiles_placeholder_coverage_incomplete",
+            "cloudfiles_protection_correlation_incomplete",
+            "cid_table_full_enumeration",
+            "cid_table_full_process_enumeration",
+            "cid_table_direct_entry_enumeration",
+            "cid_table_full_thread_enumeration",
+            "cid_table_thread_cross_view_complete",
+            "cid_table_lookup_only",
             "threat_intel_active",
             "threat_intel_available",
             "threat_intel_correlation_incomplete"
@@ -206,10 +337,145 @@ if ($null -ne $document)
             Add-Failure -Failures $failures -Message "summary.coverage_complete is false"
         }
         foreach ($field in @(
+            "cid_table_anchor",
+            "cid_table_address",
+            "cid_table_code"
+        ))
+        {
+            if ($null -ne $document.summary.PSObject.Properties[$field] -and
+                -not (Test-JsonNonzeroHex64 -Value $document.summary.$field))
+            {
+                Add-Failure -Failures $failures -Message "summary.$field must be a nonzero 16-digit hexadecimal string"
+            }
+        }
+        if ($document.summary.cid_table_full_enumeration -is [bool] -and
+            -not $document.summary.cid_table_full_enumeration)
+        {
+            Add-Failure -Failures $failures -Message (
+                "complete direct process-and-thread CID enumeration is required")
+        }
+        if ($document.summary.cid_table_full_process_enumeration -is [bool] -and
+            -not $document.summary.cid_table_full_process_enumeration)
+        {
+            Add-Failure -Failures $failures -Message "full bounded process-CID enumeration is required"
+        }
+        foreach ($field in @(
+            "cid_table_direct_entry_enumeration",
+            "cid_table_full_thread_enumeration",
+            "cid_table_thread_cross_view_complete"
+        ))
+        {
+            if ($document.summary.$field -is [bool] -and
+                -not $document.summary.$field)
+            {
+                Add-Failure -Failures $failures -Message "summary.$field must be true"
+            }
+        }
+        if ($document.summary.cid_table_lookup_only -is [bool] -and
+            $document.summary.cid_table_lookup_only)
+        {
+            Add-Failure -Failures $failures -Message "known-PID-only CID lookup cannot satisfy the clean-host gate"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_level) -and
+            ([int64]$document.summary.cid_table_level -lt 0 -or
+             [int64]$document.summary.cid_table_level -gt 2))
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_level must be 0, 1, or 2"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_next_handle) -and
+            ([int64]$document.summary.cid_table_next_handle -lt 8 -or
+             ([int64]$document.summary.cid_table_next_handle % 4) -ne 0))
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_next_handle must be an aligned allocated CID bound"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_allocated_leaves) -and
+            [int64]$document.summary.cid_table_allocated_leaves -le 0)
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_allocated_leaves must be greater than zero"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_next_handle) -and
+            (Test-JsonInteger -Value $document.summary.cid_table_allocated_handle_capacity) -and
+            [int64]$document.summary.cid_table_next_handle -ne
+                [int64]$document.summary.cid_table_allocated_handle_capacity)
+        {
+            Add-Failure -Failures $failures -Message "CID NextHandle and allocated-leaf capacity disagree"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_next_handle) -and
+            (Test-JsonInteger -Value $document.summary.cid_table_probes) -and
+            [int64]$document.summary.cid_table_next_handle -ge 8 -and
+            [int64]$document.summary.cid_table_probes -lt
+                (([int64]$document.summary.cid_table_next_handle / 4) - 1))
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_probes does not cover every aligned CID below the validated bound"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_processes) -and
+            [int64]$document.summary.cid_table_processes -le 0)
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_processes must be greater than zero"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_discovered_processes) -and
+            (Test-JsonInteger -Value $document.summary.cid_table_processes) -and
+            [int64]$document.summary.cid_table_discovered_processes -gt
+                [int64]$document.summary.cid_table_processes)
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_discovered_processes exceeds the enumerated process count"
+        }
+        foreach ($field in @(
+            "system_process_information_threads",
+            "toolhelp_threads",
+            "cid_table_direct_entries",
+            "cid_table_direct_processes",
+            "cid_table_direct_threads"
+        ))
+        {
+            if ((Test-JsonInteger -Value $document.summary.$field) -and
+                [int64]$document.summary.$field -le 0)
+            {
+                Add-Failure -Failures $failures -Message "summary.$field must be greater than zero"
+            }
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_direct_entries) -and
+            (Test-JsonInteger -Value $document.summary.cid_table_direct_processes) -and
+            (Test-JsonInteger -Value $document.summary.cid_table_direct_threads) -and
+            [int64]$document.summary.cid_table_direct_entries -ne
+                ([int64]$document.summary.cid_table_direct_processes +
+                 [int64]$document.summary.cid_table_direct_threads))
+        {
+            Add-Failure -Failures $failures -Message "direct CID entry count does not equal typed process plus thread entries"
+        }
+        foreach ($field in @(
+            "cid_table_unclassified_entries",
+            "cid_table_thread_findings",
+            "cid_table_persistent_thread_view_misses"
+        ))
+        {
+            if ((Test-JsonInteger -Value $document.summary.$field) -and
+                [int64]$document.summary.$field -ne 0)
+            {
+                Add-Failure -Failures $failures -Message "summary.$field must be zero"
+            }
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_probe_failures) -and
+            [int64]$document.summary.cid_table_probe_failures -ne 0)
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_probe_failures must be zero"
+        }
+        if ((Test-JsonInteger -Value $document.summary.cid_table_persistent_api_misses) -and
+            [int64]$document.summary.cid_table_persistent_api_misses -ne 0)
+        {
+            Add-Failure -Failures $failures -Message "summary.cid_table_persistent_api_misses must be zero"
+        }
+        foreach ($field in @(
             "process_inventory_incomplete",
             "process_triage_coverage_incomplete",
             "deep_image_comparison_coverage_incomplete",
             "driver_service_coverage_incomplete",
+            "wfp_filter_coverage_incomplete",
+            "qos_policy_coverage_incomplete",
+            "bindflt_global_coverage_incomplete",
+            "bindflt_process_correlation_coverage_incomplete",
+            "cloudfiles_placeholder_coverage_incomplete",
+            "cloudfiles_protection_correlation_incomplete",
             "threat_intel_correlation_incomplete"
         ))
         {
@@ -261,11 +527,248 @@ if ($null -ne $document)
                 ($null -ne $document.summary.PSObject.Properties["driver_service_coverage_incomplete"] -and
                     $document.summary.driver_service_coverage_incomplete -is [bool] -and
                     $document.summary.driver_service_coverage_incomplete) -or
+                ($null -ne $document.summary.PSObject.Properties["wfp_filter_coverage_incomplete"] -and
+                    $document.summary.wfp_filter_coverage_incomplete -is [bool] -and
+                    $document.summary.wfp_filter_coverage_incomplete) -or
+                ($null -ne $document.summary.PSObject.Properties["qos_policy_coverage_incomplete"] -and
+                    $document.summary.qos_policy_coverage_incomplete -is [bool] -and
+                    $document.summary.qos_policy_coverage_incomplete) -or
+                ($null -ne $document.summary.PSObject.Properties["bindflt_global_coverage_incomplete"] -and
+                    $document.summary.bindflt_global_coverage_incomplete -is [bool] -and
+                    $document.summary.bindflt_global_coverage_incomplete) -or
+                ($null -ne $document.summary.PSObject.Properties["bindflt_process_correlation_coverage_incomplete"] -and
+                    $document.summary.bindflt_process_correlation_coverage_incomplete -is [bool] -and
+                    $document.summary.bindflt_process_correlation_coverage_incomplete) -or
+                ($null -ne $document.summary.PSObject.Properties["cloudfiles_placeholder_coverage_incomplete"] -and
+                    $document.summary.cloudfiles_placeholder_coverage_incomplete -is [bool] -and
+                    $document.summary.cloudfiles_placeholder_coverage_incomplete) -or
+                ($null -ne $document.summary.PSObject.Properties["cloudfiles_protection_correlation_incomplete"] -and
+                    $document.summary.cloudfiles_protection_correlation_incomplete -is [bool] -and
+                    $document.summary.cloudfiles_protection_correlation_incomplete) -or
                 ($null -ne $document.summary.PSObject.Properties["threat_intel_correlation_incomplete"] -and
                     $document.summary.threat_intel_correlation_incomplete -is [bool] -and
                     $document.summary.threat_intel_correlation_incomplete)))
         {
             Add-Failure -Failures $failures -Message "summary.coverage_complete conflicts with an incomplete coverage flag"
+        }
+    }
+
+    $cidThreads = @()
+    if ($null -eq $document.PSObject.Properties["cid_threads"])
+    {
+        Add-Failure -Failures $failures -Message "cid_threads array is missing"
+    }
+    elseif ($document.cid_threads -isnot [System.Array])
+    {
+        Add-Failure -Failures $failures -Message "cid_threads must be a JSON array"
+    }
+    else
+    {
+        $cidThreads = @($document.cid_threads)
+        $seenThreadIds =
+            [System.Collections.Generic.HashSet[uint32]]::new()
+        $directThreadRecords = 0
+        $suspiciousThreadRecords = 0
+        foreach ($record in $cidThreads)
+        {
+            if ($null -eq $record)
+            {
+                Add-Failure -Failures $failures -Message "cid_threads contains a null item"
+                continue
+            }
+
+            foreach ($field in @(
+                "tid",
+                "pid",
+                "object_header",
+                "ethread",
+                "eprocess",
+                "terminated",
+                "direct_cid_seen",
+                "executive_thread_list_seen",
+                "scheduler_thread_list_seen",
+                "system_process_information_seen",
+                "toolhelp_seen",
+                "identity_revalidated",
+                "views_revalidated",
+                "lifecycle_changed",
+                "suspicious",
+                "reasons",
+                "warnings"
+            ))
+            {
+                if ($null -eq $record.PSObject.Properties[$field])
+                {
+                    Add-Failure -Failures $failures -Message "cid_threads.$field is missing"
+                }
+            }
+
+            if (-not (Test-JsonInteger -Value $record.tid) -or
+                [int64]$record.tid -le 0 -or
+                [int64]$record.tid -gt [uint32]::MaxValue)
+            {
+                Add-Failure -Failures $failures -Message "cid_threads.tid must be a positive 32-bit JSON integer"
+            }
+            elseif (-not $seenThreadIds.Add([uint32]$record.tid))
+            {
+                Add-Failure -Failures $failures -Message "cid_threads contains duplicate tid=$($record.tid)"
+            }
+            if (-not (Test-JsonInteger -Value $record.pid) -or
+                [int64]$record.pid -lt 0 -or
+                [int64]$record.pid -gt [uint32]::MaxValue)
+            {
+                Add-Failure -Failures $failures -Message "cid_threads.pid must be a nonnegative 32-bit JSON integer"
+            }
+            foreach ($field in @(
+                "object_header",
+                "ethread",
+                "eprocess"
+            ))
+            {
+                if ($record.$field -isnot [string] -or
+                    [string]$record.$field -notmatch '^0x[0-9a-fA-F]{16}$')
+                {
+                    Add-Failure -Failures $failures -Message "cid_threads.$field must be a 16-digit hexadecimal string"
+                }
+            }
+            foreach ($field in @(
+                "terminated",
+                "direct_cid_seen",
+                "executive_thread_list_seen",
+                "scheduler_thread_list_seen",
+                "system_process_information_seen",
+                "toolhelp_seen",
+                "identity_revalidated",
+                "views_revalidated",
+                "lifecycle_changed",
+                "suspicious"
+            ))
+            {
+                if ($null -ne $record.PSObject.Properties[$field] -and
+                    $record.$field -isnot [bool])
+                {
+                    Add-Failure -Failures $failures -Message "cid_threads.$field must be a JSON boolean"
+                }
+            }
+            foreach ($field in @("reasons", "warnings"))
+            {
+                if ($null -ne $record.PSObject.Properties[$field] -and
+                    $record.$field -isnot [System.Array])
+                {
+                    Add-Failure -Failures $failures -Message "cid_threads.$field must be a JSON array"
+                }
+            }
+
+            if ($record.direct_cid_seen -is [bool] -and
+                $record.direct_cid_seen)
+            {
+                ++$directThreadRecords
+            }
+            if ($record.suspicious -is [bool] -and
+                $record.suspicious)
+            {
+                ++$suspiciousThreadRecords
+            }
+            if ($record.identity_revalidated -is [bool] -and
+                -not $record.identity_revalidated)
+            {
+                Add-Failure -Failures $failures -Message "clean cid_threads record lacks identity revalidation for tid=$($record.tid)"
+            }
+            if ($record.views_revalidated -is [bool] -and
+                -not $record.views_revalidated)
+            {
+                Add-Failure -Failures $failures -Message "clean cid_threads record lacks view revalidation for tid=$($record.tid)"
+            }
+            if ($record.suspicious -is [bool] -and
+                $record.suspicious)
+            {
+                Add-Failure -Failures $failures -Message "clean cid_threads record is suspicious for tid=$($record.tid)"
+            }
+        }
+
+        if ($null -ne $document.summary -and
+            (Test-JsonInteger -Value $document.summary.cid_table_direct_threads) -and
+            $cidThreads.Count -lt
+                [int64]$document.summary.cid_table_direct_threads)
+        {
+            Add-Failure -Failures $failures -Message "cid_threads omits one or more directly decoded thread entries"
+        }
+        if ($null -ne $document.summary -and
+            (Test-JsonInteger -Value $document.summary.cid_table_direct_threads) -and
+            $directThreadRecords -ne
+                [int64]$document.summary.cid_table_direct_threads)
+        {
+            Add-Failure -Failures $failures -Message "direct_cid_seen record count does not match summary.cid_table_direct_threads"
+        }
+        if ($null -ne $document.summary -and
+            (Test-JsonInteger -Value $document.summary.cid_table_thread_findings) -and
+            $suspiciousThreadRecords -ne
+                [int64]$document.summary.cid_table_thread_findings)
+        {
+            Add-Failure -Failures $failures -Message "suspicious cid_threads count does not match summary.cid_table_thread_findings"
+        }
+        if ($null -ne $document.summary -and
+            (Test-JsonInteger -Value $document.summary.cid_table_persistent_thread_view_misses) -and
+            $suspiciousThreadRecords -ne
+                [int64]$document.summary.cid_table_persistent_thread_view_misses)
+        {
+            Add-Failure -Failures $failures -Message "suspicious cid_threads count does not match persistent thread-view misses"
+        }
+    }
+
+    $cloudFileImages = @()
+    if ($null -eq $document.PSObject.Properties["cloudfiles_images"])
+    {
+        Add-Failure -Failures $failures -Message "cloudfiles_images array is missing"
+    }
+    elseif ($document.cloudfiles_images -isnot [System.Array])
+    {
+        Add-Failure -Failures $failures -Message "cloudfiles_images must be a JSON array"
+    }
+    else
+    {
+        $cloudFileImages = @($document.cloudfiles_images)
+        $suspiciousCloudFileImages = 0
+        foreach ($record in $cloudFileImages)
+        {
+            if ($null -eq $record)
+            {
+                Add-Failure -Failures $failures -Message "cloudfiles_images contains a null item"
+                continue
+            }
+            $suspiciousProperty =
+                $record.PSObject.Properties["suspicious"]
+            if ($null -eq $suspiciousProperty)
+            {
+                Add-Failure -Failures $failures -Message "cloudfiles_images.suspicious is missing"
+            }
+            elseif ($suspiciousProperty.Value -isnot [bool])
+            {
+                Add-Failure -Failures $failures -Message "cloudfiles_images.suspicious must be a JSON boolean"
+            }
+            elseif ($suspiciousProperty.Value)
+            {
+                ++$suspiciousCloudFileImages
+            }
+        }
+
+        if ($null -ne $document.summary -and
+            (Test-JsonInteger -Value $document.summary.cloudfiles_placeholder_images) -and
+            [int64]$document.summary.cloudfiles_placeholder_images -ne
+                $cloudFileImages.Count)
+        {
+            Add-Failure -Failures $failures -Message (
+                "summary.cloudfiles_placeholder_images=$($document.summary.cloudfiles_placeholder_images) " +
+                "does not match cloudfiles_images count=$($cloudFileImages.Count)")
+        }
+        if ($null -ne $document.summary -and
+            (Test-JsonInteger -Value $document.summary.suspicious_cloudfiles_images) -and
+            [int64]$document.summary.suspicious_cloudfiles_images -ne
+                $suspiciousCloudFileImages)
+        {
+            Add-Failure -Failures $failures -Message (
+                "summary.suspicious_cloudfiles_images=$($document.summary.suspicious_cloudfiles_images) " +
+                "does not match suspicious cloudfiles_images count=$suspiciousCloudFileImages")
         }
     }
 

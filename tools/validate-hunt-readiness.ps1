@@ -1738,6 +1738,29 @@ if (-not (Test-Path -LiteralPath $buildDir))
     New-Item -ItemType Directory -Path $buildDir | Out-Null
 }
 
+Invoke-Step -Name "evasion research ledger claim controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\validate-evasion-research-ledger.ps1") `
+        -Root $rootPath `
+        -ReportPath (
+            Join-Path $buildDir (
+                "evasion-research-ledger-validation.json"))
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "evasion research ledger validation failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step -Name "evasion research ledger mutation controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\validate-evasion-research-ledger-selftest.ps1") `
+        -Root $rootPath
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "evasion research ledger self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
 Invoke-Step -Name "ESET IOC source coverage" -Script {
     & (Join-Path $rootPath "tools\validate-eset-hunt-iocs.ps1") -Root $rootPath
     if ($LASTEXITCODE -ne 0)
@@ -1753,6 +1776,55 @@ Invoke-Step -Name "clean-host validator negative controls" -Script {
     if ($LASTEXITCODE -ne 0)
     {
         throw "clean-host validator self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step -Name "CloudFiles hunt E2E evidence controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\validate-cloudfiles-hunt-e2e-selftest.ps1") `
+        -Root $rootPath
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "CloudFiles hunt E2E validator self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step -Name "minifilter detach E2E evidence controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\validate-minifilter-detach-e2e-selftest.ps1") `
+        -Root $rootPath
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "minifilter detach E2E validator self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step -Name "constrained Bind Filter fixture controller" -Script {
+    & (Join-Path $rootPath "x64\Release\KnLiveDbgBindFixture.exe") `
+        --self-test
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "constrained Bind Filter fixture controller self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step -Name "QoS and Bind Filter E2E evidence controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\validate-qos-bind-e2e-selftest.ps1") `
+        -Root $rootPath
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "QoS/Bind Filter E2E validator self-test failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step -Name "evasion external gate artifact controls" -Script {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $rootPath "tools\validate-evasion-external-gate-selftest.ps1") `
+        -Root $rootPath
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "evasion external gate validator self-test failed with exit code $LASTEXITCODE"
     }
 }
 

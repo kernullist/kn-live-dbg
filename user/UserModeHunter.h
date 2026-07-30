@@ -64,6 +64,7 @@ struct HuntModuleRecord
     bool LdrInitSeen = false;
     bool PrivatePeVadSeen = false;
     bool VadImageSeen = false;
+    bool VadSectionSeen = false;
     bool VadBackingManagedImage = false;
     uint64_t VadAddress = 0;
     std::wstring VadBackingPath;
@@ -83,13 +84,26 @@ struct HuntProcessRecord
     bool ActiveProcessLinksStableUnlinked = false;
     bool SystemProcessInformationSeen = false;
     bool ToolhelpProcessSeen = false;
-    // True when known-PID CID lookup was attempted for this process (not a full
-    // PspCidTable enumeration). CidTableSeen means PsLookupProcessByProcessId
-    // succeeded for that PID.
+    // True when a CID lookup surface was attempted for this process.
+    // CidTableEnumerated distinguishes a bounded whole process-CID inventory
+    // (exported sweep or direct typed entry walk) from the legacy known-PID
+    // fallback. CidDirectEntrySeen identifies the anti-hook direct view.
     bool HasCidTableView = false;
     bool CidTableSeen = false;
+    bool CidDirectEntrySeen = false;
+    bool CidLookupDirectAgreed = false;
+    // The PID was discovered by the bounded full CID range rather than seeded
+    // by ActiveProcessLinks or either user API view.
+    bool CidTableEnumerated = false;
+    bool CidTableDiscovered = false;
+    // A second API snapshot and same-identity CID lookup completed after the
+    // initial discovery. These gates suppress start/exit and PID-reuse races.
+    bool CidApiViewsRevalidated = false;
+    bool CidIdentityRevalidated = false;
     bool AddressContextRefreshed = false;
     bool LifecycleChangedBeforeTriage = false;
+    bool HasProtection = false;
+    uint8_t Protection = 0;
     std::wstring KernelImageName;
     std::wstring SystemProcessImageName;
     std::wstring ToolhelpImageName;
@@ -138,9 +152,13 @@ struct HuntProcessRecord
     uint32_t VadScanAttempts = 0;
     uint32_t ThreadScanAttempts = 0;
     uint64_t ThreadsVisited = 0;
+    uint64_t SuspensionStateResolvedThreads = 0;
+    uint64_t SuspendedThreads = 0;
     uint64_t SuspiciousThreadStarts = 0;
     uint64_t NonEmptyApcQueues = 0;
     uint64_t StackReferenceCount = 0;
+    bool ThreadInventoryComplete = false;
+    bool ThreadSuspensionStateCoverageComplete = false;
 };
 
 struct HuntFinding
@@ -159,6 +177,60 @@ struct HuntFinding
     std::vector<std::wstring> Followups;
 };
 
+struct HuntCloudFileImageRecord
+{
+    uint32_t ProcessId = 0;
+    uint64_t ModuleBase = 0;
+    uint64_t ModuleSize = 0;
+    std::wstring ImageName;
+    std::wstring ModuleName;
+    std::wstring VadBackingPath;
+    std::wstring NormalizedBackingPath;
+    uint32_t FileAttributes = 0;
+    uint32_t ReparseTag = 0;
+    uint32_t PlaceholderState = 0;
+    uint32_t PinState = 0;
+    uint32_t InSyncState = 0;
+    uint32_t PlaceholderInfoQueryStatus = 0;
+    int64_t OnDiskDataSize = 0;
+    int64_t ValidatedDataSize = 0;
+    int64_t ModifiedDataSize = 0;
+    int64_t PropertiesSize = 0;
+    uint32_t FileIdentityLength = 0;
+    bool CloudReparseTagObserved = false;
+    bool PlaceholderInfoIdentificationFallbackUsed = false;
+    bool ProcessProtectionResolved = false;
+    uint8_t ProcessProtection = 0;
+    bool DeepMismatchCorrelated = false;
+    bool Suspicious = false;
+    std::vector<std::wstring> Reasons;
+};
+
+struct HuntCidThreadRecord
+{
+    uint32_t ThreadId = 0;
+    uint32_t ProcessId = 0;
+    uint64_t ObjectHeader = 0;
+    uint64_t Ethread = 0;
+    uint64_t Eprocess = 0;
+    uint64_t CreateTime = 0;
+    uint64_t ExitTime = 0;
+    bool HasCreateTime = false;
+    bool HasExitTime = false;
+    bool Terminated = false;
+    bool DirectCidSeen = false;
+    bool ExecutiveThreadListSeen = false;
+    bool SchedulerThreadListSeen = false;
+    bool SystemProcessInformationSeen = false;
+    bool ToolhelpThreadSeen = false;
+    bool IdentityRevalidated = false;
+    bool ViewsRevalidated = false;
+    bool LifecycleChanged = false;
+    bool Suspicious = false;
+    std::vector<std::wstring> Reasons;
+    std::vector<std::wstring> Warnings;
+};
+
 struct HuntResult
 {
     std::wstring Schema;
@@ -166,10 +238,14 @@ struct HuntResult
     std::wstring ModeText;
     std::vector<HuntProcessRecord> Processes;
     std::vector<HuntFinding> Findings;
+    std::vector<HuntCloudFileImageRecord> CloudFileImages;
+    std::vector<HuntCidThreadRecord> CidThreads;
     std::vector<std::wstring> Warnings;
     uint64_t KernelProcessCount = 0;
     uint64_t SystemProcessInfoCount = 0;
     uint64_t ToolhelpProcessCount = 0;
+    uint64_t SystemProcessInfoThreadCount = 0;
+    uint64_t ToolhelpThreadCount = 0;
     uint64_t ScannedProcessCount = 0;
     uint64_t VadRecordCount = 0;
     uint64_t HiddenPteRangeCount = 0;
@@ -186,6 +262,23 @@ struct HuntResult
     bool DriverServiceCoverageIncomplete = false;
     uint64_t WfpFilterCount = 0;
     uint64_t SuspiciousWfpFilterCount = 0;
+    bool WfpFilterCoverageIncomplete = false;
+    uint64_t QosPolicyCount = 0;
+    uint64_t SuspiciousQosPolicyCount = 0;
+    bool QosPolicyCoverageIncomplete = false;
+    uint64_t BindFilterMappingCount = 0;
+    uint64_t SuspiciousBindFilterMappingCount = 0;
+    uint64_t BindFilterProcessBindingCount = 0;
+    bool BindFilterGlobalCoverageIncomplete = false;
+    // A process matched the visible side of a high-signal global mapping, but
+    // both the EPROCESS main-section and main-image VAD backing paths were not
+    // resolved. An empty Process-Binding result is not clean proof when true.
+    bool BindFilterProcessCorrelationCoverageIncomplete = false;
+    bool BindFilterSiloCoverageUnsupported = true;
+    uint64_t CloudFilePlaceholderImageCount = 0;
+    uint64_t SuspiciousCloudFileImageCount = 0;
+    bool CloudFilePlaceholderCoverageIncomplete = false;
+    bool CloudFileProtectionCorrelationIncomplete = false;
     bool ThreatIntelActive = false;
     bool ThreatIntelAvailable = false;
     // Deep-mode TI correlation could not observe a usable collection surface,
@@ -194,9 +287,33 @@ struct HuntResult
     // Kernel ActiveProcessLinks inventory was partial (poisoned nodes skipped
     // or walk stopped early). Findings must not be read as whole-system clean.
     bool ProcessInventoryIncomplete = false;
-    // CID path is known-PID lookup only; full PspCidTable enumeration is absent.
+    // Direct typed process/thread CID state. The whole-table flag is true only
+    // when direct entry typing, both object classes, and the thread cross-view
+    // all complete.
     bool CidTableFullEnumeration = false;
+    bool CidTableFullProcessEnumeration = false;
+    bool CidTableDirectEntryEnumeration = false;
+    bool CidTableFullThreadEnumeration = false;
+    bool CidTableThreadCrossViewComplete = false;
     bool CidTableLookupOnly = true;
+    uint64_t CidTableAnchorAddress = 0;
+    uint64_t CidTableAddress = 0;
+    uint64_t CidTableCode = 0;
+    uint32_t CidTableLevel = 0;
+    uint32_t CidTableNextHandle = 0;
+    uint32_t CidTableAllocatedLeafCount = 0;
+    uint64_t CidTableAllocatedHandleCapacity = 0;
+    uint64_t CidTableProbeCount = 0;
+    uint64_t CidTableProcessCount = 0;
+    uint64_t CidTableDiscoveredProcessCount = 0;
+    uint64_t CidTableDirectEntryCount = 0;
+    uint64_t CidTableDirectProcessCount = 0;
+    uint64_t CidTableDirectThreadCount = 0;
+    uint64_t CidTableUnclassifiedEntryCount = 0;
+    uint64_t CidTableThreadFindingCount = 0;
+    uint64_t CidTablePersistentThreadViewMissCount = 0;
+    uint64_t CidTableProbeFailureCount = 0;
+    uint64_t CidTablePersistentApiMissCount = 0;
     // VAD / hidden-PTE / thread collection surfaces reported incompleteness.
     bool ProcessTriageCoverageIncomplete = false;
     // Deep live-vs-disk comparison rejected a required relocation structure
@@ -232,10 +349,16 @@ private:
 std::wstring HuntModeToText(HuntMode mode);
 std::wstring HuntFirstCommandLineImage(const std::wstring& commandLine);
 bool HuntProcessLifecycleSelfTest();
+bool HuntCidTableAnchorSelfTest();
 bool HuntDiskPeBoundsSelfTest();
 bool HuntBaseRelocationMaskSelfTest();
 bool HuntDynamicRelocationMaskSelfTest();
 bool HuntEffectiveVadProtectionSelfTest();
 bool HuntEdrKillerProfileSelfTest();
 bool HuntManagedLoaderlessMappingSelfTest();
+bool HuntSecurityProcessFreezeSelfTest();
+bool HuntWfpPolicySelfTest();
+bool HuntQosPolicySelfTest();
+bool HuntBindFilterMappingSelfTest();
+bool HuntCloudFilePlaceholderSelfTest();
 std::wstring BuildHuntJson(const HuntResult& result);
