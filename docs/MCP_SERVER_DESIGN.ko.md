@@ -57,7 +57,7 @@
 2. **Claude Desktop은 GUI 앱이라 UAC 없이 elevated 자식 프로세스를 spawn할 수 없다** — `command: KnLiveDbg.exe` 형태의 stdio 설정은 실제로 기동되지 않는다.
 3. **stdout 오염**: REPL/스캐너는 `std::wcout`에 대량 출력(C4)하고, `ScopedCommandProgress`는 콘솔 핸들에 직접 write(C10)한다. stdio JSON-RPC는 stdout을 프레이밍으로 점유해야 하므로 한 바이트만 새도 세션이 깨진다.
 4. **HTTP는 콘솔과 깔끔히 공존**: HTTP 리스너는 자체 소켓/스레드를 소유하고 콘솔을 건드리지 않는다. operator REPL이 살아있어 human-in-the-loop가 유지된다(보안상 필수).
-5. **Claude Code/Desktop은 `type: http`를 네이티브 지원**한다(아래 §8). 별도 shim 불필요. stdio 전용 호스트만 별도의 무상태 브리지 `npx mcp-remote <url>`로 연결한다(이 브리지는 디바이스를 건드리지 않으므로 자유롭게 spawn 가능).
+5. **Claude Code/Desktop은 `type: http`를 네이티브 지원**한다(아래 §8). 별도 shim 불필요. stdio 전용 호스트만 버전과 전송을 고정한 무상태 브리지 `tools/mcp-bridge.ps1`로 연결한다(이 브리지는 디바이스를 건드리지 않으므로 자유롭게 spawn 가능).
 
 **구현 스택**: HTTP 서버는 신규 추가다(현재 프로젝트는 `winhttp.lib` *클라이언트*만 링크, 서버 소켓/파이프 없음).
 - 1순위: **HTTP Server API(http.sys, `httpapi.lib`)** — `HttpInitialize` / `HttpCreateRequestQueue` / `HttpAddUrlToUrlGroup`(`http://127.0.0.1:<port>/mcp`). 커널측 URL 예약과 ACL을 얻고 raw 소켓 파싱을 피한다. URL 예약(`netsh http add urlacl` 또는 SDDL)이 필요할 수 있음(미해결 §10).
@@ -207,7 +207,7 @@ elevated 커널 RW 도구를 잠재적으로 적대적/인젝션된 LLM에 노�
 ### 5.2 인증과 토큰 취급
 
 1. Bearer 토큰은 기본 **재기동 안정** (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, 상수 시간 비교, 불일치 시 401). 신규 256-bit 발급은 파일 없음 또는 `--new-token`일 때만. `mcp on`은 Claude/Cursor/Codex/Grok Build용 **stdio 브리지**가 읽는 `mcp-endpoint.json`을 기록한다.
-2. 서버 측: 토큰을 콘솔에 1회만 출력(평문 로깅 금지, audit에는 fingerprint만), 짧은 idle TTL 후 자동 만료.
+2. 서버는 토큰 출처(reused/new/env/override)를 출력하고 audit에는 요청 fingerprint만 남긴다. 토큰과 endpoint 파일은 현재 사용자만 전체 접근 가능한 보호 DACL로 임시 파일에 쓴 뒤 원자적으로 교체한다. 토큰 또는 endpoint 영속화가 실패하면 MCP 시작도 실패한다.
 3. **클라이언트 측 저장이 진짜 누출 지점**: Claude Code는 HTTP 헤더(Authorization 포함)를 설정 파일에 영속화한다. 커널 RW 엔드포인트를 인증하는 토큰을 **committable한 project-scope `.mcp.json`에 붙여넣지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수 인다이렉션 또는 `headersHelper`(접속 시 회전 토큰 발급)를 강제한다. 절대 git 커밋 금지.
 4. 옵션: `GetExtendedTcpTable`로 loopback peer PID에 토큰을 바인딩(방어 심화, 단 재접속/PID 재사용에 취약).
 
@@ -414,7 +414,7 @@ claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
 
 # stdio 전용 호스트용 별도 무상태 브리지(라이브 프로세스를 직접 노출하지 않음)
 claude mcp add --transport stdio knlivedbg-bridge -- \
-  npx -y mcp-remote http://127.0.0.1:51766/mcp --header "Authorization: Bearer YOUR_TOKEN"
+  npx -y mcp-remote@0.1.38 http://127.0.0.1:51766/mcp --allow-http --transport http-only --silent --header "Authorization: Bearer YOUR_TOKEN"
 ```
 
 원격 바인드 시(§5.1.1): bearer 토큰이 유일한 장벽이므로 **방화벽에서 클라이언트 IP만 인바운드 허용**하고 신뢰된 lab 세그먼트에서만 사용. `--bind 0.0.0.0`은 모든 인터페이스에 열리니 가능하면 구체 IP를 지정.
@@ -437,7 +437,7 @@ claude mcp add --transport stdio knlivedbg-bridge -- \
 
 ### 8.3 Claude Desktop
 
-`%APPDATA%\Claude\claude_desktop_config.json` 에 동일한 `type: http` 항목. 네이티브 http 미지원 빌드면 `command: npx, args: ["-y","mcp-remote", ...]` 브리지. 편집 후 Desktop 완전 재시작.
+`%APPDATA%\Claude\claude_desktop_config.json` 에 동일한 `type: http` 항목. 네이티브 http 미지원 빌드면 `tools/mcp-bridge.ps1` 또는 §8.1의 `mcp-remote@0.1.38` 명령을 `--allow-http --transport http-only --silent`와 함께 쓴다. 편집 후 Desktop 완전 재시작.
 
 권장: project-scope `.mcp.json` 대신 **user-scope + `${KNLIVEDBG_TOKEN}`** 한 형태로 Claude Code/Desktop 모두 커버.
 

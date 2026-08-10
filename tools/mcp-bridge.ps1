@@ -43,12 +43,13 @@ function Resolve-EndpointPath
     {
         $candidates += (Join-Path $env:LOCALAPPDATA "kn-live-dbg\mcp-endpoint.json")
     }
-
-    $scriptDir = Split-Path -Parent $PSCommandPath
-    $candidates += (Join-Path $scriptDir "mcp-endpoint.json")
-    $candidates += (Join-Path $scriptDir "..\x64\Release\.kn-live-dbg\mcp-endpoint.json")
-    $candidates += (Join-Path $scriptDir "..\.kn-live-dbg\mcp-endpoint.json")
-    $candidates += (Join-Path (Get-Location) ".kn-live-dbg\mcp-endpoint.json")
+    else
+    {
+        # The server uses EXE-local state only when LOCALAPPDATA is unavailable.
+        $scriptDir = Split-Path -Parent $PSCommandPath
+        $candidates += (Join-Path $scriptDir "..\.kn-live-dbg\mcp-endpoint.json")
+        $candidates += (Join-Path $scriptDir "..\x64\Release\.kn-live-dbg\mcp-endpoint.json")
+    }
 
     foreach ($path in $candidates)
     {
@@ -130,9 +131,16 @@ if ($PreferRemote)
     {
         $url = $remoteUrl
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($clientUrl) -and $clientUrl -notlike "*127.0.0.1*" -and $clientUrl -notlike "*localhost*")
+    elseif (-not [string]::IsNullOrWhiteSpace($clientUrl) -and
+            $clientUrl -notlike "*<this-host-ip>*" -and
+            $clientUrl -notlike "*127.0.0.1*" -and
+            $clientUrl -notlike "*localhost*")
     {
         $url = $clientUrl
+    }
+    else
+    {
+        throw "A concrete remote MCP URL is unavailable. Start the server with --bind <specific-ip> instead of a wildcard bind."
     }
 }
 if ([string]::IsNullOrWhiteSpace($url))
@@ -181,6 +189,7 @@ if ([string]::IsNullOrWhiteSpace($npxPath))
     $npxPath = $npx.Path
 }
 
-# mcp-remote: stdio JSON-RPC <-> Streamable HTTP. Inherit stdin/stdout for MCP.
-& $npxPath -y mcp-remote $url --header $header
+# mcp-remote: stdio JSON-RPC <-> Streamable HTTP. The endpoint is intentionally
+# plain HTTP on loopback, so opt in explicitly and avoid transport auto-probing.
+& $npxPath -y mcp-remote@0.1.38 $url --allow-http --transport http-only --silent --header $header
 exit $LASTEXITCODE

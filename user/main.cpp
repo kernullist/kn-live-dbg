@@ -50,7 +50,6 @@
 #include "../shared/KnLiveDbgProbeIoctl.h"
 
 #include <Windows.h>
-#include <sddl.h>
 #include <conio.h>
 #include <shellapi.h>
 
@@ -14145,7 +14144,7 @@ static void PrintEtwHelp()
     std::wcout << L"  loggers    list every populated WMI_LOGGER_CONTEXT slot under nt!EtwpDebuggerData with name and GetCpuClock annotation\n";
     std::wcout << L"  logger     filter by slot index (decimal) or case-insensitive name substring\n";
     std::wcout << L"  integrity  decode the first instructions of canonical ETW/PMC dispatch functions and report trampoline / cross-module branch findings (modern InfinityHook variants)\n";
-    std::wcout << L"  providers  heuristic/partial provider registration surface + enable-callback ownership (coverage incomplete by design)\n";
+    std::wcout << L"  providers  heuristic provider candidates with unclassified nearby-pointer diagnostics (coverage incomplete by design)\n";
     std::wcout << L"  ti-cross   correlate active !ti subscription reception rate with silence / drop signals\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
@@ -14456,9 +14455,11 @@ static void HandleEtwCommand(
                 if (ToLower(args[index]) == L"/limit" && index + 1 < args.size())
                 {
                     uint64_t limitValue = 0;
-                    if (!ParseUnsigned(args[index + 1], 10, &limitValue))
+                    if (!ParseUnsigned(args[index + 1], 10, &limitValue) ||
+                        limitValue == 0 ||
+                        limitValue > 256)
                     {
-                        std::wcerr << L"!etw providers: invalid /limit\n";
+                        std::wcerr << L"!etw providers: /limit must be between 1 and 256\n";
                         break;
                     }
                     options.Limit = static_cast<uint32_t>(limitValue);
@@ -14522,7 +14523,10 @@ static void HandleEtwCommand(
 
             PrintColoredText(L"etw ti-cross", KNDBG_COLOR_TITLE);
             std::wcout << L" status=";
-            PrintColoredText(cross.Status, cross.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_OK);
+            const WORD statusColor = cross.Suspicious
+                ? KNDBG_COLOR_FAIL
+                : (cross.Status == L"healthy" ? KNDBG_COLOR_OK : KNDBG_COLOR_WARN);
+            PrintColoredText(cross.Status, statusColor);
             std::wcout << L" active=" << (cross.TiActive ? L"yes" : L"no")
                        << L" received=" << std::dec << cross.EventsReceived
                        << L" dropped=" << cross.EventsDropped
@@ -14592,7 +14596,7 @@ static void HandleEtwCommand(
                 PrintColoredText(L"[etw.provider]", KNDBG_COLOR_TITLE);
                 std::wcout << L" guid=" << record.GuidText
                            << L" entry=" << HexTextWidth(record.EntryAddress, 16, true)
-                           << L" callback=" << HexTextWidth(record.EnableCallback, 16, true);
+                           << L" candidatePointer=" << HexTextWidth(record.EnableCallback, 16, true);
                 if (!record.EnableCallbackModule.empty())
                 {
                     std::wcout << L" module=" << record.EnableCallbackModule;
@@ -15485,7 +15489,9 @@ static void HandleHalCommand(
         }
 
         PrintColoredText(L"hal", KNDBG_COLOR_TITLE);
-        std::wcout << L" tables=" << std::dec << result.Tables.size();
+        std::wcout << L" tables=" << std::dec << result.Tables.size()
+                   << L" coverage="
+                   << (result.CoverageComplete ? L"complete" : L"incomplete");
         if (result.AnySuspicious)
         {
             std::wcout << L" ";
@@ -15502,16 +15508,25 @@ static void HandleHalCommand(
                        << L" slots=" << std::dec << table.SlotCount
                        << L" nonNull=" << table.NonNullCount
                        << L" suspicious=" << table.SuspiciousCount
+                       << L" coverage="
+                       << (table.CoverageComplete ? L"complete" : L"incomplete")
                        << L"\n";
             if (!table.Resolved)
             {
                 std::wcout << L"  unresolved: " << table.Warning << L"\n";
                 continue;
             }
-            if (table.SuspiciousCount == 0)
+            if (!table.CoverageComplete)
+            {
+                std::wcout << L"  incomplete: "
+                           << (table.Warning.empty()
+                                   ? L"one or more PDB/read bounds were unavailable"
+                                   : table.Warning)
+                           << L"\n";
+            }
+            else if (table.SuspiciousCount == 0)
             {
                 std::wcout << L"  all non-null HAL slots resolve into expected modules\n";
-                continue;
             }
             for (const HalDispatchSlot& slot : table.Slots)
             {
@@ -15522,6 +15537,7 @@ static void HandleHalCommand(
                 std::wcout << L"  ";
                 PrintColoredText(L"[hal.hook]", KNDBG_COLOR_FAIL);
                 std::wcout << L" index=" << std::dec << slot.Index
+                           << L" field=" << slot.Name
                            << L" routine=" << HexTextWidth(slot.Routine, 16, true);
                 if (!slot.Module.empty())
                 {
@@ -15630,7 +15646,9 @@ static void HandleHiveCommand(
 
         for (const HiveRecord& hive : result.Hives)
         {
-            if (!hive.Suspicious && result.Hives.size() > 16)
+            if (!hive.Suspicious &&
+                !hive.CoverageIncomplete &&
+                result.Hives.size() > 16)
             {
                 continue;
             }
@@ -15662,11 +15680,11 @@ static void HandleHiveCommand(
 static void PrintTokenHelp()
 {
     std::wcout << L"!token command:\n";
-    std::wcout << L"  !token <pid|image|eprocess>\n";
-    std::wcout << L"  !token /all [/limit <n>]\n";
+    std::wcout << L"  !token <pid|image|eprocess> [/system]\n";
+    std::wcout << L"  !token /all [/limit <n>] [/system]\n";
     std::wcout << L"\n";
     std::wcout << L"reads _EPROCESS.Token -> _SEP_TOKEN_PRIVILEGES and reports high-risk enabled privileges.\n";
-    std::wcout << L"system-profile images are suppressed from default suspicion.\n";
+    std::wcout << L"system-profile images are suppressed by default; /system includes them in suspicion.\n";
 }
 
 static void HandleTokenCommand(
@@ -15690,6 +15708,7 @@ static void HandleTokenCommand(
 
         TokenPrivilegeScanner::Options options = {};
         size_t index = 1;
+        bool parseOk = true;
         while (index < args.size())
         {
             std::wstring token = ToLower(args[index]);
@@ -15699,12 +15718,21 @@ static void HandleTokenCommand(
                 ++index;
                 continue;
             }
-            if (token == L"/limit" && index + 1 < args.size())
+            if (token == L"/limit")
             {
-                uint64_t limitValue = 0;
-                if (!ParseUnsigned(args[index + 1], 10, &limitValue))
+                if (index + 1 >= args.size())
                 {
-                    std::wcerr << L"!token: invalid /limit\n";
+                    std::wcerr << L"!token: /limit requires a value\n";
+                    parseOk = false;
+                    break;
+                }
+                uint64_t limitValue = 0;
+                if (!ParseUnsigned(args[index + 1], 10, &limitValue) ||
+                    limitValue == 0 ||
+                    limitValue > 4096)
+                {
+                    std::wcerr << L"!token: /limit must be between 1 and 4096\n";
+                    parseOk = false;
                     break;
                 }
                 options.Limit = static_cast<uint32_t>(limitValue);
@@ -15717,10 +15745,28 @@ static void HandleTokenCommand(
                 ++index;
                 continue;
             }
+            if (!token.empty() && token[0] == L'/')
+            {
+                std::wcerr << L"!token: unknown option " << args[index] << L"\n";
+                parseOk = false;
+                break;
+            }
 
             uint64_t pidValue = 0;
-            if (ParseUnsigned(args[index], 10, &pidValue) && pidValue <= 0xffffffffull)
+            if (ParseUnsigned(args[index], 10, &pidValue))
             {
+                if (pidValue > 0xffffffffull)
+                {
+                    std::wcerr << L"!token: pid exceeds 32-bit range\n";
+                    parseOk = false;
+                    break;
+                }
+                if (options.HasProcessId || options.HasEprocess || !options.ImageFilter.empty())
+                {
+                    std::wcerr << L"!token: specify only one pid, image, or eprocess target\n";
+                    parseOk = false;
+                    break;
+                }
                 options.HasProcessId = true;
                 options.ProcessId = static_cast<uint32_t>(pidValue);
                 ++index;
@@ -15731,14 +15777,39 @@ static void HandleTokenCommand(
             if ((args[index].rfind(L"0x", 0) == 0 || args[index].rfind(L"0X", 0) == 0) &&
                 ParseUnsigned(args[index], 16, &eprocess))
             {
+                if (options.HasProcessId || options.HasEprocess || !options.ImageFilter.empty())
+                {
+                    std::wcerr << L"!token: specify only one pid, image, or eprocess target\n";
+                    parseOk = false;
+                    break;
+                }
                 options.HasEprocess = true;
                 options.Eprocess = eprocess;
                 ++index;
                 continue;
             }
 
+            if (options.HasProcessId || options.HasEprocess || !options.ImageFilter.empty())
+            {
+                std::wcerr << L"!token: specify only one pid, image, or eprocess target\n";
+                parseOk = false;
+                break;
+            }
             options.ImageFilter = args[index];
             ++index;
+        }
+
+        if (!parseOk)
+        {
+            PrintTokenHelp();
+            break;
+        }
+
+        if (options.ScanAll &&
+            (options.HasProcessId || options.HasEprocess || !options.ImageFilter.empty()))
+        {
+            std::wcerr << L"!token: /all cannot be combined with a process target\n";
+            break;
         }
 
         if (!options.ScanAll && !options.HasProcessId && !options.HasEprocess && options.ImageFilter.empty())
@@ -15870,12 +15941,22 @@ static void HandleDpcTimerCommand(
                 ++index;
                 continue;
             }
-            if (token == L"/limit" && index + 1 < args.size())
+            if (token == L"/limit")
             {
-                uint64_t limitValue = 0;
-                if (!ParseUnsigned(args[index + 1], 10, &limitValue))
+                if (index + 1 >= args.size())
                 {
-                    std::wcerr << command << L": invalid /limit\n";
+                    std::wcerr << command << L": /limit requires a value\n";
+                    break;
+                }
+                uint64_t limitValue = 0;
+                const uint64_t maximumLimit =
+                    scope == DpcTimerScanner::Scope::Timer ? 8192ull : 4096ull;
+                if (!ParseUnsigned(args[index + 1], 10, &limitValue) ||
+                    limitValue == 0 ||
+                    limitValue > maximumLimit)
+                {
+                    std::wcerr << command << L": /limit must be between 1 and "
+                               << maximumLimit << L"\n";
                     break;
                 }
                 options.Limit = static_cast<uint32_t>(limitValue);
@@ -15960,9 +16041,15 @@ static void HandleDpcTimerCommand(
                 }
                 std::wcout << L"\n";
             }
-            if (result.SuspiciousDpcCount == 0 && !options.Verbose)
+            if (result.SuspiciousDpcCount == 0 &&
+                !options.Verbose &&
+                result.DpcCoverageComplete)
             {
                 std::wcout << L"  no non-image DPC routines observed in sampled queues\n";
+            }
+            else if (!options.Verbose && !result.DpcCoverageComplete)
+            {
+                std::wcout << L"  DPC coverage incomplete; absence of findings is not a clean result\n";
             }
         }
         else if (scope == DpcTimerScanner::Scope::Timer)
@@ -15990,9 +16077,15 @@ static void HandleDpcTimerCommand(
                 }
                 std::wcout << L"\n";
             }
-            if (result.SuspiciousTimerCount == 0 && !options.Verbose)
+            if (result.SuspiciousTimerCount == 0 &&
+                !options.Verbose &&
+                result.TimerCoverageComplete)
             {
                 std::wcout << L"  no non-image timer DPC routines observed\n";
+            }
+            else if (!options.Verbose && !result.TimerCoverageComplete)
+            {
+                std::wcout << L"  timer coverage incomplete; absence of findings is not a clean result\n";
             }
         }
         else
@@ -34892,6 +34985,19 @@ static bool ValidateAiCapabilityToolArgKeys(
     {
         allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"apc", L"stacks", L"limit"};
     }
+    else if (tool == L"token.inspect")
+    {
+        allowed = {L"pid", L"image", L"eprocess", L"limit"};
+    }
+    else if (tool == L"etw.providers" ||
+             tool == L"etw.ti_cross" ||
+             tool == L"hal.scan" ||
+             tool == L"hive.list" ||
+             tool == L"dpc.list" ||
+             tool == L"timer.list")
+    {
+        allowed = {};
+    }
     else if (tool == L"etw.integrity" || tool == L"assistant.answer")
     {
         allowed = {};
@@ -38791,7 +38897,19 @@ static bool ExecuteAiCapabilitySimpleBang(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": " << toolName << L"\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        if (structuredJsonOut != nullptr)
+        {
+            structuredJsonOut->clear();
+        }
         handler(args, device, symbols, structuredJsonOut);
+        if (structuredJsonOut != nullptr && structuredJsonOut->empty())
+        {
+            if (error != nullptr)
+            {
+                *error = toolName + L" did not produce a structured result";
+            }
+            break;
+        }
         ok = true;
     } while (false);
     return ok;
@@ -39328,26 +39446,63 @@ static bool ExecuteAiCapabilityPlan(
             }
             else if (step.Tool == L"token.inspect")
             {
-                std::wstring pid;
-                ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pid", L"process"}, &pid);
-                std::vector<std::wstring> tokenArgs = {L"!token"};
-                if (!pid.empty())
+                do
                 {
-                    tokenArgs.push_back(pid);
-                }
-                else
-                {
-                    tokenArgs.push_back(L"4");
-                }
-                stepOk = ExecuteAiCapabilitySimpleBang(
-                    step,
-                    device,
-                    symbols,
-                    L"token.inspect",
-                    tokenArgs,
-                    error,
-                    structuredJsonOut,
-                    HandleTokenCommand);
+                    std::wstring pid;
+                    std::wstring image;
+                    std::wstring eprocess;
+                    std::wstring limit;
+                    ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pid"}, &pid);
+                    ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"image"}, &image);
+                    ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"eprocess"}, &eprocess);
+                    ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"limit"}, &limit);
+
+                    const uint32_t targetCount =
+                        (pid.empty() ? 0u : 1u) +
+                        (image.empty() ? 0u : 1u) +
+                        (eprocess.empty() ? 0u : 1u);
+                    if (targetCount > 1)
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = L"token.inspect accepts only one of pid, image, or eprocess";
+                        }
+                        break;
+                    }
+
+                    std::vector<std::wstring> tokenArgs = {L"!token"};
+                    if (!pid.empty())
+                    {
+                        tokenArgs.push_back(pid);
+                    }
+                    else if (!image.empty())
+                    {
+                        tokenArgs.push_back(image);
+                    }
+                    else if (!eprocess.empty())
+                    {
+                        tokenArgs.push_back(eprocess);
+                    }
+                    else
+                    {
+                        tokenArgs.push_back(L"4");
+                    }
+                    if (!limit.empty())
+                    {
+                        tokenArgs.push_back(L"/limit");
+                        tokenArgs.push_back(limit);
+                    }
+
+                    stepOk = ExecuteAiCapabilitySimpleBang(
+                        step,
+                        device,
+                        symbols,
+                        L"token.inspect",
+                        tokenArgs,
+                        error,
+                        structuredJsonOut,
+                        HandleTokenCommand);
+                } while (false);
             }
             else if (step.Tool == L"dpc.list")
             {
@@ -42277,13 +42432,25 @@ static std::wstring GetMcpStableTokenPath()
 
 static std::wstring ResolveMcpBridgeScriptPath()
 {
-    // Prefer a bridge staged beside the EXE (release layout), then repo tools/.
+    const std::wstring executableDirectory = GetExecutableDirectory();
+    const std::wstring repositoryRoot = executableDirectory + L"\\..\\..";
+    const std::wstring repositoryBridge =
+        repositoryRoot + L"\\tools\\mcp-bridge.ps1";
+    const DWORD repositoryAttributes =
+        GetFileAttributesW((repositoryRoot + L"\\.git").c_str());
+    if (repositoryAttributes != INVALID_FILE_ATTRIBUTES &&
+        FileExists(repositoryBridge))
+    {
+        // Development builds must not select an older script left in x64/.
+        return repositoryBridge;
+    }
+
+    // Packaged builds use the bridge staged beside the EXE.
     const std::wstring candidates[] =
     {
-        GetExecutableDirectory() + L"\\tools\\mcp-bridge.ps1",
-        GetExecutableDirectory() + L"\\mcp-bridge.ps1",
-        GetExecutableDirectory() + L"\\..\\..\\tools\\mcp-bridge.ps1",
-        GetExecutableDirectory() + L"\\..\\tools\\mcp-bridge.ps1",
+        executableDirectory + L"\\tools\\mcp-bridge.ps1",
+        executableDirectory + L"\\mcp-bridge.ps1",
+        executableDirectory + L"\\..\\tools\\mcp-bridge.ps1",
     };
     for (const std::wstring& path : candidates)
     {
@@ -42295,43 +42462,6 @@ static std::wstring ResolveMcpBridgeScriptPath()
     return candidates[0];
 }
 
-static bool CopyFileIfExists(const std::wstring& source, const std::wstring& dest)
-{
-    if (!FileExists(source) || dest.empty())
-    {
-        return false;
-    }
-    size_t slash = dest.find_last_of(L"\\/");
-    if (slash != std::wstring::npos)
-    {
-        CreateDirectoryW(dest.substr(0, slash).c_str(), nullptr);
-    }
-    return CopyFileW(source.c_str(), dest.c_str(), FALSE) != 0;
-}
-
-static void MigrateLegacyMcpTokenIfNeeded(uint16_t port, const std::wstring& stableTokenPath)
-{
-    if (FileExists(stableTokenPath))
-    {
-        return;
-    }
-    // Older builds stored per-port tokens next to the EXE. Promote the default
-    // port file (and the active port file) so existing lab boxes keep working
-    // without re-registering clients.
-    const std::wstring legacyDir = GetExecutableDirectory() + L"\\.kn-live-dbg";
-    const std::wstring legacyPort = legacyDir + L"\\mcp-token-" + std::to_wstring(port);
-    const std::wstring legacyDefault = legacyDir + L"\\mcp-token-51766";
-    if (FileExists(legacyPort))
-    {
-        CopyFileIfExists(legacyPort, stableTokenPath);
-        return;
-    }
-    if (port != 51766 && FileExists(legacyDefault))
-    {
-        CopyFileIfExists(legacyDefault, stableTokenPath);
-    }
-}
-
 static bool WriteMcpEndpointFile(
     const std::wstring& loopUrl,
     const std::wstring& remoteUrl,
@@ -42340,7 +42470,8 @@ static bool WriteMcpEndpointFile(
     uint16_t port,
     bool allowWrite,
     bool remoteBind,
-    std::wstring* pathOut)
+    std::wstring* pathOut,
+    std::wstring* error)
 {
     const std::wstring path = GetMcpEndpointPath();
     if (pathOut != nullptr)
@@ -42362,66 +42493,50 @@ static bool WriteMcpEndpointFile(
     json += L"  \"bridge\": " + mcpjson::Quote(ResolveMcpBridgeScriptPath()) + L"\n";
     json += L"}\n";
 
-    size_t slash = path.find_last_of(L"\\/");
-    if (slash != std::wstring::npos)
+    if (!WriteMcpSensitiveFile(path, mcpjson::WideToUtf8(json), error))
     {
-        CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
+        return false;
     }
 
-    // Also mirror under the EXE directory so portable lab copies and the
-    // staged bridge can discover the endpoint without LOCALAPPDATA.
-    const std::wstring exeMirror =
+    // Builds before the per-user endpoint stored a second plaintext copy next
+    // to the EXE. Remove that obsolete copy after the protected file is live.
+    const std::wstring legacyMirror =
         GetExecutableDirectory() + L"\\.kn-live-dbg\\mcp-endpoint.json";
-
-    auto writeOne = [&](const std::wstring& target) -> bool
+    if (_wcsicmp(path.c_str(), legacyMirror.c_str()) != 0)
     {
-        size_t slash2 = target.find_last_of(L"\\/");
-        if (slash2 != std::wstring::npos)
+        const DWORD attributes = GetFileAttributesW(legacyMirror.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES)
         {
-            CreateDirectoryW(target.substr(0, slash2).c_str(), nullptr);
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+                !DeleteFileW(legacyMirror.c_str()))
+            {
+                if (error != nullptr)
+                {
+                    const DWORD status =
+                        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+                            ? ERROR_DIRECTORY
+                            : GetLastError();
+                    *error = L"could not remove obsolete MCP endpoint file '" +
+                        legacyMirror + L"': " + std::to_wstring(status);
+                }
+                return false;
+            }
         }
-        HANDLE file = CreateFileW(
-            target.c_str(),
-            GENERIC_WRITE,
-            0,
-            nullptr,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (file == INVALID_HANDLE_VALUE)
+        else
         {
-            return false;
-        }
-        std::string utf8 = mcpjson::WideToUtf8(json);
-        DWORD written = 0;
-        const BOOL ok = WriteFile(
-            file,
-            utf8.data(),
-            static_cast<DWORD>(utf8.size()),
-            &written,
-            nullptr);
-        CloseHandle(file);
-        return ok != 0 && written == utf8.size();
-    };
-
-    const bool primaryOk = writeOne(path);
-    writeOne(exeMirror);
-    // Best-effort owner-only DACL (same model as the token file).
-    if (primaryOk)
-    {
-        PSECURITY_DESCRIPTOR sd = nullptr;
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:P(A;;FA;;;OW)",
-                SDDL_REVISION_1,
-                &sd,
-                nullptr) &&
-            sd != nullptr)
-        {
-            SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, sd);
-            LocalFree(sd);
+            const DWORD status = GetLastError();
+            if (status != ERROR_FILE_NOT_FOUND && status != ERROR_PATH_NOT_FOUND)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not inspect obsolete MCP endpoint file '" +
+                        legacyMirror + L"': " + std::to_wstring(status);
+                }
+                return false;
+            }
         }
     }
-    return primaryOk;
+    return true;
 }
 
 static std::wstring JsonEscapePath(const std::wstring& path)
@@ -42440,23 +42555,11 @@ static std::wstring JsonEscapePath(const std::wstring& path)
     return out;
 }
 
-static std::wstring TomlSingleQuotedPath(const std::wstring& path)
+static std::wstring TomlQuotedPath(const std::wstring& path)
 {
-    // TOML single-quoted literal: only ' needs doubling.
-    std::wstring out = L"'";
-    for (wchar_t ch : path)
-    {
-        if (ch == L'\'')
-        {
-            out += L"''";
-        }
-        else
-        {
-            out.push_back(ch);
-        }
-    }
-    out.push_back(L'\'');
-    return out;
+    // TOML basic strings use the same escaping needed here for Windows path
+    // backslashes and quotes. Literal strings cannot represent an apostrophe.
+    return L"\"" + JsonEscapePath(path) + L"\"";
 }
 
 static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& wideText)
@@ -42519,7 +42622,7 @@ static std::wstring BuildMcpBridgeCodexToml(const std::wstring& bridge)
     toml += L"[mcp_servers.knlivedbg]\n";
     toml += L"command = \"powershell.exe\"\n";
     toml += L"args = [\"-NoProfile\", \"-ExecutionPolicy\", \"Bypass\", \"-File\", ";
-    toml += TomlSingleQuotedPath(bridge);
+    toml += TomlQuotedPath(bridge);
     toml += L"]\n";
     toml += L"startup_timeout_sec = 120\n";
     return toml;
@@ -42534,7 +42637,7 @@ static std::wstring BuildMcpBridgeGrokToml(const std::wstring& bridge)
     toml += L"[mcp_servers.knlivedbg]\n";
     toml += L"command = \"powershell.exe\"\n";
     toml += L"args = [\"-NoProfile\", \"-ExecutionPolicy\", \"Bypass\", \"-File\", ";
-    toml += TomlSingleQuotedPath(bridge);
+    toml += TomlQuotedPath(bridge);
     toml += L"]\n";
     toml += L"enabled = true\n";
     toml += L"startup_timeout_sec = 120\n";
@@ -42735,20 +42838,35 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         if (ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size() - 1), &read, nullptr) && read > 0)
         {
             bytes.resize(read);
-            std::wstring wide = mcpjson::Utf8ToWide(bytes);
-            // Redact token value in status output.
-            size_t tokenKey = wide.find(L"\"token\"");
-            if (tokenKey != std::wstring::npos)
+            const std::wstring wide = mcpjson::Utf8ToWide(bytes);
+            std::wstring url;
+            std::wstring remoteUrl;
+            std::wstring clientUrl;
+            std::wstring tokenSource;
+            std::wstring port;
+            std::wstring write;
+            if (!ExtractJsonStringValue(wide, L"url", &url) ||
+                !ExtractJsonStringValue(wide, L"token_source", &tokenSource) ||
+                !ExtractJsonScalarValue(wide, L"port", &port) ||
+                !ExtractJsonScalarValue(wide, L"write", &write))
             {
-                size_t colon = wide.find(L':', tokenKey);
-                size_t q1 = wide.find(L'"', colon + 1);
-                size_t q2 = (q1 == std::wstring::npos) ? std::wstring::npos : wide.find(L'"', q1 + 1);
-                if (q1 != std::wstring::npos && q2 != std::wstring::npos && q2 > q1 + 1)
-                {
-                    wide.replace(q1 + 1, q2 - q1 - 1, L"<redacted>");
-                }
+                std::wcout << L"  (invalid endpoint descriptor)\n";
             }
-            std::wcout << wide << L"\n";
+            else
+            {
+                ExtractJsonStringValue(wide, L"remote_url", &remoteUrl);
+                ExtractJsonStringValue(wide, L"client_url", &clientUrl);
+                std::wcout << L"  url         : " << url << L"\n";
+                if (!remoteUrl.empty())
+                {
+                    std::wcout << L"  remote_url  : " << remoteUrl << L"\n";
+                }
+                std::wcout << L"  client_url  : " << clientUrl << L"\n";
+                std::wcout << L"  token       : <redacted>\n";
+                std::wcout << L"  token_source: " << tokenSource << L"\n";
+                std::wcout << L"  port        : " << port << L"\n";
+                std::wcout << L"  write       : " << write << L"\n";
+            }
         }
         CloseHandle(file);
         std::wcout << L"bridge: " << ResolveMcpBridgeScriptPath() << L"\n";
@@ -42815,7 +42933,15 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         // registered once keep working across restarts, port tweaks, and moved
         // release folders. --new-token still rotates.
         config.TokenPath = GetMcpStableTokenPath();
-        MigrateLegacyMcpTokenIfNeeded(config.Port, config.TokenPath);
+        const std::wstring legacyDir =
+            GetExecutableDirectory() + L"\\.kn-live-dbg";
+        config.LegacyTokenPaths.push_back(
+            legacyDir + L"\\mcp-token-" + std::to_wstring(config.Port));
+        if (config.Port != 51766)
+        {
+            config.LegacyTokenPaths.push_back(
+                legacyDir + L"\\mcp-token-51766");
+        }
 
         std::wstring startError;
         if (!g_McpServer.Start(config, &startError))
@@ -42831,19 +42957,30 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
 
         std::wstring loopUrl = L"http://127.0.0.1:" + std::to_wstring(g_McpServer.Port()) + L"/mcp";
         std::wstring remoteHost = wildcardBind ? L"<this-host-ip>" : config.BindAddress;
-        std::wstring remoteUrl = L"http://" + remoteHost + L":" + std::to_wstring(g_McpServer.Port()) + L"/mcp";
+        std::wstring remoteUrl = remoteBind
+            ? (L"http://" + remoteHost + L":" +
+               std::to_wstring(g_McpServer.Port()) + L"/mcp")
+            : std::wstring();
         std::wstring clientUrl = remoteBind ? remoteUrl : loopUrl;
 
         std::wstring endpointPath;
-        WriteMcpEndpointFile(
-            loopUrl,
-            remoteUrl,
-            g_McpServer.Token(),
-            g_McpServer.TokenSource(),
-            g_McpServer.Port(),
-            config.AllowWrite,
-            remoteBind,
-            &endpointPath);
+        std::wstring endpointError;
+        if (!WriteMcpEndpointFile(
+                loopUrl,
+                remoteUrl,
+                g_McpServer.Token(),
+                g_McpServer.TokenSource(),
+                g_McpServer.Port(),
+                config.AllowWrite,
+                remoteBind,
+                &endpointPath,
+                &endpointError))
+        {
+            g_McpServer.Stop();
+            std::wcerr << L"mcp start failed: endpoint persistence failed: "
+                       << endpointError << L"\n";
+            return;
+        }
         // Refresh agent snippets every start so bridge paths stay accurate.
         WriteMcpClientSnippetFiles(ResolveMcpBridgeScriptPath());
 

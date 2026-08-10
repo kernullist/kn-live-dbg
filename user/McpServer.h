@@ -77,10 +77,19 @@ struct McpServerConfig
     // KNLIVEDBG_TOKEN env > persisted TokenPath file > freshly minted (then
     // persisted). RotateToken (--new-token) forces a fresh random token,
     // overwriting the persisted file.
-    std::wstring TokenPath;      // persisted token file (<.kn-live-dbg>\mcp-token-<port>)
+    std::wstring TokenPath;      // persisted per-user token file (<LocalAppData>\kn-live-dbg\mcp-token)
+    std::vector<std::wstring> LegacyTokenPaths; // optional old per-port token files
     std::wstring TokenOverride;  // explicit --token value; empty = none
     bool RotateToken = false;    // --new-token
 };
+
+// Atomically writes an MCP secret-bearing file with a protected DACL granting
+// full access only to the current process user. The destination is replaced
+// only after the complete temporary file has been flushed.
+bool WriteMcpSensitiveFile(
+    const std::wstring& path,
+    const std::string& bytes,
+    std::wstring* error);
 
 struct McpToolCatalogEntry
 {
@@ -101,9 +110,9 @@ public:
     McpServer(const McpServer&) = delete;
     McpServer& operator=(const McpServer&) = delete;
 
-    // Starts the http.sys listener on 127.0.0.1:<port>/mcp (and [::1]). Mints a
-    // fresh bearer token. Returns false (with error) if the transport cannot be
-    // initialized. On success the server is running and accepting connections.
+    // Starts the http.sys listener on 127.0.0.1:<port>/mcp (and [::1]). Resolves
+    // a stable bearer token. Returns false (with error) if token persistence or
+    // transport initialization fails. On success the server accepts requests.
     bool Start(const McpServerConfig& config, std::wstring* error);
 
     // Stops the listener, cancels queued jobs, and joins the listener thread.
@@ -137,7 +146,7 @@ private:
     void AppendAuditLine(const std::wstring& line);
     // Resolves the bearer token per the config precedence (see McpServerConfig)
     // and records how it was obtained in tokenSource_.
-    std::wstring ResolveToken();
+    bool ResolveToken(std::wstring* token, std::wstring* error);
 
     std::mutex auditMutex_;
 

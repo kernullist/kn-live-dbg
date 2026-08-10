@@ -6,7 +6,7 @@
 
 - 서버 이름: `knlivedbg`  ·  서버 버전: `0.1.0`  ·  MCP 프로토콜: `2025-06-18`
 - 전송: 인프로세스 Streamable HTTP(`http.sys`), 엔드포인트 경로 `/mcp`
-- 기본 포트: `51766`  ·  인증: 기동 시마다 새로 발급되는 256-bit bearer 토큰
+- 기본 포트: `51766`  ·  인증: 저장된 값이 없거나 명시적으로 회전할 때만 바뀌는 256-bit bearer 토큰
 - 기본 노출: **loopback 전용**(`127.0.0.1` + `[::1]`). 네트워크 노출은 `--bind`로만 옵트인.
 
 ---
@@ -85,7 +85,7 @@ mcp status     # 현재 상태
 | `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 10종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
 | `--bind <addr>` | 네트워크 노출. `<addr>`에 추가로 바인드 | 없음 = loopback 전용 |
 | `--bind=<addr>` | 위와 동일(붙여 쓰는 형태) | 없음 |
-| `--token <t>` | 고정 bearer 토큰 사용(영속), 자동 관리 토큰 대신 | auto |
+| `--token <t>` | 16-512자 printable ASCII 고정 bearer 토큰 사용(영속), 자동 관리 토큰 대신 | auto |
 | `--new-token` | 회전: 영속 토큰 폐기 후 새 랜덤 토큰 발급 | off |
 
 `<addr>`에는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0` / `*` / `+`(http.sys 강한 와일드카드 `+`로 매핑)를 줄 수 있다.
@@ -182,7 +182,7 @@ knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 
 - 읽기 전용(기본): 엔진 진입 시 `SetWriteMode(false)`로 **커널 write 플래그 자체를 비무장**한다. write 툴은 등록되지 않으며, 호출 시 `writes are disabled; start the MCP server with --allow-write (lab mode)`로 거부된다.
 - `--allow-write`: write 툴 10종이 노출되고 `SetWriteMode(true)`로 커널 write가 무장된다. 커널 메모리 write는 preflight/backup/verify-diff/audit 레일을 타고, 파일/링 작업은 backup/verify가 의미 없는 경우에도 게이트·감사·경고를 유지한다(인터랙티브 확인은 생략).
-- **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. **토큰이 새로 발급되므로 클라이언트 헤더도 갱신**해야 한다.
+- **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. `--new-token`을 함께 쓰거나 `--token`/`KNLIVEDBG_TOKEN` 값을 바꾸지 않는 한 저장된 토큰은 그대로 유지된다.
 - **권고**: write 세션 전 VM 스냅샷을 찍고, 분석 baseline(`snapshot.capture`)을 캡처하라. 격리 VM 전용이며 라이브 EDR/AC 박스에서는 절대 쓰지 않는다.
 
 ---
@@ -224,7 +224,7 @@ claude mcp list
 }
 ```
 
-> `${KNLIVEDBG_TOKEN}`은 **클라이언트 측 권장 관례**다(서버가 이 환경변수를 읽지는 않는다 — 토큰은 서버가 매 `mcp on`마다 새로 발급). 클라이언트 셸에서 `export KNLIVEDBG_TOKEN=<token>`(PowerShell은 `$env:KNLIVEDBG_TOKEN="<token>"`)로 주입한다.
+> `${KNLIVEDBG_TOKEN}`은 서버가 설정돼 있을 때 읽고, 클라이언트 설정에서도 보간할 수 있다. 서버와 클라이언트가 같은 값을 상속하도록 맞춰야 한다. 그렇지 않으면 보호된 라이브 엔드포인트 파일을 직접 읽는 `tools/mcp-bridge.ps1`을 권장한다.
 
 유용한 노브: per-server `timeout`(ms, 느린 스캔용 상향 — 진행 알림으로 연장되지 않음), `headersHelper`(접속 시 회전 토큰 발급), `alwaysLoad`.
 
@@ -237,7 +237,8 @@ claude mcp list
   "mcpServers": {
     "knlivedbg": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "http://192.168.56.10:51766/mcp",
+      "args": ["-y", "mcp-remote@0.1.38", "http://192.168.56.10:51766/mcp",
+               "--allow-http", "--transport", "http-only", "--silent",
                "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
     }
   }
@@ -274,7 +275,7 @@ http_headers = { "Authorization" = "Bearer <token-from-server>" }
 ```toml
 [mcp_servers.knlivedbg]
 command = "npx"
-args = ["-y", "mcp-remote", "http://192.168.56.10:51766/mcp", "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
+args = ["-y", "mcp-remote@0.1.38", "http://192.168.56.10:51766/mcp", "--allow-http", "--transport", "http-only", "--silent", "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
 env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
 ```
 
@@ -438,7 +439,7 @@ hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
 ```
 
 - Hermes는 시작 시 `config.yaml`을 한 번만 읽으므로 편집 후 **Hermes 재시작**. `hermes mcp list`로 확인(`knlivedbg`가 connected). 헤더 env 보간은 보장되지 않아 보통 토큰 원문이 YAML에 들어가므로, 파일을 비밀로 다루고 커밋하지 말 것.
-- 빌드가 오래돼 `url`을 거부하면 stdio `mcp-remote` 브리지로 폴백한다(`command: npx`, `args: [-y, mcp-remote, <url>, --header, "Authorization: Bearer <token>"]`). Windows에서는 PATH에 Node/`npx`가 있어야 하며, 이게 없는 게 "서버 못 찾음"의 흔한 원인이다. 출처: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
+- 빌드가 오래돼 `url`을 거부하면 `tools/mcp-bridge.ps1`을 사용한다. 이 스크립트는 `mcp-remote` 버전을 고정하고 로컬 HTTP 허용 및 HTTP-only 전송 플래그를 명시한다. Windows에서는 PATH에 Node/`npx`가 있어야 한다. 출처: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
 
 ### 4.11 토큰 취급 주의
 
@@ -587,10 +588,10 @@ claude mcp list                      # connected 확인
 
 | 증상 | 원인 / 해결 |
 |------|-------------|
-| 연결이 401 | 토큰 불일치. 서버가 새로 찍은 토큰으로 클라이언트 헤더 갱신 |
+| 연결이 401 | 토큰 불일치. 서버가 출력한 현재 토큰으로 클라이언트 헤더를 갱신하거나 `tools/mcp-bridge.ps1`로 다시 연결 |
 | 연결이 403 | (로컬) loopback이 아닌 Host로 접속 → 원격이면 `--bind` 필요 / (양쪽) Origin이 비-loopback인 브라우저 컨텍스트 |
 | 원격에서 접속 불가(타임아웃) | 방화벽 인바운드 차단. `New-NetFirewallRule`로 포트/클라이언트 IP 허용. 서버가 `--bind <IP>`로 떴는지 확인 |
-| `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write [--bind <addr>]`로 재기동. 토큰이 새로 발급되니 클라이언트 헤더도 갱신 |
+| `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write [--bind <addr>]`로 재기동. 명시적으로 회전하거나 덮어쓰지 않는 한 저장된 토큰은 유지됨 |
 | `engine busy; retry shortly` 또는 `engine timeout` | tools/call은 JSON-RPC 에러코드가 아니라 `isError:true` CallToolResult로 옴. 대기 큐(8개) 포화 시 `engine busy`(audit `engine-busy`), 30초 요청 타임아웃 초과(긴 스캔) 시 `engine timeout`(audit `tool-error`). 클라이언트 per-server `timeout` 상향 또는 `limit`/`count`로 스캔 단축. (`-32603`은 `resources/read` 혼잡 경로에서만 발생) |
 | 드라이버 로드 실패 | 테스트 서명 미활성 → `bcdedit /set testsigning on` 후 재부팅 / 비-elevated 실행 |
 | `symType=0 (SymNone)` | 심볼 DLL 묶음을 EXE 옆에 두지 않음(2.1 참고) |

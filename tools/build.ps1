@@ -164,7 +164,61 @@ function Find-DebuggingToolsDir
         }
     }
 
-    throw "Windows Kits Debugging Tools x64 runtime was not found"
+    return $null
+}
+
+function Find-DebuggingToolsBuildLayout
+{
+    param(
+        [string]$DebuggersDir
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($DebuggersDir))
+    {
+        $debuggersRoot = Split-Path -Parent $DebuggersDir
+        $includeDir = Join-Path $debuggersRoot "inc"
+        $libDir = Join-Path $debuggersRoot "lib\x64"
+        if ((Test-Path (Join-Path $includeDir "DbgEng.h")) -and
+            (Test-Path (Join-Path $libDir "DbgEng.Lib")))
+        {
+            return [pscustomobject]@{
+                IncludeDir = $includeDir
+                LibDir = $libDir
+            }
+        }
+    }
+
+    $kitRoots = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10"),
+        (Join-Path $env:ProgramFiles "Windows Kits\10")
+    )
+
+    foreach ($kitRoot in $kitRoots)
+    {
+        $includeRoot = Join-Path $kitRoot "Include"
+        if (-not (Test-Path $includeRoot))
+        {
+            continue
+        }
+
+        $versions = Get-ChildItem -LiteralPath $includeRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object { [version]$_.Name } -Descending
+        foreach ($version in $versions)
+        {
+            $includeDir = Join-Path $version.FullName "um"
+            $libDir = Join-Path $kitRoot ("Lib\{0}\um\x64" -f $version.Name)
+            if ((Test-Path (Join-Path $includeDir "DbgEng.h")) -and
+                (Test-Path (Join-Path $libDir "DbgEng.Lib")))
+            {
+                return [pscustomobject]@{
+                    IncludeDir = $includeDir
+                    LibDir = $libDir
+                }
+            }
+        }
+    }
+
+    throw "DbgEng headers and x64 import library were not found in the Windows SDK"
 }
 
 function Parse-VersionParts
@@ -457,7 +511,8 @@ function Copy-DebuggingToolsRuntime
         [Parameter(Mandatory = $true)]
         [string]$SourceDir,
         [Parameter(Mandatory = $true)]
-        [string]$DestinationDir
+        [string]$DestinationDir,
+        [string]$FallbackDir
     )
 
     if (-not (Test-Path $SourceDir))
@@ -482,8 +537,15 @@ function Copy-DebuggingToolsRuntime
         $source = Join-Path $SourceDir $name
         if (-not (Test-Path $source))
         {
-            $fallback = Join-Path $debuggersDir $name
-            if ($SourceDir -ne $debuggersDir -and (Test-Path $fallback))
+            $fallback = $null
+            if (-not [string]::IsNullOrWhiteSpace($FallbackDir))
+            {
+                $fallback = Join-Path $FallbackDir $name
+            }
+
+            if ($SourceDir -ne $FallbackDir -and
+                -not [string]::IsNullOrWhiteSpace($fallback) -and
+                (Test-Path $fallback))
             {
                 $source = $fallback
                 Write-Warning "Debugging Tools runtime file was not found in vendor source; using installed fallback: $name"
@@ -559,16 +621,24 @@ if ($visualStudioInstallations.Count -eq 0)
 $msbuild = Find-MSBuild -VisualStudioInstallations $visualStudioInstallations
 $diaSdkDir = Find-DiaSdk -VisualStudioInstallations $visualStudioInstallations
 $debuggersDir = Find-DebuggingToolsDir
+$debuggingToolsBuildLayout = Find-DebuggingToolsBuildLayout -DebuggersDir $debuggersDir
 $diaIncludeDir = Join-Path $diaSdkDir "include"
 $diaLibDir = Join-Path $diaSdkDir "lib\amd64"
-$debuggersIncludeDir = Split-Path -Parent $debuggersDir
-$debuggersIncludeDir = Join-Path $debuggersIncludeDir "inc"
-$debuggersLibDir = Split-Path -Parent $debuggersDir
-$debuggersLibDir = Join-Path $debuggersLibDir "lib\x64"
+$debuggersIncludeDir = $debuggingToolsBuildLayout.IncludeDir
+$debuggersLibDir = $debuggingToolsBuildLayout.LibDir
 
 Write-Host "MSBuild: $msbuild"
 Write-Host "DIA SDK: $diaSdkDir"
-Write-Host "Debugging Tools: $debuggersDir"
+Write-Host "DbgEng include: $debuggersIncludeDir"
+Write-Host "DbgEng library: $debuggersLibDir"
+if (-not [string]::IsNullOrWhiteSpace($debuggersDir))
+{
+    Write-Host "Installed Debugging Tools runtime: $debuggersDir"
+}
+else
+{
+    Write-Host "Installed Debugging Tools runtime: not found; using the bundled runtime"
+}
 
 $baselineVersion = Get-BaselineVersion
 $versionParts = Parse-VersionParts -VersionText $baselineVersion
@@ -622,12 +692,17 @@ $runtimeSourceDir = $vendorDebuggersDir
 if (-not (Test-Path (Join-Path $runtimeSourceDir "dbghelp.dll")) -or
     -not (Test-Path (Join-Path $runtimeSourceDir "symsrv.dll")))
 {
+    if ([string]::IsNullOrWhiteSpace($debuggersDir))
+    {
+        throw "The bundled Debugging Tools runtime is incomplete and no installed runtime fallback was found"
+    }
+
     Write-Warning "Vendor Debugging Tools runtime is incomplete; falling back to installed Windows Kits runtime"
     $runtimeSourceDir = $debuggersDir
 }
 
 Write-Host "Runtime source: $runtimeSourceDir"
-Copy-DebuggingToolsRuntime -SourceDir $runtimeSourceDir -DestinationDir $outputDir
+Copy-DebuggingToolsRuntime -SourceDir $runtimeSourceDir -DestinationDir $outputDir -FallbackDir $debuggersDir
 Copy-ByovdUpdaterScript -DestinationDir $outputDir
 Copy-McpBridgeScript -DestinationDir $outputDir
 

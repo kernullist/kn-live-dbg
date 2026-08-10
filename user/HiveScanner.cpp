@@ -1,6 +1,5 @@
 #include "HiveScanner.h"
 
-#include "LayoutResolver.h"
 #include "McpJson.h"
 
 #include <cstring>
@@ -130,58 +129,61 @@ namespace
             }
             *layout = HiveLayout{};
 
-            // Prefer _HHIVE embedded at the front of _CMHIVE on modern builds.
-            ResolvedFieldOffset getCell = ResolveFieldOffset(symbols, L"nt!_HHIVE", L"GetCellRoutine", 0x18);
-            ResolvedFieldOffset releaseCell = ResolveFieldOffset(symbols, L"nt!_HHIVE", L"ReleaseCellRoutine", 0x20);
-            ResolvedFieldOffset allocate = ResolveFieldOffset(symbols, L"nt!_HHIVE", L"Allocate", 0x28);
-            ResolvedFieldOffset freeField = ResolveFieldOffset(symbols, L"nt!_HHIVE", L"Free", 0x30);
-
-            // HiveList is mandatory from PDB. Hard-coded 0xA68 is build-volatile
-            // and will invent fake hives; refuse that path.
-            TypeFieldInfo field = {};
+            TypeFieldInfo embeddedHive = {};
+            TypeFieldInfo hiveList = {};
+            TypeFieldInfo getCell = {};
+            TypeFieldInfo releaseCell = {};
+            TypeFieldInfo allocate = {};
+            TypeFieldInfo freeField = {};
             std::wstring ignored;
-            bool hiveListFromPdb = symbols.FindField(L"nt!_CMHIVE", L"HiveList", &field, &ignored);
+            const bool embeddedHiveFromPdb =
+                symbols.FindField(L"nt!_CMHIVE", L"Hive", &embeddedHive, &ignored);
+            const bool hiveListFromPdb =
+                symbols.FindField(L"nt!_CMHIVE", L"HiveList", &hiveList, &ignored);
+            const bool getCellFromPdb =
+                symbols.FindField(L"nt!_HHIVE", L"GetCellRoutine", &getCell, &ignored);
 
-            layout->GetCellOffset = getCell.Offset;
-            layout->ReleaseCellOffset = releaseCell.Offset;
-            layout->AllocateOffset = allocate.Offset;
-            layout->FreeOffset = freeField.Offset;
-            layout->HasRelease = releaseCell.FromPdb;
-            layout->HasAllocate = allocate.FromPdb;
-            layout->HasFree = freeField.FromPdb;
-
-            if (!getCell.FromPdb)
-            {
-                // Stable public x64 HHIVE function-pointer block used by
-                // multiple research tools: GetCell at +0x18 after base fields.
-                layout->GetCellOffset = 0x18;
-                layout->ReleaseCellOffset = 0x20;
-                layout->AllocateOffset = 0x28;
-                layout->FreeOffset = 0x30;
-                layout->HasRelease = true;
-                layout->HasAllocate = true;
-                layout->HasFree = true;
-                if (warnings != nullptr)
-                {
-                    warnings->push_back(
-                        L"_HHIVE.GetCellRoutine not in PDB; using guarded x64 fallback offsets");
-                }
-            }
-
-            if (!hiveListFromPdb)
+            if (!embeddedHiveFromPdb || !hiveListFromPdb || !getCellFromPdb)
             {
                 if (warnings != nullptr)
                 {
                     warnings->push_back(
-                        L"_CMHIVE.HiveList not in PDB; hive walk aborted (no trusted list offset)");
+                        L"mandatory _CMHIVE.Hive/HiveList or _HHIVE.GetCellRoutine "
+                        L"field missing from PDB; hive walk disabled");
                 }
-                // Leave HiveListOffset = 0 and FromPdb false; Scan will fail closed.
                 ok = true;
                 break;
             }
 
-            layout->HiveListOffset = field.Offset;
-            // HiveList is PDB-trusted. GetCell may still use guarded fallback.
+            layout->HiveListOffset = hiveList.Offset;
+            layout->GetCellOffset = embeddedHive.Offset + getCell.Offset;
+            layout->HasRelease = symbols.FindField(
+                L"nt!_HHIVE",
+                L"ReleaseCellRoutine",
+                &releaseCell,
+                &ignored);
+            layout->HasAllocate = symbols.FindField(
+                L"nt!_HHIVE",
+                L"Allocate",
+                &allocate,
+                &ignored);
+            layout->HasFree = symbols.FindField(
+                L"nt!_HHIVE",
+                L"Free",
+                &freeField,
+                &ignored);
+            if (layout->HasRelease)
+            {
+                layout->ReleaseCellOffset = embeddedHive.Offset + releaseCell.Offset;
+            }
+            if (layout->HasAllocate)
+            {
+                layout->AllocateOffset = embeddedHive.Offset + allocate.Offset;
+            }
+            if (layout->HasFree)
+            {
+                layout->FreeOffset = embeddedHive.Offset + freeField.Offset;
+            }
             layout->FromPdb = true;
 
             if (layout->GetCellOffset >= kMaxLayoutProbe ||
@@ -198,23 +200,6 @@ namespace
             ok = true;
         } while (false);
         return ok;
-    }
-
-    bool LooksLikeGetCellRoutine(SymbolEngine& symbols, uint64_t routine)
-    {
-        if (routine == 0 || !IsKernelAddress(routine))
-        {
-            return false;
-        }
-        std::wstring module = FindOwningModule(symbols, routine);
-        if (!ModuleLooksLikeNt(module))
-        {
-            return false;
-        }
-        std::wstring symbol = NearestSymbolText(symbols, routine);
-        // Accept any ntoskrnl-owned routine; symbol name hint is soft.
-        (void)symbol;
-        return true;
     }
 
     std::wstring JsonHex(uint64_t value)
@@ -292,22 +277,26 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
         result->GetCellOffset = layout.GetCellOffset;
         result->ReleaseCellOffset = layout.ReleaseCellOffset;
 
-        if (layout.HiveListOffset == 0 || !layout.FromPdb)
+        if (!layout.FromPdb)
         {
             if (error != nullptr)
             {
-                *error = L"hive list layout unavailable without PDB-resolved _CMHIVE.HiveList";
+                *error = L"hive layout unavailable without mandatory PDB fields";
             }
             result->CoverageComplete = false;
             break;
         }
 
         uint64_t flink = 0;
-        if (!ReadU64(device_, listHead, &flink) || flink == 0)
+        uint64_t blink = 0;
+        if (!ReadU64(device_, listHead, &flink) ||
+            !ReadU64(device_, listHead + sizeof(uint64_t), &blink) ||
+            flink == 0 ||
+            blink == 0)
         {
             if (error != nullptr)
             {
-                *error = L"failed to read hive list Flink";
+                *error = L"failed to read hive list head links";
             }
             break;
         }
@@ -315,14 +304,21 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
         // Empty list sentinel.
         if (flink == listHead)
         {
-            result->CoverageComplete = true;
+            result->CoverageComplete = blink == listHead;
+            if (!result->CoverageComplete)
+            {
+                result->Warnings.push_back(
+                    L"empty hive list sentinel has a mismatched Blink");
+            }
             ok = true;
             break;
         }
 
         std::set<uint64_t> visited;
         uint64_t entry = flink;
+        uint64_t previous = listHead;
         uint32_t index = 0;
+        bool walkComplete = false;
         uint32_t limit = options.Limit == 0 ? kMaxHives : options.Limit;
         if (limit > kMaxHives)
         {
@@ -341,6 +337,39 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
             if (!IsKernelAddress(entry))
             {
                 result->Warnings.push_back(L"non-canonical hive list entry; walk stopped");
+                break;
+            }
+
+            uint64_t next = 0;
+            uint64_t previousLink = 0;
+            if (!ReadU64(device_, entry, &next) ||
+                !ReadU64(device_, entry + sizeof(uint64_t), &previousLink))
+            {
+                result->Warnings.push_back(
+                    L"failed to read hive list links; walk stopped");
+                break;
+            }
+            if (previousLink != previous)
+            {
+                result->Warnings.push_back(
+                    L"hive list backlink mismatch; walk stopped");
+                break;
+            }
+            if (next == 0 || (next != listHead && !IsKernelAddress(next)))
+            {
+                result->Warnings.push_back(
+                    L"invalid next hive list link; walk stopped");
+                break;
+            }
+            uint64_t nextBacklink = 0;
+            if (!ReadU64(
+                    device_,
+                    next + sizeof(uint64_t),
+                    &nextBacklink) ||
+                nextBacklink != entry)
+            {
+                result->Warnings.push_back(
+                    L"next hive list backlink mismatch; walk stopped");
                 break;
             }
 
@@ -365,7 +394,7 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
             if (!ReadU64(device_, hiveBase + layout.GetCellOffset, &getCell))
             {
                 record.Notes = L"GetCellRoutine read failed";
-                record.Suspicious = true;
+                record.CoverageIncomplete = true;
             }
             else
             {
@@ -383,16 +412,21 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
                     record.Suspicious = true;
                     record.Notes = L"GetCellRoutine owned by non-nt module (" + record.GetCellModule + L")";
                 }
-                else if (!LooksLikeGetCellRoutine(symbols_, getCell))
-                {
-                    // still nt-owned; keep as info unless we want soft note
-                }
             }
 
             if (layout.HasRelease)
             {
                 uint64_t releaseCell = 0;
-                if (ReadU64(device_, hiveBase + layout.ReleaseCellOffset, &releaseCell) && releaseCell != 0)
+                if (!ReadU64(device_, hiveBase + layout.ReleaseCellOffset, &releaseCell))
+                {
+                    record.CoverageIncomplete = true;
+                    if (!record.Notes.empty())
+                    {
+                        record.Notes += L"; ";
+                    }
+                    record.Notes += L"ReleaseCellRoutine read failed";
+                }
+                else if (releaseCell != 0)
                 {
                     record.HasReleaseCell = true;
                     record.ReleaseCellRoutine = releaseCell;
@@ -438,24 +472,26 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
 
             result->Hives.push_back(record);
             ++index;
-
-            uint64_t next = 0;
-            if (!ReadU64(device_, entry, &next))
-            {
-                result->Warnings.push_back(L"failed to read next hive list Flink; walk stopped");
-                break;
-            }
+            previous = entry;
             entry = next;
         }
 
-        if (index >= limit && entry != listHead && entry != 0)
+        if (entry == listHead)
+        {
+            walkComplete = true;
+        }
+        if (index >= limit && entry != listHead)
         {
             result->Warnings.push_back(L"hive walk hit limit; coverage incomplete");
-            result->CoverageComplete = false;
         }
-        else if (entry == listHead || entry == 0)
+        result->CoverageComplete = walkComplete;
+        for (const HiveRecord& record : result->Hives)
         {
-            result->CoverageComplete = true;
+            if (record.CoverageIncomplete)
+            {
+                result->CoverageComplete = false;
+                break;
+            }
         }
 
         ok = true;
@@ -508,6 +544,8 @@ std::wstring BuildHiveJson(const HiveScanResult& result)
         out += L",\"releaseCellModule\":" + mcpjson::Quote(hive.ReleaseCellModule);
         out += L",\"suspicious\":";
         out += hive.Suspicious ? L"true" : L"false";
+        out += L",\"coverageIncomplete\":";
+        out += hive.CoverageIncomplete ? L"true" : L"false";
         out += L",\"notes\":" + mcpjson::Quote(hive.Notes);
         out += L"}";
     }

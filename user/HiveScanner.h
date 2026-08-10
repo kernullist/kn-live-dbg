@@ -23,6 +23,7 @@ struct HiveRecord
     std::wstring ReleaseCellSymbol;
     std::wstring Notes;
     bool Suspicious = false;
+    bool CoverageIncomplete = false;
     bool HasReleaseCell = false;
     bool HasAllocate = false;
     bool HasFree = false;

@@ -171,18 +171,6 @@ namespace
         return false;
     }
 
-    bool ElevatingFindingBit(uint32_t bit)
-    {
-        for (const KnownPrivilege& item : kKnownPrivileges)
-        {
-            if (item.Bit == bit)
-            {
-                return item.ElevatingFinding;
-            }
-        }
-        return false;
-    }
-
     bool IsCommonAdminPrivilegeName(const std::wstring& name)
     {
         return EqualsCI(name, L"SeDebugPrivilege") ||
@@ -207,14 +195,23 @@ namespace
             IsKernelAddress(*address);
     }
 
-    std::wstring ReadImageFileName(DeviceClient& device, uint64_t eprocess, uint32_t offset)
+    std::wstring ReadImageFileName(
+        DeviceClient& device,
+        uint64_t eprocess,
+        uint32_t offset,
+        bool* resolved)
     {
+        if (resolved != nullptr)
+        {
+            *resolved = false;
+        }
         std::vector<uint8_t> bytes;
         if (!ReadBytes(device, eprocess + offset, 15, &bytes))
         {
             return std::wstring();
         }
         std::wstring name;
+        bool valid = true;
         for (uint8_t ch : bytes)
         {
             if (ch == 0)
@@ -223,9 +220,14 @@ namespace
             }
             if (ch < 32 || ch > 126)
             {
+                valid = false;
                 break;
             }
             name.push_back(static_cast<wchar_t>(ch));
+        }
+        if (resolved != nullptr)
+        {
+            *resolved = valid && !name.empty();
         }
         return name;
     }
@@ -366,12 +368,24 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             ResolveFieldOffset(symbols_, L"nt!_SEP_TOKEN_PRIVILEGES", L"EnabledByDefault", 0x10);
 
         result->LayoutFromPdb =
-            tokenField.FromPdb && privilegesField.FromPdb && presentField.FromPdb && enabledField.FromPdb;
+            tokenField.FromPdb &&
+            privilegesField.FromPdb &&
+            presentField.FromPdb &&
+            enabledField.FromPdb &&
+            enabledByDefaultField.FromPdb;
+        result->ProcessLayoutFromPdb =
+            pidField.FromPdb && linksField.FromPdb && imageField.FromPdb;
 
         if (!result->LayoutFromPdb)
         {
             result->Warnings.push_back(
                 L"token privilege layout partially from fallback offsets; treat findings as evidence");
+        }
+        if (!result->ProcessLayoutFromPdb &&
+            !options.HasEprocess)
+        {
+            result->Warnings.push_back(
+                L"process-list layout partially from fallback offsets; walk coverage is incomplete");
         }
 
         struct Target
@@ -379,6 +393,7 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             uint64_t Eprocess = 0;
             uint32_t Pid = 0;
             std::wstring Image;
+            bool IdentityResolved = false;
         };
 
         std::vector<Target> targets;
@@ -390,11 +405,22 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             // Best-effort identity fill so !token <eprocess> and snapshot paths
             // still show pid/image when the EPROCESS is readable.
             uint64_t pidValue = 0;
-            if (ReadU64(device_, options.Eprocess + pidField.Offset, &pidValue))
+            const bool pidResolved =
+                ReadU64(device_, options.Eprocess + pidField.Offset, &pidValue) &&
+                pidValue <= 0xffffffffull;
+            if (pidResolved)
             {
                 target.Pid = static_cast<uint32_t>(pidValue & 0xffffffffu);
             }
-            target.Image = ReadImageFileName(device_, options.Eprocess, imageField.Offset);
+            bool imageResolved = false;
+            target.Image = ReadImageFileName(
+                device_,
+                options.Eprocess,
+                imageField.Offset,
+                &imageResolved);
+            target.IdentityResolved = pidResolved && imageResolved;
+            result->ProcessWalkComplete =
+                target.IdentityResolved && result->ProcessLayoutFromPdb;
             targets.push_back(target);
         }
         else if (options.HasProcessId || options.ScanAll || !options.ImageFilter.empty())
@@ -410,43 +436,102 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             }
 
             uint64_t flink = 0;
-            if (!ReadU64(device_, listHead, &flink))
+            uint64_t blink = 0;
+            if (!ReadU64(device_, listHead, &flink) ||
+                !ReadU64(
+                    device_,
+                    listHead + sizeof(uint64_t),
+                    &blink))
             {
                 if (error != nullptr)
                 {
-                    *error = L"failed to read PsActiveProcessHead";
+                    *error = L"failed to read PsActiveProcessHead links";
+                }
+                break;
+            }
+            if ((flink != listHead && !IsKernelAddress(flink)) ||
+                (blink != listHead && !IsKernelAddress(blink)) ||
+                (flink == listHead && blink != listHead))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"PsActiveProcessHead contains invalid sentinel links";
                 }
                 break;
             }
 
             std::set<uint64_t> visited;
             uint64_t entry = flink;
+            uint64_t previous = listHead;
             uint32_t walked = 0;
+            bool exactTargetFound = false;
             while (entry != 0 && entry != listHead && walked < kMaxProcesses)
             {
                 if (visited.find(entry) != visited.end())
                 {
+                    result->Warnings.push_back(
+                        L"active process list cycle detected; walk stopped");
                     break;
                 }
                 visited.insert(entry);
 
                 if (!IsKernelAddress(entry) || entry < linksField.Offset)
                 {
+                    result->Warnings.push_back(
+                        L"active process list entry is invalid; walk stopped");
+                    break;
+                }
+
+                uint64_t next = 0;
+                uint64_t previousLink = 0;
+                if (!ReadU64(device_, entry, &next) ||
+                    !ReadU64(device_, entry + sizeof(uint64_t), &previousLink))
+                {
+                    result->Warnings.push_back(
+                        L"active process list link read failed; walk stopped");
+                    break;
+                }
+                if (previousLink != previous ||
+                    next == 0 ||
+                    (next != listHead && !IsKernelAddress(next)))
+                {
+                    result->Warnings.push_back(
+                        L"active process list link validation failed; walk stopped");
+                    break;
+                }
+                uint64_t nextBacklink = 0;
+                if (!ReadU64(
+                        device_,
+                        next + sizeof(uint64_t),
+                        &nextBacklink) ||
+                    nextBacklink != entry)
+                {
+                    result->Warnings.push_back(
+                        L"active process list backlink mismatch; walk stopped");
                     break;
                 }
 
                 uint64_t eprocess = entry - linksField.Offset;
                 uint64_t pidValue = 0;
-                ReadU64(device_, eprocess + pidField.Offset, &pidValue);
+                const bool pidResolved =
+                    ReadU64(device_, eprocess + pidField.Offset, &pidValue) &&
+                    pidValue <= 0xffffffffull;
                 uint32_t pid = static_cast<uint32_t>(pidValue & 0xffffffffu);
-                std::wstring image = ReadImageFileName(device_, eprocess, imageField.Offset);
+                bool imageResolved = false;
+                std::wstring image = ReadImageFileName(
+                    device_,
+                    eprocess,
+                    imageField.Offset,
+                    &imageResolved);
 
                 bool keep = options.ScanAll;
-                if (options.HasProcessId && pid == options.ProcessId)
+                if (options.HasProcessId && pidResolved && pid == options.ProcessId)
                 {
                     keep = true;
                 }
-                if (!options.ImageFilter.empty() && ContainsCI(image, options.ImageFilter))
+                if (!options.ImageFilter.empty() &&
+                    imageResolved &&
+                    ContainsCI(image, options.ImageFilter))
                 {
                     keep = true;
                 }
@@ -456,20 +541,33 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
                     target.Eprocess = eprocess;
                     target.Pid = pid;
                     target.Image = image;
+                    target.IdentityResolved = pidResolved && imageResolved;
                     targets.push_back(target);
                     if (options.HasProcessId && !options.ScanAll && options.ImageFilter.empty())
                     {
+                        exactTargetFound = true;
                         break;
                     }
                 }
 
-                uint64_t next = 0;
-                if (!ReadU64(device_, entry, &next))
-                {
-                    break;
-                }
+                previous = entry;
                 entry = next;
                 ++walked;
+            }
+
+            if (exactTargetFound)
+            {
+                result->ProcessWalkComplete = result->ProcessLayoutFromPdb;
+            }
+            else
+            {
+                result->ProcessWalkComplete =
+                    result->ProcessLayoutFromPdb && entry == listHead;
+                if (walked >= kMaxProcesses && entry != listHead)
+                {
+                    result->Warnings.push_back(
+                        L"active process walk hit safety limit; coverage incomplete");
+                }
             }
         }
         else
@@ -495,6 +593,12 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
         {
             limit = static_cast<uint32_t>(targets.size());
         }
+        if (limit < static_cast<uint32_t>(targets.size()))
+        {
+            result->ProcessWalkComplete = false;
+            result->Warnings.push_back(
+                L"token record limit truncated matching processes; coverage incomplete");
+        }
 
         for (uint32_t i = 0; i < limit; ++i)
         {
@@ -503,7 +607,16 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             record.Eprocess = target.Eprocess;
             record.ProcessId = target.Pid;
             record.ImageName = target.Image;
-            record.SystemProfile = IsSystemProfileImage(target.Image, target.Pid);
+            record.IdentityResolved = target.IdentityResolved;
+            record.SystemProfile =
+                target.IdentityResolved &&
+                IsSystemProfileImage(target.Image, target.Pid);
+            if (!record.IdentityResolved)
+            {
+                record.CoverageIncomplete = true;
+                record.Notes.push_back(
+                    L"process identity read incomplete; system-profile suppression disabled");
+            }
 
             uint64_t tokenRaw = 0;
             if (!ReadU64(device_, target.Eprocess + tokenField.Offset, &tokenRaw) || tokenRaw == 0)
@@ -545,11 +658,20 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             record.EnabledByDefaultMask = enabledByDefault;
             record.PrivilegeFingerprint = BuildPrivilegeFingerprint(present, enabled);
 
-            // Enabled bits must be a subset of Present.
-            if ((enabled & ~present) != 0)
+            const bool privilegeFindingsAllowed =
+                !options.RequirePdbLayoutForPrivilegeFindings || result->LayoutFromPdb;
+
+            // Enabled and EnabledByDefault bits must be subsets of Present.
+            if (privilegeFindingsAllowed && (enabled & ~present) != 0)
             {
                 record.Suspicious = true;
                 record.Notes.push_back(L"Enabled privilege bits not present in Present mask");
+            }
+            if (privilegeFindingsAllowed && (enabledByDefault & ~present) != 0)
+            {
+                record.Suspicious = true;
+                record.Notes.push_back(
+                    L"EnabledByDefault privilege bits not present in Present mask");
             }
 
             for (uint32_t bit = 0; bit < kMaxPrivilegeBits; ++bit)
@@ -580,9 +702,6 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
                     record.HighRiskEnabled.push_back(item.Name);
                 }
             }
-
-            const bool privilegeFindingsAllowed =
-                !options.RequirePdbLayoutForPrivilegeFindings || result->LayoutFromPdb;
 
             if (!record.HighRiskEnabled.empty() && !record.SystemProfile && privilegeFindingsAllowed)
             {
@@ -619,9 +738,14 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
                         L"common admin privileges present (not auto-suspicious in hunt/snapshot mode)");
                 }
             }
-            else if (!record.HighRiskEnabled.empty() && record.SystemProfile && options.IncludeSystemProfile)
+            else if (!record.HighRiskEnabled.empty() &&
+                     record.SystemProfile &&
+                     options.IncludeSystemProfile &&
+                     privilegeFindingsAllowed)
             {
-                // Verbose system mode: annotate only.
+                record.Suspicious = true;
+                record.Notes.push_back(
+                    L"high-risk privileges enabled on explicitly included system-profile process");
             }
             else if (!privilegeFindingsAllowed && !record.HighRiskEnabled.empty())
             {
@@ -638,7 +762,8 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             result->Records.push_back(record);
         }
 
-        result->CoverageComplete = true;
+        result->CoverageComplete =
+            result->LayoutFromPdb && result->ProcessWalkComplete;
         for (const TokenPrivilegeRecord& record : result->Records)
         {
             if (record.CoverageIncomplete)
@@ -659,6 +784,10 @@ std::wstring BuildTokenPrivilegeJson(const TokenPrivilegeScanResult& result)
     std::wstring out = L"{\"schema\":\"kn-live-dbg.token.v1\"";
     out += L",\"layoutFromPdb\":";
     out += result.LayoutFromPdb ? L"true" : L"false";
+    out += L",\"processLayoutFromPdb\":";
+    out += result.ProcessLayoutFromPdb ? L"true" : L"false";
+    out += L",\"processWalkComplete\":";
+    out += result.ProcessWalkComplete ? L"true" : L"false";
     out += L",\"coverageComplete\":";
     out += result.CoverageComplete ? L"true" : L"false";
     out += L",\"anySuspicious\":";
@@ -692,6 +821,8 @@ std::wstring BuildTokenPrivilegeJson(const TokenPrivilegeScanResult& result)
         out += L",\"fingerprint\":" + mcpjson::Quote(record.PrivilegeFingerprint);
         out += L",\"systemProfile\":";
         out += record.SystemProfile ? L"true" : L"false";
+        out += L",\"identityResolved\":";
+        out += record.IdentityResolved ? L"true" : L"false";
         out += L",\"suspicious\":";
         out += record.Suspicious ? L"true" : L"false";
         out += L",\"tokenResolved\":";
