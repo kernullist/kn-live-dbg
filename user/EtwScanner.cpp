@@ -3,10 +3,14 @@
 
 #include <Zydis.h>
 
+#include <Windows.h>
+
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <iomanip>
+#include <set>
 #include <sstream>
 
 namespace
@@ -1618,5 +1622,531 @@ std::wstring BuildEtwIntegrityJson(const EtwIntegrityResult& result)
     }
     out += L"]}";
 
+    return out;
+}
+
+namespace
+{
+    std::wstring FormatGuidBytes(const uint8_t* bytes)
+    {
+        // GUID on disk: Data1(4 LE) Data2(2) Data3(2) Data4(8)
+        if (bytes == nullptr)
+        {
+            return std::wstring();
+        }
+        uint32_t data1 = 0;
+        uint16_t data2 = 0;
+        uint16_t data3 = 0;
+        memcpy(&data1, bytes, 4);
+        memcpy(&data2, bytes + 4, 2);
+        memcpy(&data3, bytes + 6, 2);
+        wchar_t buffer[64];
+        swprintf_s(
+            buffer,
+            L"%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            data1,
+            data2,
+            data3,
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15]);
+        return buffer;
+    }
+
+    bool AddressInLoadedModuleLocal(SymbolEngine& symbols, uint64_t address)
+    {
+        for (const KernelModuleInfo& module : symbols.Modules())
+        {
+            uint64_t end = module.Base + module.Size;
+            if (end < module.Base)
+            {
+                continue;
+            }
+            if (address >= module.Base && address < end)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::wstring ModuleForAddressLocal(SymbolEngine& symbols, uint64_t address)
+    {
+        for (const KernelModuleInfo& module : symbols.Modules())
+        {
+            uint64_t end = module.Base + module.Size;
+            if (end < module.Base)
+            {
+                continue;
+            }
+            if (address >= module.Base && address < end)
+            {
+                return module.ImageName;
+            }
+        }
+        return std::wstring();
+    }
+
+    std::wstring NearestSymbolLocal(SymbolEngine& symbols, uint64_t address)
+    {
+        std::wstring nearest;
+        uint64_t displacement = 0;
+        std::wstring ignored;
+        if (!symbols.FindNearestSymbol(address, &nearest, &displacement, &ignored))
+        {
+            return std::wstring();
+        }
+        std::wstringstream stream;
+        stream << nearest;
+        if (displacement != 0)
+        {
+            stream << L"+0x" << std::hex << displacement;
+        }
+        return stream.str();
+    }
+
+    uint32_t EnumerateUserModeTraceGuids()
+    {
+        // Optional soft signal only: count registered providers via TDH/ETW API
+        // when available. Failure is not an error for kernel coverage.
+        HMODULE advapi = GetModuleHandleW(L"advapi32.dll");
+        if (advapi == nullptr)
+        {
+            advapi = LoadLibraryW(L"advapi32.dll");
+        }
+        if (advapi == nullptr)
+        {
+            return 0;
+        }
+
+        using EnumerateTraceGuidsExFn = ULONG(WINAPI*)(ULONG, PVOID, ULONG, PVOID, ULONG, PULONG);
+        auto enumerate = reinterpret_cast<EnumerateTraceGuidsExFn>(
+            GetProcAddress(advapi, "EnumerateTraceGuidsEx"));
+        if (enumerate == nullptr)
+        {
+            return 0;
+        }
+
+        // TraceGuidQueryList = 0
+        ULONG returnLength = 0;
+        ULONG status = enumerate(0, nullptr, 0, nullptr, 0, &returnLength);
+        if (returnLength < sizeof(GUID) || (status != 0 && status != ERROR_INSUFFICIENT_BUFFER && status != ERROR_MORE_DATA))
+        {
+            // Some systems return ERROR_MORE_DATA / insufficient buffer as success path.
+            if (returnLength < sizeof(GUID))
+            {
+                return 0;
+            }
+        }
+
+        std::vector<uint8_t> buffer(returnLength);
+        status = enumerate(0, nullptr, 0, buffer.data(), returnLength, &returnLength);
+        if (status != 0)
+        {
+            return 0;
+        }
+        return static_cast<uint32_t>(returnLength / sizeof(GUID));
+    }
+}
+
+bool EtwScanner::ScanProviders(const Options& options, EtwProviderScanResult* result, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid ETW provider scan result output";
+            }
+            break;
+        }
+
+        *result = EtwProviderScanResult{};
+
+        if (symbols_.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols_.LoadKernelModules(&loadError))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not load kernel modules: " + loadError;
+                }
+                break;
+            }
+        }
+
+        result->UserModeProviderCount = EnumerateUserModeTraceGuids();
+        result->UserModeEnumerationOk = result->UserModeProviderCount > 0;
+        if (!result->UserModeEnumerationOk)
+        {
+            result->Warnings.push_back(
+                L"user-mode EnumerateTraceGuidsEx unavailable or empty; kernel walk is primary");
+        }
+
+        const std::wstring anchorCandidates[] =
+        {
+            L"nt!EtwpGuidHashTable",
+            L"nt!EtwpHostSiloState",
+            L"nt!EtwSiloState",
+            L"nt!EtwpSiloState",
+            L"nt!EtwpDebuggerData"
+        };
+
+        for (const std::wstring& name : anchorCandidates)
+        {
+            uint64_t address = 0;
+            if (symbols_.ResolveSymbol(name, &address, nullptr) && IsKernelAddress(address))
+            {
+                result->AnchorAddress = address;
+                result->AnchorSymbol = name;
+                result->AnchorResolved = true;
+                break;
+            }
+        }
+
+        if (!result->AnchorResolved)
+        {
+            result->Warnings.push_back(
+                L"no ETW provider anchor symbol resolved; provider DKOM coverage incomplete");
+            result->CoverageComplete = false;
+            ok = true; // soft success with incomplete coverage
+            break;
+        }
+
+        // Probe the anchor region for GUID-shaped 16-byte values paired with
+        // nearby kernel function pointers (enable callbacks). This is a
+        // conservative heuristic: only emit records when both a plausible GUID
+        // and a non-null kernel callback-like pointer co-locate.
+        constexpr uint32_t kProbeBytes = 0x1000;
+        std::vector<uint8_t> probe;
+        std::wstring readError;
+        if (!device_.ReadMemory(result->AnchorAddress, kProbeBytes, &probe, &readError) ||
+            probe.size() < 0x40)
+        {
+            result->Warnings.push_back(
+                L"failed to read provider anchor region: " + readError);
+            result->CoverageComplete = false;
+            ok = true;
+            break;
+        }
+
+        const uint32_t limit = options.Limit == 0 ? 256u : options.Limit;
+        std::set<uint64_t> seenEntries;
+
+        for (uint32_t offset = 0; offset + 24 <= static_cast<uint32_t>(probe.size()); offset += 8)
+        {
+            // Candidate: pointer-sized value that looks like a GUID entry object.
+            uint64_t entryPtr = 0;
+            memcpy(&entryPtr, probe.data() + offset, sizeof(uint64_t));
+            if (!IsKernelAddress(entryPtr) || seenEntries.find(entryPtr) != seenEntries.end())
+            {
+                continue;
+            }
+
+            std::vector<uint8_t> entryBytes;
+            if (!device_.ReadMemory(entryPtr, 0x80, &entryBytes, nullptr) || entryBytes.size() < 0x40)
+            {
+                continue;
+            }
+
+            // Look for a 16-byte GUID at common offsets (0x00 / 0x08 / 0x10).
+            bool foundGuid = false;
+            std::wstring guidText;
+            uint32_t guidOffset = 0;
+            const uint32_t guidCandidates[] = { 0x00, 0x08, 0x10, 0x14, 0x18 };
+            for (uint32_t go : guidCandidates)
+            {
+                if (go + 16 > entryBytes.size())
+                {
+                    continue;
+                }
+                // Reject all-zero and all-FF GUIDs.
+                bool allZero = true;
+                bool allFf = true;
+                for (uint32_t i = 0; i < 16; ++i)
+                {
+                    if (entryBytes[go + i] != 0)
+                    {
+                        allZero = false;
+                    }
+                    if (entryBytes[go + i] != 0xff)
+                    {
+                        allFf = false;
+                    }
+                }
+                if (allZero || allFf)
+                {
+                    continue;
+                }
+                // Soft GUID shape: non-zero version nibble area not required.
+                guidText = FormatGuidBytes(entryBytes.data() + go);
+                guidOffset = go;
+                foundGuid = true;
+                break;
+            }
+            if (!foundGuid)
+            {
+                continue;
+            }
+
+            // Look for an enable-style callback pointer after the GUID.
+            uint64_t callback = 0;
+            bool foundCallback = false;
+            for (uint32_t co = guidOffset + 16; co + 8 <= entryBytes.size(); co += 8)
+            {
+                uint64_t candidate = 0;
+                memcpy(&candidate, entryBytes.data() + co, sizeof(uint64_t));
+                if (candidate == 0 || !IsKernelAddress(candidate))
+                {
+                    continue;
+                }
+                // Prefer executable-looking targets inside modules or suspicious non-image.
+                callback = candidate;
+                foundCallback = true;
+                break;
+            }
+
+            if (!foundCallback)
+            {
+                continue;
+            }
+
+            seenEntries.insert(entryPtr);
+
+            EtwProviderRecord record = {};
+            record.Index = static_cast<uint32_t>(result->Providers.size());
+            record.EntryAddress = entryPtr;
+            record.GuidText = guidText;
+            record.EnableCallback = callback;
+            record.EnableCallbackModule = ModuleForAddressLocal(symbols_, callback);
+            record.EnableCallbackSymbol = NearestSymbolLocal(symbols_, callback);
+            if (!AddressInLoadedModuleLocal(symbols_, callback))
+            {
+                record.Suspicious = true;
+                record.Notes = L"provider enable callback outside loaded kernel modules";
+                ++result->SuspiciousCount;
+                result->AnySuspicious = true;
+            }
+
+            result->Providers.push_back(record);
+            if (result->Providers.size() >= limit)
+            {
+                result->Warnings.push_back(L"provider probe hit limit; coverage incomplete");
+                break;
+            }
+        }
+
+        if (result->Providers.empty())
+        {
+            result->Warnings.push_back(
+                L"anchor resolved but no GUID+callback provider entries validated; "
+                L"provider DKOM coverage incomplete (layout may differ on this build)");
+            result->CoverageComplete = false;
+        }
+        else
+        {
+            // Heuristic coverage is partial by definition.
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"provider enumeration is heuristic/partial; empty is not a clean bill of health");
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool EtwScanner::BuildTiCrossView(const EtwTiCrossInput& input, EtwTiCrossResult* result, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid TI cross-view result output";
+            }
+            break;
+        }
+
+        *result = EtwTiCrossResult{};
+        result->TiActive = input.TiActive;
+        result->EventsReceived = input.EventsReceived;
+        result->EventsDropped = input.EventsDropped;
+
+        if (!input.TiActive)
+        {
+            result->Skipped = true;
+            result->Status = L"skipped";
+            result->Reason = L"Threat-Intelligence subscription is not active";
+            ok = true;
+            break;
+        }
+
+        if (!input.PplAntimalware)
+        {
+            result->Notes.push_back(
+                L"consumer may lack PPL Antimalware; silent TI can be environmental");
+        }
+
+        uint64_t elapsedMs = 0;
+        if (input.NowTickMs >= input.StartTickMs)
+        {
+            elapsedMs = input.NowTickMs - input.StartTickMs;
+        }
+        result->ElapsedSeconds = elapsedMs / 1000ull;
+        if (input.LastEventTickMs != 0 && input.NowTickMs >= input.LastEventTickMs)
+        {
+            result->SecondsSinceLastEvent = (input.NowTickMs - input.LastEventTickMs) / 1000ull;
+        }
+
+        if (result->ElapsedSeconds > 0)
+        {
+            result->EventsPerSecond =
+                static_cast<double>(input.EventsReceived) / static_cast<double>(result->ElapsedSeconds);
+        }
+
+        if (result->ElapsedSeconds < input.MinSilentSeconds)
+        {
+            result->Status = L"starting";
+            result->Reason =
+                L"subscription younger than silence threshold; not yet evaluated as silent";
+            ok = true;
+            break;
+        }
+
+        if (input.EventsDropped > 0 &&
+            input.EventsReceived > 0 &&
+            input.EventsDropped * 2 > input.EventsReceived)
+        {
+            result->Status = L"dropping";
+            result->Reason = L"high TI ring drop rate relative to received events";
+            result->Suspicious = false; // operational, not DKOM by itself
+            result->Notes.push_back(L"increase ring size or reduce host load before treating as attack");
+            ok = true;
+            break;
+        }
+
+        if (input.EventsReceived == 0)
+        {
+            result->Status = L"silent";
+            result->Reason =
+                L"TI subscription active past threshold with zero received events";
+            result->Suspicious = true;
+            if (!input.PplAntimalware)
+            {
+                result->Notes.push_back(L"confirm set-ppl-antimalware on before escalating");
+            }
+            result->Notes.push_back(L"correlate with !etw providers and !etw integrity");
+            ok = true;
+            break;
+        }
+
+        result->Status = L"healthy";
+        result->Reason = L"TI events are being received";
+        result->Suspicious = false;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+std::wstring BuildEtwProvidersJson(const EtwProviderScanResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.etw-providers.v1\"";
+    out += L",\"anchorResolved\":";
+    out += result.AnchorResolved ? L"true" : L"false";
+    out += L",\"anchorAddress\":" + mcpjson::Quote(EtwIntegrityJsonHex(result.AnchorAddress));
+    out += L",\"anchorSymbol\":" + mcpjson::Quote(result.AnchorSymbol);
+    out += L",\"coverageComplete\":";
+    out += result.CoverageComplete ? L"true" : L"false";
+    out += L",\"anySuspicious\":";
+    out += result.AnySuspicious ? L"true" : L"false";
+    out += L",\"suspiciousCount\":" + std::to_wstring(result.SuspiciousCount);
+    out += L",\"providerCount\":" + std::to_wstring(result.Providers.size());
+    out += L",\"userModeProviderCount\":" + std::to_wstring(result.UserModeProviderCount);
+    out += L",\"userModeEnumerationOk\":";
+    out += result.UserModeEnumerationOk ? L"true" : L"false";
+    out += L",\"warnings\":[";
+    for (size_t i = 0; i < result.Warnings.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[i]);
+    }
+    out += L"],\"providers\":[";
+    for (size_t i = 0; i < result.Providers.size(); ++i)
+    {
+        const EtwProviderRecord& record = result.Providers[i];
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += L"{\"index\":" + std::to_wstring(record.Index);
+        out += L",\"entry\":" + mcpjson::Quote(EtwIntegrityJsonHex(record.EntryAddress));
+        out += L",\"guid\":" + mcpjson::Quote(record.GuidText);
+        out += L",\"enableCallback\":" + mcpjson::Quote(EtwIntegrityJsonHex(record.EnableCallback));
+        out += L",\"module\":" + mcpjson::Quote(record.EnableCallbackModule);
+        out += L",\"symbol\":" + mcpjson::Quote(record.EnableCallbackSymbol);
+        out += L",\"suspicious\":";
+        out += record.Suspicious ? L"true" : L"false";
+        out += L",\"notes\":" + mcpjson::Quote(record.Notes);
+        out += L"}";
+    }
+    out += L"]}";
+    return out;
+}
+
+std::wstring BuildEtwTiCrossJson(const EtwTiCrossResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.etw-ti-cross.v1\"";
+    out += L",\"tiActive\":";
+    out += result.TiActive ? L"true" : L"false";
+    out += L",\"skipped\":";
+    out += result.Skipped ? L"true" : L"false";
+    out += L",\"suspicious\":";
+    out += result.Suspicious ? L"true" : L"false";
+    out += L",\"status\":" + mcpjson::Quote(result.Status);
+    out += L",\"reason\":" + mcpjson::Quote(result.Reason);
+    out += L",\"eventsReceived\":" + std::to_wstring(result.EventsReceived);
+    out += L",\"eventsDropped\":" + std::to_wstring(result.EventsDropped);
+    out += L",\"elapsedSeconds\":" + std::to_wstring(result.ElapsedSeconds);
+    out += L",\"secondsSinceLastEvent\":" + std::to_wstring(result.SecondsSinceLastEvent);
+    wchar_t rateBuf[64];
+    swprintf_s(rateBuf, L"%.3f", result.EventsPerSecond);
+    out += L",\"eventsPerSecond\":" + mcpjson::Quote(rateBuf);
+    out += L",\"notes\":[";
+    for (size_t i = 0; i < result.Notes.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Notes[i]);
+    }
+    out += L"],\"warnings\":[";
+    for (size_t i = 0; i < result.Warnings.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[i]);
+    }
+    out += L"]}";
     return out;
 }

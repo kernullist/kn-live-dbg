@@ -5,6 +5,8 @@
 #include "CallbackScanner.h"
 #include "EtwScanner.h"
 #include "FirmwareTableScanner.h"
+#include "HalDispatchScanner.h"
+#include "HiveScanner.h"
 #include "IntegrityScanner.h"
 #include "MinifilterAttachmentScanner.h"
 #include "NmiScanner.h"
@@ -12,6 +14,8 @@
 #include "CrScanner.h"
 #include "SsdtScanner.h"
 #include "IdtScanner.h"
+#include "DpcTimerScanner.h"
+#include "TokenPrivilegeScanner.h"
 #include "PoolPeHunter.h"
 #include "PoolScanner.h"
 #include "ProcessTriageScanner.h"
@@ -462,6 +466,34 @@ namespace
                 DecText((protection >> 3) & 0x1u);
             securityRecord.Evidence[L"protection_signer"] =
                 DecText((protection >> 4) & 0xfu);
+
+            // Privilege fingerprint for same-boot diffs. Use elevated-signal
+            // mode so common admin SeDebug does not escalate risk on clean hosts.
+            TokenPrivilegeScanner tokenScanner(device, symbols);
+            TokenPrivilegeScanner::Options tokenOptions = {};
+            tokenOptions.HasEprocess = true;
+            tokenOptions.Eprocess = process.Eprocess;
+            tokenOptions.TreatCommonAdminPrivilegesAsSuspicious = false;
+            tokenOptions.RequirePdbLayoutForPrivilegeFindings = true;
+            TokenPrivilegeScanResult tokenResult = {};
+            std::wstring tokenError;
+            if (tokenScanner.Scan(tokenOptions, &tokenResult, &tokenError) &&
+                !tokenResult.Records.empty() &&
+                tokenResult.Records[0].PrivilegesResolved &&
+                tokenResult.LayoutFromPdb)
+            {
+                const TokenPrivilegeRecord& token = tokenResult.Records[0];
+                securityRecord.Evidence[L"token_fingerprint"] = token.PrivilegeFingerprint;
+                securityRecord.Evidence[L"token_present"] = SnapshotHex(token.PresentMask, 16);
+                securityRecord.Evidence[L"token_enabled"] = SnapshotHex(token.EnabledMask, 16);
+                if (token.Suspicious)
+                {
+                    securityRecord.Risk = L"high";
+                    securityRecord.Tags.push_back(L"token-privilege");
+                    securityRecord.Tags.push_back(L"suspicious");
+                }
+            }
+
             AddRecord(document, std::move(securityRecord));
         }
 
@@ -842,6 +874,142 @@ namespace
                 DecText(detachedCount);
     }
 
+    void CaptureHal(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        HalDispatchScanner scanner(device, symbols);
+        HalDispatchScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(HalDispatchScanner::Options{}, &result, &error))
+        {
+            AddWarning(document, L"hal", error);
+            AddWarnings(document, L"hal", result.Warnings);
+            return;
+        }
+        AddWarnings(document, L"hal", result.Warnings);
+        document->Metadata[L"hal_coverage_complete"] = BoolText(true);
+        for (const HalDispatchTable& table : result.Tables)
+        {
+            for (const HalDispatchSlot& slot : table.Slots)
+            {
+                if (slot.NullSlot && !slot.Suspicious)
+                {
+                    continue;
+                }
+                SnapshotRecord record;
+                record.Domain = L"hal";
+                record.Identity =
+                    L"hal:" + SnapshotToLower(table.Name) + L":" + std::to_wstring(slot.Index);
+                record.Display = table.Name + L"[" + std::to_wstring(slot.Index) + L"]";
+                record.Risk = slot.Suspicious ? L"high" : L"info";
+                record.Tags = {L"hal", L"dispatch"};
+                if (slot.Suspicious)
+                {
+                    record.Tags.push_back(L"suspicious");
+                }
+                record.Evidence[L"table"] = table.Name;
+                record.Evidence[L"index"] = DecText(slot.Index);
+                record.Evidence[L"routine"] = SnapshotHex(slot.Routine, 16);
+                record.Evidence[L"module"] = slot.Module;
+                record.Evidence[L"symbol"] = slot.Symbol;
+                record.Evidence[L"notes"] = slot.Notes;
+                AddRecord(document, std::move(record));
+            }
+        }
+    }
+
+    void CaptureHive(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        HiveScanner scanner(device, symbols);
+        HiveScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(HiveScanner::Options{}, &result, &error))
+        {
+            AddWarning(document, L"hive", error);
+            AddWarnings(document, L"hive", result.Warnings);
+            document->Metadata[L"hive_coverage_complete"] = L"false";
+            return;
+        }
+        AddWarnings(document, L"hive", result.Warnings);
+        document->Metadata[L"hive_coverage_complete"] = BoolText(result.CoverageComplete);
+        for (const HiveRecord& hive : result.Hives)
+        {
+            SnapshotRecord record;
+            record.Domain = L"hive";
+            record.Identity = L"hive:" + SnapshotHex(hive.HiveAddress, 16);
+            record.Display = L"hive " + SnapshotHex(hive.HiveAddress, 16);
+            record.Risk = hive.Suspicious ? L"high" : L"info";
+            record.Tags = {L"hive", L"getcell"};
+            if (hive.Suspicious)
+            {
+                record.Tags.push_back(L"suspicious");
+            }
+            record.Evidence[L"hive"] = SnapshotHex(hive.HiveAddress, 16);
+            record.Evidence[L"get_cell"] = SnapshotHex(hive.GetCellRoutine, 16);
+            record.Evidence[L"module"] = hive.GetCellModule;
+            record.Evidence[L"symbol"] = hive.GetCellSymbol;
+            record.Evidence[L"notes"] = hive.Notes;
+            AddRecord(document, std::move(record));
+        }
+    }
+
+    void CaptureDpcTimer(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        DpcTimerScanner scanner(device, symbols);
+        DpcTimerScanner::Options options = {};
+        options.Target = DpcTimerScanner::Scope::All;
+        DpcTimerScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"dpc-timer", error);
+            AddWarnings(document, L"dpc-timer", result.Warnings);
+            document->Metadata[L"dpc_timer_coverage_complete"] = L"false";
+            return;
+        }
+        AddWarnings(document, L"dpc-timer", result.Warnings);
+        document->Metadata[L"dpc_coverage_complete"] = BoolText(result.DpcCoverageComplete);
+        document->Metadata[L"timer_coverage_complete"] = BoolText(result.TimerCoverageComplete);
+        document->Metadata[L"workitem_coverage_complete"] = BoolText(result.WorkItemCoverageComplete);
+
+        for (const DpcRoutineRecord& dpc : result.Dpcs)
+        {
+            if (!dpc.Suspicious)
+            {
+                continue;
+            }
+            SnapshotRecord record;
+            record.Domain = L"dpc-timer";
+            record.Identity = L"dpc:" + SnapshotHex(dpc.Routine, 16);
+            record.Display = L"dpc " + dpc.Symbol;
+            record.Risk = L"high";
+            record.Tags = {L"dpc", L"suspicious"};
+            record.Evidence[L"routine"] = SnapshotHex(dpc.Routine, 16);
+            record.Evidence[L"module"] = dpc.Module;
+            record.Evidence[L"symbol"] = dpc.Symbol;
+            record.Evidence[L"source"] = dpc.Source;
+            record.Evidence[L"notes"] = dpc.Notes;
+            AddRecord(document, std::move(record));
+        }
+        for (const TimerRoutineRecord& timer : result.Timers)
+        {
+            if (!timer.Suspicious)
+            {
+                continue;
+            }
+            SnapshotRecord record;
+            record.Domain = L"dpc-timer";
+            record.Identity = L"timer:" + SnapshotHex(timer.Routine, 16);
+            record.Display = L"timer " + timer.Symbol;
+            record.Risk = L"high";
+            record.Tags = {L"timer", L"suspicious"};
+            record.Evidence[L"routine"] = SnapshotHex(timer.Routine, 16);
+            record.Evidence[L"module"] = timer.Module;
+            record.Evidence[L"symbol"] = timer.Symbol;
+            record.Evidence[L"notes"] = timer.Notes;
+            AddRecord(document, std::move(record));
+        }
+    }
+
     void CaptureEtw(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
     {
         EtwScanner scanner(device, symbols);
@@ -882,6 +1050,43 @@ namespace
         {
             AddWarning(document, L"etw", error);
             AddWarnings(document, L"etw", result.Warnings);
+        }
+
+        EtwProviderScanResult providers = {};
+        EtwScanner::Options providerOptions = {};
+        if (scanner.ScanProviders(providerOptions, &providers, &error))
+        {
+            AddWarnings(document, L"etw", providers.Warnings);
+            document->Metadata[L"etw_provider_coverage_complete"] =
+                BoolText(providers.CoverageComplete);
+            for (const EtwProviderRecord& provider : providers.Providers)
+            {
+                if (!provider.Suspicious && providers.Providers.size() > 64)
+                {
+                    continue;
+                }
+                SnapshotRecord record;
+                record.Domain = L"etw";
+                record.Identity = L"etw-provider:" + SnapshotToLower(provider.GuidText);
+                record.Display = provider.GuidText;
+                record.Risk = provider.Suspicious ? L"high" : L"info";
+                record.Tags = {L"provider"};
+                if (provider.Suspicious)
+                {
+                    record.Tags.push_back(L"suspicious");
+                }
+                record.Evidence[L"guid"] = provider.GuidText;
+                record.Evidence[L"entry"] = SnapshotHex(provider.EntryAddress, 16);
+                record.Evidence[L"callback"] = SnapshotHex(provider.EnableCallback, 16);
+                record.Evidence[L"module"] = provider.EnableCallbackModule;
+                record.Evidence[L"symbol"] = provider.EnableCallbackSymbol;
+                record.Evidence[L"notes"] = provider.Notes;
+                AddRecord(document, std::move(record));
+            }
+        }
+        else if (!error.empty())
+        {
+            AddWarning(document, L"etw", L"providers: " + error);
         }
 
         EtwIntegrityResult integrity = {};
@@ -1725,6 +1930,9 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
         CaptureEtw(device_, symbols_, document);
         CaptureNmi(device_, symbols_, document);
         CaptureCpuState(device_, symbols_, document);
+        CaptureHal(device_, symbols_, document);
+        CaptureHive(device_, symbols_, document);
+        CaptureDpcTimer(device_, symbols_, document);
         CaptureFirmwareTables(device_, symbols_, document);
         CapturePool(device_, symbols_, document);
         CapturePoolPe(device_, document);

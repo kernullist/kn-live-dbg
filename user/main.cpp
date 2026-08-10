@@ -11,7 +11,11 @@
 #include "DriverService.h"
 #include "EtwScanner.h"
 #include "FirmwareTableScanner.h"
+#include "HalDispatchScanner.h"
+#include "HiveScanner.h"
 #include "IntegrityScanner.h"
+#include "DpcTimerScanner.h"
+#include "TokenPrivilegeScanner.h"
 #include "McpJson.h"
 #include "McpServer.h"
 #include "McpSelfTest.h"
@@ -1757,6 +1761,13 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !pool           big-pool allocation triage and W+X annotation\n";
     std::wcout << L"  help !timeline       time-ordered TI/snapshot/live evidence store\n";
     std::wcout << L"  help !address        canonicality, page-table walk, effective permissions, owner symbol\n";
+    std::wcout << L"  help !hal            HAL dispatch table ownership\n";
+    std::wcout << L"  help !hive           registry hive GetCellRoutine ownership\n";
+    std::wcout << L"  help !token          process token privilege Present/Enabled triage\n";
+    std::wcout << L"  help !dpc            sampled DPC deferred routines\n";
+    std::wcout << L"  help !timer          kernel timer DPC routines\n";
+    std::wcout << L"  help !workitem       best-effort work-item coverage\n";
+    std::wcout << L"  help !etw            ETW loggers, integrity, providers, TI cross-view\n";
     std::wcout << L"  help dt              type layout, wildcard, and field filters\n";
     std::wcout << L"  help e               virtual memory editing and /process behavior\n";
     std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
@@ -1775,6 +1786,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  process       !hunt /deep /summary | !dml_proc [pid|name] | !vad <pid> /exec /private | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
+    std::wcout << L"  quiet-surface !hal | !hive | !token <pid> | !dpc | !timer | !etw providers | !etw ti-cross\n";
     std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
     std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
     std::wcout << L"  hunting       !hunt | !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
@@ -2109,6 +2121,12 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!cr" ||
         command == L"!ssdt" ||
         command == L"!idt" ||
+        command == L"!hal" ||
+        command == L"!hive" ||
+        command == L"!token" ||
+        command == L"!dpc" ||
+        command == L"!timer" ||
+        command == L"!workitem" ||
         command == L"!fwtable" ||
         command == L"!module" ||
         command == L"!driver" ||
@@ -2125,6 +2143,12 @@ static bool IsNativeBangCommand(const std::wstring& command)
 }
 
 static bool IsNativeOwnedCommand(const std::wstring& command);
+static bool CheckSelfIsPplAntimalware(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint8_t* protectionOut,
+    std::wstring* error);
+static TiSubscriber& GetTiSubscriberInstance();
 
 static bool ShouldRouteToDbgEng(const std::wstring& command)
 {
@@ -3040,7 +3064,12 @@ static bool IsCiScopeName(const std::wstring& value)
 static bool IsEtwScopeName(const std::wstring& value)
 {
     std::wstring lowered = ToLower(value);
-    return lowered == L"loggers" || lowered == L"logger" || lowered == L"integrity";
+    return lowered == L"loggers" ||
+        lowered == L"logger" ||
+        lowered == L"integrity" ||
+        lowered == L"providers" ||
+        lowered == L"ti-cross" ||
+        lowered == L"ticross";
 }
 
 static bool IsNmiScopeName(const std::wstring& value)
@@ -3610,6 +3639,12 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!cr",
         L"!ssdt",
         L"!idt",
+        L"!hal",
+        L"!hive",
+        L"!token",
+        L"!dpc",
+        L"!timer",
+        L"!workitem",
         L"!fwtable",
         L"!module",
         L"!driver",
@@ -3914,7 +3949,9 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             break;
         }
 
-        if (IsHelpToken(argsBefore.back()))
+        // "cmd help <tab>" has nothing useful after help. "help <tab>" must still
+        // offer topic candidates (registered commands plus help meta topics).
+        if (IsHelpToken(argsBefore.back()) && argsBefore.size() > 1)
         {
             break;
         }
@@ -4026,7 +4063,46 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     {
                         L"loggers",
                         L"logger",
-                        L"integrity"
+                        L"integrity",
+                        L"providers",
+                        L"ti-cross"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!hal")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"dispatch",
+                        L"private"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!hive")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"list",
+                        L"cells"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!token")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"/all",
+                        L"/limit",
+                        L"/system"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!dpc" || topic == L"!timer" || topic == L"!workitem")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"/verbose",
+                        L"/limit"
                     };
                     AddCompletionCandidates(&candidates, values);
                 }
@@ -4229,10 +4305,73 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"loggers",
                     L"logger",
                     L"integrity",
+                    L"providers",
+                    L"ti-cross",
                     L"help"
                 };
                 AddCompletionCandidates(&candidates, values);
             }
+            else if (ToLower(argsBefore[1]) == L"providers")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/limit",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else if (argsBefore.size() == 2 && ToLower(argsBefore[1]) == L"logger")
+            {
+                // Filter token is free-form index/name; only offer help.
+                AddCompletionCandidate(&candidates, L"help");
+            }
+        }
+        else if (command == L"!hal")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"dispatch",
+                    L"private",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"!hive")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"list",
+                    L"cells",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"!token")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/all",
+                L"/limit",
+                L"/system",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!dpc" || command == L"!timer" || command == L"!workitem")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/verbose",
+                L"/limit",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
         }
         else if (command == L"!nmi")
         {
@@ -13955,16 +14094,22 @@ static void PrintEtwHelp()
     std::wcout << L"  !etw loggers\n";
     std::wcout << L"  !etw logger <index|name-substring>\n";
     std::wcout << L"  !etw integrity\n";
+    std::wcout << L"  !etw providers [/limit <n>]\n";
+    std::wcout << L"  !etw ti-cross\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
     std::wcout << L"  loggers    list every populated WMI_LOGGER_CONTEXT slot under nt!EtwpDebuggerData with name and GetCpuClock annotation\n";
     std::wcout << L"  logger     filter by slot index (decimal) or case-insensitive name substring\n";
     std::wcout << L"  integrity  decode the first instructions of canonical ETW/PMC dispatch functions and report trampoline / cross-module branch findings (modern InfinityHook variants)\n";
+    std::wcout << L"  providers  heuristic/partial provider registration surface + enable-callback ownership (coverage incomplete by design)\n";
+    std::wcout << L"  ti-cross   correlate active !ti subscription reception rate with silence / drop signals\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Resolves nt!EtwpDebuggerData, walks the silo state when present, then resolves LoggerName and GetCpuClock through _WMI_LOGGER_CONTEXT PDB fields with documented fallbacks.\n";
     std::wcout << L"  In modern Windows GetCpuClock is a UINT32 mode tag dispatched internally; mode=Custom on Circular Kernel Context Logger is normal, not a hook indicator.\n";
     std::wcout << L"  !etw integrity disassembles each target's first 16 instructions and flags first-instruction jmp/int3/ud2, mov-imm64+jmp-reg trampolines, push-imm+ret trampolines, and cross-module branches whose targets lie outside any loaded kernel module.\n";
+    std::wcout << L"  !etw providers never claims full ETW tree reconstruction; empty + incomplete means layout drift, not clean.\n";
+    std::wcout << L"  !etw ti-cross is skipped when TI is not active; silence is only evaluated after a short start threshold.\n";
 }
 
 static void PrintNmiHelp()
@@ -14220,11 +14365,19 @@ static void HandleEtwCommand(
                 {
                     options.Target = EtwScanner::Scope::Integrity;
                 }
+                else if (scope == L"providers")
+                {
+                    options.Target = EtwScanner::Scope::Providers;
+                }
+                else if (scope == L"ti-cross" || scope == L"ticross")
+                {
+                    options.Target = EtwScanner::Scope::TiCross;
+                }
                 ++index;
             }
             else
             {
-                std::wcerr << L"usage: !etw [loggers|logger <index|name>|integrity]\n";
+                std::wcerr << L"usage: !etw [loggers|logger <index|name>|integrity|providers|ti-cross]\n";
                 PrintEtwHelp();
                 break;
             }
@@ -14252,9 +14405,34 @@ static void HandleEtwCommand(
             ++index;
         }
 
-        if (index < args.size())
+        if (options.Target == EtwScanner::Scope::Providers)
+        {
+            while (index < args.size())
+            {
+                if (ToLower(args[index]) == L"/limit" && index + 1 < args.size())
+                {
+                    uint64_t limitValue = 0;
+                    if (!ParseUnsigned(args[index + 1], 10, &limitValue))
+                    {
+                        std::wcerr << L"!etw providers: invalid /limit\n";
+                        break;
+                    }
+                    options.Limit = static_cast<uint32_t>(limitValue);
+                    index += 2;
+                    continue;
+                }
+                break;
+            }
+        }
+
+        if (index < args.size() && options.Target != EtwScanner::Scope::Providers)
         {
             std::wcerr << L"!etw: unexpected extra argument \"" << args[index] << L"\"\n";
+            break;
+        }
+        if (index < args.size() && options.Target == EtwScanner::Scope::Providers)
+        {
+            std::wcerr << L"!etw providers: unexpected extra argument \"" << args[index] << L"\"\n";
             break;
         }
 
@@ -14269,6 +14447,125 @@ static void HandleEtwCommand(
         }
 
         EtwScanner scanner(device, symbols);
+
+        if (options.Target == EtwScanner::Scope::TiCross)
+        {
+            EtwTiCrossInput input = {};
+            TiSubscriber& ti = GetTiSubscriberInstance();
+            input.TiActive = ti.IsActive();
+            TiSubscriberStats stats = ti.SnapshotStats();
+            input.EventsReceived = stats.EventsReceived;
+            input.EventsKept = stats.EventsKept;
+            input.EventsDropped = stats.EventsDropped;
+            input.StartTickMs = stats.StartTickMs;
+            input.LastEventTickMs = stats.LastEventTickMs;
+            input.NowTickMs = GetTickCount64();
+            uint8_t protection = 0;
+            std::wstring gateError;
+            input.PplAntimalware = CheckSelfIsPplAntimalware(device, symbols, &protection, &gateError);
+
+            EtwTiCrossResult cross = {};
+            std::wstring crossError;
+            if (!EtwScanner::BuildTiCrossView(input, &cross, &crossError))
+            {
+                std::wcerr << L"!etw ti-cross failed: " << crossError << L"\n";
+                break;
+            }
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildEtwTiCrossJson(cross);
+            }
+
+            PrintColoredText(L"etw ti-cross", KNDBG_COLOR_TITLE);
+            std::wcout << L" status=";
+            PrintColoredText(cross.Status, cross.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_OK);
+            std::wcout << L" active=" << (cross.TiActive ? L"yes" : L"no")
+                       << L" received=" << std::dec << cross.EventsReceived
+                       << L" dropped=" << cross.EventsDropped
+                       << L" elapsed=" << cross.ElapsedSeconds << L"s";
+            if (cross.Suspicious)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            }
+            std::wcout << L"\n";
+            if (!cross.Reason.empty())
+            {
+                std::wcout << L"  reason=" << cross.Reason << L"\n";
+            }
+            for (const std::wstring& note : cross.Notes)
+            {
+                std::wcout << L"  note: " << note << L"\n";
+            }
+            break;
+        }
+
+        if (options.Target == EtwScanner::Scope::Providers)
+        {
+            EtwProviderScanResult providerResult = {};
+            std::wstring providerError;
+            if (!scanner.ScanProviders(options, &providerResult, &providerError))
+            {
+                std::wcerr << L"!etw providers failed: " << providerError << L"\n";
+                for (const std::wstring& warning : providerResult.Warnings)
+                {
+                    std::wcerr << L"!etw warning: " << warning << L"\n";
+                }
+                break;
+            }
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildEtwProvidersJson(providerResult);
+            }
+            for (const std::wstring& warning : providerResult.Warnings)
+            {
+                std::wcerr << L"!etw warning: " << warning << L"\n";
+            }
+
+            PrintColoredText(L"etw providers", KNDBG_COLOR_TITLE);
+            std::wcout << L" count=" << std::dec << providerResult.Providers.size()
+                       << L" suspicious=" << providerResult.SuspiciousCount
+                       << L" coverage=" << (providerResult.CoverageComplete ? L"complete" : L"incomplete")
+                       << L" usermodeProviders=" << providerResult.UserModeProviderCount;
+            if (providerResult.AnchorResolved)
+            {
+                std::wcout << L" anchor=" << providerResult.AnchorSymbol
+                           << L"@" << HexTextWidth(providerResult.AnchorAddress, 16, true);
+            }
+            if (providerResult.AnySuspicious)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            }
+            std::wcout << L"\n";
+
+            for (const EtwProviderRecord& record : providerResult.Providers)
+            {
+                if (!record.Suspicious && providerResult.Providers.size() > 32)
+                {
+                    continue;
+                }
+                PrintColoredText(L"[etw.provider]", KNDBG_COLOR_TITLE);
+                std::wcout << L" guid=" << record.GuidText
+                           << L" entry=" << HexTextWidth(record.EntryAddress, 16, true)
+                           << L" callback=" << HexTextWidth(record.EnableCallback, 16, true);
+                if (!record.EnableCallbackModule.empty())
+                {
+                    std::wcout << L" module=" << record.EnableCallbackModule;
+                }
+                if (record.Suspicious)
+                {
+                    std::wcout << L" ";
+                    PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+                }
+                std::wcout << L"\n";
+                if (!record.Notes.empty())
+                {
+                    std::wcout << L"  note: " << record.Notes << L"\n";
+                }
+            }
+            break;
+        }
 
         if (options.Target == EtwScanner::Scope::Integrity)
         {
@@ -15052,6 +15349,617 @@ static void HandleIdtCommand(
                 std::wcout << L"    note: ";
                 PrintColoredText(entry.Notes, KNDBG_COLOR_WARN);
                 std::wcout << L"\n";
+            }
+        }
+    } while (false);
+}
+
+static void PrintHalHelp()
+{
+    std::wcout << L"!hal command:\n";
+    std::wcout << L"  !hal\n";
+    std::wcout << L"  !hal dispatch\n";
+    std::wcout << L"  !hal private\n";
+    std::wcout << L"\n";
+    std::wcout << L"checks HalDispatchTable / HalPrivateDispatchTable function pointers for ownership outside loaded modules or unexpected modules.\n";
+}
+
+static void HandleHalCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!hal requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1))
+        {
+            PrintHalHelp();
+            break;
+        }
+
+        HalDispatchScanner::Options options = {};
+        options.Target = HalDispatchScanner::Scope::All;
+        if (args.size() >= 2)
+        {
+            std::wstring scope = ToLower(args[1]);
+            if (scope == L"dispatch")
+            {
+                options.Target = HalDispatchScanner::Scope::Dispatch;
+            }
+            else if (scope == L"private")
+            {
+                options.Target = HalDispatchScanner::Scope::Private;
+            }
+            else
+            {
+                std::wcerr << L"usage: !hal [dispatch|private]\n";
+                PrintHalHelp();
+                break;
+            }
+            if (args.size() > 2)
+            {
+                std::wcerr << L"!hal: unexpected extra argument\n";
+                break;
+            }
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!hal failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        HalDispatchScanner scanner(device, symbols);
+        HalDispatchScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!hal failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!hal warning: " << warning << L"\n";
+            }
+            break;
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildHalDispatchJson(result);
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!hal warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"hal", KNDBG_COLOR_TITLE);
+        std::wcout << L" tables=" << std::dec << result.Tables.size();
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            std::wcout << L" hooks=" << result.SuspiciousCount;
+        }
+        std::wcout << L"\n";
+
+        for (const HalDispatchTable& table : result.Tables)
+        {
+            PrintColoredText(L"[hal.table]", KNDBG_COLOR_TITLE);
+            std::wcout << L" " << table.Name
+                       << L" base=" << HexTextWidth(table.Base, 16, true)
+                       << L" slots=" << std::dec << table.SlotCount
+                       << L" nonNull=" << table.NonNullCount
+                       << L" suspicious=" << table.SuspiciousCount
+                       << L"\n";
+            if (!table.Resolved)
+            {
+                std::wcout << L"  unresolved: " << table.Warning << L"\n";
+                continue;
+            }
+            if (table.SuspiciousCount == 0)
+            {
+                std::wcout << L"  all non-null HAL slots resolve into expected modules\n";
+                continue;
+            }
+            for (const HalDispatchSlot& slot : table.Slots)
+            {
+                if (!slot.Suspicious)
+                {
+                    continue;
+                }
+                std::wcout << L"  ";
+                PrintColoredText(L"[hal.hook]", KNDBG_COLOR_FAIL);
+                std::wcout << L" index=" << std::dec << slot.Index
+                           << L" routine=" << HexTextWidth(slot.Routine, 16, true);
+                if (!slot.Module.empty())
+                {
+                    std::wcout << L" module=" << slot.Module;
+                }
+                if (!slot.Symbol.empty())
+                {
+                    std::wcout << L" symbol=" << slot.Symbol;
+                }
+                std::wcout << L"\n";
+                if (!slot.Notes.empty())
+                {
+                    std::wcout << L"    note: " << slot.Notes << L"\n";
+                }
+            }
+        }
+    } while (false);
+}
+
+static void PrintHiveHelp()
+{
+    std::wcout << L"!hive command:\n";
+    std::wcout << L"  !hive\n";
+    std::wcout << L"  !hive list\n";
+    std::wcout << L"  !hive cells\n";
+    std::wcout << L"\n";
+    std::wcout << L"passively walks CmpHiveListHead and flags GetCellRoutine / ReleaseCellRoutine outside ntoskrnl.\n";
+}
+
+static void HandleHiveCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!hive requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1))
+        {
+            PrintHiveHelp();
+            break;
+        }
+        if (args.size() > 1)
+        {
+            std::wstring scope = ToLower(args[1]);
+            if (scope != L"list" && scope != L"cells")
+            {
+                std::wcerr << L"usage: !hive [list|cells]\n";
+                PrintHiveHelp();
+                break;
+            }
+            if (args.size() > 2)
+            {
+                std::wcerr << L"!hive: unexpected extra argument\n";
+                break;
+            }
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!hive failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        HiveScanner scanner(device, symbols);
+        HiveScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(HiveScanner::Options{}, &result, &error))
+        {
+            std::wcerr << L"!hive failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!hive warning: " << warning << L"\n";
+            }
+            break;
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildHiveJson(result);
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!hive warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"hive", KNDBG_COLOR_TITLE);
+        std::wcout << L" count=" << std::dec << result.Hives.size()
+                   << L" suspicious=" << result.SuspiciousCount
+                   << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete")
+                   << L" layoutFromPdb=" << (result.LayoutFromPdb ? L"yes" : L"no");
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+        }
+        std::wcout << L"\n";
+
+        for (const HiveRecord& hive : result.Hives)
+        {
+            if (!hive.Suspicious && result.Hives.size() > 16)
+            {
+                continue;
+            }
+            PrintColoredText(L"[hive.entry]", hive.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+            std::wcout << L" hive=" << HexTextWidth(hive.HiveAddress, 16, true)
+                       << L" getCell=" << HexTextWidth(hive.GetCellRoutine, 16, true);
+            if (!hive.GetCellModule.empty())
+            {
+                std::wcout << L" module=" << hive.GetCellModule;
+            }
+            if (!hive.GetCellSymbol.empty())
+            {
+                std::wcout << L" symbol=" << hive.GetCellSymbol;
+            }
+            if (hive.Suspicious)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            }
+            std::wcout << L"\n";
+            if (!hive.Notes.empty())
+            {
+                std::wcout << L"  note: " << hive.Notes << L"\n";
+            }
+        }
+    } while (false);
+}
+
+static void PrintTokenHelp()
+{
+    std::wcout << L"!token command:\n";
+    std::wcout << L"  !token <pid|image|eprocess>\n";
+    std::wcout << L"  !token /all [/limit <n>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"reads _EPROCESS.Token -> _SEP_TOKEN_PRIVILEGES and reports high-risk enabled privileges.\n";
+    std::wcout << L"system-profile images are suppressed from default suspicion.\n";
+}
+
+static void HandleTokenCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!token requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1) || args.size() < 2)
+        {
+            PrintTokenHelp();
+            break;
+        }
+
+        TokenPrivilegeScanner::Options options = {};
+        size_t index = 1;
+        while (index < args.size())
+        {
+            std::wstring token = ToLower(args[index]);
+            if (token == L"/all")
+            {
+                options.ScanAll = true;
+                ++index;
+                continue;
+            }
+            if (token == L"/limit" && index + 1 < args.size())
+            {
+                uint64_t limitValue = 0;
+                if (!ParseUnsigned(args[index + 1], 10, &limitValue))
+                {
+                    std::wcerr << L"!token: invalid /limit\n";
+                    break;
+                }
+                options.Limit = static_cast<uint32_t>(limitValue);
+                index += 2;
+                continue;
+            }
+            if (token == L"/system")
+            {
+                options.IncludeSystemProfile = true;
+                ++index;
+                continue;
+            }
+
+            uint64_t pidValue = 0;
+            if (ParseUnsigned(args[index], 10, &pidValue) && pidValue <= 0xffffffffull)
+            {
+                options.HasProcessId = true;
+                options.ProcessId = static_cast<uint32_t>(pidValue);
+                ++index;
+                continue;
+            }
+
+            uint64_t eprocess = 0;
+            if ((args[index].rfind(L"0x", 0) == 0 || args[index].rfind(L"0X", 0) == 0) &&
+                ParseUnsigned(args[index], 16, &eprocess))
+            {
+                options.HasEprocess = true;
+                options.Eprocess = eprocess;
+                ++index;
+                continue;
+            }
+
+            options.ImageFilter = args[index];
+            ++index;
+        }
+
+        if (!options.ScanAll && !options.HasProcessId && !options.HasEprocess && options.ImageFilter.empty())
+        {
+            std::wcerr << L"!token requires pid, image, eprocess, or /all\n";
+            PrintTokenHelp();
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << L"!token failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        TokenPrivilegeScanner scanner(device, symbols);
+        TokenPrivilegeScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!token failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!token warning: " << warning << L"\n";
+            }
+            break;
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildTokenPrivilegeJson(result);
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!token warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"token", KNDBG_COLOR_TITLE);
+        std::wcout << L" records=" << std::dec << result.Records.size()
+                   << L" suspicious=" << result.SuspiciousCount
+                   << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete");
+        if (result.AnySuspicious)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+        }
+        std::wcout << L"\n";
+
+        for (const TokenPrivilegeRecord& record : result.Records)
+        {
+            PrintColoredText(L"[token.record]", record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+            std::wcout << L" pid=" << std::dec << record.ProcessId
+                       << L" image=" << record.ImageName
+                       << L" token=" << HexTextWidth(record.TokenObject, 16, true)
+                       << L" present=" << HexTextWidth(record.PresentMask, 16, true)
+                       << L" enabled=" << HexTextWidth(record.EnabledMask, 16, true);
+            if (record.Suspicious)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+            }
+            std::wcout << L"\n";
+            if (!record.HighRiskEnabled.empty())
+            {
+                std::wcout << L"  highRiskEnabled=";
+                for (size_t i = 0; i < record.HighRiskEnabled.size(); ++i)
+                {
+                    if (i > 0)
+                    {
+                        std::wcout << L",";
+                    }
+                    std::wcout << record.HighRiskEnabled[i];
+                }
+                std::wcout << L"\n";
+            }
+            for (const std::wstring& note : record.Notes)
+            {
+                std::wcout << L"  note: " << note << L"\n";
+            }
+        }
+    } while (false);
+}
+
+static void PrintDpcTimerHelp(const wchar_t* command)
+{
+    std::wcout << command << L" command:\n";
+    std::wcout << L"  " << command << L" [/verbose] [/limit <n>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"enumerates deferred execution callbacks. High risk is reserved for non-image routines.\n";
+    std::wcout << L"workitem coverage is best-effort and may report incomplete on modern threadpools.\n";
+}
+
+static void HandleDpcTimerCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    DpcTimerScanner::Scope scope,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    const wchar_t* command =
+        scope == DpcTimerScanner::Scope::Dpc ? L"!dpc" :
+        (scope == DpcTimerScanner::Scope::Timer ? L"!timer" : L"!workitem");
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << command << L" requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1))
+        {
+            PrintDpcTimerHelp(command);
+            break;
+        }
+
+        DpcTimerScanner::Options options = {};
+        options.Target = scope;
+        size_t index = 1;
+        while (index < args.size())
+        {
+            std::wstring token = ToLower(args[index]);
+            if (token == L"/verbose")
+            {
+                options.Verbose = true;
+                ++index;
+                continue;
+            }
+            if (token == L"/limit" && index + 1 < args.size())
+            {
+                uint64_t limitValue = 0;
+                if (!ParseUnsigned(args[index + 1], 10, &limitValue))
+                {
+                    std::wcerr << command << L": invalid /limit\n";
+                    break;
+                }
+                options.Limit = static_cast<uint32_t>(limitValue);
+                index += 2;
+                continue;
+            }
+            std::wcerr << command << L": unexpected argument \"" << args[index] << L"\"\n";
+            break;
+        }
+        if (index < args.size())
+        {
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            std::wstring loadError;
+            if (!symbols.LoadKernelModules(&loadError))
+            {
+                std::wcerr << command << L" failed: " << loadError << L"\n";
+                break;
+            }
+        }
+
+        DpcTimerScanner scanner(device, symbols);
+        DpcTimerScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << command << L" failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << command << L" warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            if (scope == DpcTimerScanner::Scope::Dpc)
+            {
+                *structuredJsonOut = BuildDpcJson(result);
+            }
+            else if (scope == DpcTimerScanner::Scope::Timer)
+            {
+                *structuredJsonOut = BuildTimerJson(result);
+            }
+            else
+            {
+                *structuredJsonOut = BuildWorkItemJson(result);
+            }
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << command << L" warning: " << warning << L"\n";
+        }
+
+        if (scope == DpcTimerScanner::Scope::Dpc)
+        {
+            PrintColoredText(L"dpc", KNDBG_COLOR_TITLE);
+            std::wcout << L" count=" << std::dec << result.Dpcs.size()
+                       << L" suspicious=" << result.SuspiciousDpcCount
+                       << L" cpus=" << result.ProcessorsSampled
+                       << L" coverage=" << (result.DpcCoverageComplete ? L"complete" : L"incomplete")
+                       << L"\n";
+            for (const DpcRoutineRecord& record : result.Dpcs)
+            {
+                if (!record.Suspicious && !options.Verbose)
+                {
+                    continue;
+                }
+                PrintColoredText(L"[dpc.routine]", record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+                std::wcout << L" cpu=" << std::dec << record.Processor
+                           << L" routine=" << HexTextWidth(record.Routine, 16, true)
+                           << L" module=" << record.Module
+                           << L" symbol=" << record.Symbol;
+                if (record.Suspicious)
+                {
+                    std::wcout << L" ";
+                    PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+                }
+                std::wcout << L"\n";
+            }
+            if (result.SuspiciousDpcCount == 0 && !options.Verbose)
+            {
+                std::wcout << L"  no non-image DPC routines observed in sampled queues\n";
+            }
+        }
+        else if (scope == DpcTimerScanner::Scope::Timer)
+        {
+            PrintColoredText(L"timer", KNDBG_COLOR_TITLE);
+            std::wcout << L" count=" << std::dec << result.Timers.size()
+                       << L" suspicious=" << result.SuspiciousTimerCount
+                       << L" coverage=" << (result.TimerCoverageComplete ? L"complete" : L"incomplete")
+                       << L"\n";
+            for (const TimerRoutineRecord& record : result.Timers)
+            {
+                if (!record.Suspicious && !options.Verbose)
+                {
+                    continue;
+                }
+                PrintColoredText(L"[timer.routine]", record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_TITLE);
+                std::wcout << L" timer=" << HexTextWidth(record.TimerAddress, 16, true)
+                           << L" routine=" << HexTextWidth(record.Routine, 16, true)
+                           << L" module=" << record.Module
+                           << L" symbol=" << record.Symbol;
+                if (record.Suspicious)
+                {
+                    std::wcout << L" ";
+                    PrintColoredText(L"[SUSPICIOUS]", KNDBG_COLOR_FAIL);
+                }
+                std::wcout << L"\n";
+            }
+            if (result.SuspiciousTimerCount == 0 && !options.Verbose)
+            {
+                std::wcout << L"  no non-image timer DPC routines observed\n";
+            }
+        }
+        else
+        {
+            PrintColoredText(L"workitem", KNDBG_COLOR_TITLE);
+            std::wcout << L" count=" << std::dec << result.WorkItems.size()
+                       << L" coverage=" << (result.WorkItemCoverageComplete ? L"complete" : L"incomplete")
+                       << L"\n";
+            if (!result.WorkItemCoverageComplete)
+            {
+                std::wcout << L"  work-item decoding is best-effort; do not treat incomplete as clean\n";
             }
         }
     } while (false);
@@ -23232,6 +24140,30 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintIdtHelp();
         }
+        else if (command == L"!hal")
+        {
+            PrintHalHelp();
+        }
+        else if (command == L"!hive")
+        {
+            PrintHiveHelp();
+        }
+        else if (command == L"!token")
+        {
+            PrintTokenHelp();
+        }
+        else if (command == L"!dpc")
+        {
+            PrintDpcTimerHelp(L"!dpc");
+        }
+        else if (command == L"!timer")
+        {
+            PrintDpcTimerHelp(L"!timer");
+        }
+        else if (command == L"!workitem")
+        {
+            PrintDpcTimerHelp(L"!workitem");
+        }
         else if (command == L"!fwtable")
         {
             PrintFirmwareTableHelp();
@@ -23553,6 +24485,60 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             SnapshotJsonStrictParsingSelfTest(),
             L"snapshot-json-strict-numeric-and-boolean-fields");
+
+        // Phase 2 quiet-surface root commands appear in registered completion.
+        CheckCompletionCandidate(&context, {}, L"!hal", L"phase2-root-hal-completion");
+        CheckCompletionCandidate(&context, {}, L"!hive", L"phase2-root-hive-completion");
+        CheckCompletionCandidate(&context, {}, L"!token", L"phase2-root-token-completion");
+        CheckCompletionCandidate(&context, {}, L"!dpc", L"phase2-root-dpc-completion");
+        CheckCompletionCandidate(&context, {}, L"!timer", L"phase2-root-timer-completion");
+        CheckCompletionCandidate(&context, {}, L"!workitem", L"phase2-root-workitem-completion");
+        CheckCompletionCandidate(&context, {}, L"!etw", L"phase2-root-etw-completion");
+
+        // Phase 2 subcommand / option completion.
+        CheckCompletionCandidate(&context, {L"!etw"}, L"providers", L"phase2-etw-providers-completion");
+        CheckCompletionCandidate(&context, {L"!etw"}, L"ti-cross", L"phase2-etw-ticross-completion");
+        CheckCompletionCandidate(&context, {L"!etw"}, L"integrity", L"phase2-etw-integrity-completion");
+        CheckCompletionCandidate(&context, {L"!etw", L"providers"}, L"/limit", L"phase2-etw-providers-limit-completion");
+        CheckCompletionCandidate(&context, {L"!hal"}, L"dispatch", L"phase2-hal-dispatch-completion");
+        CheckCompletionCandidate(&context, {L"!hal"}, L"private", L"phase2-hal-private-completion");
+        CheckCompletionCandidate(&context, {L"!hive"}, L"list", L"phase2-hive-list-completion");
+        CheckCompletionCandidate(&context, {L"!hive"}, L"cells", L"phase2-hive-cells-completion");
+        CheckCompletionCandidate(&context, {L"!token"}, L"/all", L"phase2-token-all-completion");
+        CheckCompletionCandidate(&context, {L"!token"}, L"/limit", L"phase2-token-limit-completion");
+        CheckCompletionCandidate(&context, {L"!dpc"}, L"/verbose", L"phase2-dpc-verbose-completion");
+        CheckCompletionCandidate(&context, {L"!timer"}, L"/limit", L"phase2-timer-limit-completion");
+        CheckCompletionCandidate(&context, {L"!workitem"}, L"/verbose", L"phase2-workitem-verbose-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!hal", L"phase2-help-hal-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!token", L"phase2-help-token-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!etw"}, L"providers", L"phase2-help-etw-providers-completion");
+
+        // Phase 2 detailed help routes.
+        {
+            const std::wstring etwHelp = CaptureDetailedHelpOutput({L"!etw", L"help"}, 0);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                etwHelp.find(L"providers") != std::wstring::npos &&
+                    etwHelp.find(L"ti-cross") != std::wstring::npos,
+                L"phase2-help-etw-mentions-providers-ticross");
+            const std::wstring halHelp = CaptureDetailedHelpOutput({L"!hal", L"help"}, 0);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                halHelp.find(L"HalDispatchTable") != std::wstring::npos ||
+                    halHelp.find(L"dispatch") != std::wstring::npos,
+                L"phase2-help-hal-routes");
+            const std::wstring tokenHelp = CaptureDetailedHelpOutput({L"help", L"!token"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                tokenHelp.find(L"privilege") != std::wstring::npos ||
+                    tokenHelp.find(L"token") != std::wstring::npos,
+                L"phase2-help-token-routes");
+            const std::wstring dpcHelp = CaptureDetailedHelpOutput({L"!dpc", L"help"}, 0);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                dpcHelp.find(L"/verbose") != std::wstring::npos,
+                L"phase2-help-dpc-routes");
+        }
 
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -26784,7 +27770,7 @@ static bool ValidateAiPlanArgumentShape(
             {
                 if (reason != nullptr)
                 {
-                    *reason = L"!etw scope must be loggers or logger";
+                    *reason = L"!etw scope must be loggers, logger, integrity, providers, or ti-cross";
                 }
                 break;
             }
@@ -26820,6 +27806,144 @@ static bool ValidateAiPlanArgumentShape(
                     }
                     break;
                 }
+            }
+            else if (args.size() >= 2 && ToLower(args[1]) == L"providers")
+            {
+                // Optional: /limit <n>
+                if (args.size() == 3)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!etw providers optional form is /limit <n>";
+                    }
+                    break;
+                }
+                if (args.size() == 4)
+                {
+                    if (ToLower(args[2]) != L"/limit")
+                    {
+                        if (reason != nullptr)
+                        {
+                            *reason = L"!etw providers only accepts /limit <n>";
+                        }
+                        break;
+                    }
+                }
+                if (args.size() > 4)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!etw providers takes at most /limit <n>";
+                    }
+                    break;
+                }
+            }
+            else if (args.size() >= 2 &&
+                (ToLower(args[1]) == L"ti-cross" || ToLower(args[1]) == L"ticross"))
+            {
+                if (args.size() > 2)
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!etw ti-cross takes no extra arguments";
+                    }
+                    break;
+                }
+            }
+        }
+        else if (command == L"!hal")
+        {
+            if (args.size() > 2)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!hal accepts at most one subcommand (dispatch|private)";
+                }
+                break;
+            }
+            if (args.size() == 2)
+            {
+                std::wstring scope = ToLower(args[1]);
+                if (scope != L"dispatch" && scope != L"private" && !IsHelpToken(args[1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!hal scope must be dispatch or private";
+                    }
+                    break;
+                }
+            }
+        }
+        else if (command == L"!hive")
+        {
+            if (args.size() > 2)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!hive accepts at most one subcommand (list|cells)";
+                }
+                break;
+            }
+            if (args.size() == 2)
+            {
+                std::wstring scope = ToLower(args[1]);
+                if (scope != L"list" && scope != L"cells" && !IsHelpToken(args[1]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"!hive scope must be list or cells";
+                    }
+                    break;
+                }
+            }
+        }
+        else if (command == L"!token")
+        {
+            // Free-form pid/image/eprocess plus optional /all /limit /system.
+            // Shape is validated by the handler; plan path only rejects empty.
+            if (args.size() < 2)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!token requires pid, image, eprocess, or /all";
+                }
+                break;
+            }
+        }
+        else if (command == L"!dpc" || command == L"!timer" || command == L"!workitem")
+        {
+            bool shapeOk = true;
+            for (size_t index = 1; index < args.size(); ++index)
+            {
+                std::wstring token = ToLower(args[index]);
+                if (token == L"/verbose" || IsHelpToken(args[index]))
+                {
+                    continue;
+                }
+                if (token == L"/limit")
+                {
+                    if (index + 1 >= args.size())
+                    {
+                        if (reason != nullptr)
+                        {
+                            *reason = command + L" /limit requires a value";
+                        }
+                        shapeOk = false;
+                        break;
+                    }
+                    ++index;
+                    continue;
+                }
+                if (reason != nullptr)
+                {
+                    *reason = command + L" accepts only /verbose and /limit <n>";
+                }
+                shapeOk = false;
+                break;
+            }
+            if (!shapeOk)
+            {
+                break;
             }
         }
         else if (command == L"!nmi")
@@ -33614,7 +34738,14 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"vad.list" ||
         tool == L"threads.list" ||
         tool == L"etw.integrity" ||
+        tool == L"etw.providers" ||
+        tool == L"etw.ti_cross" ||
         tool == L"nmi.list" ||
+        tool == L"hal.scan" ||
+        tool == L"hive.list" ||
+        tool == L"token.inspect" ||
+        tool == L"dpc.list" ||
+        tool == L"timer.list" ||
         tool == L"fwtable.list" ||
         // firmwaretable.list is an internal AI-planner alias only; it is NOT an
         // MCP tool name (kTools advertises just fwtable.list, and FindTool only
@@ -33976,7 +35107,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|nmi.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|etw.providers|etw.ti_cross|nmi.list|hal.scan|hive.list|token.inspect|dpc.list|timer.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -33989,7 +35120,14 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- vad.list: list target process VADs and optionally detect present PTE ranges missing from the VAD tree. Args: image, pid, eprocess, or source; optional booleans exec, private, wx, pe, hiddenpte, dkom, summary; optional limit string.\n";
     stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
     stream << L"- etw.integrity: check inline ETW GetCpuClock targets and suspicious callback redirects. Args: {}.\n";
+    stream << L"- etw.providers: heuristic ETW provider registration surface and enable-callback ownership. Args: {}.\n";
+    stream << L"- etw.ti_cross: correlate active Threat-Intelligence subscription reception with silence/drop signals. Args: {}.\n";
     stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
+    stream << L"- hal.scan: check HalDispatchTable ownership. Args: {}.\n";
+    stream << L"- hive.list: walk registry hive GetCellRoutine ownership. Args: {}.\n";
+    stream << L"- token.inspect: inspect process token privileges (pid optional, default 4). Args: optional pid.\n";
+    stream << L"- dpc.list: enumerate sampled DPC routines. Args: {}.\n";
+    stream << L"- timer.list: enumerate timer DPC routines. Args: {}.\n";
     stream << L"- fwtable.list: list registered firmware table providers from nt!ExpFirmwareTableProviderListHead without invoking handlers. Args: optional scope providers|provider, optional module string, optional provider/signature string.\n";
     stream << L"- pool.find: find big pool entries. Args: optional tag, min, max, addr/address, limit strings; optional paged string any|nonpaged|paged; optional booleans annotate, wx. Use wx=true for W+X pool.\n";
     stream << L"- address.inspect: inspect one virtual address or symbol. Args: address, va, or symbol string.\n";
@@ -37578,6 +38716,47 @@ static bool ExecuteAiCapabilityIdtScan(
     return ok;
 }
 
+static bool ExecuteAiCapabilitySimpleBang(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const std::wstring& toolName,
+    const std::vector<std::wstring>& args,
+    std::wstring* error,
+    std::wstring* structuredJsonOut,
+    void (*handler)(const std::vector<std::wstring>&, DeviceClient&, SymbolEngine&, std::wstring*))
+{
+    bool ok = false;
+    do
+    {
+        (void)step;
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = toolName + L" requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": " << toolName << L"\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        handler(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+    return ok;
+}
+
+static void HandleDpcAi(const std::vector<std::wstring>& args, DeviceClient& device, SymbolEngine& symbols, std::wstring* json)
+{
+    HandleDpcTimerCommand(args, device, symbols, DpcTimerScanner::Scope::Dpc, json);
+}
+
+static void HandleTimerAi(const std::vector<std::wstring>& args, DeviceClient& device, SymbolEngine& symbols, std::wstring* json)
+{
+    HandleDpcTimerCommand(args, device, symbols, DpcTimerScanner::Scope::Timer, json);
+}
+
 static bool ExecuteAiCapabilityCrScan(
     const AiCapabilityStep& step,
     DeviceClient& device,
@@ -38048,6 +39227,101 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"etw.integrity")
             {
                 stepOk = ExecuteAiCapabilityEtwIntegrity(step, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"etw.providers")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step,
+                    device,
+                    symbols,
+                    L"etw.providers",
+                    {L"!etw", L"providers"},
+                    error,
+                    structuredJsonOut,
+                    HandleEtwCommand);
+            }
+            else if (step.Tool == L"etw.ti_cross")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step,
+                    device,
+                    symbols,
+                    L"etw.ti_cross",
+                    {L"!etw", L"ti-cross"},
+                    error,
+                    structuredJsonOut,
+                    HandleEtwCommand);
+            }
+            else if (step.Tool == L"hal.scan")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step,
+                    device,
+                    symbols,
+                    L"hal.scan",
+                    {L"!hal"},
+                    error,
+                    structuredJsonOut,
+                    HandleHalCommand);
+            }
+            else if (step.Tool == L"hive.list")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step,
+                    device,
+                    symbols,
+                    L"hive.list",
+                    {L"!hive"},
+                    error,
+                    structuredJsonOut,
+                    HandleHiveCommand);
+            }
+            else if (step.Tool == L"token.inspect")
+            {
+                std::wstring pid;
+                ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pid", L"process"}, &pid);
+                std::vector<std::wstring> tokenArgs = {L"!token"};
+                if (!pid.empty())
+                {
+                    tokenArgs.push_back(pid);
+                }
+                else
+                {
+                    tokenArgs.push_back(L"4");
+                }
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step,
+                    device,
+                    symbols,
+                    L"token.inspect",
+                    tokenArgs,
+                    error,
+                    structuredJsonOut,
+                    HandleTokenCommand);
+            }
+            else if (step.Tool == L"dpc.list")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step,
+                    device,
+                    symbols,
+                    L"dpc.list",
+                    {L"!dpc"},
+                    error,
+                    structuredJsonOut,
+                    HandleDpcAi);
+            }
+            else if (step.Tool == L"timer.list")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step,
+                    device,
+                    symbols,
+                    L"timer.list",
+                    {L"!timer"},
+                    error,
+                    structuredJsonOut,
+                    HandleTimerAi);
             }
             else if (step.Tool == L"nmi.list")
             {
@@ -39492,6 +40766,30 @@ static bool HandleCommand(
         else if (command == L"!idt")
         {
             HandleIdtCommand(args, device, symbols);
+        }
+        else if (command == L"!hal")
+        {
+            HandleHalCommand(args, device, symbols);
+        }
+        else if (command == L"!hive")
+        {
+            HandleHiveCommand(args, device, symbols);
+        }
+        else if (command == L"!token")
+        {
+            HandleTokenCommand(args, device, symbols);
+        }
+        else if (command == L"!dpc")
+        {
+            HandleDpcTimerCommand(args, device, symbols, DpcTimerScanner::Scope::Dpc);
+        }
+        else if (command == L"!timer")
+        {
+            HandleDpcTimerCommand(args, device, symbols, DpcTimerScanner::Scope::Timer);
+        }
+        else if (command == L"!workitem")
+        {
+            HandleDpcTimerCommand(args, device, symbols, DpcTimerScanner::Scope::WorkItem);
         }
         else if (command == L"!fwtable")
         {
