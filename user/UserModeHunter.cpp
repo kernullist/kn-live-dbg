@@ -5,6 +5,7 @@
 #include "CloudFileScanner.h"
 #include "IntegrityScanner.h"
 #include "QosPolicyScanner.h"
+#include "TokenPrivilegeScanner.h"
 #include "WfpScanner.h"
 #include "Zydis.h"
 
@@ -26210,6 +26211,83 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         }
 
         AddThreatIntelCorrelationFindings(result, processes, options);
+
+        // Token privilege triage. Hunt uses elevated-signal mode so common
+        // admin SeDebug rights on developer desktops do not poison clean-host
+        // gates; structural Enabled-not-in-Present remains high signal.
+        if (options.Mode != HuntMode::Quick)
+        {
+            TokenPrivilegeScanner tokenScanner(device_, symbols_);
+            TokenPrivilegeScanner::Options tokenOptions = {};
+            tokenOptions.ScanAll = true;
+            tokenOptions.Limit = 0;
+            tokenOptions.TreatCommonAdminPrivilegesAsSuspicious = false;
+            tokenOptions.RequirePdbLayoutForPrivilegeFindings = true;
+            TokenPrivilegeScanResult tokenResult = {};
+            std::wstring tokenError;
+            if (tokenScanner.Scan(tokenOptions, &tokenResult, &tokenError))
+            {
+                for (const TokenPrivilegeRecord& token : tokenResult.Records)
+                {
+                    if (!token.Suspicious)
+                    {
+                        continue;
+                    }
+
+                    bool structural = false;
+                    for (const std::wstring& note : token.Notes)
+                    {
+                        if (note.find(L"not present in Present") != std::wstring::npos)
+                        {
+                            structural = true;
+                            break;
+                        }
+                    }
+
+                    HuntFinding finding = {};
+                    finding.Risk = L"high";
+                    finding.Confidence = structural ? L"high" : L"medium";
+                    finding.ClassName = structural
+                        ? L"token_privilege_inconsistency"
+                        : L"unexpected_enabled_privilege";
+                    finding.Title = structural
+                        ? L"token Enabled privileges not present in Present mask"
+                        : L"elevating token privileges enabled";
+                    finding.ProcessId = token.ProcessId;
+                    finding.Eprocess = token.Eprocess;
+                    finding.ImageName = token.ImageName;
+                    finding.ReasonCodes.push_back(finding.ClassName);
+                    finding.Evidence[L"token"] = HuntHex(token.TokenObject, 16);
+                    finding.Evidence[L"present"] = HuntHex(token.PresentMask, 16);
+                    finding.Evidence[L"enabled"] = HuntHex(token.EnabledMask, 16);
+                    finding.Evidence[L"fingerprint"] = token.PrivilegeFingerprint;
+                    if (!token.HighRiskEnabled.empty())
+                    {
+                        std::wstring joined;
+                        for (size_t i = 0; i < token.HighRiskEnabled.size(); ++i)
+                        {
+                            if (i > 0)
+                            {
+                                joined += L",";
+                            }
+                            joined += token.HighRiskEnabled[i];
+                        }
+                        finding.Evidence[L"high_risk_enabled"] = joined;
+                    }
+                    finding.Followups.push_back(
+                        L"!token " + std::to_wstring(token.ProcessId));
+                    result->Findings.push_back(std::move(finding));
+                }
+            }
+            else if (!tokenError.empty())
+            {
+                result->Warnings.push_back(L"token privilege scan: " + tokenError);
+            }
+            for (const std::wstring& tokenWarning : tokenResult.Warnings)
+            {
+                result->Warnings.push_back(L"token: " + tokenWarning);
+            }
+        }
 
         result->Processes.reserve(processes.size());
         for (auto& item : processes)

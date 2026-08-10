@@ -114,12 +114,16 @@
     <ClCompile Include="DriverService.cpp" />
     <ClCompile Include="EtwScanner.cpp" />
     <ClCompile Include="FirmwareTableScanner.cpp" />
+    <ClCompile Include="HalDispatchScanner.cpp" />
+    <ClCompile Include="HiveScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
     <ClCompile Include="NmiScanner.cpp" />
     <ClCompile Include="MsrScanner.cpp" />
     <ClCompile Include="CrScanner.cpp" />
     <ClCompile Include="SsdtScanner.cpp" />
     <ClCompile Include="IdtScanner.cpp" />
+    <ClCompile Include="DpcTimerScanner.cpp" />
+    <ClCompile Include="TokenPrivilegeScanner.cpp" />
     <ClCompile Include="McpServer.cpp" />
     <ClCompile Include="McpSelfTest.cpp" />
     <ClCompile Include="MemoryDumper.cpp" />
@@ -167,6 +171,8 @@
     <ClInclude Include="DriverService.h" />
     <ClInclude Include="EtwScanner.h" />
     <ClInclude Include="FirmwareTableScanner.h" />
+    <ClInclude Include="HalDispatchScanner.h" />
+    <ClInclude Include="HiveScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />
     <ClInclude Include="LayoutResolver.h" />
     <ClInclude Include="McpJson.h" />
@@ -176,6 +182,8 @@
     <ClInclude Include="CrScanner.h" />
     <ClInclude Include="SsdtScanner.h" />
     <ClInclude Include="IdtScanner.h" />
+    <ClInclude Include="DpcTimerScanner.h" />
+    <ClInclude Include="TokenPrivilegeScanner.h" />
     <ClInclude Include="NativeDisassembler.h" />
     <ClInclude Include="NmiScanner.h" />
     <ClInclude Include="MemoryDumper.h" />

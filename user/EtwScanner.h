@@ -77,6 +77,66 @@ struct EtwIntegrityResult
     std::vector<std::wstring>       Warnings;
 };
 
+// Best-effort ETW provider registration surface. Full tree reconstruction is
+// not guaranteed across builds; CoverageComplete must be trusted over empty.
+struct EtwProviderRecord
+{
+    uint32_t Index = 0;
+    uint64_t EntryAddress = 0;
+    std::wstring GuidText;
+    uint64_t EnableCallback = 0;
+    std::wstring EnableCallbackModule;
+    std::wstring EnableCallbackSymbol;
+    uint64_t RegEntry = 0;
+    bool Suspicious = false;
+    std::wstring Notes;
+};
+
+struct EtwProviderScanResult
+{
+    std::vector<EtwProviderRecord> Providers;
+    std::vector<std::wstring> Warnings;
+    uint64_t AnchorAddress = 0;
+    std::wstring AnchorSymbol;
+    bool AnchorResolved = false;
+    bool CoverageComplete = false;
+    bool LayoutFromPdb = false;
+    uint32_t SuspiciousCount = 0;
+    bool AnySuspicious = false;
+    uint32_t UserModeProviderCount = 0;
+    bool UserModeEnumerationOk = false;
+};
+
+// Correlates Threat-Intelligence subscription health with kernel ETW evidence.
+struct EtwTiCrossInput
+{
+    bool TiActive = false;
+    bool PplAntimalware = false;
+    uint64_t EventsReceived = 0;
+    uint64_t EventsKept = 0;
+    uint64_t EventsDropped = 0;
+    uint64_t StartTickMs = 0;
+    uint64_t LastEventTickMs = 0;
+    uint64_t NowTickMs = 0;
+    uint64_t MinSilentSeconds = 15;
+};
+
+struct EtwTiCrossResult
+{
+    bool TiActive = false;
+    bool Skipped = false;
+    bool Suspicious = false;
+    std::wstring Status; // skipped | silent | healthy | dropping | starting
+    std::wstring Reason;
+    double EventsPerSecond = 0.0;
+    uint64_t EventsReceived = 0;
+    uint64_t EventsDropped = 0;
+    uint64_t ElapsedSeconds = 0;
+    uint64_t SecondsSinceLastEvent = 0;
+    std::vector<std::wstring> Warnings;
+    std::vector<std::wstring> Notes;
+};
+
 class EtwScanner
 {
 public:
@@ -84,7 +144,9 @@ public:
     {
         Loggers,
         Logger,
-        Integrity
+        Integrity,
+        Providers,
+        TiCross
     };
 
     struct Options
@@ -93,12 +155,15 @@ public:
         std::wstring NameFilter;
         uint32_t IndexFilter = 0;
         bool     HasIndexFilter = false;
+        uint32_t Limit = 0;
     };
 
     EtwScanner(DeviceClient& device, SymbolEngine& symbols);
 
     bool Scan(const Options& options, EtwScanResult* result, std::wstring* error);
     bool ScanIntegrity(EtwIntegrityResult* result, std::wstring* error);
+    bool ScanProviders(const Options& options, EtwProviderScanResult* result, std::wstring* error);
+    static bool BuildTiCrossView(const EtwTiCrossInput& input, EtwTiCrossResult* result, std::wstring* error);
 
 private:
     DeviceClient& device_;
@@ -106,3 +171,5 @@ private:
 };
 
 std::wstring BuildEtwIntegrityJson(const EtwIntegrityResult& result);
+std::wstring BuildEtwProvidersJson(const EtwProviderScanResult& result);
+std::wstring BuildEtwTiCrossJson(const EtwTiCrossResult& result);
