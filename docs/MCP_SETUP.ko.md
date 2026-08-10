@@ -90,7 +90,9 @@ mcp status     # 현재 상태
 
 `<addr>`에는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0` / `*` / `+`(http.sys 강한 와일드카드 `+`로 매핑)를 줄 수 있다.
 
-**토큰 안정성.** bearer 토큰은 **재기동해도 유지**되므로 클라이언트는 한 번만 등록하면 된다 — 매 `mcp on`마다 다시 추가할 필요 없음. 결정 순서: `--token <t>` > `KNLIVEDBG_TOKEN` 환경변수 > 영속 파일(`<exeDir>\.kn-live-dbg\mcp-token-<port>`) > 새 랜덤 발급(발급 후 재사용을 위해 영속화). 기동 배너가 어느 출처인지 표시한다. 회전은 `--new-token`(이후 클라이언트 갱신). 영속 토큰은 (격리 lab) 박스에 operator-readable 파일로 남으니, 걱정되면 `--new-token` 또는 strict-ACL `KNLIVEDBG_TOKEN`을 쓴다.
+**권장 재연결 모델 (토큰 붙여넣기 없음):** Claude/Cursor에 `tools\mcp-bridge.ps1`을 **한 번만** 등록(`mcp client-setup`). 이후 세션은 `mcp on`만 하면 된다. 브리지가 `%LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json`을 읽어 현재 토큰으로 자동 연결한다.
+
+**토큰 안정성.** bearer 토큰은 **재기동·포트 변경에도 유지**(기본은 포트별이 아닌 사용자 단위 파일). 결정 순서: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token`(구버전 per-port 파일은 1회 마이그레이션) > 새 랜덤 발급(영속화). 회전은 `--new-token`(브리지가 자동 반영, 에이전트 설정 수정 불필요).
 
 ### 3.2 로컬(loopback) — 같은 PC
 
@@ -102,15 +104,46 @@ knkd> mcp on
 
 ```text
 MCP server started (loopback Streamable HTTP).
-  url   : http://127.0.0.1:51766/mcp
-  token : 3f9c... (64 hex chars)
-  write : disabled (read-only)
-  audit : <exeDir>\.kn-live-dbg\mcp-audit-51766.jsonl
-  claude code: claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp --header "Authorization: Bearer 3f9c..."
-  the engine loop starts now; type 'off' + Enter here to stop.
+  url      : http://127.0.0.1:51766/mcp
+  token    : 3f9c... (REUSED — AI agent re-register NOT required)
+  tokenFile: %LOCALAPPDATA%\kn-live-dbg\mcp-token
+  endpoint : %LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json  (bridge reads this every connect)
+  write    : disabled (read-only)
+
+  Preferred (no token paste on reconnect):
+    mcp client-setup
 ```
 
 이 시점부터 콘솔은 **MCP 엔진 루프**다. 중지하려면 `off` + Enter.
+
+### 3.2.1 에이전트 1회 등록 (권장)
+
+```text
+knkd> mcp client-setup
+knkd> mcp client-setup claude
+knkd> mcp client-setup cursor
+knkd> mcp client-setup codex
+knkd> mcp client-setup grok
+```
+
+스니펫은 `%LOCALAPPDATA%\kn-live-dbg\clients\` 에도 기록된다.
+
+| 에이전트 | 1회 등록 |
+|------|---------------------------|
+| **Claude Code** | `claude mcp add --transport stdio knlivedbg -- powershell.exe ... -File <bridge>` |
+| **Cursor** | `clients\cursor-mcp.json` 내용을 Cursor MCP 설정에 병합 |
+| **OpenAI Codex** | `codex mcp add knlivedbg -- powershell.exe ... -File <bridge>` 또는 `%USERPROFILE%\.codex\config.toml` 에 `codex-config.toml.snippet` 추가 |
+| **Grok Build** | `grok mcp add knlivedbg -- powershell.exe ... -File <bridge>` 또는 `%USERPROFILE%\.grok\config.toml` 에 `grok-config.toml.snippet` 추가 |
+
+이후 분석 세션은:
+
+```text
+knkd> mcp on
+```
+
+토큰을 에이전트 설정에 다시 넣을 필요 없음. `--new-token` 회전도 브리지가 자동 반영.
+
+**Grok 네이티브 HTTP(선택, npx 불필요):** `grok-http.toml.snippet` + `mcp-load-env.ps1` 로 `${KNLIVEDBG_TOKEN}` 주입. 잦은 재연결은 브리지 권장.
 
 ### 3.3 원격(`--bind`) — 분리된 PC/VM
 

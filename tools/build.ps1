@@ -530,6 +530,26 @@ function Copy-ByovdUpdaterScript
     Write-Host "BYOVD: copied update-byovd-intel.ps1"
 }
 
+function Copy-McpBridgeScript
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDir
+    )
+
+    $source = Join-Path $repo "tools\mcp-bridge.ps1"
+    if (-not (Test-Path $source))
+    {
+        Write-Warning "MCP bridge script was not found: $source"
+        return
+    }
+
+    $toolsDir = Join-Path $DestinationDir "tools"
+    New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+    Copy-Item -LiteralPath $source -Destination (Join-Path $toolsDir "mcp-bridge.ps1") -Force
+    Write-Host "MCP: copied mcp-bridge.ps1"
+}
+
 $visualStudioInstallations = Get-VisualStudioInstallations
 if ($visualStudioInstallations.Count -eq 0)
 {
@@ -609,6 +629,7 @@ if (-not (Test-Path (Join-Path $runtimeSourceDir "dbghelp.dll")) -or
 Write-Host "Runtime source: $runtimeSourceDir"
 Copy-DebuggingToolsRuntime -SourceDir $runtimeSourceDir -DestinationDir $outputDir
 Copy-ByovdUpdaterScript -DestinationDir $outputDir
+Copy-McpBridgeScript -DestinationDir $outputDir
 
 if ($BumpVersion)
 {

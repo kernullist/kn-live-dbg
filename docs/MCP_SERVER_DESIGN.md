@@ -206,10 +206,11 @@ Practical constraint: if the lab test VM is on a **physically separate PC**, an 
 
 ### 5.2 Authentication and token handling
 
-1. On each `mcp on`, **issue a fresh 256-bit random bearer token**, do a **constant-time comparison**, and on mismatch return 401 + close the connection.
-2. Server side: print the token to the console once only (no plaintext logging; the audit keeps only a fingerprint), auto-expire after a short idle TTL.
-3. **Client-side storage is the real leak point**: Claude Code persists HTTP headers (including Authorization) to a config file. **Do not paste a token that authenticates a kernel-RW endpoint into a committable project-scope `.mcp.json`.** Enforce user-scope config + `${KNLIVEDBG_TOKEN}` environment-variable indirection or `headersHelper` (issuing a rotating token at connect time). Never commit to git.
-4. Optional: bind the token to the loopback peer PID via `GetExtendedTcpTable` (defense-in-depth, though vulnerable to reconnect/PID reuse).
+1. Bearer tokens are **stable by default** across restarts (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, constant-time compare, 401 + close on mismatch). A fresh 256-bit token is minted only when missing or when the operator passes `--new-token`.
+2. `mcp on` writes `mcp-endpoint.json` (url + token) for the **stdio bridge** (`tools/mcp-bridge.ps1`). Agents register the bridge once; reconnects do not require re-pasting a token into Claude / Cursor / Codex / Grok Build configs.
+3. Server side: print the token source (reused/new/env/override); audit keeps request fingerprints, not the raw secret. Owner-only DACL is applied best-effort on token/endpoint files.
+4. **Client-side storage is the real leak point**: do **not** paste bearer tokens into committable project configs. Prefer the bridge (stdio) or user-scope config + `${KNLIVEDBG_TOKEN}` / `mcp-load-env.ps1`. Never commit secrets to git.
+5. Optional: bind the token to the loopback peer PID via `GetExtendedTcpTable` (defense-in-depth, though vulnerable to reconnect/PID reuse).
 
 ### 5.3 Two modes: read-only (default) vs Lab write mode (updated by decision §10-Q1)
 
@@ -403,7 +404,11 @@ Mitigation: before serialization, sanitize all wide strings against ill-formed U
 ### 8.2 Claude Code
 
 ```bash
-# Recommended: HTTP + static token (connecting to an already-running server)
+# Recommended: stdio bridge (token loaded from endpoint file each connect)
+#   knkd> mcp client-setup
+#   claude/codex/grok mcp add ... tools\mcp-bridge.ps1
+#
+# Alternative: HTTP + static token (connecting to an already-running server)
 claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
   --header "Authorization: Bearer YOUR_TOKEN"
 
