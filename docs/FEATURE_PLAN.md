@@ -27,16 +27,14 @@ Remaining priority order:
 
 Status: implemented (read-only user-mode scanners; no driver ABI change).
 
-Plan: `docs/plan/2026-08-11-phase2-quiet-surfaces.md`
-
 Implemented:
 
-1. `!hal` / `hal.scan` — HalDispatchTable + HalPrivateDispatchTable ownership.
-2. `!hive` / `hive.list` — CmpHiveListHead GetCellRoutine ownership.
+1. `!hal` / `hal.scan` — PDB-described HalDispatchTable pointer-field ownership; no raw-qword fallback.
+2. `!hive` / `hive.list` — PDB-described CmpHiveListHead GetCellRoutine ownership with validated list links.
 3. `!token` / `token.inspect` + `!hunt` privilege findings — high-risk enabled privileges on non-system profiles; process-security snapshot fingerprint.
-4. `!etw providers` / `etw.providers` — heuristic provider registration surface (coverage incomplete by design).
-5. `!etw ti-cross` / `etw.ti_cross` — TI subscription reception silence/drop correlator.
-6. `!dpc` / `!timer` / `!workitem` + `dpc.list` / `timer.list` — deferred execution callbacks; non-image high risk; workitem best-effort incomplete.
+4. `!etw providers` / `etw.providers` — unclassified heuristic provider diagnostics (coverage incomplete by design).
+5. `!etw ti-cross` / `etw.ti_cross` — TI reception/drop health view; silence alone is inconclusive.
+6. `!dpc` / `!timer` / `!workitem` + `dpc.list` / `timer.list` — PDB-bounded deferred execution callbacks; non-image high risk; workitem best-effort incomplete.
 
 Snapshot domains: `hal`, `hive`, `dpc-timer`, extended `etw` providers, extended `process-security` token fingerprint.
 

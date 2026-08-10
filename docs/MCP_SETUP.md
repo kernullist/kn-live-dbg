@@ -6,7 +6,7 @@ This document covers the **operational procedure for actually launching KnLiveDb
 
 - Server name: `knlivedbg`  ·  Server version: `0.1.0`  ·  MCP protocol: `2025-06-18`
 - Transport: in-process Streamable HTTP (`http.sys`), endpoint path `/mcp`
-- Default port: `51766`  ·  Authentication: a fresh 256-bit bearer token issued on every startup
+- Default port: `51766`  ·  Authentication: a stable 256-bit bearer token, rotated only on request or when no saved token exists
 - Default exposure: **loopback only** (`127.0.0.1` + `[::1]`). Network exposure is opt-in via `--bind` only.
 
 ---
@@ -85,7 +85,7 @@ mcp status     # current state
 | `--allow-write` (or `allow-write`) | Lab write mode. Registers the 10 write tools + arms kernel write | none = read-only |
 | `--bind <addr>` | Network exposure. Additionally binds to `<addr>` | none = loopback only |
 | `--bind=<addr>` | Same as above (joined form) | none |
-| `--token <t>` | Use a fixed bearer token (persisted), instead of the auto-managed one | auto |
+| `--token <t>` | Use a fixed 16-512 character printable-ASCII bearer token (persisted), instead of the auto-managed one | auto |
 | `--new-token` | Rotate: discard the persisted token and mint a fresh random one | off |
 
 For `<addr>` you can give a concrete IP (e.g. `192.168.56.10`) or, for all interfaces, `0.0.0.0` / `*` / `+` (mapped to the http.sys strong wildcard `+`).
@@ -184,7 +184,7 @@ knkd> mcp on 51766 --allow-write --bind 192.168.56.10
 
 - Read-only (default): on engine entry, `SetWriteMode(false)` **disarms the kernel write flag itself**. The write tools are not registered, and when called they are rejected with `writes are disabled; start the MCP server with --allow-write (lab mode)`.
 - `--allow-write`: the 10 write tools are exposed and `SetWriteMode(true)` arms kernel writes. Kernel-memory writes use the preflight/backup/verify-diff/audit rails; file/ring operations are still gated, audited, and warned when backup/verify is not meaningful (interactive confirmation is skipped).
-- **Mode-switch caveat**: if the server is already running, `mcp on --allow-write` (or `--bind`/port change) is **ignored** (it only prints `MCP server is already running on port N`). To change flags, first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch. **A new token is issued, so the client header must also be updated.**
+- **Mode-switch caveat**: if the server is already running, `mcp on --allow-write` (or `--bind`/port change) is **ignored** (it only prints `MCP server is already running on port N`). To change flags, first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch. The saved token remains valid unless you also pass `--new-token` or change `--token`/`KNLIVEDBG_TOKEN`.
 - **Recommendation**: take a VM snapshot before a write session, and capture an analysis baseline (`snapshot.capture`). It is for isolated VMs only; never use it on a live EDR/AC box.
 
 ---
@@ -226,7 +226,7 @@ If you write `.mcp.json` directly (token via **env indirection**, never commit i
 }
 ```
 
-> `${KNLIVEDBG_TOKEN}` is a **client-side recommended convention** (the server does not read this environment variable — the token is freshly issued by the server on every `mcp on`). Inject it in the client shell with `export KNLIVEDBG_TOKEN=<token>` (PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`).
+> `${KNLIVEDBG_TOKEN}` is read by the server when present and can also be interpolated by the client configuration. Make sure the server and client inherit the same value; otherwise prefer `tools/mcp-bridge.ps1`, which reads the protected live endpoint file directly.
 
 Useful knobs: per-server `timeout` (ms, raise it for slow scans — it is not extended by progress notifications), `headersHelper` (issue a rotating token on connect), `alwaysLoad`.
 
@@ -239,7 +239,8 @@ Put the same `type: http` entry in `%APPDATA%\Claude\claude_desktop_config.json`
   "mcpServers": {
     "knlivedbg": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "http://192.168.56.10:51766/mcp",
+      "args": ["-y", "mcp-remote@0.1.38", "http://192.168.56.10:51766/mcp",
+               "--allow-http", "--transport", "http-only", "--silent",
                "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
     }
   }
@@ -276,7 +277,7 @@ http_headers = { "Authorization" = "Bearer <token-from-server>" }
 ```toml
 [mcp_servers.knlivedbg]
 command = "npx"
-args = ["-y", "mcp-remote", "http://192.168.56.10:51766/mcp", "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
+args = ["-y", "mcp-remote@0.1.38", "http://192.168.56.10:51766/mcp", "--allow-http", "--transport", "http-only", "--silent", "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
 env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
 ```
 
@@ -440,7 +441,7 @@ hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
 ```
 
 - Hermes reads `config.yaml` once at startup — **restart Hermes** after editing. Verify with `hermes mcp list` (should show `knlivedbg` connected). Header env interpolation is not guaranteed, so the literal token usually lands in the YAML — treat the file as a secret and do not commit it.
-- If your build is old enough that it rejects `url`, fall back to the stdio `mcp-remote` bridge (`command: npx`, `args: [-y, mcp-remote, <url>, --header, "Authorization: Bearer <token>"]`); on Windows that needs Node/`npx` on PATH and is the usual cause of "server not found". Source: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
+- If your build is old enough that it rejects `url`, use `tools/mcp-bridge.ps1`; it pins `mcp-remote` and supplies the explicit local-HTTP and HTTP-only transport flags. On Windows this needs Node/`npx` on PATH. Source: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
 
 ### 4.11 Token handling caveats
 
@@ -589,10 +590,10 @@ claude mcp list                      # confirm connected
 
 | Symptom | Cause / Fix |
 |------|-------------|
-| Connection 401 | Token mismatch. Refresh the client header with the token freshly printed by the server |
+| Connection 401 | Token mismatch. Refresh the client header with the current token printed by the server, or reconnect through `tools/mcp-bridge.ps1` |
 | Connection 403 | (local) Connected with a non-loopback Host -> if remote, `--bind` is needed / (both) Browser context where Origin is non-loopback |
 | Cannot connect from remote (timeout) | Firewall inbound blocked. Allow the port/client IP with `New-NetFirewallRule`. Confirm the server came up with `--bind <IP>` |
-| `writes are disabled` | Read-only mode. **If already running, `mcp on --allow-write` is ignored** (prints `MCP server is already running`) -> first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch with `mcp on <port> --allow-write [--bind <addr>]`. A new token is issued, so refresh the client header too |
+| `writes are disabled` | Read-only mode. **If already running, `mcp on --allow-write` is ignored** (prints `MCP server is already running`) -> first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch with `mcp on <port> --allow-write [--bind <addr>]`. The saved token remains valid unless explicitly rotated or overridden |
 | `engine busy; retry shortly` or `engine timeout` | tools/call arrives not as a JSON-RPC error code but as an `isError:true` CallToolResult. On wait-queue (8) saturation, `engine busy` (audit `engine-busy`); on exceeding the 30s request timeout (long scans), `engine timeout` (audit `tool-error`). Raise the client per-server `timeout`, or shorten the scan with `limit`/`count`. (`-32603` occurs only on the congested `resources/read` path) |
 | Driver load failure | Test signing not enabled -> reboot after `bcdedit /set testsigning on` / running non-elevated |
 | `symType=0 (SymNone)` | The symbol DLL bundle was not placed next to the EXE (see 2.1) |

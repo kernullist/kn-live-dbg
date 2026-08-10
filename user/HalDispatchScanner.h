@@ -11,6 +11,7 @@
 struct HalDispatchSlot
 {
     uint32_t Index = 0;
+    std::wstring Name;
     uint64_t SlotAddress = 0;
     uint64_t Routine = 0;
     std::wstring Module;
@@ -30,6 +31,7 @@ struct HalDispatchTable
     uint32_t SuspiciousCount = 0;
     bool Resolved = false;
     bool BoundFromPdb = false;
+    bool CoverageComplete = false;
     std::vector<HalDispatchSlot> Slots;
     std::wstring Warning;
 };
@@ -40,6 +42,7 @@ struct HalDispatchScanResult
     std::vector<std::wstring> Warnings;
     bool AnySuspicious = false;
     uint32_t SuspiciousCount = 0;
+    bool CoverageComplete = false;
 };
 
 // Read-only ownership check for HAL dispatch function-pointer tables.

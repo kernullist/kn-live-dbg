@@ -1658,23 +1658,6 @@ namespace
         return buffer;
     }
 
-    bool AddressInLoadedModuleLocal(SymbolEngine& symbols, uint64_t address)
-    {
-        for (const KernelModuleInfo& module : symbols.Modules())
-        {
-            uint64_t end = module.Base + module.Size;
-            if (end < module.Base)
-            {
-                continue;
-            }
-            if (address >= module.Base && address < end)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
     std::wstring ModuleForAddressLocal(SymbolEngine& symbols, uint64_t address)
     {
         for (const KernelModuleInfo& module : symbols.Modules())
@@ -1823,9 +1806,9 @@ bool EtwScanner::ScanProviders(const Options& options, EtwProviderScanResult* re
         }
 
         // Probe the anchor region for GUID-shaped 16-byte values paired with
-        // nearby kernel function pointers (enable callbacks). This is a
-        // conservative heuristic: only emit records when both a plausible GUID
-        // and a non-null kernel callback-like pointer co-locate.
+        // nearby kernel pointers. Without a PDB-backed registration layout,
+        // these are diagnostics only: arbitrary object pointers must never be
+        // promoted to callback-tampering findings.
         constexpr uint32_t kProbeBytes = 0x1000;
         std::vector<uint8_t> probe;
         std::wstring readError;
@@ -1839,7 +1822,9 @@ bool EtwScanner::ScanProviders(const Options& options, EtwProviderScanResult* re
             break;
         }
 
-        const uint32_t limit = options.Limit == 0 ? 256u : options.Limit;
+        const uint32_t limit = options.Limit == 0
+            ? 256u
+            : (std::min)(options.Limit, 256u);
         std::set<uint64_t> seenEntries;
 
         for (uint32_t offset = 0; offset + 24 <= static_cast<uint32_t>(probe.size()); offset += 8)
@@ -1929,13 +1914,8 @@ bool EtwScanner::ScanProviders(const Options& options, EtwProviderScanResult* re
             record.EnableCallback = callback;
             record.EnableCallbackModule = ModuleForAddressLocal(symbols_, callback);
             record.EnableCallbackSymbol = NearestSymbolLocal(symbols_, callback);
-            if (!AddressInLoadedModuleLocal(symbols_, callback))
-            {
-                record.Suspicious = true;
-                record.Notes = L"provider enable callback outside loaded kernel modules";
-                ++result->SuspiciousCount;
-                result->AnySuspicious = true;
-            }
+            record.Notes =
+                L"unverified provider-layout candidate; not classified as a callback finding";
 
             result->Providers.push_back(record);
             if (result->Providers.size() >= limit)
@@ -1957,7 +1937,8 @@ bool EtwScanner::ScanProviders(const Options& options, EtwProviderScanResult* re
             // Heuristic coverage is partial by definition.
             result->CoverageComplete = false;
             result->Warnings.push_back(
-                L"provider enumeration is heuristic/partial; empty is not a clean bill of health");
+                L"provider candidates are heuristic diagnostics only; no callback "
+                L"tampering classification is made without a PDB-backed layout");
         }
 
         ok = true;
@@ -2029,7 +2010,7 @@ bool EtwScanner::BuildTiCrossView(const EtwTiCrossInput& input, EtwTiCrossResult
 
         if (input.EventsDropped > 0 &&
             input.EventsReceived > 0 &&
-            input.EventsDropped * 2 > input.EventsReceived)
+            input.EventsDropped > input.EventsReceived / 2)
         {
             result->Status = L"dropping";
             result->Reason = L"high TI ring drop rate relative to received events";
@@ -2044,11 +2025,14 @@ bool EtwScanner::BuildTiCrossView(const EtwTiCrossInput& input, EtwTiCrossResult
             result->Status = L"silent";
             result->Reason =
                 L"TI subscription active past threshold with zero received events";
-            result->Suspicious = true;
+            result->Suspicious = false;
             if (!input.PplAntimalware)
             {
                 result->Notes.push_back(L"confirm set-ppl-antimalware on before escalating");
             }
+            result->Notes.push_back(
+                L"silence alone is inconclusive without expected TI-generating activity "
+                L"or an independent kernel contradiction");
             result->Notes.push_back(L"correlate with !etw providers and !etw integrity");
             ok = true;
             break;
@@ -2072,6 +2056,8 @@ std::wstring BuildEtwProvidersJson(const EtwProviderScanResult& result)
     out += L",\"anchorSymbol\":" + mcpjson::Quote(result.AnchorSymbol);
     out += L",\"coverageComplete\":";
     out += result.CoverageComplete ? L"true" : L"false";
+    out += L",\"layoutFromPdb\":";
+    out += result.LayoutFromPdb ? L"true" : L"false";
     out += L",\"anySuspicious\":";
     out += result.AnySuspicious ? L"true" : L"false";
     out += L",\"suspiciousCount\":" + std::to_wstring(result.SuspiciousCount);

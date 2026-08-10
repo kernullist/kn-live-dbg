@@ -2,6 +2,7 @@
 
 #include "McpJson.h"
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <sstream>
@@ -9,7 +10,6 @@
 namespace
 {
     constexpr uint64_t kKernelSpaceMin = 0xffff800000000000ull;
-    constexpr uint32_t kDefaultDispatchSlots = 32;
     constexpr uint32_t kMaxDispatchSlots = 128;
 
     bool IsKernelAddress(uint64_t value)
@@ -92,63 +92,76 @@ namespace
             return true;
         }
 
-        // Some builds fold HAL into ntoskrnl; any loaded-module hit is still
-        // treated as non-suspicious for ownership, only non-image is high risk.
+        // Some builds fold HAL into ntoskrnl. Loaded third-party ownership is
+        // still unexpected for these tables and is classified separately from
+        // a callback that is outside every loaded image.
         return false;
     }
 
-    uint32_t ResolveTableSlotCount(SymbolEngine& symbols, const std::wstring& symbolName, uint64_t base, bool* fromPdb)
+    bool ResolveTablePointerFields(
+        SymbolEngine& symbols,
+        const std::vector<std::wstring>& typeNames,
+        std::vector<TypeFieldInfo>* fields,
+        std::wstring* resolvedType,
+        std::wstring* error)
     {
-        if (fromPdb != nullptr)
+        if (fields == nullptr)
         {
-            *fromPdb = false;
+            return false;
         }
+        fields->clear();
 
-        std::vector<SymbolMatchInfo> matches;
-        if (symbols.EnumerateSymbols(symbolName, 8, &matches, nullptr))
+        std::wstring lastError;
+        for (const std::wstring& typeName : typeNames)
         {
-            for (const SymbolMatchInfo& match : matches)
+            TypeLayoutInfo layout = {};
+            std::wstring layoutError;
+            if (!symbols.GetTypeLayout(typeName, &layout, &layoutError))
             {
-                if (match.Address == base && match.Size >= sizeof(uint64_t))
+                if (!layoutError.empty())
                 {
-                    uint32_t count = static_cast<uint32_t>(match.Size / sizeof(uint64_t));
-                    if (count == 0)
-                    {
-                        count = kDefaultDispatchSlots;
-                    }
-                    if (count > kMaxDispatchSlots)
-                    {
-                        count = kMaxDispatchSlots;
-                    }
-                    if (fromPdb != nullptr)
-                    {
-                        *fromPdb = true;
-                    }
-                    return count;
+                    lastError = layoutError;
                 }
+                continue;
             }
-        }
 
-        TypeLayoutInfo layout = {};
-        std::wstring ignored;
-        if (symbols.GetTypeLayout(L"nt!_HAL_DISPATCH", &layout, &ignored) && layout.Size >= sizeof(uint64_t))
-        {
-            uint32_t count = static_cast<uint32_t>(layout.Size / sizeof(uint64_t));
-            if (count > kMaxDispatchSlots)
+            for (const TypeFieldInfo& field : layout.Fields)
             {
-                count = kMaxDispatchSlots;
-            }
-            if (count > 0)
-            {
-                if (fromPdb != nullptr)
+                if (field.IsBitField ||
+                    field.ChildTag != KNDBG_SYMTAG_POINTER_TYPE ||
+                    field.Length != sizeof(uint64_t) ||
+                    static_cast<uint64_t>(field.Offset) + sizeof(uint64_t) > layout.Size)
                 {
-                    *fromPdb = true;
+                    continue;
                 }
-                return count;
+                fields->push_back(field);
             }
+
+            if (!fields->empty())
+            {
+                std::sort(
+                    fields->begin(),
+                    fields->end(),
+                    [](const TypeFieldInfo& left, const TypeFieldInfo& right)
+                    {
+                        return left.Offset < right.Offset;
+                    });
+                if (resolvedType != nullptr)
+                {
+                    *resolvedType = typeName;
+                }
+                return true;
+            }
+            lastError = typeName + L" contains no pointer fields";
         }
 
-        return kDefaultDispatchSlots;
+        if (error != nullptr)
+        {
+            *error = lastError.empty()
+                ? L"no HAL dispatch type layout resolved"
+                : lastError;
+        }
+        return false;
     }
 
     bool ScanOneTable(
@@ -156,6 +169,8 @@ namespace
         SymbolEngine& symbols,
         const std::wstring& symbolName,
         const std::wstring& displayName,
+        const std::vector<std::wstring>& typeNames,
+        uint32_t requestedLimit,
         HalDispatchTable* table,
         std::vector<std::wstring>* warnings)
     {
@@ -190,33 +205,66 @@ namespace
                 break;
             }
 
-            bool boundFromPdb = false;
-            uint32_t slotCount = ResolveTableSlotCount(symbols, symbolName, base, &boundFromPdb);
             table->Base = base;
-            table->SlotCount = slotCount;
-            table->BoundFromPdb = boundFromPdb;
             table->Resolved = true;
 
-            if (!boundFromPdb && warnings != nullptr)
+            std::vector<TypeFieldInfo> pointerFields;
+            std::wstring resolvedType;
+            std::wstring layoutError;
+            if (!ResolveTablePointerFields(
+                    symbols,
+                    typeNames,
+                    &pointerFields,
+                    &resolvedType,
+                    &layoutError))
             {
-                warnings->push_back(
-                    symbolName + L": table bound not from PDB; using default slot count " +
-                    std::to_wstring(slotCount));
+                table->Warning =
+                    L"PDB pointer-field layout unavailable; raw qword scanning disabled";
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(symbolName + L": " + table->Warning +
+                        (layoutError.empty() ? std::wstring() : L" (" + layoutError + L")"));
+                }
+                ok = true;
+                break;
             }
 
-            for (uint32_t index = 0; index < slotCount; ++index)
+            table->BoundFromPdb = true;
+            table->CoverageComplete = true;
+            if (warnings != nullptr && !resolvedType.empty())
             {
+                warnings->push_back(
+                    symbolName + L": pointer fields from " + resolvedType);
+            }
+            uint32_t fieldLimit = static_cast<uint32_t>(pointerFields.size());
+            if (fieldLimit > kMaxDispatchSlots)
+            {
+                fieldLimit = kMaxDispatchSlots;
+                table->CoverageComplete = false;
+                table->Warning = L"PDB pointer-field count exceeds safety limit";
+            }
+            if (requestedLimit != 0 && fieldLimit > requestedLimit)
+            {
+                fieldLimit = requestedLimit;
+                table->CoverageComplete = false;
+                table->Warning = L"operator limit truncated HAL dispatch coverage";
+            }
+            table->SlotCount = fieldLimit;
+
+            for (uint32_t index = 0; index < fieldLimit; ++index)
+            {
+                const TypeFieldInfo& field = pointerFields[index];
                 HalDispatchSlot slot = {};
                 slot.Index = index;
-                slot.SlotAddress = base + static_cast<uint64_t>(index) * sizeof(uint64_t);
+                slot.Name = field.Name;
+                slot.SlotAddress = base + field.Offset;
 
                 uint64_t routine = 0;
                 if (!ReadU64(device, slot.SlotAddress, &routine))
                 {
                     slot.Notes = L"slot read failed";
-                    slot.Suspicious = true;
+                    table->CoverageComplete = false;
                     table->Slots.push_back(slot);
-                    ++table->SuspiciousCount;
                     continue;
                 }
 
@@ -240,23 +288,11 @@ namespace
                 }
                 else if (!ModuleLooksLikeNtOrHal(slot.Module))
                 {
-                    // Third-party ownership is unusual. Only auto-flag when the
-                    // table bound is PDB-verified; otherwise adjacent-memory
-                    // over-reads can invent false hooks.
-                    if (boundFromPdb)
-                    {
-                        slot.Suspicious = true;
-                        slot.Notes =
-                            L"HAL dispatch routine owned by unexpected module (" +
-                            slot.Module + L")";
-                        ++table->SuspiciousCount;
-                    }
-                    else
-                    {
-                        slot.Notes =
-                            L"unexpected module with unverified table bound (" +
-                            slot.Module + L"); not auto-suspicious";
-                    }
+                    slot.Suspicious = true;
+                    slot.Notes =
+                        L"HAL dispatch routine owned by unexpected module (" +
+                        slot.Module + L")";
+                    ++table->SuspiciousCount;
                 }
 
                 table->Slots.push_back(slot);
@@ -298,6 +334,7 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
         }
 
         *result = HalDispatchScanResult{};
+        result->CoverageComplete = true;
 
         if (symbols_.Modules().empty())
         {
@@ -316,6 +353,7 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
         {
             std::wstring Symbol;
             std::wstring Name;
+            std::vector<std::wstring> TypeNames;
             bool Optional = false;
         };
 
@@ -325,6 +363,7 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
             Target target = {};
             target.Symbol = L"nt!HalDispatchTable";
             target.Name = L"HalDispatchTable";
+            target.TypeNames = {L"nt!_HAL_DISPATCH"};
             target.Optional = false;
             targets.push_back(target);
         }
@@ -333,6 +372,11 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
             Target target = {};
             target.Symbol = L"nt!HalPrivateDispatchTable";
             target.Name = L"HalPrivateDispatchTable";
+            target.TypeNames =
+            {
+                L"nt!_HAL_PRIVATE_DISPATCH",
+                L"nt!_HAL_PRIVATE_DISPATCH_TABLE"
+            };
             target.Optional = true;
             targets.push_back(target);
         }
@@ -345,6 +389,8 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
                 symbols_,
                 target.Symbol,
                 target.Name,
+                target.TypeNames,
+                options.Limit,
                 &table,
                 &result->Warnings);
 
@@ -362,6 +408,7 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
                     break;
                 }
 
+                result->CoverageComplete = false;
                 if (!table.Warning.empty())
                 {
                     result->Warnings.push_back(table.Warning);
@@ -371,6 +418,10 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
             }
 
             result->SuspiciousCount += table.SuspiciousCount;
+            if (!table.CoverageComplete)
+            {
+                result->CoverageComplete = false;
+            }
             if (table.SuspiciousCount > 0)
             {
                 result->AnySuspicious = true;
@@ -439,6 +490,8 @@ std::wstring BuildHalDispatchJson(const HalDispatchScanResult& result)
     std::wstring out = L"{\"schema\":\"kn-live-dbg.hal.v1\",\"anySuspicious\":";
     out += result.AnySuspicious ? L"true" : L"false";
     out += L",\"suspiciousCount\":" + std::to_wstring(result.SuspiciousCount);
+    out += L",\"coverageComplete\":";
+    out += result.CoverageComplete ? L"true" : L"false";
     out += L",\"tableCount\":" + std::to_wstring(result.Tables.size());
     out += L",\"warnings\":[";
     for (size_t i = 0; i < result.Warnings.size(); ++i)
@@ -464,6 +517,8 @@ std::wstring BuildHalDispatchJson(const HalDispatchScanResult& result)
         out += table.Resolved ? L"true" : L"false";
         out += L",\"boundFromPdb\":";
         out += table.BoundFromPdb ? L"true" : L"false";
+        out += L",\"coverageComplete\":";
+        out += table.CoverageComplete ? L"true" : L"false";
         out += L",\"base\":" + mcpjson::Quote(JsonHex(table.Base));
         out += L",\"slotCount\":" + std::to_wstring(table.SlotCount);
         out += L",\"nonNullCount\":" + std::to_wstring(table.NonNullCount);
@@ -484,6 +539,7 @@ std::wstring BuildHalDispatchJson(const HalDispatchScanResult& result)
             }
             firstSlot = false;
             out += L"{\"index\":" + std::to_wstring(slot.Index);
+            out += L",\"name\":" + mcpjson::Quote(slot.Name);
             out += L",\"slotAddress\":" + mcpjson::Quote(JsonHex(slot.SlotAddress));
             out += L",\"routine\":" + mcpjson::Quote(JsonHex(slot.Routine));
             out += L",\"nullSlot\":";

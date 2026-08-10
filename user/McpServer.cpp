@@ -55,6 +55,7 @@ namespace
     const McpToolArg kArgsAlpc[] = { {L"scope", L"string", false}, {L"name", L"string", false}, {L"pid", L"string", false} };
     const McpToolArg kArgsVad[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"exec", L"boolean", false}, {L"private", L"boolean", false}, {L"wx", L"boolean", false}, {L"pe", L"boolean", false}, {L"hiddenpte", L"boolean", false}, {L"dkom", L"boolean", false}, {L"summary", L"boolean", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsThreads[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"apc", L"boolean", false}, {L"stacks", L"boolean", false}, {L"limit", L"string", false} };
+    const McpToolArg kArgsTokenInspect[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsNmi[] = { {L"scope", L"string", false} };
     const McpToolArg kArgsFwtable[] = { {L"scope", L"string", false}, {L"module", L"string", false}, {L"provider", L"string", false}, {L"signature", L"string", false} };
     const McpToolArg kArgsPool[] = { {L"tag", L"string", false}, {L"min", L"string", false}, {L"max", L"string", false}, {L"addr", L"string", false}, {L"limit", L"string", false}, {L"paged", L"string", false}, {L"annotate", L"boolean", false}, {L"wx", L"boolean", false} };
@@ -123,7 +124,7 @@ namespace
         { L"nmi.list", L"Enumerate registered NMI callbacks.", true, MCP_ARG_TABLE(kArgsNmi) },
         { L"hal.scan", L"Check HalDispatchTable / HalPrivateDispatchTable function-pointer ownership.", true, nullptr, 0 },
         { L"hive.list", L"Walk registry hive list and flag GetCellRoutine handlers outside ntoskrnl.", true, nullptr, 0 },
-        { L"token.inspect", L"Inspect process token privilege Present/Enabled masks.", true, MCP_ARG_TABLE(kArgsProcessDescribe) },
+        { L"token.inspect", L"Inspect process token privilege Present/Enabled masks.", true, MCP_ARG_TABLE(kArgsTokenInspect) },
         { L"dpc.list", L"Enumerate sampled DPC deferred routines and flag non-image callbacks.", true, nullptr, 0 },
         { L"timer.list", L"Enumerate kernel timer DPC routines and flag non-image callbacks.", true, nullptr, 0 },
         { L"fwtable.list", L"Enumerate firmware table providers.", true, MCP_ARG_TABLE(kArgsFwtable) },
@@ -215,7 +216,7 @@ namespace
             unsigned int value = 0;
             if (rand_s(&value) != 0)
             {
-                value = static_cast<unsigned int>(i * 2654435761u);
+                return std::wstring();
             }
             wchar_t pair[4];
             swprintf_s(pair, L"%02x", value & 0xFFu);
@@ -240,7 +241,7 @@ namespace
             --end;
         }
         std::wstring token = raw.substr(begin, end - begin);
-        if (token.empty() || token.size() > 512)
+        if (token.size() < 16 || token.size() > 512)
         {
             return std::wstring();
         }
@@ -257,11 +258,28 @@ namespace
         return token;
     }
 
-    std::wstring ReadEnvToken()
+    std::wstring ReadEnvToken(bool* present)
     {
+        if (present != nullptr)
+        {
+            *present = false;
+        }
         wchar_t buffer[1024];
+        SetLastError(ERROR_SUCCESS);
         DWORD len = GetEnvironmentVariableW(L"KNLIVEDBG_TOKEN", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
-        if (len == 0 || len >= sizeof(buffer) / sizeof(buffer[0]))
+        if (len == 0)
+        {
+            if (present != nullptr && GetLastError() != ERROR_ENVVAR_NOT_FOUND)
+            {
+                *present = true;
+            }
+            return std::wstring();
+        }
+        if (present != nullptr)
+        {
+            *present = true;
+        }
+        if (len >= sizeof(buffer) / sizeof(buffer[0]))
         {
             return std::wstring();
         }
@@ -300,56 +318,160 @@ namespace
         return token;
     }
 
-    // Best-effort: restrict a sensitive file to the current user (no inherited
-    // Everyone/Users ACE). Failure is non-fatal -- lab boxes still work.
-    void RestrictFileToCurrentUser(const std::wstring& path)
+    bool RemoveLegacyTokenFiles(
+        const std::vector<std::wstring>& paths,
+        const std::wstring& activePath,
+        std::wstring* error)
     {
-        PSECURITY_DESCRIPTOR sd = nullptr;
-        // D:P = protected DACL (no inherit). A;;FA;;;OW = owner full access only.
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:P(A;;FA;;;OW)",
-                SDDL_REVISION_1,
-                &sd,
-                nullptr) &&
-            sd != nullptr)
+        for (const std::wstring& path : paths)
         {
-            SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, sd);
-            LocalFree(sd);
+            if (path.empty() || _wcsicmp(path.c_str(), activePath.c_str()) == 0)
+            {
+                continue;
+            }
+
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES)
+            {
+                const DWORD status = GetLastError();
+                if (status == ERROR_FILE_NOT_FOUND ||
+                    status == ERROR_PATH_NOT_FOUND)
+                {
+                    continue;
+                }
+                if (error != nullptr)
+                {
+                    *error = L"could not inspect legacy MCP token file '" +
+                        path + L"': " + std::to_wstring(status);
+                }
+                return false;
+            }
+
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+                !DeleteFileW(path.c_str()))
+            {
+                const DWORD status =
+                    (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+                        ? ERROR_DIRECTORY
+                        : GetLastError();
+                if (error != nullptr)
+                {
+                    *error = L"could not remove legacy MCP token file '" +
+                        path + L"': " + std::to_wstring(status);
+                }
+                return false;
+            }
         }
+        return true;
     }
 
-    bool WriteTokenFile(const std::wstring& path, const std::wstring& token)
+    bool BuildCurrentUserSecurityDescriptor(
+        PSECURITY_DESCRIPTOR* descriptor,
+        std::wstring* error)
     {
-        if (path.empty())
+        bool ok = false;
+        HANDLE token = nullptr;
+        LPWSTR sidText = nullptr;
+        PSECURITY_DESCRIPTOR localDescriptor = nullptr;
+
+        do
         {
-            return false;
-        }
-        size_t slash = path.find_last_of(L"\\/");
-        if (slash != std::wstring::npos)
+            if (descriptor == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid security descriptor output";
+                }
+                break;
+            }
+            *descriptor = nullptr;
+
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"OpenProcessToken failed: " + std::to_wstring(GetLastError());
+                }
+                break;
+            }
+
+            DWORD required = 0;
+            GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+            if (required == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"GetTokenInformation size query failed: " +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+
+            std::vector<unsigned char> buffer(required);
+            if (!GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.data(),
+                    required,
+                    &required))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"GetTokenInformation failed: " +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+
+            const TOKEN_USER* tokenUser =
+                reinterpret_cast<const TOKEN_USER*>(buffer.data());
+            if (!IsValidSid(tokenUser->User.Sid) ||
+                !ConvertSidToStringSidW(tokenUser->User.Sid, &sidText) ||
+                sidText == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not resolve the current user SID: " +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+
+            const std::wstring sddl =
+                L"D:P(A;;FA;;;" + std::wstring(sidText) + L")";
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.c_str(),
+                    SDDL_REVISION_1,
+                    &localDescriptor,
+                    nullptr) ||
+                localDescriptor == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not create the current-user DACL: " +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+
+            *descriptor = localDescriptor;
+            localDescriptor = nullptr;
+            ok = true;
+        } while (false);
+
+        if (localDescriptor != nullptr)
         {
-            CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
+            LocalFree(localDescriptor);
         }
-        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE)
+        if (sidText != nullptr)
         {
-            return false;
+            LocalFree(sidText);
         }
-        std::string ascii;
-        ascii.reserve(token.size());
-        for (wchar_t ch : token)
+        if (token != nullptr)
         {
-            ascii.push_back(static_cast<char>(ch & 0x7f));
+            CloseHandle(token);
         }
-        DWORD written = 0;
-        bool ok = WriteFile(file, ascii.data(), static_cast<DWORD>(ascii.size()), &written, nullptr) != 0;
-        CloseHandle(file);
-        if (ok && written == ascii.size())
-        {
-            RestrictFileToCurrentUser(path);
-            return true;
-        }
-        return false;
+        return ok;
     }
 
     bool ConstantTimeEqual(const std::string& a, const std::string& b)
@@ -697,6 +819,171 @@ namespace
 // and fulfills each job's promise. The listener thread only enqueues + waits.
 // ---------------------------------------------------------------------------
 
+bool WriteMcpSensitiveFile(
+    const std::wstring& path,
+    const std::string& bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    std::wstring temporaryPath;
+
+    do
+    {
+        if (path.empty() || bytes.size() > MAXDWORD)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid MCP sensitive-file path or size";
+            }
+            break;
+        }
+
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+        {
+            const std::wstring directory = path.substr(0, slash);
+            if (!CreateDirectoryW(directory.c_str(), nullptr) &&
+                GetLastError() != ERROR_ALREADY_EXISTS)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not create MCP state directory: " +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+        }
+
+        if (!BuildCurrentUserSecurityDescriptor(&descriptor, error))
+        {
+            break;
+        }
+
+        SECURITY_ATTRIBUTES attributes = {};
+        attributes.nLength = sizeof(attributes);
+        attributes.lpSecurityDescriptor = descriptor;
+        attributes.bInheritHandle = FALSE;
+
+        const DWORD processId = GetCurrentProcessId();
+        const ULONGLONG tick = GetTickCount64();
+        for (uint32_t attempt = 0; attempt < 16; ++attempt)
+        {
+            temporaryPath = path + L".tmp." + std::to_wstring(processId) +
+                L"." + std::to_wstring(tick) + L"." + std::to_wstring(attempt);
+            file = CreateFileW(
+                temporaryPath.c_str(),
+                GENERIC_WRITE,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_TEMPORARY,
+                nullptr);
+            if (file != INVALID_HANDLE_VALUE)
+            {
+                break;
+            }
+            if (GetLastError() != ERROR_FILE_EXISTS)
+            {
+                break;
+            }
+        }
+
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"could not create protected MCP temporary file: " +
+                    std::to_wstring(GetLastError());
+            }
+            break;
+        }
+
+        size_t offset = 0;
+        while (offset < bytes.size())
+        {
+            const DWORD remaining = static_cast<DWORD>(bytes.size() - offset);
+            DWORD written = 0;
+            if (!WriteFile(file, bytes.data() + offset, remaining, &written, nullptr) ||
+                written == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not write protected MCP file: " +
+                        std::to_wstring(GetLastError());
+                }
+                break;
+            }
+            offset += written;
+        }
+
+        if (offset != bytes.size())
+        {
+            break;
+        }
+        if (!FlushFileBuffers(file))
+        {
+            if (error != nullptr)
+            {
+                *error = L"could not flush protected MCP file: " +
+                    std::to_wstring(GetLastError());
+            }
+            break;
+        }
+
+        CloseHandle(file);
+        file = INVALID_HANDLE_VALUE;
+
+        DWORD moveError = ERROR_SUCCESS;
+        for (uint32_t attempt = 0; attempt < 5; ++attempt)
+        {
+            if (MoveFileExW(
+                    temporaryPath.c_str(),
+                    path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                moveError = ERROR_SUCCESS;
+                break;
+            }
+            moveError = GetLastError();
+            if (moveError != ERROR_SHARING_VIOLATION &&
+                moveError != ERROR_ACCESS_DENIED)
+            {
+                break;
+            }
+            Sleep(10);
+        }
+
+        if (moveError != ERROR_SUCCESS)
+        {
+            if (error != nullptr)
+            {
+                *error = L"could not install protected MCP file: " +
+                    std::to_wstring(moveError);
+            }
+            break;
+        }
+
+        temporaryPath.clear();
+        ok = true;
+    } while (false);
+
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+    }
+    if (!temporaryPath.empty())
+    {
+        DeleteFileW(temporaryPath.c_str());
+    }
+    if (descriptor != nullptr)
+    {
+        LocalFree(descriptor);
+    }
+    return ok;
+}
+
 std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot()
 {
     std::vector<McpToolCatalogEntry> entries;
@@ -787,24 +1074,100 @@ std::wstring McpServer::TokenSource() const
     return tokenSource_;
 }
 
-std::wstring McpServer::ResolveToken()
+bool McpServer::ResolveToken(std::wstring* token, std::wstring* error)
 {
+    if (token == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = L"invalid MCP token output";
+        }
+        return false;
+    }
+    token->clear();
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+
+    auto mintAndPersistFresh = [&]() -> bool
+    {
+        std::wstring fresh = RandomHex(32);
+        if (fresh.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"cryptographic token generation failed";
+            }
+            return false;
+        }
+        if (!WriteMcpSensitiveFile(
+                config_.TokenPath,
+                mcpjson::WideToUtf8(fresh),
+                error))
+        {
+            return false;
+        }
+        tokenSource_ = L"new";
+        *token = fresh;
+        return true;
+    };
+
     // 1) explicit --token: use and persist (so later restarts without --token,
     //    and without an env var, reuse it from the file).
     std::wstring explicitToken = SanitizeToken(config_.TokenOverride);
+    if (!config_.TokenOverride.empty() && explicitToken.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = L"--token must be 16-512 printable ASCII characters without spaces";
+        }
+        return false;
+    }
     if (!explicitToken.empty())
     {
-        WriteTokenFile(config_.TokenPath, explicitToken);
+        if (!WriteMcpSensitiveFile(
+                config_.TokenPath,
+                mcpjson::WideToUtf8(explicitToken),
+                error))
+        {
+            return false;
+        }
+        if (!RemoveLegacyTokenFiles(
+                config_.LegacyTokenPaths,
+                config_.TokenPath,
+                error))
+        {
+            return false;
+        }
         tokenSource_ = L"override";
-        return explicitToken;
+        *token = explicitToken;
+        return true;
     }
 
     // 2) KNLIVEDBG_TOKEN env: authoritative each run, not persisted (env wins).
-    std::wstring envToken = ReadEnvToken();
+    bool envTokenPresent = false;
+    std::wstring envToken = ReadEnvToken(&envTokenPresent);
+    if (envTokenPresent && envToken.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = L"KNLIVEDBG_TOKEN must be 16-512 printable ASCII characters without spaces";
+        }
+        return false;
+    }
     if (!envToken.empty())
     {
+        if (!RemoveLegacyTokenFiles(
+                config_.LegacyTokenPaths,
+                config_.TokenPath,
+                error))
+        {
+            return false;
+        }
         tokenSource_ = L"env";
-        return envToken;
+        *token = envToken;
+        return true;
     }
 
     // 3) persisted file: reuse unless an explicit rotation was requested.
@@ -813,16 +1176,60 @@ std::wstring McpServer::ResolveToken()
         std::wstring saved = ReadTokenFile(config_.TokenPath);
         if (!saved.empty())
         {
+            if (!WriteMcpSensitiveFile(
+                    config_.TokenPath,
+                    mcpjson::WideToUtf8(saved),
+                    error))
+            {
+                return false;
+            }
+            std::wstring cleanupError;
+            if (!RemoveLegacyTokenFiles(
+                    config_.LegacyTokenPaths,
+                    config_.TokenPath,
+                    &cleanupError))
+            {
+                // A legacy plaintext copy could contain this same token. If it
+                // cannot be removed, rotate so the leftover value is invalid.
+                return mintAndPersistFresh();
+            }
             tokenSource_ = L"reused";
-            return saved;
+            *token = saved;
+            return true;
+        }
+
+        for (const std::wstring& legacyPath : config_.LegacyTokenPaths)
+        {
+            std::wstring legacy = ReadTokenFile(legacyPath);
+            if (legacy.empty())
+            {
+                continue;
+            }
+            if (!WriteMcpSensitiveFile(
+                    config_.TokenPath,
+                    mcpjson::WideToUtf8(legacy),
+                    error))
+            {
+                return false;
+            }
+            std::wstring cleanupError;
+            if (!RemoveLegacyTokenFiles(
+                    config_.LegacyTokenPaths,
+                    config_.TokenPath,
+                    &cleanupError))
+            {
+                // Preserve availability without accepting a token that may
+                // still be readable from an obsolete plaintext location.
+                return mintAndPersistFresh();
+            }
+            tokenSource_ = L"reused";
+            *token = legacy;
+            return true;
         }
     }
 
     // 4) mint a fresh random token and persist it for the next restart.
-    std::wstring fresh = RandomHex(32);
-    WriteTokenFile(config_.TokenPath, fresh);
-    tokenSource_ = L"new";
-    return fresh;
+    return mintAndPersistFresh();
 }
 
 std::wstring McpServer::AuditPath() const
@@ -915,8 +1322,8 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         sessionId_.clear();
         stopRequested_.store(false);
 
-        // Ensure the .kn-live-dbg directory exists (audit log + persisted token);
-        // best-effort, logging/persistence are non-fatal.
+        // Ensure the audit directory exists. Audit logging is best-effort;
+        // bearer-token persistence below is mandatory.
         if (!config_.AuditPath.empty())
         {
             size_t slash = config_.AuditPath.find_last_of(L"\\/");
@@ -925,11 +1332,6 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
                 CreateDirectoryW(config_.AuditPath.substr(0, slash).c_str(), nullptr);
             }
         }
-
-        // Resolve a STABLE bearer token so a client registered once keeps
-        // working across restarts (the dir above must exist first so a freshly
-        // minted token can be persisted).
-        token_ = ResolveToken();
 
         jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1035,6 +1437,19 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
                 }
                 break;
             }
+        }
+
+        // Resolve the stable bearer token only after all listener prefixes are
+        // reserved. A failed bind must not rotate or overwrite client state.
+        // Persistence remains mandatory before the listener thread starts.
+        std::wstring tokenError;
+        if (!ResolveToken(&token_, &tokenError))
+        {
+            if (error != nullptr)
+            {
+                *error = L"failed to resolve MCP bearer token: " + tokenError;
+            }
+            break;
         }
 
         running_.store(true);

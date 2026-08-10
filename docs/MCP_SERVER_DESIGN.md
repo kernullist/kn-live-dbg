@@ -57,7 +57,7 @@ Rationale:
 2. **Claude Desktop is a GUI app, so it cannot spawn an elevated child process without UAC** -- a stdio config of the form `command: KnLiveDbg.exe` will not actually start.
 3. **stdout pollution**: the REPL/scanners emit massive output to `std::wcout` (C4), and `ScopedCommandProgress` writes directly to the console handle (C10). stdio JSON-RPC must own stdout for framing, so a single stray byte breaks the session.
 4. **HTTP coexists cleanly with the console**: the HTTP listener owns its own socket/thread and never touches the console. The operator REPL stays alive, preserving the human-in-the-loop (security-critical).
-5. **Claude Code/Desktop natively support `type: http`** (see §8 below). No separate shim needed. Only stdio-only hosts connect via a separate stateless bridge `npx mcp-remote <url>` (this bridge never touches the device, so it can be freely spawned).
+5. **Claude Code/Desktop natively support `type: http`** (see §8 below). No separate shim needed. Only stdio-only hosts connect through `tools/mcp-bridge.ps1`, which pins and constrains the stateless `mcp-remote` bridge (the bridge never touches the device, so it can be freely spawned).
 
 **Implementation stack**: the HTTP server is a new addition (the current project only links the `winhttp.lib` *client*, with no server socket/pipe).
 - First choice: **HTTP Server API (http.sys, `httpapi.lib`)** -- `HttpInitialize` / `HttpCreateRequestQueue` / `HttpAddUrlToUrlGroup` (`http://127.0.0.1:<port>/mcp`). This gains kernel-side URL reservation and ACL, and avoids raw socket parsing. A URL reservation (`netsh http add urlacl` or SDDL) may be required (open question §10).
@@ -208,7 +208,7 @@ Practical constraint: if the lab test VM is on a **physically separate PC**, an 
 
 1. Bearer tokens are **stable by default** across restarts (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, constant-time compare, 401 + close on mismatch). A fresh 256-bit token is minted only when missing or when the operator passes `--new-token`.
 2. `mcp on` writes `mcp-endpoint.json` (url + token) for the **stdio bridge** (`tools/mcp-bridge.ps1`). Agents register the bridge once; reconnects do not require re-pasting a token into Claude / Cursor / Codex / Grok Build configs.
-3. Server side: print the token source (reused/new/env/override); audit keeps request fingerprints, not the raw secret. Owner-only DACL is applied best-effort on token/endpoint files.
+3. Server side: print the token source (reused/new/env/override); audit keeps request fingerprints, not the raw secret. Token and endpoint files are atomically replaced with a protected DACL granting full access only to the current user. Token persistence or endpoint persistence failure aborts MCP startup.
 4. **Client-side storage is the real leak point**: do **not** paste bearer tokens into committable project configs. Prefer the bridge (stdio) or user-scope config + `${KNLIVEDBG_TOKEN}` / `mcp-load-env.ps1`. Never commit secrets to git.
 5. Optional: bind the token to the loopback peer PID via `GetExtendedTcpTable` (defense-in-depth, though vulnerable to reconnect/PID reuse).
 
@@ -419,7 +419,7 @@ claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
 
 # Separate stateless bridge for stdio-only hosts (does not directly expose the live process)
 claude mcp add --transport stdio knlivedbg-bridge -- \
-  npx -y mcp-remote http://127.0.0.1:51766/mcp --header "Authorization: Bearer YOUR_TOKEN"
+  npx -y mcp-remote@0.1.38 http://127.0.0.1:51766/mcp --allow-http --transport http-only --silent --header "Authorization: Bearer YOUR_TOKEN"
 ```
 
 On a remote bind (§5.1.1): since the bearer token is the only barrier, **allow inbound only from the client IP at the firewall** and use it only on a trusted lab segment. `--bind 0.0.0.0` opens on all interfaces, so specify a concrete IP if possible.
@@ -442,7 +442,7 @@ Useful knobs: per-server `timeout` (ms, raise it for slow scans -- not extended 
 
 ### 8.3 Claude Desktop
 
-The same `type: http` entry in `%APPDATA%\Claude\claude_desktop_config.json`. On builds without native http support, use a `command: npx, args: ["-y","mcp-remote", ...]` bridge. Fully restart Desktop after editing.
+The same `type: http` entry in `%APPDATA%\Claude\claude_desktop_config.json`. On builds without native http support, use `tools/mcp-bridge.ps1` or the pinned `mcp-remote@0.1.38` command from §8.1 with `--allow-http --transport http-only --silent`. Fully restart Desktop after editing.
 
 Recommended: instead of project-scope `.mcp.json`, use a single **user-scope + `${KNLIVEDBG_TOKEN}`** form to cover both Claude Code/Desktop.
 

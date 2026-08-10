@@ -34,6 +34,7 @@ struct TokenPrivilegeRecord
     bool PrivilegesResolved = false;
     bool Suspicious = false;
     bool SystemProfile = false;
+    bool IdentityResolved = false;
     bool CoverageIncomplete = false;
     std::wstring PrivilegeFingerprint;
 };
@@ -43,6 +44,8 @@ struct TokenPrivilegeScanResult
     std::vector<TokenPrivilegeRecord> Records;
     std::vector<std::wstring> Warnings;
     bool LayoutFromPdb = false;
+    bool ProcessLayoutFromPdb = false;
+    bool ProcessWalkComplete = false;
     bool CoverageComplete = false;
     uint32_t SuspiciousCount = 0;
     bool AnySuspicious = false;
@@ -67,8 +70,8 @@ public:
         // Hunt/snapshot use false to avoid clean-host and admin-desktop false
         // positives; interactive !token keeps the default true.
         bool TreatCommonAdminPrivilegesAsSuspicious = true;
-        // When true, privilege-based suspicion requires PDB-resolved layouts.
-        // Structural Enabled-not-in-Present findings still apply.
+        // When true, all privilege-based suspicion, including mask invariants,
+        // requires a fully PDB-resolved privilege layout.
         bool RequirePdbLayoutForPrivilegeFindings = false;
     };
 

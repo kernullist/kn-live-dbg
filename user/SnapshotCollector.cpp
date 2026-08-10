@@ -374,6 +374,8 @@ namespace
 
         uint64_t protectionReadsAttempted = 0;
         uint64_t protectionReadsSucceeded = 0;
+        uint64_t tokenReadsAttempted = 0;
+        uint64_t tokenReadsSucceeded = 0;
         document->Processes = options.Processes;
         for (SnapshotProcessRecord& process : document->Processes)
         {
@@ -407,68 +409,7 @@ namespace
             record.Evidence[L"create_time"] = SnapshotHex(process.CreateTime, 16);
             AddRecord(document, std::move(record));
 
-            if (!protectionFieldResolved)
-            {
-                continue;
-            }
-
-            ++protectionReadsAttempted;
-            uint64_t protectionAddress = 0;
-            if (process.Eprocess == 0 ||
-                process.Eprocess >
-                    std::numeric_limits<uint64_t>::max() -
-                        protectionField.Offset)
-            {
-                continue;
-            }
-            protectionAddress =
-                process.Eprocess + protectionField.Offset;
-
-            std::vector<uint8_t> protectionBytes;
-            std::wstring readError;
-            if (!device.ReadMemory(
-                    protectionAddress,
-                    sizeof(uint8_t),
-                    &protectionBytes,
-                    &readError) ||
-                protectionBytes.size() != sizeof(uint8_t))
-            {
-                continue;
-            }
-
-            ++protectionReadsSucceeded;
-            const uint8_t protection = protectionBytes[0];
-            SnapshotRecord securityRecord;
-            securityRecord.Domain = L"process-security";
-            securityRecord.Identity =
-                L"process-security:" + process.Identity;
-            securityRecord.Display =
-                process.ImageName + L" pid=" +
-                std::to_wstring(process.ProcessId) +
-                L" protection=" +
-                SnapshotHex(protection, 2);
-            securityRecord.Risk = L"info";
-            securityRecord.Tags =
-                {L"process-security", L"process-protection"};
-            securityRecord.Evidence[L"pid"] =
-                DecText(process.ProcessId);
-            securityRecord.Evidence[L"image"] =
-                process.ImageName;
-            securityRecord.Evidence[L"eprocess"] =
-                SnapshotHex(process.Eprocess, 16);
-            securityRecord.Evidence[L"protection_raw"] =
-                DecText(protection);
-            securityRecord.Evidence[L"protection_hex"] =
-                SnapshotHex(protection, 2);
-            securityRecord.Evidence[L"protection_type"] =
-                DecText(protection & 0x7u);
-            securityRecord.Evidence[L"protection_audit"] =
-                DecText((protection >> 3) & 0x1u);
-            securityRecord.Evidence[L"protection_signer"] =
-                DecText((protection >> 4) & 0xfu);
-
-            // Privilege fingerprint for same-boot diffs. Use elevated-signal
-            // mode so common admin SeDebug does not escalate risk on clean hosts.
+            ++tokenReadsAttempted;
             TokenPrivilegeScanner tokenScanner(device, symbols);
             TokenPrivilegeScanner::Options tokenOptions = {};
             tokenOptions.HasEprocess = true;
@@ -477,19 +418,103 @@ namespace
             tokenOptions.RequirePdbLayoutForPrivilegeFindings = true;
             TokenPrivilegeScanResult tokenResult = {};
             std::wstring tokenError;
-            if (tokenScanner.Scan(tokenOptions, &tokenResult, &tokenError) &&
+            const bool tokenScanOk =
+                tokenScanner.Scan(tokenOptions, &tokenResult, &tokenError);
+            const bool tokenIdentityMatches =
+                tokenScanOk &&
                 !tokenResult.Records.empty() &&
+                tokenResult.Records[0].IdentityResolved &&
+                tokenResult.Records[0].ProcessId == process.ProcessId &&
+                SnapshotToLower(tokenResult.Records[0].ImageName) ==
+                    SnapshotToLower(process.ImageName);
+            const bool tokenAvailable =
+                tokenScanOk &&
+                tokenIdentityMatches &&
+                tokenResult.CoverageComplete &&
                 tokenResult.Records[0].PrivilegesResolved &&
-                tokenResult.LayoutFromPdb)
+                tokenResult.LayoutFromPdb;
+            if (tokenAvailable)
+            {
+                ++tokenReadsSucceeded;
+            }
+
+            bool protectionAvailable = false;
+            uint8_t protection = 0;
+            if (protectionFieldResolved)
+            {
+                ++protectionReadsAttempted;
+                if (process.Eprocess != 0 &&
+                    process.Eprocess <=
+                        std::numeric_limits<uint64_t>::max() -
+                            protectionField.Offset)
+                {
+                    const uint64_t protectionAddress =
+                        process.Eprocess + protectionField.Offset;
+                    std::vector<uint8_t> protectionBytes;
+                    std::wstring readError;
+                    if (device.ReadMemory(
+                            protectionAddress,
+                            sizeof(uint8_t),
+                            &protectionBytes,
+                            &readError) &&
+                        protectionBytes.size() == sizeof(uint8_t))
+                    {
+                        protection = protectionBytes[0];
+                        protectionAvailable = true;
+                        ++protectionReadsSucceeded;
+                    }
+                }
+            }
+
+            if (!protectionAvailable && !tokenAvailable)
+            {
+                continue;
+            }
+
+            SnapshotRecord securityRecord;
+            securityRecord.Domain = L"process-security";
+            securityRecord.Identity =
+                L"process-security:" + process.Identity;
+            securityRecord.Display =
+                process.ImageName + L" pid=" +
+                std::to_wstring(process.ProcessId);
+            securityRecord.Risk = L"info";
+            securityRecord.Tags = {L"process-security"};
+            securityRecord.Evidence[L"pid"] =
+                DecText(process.ProcessId);
+            securityRecord.Evidence[L"image"] =
+                process.ImageName;
+            securityRecord.Evidence[L"eprocess"] =
+                SnapshotHex(process.Eprocess, 16);
+            if (protectionAvailable)
+            {
+                securityRecord.Display +=
+                    L" protection=" + SnapshotHex(protection, 2);
+                securityRecord.Tags.push_back(L"process-protection");
+                securityRecord.Evidence[L"protection_raw"] =
+                    DecText(protection);
+                securityRecord.Evidence[L"protection_hex"] =
+                    SnapshotHex(protection, 2);
+                securityRecord.Evidence[L"protection_type"] =
+                    DecText(protection & 0x7u);
+                securityRecord.Evidence[L"protection_audit"] =
+                    DecText((protection >> 3) & 0x1u);
+                securityRecord.Evidence[L"protection_signer"] =
+                    DecText((protection >> 4) & 0xfu);
+            }
+
+            // Privilege fingerprint for same-boot diffs. Use elevated-signal
+            // mode so common admin SeDebug does not escalate risk on clean hosts.
+            if (tokenAvailable)
             {
                 const TokenPrivilegeRecord& token = tokenResult.Records[0];
+                securityRecord.Tags.push_back(L"token-privilege");
                 securityRecord.Evidence[L"token_fingerprint"] = token.PrivilegeFingerprint;
                 securityRecord.Evidence[L"token_present"] = SnapshotHex(token.PresentMask, 16);
                 securityRecord.Evidence[L"token_enabled"] = SnapshotHex(token.EnabledMask, 16);
                 if (token.Suspicious)
                 {
                     securityRecord.Risk = L"high";
-                    securityRecord.Tags.push_back(L"token-privilege");
                     securityRecord.Tags.push_back(L"suspicious");
                 }
             }
@@ -504,8 +529,16 @@ namespace
         const bool protectionCoverageComplete =
             protectionFieldResolved &&
             protectionReadsAttempted == protectionReadsSucceeded;
+        const bool tokenCoverageComplete =
+            tokenReadsAttempted == tokenReadsSucceeded;
+        document->Metadata[L"token_privilege_reads_attempted"] =
+            DecText(tokenReadsAttempted);
+        document->Metadata[L"token_privilege_reads_succeeded"] =
+            DecText(tokenReadsSucceeded);
+        document->Metadata[L"token_privilege_coverage_complete"] =
+            BoolText(tokenCoverageComplete);
         document->Metadata[L"process_security_coverage_complete"] =
-            BoolText(protectionCoverageComplete);
+            BoolText(protectionCoverageComplete && tokenCoverageComplete);
         if (!protectionFieldResolved)
         {
             AddWarning(
@@ -524,6 +557,17 @@ namespace
                     DecText(protectionReadsSucceeded) +
                     L" of " +
                     DecText(protectionReadsAttempted) +
+                    L" process records");
+        }
+        if (!tokenCoverageComplete)
+        {
+            AddWarning(
+                document,
+                L"process-security",
+                L"token privilege coverage incomplete: read " +
+                    DecText(tokenReadsSucceeded) +
+                    L" of " +
+                    DecText(tokenReadsAttempted) +
                     L" process records");
         }
     }
@@ -886,7 +930,8 @@ namespace
             return;
         }
         AddWarnings(document, L"hal", result.Warnings);
-        document->Metadata[L"hal_coverage_complete"] = BoolText(true);
+        document->Metadata[L"hal_coverage_complete"] =
+            BoolText(result.CoverageComplete);
         for (const HalDispatchTable& table : result.Tables)
         {
             for (const HalDispatchSlot& slot : table.Slots)
@@ -898,8 +943,10 @@ namespace
                 SnapshotRecord record;
                 record.Domain = L"hal";
                 record.Identity =
-                    L"hal:" + SnapshotToLower(table.Name) + L":" + std::to_wstring(slot.Index);
-                record.Display = table.Name + L"[" + std::to_wstring(slot.Index) + L"]";
+                    L"hal:" + SnapshotToLower(table.Name) + L":" +
+                    (slot.Name.empty() ? std::to_wstring(slot.Index) : SnapshotToLower(slot.Name));
+                record.Display = table.Name + L"." +
+                    (slot.Name.empty() ? std::to_wstring(slot.Index) : slot.Name);
                 record.Risk = slot.Suspicious ? L"high" : L"info";
                 record.Tags = {L"hal", L"dispatch"};
                 if (slot.Suspicious)
@@ -908,6 +955,7 @@ namespace
                 }
                 record.Evidence[L"table"] = table.Name;
                 record.Evidence[L"index"] = DecText(slot.Index);
+                record.Evidence[L"field"] = slot.Name;
                 record.Evidence[L"routine"] = SnapshotHex(slot.Routine, 16);
                 record.Evidence[L"module"] = slot.Module;
                 record.Evidence[L"symbol"] = slot.Symbol;
@@ -979,11 +1027,14 @@ namespace
             }
             SnapshotRecord record;
             record.Domain = L"dpc-timer";
-            record.Identity = L"dpc:" + SnapshotHex(dpc.Routine, 16);
+            record.Identity =
+                L"dpc:" + SnapshotHex(dpc.ObjectAddress, 16) + L":" +
+                SnapshotHex(dpc.Routine, 16);
             record.Display = L"dpc " + dpc.Symbol;
             record.Risk = L"high";
             record.Tags = {L"dpc", L"suspicious"};
             record.Evidence[L"routine"] = SnapshotHex(dpc.Routine, 16);
+            record.Evidence[L"object"] = SnapshotHex(dpc.ObjectAddress, 16);
             record.Evidence[L"module"] = dpc.Module;
             record.Evidence[L"symbol"] = dpc.Symbol;
             record.Evidence[L"source"] = dpc.Source;
@@ -998,11 +1049,15 @@ namespace
             }
             SnapshotRecord record;
             record.Domain = L"dpc-timer";
-            record.Identity = L"timer:" + SnapshotHex(timer.Routine, 16);
+            record.Identity =
+                L"timer:" + SnapshotHex(timer.TimerAddress, 16) + L":" +
+                SnapshotHex(timer.Routine, 16);
             record.Display = L"timer " + timer.Symbol;
             record.Risk = L"high";
             record.Tags = {L"timer", L"suspicious"};
             record.Evidence[L"routine"] = SnapshotHex(timer.Routine, 16);
+            record.Evidence[L"timer"] = SnapshotHex(timer.TimerAddress, 16);
+            record.Evidence[L"dpc"] = SnapshotHex(timer.DpcAddress, 16);
             record.Evidence[L"module"] = timer.Module;
             record.Evidence[L"symbol"] = timer.Symbol;
             record.Evidence[L"notes"] = timer.Notes;

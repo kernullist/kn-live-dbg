@@ -26214,7 +26214,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
 
         // Token privilege triage. Hunt uses elevated-signal mode so common
         // admin SeDebug rights on developer desktops do not poison clean-host
-        // gates; structural Enabled-not-in-Present remains high signal.
+        // gates. PDB coverage is required for every privilege finding.
         if (options.Mode != HuntMode::Quick)
         {
             TokenPrivilegeScanner tokenScanner(device_, symbols_);
@@ -26227,6 +26227,13 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             std::wstring tokenError;
             if (tokenScanner.Scan(tokenOptions, &tokenResult, &tokenError))
             {
+                if (!tokenResult.CoverageComplete)
+                {
+                    result->ProcessTriageCoverageIncomplete = true;
+                    result->CoverageComplete = false;
+                    result->Warnings.push_back(
+                        L"token privilege scan coverage incomplete");
+                }
                 for (const TokenPrivilegeRecord& token : tokenResult.Records)
                 {
                     if (!token.Suspicious)
@@ -26279,9 +26286,14 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     result->Findings.push_back(std::move(finding));
                 }
             }
-            else if (!tokenError.empty())
+            else
             {
-                result->Warnings.push_back(L"token privilege scan: " + tokenError);
+                result->Warnings.push_back(
+                    tokenError.empty()
+                        ? L"token privilege scan failed"
+                        : L"token privilege scan: " + tokenError);
+                result->ProcessTriageCoverageIncomplete = true;
+                result->CoverageComplete = false;
             }
             for (const std::wstring& tokenWarning : tokenResult.Warnings)
             {

@@ -1,9 +1,9 @@
 #include "DpcTimerScanner.h"
 
-#include "LayoutResolver.h"
 #include "McpJson.h"
 
 #include <Windows.h>
+#include <algorithm>
 #include <cstring>
 #include <set>
 #include <sstream>
@@ -13,8 +13,8 @@ namespace
     constexpr uint64_t kKernelSpaceMin = 0xffff800000000000ull;
     constexpr uint32_t kMaxDpcRecords = 4096;
     constexpr uint32_t kMaxTimerRecords = 8192;
-    constexpr uint32_t kMaxWorkItems = 1024;
     constexpr uint32_t kMaxListWalk = 512;
+    constexpr uint32_t kMaxTimerBuckets = 512;
 
     bool IsKernelAddress(uint64_t value)
     {
@@ -150,7 +150,7 @@ namespace
         return false;
     }
 
-    void WalkListForDpcRoutines(
+    bool WalkListForDpcRoutines(
         DeviceClient& device,
         SymbolEngine& symbols,
         uint64_t listHead,
@@ -161,34 +161,62 @@ namespace
         uint32_t limit,
         DpcTimerScanResult* result)
     {
-        if (result == nullptr || listHead == 0 || !IsKernelAddress(listHead))
+        if (result == nullptr ||
+            listHead == 0 ||
+            !IsKernelAddress(listHead) ||
+            result->Dpcs.size() >= limit)
         {
-            return;
+            return false;
         }
 
         uint64_t flink = 0;
-        if (!ReadU64(device, listHead, &flink) || flink == 0)
+        uint64_t blink = 0;
+        if (!ReadU64(device, listHead, &flink) ||
+            !ReadU64(device, listHead + sizeof(uint64_t), &blink) ||
+            flink == 0 ||
+            blink == 0)
         {
-            return;
+            return false;
         }
         if (flink == listHead)
         {
-            return;
+            return blink == listHead;
         }
 
         std::set<uint64_t> visited;
         uint64_t entry = flink;
+        uint64_t previous = listHead;
         uint32_t walked = 0;
         while (entry != 0 && entry != listHead && walked < kMaxListWalk)
         {
             if (visited.find(entry) != visited.end())
             {
-                break;
+                return false;
             }
             visited.insert(entry);
             if (!IsKernelAddress(entry))
             {
-                break;
+                return false;
+            }
+
+            uint64_t next = 0;
+            uint64_t previousLink = 0;
+            if (!ReadU64(device, entry, &next) ||
+                !ReadU64(device, entry + sizeof(uint64_t), &previousLink) ||
+                previousLink != previous ||
+                next == 0 ||
+                (next != listHead && !IsKernelAddress(next)))
+            {
+                return false;
+            }
+            uint64_t nextBacklink = 0;
+            if (!ReadU64(
+                    device,
+                    next + sizeof(uint64_t),
+                    &nextBacklink) ||
+                nextBacklink != entry)
+            {
+                return false;
             }
 
             uint64_t objectAddress = entry;
@@ -198,7 +226,11 @@ namespace
             }
 
             uint64_t routine = 0;
-            if (ReadU64(device, objectAddress + deferredRoutineOffset, &routine) && routine != 0)
+            if (!ReadU64(device, objectAddress + deferredRoutineOffset, &routine))
+            {
+                return false;
+            }
+            if (routine != 0)
             {
                 DpcRoutineRecord record = {};
                 record.Index = static_cast<uint32_t>(result->Dpcs.size());
@@ -221,18 +253,44 @@ namespace
                 result->Dpcs.push_back(record);
                 if (result->Dpcs.size() >= limit)
                 {
-                    return;
+                    return next == listHead;
                 }
             }
 
-            uint64_t next = 0;
-            if (!ReadU64(device, entry, &next))
-            {
-                break;
-            }
+            previous = entry;
             entry = next;
             ++walked;
         }
+
+        return entry == listHead;
+    }
+
+    bool ResolveExactSymbolSize(
+        SymbolEngine& symbols,
+        const std::wstring& name,
+        uint64_t address,
+        uint32_t* size)
+    {
+        if (size == nullptr)
+        {
+            return false;
+        }
+        *size = 0;
+
+        std::vector<SymbolMatchInfo> matches;
+        if (!symbols.EnumerateSymbols(name, 8, &matches, nullptr))
+        {
+            return false;
+        }
+        for (const SymbolMatchInfo& match : matches)
+        {
+            if (match.Address == address && match.Size != 0)
+            {
+                *size = match.Size;
+                return true;
+            }
+        }
+        return false;
     }
 }
 
@@ -272,28 +330,36 @@ bool DpcTimerScanner::Scan(const Options& options, DpcTimerScanResult* result, s
             }
         }
 
-        ResolvedFieldOffset deferredRoutine =
-            ResolveFieldOffset(symbols_, L"nt!_KDPC", L"DeferredRoutine", 0x18);
-        ResolvedFieldOffset dpcListEntry =
-            ResolveFieldOffset(symbols_, L"nt!_KDPC", L"DpcListEntry", 0x08);
-        ResolvedFieldOffset timerDpc =
-            ResolveFieldOffset(symbols_, L"nt!_KTIMER", L"Dpc", 0x30);
-        ResolvedFieldOffset timerListEntry =
-            ResolveFieldOffset(symbols_, L"nt!_KTIMER", L"TimerListEntry", 0x20);
+        TypeFieldInfo deferredRoutine = {};
+        TypeFieldInfo dpcListEntry = {};
+        TypeFieldInfo timerDpc = {};
+        TypeFieldInfo timerListEntry = {};
+        std::wstring ignored;
+        const bool dpcObjectLayoutFromPdb =
+            symbols_.FindField(
+                L"nt!_KDPC",
+                L"DeferredRoutine",
+                &deferredRoutine,
+                &ignored) &&
+            symbols_.FindField(
+                L"nt!_KDPC",
+                L"DpcListEntry",
+                &dpcListEntry,
+                &ignored);
+        const bool timerObjectLayoutFromPdb =
+            symbols_.FindField(L"nt!_KTIMER", L"Dpc", &timerDpc, &ignored) &&
+            symbols_.FindField(
+                L"nt!_KTIMER",
+                L"TimerListEntry",
+                &timerListEntry,
+                &ignored);
 
-        if (!deferredRoutine.FromPdb)
-        {
-            result->Warnings.push_back(
-                L"_KDPC.DeferredRoutine not in PDB; using guarded x64 fallback 0x18");
-        }
-        if (!timerDpc.FromPdb)
-        {
-            result->Warnings.push_back(
-                L"_KTIMER.Dpc not in PDB; using guarded x64 fallback 0x30");
-        }
-
-        const uint32_t dpcLimit = options.Limit == 0 ? kMaxDpcRecords : options.Limit;
-        const uint32_t timerLimit = options.Limit == 0 ? kMaxTimerRecords : options.Limit;
+        const uint32_t dpcLimit = options.Limit == 0
+            ? kMaxDpcRecords
+            : (std::min)(options.Limit, kMaxDpcRecords);
+        const uint32_t timerLimit = options.Limit == 0
+            ? kMaxTimerRecords
+            : (std::min)(options.Limit, kMaxTimerRecords);
 
         // ---- DPC path: per-PRCB list heads when available ----
         if (options.Target == Scope::Dpc || options.Target == Scope::All)
@@ -301,7 +367,49 @@ bool DpcTimerScanner::Scan(const Options& options, DpcTimerScanResult* result, s
             uint64_t prcbArray = 0;
             uint32_t processorCount = 0;
             std::wstring prcbSymbol;
-            if (!ResolvePrcbArray(symbols_, &prcbArray, &processorCount, &prcbSymbol))
+            TypeFieldInfo dpcDataField = {};
+            TypeFieldInfo dpcListHeadField = {};
+            TypeLayoutInfo dpcDataLayout = {};
+            const bool dpcQueueLayoutFromPdb =
+                dpcObjectLayoutFromPdb &&
+                symbols_.FindField(
+                    L"nt!_KPRCB",
+                    L"DpcData",
+                    &dpcDataField,
+                    &ignored) &&
+                symbols_.FindField(
+                    L"nt!_KDPC_DATA",
+                    L"DpcListHead",
+                    &dpcListHeadField,
+                    &ignored) &&
+                symbols_.GetTypeLayout(
+                    L"nt!_KDPC_DATA",
+                    &dpcDataLayout,
+                    &ignored) &&
+                dpcDataLayout.Size >= sizeof(uint64_t) * 2;
+
+            uint32_t dpcDataCount = 0;
+            if (dpcQueueLayoutFromPdb)
+            {
+                dpcDataCount = static_cast<uint32_t>(
+                    dpcDataField.Length / dpcDataLayout.Size);
+                if (dpcDataCount == 0 || dpcDataCount > 4)
+                {
+                    dpcDataCount = 0;
+                }
+            }
+
+            if (!dpcQueueLayoutFromPdb || dpcDataCount == 0)
+            {
+                result->Warnings.push_back(
+                    L"PDB DPC queue layout unavailable; heuristic PRCB probing disabled");
+                result->DpcCoverageComplete = false;
+            }
+            else if (!ResolvePrcbArray(
+                         symbols_,
+                         &prcbArray,
+                         &processorCount,
+                         &prcbSymbol))
             {
                 result->Warnings.push_back(
                     L"KiProcessorBlock not resolved; DPC per-CPU queues unavailable");
@@ -309,17 +417,15 @@ bool DpcTimerScanner::Scan(const Options& options, DpcTimerScanResult* result, s
             }
             else
             {
+                bool coverageComplete = true;
                 if (options.MaxProcessors != 0 && processorCount > options.MaxProcessors)
                 {
                     processorCount = options.MaxProcessors;
+                    coverageComplete = false;
+                    result->Warnings.push_back(
+                        L"processor limit truncated DPC coverage");
                 }
-                result->ProcessorsSampled = processorCount;
                 result->Warnings.push_back(L"PRCB array via " + prcbSymbol);
-
-                // Candidate offsets of DpcData / DpcList heads inside KPRCB.
-                // Public PDBs often expose DpcData; otherwise probe known regions.
-                ResolvedFieldOffset dpcData =
-                    ResolveFieldOffset(symbols_, L"nt!_KPRCB", L"DpcData", 0x2d80);
 
                 for (uint32_t cpu = 0; cpu < processorCount; ++cpu)
                 {
@@ -327,91 +433,42 @@ bool DpcTimerScanner::Scan(const Options& options, DpcTimerScanResult* result, s
                     if (!ReadU64(device_, prcbArray + static_cast<uint64_t>(cpu) * sizeof(uint64_t), &prcbPtr) ||
                         !IsKernelAddress(prcbPtr))
                     {
+                        coverageComplete = false;
                         continue;
                     }
+                    ++result->ProcessorsSampled;
 
-                    // DpcData is typically an array of KDPC_DATA; each has a LIST_ENTRY.
-                    // Read a few candidate list heads around DpcData.
-                    const uint32_t candidateOffsets[] =
+                    for (uint32_t dataIndex = 0; dataIndex < dpcDataCount; ++dataIndex)
                     {
-                        dpcData.Offset,
-                        dpcData.Offset + 0x00,
-                        dpcData.Offset + 0x20,
-                        dpcData.Offset + 0x40,
-                    };
-
-                    for (uint32_t offset : candidateOffsets)
-                    {
-                        uint64_t listHead = prcbPtr + offset;
-                        uint64_t flink = 0;
-                        uint64_t blink = 0;
-                        if (!ReadU64(device_, listHead, &flink) || !ReadU64(device_, listHead + 8, &blink))
-                        {
-                            continue;
-                        }
-                        if (!IsKernelAddress(flink) || !IsKernelAddress(blink))
-                        {
-                            continue;
-                        }
-                        // Valid list head: empty (self) or flink->blink round trip.
-                        if (flink != listHead)
-                        {
-                            uint64_t flinkBlink = 0;
-                            if (!ReadU64(device_, flink + 8, &flinkBlink) || flinkBlink != listHead)
-                            {
-                                continue;
-                            }
-                        }
-
-                        WalkListForDpcRoutines(
+                        const uint64_t listHead =
+                            prcbPtr + dpcDataField.Offset +
+                            static_cast<uint64_t>(dataIndex) * dpcDataLayout.Size +
+                            dpcListHeadField.Offset;
+                        const bool queueComplete = WalkListForDpcRoutines(
                             device_,
                             symbols_,
                             listHead,
                             cpu,
-                            L"prcb.dpcdata",
+                            L"prcb.dpcdata[" + std::to_wstring(dataIndex) + L"]",
                             deferredRoutine.Offset,
-                            dpcListEntry.FromPdb ? dpcListEntry.Offset : 0x08,
+                            dpcListEntry.Offset,
                             dpcLimit,
                             result);
-
-                        if (result->Dpcs.size() >= dpcLimit)
+                        if (!queueComplete)
                         {
-                            break;
+                            coverageComplete = false;
                         }
                     }
 
                     if (result->Dpcs.size() >= dpcLimit)
                     {
                         result->Warnings.push_back(L"DPC walk hit limit; coverage incomplete");
+                        coverageComplete = false;
                         break;
                     }
                 }
 
-                result->DpcCoverageComplete = result->Dpcs.size() < dpcLimit;
-            }
-
-            // Also resolve any global DPC-related list symbols if present.
-            const std::wstring globalDpcHeads[] =
-            {
-                L"nt!KiDpcQueue",
-                L"nt!IopWaitCompletionPacketDpc"
-            };
-            for (const std::wstring& name : globalDpcHeads)
-            {
-                uint64_t head = 0;
-                if (symbols_.ResolveSymbol(name, &head, nullptr) && IsKernelAddress(head))
-                {
-                    WalkListForDpcRoutines(
-                        device_,
-                        symbols_,
-                        head,
-                        0,
-                        name,
-                        deferredRoutine.Offset,
-                        dpcListEntry.FromPdb ? dpcListEntry.Offset : 0x08,
-                        dpcLimit,
-                        result);
-                }
+                result->DpcCoverageComplete = coverageComplete;
             }
         }
 
@@ -419,113 +476,209 @@ bool DpcTimerScanner::Scan(const Options& options, DpcTimerScanResult* result, s
         if (options.Target == Scope::Timer || options.Target == Scope::All)
         {
             uint64_t timerTable = 0;
-            const std::wstring timerSymbols[] =
+            uint32_t timerTableSize = 0;
+            const std::wstring timerSymbol = L"nt!KiTimerTableListHead";
+            TypeLayoutInfo timerTableEntryLayout = {};
+            TypeFieldInfo timerTableListField = {};
+            bool timerTableListFieldFromPdb = symbols_.FindField(
+                L"nt!_KTIMER_TABLE_ENTRY",
+                L"Entry",
+                &timerTableListField,
+                &ignored);
+            if (!timerTableListFieldFromPdb)
             {
-                L"nt!KiTimerTableListHead",
-                L"nt!KiTimerTable",
-                L"nt!ExpKernelTimer"
-            };
-
-            bool foundTimerRoot = false;
-            for (const std::wstring& name : timerSymbols)
-            {
-                if (symbols_.ResolveSymbol(name, &timerTable, nullptr) && IsKernelAddress(timerTable))
-                {
-                    foundTimerRoot = true;
-                    result->Warnings.push_back(L"timer root via " + name);
-
-                    // Treat as an array of LIST_ENTRY heads. Bound to 256 or 512 buckets.
-                    const uint32_t bucketCount = 256;
-                    for (uint32_t bucket = 0; bucket < bucketCount; ++bucket)
-                    {
-                        uint64_t listHead = timerTable + static_cast<uint64_t>(bucket) * 0x10;
-                        uint64_t flink = 0;
-                        if (!ReadU64(device_, listHead, &flink) || flink == 0 || flink == listHead)
-                        {
-                            continue;
-                        }
-                        if (!IsKernelAddress(flink))
-                        {
-                            continue;
-                        }
-
-                        std::set<uint64_t> visited;
-                        uint64_t entry = flink;
-                        uint32_t walked = 0;
-                        while (entry != 0 && entry != listHead && walked < kMaxListWalk)
-                        {
-                            if (visited.find(entry) != visited.end())
-                            {
-                                break;
-                            }
-                            visited.insert(entry);
-
-                            uint64_t timerAddress = entry;
-                            if (timerListEntry.Offset != 0 && entry >= timerListEntry.Offset)
-                            {
-                                timerAddress = entry - timerListEntry.Offset;
-                            }
-
-                            uint64_t dpcPtr = 0;
-                            if (ReadU64(device_, timerAddress + timerDpc.Offset, &dpcPtr) &&
-                                dpcPtr != 0 &&
-                                IsKernelAddress(dpcPtr))
-                            {
-                                uint64_t routine = 0;
-                                if (ReadU64(device_, dpcPtr + deferredRoutine.Offset, &routine) && routine != 0)
-                                {
-                                    TimerRoutineRecord record = {};
-                                    record.Index = static_cast<uint32_t>(result->Timers.size());
-                                    record.TimerAddress = timerAddress;
-                                    record.DpcAddress = dpcPtr;
-                                    record.Routine = routine;
-                                    ClassifyRoutine(
-                                        symbols_,
-                                        routine,
-                                        &record.Module,
-                                        &record.Symbol,
-                                        &record.Suspicious,
-                                        &record.Notes);
-                                    if (record.Suspicious)
-                                    {
-                                        ++result->SuspiciousTimerCount;
-                                        result->AnySuspicious = true;
-                                    }
-                                    result->Timers.push_back(record);
-                                    if (result->Timers.size() >= timerLimit)
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            uint64_t next = 0;
-                            if (!ReadU64(device_, entry, &next))
-                            {
-                                break;
-                            }
-                            entry = next;
-                            ++walked;
-                        }
-
-                        if (result->Timers.size() >= timerLimit)
-                        {
-                            break;
-                        }
-                    }
-                    break;
-                }
+                timerTableListFieldFromPdb = symbols_.FindField(
+                    L"nt!_KTIMER_TABLE_ENTRY",
+                    L"ListHead",
+                    &timerTableListField,
+                    &ignored);
             }
+            const bool foundTimerRoot =
+                dpcObjectLayoutFromPdb &&
+                timerObjectLayoutFromPdb &&
+                timerTableListFieldFromPdb &&
+                symbols_.GetTypeLayout(
+                    L"nt!_KTIMER_TABLE_ENTRY",
+                    &timerTableEntryLayout,
+                    &ignored) &&
+                timerTableEntryLayout.Size >= sizeof(uint64_t) * 2 &&
+                timerTableEntryLayout.Size <= 0x100 &&
+                static_cast<uint64_t>(timerTableListField.Offset) +
+                        sizeof(uint64_t) * 2 <=
+                    timerTableEntryLayout.Size &&
+                symbols_.ResolveSymbol(timerSymbol, &timerTable, nullptr) &&
+                IsKernelAddress(timerTable) &&
+                ResolveExactSymbolSize(
+                    symbols_,
+                    timerSymbol,
+                    timerTable,
+                    &timerTableSize) &&
+                timerTableSize % timerTableEntryLayout.Size == 0;
+            const uint32_t bucketCount = foundTimerRoot
+                ? static_cast<uint32_t>(
+                      timerTableSize / timerTableEntryLayout.Size)
+                : 0;
 
-            if (!foundTimerRoot)
+            if (!foundTimerRoot ||
+                bucketCount == 0 ||
+                bucketCount > kMaxTimerBuckets)
             {
                 result->Warnings.push_back(
-                    L"timer table symbol not resolved; timer coverage incomplete");
+                    L"PDB-bounded KiTimerTableListHead unavailable; heuristic timer "
+                    L"table probing disabled");
                 result->TimerCoverageComplete = false;
             }
             else
             {
-                result->TimerCoverageComplete = result->Timers.size() < timerLimit;
+                bool coverageComplete = true;
+                result->Warnings.push_back(
+                    L"timer root via PDB-bounded " + timerSymbol);
+
+                for (uint32_t bucket = 0; bucket < bucketCount; ++bucket)
+                {
+                    const uint64_t listHead =
+                        timerTable +
+                        static_cast<uint64_t>(bucket) *
+                            timerTableEntryLayout.Size +
+                        timerTableListField.Offset;
+                    uint64_t flink = 0;
+                    uint64_t blink = 0;
+                    if (!ReadU64(device_, listHead, &flink) ||
+                        !ReadU64(
+                            device_,
+                            listHead + sizeof(uint64_t),
+                            &blink) ||
+                        flink == 0 ||
+                        blink == 0)
+                    {
+                        coverageComplete = false;
+                        continue;
+                    }
+                    if (flink == listHead)
+                    {
+                        if (blink != listHead)
+                        {
+                            coverageComplete = false;
+                        }
+                        continue;
+                    }
+
+                    std::set<uint64_t> visited;
+                    uint64_t entry = flink;
+                    uint64_t previous = listHead;
+                    uint32_t walked = 0;
+                    while (entry != 0 &&
+                           entry != listHead &&
+                           walked < kMaxListWalk)
+                    {
+                        if (!IsKernelAddress(entry) ||
+                            entry < timerListEntry.Offset ||
+                            !visited.insert(entry).second)
+                        {
+                            coverageComplete = false;
+                            break;
+                        }
+
+                        uint64_t next = 0;
+                        uint64_t previousLink = 0;
+                        if (!ReadU64(device_, entry, &next) ||
+                            !ReadU64(
+                                device_,
+                                entry + sizeof(uint64_t),
+                                &previousLink) ||
+                            previousLink != previous ||
+                            next == 0 ||
+                            (next != listHead && !IsKernelAddress(next)))
+                        {
+                            coverageComplete = false;
+                            break;
+                        }
+                        uint64_t nextBacklink = 0;
+                        if (!ReadU64(
+                                device_,
+                                next + sizeof(uint64_t),
+                                &nextBacklink) ||
+                            nextBacklink != entry)
+                        {
+                            coverageComplete = false;
+                            break;
+                        }
+
+                        const uint64_t timerAddress =
+                            entry - timerListEntry.Offset;
+                        uint64_t dpcPtr = 0;
+                        if (!ReadU64(
+                                device_,
+                                timerAddress + timerDpc.Offset,
+                                &dpcPtr))
+                        {
+                            coverageComplete = false;
+                            break;
+                        }
+                        if (dpcPtr != 0)
+                        {
+                            if (!IsKernelAddress(dpcPtr))
+                            {
+                                coverageComplete = false;
+                                break;
+                            }
+
+                            uint64_t routine = 0;
+                            if (!ReadU64(
+                                    device_,
+                                    dpcPtr + deferredRoutine.Offset,
+                                    &routine))
+                            {
+                                coverageComplete = false;
+                                break;
+                            }
+                            if (routine != 0)
+                            {
+                                TimerRoutineRecord record = {};
+                                record.Index =
+                                    static_cast<uint32_t>(result->Timers.size());
+                                record.TimerAddress = timerAddress;
+                                record.DpcAddress = dpcPtr;
+                                record.Routine = routine;
+                                ClassifyRoutine(
+                                    symbols_,
+                                    routine,
+                                    &record.Module,
+                                    &record.Symbol,
+                                    &record.Suspicious,
+                                    &record.Notes);
+                                if (record.Suspicious)
+                                {
+                                    ++result->SuspiciousTimerCount;
+                                    result->AnySuspicious = true;
+                                }
+                                result->Timers.push_back(record);
+                                if (result->Timers.size() >= timerLimit)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+
+                        previous = entry;
+                        entry = next;
+                        ++walked;
+                    }
+
+                    if (entry != listHead)
+                    {
+                        coverageComplete = false;
+                    }
+                    if (result->Timers.size() >= timerLimit)
+                    {
+                        coverageComplete = false;
+                        result->Warnings.push_back(
+                            L"timer walk hit limit; coverage incomplete");
+                        break;
+                    }
+                }
+
+                result->TimerCoverageComplete = coverageComplete;
             }
         }
 
