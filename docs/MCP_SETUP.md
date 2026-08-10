@@ -90,7 +90,9 @@ mcp status     # current state
 
 For `<addr>` you can give a concrete IP (e.g. `192.168.56.10`) or, for all interfaces, `0.0.0.0` / `*` / `+` (mapped to the http.sys strong wildcard `+`).
 
-**Token stability.** The bearer token is **stable across restarts** so a client registered once keeps working — you do not re-add it on every `mcp on`. Resolution order: `--token <t>` > the `KNLIVEDBG_TOKEN` environment variable > a persisted file (`<exeDir>\.kn-live-dbg\mcp-token-<port>`) > a freshly minted random token (which is then persisted for reuse). The startup banner notes which source was used. Use `--new-token` to rotate (then refresh the client). The persisted token sits in an operator-readable file on the (isolated lab) box — use `--new-token` or set a strict-ACL `KNLIVEDBG_TOKEN` if that is a concern.
+**Recommended reconnect model (no token paste):** register `tools\mcp-bridge.ps1` **once** in Claude/Cursor (`mcp client-setup`). Every later session only needs `mcp on`. The bridge reads `%LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json` (written by `mcp on`) and attaches with the current token automatically.
+
+**Token stability.** The bearer token is **stable across restarts** (and no longer per-port by default) so a client registered once keeps working. Resolution order: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token` (legacy per-port files under `<exeDir>\.kn-live-dbg\` are migrated once) > freshly minted random token (persisted). Use `--new-token` to rotate; the bridge picks up the new token without editing agent config.
 
 ### 3.2 Local (loopback) — same PC
 
@@ -102,15 +104,48 @@ Example output:
 
 ```text
 MCP server started (loopback Streamable HTTP).
-  url   : http://127.0.0.1:51766/mcp
-  token : 3f9c... (64 hex chars)
-  write : disabled (read-only)
-  audit : <exeDir>\.kn-live-dbg\mcp-audit-51766.jsonl
-  claude code: claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp --header "Authorization: Bearer 3f9c..."
-  the engine loop starts now; type 'off' + Enter here to stop.
+  url      : http://127.0.0.1:51766/mcp
+  token    : 3f9c... (REUSED — AI agent re-register NOT required)
+  tokenFile: %LOCALAPPDATA%\kn-live-dbg\mcp-token
+  endpoint : %LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json  (bridge reads this every connect)
+  write    : disabled (read-only)
+  audit    : <exeDir>\.kn-live-dbg\mcp-audit-51766.jsonl
+
+  Preferred (no token paste on reconnect):
+    mcp client-setup
+    then register tools\mcp-bridge.ps1 once in Claude/Cursor
 ```
 
 From this point the console is the **MCP engine loop**. To stop, type `off` + Enter.
+
+### 3.2.1 One-time agent registration (preferred)
+
+```text
+knkd> mcp client-setup
+knkd> mcp client-setup claude
+knkd> mcp client-setup cursor
+knkd> mcp client-setup codex
+knkd> mcp client-setup grok
+```
+
+Snippets are also written under `%LOCALAPPDATA%\kn-live-dbg\clients\`.
+
+| Agent | One-time command / config |
+|------|---------------------------|
+| **Claude Code** | `claude mcp add --transport stdio knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File <bridge>` |
+| **Cursor** | Merge `clients\cursor-mcp.json` into Cursor MCP settings |
+| **OpenAI Codex** | `codex mcp add knlivedbg -- powershell.exe ... -File <bridge>` **or** append `clients\codex-config.toml.snippet` to `%USERPROFILE%\.codex\config.toml` |
+| **Grok Build** | `grok mcp add knlivedbg -- powershell.exe ... -File <bridge>` **or** append `clients\grok-config.toml.snippet` to `%USERPROFILE%\.grok\config.toml` |
+
+After that, each analysis session is only:
+
+```text
+knkd> mcp on
+```
+
+No token re-entry into the AI agent. Token rotation (`mcp on --new-token`) is picked up by the bridge automatically.
+
+**Grok optional native HTTP** (no `npx`): enable `clients\grok-http.toml.snippet` and load `mcp-load-env.ps1` so `${KNLIVEDBG_TOKEN}` expands. Prefer the bridge for frequent reconnects.
 
 ### 3.3 Remote (`--bind`) — separate PC/VM
 

@@ -447,7 +447,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"backend", L"backend", L"session", L"show or set native/dbgeng/auto backend mode", CommandSupport::Native),
         Make(L"byovd", L"byovd", L"kernel", L"scan loaded kernel modules against local Microsoft and LOLDrivers BYOVD hash/YARA intelligence", CommandSupport::Native),
         Make(L"drvstatus", L"drvstatus", L"session", L"show service, owner, handle, and write-gate state", CommandSupport::Native),
-        Make(L"mcp", L"mcp", L"session", L"start/stop the MCP server (mcp on [port] [--allow-write] [--bind <addr>] [--token <t>] [--new-token])", CommandSupport::Native),
+        Make(L"mcp", L"mcp", L"session", L"MCP server: on/off/status/client-setup/endpoint (stable token + bridge; no per-session token paste)", CommandSupport::Native),
         Make(L"kd", L"kd", L"session", L"execute a raw command through DbgEng", CommandSupport::Native),
         Make(L"kdinit", L"kdinit", L"session", L"initialize local-kernel DbgEng backend", CommandSupport::Native),
         Make(L"kddetach", L"kddetach", L"session", L"end DbgEng session", CommandSupport::Native),

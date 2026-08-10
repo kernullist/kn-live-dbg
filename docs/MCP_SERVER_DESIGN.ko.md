@@ -206,7 +206,7 @@ elevated 커널 RW 도구를 잠재적으로 적대적/인젝션된 LLM에 노�
 
 ### 5.2 인증과 토큰 취급
 
-1. `mcp on`마다 **256-bit 랜덤 bearer 토큰**을 새로 발급, **상수 시간 비교**, 불일치 시 401+연결 종료.
+1. Bearer 토큰은 기본 **재기동 안정** (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, 상수 시간 비교, 불일치 시 401). 신규 256-bit 발급은 파일 없음 또는 `--new-token`일 때만. `mcp on`은 Claude/Cursor/Codex/Grok Build용 **stdio 브리지**가 읽는 `mcp-endpoint.json`을 기록한다.
 2. 서버 측: 토큰을 콘솔에 1회만 출력(평문 로깅 금지, audit에는 fingerprint만), 짧은 idle TTL 후 자동 만료.
 3. **클라이언트 측 저장이 진짜 누출 지점**: Claude Code는 HTTP 헤더(Authorization 포함)를 설정 파일에 영속화한다. 커널 RW 엔드포인트를 인증하는 토큰을 **committable한 project-scope `.mcp.json`에 붙여넣지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수 인다이렉션 또는 `headersHelper`(접속 시 회전 토큰 발급)를 강제한다. 절대 git 커밋 금지.
 4. 옵션: `GetExtendedTcpTable`로 loopback peer PID에 토큰을 바인딩(방어 심화, 단 재접속/PID 재사용에 취약).

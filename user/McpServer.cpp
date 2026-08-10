@@ -3,7 +3,10 @@
 #include "McpServer.h"
 #include "McpJson.h"
 
+#include <Windows.h>
 #include <http.h>
+#include <sddl.h>
+
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +15,7 @@
 #include <vector>
 
 #pragma comment(lib, "httpapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // ---------------------------------------------------------------------------
 // Static tool / resource / prompt catalog and transport helpers.
@@ -296,6 +300,24 @@ namespace
         return token;
     }
 
+    // Best-effort: restrict a sensitive file to the current user (no inherited
+    // Everyone/Users ACE). Failure is non-fatal -- lab boxes still work.
+    void RestrictFileToCurrentUser(const std::wstring& path)
+    {
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        // D:P = protected DACL (no inherit). A;;FA;;;OW = owner full access only.
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;;FA;;;OW)",
+                SDDL_REVISION_1,
+                &sd,
+                nullptr) &&
+            sd != nullptr)
+        {
+            SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, sd);
+            LocalFree(sd);
+        }
+    }
+
     bool WriteTokenFile(const std::wstring& path, const std::wstring& token)
     {
         if (path.empty())
@@ -322,7 +344,12 @@ namespace
         DWORD written = 0;
         bool ok = WriteFile(file, ascii.data(), static_cast<DWORD>(ascii.size()), &written, nullptr) != 0;
         CloseHandle(file);
-        return ok && written == ascii.size();
+        if (ok && written == ascii.size())
+        {
+            RestrictFileToCurrentUser(path);
+            return true;
+        }
+        return false;
     }
 
     bool ConstantTimeEqual(const std::string& a, const std::string& b)
