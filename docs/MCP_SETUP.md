@@ -90,9 +90,9 @@ mcp status     # current state
 
 For `<addr>` you can give a concrete IP (e.g. `192.168.56.10`) or, for all interfaces, `0.0.0.0` / `*` / `+` (mapped to the http.sys strong wildcard `+`).
 
-**Recommended reconnect model (no token paste):** run `mcp client-setup` and use the generated native Streamable HTTP configuration for Claude Code, Cursor, Codex, or Grok Build. Before launching the client on the same PC, dot-source `%LOCALAPPDATA%\kn-live-dbg\mcp-load-env.ps1`; the configuration reads `KNLIVEDBG_TOKEN` without storing the bearer token in a project file. Claude Desktop local MCP is the exception and uses `tools\mcp-bridge.ps1` because its remote connectors originate in Anthropic's cloud and cannot reach loopback/private endpoints.
+**Recommended reconnect model (no token paste):** `mcp on` refreshes native Streamable HTTP snippets for the actual bind address and port. Use them with Claude Code, Cursor, Codex, or Grok Build. Before launching a client on the same PC, dot-source `%LOCALAPPDATA%\kn-live-dbg\mcp-load-env.ps1`; the configuration reads `KNLIVEDBG_TOKEN` without storing the bearer token in a project file. Claude Desktop local MCP is the exception and uses `tools\mcp-bridge.ps1` because its remote connectors originate in Anthropic's cloud and cannot reach loopback/private endpoints.
 
-**Token stability.** The bearer token is **stable across restarts** (and no longer per-port by default), so a native client config remains valid while the URL is unchanged. Resolution order: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token` (legacy per-port files under `<exeDir>\.kn-live-dbg\` are migrated once) > freshly minted random token (persisted). If the port or bind address changes, rerun `mcp client-setup` and update the client's URL. After `--new-token`, native clients must reload `KNLIVEDBG_TOKEN` and reconnect; the Claude Desktop/legacy bridge reads both URL and token automatically.
+**Token stability.** The bearer token is **stable across restarts** (and no longer per-port by default), so a native client config remains valid while the URL is unchanged. Resolution order: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token` (legacy per-port files under `<exeDir>\.kn-live-dbg\` are migrated once) > freshly minted random token (persisted). If the port or bind address changes, apply the refreshed client URL. After `--new-token`, native clients must reload `KNLIVEDBG_TOKEN` and reconnect. Claude Desktop/legacy bridges must also be restarted so the new bridge process rereads the endpoint file.
 
 ### 3.2 Local (loopback) — same PC
 
@@ -111,14 +111,16 @@ MCP server started (loopback Streamable HTTP).
   write    : disabled (read-only)
   audit    : <exeDir>\.kn-live-dbg\mcp-audit-51766.jsonl
 
-  Preferred (native HTTP; no npx):
-    mcp client-setup
-    client launch shell: . $env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1
+  Native HTTP client files refreshed (no npx):
+    snippets: %LOCALAPPDATA%\kn-live-dbg\clients
+    separate client launch shell: . "$env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1"
 ```
 
 From this point the console is the **MCP engine loop**. To stop, type `off` + Enter.
 
-### 3.2.1 One-time client registration (native HTTP preferred)
+### 3.2.1 Client registration (native HTTP preferred)
+
+`mcp on` automatically rewrites the snippets with the live URL. While the MCP engine loop is running, the KnLiveDbg console accepts only `off` and `status`; use the generated files from a **separate PowerShell**. When the normal REPL is active (before `mcp on` or after `off`), `mcp client-setup` prints the last saved setup:
 
 ```text
 knkd> mcp client-setup
@@ -137,24 +139,18 @@ Snippets are also written under `%LOCALAPPDATA%\kn-live-dbg\clients\`.
 | **Claude Code** | Run `clients\claude-code-http.powershell.txt` in PowerShell or use `clients\claude-code-http.json` |
 | **Claude Desktop (local)** | Merge `clients\claude-desktop-mcp.json`; this is the stdio bridge exception |
 | **Cursor** | Merge the native HTTP `clients\cursor-mcp.json` into user MCP settings |
-| **OpenAI Codex** | Append the native HTTP `clients\codex-config.toml.snippet` to `%USERPROFILE%\.codex\config.toml` |
-| **Grok Build** | Append the native HTTP `clients\grok-config.toml.snippet` to `%USERPROFILE%\.grok\config.toml` |
+| **OpenAI Codex** | Run `clients\codex-http.powershell.txt`, or append `clients\codex-config.toml.snippet` |
+| **Grok Build** | Run `clients\grok-http.powershell.txt`, or append `clients\grok-config.toml.snippet` |
 | **Older stdio-only client** | Merge `clients\legacy-stdio-mcp.json` as a compatibility fallback |
 
-After that, start the server in KnLiveDbg:
-
-```text
-knkd> mcp on
-```
-
-Then, in the PowerShell session that will launch the native client:
+In the separate PowerShell session that will launch the native client:
 
 ```powershell
 . $env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1
 # Start or restart the client from this shell.
 ```
 
-The stable token means normal restarts at the same URL do not require config edits. A port or bind-address change requires regenerating and applying the native URL snippet. After explicit rotation (`mcp on --new-token`), rerun the env loader and restart/reconnect a native client. Claude Desktop and legacy bridges pick up URL and token changes from the protected endpoint file on their next connection.
+The stable token means normal restarts at the same URL do not require config edits. A port or bind-address change requires applying the refreshed native URL snippet. After explicit rotation (`mcp on --new-token`), rerun the env loader and restart/reconnect a native client. Restart Claude Desktop or any legacy client too: the bridge reads URL and token once when its process starts, not on each HTTP reconnect.
 
 ### 3.3 Remote (`--bind`) — separate PC/VM
 
@@ -237,7 +233,7 @@ If you write `.mcp.json` directly (token via **env indirection**, never commit i
 
 > `${KNLIVEDBG_TOKEN}` is read by Claude Code from its launch environment. On the same PC, dot-source `mcp-load-env.ps1` before starting Claude Code. After explicit token rotation, reload the environment and reconnect. The bridge is not needed for current Claude Code builds.
 
-Useful knobs: per-server `timeout` (ms, raise it for slow scans — it is not extended by progress notifications), `headersHelper` (issue a rotating token on connect), `alwaysLoad`.
+Useful knobs: per-server `timeout` (ms; keep it above the server's 30-second engine limit), `headersHelper` (issue a rotating token on connect), `alwaysLoad`.
 
 ### 4.2 Claude Desktop
 
@@ -255,7 +251,7 @@ Claude Desktop's remote connectors support Streamable HTTP, but their traffic or
 }
 ```
 
-`mcp client-setup claude-desktop` writes the exact path to `%LOCALAPPDATA%\kn-live-dbg\clients\claude-desktop-mcp.json`. Merge it into `%APPDATA%\Claude\claude_desktop_config.json`, then fully restart Desktop. The bridge reads the protected live endpoint on every connection, so it handles token rotation without placing the token in Desktop config.
+`mcp client-setup claude-desktop` writes the exact path to `%LOCALAPPDATA%\kn-live-dbg\clients\claude-desktop-mcp.json`. Merge it into `%APPDATA%\Claude\claude_desktop_config.json`, then fully restart Desktop. Each bridge process reads the protected endpoint once at startup, so the token stays out of Desktop config. Restart Desktop after a URL or token change so it launches a bridge with the new state.
 
 Do not publish the elevated kernel endpoint to the internet merely to make it reachable by a Claude remote connector. Keep this path loopback-only.
 
@@ -265,13 +261,19 @@ Source: [Anthropic custom connector network requirements](https://support.claude
 
 Codex reads MCP config from `~/.codex/config.toml` (or a trusted project `.codex/config.toml`) and supports streamable-HTTP MCP servers directly.
 
-**HTTP (recommended).** Token via env indirection (sent as `Authorization: Bearer <env value>`):
+**HTTP (recommended).** The current CLI registers the URL and bearer-token environment variable directly:
+
+```powershell
+codex mcp add knlivedbg --url 'http://192.168.56.10:51766/mcp' --bearer-token-env-var KNLIVEDBG_TOKEN
+```
+
+Equivalent `config.toml` (the token is sent as `Authorization: Bearer <env value>`):
 
 ```toml
 [mcp_servers.knlivedbg]
 url = "http://192.168.56.10:51766/mcp"
 bearer_token_env_var = "KNLIVEDBG_TOKEN"
-tool_timeout_sec = 600   # raise above the 60s default for slow scans (hunt.run, etc.)
+tool_timeout_sec = 60    # server returns engine timeout after 30s
 ```
 
 Then `export KNLIVEDBG_TOKEN=<token>` (PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`) in the shell that launches Codex. A static header works too:
@@ -294,8 +296,8 @@ env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
 ```
 
 Notes:
-- `codex mcp add <name> --env VAR=VALUE -- <command>` registers a **stdio** server from the CLI; HTTP/`url` servers are configured by editing `config.toml` directly.
-- Timeouts: `startup_timeout_sec` (default 10s), `tool_timeout_sec` (default 60s). The server caps a single request at 30s internally, but a whole-system `hunt.run` can still exceed the Codex tool timeout — raise `tool_timeout_sec`.
+- Use `codex mcp add <name> --url <url> --bearer-token-env-var <env>` for Streamable HTTP. The `--env VAR=VALUE -- <command>` form is only for **stdio** servers.
+- Timeouts: `startup_timeout_sec` defaults to 10s and `tool_timeout_sec` to 60s. KnLiveDbg returns `engine timeout` after 30s, so raising only the client timeout cannot make a longer scan finish; narrow or split the scan.
 - Codex is a non-browser client (sends no `Origin`) and connects on the bound host, so the bearer token is the only barrier — same as Claude (§5).
 
 > All clients below are non-browser MCP clients, so the bearer token is the only barrier (§5). Watch the **field-name traps**: Gemini uses `httpUrl`, Cline uses `type: "streamableHttp"`, Goose uses `uri` + `streamable_http`, Windsurf uses `serverUrl`. The endpoint is plain `http://` — the token crosses the wire unencrypted, so keep it on a trusted LAN/loopback or front it with TLS / an SSH tunnel.
@@ -606,7 +608,7 @@ claude mcp list                      # confirm connected
 | Connection 403 | (local) Connected with a non-loopback Host -> if remote, `--bind` is needed / (both) Browser context where Origin is non-loopback |
 | Cannot connect from remote (timeout) | Firewall inbound blocked. Allow the port/client IP with `New-NetFirewallRule`. Confirm the server came up with `--bind <IP>` |
 | `writes are disabled` | Read-only mode. **If already running, `mcp on --allow-write` is ignored** (prints `MCP server is already running`) -> first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch with `mcp on <port> --allow-write [--bind <addr>]`. The saved token remains valid unless explicitly rotated or overridden |
-| `engine busy; retry shortly` or `engine timeout` | tools/call arrives not as a JSON-RPC error code but as an `isError:true` CallToolResult. On wait-queue (8) saturation, `engine busy` (audit `engine-busy`); on exceeding the 30s request timeout (long scans), `engine timeout` (audit `tool-error`). Raise the client per-server `timeout`, or shorten the scan with `limit`/`count`. (`-32603` occurs only on the congested `resources/read` path) |
+| `engine busy; retry shortly` or `engine timeout` | tools/call arrives not as a JSON-RPC error code but as an `isError:true` CallToolResult. On wait-queue (8) saturation, `engine busy` (audit `engine-busy`); on exceeding the 30s engine wait, `engine timeout` (audit `tool-error`). Retry after the queue drains, or shorten/split the scan with `limit`/`count`; a larger client timeout does not extend this server limit. (`-32603` occurs only on the congested `resources/read` path) |
 | Driver load failure | Test signing not enabled -> reboot after `bcdedit /set testsigning on` / running non-elevated |
 | `symType=0 (SymNone)` | The symbol DLL bundle was not placed next to the EXE (see 2.1) |
 
@@ -795,5 +797,5 @@ Export the current Threat-Intelligence ring to C:\lab\ti.jsonl, then clear the i
 - **Give concrete values**: specifying PID/module name/address makes the arguments precise. If you don't know them, resolve first with `process.find`/`symbol.search`.
 - **Ask for cross-correlation**: "combine the VADs, threads, and TI and pull only the evidence pointing at the same region" — you get analysis, not a single listing.
 - **Go read->confirm->code**: narrow down with `address.inspect` (identity) -> `memory.read_virtual` (bytes) -> `code.disasm` (instructions).
-- **Slow scans**: `hunt.run`/full scans can exceed the 30s request timeout — raise the client `timeout` or narrow the scope with `limit`/`count`.
+- **Slow scans**: `hunt.run`/full scans can exceed the 30s engine wait — narrow or split the scope with `limit`/`count`; raising only the client timeout does not extend it.
 - **Audit trail**: check what the model called via `kn://audit/tail` or `mcp-audit-<port>.jsonl`.

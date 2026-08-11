@@ -439,7 +439,7 @@ Useful knobs: per-server `timeout` (ms, raise it for slow scans -- not extended 
 
 ### 8.3 Claude Desktop
 
-Claude Desktop's remote connectors support Streamable HTTP, but Claude connects to them from Anthropic's cloud. They cannot reach `127.0.0.1` or a private lab address, and Claude Desktop does not connect to a remote HTTP server declared directly in `claude_desktop_config.json`. For this local KnLiveDbg endpoint, merge the stdio config printed by `mcp client-setup claude-desktop`; it launches `tools/mcp-bridge.ps1`, which reads the protected live endpoint file and forwards stdio to HTTP. Fully restart Desktop after editing.
+Claude Desktop's remote connectors support Streamable HTTP, but Claude connects to them from Anthropic's cloud. They cannot reach `127.0.0.1` or a private lab address, and Claude Desktop does not connect to a remote HTTP server declared directly in `claude_desktop_config.json`. For this local KnLiveDbg endpoint, merge the stdio config printed by `mcp client-setup claude-desktop`; it launches `tools/mcp-bridge.ps1`, which reads the protected endpoint once at process startup and forwards stdio to HTTP. Fully restart Desktop after editing or after changing the endpoint URL/token.
 
 Do not expose the kernel endpoint publicly merely to use a Claude remote connector. Keep it on loopback and use the local bridge. This is the only current first-class client path where the bridge is preferred.
 
@@ -468,7 +468,7 @@ The 6 open items of the §3 initial design are finalized as below.
 3. **Write exposure -> full open in Lab write mode (Q1, updated 2026-06-24)**. Since it is an isolated lab/VM (Q2), open the full typed write tool set (§6.1.1) via `mcp on --allow-write` for analysis fidelity. But "open != safety rails removed" -- keep frictionless automatic preflight/backup/verify-diff/audit (§5.3.2) and continue to forbid raw kd / arbitrary commands / hidden writes. The non-lab default is read-only + kernel flag disarmed (§5.3.1). VM snapshot recommended before writing (§5.3.3). *(Replaces the earlier "PPL exception only" decision.)*
 4. **Client token -> static (newly issued per `mcp on`) + `${KNLIVEDBG_TOKEN}` env indirection**, with `headersHelper` rotation optional. No project-scope commit. (Works on both Claude Code/Desktop + minimal setup; new per session + idle TTL gives a rotation effect.)
 5. **Execution environment -> centered on an isolated analysis VM (Q2)**. Since inbound loopback listener exposure is moot, http.sys loopback alone is sufficient with no additional transport layer such as a named pipe. (If a need arises to use it on a live EDR/AC box, review the named-pipe option from the backlog.)
-6. **Timeouts/caps -> adopt starting defaults, tune by measurement on a live VM**. Request timeout 30s (raise the client per-server `timeout` for slow scans), MCP waiting queue 8, per-result 64KB/200 records, raw read 1MB (driver cap), forced `limit` on hunt/pool-scan. All exposed in config.
+6. **Timeouts/caps -> adopt starting defaults, tune by measurement on a live VM**. Engine wait 30s (split or bound scans that exceed it; client timeout alone cannot extend it), MCP waiting queue 8, per-result 64KB/200 records, raw read 1MB (driver cap), forced `limit` on hunt/pool-scan. All exposed in config.
 
 Remaining backlog (decide at operation/implementation time): whether to limit the port ACL to the elevated account via http.sys SDDL; the driver hardening (§5.3.1) that adds a gate independent of `WriteEnabled` to `SetProcessProtection` to remove the momentary write window.
 

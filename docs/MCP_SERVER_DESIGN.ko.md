@@ -438,7 +438,7 @@ claude mcp add --transport stdio knlivedbg-bridge -- \
 
 ### 8.3 Claude Desktop
 
-Claude Desktop의 원격 connector는 Streamable HTTP를 지원하지만 Anthropic 클라우드에서 연결한다. 따라서 `127.0.0.1`이나 사설 lab 주소에는 도달하지 못하며, `claude_desktop_config.json`에 원격 HTTP 서버를 직접 선언해 연결하지도 않는다. 이 로컬 KnLiveDbg 엔드포인트에는 `mcp client-setup claude-desktop`이 출력하는 stdio 설정을 병합한다. 이 설정은 보호된 endpoint 파일을 읽어 HTTP로 전달하는 `tools/mcp-bridge.ps1`을 실행한다. 편집 후 Desktop을 완전히 재시작한다.
+Claude Desktop의 원격 connector는 Streamable HTTP를 지원하지만 Anthropic 클라우드에서 연결한다. 따라서 `127.0.0.1`이나 사설 lab 주소에는 도달하지 못하며, `claude_desktop_config.json`에 원격 HTTP 서버를 직접 선언해 연결하지도 않는다. 이 로컬 KnLiveDbg 엔드포인트에는 `mcp client-setup claude-desktop`이 출력하는 stdio 설정을 병합한다. 이 설정은 프로세스 시작 시 보호된 endpoint 파일을 한 번 읽고 HTTP로 전달하는 `tools/mcp-bridge.ps1`을 실행한다. 편집하거나 endpoint URL/토큰을 바꾼 뒤에는 Desktop을 완전히 재시작한다.
 
 Claude 원격 connector를 쓰려고 커널 엔드포인트를 인터넷에 공개하지 않는다. loopback을 유지하고 로컬 브리지를 쓴다. 현재 일급 지원 클라이언트 중 브리지가 권장되는 경로는 이것뿐이다.
 
@@ -467,7 +467,7 @@ Claude 원격 connector를 쓰려고 커널 엔드포인트를 인터넷에 공�
 3. **write 노출 → Lab write 모드 전면 개방 (Q1, 2026-06-24 갱신)**. 격리 lab/VM(Q2)이므로 분석 충실도를 위해 `mcp on --allow-write`로 전체 타입 write 툴(§6.1.1)을 연다. 단 "개방 ≠ 안전 레일 제거" — 마찰 없는 자동 preflight/backup/verify-diff/audit를 유지(§5.3.2)하고 raw kd/임의 명령/숨은 write는 계속 금지. 비-lab 기본은 읽기 전용 + 커널 플래그 비무장(§5.3.1). write 전 VM 스냅샷 권장(§5.3.3). *(이전 "PPL 예외만" 결정을 대체.)*
 4. **클라이언트 토큰 → 정적(per-`mcp on` 신규 발급) + `${KNLIVEDBG_TOKEN}` env 인다이렉션**, `headersHelper` 회전은 옵션. project-scope 커밋 금지. (Claude Code/Desktop 양쪽 동작 + 최소 셋업; 세션마다 신규 + idle TTL로 회전 효과.)
 5. **실행 환경 → 격리 분석 VM 중심 (Q2)**. 인바운드 loopback 리스너 노출이 무관하므로 http.sys loopback 단독, named pipe 등 추가 전송 계층 불필요. (라이브 EDR/AC 박스에서 쓸 일이 생기면 named pipe 옵션을 백로그에서 검토.)
-6. **타임아웃/캡 → 시작 기본값 채택, 라이브 VM 실측 튜닝**. 요청 타임아웃 30s(느린 스캔은 클라 per-server `timeout` 상향), MCP 대기 큐 8, per-result 64KB/200 레코드, raw read 1MB(드라이버 캡), hunt/pool-scan 강제 `limit`. 전부 config 노출.
+6. **타임아웃/캡 → 시작 기본값 채택, 라이브 VM 실측 튜닝**. 엔진 대기 30s(넘는 스캔은 범위를 나누거나 제한하며 클라이언트 timeout만으로 연장 불가), MCP 대기 큐 8, per-result 64KB/200 레코드, raw read 1MB(드라이버 캡), hunt/pool-scan 강제 `limit`. 전부 config 노출.
 
 남은 백로그(운영/구현 시 결정): http.sys SDDL로 포트 ACL을 elevated 계정에 한정할지; `SetProcessProtection`에 `WriteEnabled`와 독립된 게이트를 추가하는 드라이버 하드닝(§5.3.1)으로 momentary write window 제거.
 

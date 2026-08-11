@@ -2,8 +2,9 @@
 #
 # Register this script for Claude Desktop local MCP, or use it as a fallback
 # only when an older MCP client cannot connect with Streamable HTTP directly.
-# On every connect it reads the live endpoint file written by `mcp on` and
-# attaches with the current bearer token -- no per-session token paste.
+# On every bridge process start it reads the endpoint file written by `mcp on`
+# and attaches with the current bearer token -- no token paste in client config.
+# Restart the bridge/client after changing the endpoint URL or bearer token.
 #
 # Prerequisite: KnLiveDbg is running with `mcp on`.
 #
