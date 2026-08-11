@@ -4688,9 +4688,12 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     L"all",
                     L"claude",
+                    L"claude-code",
+                    L"claude-desktop",
                     L"cursor",
                     L"codex",
                     L"grok",
+                    L"legacy",
                     L"help"
                 };
                 AddCompletionCandidates(&candidates, values);
@@ -24444,6 +24447,12 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
     return handled;
 }
 
+static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge);
+static std::wstring BuildMcpClaudeCodeHttpServerJson(const std::wstring& url);
+static std::wstring BuildMcpCursorHttpJson(const std::wstring& url);
+static std::wstring BuildMcpCodexHttpToml(const std::wstring& url);
+static std::wstring BuildMcpGrokHttpToml(const std::wstring& url);
+
 struct ConsoleSurfaceSelfTestContext
 {
     uint32_t Passed = 0;
@@ -24628,6 +24637,60 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             SnapshotJsonStrictParsingSelfTest(),
             L"snapshot-json-strict-numeric-and-boolean-fields");
+
+        CheckCompletionCandidate(
+            &context,
+            {L"mcp", L"client-setup"},
+            L"claude-desktop",
+            L"mcp-client-setup-claude-desktop-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"mcp", L"client-setup"},
+            L"legacy",
+            L"mcp-client-setup-legacy-completion");
+
+        const std::wstring mcpSelfTestUrl = L"http://127.0.0.1:51766/mcp";
+        const std::wstring claudeHttp = BuildMcpClaudeCodeHttpServerJson(mcpSelfTestUrl);
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            claudeHttp.find(L"\"type\":\"http\"") != std::wstring::npos &&
+                claudeHttp.find(mcpSelfTestUrl) != std::wstring::npos &&
+                claudeHttp.find(L"${KNLIVEDBG_TOKEN}") != std::wstring::npos &&
+                claudeHttp.find(L"powershell.exe") == std::wstring::npos,
+            L"mcp-claude-code-native-http-config");
+
+        const std::wstring cursorHttp = BuildMcpCursorHttpJson(mcpSelfTestUrl);
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            cursorHttp.find(mcpSelfTestUrl) != std::wstring::npos &&
+                cursorHttp.find(L"${env:KNLIVEDBG_TOKEN}") != std::wstring::npos &&
+                cursorHttp.find(L"powershell.exe") == std::wstring::npos,
+            L"mcp-cursor-native-http-config");
+
+        const std::wstring codexHttp = BuildMcpCodexHttpToml(mcpSelfTestUrl);
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            codexHttp.find(mcpSelfTestUrl) != std::wstring::npos &&
+                codexHttp.find(L"bearer_token_env_var = \"KNLIVEDBG_TOKEN\"") != std::wstring::npos &&
+                codexHttp.find(L"command =") == std::wstring::npos,
+            L"mcp-codex-native-http-config");
+
+        const std::wstring grokHttp = BuildMcpGrokHttpToml(mcpSelfTestUrl);
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            grokHttp.find(mcpSelfTestUrl) != std::wstring::npos &&
+                grokHttp.find(L"Bearer ${KNLIVEDBG_TOKEN}") != std::wstring::npos &&
+                grokHttp.find(L"command =") == std::wstring::npos,
+            L"mcp-grok-native-http-config");
+
+        const std::wstring desktopBridge =
+            BuildMcpBridgeStdioJson(L"C:\\tools\\mcp-bridge.ps1");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            desktopBridge.find(L"powershell.exe") != std::wstring::npos &&
+                desktopBridge.find(L"mcp-bridge.ps1") != std::wstring::npos &&
+                desktopBridge.find(L"\"url\"") == std::wstring::npos,
+            L"mcp-claude-desktop-stdio-bridge-config");
 
         // Phase 2 quiet-surface root commands appear in registered completion.
         CheckCompletionCandidate(&context, {}, L"!hal", L"phase2-root-hal-completion");
@@ -42613,49 +42676,73 @@ static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge)
     return json;
 }
 
-static std::wstring BuildMcpBridgeCodexToml(const std::wstring& bridge)
+static std::wstring BuildMcpClaudeCodeHttpServerJson(const std::wstring& url)
 {
-    // Codex CLI: ~/.codex/config.toml  [mcp_servers.<name>]
+    std::wstring json;
+    json += L"{\"type\":\"http\",\"url\":" + mcpjson::Quote(url);
+    json += L",\"headers\":{\"Authorization\":\"Bearer ${KNLIVEDBG_TOKEN}\"}}";
+    return json;
+}
+
+static std::wstring BuildMcpClaudeCodeHttpJson(const std::wstring& url)
+{
+    std::wstring json;
+    json += L"{\n";
+    json += L"  \"mcpServers\": {\n";
+    json += L"    \"knlivedbg\": {\n";
+    json += L"      \"type\": \"http\",\n";
+    json += L"      \"url\": " + mcpjson::Quote(url) + L",\n";
+    json += L"      \"headers\": {\n";
+    json += L"        \"Authorization\": \"Bearer ${KNLIVEDBG_TOKEN}\"\n";
+    json += L"      }\n";
+    json += L"    }\n";
+    json += L"  }\n";
+    json += L"}\n";
+    return json;
+}
+
+static std::wstring BuildMcpCursorHttpJson(const std::wstring& url)
+{
+    std::wstring json;
+    json += L"{\n";
+    json += L"  \"mcpServers\": {\n";
+    json += L"    \"knlivedbg\": {\n";
+    json += L"      \"url\": " + mcpjson::Quote(url) + L",\n";
+    json += L"      \"headers\": {\n";
+    json += L"        \"Authorization\": \"Bearer ${env:KNLIVEDBG_TOKEN}\"\n";
+    json += L"      }\n";
+    json += L"    }\n";
+    json += L"  }\n";
+    json += L"}\n";
+    return json;
+}
+
+static std::wstring BuildMcpCodexHttpToml(const std::wstring& url)
+{
+    // Codex CLI and IDE: ~/.codex/config.toml  [mcp_servers.<name>]
     std::wstring toml;
-    toml += L"# KnLiveDbg MCP (stdio bridge) -- paste into %USERPROFILE%\\.codex\\config.toml\n";
-    toml += L"# Register once. Reconnect after each 'mcp on' without editing this file.\n";
+    toml += L"# KnLiveDbg MCP (native Streamable HTTP) -- paste into %USERPROFILE%\\.codex\\config.toml\n";
+    toml += L"# Start Codex with KNLIVEDBG_TOKEN set in its environment.\n";
     toml += L"[mcp_servers.knlivedbg]\n";
-    toml += L"command = \"powershell.exe\"\n";
-    toml += L"args = [\"-NoProfile\", \"-ExecutionPolicy\", \"Bypass\", \"-File\", ";
-    toml += TomlQuotedPath(bridge);
-    toml += L"]\n";
+    toml += L"url = " + TomlQuotedPath(url) + L"\n";
+    toml += L"bearer_token_env_var = \"KNLIVEDBG_TOKEN\"\n";
     toml += L"startup_timeout_sec = 120\n";
+    toml += L"tool_timeout_sec = 600\n";
     return toml;
 }
 
-static std::wstring BuildMcpBridgeGrokToml(const std::wstring& bridge)
+static std::wstring BuildMcpGrokHttpToml(const std::wstring& url)
 {
     // Grok Build: ~/.grok/config.toml  [mcp_servers.<name>]
     std::wstring toml;
-    toml += L"# KnLiveDbg MCP (stdio bridge) -- paste into %USERPROFILE%\\.grok\\config.toml\n";
-    toml += L"# Prefer bridge over embedding a bearer token so --new-token needs no config edit.\n";
+    toml += L"# KnLiveDbg MCP (native Streamable HTTP) -- paste into %USERPROFILE%\\.grok\\config.toml\n";
+    toml += L"# Start Grok Build with KNLIVEDBG_TOKEN set in its environment.\n";
     toml += L"[mcp_servers.knlivedbg]\n";
-    toml += L"command = \"powershell.exe\"\n";
-    toml += L"args = [\"-NoProfile\", \"-ExecutionPolicy\", \"Bypass\", \"-File\", ";
-    toml += TomlQuotedPath(bridge);
-    toml += L"]\n";
+    toml += L"url = " + TomlQuotedPath(url) + L"\n";
+    toml += L"headers = { Authorization = \"Bearer ${KNLIVEDBG_TOKEN}\" }\n";
     toml += L"enabled = true\n";
     toml += L"startup_timeout_sec = 120\n";
     toml += L"tool_timeout_sec = 6000\n";
-    return toml;
-}
-
-static std::wstring BuildMcpGrokHttpTomlHint()
-{
-    // Optional native HTTP (token via env). Less ideal for token rotation.
-    std::wstring toml;
-    toml += L"# OPTIONAL Grok native HTTP (no npx). Requires KNLIVEDBG_TOKEN in the environment.\n";
-    toml += L"# After 'mcp on', run:  powershell -File %LOCALAPPDATA%\\kn-live-dbg\\mcp-load-env.ps1\n";
-    toml += L"# or set the env var from the endpoint file before starting Grok.\n";
-    toml += L"[mcp_servers.knlivedbg_http]\n";
-    toml += L"url = \"http://127.0.0.1:51766/mcp\"\n";
-    toml += L"headers = { Authorization = \"Bearer ${KNLIVEDBG_TOKEN}\" }\n";
-    toml += L"enabled = false\n";
     return toml;
 }
 
@@ -42676,28 +42763,87 @@ static bool WriteMcpLoadEnvScript(const std::wstring& path)
     return WriteUtf8TextFile(path, ps);
 }
 
-static void WriteMcpClientSnippetFiles(const std::wstring& bridge)
+static std::wstring ResolveMcpClientSetupUrl()
+{
+    const std::wstring fallback = L"http://127.0.0.1:51766/mcp";
+    const std::wstring endpointPath = GetMcpEndpointPath();
+    HANDLE file = CreateFileW(
+        endpointPath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return fallback;
+    }
+
+    std::string bytes(8192, '\0');
+    DWORD read = 0;
+    const BOOL ok = ReadFile(
+        file,
+        bytes.data(),
+        static_cast<DWORD>(bytes.size() - 1),
+        &read,
+        nullptr);
+    CloseHandle(file);
+    if (ok == 0 || read == 0)
+    {
+        return fallback;
+    }
+
+    bytes.resize(read);
+    const std::wstring json = mcpjson::Utf8ToWide(bytes);
+    std::wstring url;
+    if (ExtractJsonStringValue(json, L"client_url", &url) && !url.empty())
+    {
+        return url;
+    }
+    if (ExtractJsonStringValue(json, L"url", &url) && !url.empty())
+    {
+        return url;
+    }
+    return fallback;
+}
+
+static void WriteMcpClientSnippetFiles(
+    const std::wstring& bridge,
+    const std::wstring& clientUrl)
 {
     const std::wstring dir = GetKnLiveDbgUserStateDirectory() + L"\\clients";
     CreateDirectoryW(dir.c_str(), nullptr);
 
-    WriteUtf8TextFile(dir + L"\\cursor-mcp.json", BuildMcpBridgeStdioJson(bridge));
-    WriteUtf8TextFile(dir + L"\\codex-config.toml.snippet", BuildMcpBridgeCodexToml(bridge));
-    WriteUtf8TextFile(dir + L"\\grok-config.toml.snippet", BuildMcpBridgeGrokToml(bridge));
-    WriteUtf8TextFile(dir + L"\\grok-http.toml.snippet", BuildMcpGrokHttpTomlHint());
+    WriteUtf8TextFile(dir + L"\\claude-code-http.json", BuildMcpClaudeCodeHttpJson(clientUrl));
+    WriteUtf8TextFile(dir + L"\\claude-desktop-mcp.json", BuildMcpBridgeStdioJson(bridge));
+    WriteUtf8TextFile(dir + L"\\cursor-mcp.json", BuildMcpCursorHttpJson(clientUrl));
+    WriteUtf8TextFile(dir + L"\\codex-config.toml.snippet", BuildMcpCodexHttpToml(clientUrl));
+    WriteUtf8TextFile(dir + L"\\grok-config.toml.snippet", BuildMcpGrokHttpToml(clientUrl));
+    WriteUtf8TextFile(dir + L"\\grok-http.toml.snippet", BuildMcpGrokHttpToml(clientUrl));
+    WriteUtf8TextFile(dir + L"\\legacy-stdio-mcp.json", BuildMcpBridgeStdioJson(bridge));
     WriteMcpLoadEnvScript(GetKnLiveDbgUserStateDirectory() + L"\\mcp-load-env.ps1");
 
     std::wstring claudeCmd =
+        L"claude mcp add-json --scope user knlivedbg '" +
+        BuildMcpClaudeCodeHttpServerJson(clientUrl) + L"'\n";
+    WriteUtf8TextFile(dir + L"\\claude-code-http.powershell.txt", claudeCmd);
+
+    std::wstring claudeDesktopNote =
+        L"REM Claude Desktop local MCP uses claude-desktop-mcp.json.\n"
+        L"REM This bridge command is also a legacy fallback for older Claude Code builds.\n"
         L"claude mcp add --transport stdio knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" +
         bridge + L"\"\n";
-    WriteUtf8TextFile(dir + L"\\claude-stdio.cmd.txt", claudeCmd);
+    WriteUtf8TextFile(dir + L"\\claude-stdio.cmd.txt", claudeDesktopNote);
 
     std::wstring codexCmd =
+        L"REM Legacy fallback only. Prefer codex-config.toml.snippet (native HTTP).\n"
         L"codex mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" +
         bridge + L"\"\n";
     WriteUtf8TextFile(dir + L"\\codex-stdio.cmd.txt", codexCmd);
 
     std::wstring grokCmd =
+        L"REM Legacy fallback only. Prefer grok-config.toml.snippet (native HTTP).\n"
         L"grok mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" +
         bridge + L"\"\n";
     WriteUtf8TextFile(dir + L"\\grok-stdio.cmd.txt", grokCmd);
@@ -42708,56 +42854,73 @@ static void PrintMcpClientSetupHelp(const std::wstring& filter)
     const std::wstring bridge = ResolveMcpBridgeScriptPath();
     const std::wstring endpoint = GetMcpEndpointPath();
     const std::wstring clientsDir = GetKnLiveDbgUserStateDirectory() + L"\\clients";
+    const std::wstring clientUrl = ResolveMcpClientSetupUrl();
     const std::wstring f = ToLower(filter);
     const bool showAll = f.empty() || f == L"all" || f == L"help";
-    const bool showClaude = showAll || f == L"claude" || f == L"claude-code";
+    const bool showClaudeCode = showAll || f == L"claude" || f == L"claude-code";
+    const bool showClaudeDesktop = showAll || f == L"claude-desktop" ||
+                                   f == L"desktop";
     const bool showCursor = showAll || f == L"cursor";
     const bool showCodex = showAll || f == L"codex";
     const bool showGrok = showAll || f == L"grok" || f == L"grok-build" || f == L"grokbuild";
+    const bool showLegacy = f == L"legacy" || f == L"bridge";
 
-    WriteMcpClientSnippetFiles(bridge);
+    WriteMcpClientSnippetFiles(bridge, clientUrl);
 
-    std::wcout << L"MCP client setup (register ONCE; reconnect without re-entering the token)\n";
+    std::wcout << L"MCP client setup (native Streamable HTTP preferred)\n";
     std::wcout << L"\n";
     std::wcout << L"How it works:\n";
     std::wcout << L"  1. knkd> mcp on            writes stable token + endpoint file\n";
-    std::wcout << L"  2. AI agent launches tools\\mcp-bridge.ps1 (stdio)\n";
-    std::wcout << L"  3. Bridge reads the endpoint file and attaches with the current token\n";
-    std::wcout << L"  Restarting KnLiveDbg does NOT require editing agent config.\n";
+    std::wcout << L"  2. Load KNLIVEDBG_TOKEN in the shell that starts the native client\n";
+    std::wcout << L"  3. Claude Code, Cursor, Codex, and Grok connect directly over HTTP\n";
+    std::wcout << L"  Claude Desktop local MCP uses the stdio bridge because its remote\n";
+    std::wcout << L"  connectors originate in Anthropic's cloud and cannot reach loopback.\n";
     std::wcout << L"\n";
     std::wcout << L"Paths:\n";
     std::wcout << L"  endpoint : " << endpoint << L"\n";
     std::wcout << L"  token    : " << GetMcpStableTokenPath() << L"\n";
+    std::wcout << L"  url      : " << clientUrl << L"\n";
     std::wcout << L"  bridge   : " << bridge << L"\n";
     std::wcout << L"  snippets : " << clientsDir << L"\n";
+    std::wcout << L"  load env : . $env:LOCALAPPDATA\\kn-live-dbg\\mcp-load-env.ps1\n";
     std::wcout << L"\n";
 
-    if (showClaude)
+    if (showClaudeCode)
     {
-        std::wcout << L"=== Claude Code (one-time) ===\n";
-        std::wcout << L"  claude mcp add --transport stdio knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \""
-                   << bridge << L"\"\n";
-        std::wcout << L"  snippet: " << clientsDir << L"\\claude-stdio.cmd.txt\n";
+        std::wcout << L"=== Claude Code (native HTTP; preferred) ===\n";
+        std::wcout << L"  PowerShell (single quotes preserve the env placeholder):\n";
+        std::wcout << L"    claude mcp add-json --scope user knlivedbg '"
+                   << BuildMcpClaudeCodeHttpServerJson(clientUrl) << L"'\n";
+        std::wcout << L"  Verify: claude mcp list   /   use /mcp in Claude Code\n";
+        std::wcout << L"  snippet: " << clientsDir << L"\\claude-code-http.json\n";
+        std::wcout << L"\n";
+    }
+
+    if (showClaudeDesktop)
+    {
+        std::wcout << L"=== Claude Desktop local MCP (stdio bridge) ===\n";
+        std::wcout << L"  Merge this into %APPDATA%\\Claude\\claude_desktop_config.json:\n";
+        std::wcout << BuildMcpBridgeStdioJson(bridge);
+        std::wcout << L"  Fully restart Claude Desktop after editing.\n";
+        std::wcout << L"  snippet: " << clientsDir << L"\\claude-desktop-mcp.json\n";
         std::wcout << L"\n";
     }
 
     if (showCursor)
     {
-        std::wcout << L"=== Cursor / generic mcp.json (one-time) ===\n";
-        std::wcout << BuildMcpBridgeStdioJson(bridge);
+        std::wcout << L"=== Cursor (native HTTP; preferred) ===\n";
+        std::wcout << L"  Merge into user-scope ~/.cursor/mcp.json:\n";
+        std::wcout << BuildMcpCursorHttpJson(clientUrl);
         std::wcout << L"  snippet: " << clientsDir << L"\\cursor-mcp.json\n";
         std::wcout << L"\n";
     }
 
     if (showCodex)
     {
-        std::wcout << L"=== OpenAI Codex CLI / IDE (one-time) ===\n";
+        std::wcout << L"=== OpenAI Codex CLI / IDE (native HTTP; preferred) ===\n";
         std::wcout << L"  Config file: %USERPROFILE%\\.codex\\config.toml\n";
-        std::wcout << L"  CLI:\n";
-        std::wcout << L"    codex mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \""
-                   << bridge << L"\"\n";
-        std::wcout << L"  Or append TOML:\n";
-        std::wcout << BuildMcpBridgeCodexToml(bridge);
+        std::wcout << L"  Append TOML:\n";
+        std::wcout << BuildMcpCodexHttpToml(clientUrl);
         std::wcout << L"  Then: codex  (or restart IDE) and run /mcp to verify.\n";
         std::wcout << L"  snippet: " << clientsDir << L"\\codex-config.toml.snippet\n";
         std::wcout << L"\n";
@@ -42765,19 +42928,21 @@ static void PrintMcpClientSetupHelp(const std::wstring& filter)
 
     if (showGrok)
     {
-        std::wcout << L"=== Grok Build (one-time) ===\n";
+        std::wcout << L"=== Grok Build (native HTTP; preferred) ===\n";
         std::wcout << L"  Config file: %USERPROFILE%\\.grok\\config.toml\n";
-        std::wcout << L"  CLI (preferred):\n";
-        std::wcout << L"    grok mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \""
-                   << bridge << L"\"\n";
-        std::wcout << L"  Or append TOML:\n";
-        std::wcout << BuildMcpBridgeGrokToml(bridge);
+        std::wcout << L"  Append TOML:\n";
+        std::wcout << BuildMcpGrokHttpToml(clientUrl);
         std::wcout << L"  Verify: grok mcp list   /   grok mcp doctor knlivedbg\n";
         std::wcout << L"  snippet: " << clientsDir << L"\\grok-config.toml.snippet\n";
         std::wcout << L"\n";
-        std::wcout << L"  Optional native HTTP (no npx; token via env -- prefer bridge for rotation):\n";
-        std::wcout << BuildMcpGrokHttpTomlHint();
-        std::wcout << L"  Load env in shell:  . $env:LOCALAPPDATA\\kn-live-dbg\\mcp-load-env.ps1\n";
+    }
+
+    if (showLegacy)
+    {
+        std::wcout << L"=== Legacy stdio-only client fallback ===\n";
+        std::wcout << BuildMcpBridgeStdioJson(bridge);
+        std::wcout << L"  Requires Node.js/npx and pinned mcp-remote@0.1.38.\n";
+        std::wcout << L"  snippet: " << clientsDir << L"\\legacy-stdio-mcp.json\n";
         std::wcout << L"\n";
     }
 
@@ -42785,8 +42950,13 @@ static void PrintMcpClientSetupHelp(const std::wstring& filter)
     {
         std::wcout << L"NOTE: endpoint file missing -- run 'mcp on' before connecting agents.\n";
     }
-    std::wcout << L"Token rotation: knkd> mcp on --new-token   (bridge picks it up automatically)\n";
-    std::wcout << L"Filter: mcp client-setup [claude|cursor|codex|grok|all]\n";
+    if (clientUrl.find(L"<this-host-ip>") != std::wstring::npos)
+    {
+        std::wcout << L"NOTE: replace <this-host-ip> with the server's concrete LAN IP.\n";
+    }
+    std::wcout << L"Token rotation: native clients must reload KNLIVEDBG_TOKEN and reconnect;\n";
+    std::wcout << L"                Claude Desktop/legacy bridges pick it up automatically.\n";
+    std::wcout << L"Filter: mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
 }
 
 static void HandleMcpCommand(const std::vector<std::wstring>& args)
@@ -42798,13 +42968,14 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         std::wcout << L"mcp commands:\n";
         std::wcout << L"  mcp on [port] [--allow-write] [--bind <addr>] [--token <t>] [--new-token]\n";
         std::wcout << L"  mcp off | mcp status\n";
-        std::wcout << L"  mcp client-setup [claude|cursor|codex|grok|all]\n";
-        std::wcout << L"                     one-time AI agent registration (Claude/Cursor/Codex/Grok Build)\n";
+        std::wcout << L"  mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
+        std::wcout << L"                     native HTTP setup; Desktop/legacy use the stdio bridge\n";
         std::wcout << L"  mcp endpoint         show the live endpoint file path / contents summary\n";
         std::wcout << L"\n";
         std::wcout << L"Reconnect workflow (analysis lab):\n";
-        std::wcout << L"  1) register the bridge once with 'mcp client-setup'\n";
-        std::wcout << L"  2) each session: mcp on   (token reused; agent reconnects without reconfig)\n";
+        std::wcout << L"  1) generate native HTTP config with 'mcp client-setup'\n";
+        std::wcout << L"  2) each session: mcp on, load KNLIVEDBG_TOKEN, start the client\n";
+        std::wcout << L"  3) Claude Desktop local MCP launches the bridge from its config\n";
         return;
     }
 
@@ -42929,9 +43100,10 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         // Always-on forensic log of every MCP request (independent of `ai audit`).
         config.AuditPath = GetExecutableDirectory() + L"\\.kn-live-dbg\\mcp-audit-" +
                            std::to_wstring(config.Port) + L".jsonl";
-        // Stable per-user token (not per-port, not tied to EXE path) so agents
-        // registered once keep working across restarts, port tweaks, and moved
-        // release folders. --new-token still rotates.
+        // Stable per-user token (not per-port, not tied to EXE path) keeps
+        // credentials valid across restarts and moved release folders.
+        // Native clients still need a URL refresh after port/bind changes.
+        // --new-token rotates the credential explicitly.
         config.TokenPath = GetMcpStableTokenPath();
         const std::wstring legacyDir =
             GetExecutableDirectory() + L"\\.kn-live-dbg";
@@ -42981,8 +43153,8 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                        << endpointError << L"\n";
             return;
         }
-        // Refresh agent snippets every start so bridge paths stay accurate.
-        WriteMcpClientSnippetFiles(ResolveMcpBridgeScriptPath());
+        // Refresh client snippets every start so URL and bridge paths stay accurate.
+        WriteMcpClientSnippetFiles(ResolveMcpBridgeScriptPath(), clientUrl);
 
         std::wcout << L"MCP server started (" << (remoteBind ? L"NETWORK" : L"loopback")
                    << L" Streamable HTTP).\n";
@@ -42993,27 +43165,24 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         }
         std::wstring tokenSource = g_McpServer.TokenSource();
         std::wstring tokenSourceNote =
-            tokenSource == L"reused" ? L" (REUSED - AI agent re-register NOT required)" :
+            tokenSource == L"reused" ? L" (REUSED)" :
             tokenSource == L"env"    ? L" (from KNLIVEDBG_TOKEN env)" :
             tokenSource == L"override" ? L" (from --token; persisted)" :
-                                       L" (NEW - run 'mcp client-setup' once, then reconnect freely)";
+                                       L" (NEW - load KNLIVEDBG_TOKEN before native clients)";
         std::wcout << L"  token    : " << g_McpServer.Token() << tokenSourceNote << L"\n";
         std::wcout << L"  tokenFile: " << config.TokenPath << L"\n";
-        std::wcout << L"  endpoint : " << endpointPath << L"  (bridge reads this every connect)\n";
+        std::wcout << L"  endpoint : " << endpointPath << L"  (Desktop/legacy bridge state)\n";
         std::wcout << L"  write    : " << (config.AllowWrite ? L"ENABLED (lab mode)" : L"disabled (read-only)") << L"\n";
         std::wcout << L"  audit    : " << g_McpServer.AuditPath() << L"\n";
         std::wcout << L"\n";
-        std::wcout << L"  Preferred (no token paste on reconnect):\n";
-        std::wcout << L"    mcp client-setup              # Claude / Cursor / Codex / Grok Build\n";
-        std::wcout << L"    mcp client-setup codex        # Codex-only snippet\n";
-        std::wcout << L"    mcp client-setup grok         # Grok Build-only snippet\n";
+        std::wcout << L"  Preferred (native HTTP; no npx):\n";
+        std::wcout << L"    mcp client-setup              # direct configs for native clients\n";
+        std::wcout << L"    client launch shell: . $env:LOCALAPPDATA\\kn-live-dbg\\mcp-load-env.ps1\n";
         std::wcout << L"    snippets under %LOCALAPPDATA%\\kn-live-dbg\\clients\\\n";
         std::wcout << L"\n";
-        std::wcout << L"  Legacy one-shot HTTP register (token embedded; avoid for frequent reconnect):\n";
-        std::wcout << L"    claude mcp add --transport http knlivedbg " << clientUrl
-                   << L" --header \"Authorization: Bearer " << g_McpServer.Token() << L"\"\n";
-        std::wcout << L"    grok mcp add --transport http knlivedbg " << clientUrl
-                   << L" --header \"Authorization: Bearer " << g_McpServer.Token() << L"\"\n";
+        std::wcout << L"  Claude Desktop local MCP / legacy stdio-only clients:\n";
+        std::wcout << L"    mcp client-setup claude-desktop\n";
+        std::wcout << L"    mcp client-setup legacy\n";
         if (remoteBind)
         {
             std::wcout << L"  WARNING: this elevated kernel read/write endpoint is now reachable over the\n";
@@ -43053,14 +43222,14 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                    << L"\n";
         std::wcout << L"  endpoint: " << GetMcpEndpointPath() << L"\n";
         std::wcout << L"  bridge  : " << ResolveMcpBridgeScriptPath() << L"\n";
-        std::wcout << L"  reconnect: agent uses bridge; no token re-entry needed\n";
+        std::wcout << L"  clients : native HTTP preferred; bridge is Desktop/legacy fallback\n";
     }
     else
     {
         std::wcout << L"MCP server: stopped.\n";
         std::wcout << L"  usage: mcp on [port] [--allow-write] [--bind <addr>] [--token <t>] [--new-token]\n";
         std::wcout << L"         mcp off | mcp status | mcp client-setup | mcp endpoint | mcp help\n";
-        std::wcout << L"  tip  : run 'mcp client-setup' once, then each session only needs 'mcp on'\n";
+        std::wcout << L"  tip  : run 'mcp client-setup'; native clients connect directly over HTTP\n";
     }
 }
 

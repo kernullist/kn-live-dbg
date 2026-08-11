@@ -1,6 +1,7 @@
 # KnLiveDbg MCP stdio bridge.
 #
-# Register this script ONCE in Claude Code / Cursor / Codex / Grok Build.
+# Register this script for Claude Desktop local MCP, or use it as a fallback
+# only when an older MCP client cannot connect with Streamable HTTP directly.
 # On every connect it reads the live endpoint file written by `mcp on` and
 # attaches with the current bearer token -- no per-session token paste.
 #
@@ -179,7 +180,8 @@ Endpoint is ready at:
   $url
   endpoint file: $endpointPath
 
-Grok Build can also use native HTTP (see 'mcp client-setup grok') without npx.
+Claude Code, Cursor, Codex, and Grok Build can use native HTTP without npx.
+See 'mcp client-setup' for their preferred direct configurations.
 "@
 }
 

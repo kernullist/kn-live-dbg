@@ -57,7 +57,7 @@
 2. **Claude Desktop은 GUI 앱이라 UAC 없이 elevated 자식 프로세스를 spawn할 수 없다** — `command: KnLiveDbg.exe` 형태의 stdio 설정은 실제로 기동되지 않는다.
 3. **stdout 오염**: REPL/스캐너는 `std::wcout`에 대량 출력(C4)하고, `ScopedCommandProgress`는 콘솔 핸들에 직접 write(C10)한다. stdio JSON-RPC는 stdout을 프레이밍으로 점유해야 하므로 한 바이트만 새도 세션이 깨진다.
 4. **HTTP는 콘솔과 깔끔히 공존**: HTTP 리스너는 자체 소켓/스레드를 소유하고 콘솔을 건드리지 않는다. operator REPL이 살아있어 human-in-the-loop가 유지된다(보안상 필수).
-5. **Claude Code/Desktop은 `type: http`를 네이티브 지원**한다(아래 §8). 별도 shim 불필요. stdio 전용 호스트만 버전과 전송을 고정한 무상태 브리지 `tools/mcp-bridge.ps1`로 연결한다(이 브리지는 디바이스를 건드리지 않으므로 자유롭게 spawn 가능).
+5. **Claude Code, Cursor, Codex, Grok Build는 Streamable HTTP를 네이티브 지원**한다(아래 §8). 따라서 전송 shim 없이 직접 연결한다. Claude Desktop도 원격 HTTP connector는 지원하지만 연결이 Anthropic 클라우드에서 시작되므로 로컬 loopback/사설망 엔드포인트에는 도달하지 못하고, 로컬 `claude_desktop_config.json` 경로는 stdio다. `tools/mcp-bridge.ps1`은 Claude Desktop 로컬 MCP와 구형 stdio 전용 클라이언트에만 사용한다. 이 무상태 브리지는 버전과 전송을 고정하며 디바이스를 건드리지 않는다.
 
 **구현 스택**: HTTP 서버는 신규 추가다(현재 프로젝트는 `winhttp.lib` *클라이언트*만 링크, 서버 소켓/파이프 없음).
 - 1순위: **HTTP Server API(http.sys, `httpapi.lib`)** — `HttpInitialize` / `HttpCreateRequestQueue` / `HttpAddUrlToUrlGroup`(`http://127.0.0.1:<port>/mcp`). 커널측 URL 예약과 ACL을 얻고 raw 소켓 파싱을 피한다. URL 예약(`netsh http add urlacl` 또는 SDDL)이 필요할 수 있음(미해결 §10).
@@ -206,9 +206,9 @@ elevated 커널 RW 도구를 잠재적으로 적대적/인젝션된 LLM에 노�
 
 ### 5.2 인증과 토큰 취급
 
-1. Bearer 토큰은 기본 **재기동 안정** (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, 상수 시간 비교, 불일치 시 401). 신규 256-bit 발급은 파일 없음 또는 `--new-token`일 때만. `mcp on`은 Claude/Cursor/Codex/Grok Build용 **stdio 브리지**가 읽는 `mcp-endpoint.json`을 기록한다.
+1. Bearer 토큰은 기본 **재기동 안정** (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, 상수 시간 비교, 불일치 시 401). 신규 256-bit 발급은 파일 없음 또는 `--new-token`일 때만. `mcp on`은 네이티브 HTTP 클라이언트용 `mcp-load-env.ps1`과 Claude Desktop/구형 클라이언트용 **stdio 브리지**가 읽는 `mcp-endpoint.json`을 기록한다. 네이티브 클라이언트 설정에는 토큰 원문 대신 환경변수 참조만 둔다.
 2. 서버는 토큰 출처(reused/new/env/override)를 출력하고 audit에는 요청 fingerprint만 남긴다. 토큰과 endpoint 파일은 현재 사용자만 전체 접근 가능한 보호 DACL로 임시 파일에 쓴 뒤 원자적으로 교체한다. 토큰 또는 endpoint 영속화가 실패하면 MCP 시작도 실패한다.
-3. **클라이언트 측 저장이 진짜 누출 지점**: Claude Code는 HTTP 헤더(Authorization 포함)를 설정 파일에 영속화한다. 커널 RW 엔드포인트를 인증하는 토큰을 **committable한 project-scope `.mcp.json`에 붙여넣지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수 인다이렉션 또는 `headersHelper`(접속 시 회전 토큰 발급)를 강제한다. 절대 git 커밋 금지.
+3. **클라이언트 측 저장이 진짜 누출 지점**: 커널 RW 엔드포인트를 인증하는 토큰을 **committable한 project-scope `.mcp.json`에 붙여넣지 말 것.** 네이티브 HTTP와 user-scope 설정 + `${KNLIVEDBG_TOKEN}`/`bearer_token_env_var` + `mcp-load-env.ps1`을 우선한다. 브리지는 Claude Desktop 로컬 MCP나 구형 stdio 전용 클라이언트에만 쓴다. 절대 git 커밋 금지.
 4. 옵션: `GetExtendedTcpTable`로 loopback peer PID에 토큰을 바인딩(방어 심화, 단 재접속/PID 재사용에 취약).
 
 ### 5.3 두 모드: 읽기 전용(기본) vs Lab write 모드 (결정 §10-Q1 갱신)
@@ -403,7 +403,8 @@ Claude Code에서 `/mcp__knlivedbg__<prompt>` 슬래시 명령으로 노출. 읽
 ### 8.2 Claude Code
 
 ```bash
-# 권장: HTTP + 정적 토큰(이미 실행 중인 서버에 연결)
+# 권장: 네이티브 Streamable HTTP. 토큰은 환경변수에 둔다.
+# `mcp client-setup claude-code`가 env 인다이렉션 user-scope 설정을 출력한다.
 claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
   --header "Authorization: Bearer YOUR_TOKEN"
 
@@ -412,7 +413,7 @@ claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
   --header "Authorization: Bearer YOUR_TOKEN"
 
-# stdio 전용 호스트용 별도 무상태 브리지(라이브 프로세스를 직접 노출하지 않음)
+# 구형 stdio 전용 호스트 폴백(라이브 프로세스를 직접 노출하지 않음)
 claude mcp add --transport stdio knlivedbg-bridge -- \
   npx -y mcp-remote@0.1.38 http://127.0.0.1:51766/mcp --allow-http --transport http-only --silent --header "Authorization: Bearer YOUR_TOKEN"
 ```
@@ -437,9 +438,9 @@ claude mcp add --transport stdio knlivedbg-bridge -- \
 
 ### 8.3 Claude Desktop
 
-`%APPDATA%\Claude\claude_desktop_config.json` 에 동일한 `type: http` 항목. 네이티브 http 미지원 빌드면 `tools/mcp-bridge.ps1` 또는 §8.1의 `mcp-remote@0.1.38` 명령을 `--allow-http --transport http-only --silent`와 함께 쓴다. 편집 후 Desktop 완전 재시작.
+Claude Desktop의 원격 connector는 Streamable HTTP를 지원하지만 Anthropic 클라우드에서 연결한다. 따라서 `127.0.0.1`이나 사설 lab 주소에는 도달하지 못하며, `claude_desktop_config.json`에 원격 HTTP 서버를 직접 선언해 연결하지도 않는다. 이 로컬 KnLiveDbg 엔드포인트에는 `mcp client-setup claude-desktop`이 출력하는 stdio 설정을 병합한다. 이 설정은 보호된 endpoint 파일을 읽어 HTTP로 전달하는 `tools/mcp-bridge.ps1`을 실행한다. 편집 후 Desktop을 완전히 재시작한다.
 
-권장: project-scope `.mcp.json` 대신 **user-scope + `${KNLIVEDBG_TOKEN}`** 한 형태로 Claude Code/Desktop 모두 커버.
+Claude 원격 connector를 쓰려고 커널 엔드포인트를 인터넷에 공개하지 않는다. loopback을 유지하고 로컬 브리지를 쓴다. 현재 일급 지원 클라이언트 중 브리지가 권장되는 경로는 이것뿐이다.
 
 ---
 

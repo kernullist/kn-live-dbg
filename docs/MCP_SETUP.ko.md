@@ -90,9 +90,9 @@ mcp status     # 현재 상태
 
 `<addr>`에는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0` / `*` / `+`(http.sys 강한 와일드카드 `+`로 매핑)를 줄 수 있다.
 
-**권장 재연결 모델 (토큰 붙여넣기 없음):** Claude/Cursor에 `tools\mcp-bridge.ps1`을 **한 번만** 등록(`mcp client-setup`). 이후 세션은 `mcp on`만 하면 된다. 브리지가 `%LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json`을 읽어 현재 토큰으로 자동 연결한다.
+**권장 재연결 모델 (토큰 붙여넣기 없음):** `mcp client-setup`이 생성하는 네이티브 Streamable HTTP 설정을 Claude Code, Cursor, Codex, Grok Build에 사용한다. 같은 PC에서는 클라이언트를 시작하기 전에 `%LOCALAPPDATA%\kn-live-dbg\mcp-load-env.ps1`을 dot-source한다. 설정에는 bearer 토큰 원문 대신 `KNLIVEDBG_TOKEN` 참조만 남는다. Claude Desktop 로컬 MCP만 예외다. 원격 connector 연결이 Anthropic 클라우드에서 시작되어 loopback/사설망에 도달하지 못하므로 `tools\mcp-bridge.ps1`을 쓴다.
 
-**토큰 안정성.** bearer 토큰은 **재기동·포트 변경에도 유지**(기본은 포트별이 아닌 사용자 단위 파일). 결정 순서: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token`(구버전 per-port 파일은 1회 마이그레이션) > 새 랜덤 발급(영속화). 회전은 `--new-token`(브리지가 자동 반영, 에이전트 설정 수정 불필요).
+**토큰 안정성.** bearer 토큰은 **재기동 후에도 유지**(기본은 포트별이 아닌 사용자 단위 파일)되므로 URL이 같으면 네이티브 클라이언트 설정도 계속 유효하다. 결정 순서: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token`(구버전 per-port 파일은 1회 마이그레이션) > 새 랜덤 발급(영속화). 포트나 bind 주소가 바뀌면 `mcp client-setup`을 다시 실행해 클라이언트 URL을 갱신한다. `--new-token` 후에는 네이티브 클라이언트가 `KNLIVEDBG_TOKEN`을 다시 읽고 재연결해야 한다. Claude Desktop/구형 클라이언트 브리지는 URL과 토큰을 자동으로 다시 읽는다.
 
 ### 3.2 로컬(loopback) — 같은 PC
 
@@ -105,45 +105,55 @@ knkd> mcp on
 ```text
 MCP server started (loopback Streamable HTTP).
   url      : http://127.0.0.1:51766/mcp
-  token    : 3f9c... (REUSED — AI agent re-register NOT required)
+  token    : 3f9c... (REUSED)
   tokenFile: %LOCALAPPDATA%\kn-live-dbg\mcp-token
-  endpoint : %LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json  (bridge reads this every connect)
+  endpoint : %LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json  (Desktop/legacy bridge state)
   write    : disabled (read-only)
 
-  Preferred (no token paste on reconnect):
+  Preferred (native HTTP; no npx):
     mcp client-setup
+    client launch shell: . $env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1
 ```
 
 이 시점부터 콘솔은 **MCP 엔진 루프**다. 중지하려면 `off` + Enter.
 
-### 3.2.1 에이전트 1회 등록 (권장)
+### 3.2.1 클라이언트 1회 등록 (네이티브 HTTP 권장)
 
 ```text
 knkd> mcp client-setup
 knkd> mcp client-setup claude
+knkd> mcp client-setup claude-desktop
 knkd> mcp client-setup cursor
 knkd> mcp client-setup codex
 knkd> mcp client-setup grok
+knkd> mcp client-setup legacy
 ```
 
 스니펫은 `%LOCALAPPDATA%\kn-live-dbg\clients\` 에도 기록된다.
 
 | 에이전트 | 1회 등록 |
 |------|---------------------------|
-| **Claude Code** | `claude mcp add --transport stdio knlivedbg -- powershell.exe ... -File <bridge>` |
-| **Cursor** | `clients\cursor-mcp.json` 내용을 Cursor MCP 설정에 병합 |
-| **OpenAI Codex** | `codex mcp add knlivedbg -- powershell.exe ... -File <bridge>` 또는 `%USERPROFILE%\.codex\config.toml` 에 `codex-config.toml.snippet` 추가 |
-| **Grok Build** | `grok mcp add knlivedbg -- powershell.exe ... -File <bridge>` 또는 `%USERPROFILE%\.grok\config.toml` 에 `grok-config.toml.snippet` 추가 |
+| **Claude Code** | PowerShell에서 `clients\claude-code-http.powershell.txt` 실행 또는 `clients\claude-code-http.json` 사용 |
+| **Claude Desktop (로컬)** | `clients\claude-desktop-mcp.json` 병합. 이 경로만 stdio 브리지 사용 |
+| **Cursor** | 네이티브 HTTP `clients\cursor-mcp.json`을 user MCP 설정에 병합 |
+| **OpenAI Codex** | 네이티브 HTTP `clients\codex-config.toml.snippet`을 `%USERPROFILE%\.codex\config.toml`에 추가 |
+| **Grok Build** | 네이티브 HTTP `clients\grok-config.toml.snippet`을 `%USERPROFILE%\.grok\config.toml`에 추가 |
+| **구형 stdio 전용 클라이언트** | 호환 폴백으로 `clients\legacy-stdio-mcp.json` 병합 |
 
-이후 분석 세션은:
+이후 KnLiveDbg에서 서버를 시작한다:
 
 ```text
 knkd> mcp on
 ```
 
-토큰을 에이전트 설정에 다시 넣을 필요 없음. `--new-token` 회전도 브리지가 자동 반영.
+그다음 네이티브 클라이언트를 실행할 PowerShell에서:
 
-**Grok 네이티브 HTTP(선택, npx 불필요):** `grok-http.toml.snippet` + `mcp-load-env.ps1` 로 `${KNLIVEDBG_TOKEN}` 주입. 잦은 재연결은 브리지 권장.
+```powershell
+. $env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1
+# 이 셸에서 클라이언트를 시작하거나 재시작한다.
+```
+
+같은 URL로 일반 재기동할 때는 안정 토큰 덕분에 설정을 수정할 필요가 없다. 포트나 bind 주소를 바꾸면 네이티브 URL 스니펫을 다시 생성해 적용한다. `mcp on --new-token`으로 명시 회전한 뒤에는 env loader를 다시 실행하고 네이티브 클라이언트를 재시작/재연결한다. Claude Desktop과 구형 클라이언트 브리지는 다음 연결 때 보호된 endpoint 파일에서 URL과 회전 토큰을 자동으로 읽는다.
 
 ### 3.3 원격(`--bind`) — 분리된 PC/VM
 
@@ -224,28 +234,31 @@ claude mcp list
 }
 ```
 
-> `${KNLIVEDBG_TOKEN}`은 서버가 설정돼 있을 때 읽고, 클라이언트 설정에서도 보간할 수 있다. 서버와 클라이언트가 같은 값을 상속하도록 맞춰야 한다. 그렇지 않으면 보호된 라이브 엔드포인트 파일을 직접 읽는 `tools/mcp-bridge.ps1`을 권장한다.
+> Claude Code는 시작 환경에서 `${KNLIVEDBG_TOKEN}`을 읽는다. 같은 PC에서는 Claude Code를 시작하기 전에 `mcp-load-env.ps1`을 dot-source한다. 명시 토큰 회전 후에는 환경을 다시 읽고 재연결한다. 최신 Claude Code에는 브리지가 필요 없다.
 
 유용한 노브: per-server `timeout`(ms, 느린 스캔용 상향 — 진행 알림으로 연장되지 않음), `headersHelper`(접속 시 회전 토큰 발급), `alwaysLoad`.
 
 ### 4.2 Claude Desktop
 
-`%APPDATA%\Claude\claude_desktop_config.json`에 동일한 `type: http` 항목을 넣는다. 네이티브 http를 미지원하는 빌드면 stdio 브리지를 쓴다:
+Claude Desktop의 원격 connector는 Streamable HTTP를 지원하지만 트래픽이 Anthropic 클라우드에서 시작된다. 따라서 `127.0.0.1`이나 사설 lab 네트워크의 KnLiveDbg에 도달하지 못하고, `claude_desktop_config.json`에 원격 HTTP 서버를 직접 선언해 연결하지도 않는다. **로컬 KnLiveDbg**에는 생성된 stdio 브리지 설정을 쓴다:
 
 ```jsonc
 {
   "mcpServers": {
     "knlivedbg": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote@0.1.38", "http://192.168.56.10:51766/mcp",
-               "--allow-http", "--transport", "http-only", "--silent",
-               "--header", "Authorization: Bearer ${KNLIVEDBG_TOKEN}"]
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+               "C:\\path\\to\\tools\\mcp-bridge.ps1"]
     }
   }
 }
 ```
 
-편집 후 Desktop을 완전히 재시작한다.
+`mcp client-setup claude-desktop`이 정확한 경로가 포함된 `%LOCALAPPDATA%\kn-live-dbg\clients\claude-desktop-mcp.json`을 쓴다. 이를 `%APPDATA%\Claude\claude_desktop_config.json`에 병합한 뒤 Desktop을 완전히 재시작한다. 브리지는 연결할 때마다 보호된 endpoint 파일을 읽으므로 Desktop 설정에 토큰을 남기지 않고 회전도 반영한다.
+
+Claude 원격 connector에 연결하려고 elevated 커널 엔드포인트를 인터넷에 공개하지 않는다. 이 경로는 loopback 전용으로 유지한다.
+
+출처: [Anthropic custom connector 네트워크 요구사항](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp).
 
 ### 4.3 Codex CLI
 
@@ -257,7 +270,7 @@ Codex는 `~/.codex/config.toml`(또는 신뢰된 프로젝트의 `.codex/config.
 [mcp_servers.knlivedbg]
 url = "http://192.168.56.10:51766/mcp"
 bearer_token_env_var = "KNLIVEDBG_TOKEN"
-tool_timeout_sec = 120   # 느린 스캔(hunt.run 등)을 위해 기본 60s보다 상향
+tool_timeout_sec = 600   # 느린 스캔(hunt.run 등)을 위해 기본 60s보다 상향
 ```
 
 그다음 Codex를 띄우는 셸에서 `export KNLIVEDBG_TOKEN=<token>`(PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`). 정적 헤더도 가능:
@@ -268,9 +281,9 @@ url = "http://192.168.56.10:51766/mcp"
 http_headers = { "Authorization" = "Bearer <token-from-server>" }
 ```
 
-> Codex 빌드가 HTTP로 연결되지 않으면 `~/.codex/config.toml` 최상위에 `experimental_use_rmcp_client = true`를 추가해 실험적 Rust MCP 클라이언트를 활성화한다.
+현재 Codex 클라이언트는 Streamable HTTP를 직접 지원한다. 구형 빌드가 `url`을 거부하면 Codex를 업데이트하고, 업데이트가 불가능할 때만 아래 브리지를 쓴다.
 
-**stdio 브리지 (범용 폴백).** HTTP를 못 쓰면 `mcp-remote`로 브리지:
+**stdio 브리지 (구형 폴백).** 구형 Codex가 HTTP를 못 쓰고 업데이트도 불가능할 때만 `mcp-remote`로 브리지:
 
 ```toml
 [mcp_servers.knlivedbg]
@@ -588,7 +601,7 @@ claude mcp list                      # connected 확인
 
 | 증상 | 원인 / 해결 |
 |------|-------------|
-| 연결이 401 | 토큰 불일치. 서버가 출력한 현재 토큰으로 클라이언트 헤더를 갱신하거나 `tools/mcp-bridge.ps1`로 다시 연결 |
+| 연결이 401 | 토큰 불일치. 네이티브 클라이언트는 `KNLIVEDBG_TOKEN`을 다시 읽고 재연결한다. Claude Desktop/구형 클라이언트는 브리지를 재시작해 보호된 endpoint 파일을 다시 읽게 한다. |
 | 연결이 403 | (로컬) loopback이 아닌 Host로 접속 → 원격이면 `--bind` 필요 / (양쪽) Origin이 비-loopback인 브라우저 컨텍스트 |
 | 원격에서 접속 불가(타임아웃) | 방화벽 인바운드 차단. `New-NetFirewallRule`로 포트/클라이언트 IP 허용. 서버가 `--bind <IP>`로 떴는지 확인 |
 | `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write [--bind <addr>]`로 재기동. 명시적으로 회전하거나 덮어쓰지 않는 한 저장된 토큰은 유지됨 |
