@@ -2284,14 +2284,20 @@ Invoke-Step -Name "git diff whitespace" -Script {
     $gitDir = Join-Path $rootPath ".git"
     if (Test-Path -LiteralPath $gitDir)
     {
-        Push-Location $rootPath
-        try
+        $gitCommand = @(
+            Get-Command git.exe `
+                -CommandType Application `
+                -ErrorAction Stop)[0]
+        $gitCheck = Start-Process `
+            -FilePath $gitCommand.Source `
+            -ArgumentList @("diff", "--check") `
+            -WorkingDirectory $rootPath `
+            -NoNewWindow `
+            -Wait `
+            -PassThru
+        if ($gitCheck.ExitCode -ne 0)
         {
-            git diff --check
-        }
-        finally
-        {
-            Pop-Location
+            throw "git diff --check failed with exit code $($gitCheck.ExitCode)"
         }
     }
     else

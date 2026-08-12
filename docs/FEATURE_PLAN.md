@@ -141,16 +141,24 @@ Operational value:
 
 Add a read-only user-mode process memory triage layer.
 
-Status: implemented in `ProcessTriageScanner` with native `!vad`, native
-`!threads`, JSON output, command help/completion, AI `vad.list` /
-`threads.list` routing, and `/hiddenpte` VAD DKOM detection for present user
-PTE ranges that no VAD covers. Remaining hardening should come from field
-testing across Windows builds and protected-process edge cases.
+Status: implemented in `ProcessTriageScanner` with native `!vad`, injection
+oriented `!vad scan`, cross-view `!vad modules`, native `!threads`, stable JSON,
+command help/completion, AI `vad.list` / `threads.list` routing, and hidden-PTE
+VAD DKOM detection for present user PTE ranges that no VAD covers. Traversal
+queues child links before decoding optional node metadata and applies filters and
+`/limit` only to emitted records, so one match or one unreadable record cannot
+terminate the remaining tree. The elevated `tools/validate-process-vad.ps1`
+positive-control gate covers all filters and both PID/EPROCESS target forms.
+Remaining hardening should come from field testing across Windows builds and
+protected-process edge cases.
 
 Target shape:
 
 ```text
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
+!vad scan <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
+!vad modules <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
+!vad mappedpe <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 ```
 
@@ -172,6 +180,14 @@ VAD requirements:
    candidates.
 7. Print a compact table and `[vad.summary]` / `[vad.hiddenpte]` counter lines.
 8. Support stable JSON output for diffing.
+9. `scan` combines private executable, W+X, intact/wiped PE, large private
+   executable, and executable present-PTE-without-VAD evidence with explicit
+   coverage and probe-status fields.
+10. `modules` merges loader, VAD, `VirtualQueryEx` `MEM_IMAGE`,
+    memory-header/entry-point, and mapped-file path views by allocation base,
+    retaining loader-invisible manual/private and SEC_IMAGE mappings even with
+    decommitted headers or nonstandard extensions, and reports independent
+    source coverage.
 
 Thread/APC requirements:
 

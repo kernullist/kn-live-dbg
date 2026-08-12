@@ -67,6 +67,7 @@ struct PeHeaderProbe
     uint16_t NumberOfSections = 0;
     uint16_t Characteristics = 0;
     uint32_t SizeOfHeaders = 0;
+    uint32_t AddressOfEntryPoint = 0;
     uint32_t TimeDateStamp = 0;
     uint64_t SizeOfImage = 0;
     uint64_t ImageBase = 0;

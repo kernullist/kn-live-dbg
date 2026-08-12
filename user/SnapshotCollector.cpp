@@ -503,8 +503,9 @@ namespace
                     DecText((protection >> 4) & 0xfu);
             }
 
-            // Privilege fingerprint for same-boot diffs. Use elevated-signal
-            // mode so common admin SeDebug does not escalate risk on clean hosts.
+            // Preserve the full privilege fingerprint for temporal diffs, but
+            // promote only a structural Enabled-vs-Present inconsistency.
+            // Legitimate high-risk privileges are telemetry, not corruption.
             if (tokenAvailable)
             {
                 const TokenPrivilegeRecord& token = tokenResult.Records[0];
@@ -512,7 +513,7 @@ namespace
                 securityRecord.Evidence[L"token_fingerprint"] = token.PrivilegeFingerprint;
                 securityRecord.Evidence[L"token_present"] = SnapshotHex(token.PresentMask, 16);
                 securityRecord.Evidence[L"token_enabled"] = SnapshotHex(token.EnabledMask, 16);
-                if (token.Suspicious)
+                if (token.StructuralInconsistency)
                 {
                     securityRecord.Risk = L"high";
                     securityRecord.Tags.push_back(L"suspicious");

@@ -32,6 +32,7 @@ struct TokenPrivilegeRecord
     std::vector<std::wstring> Notes;
     bool TokenResolved = false;
     bool PrivilegesResolved = false;
+    bool StructuralInconsistency = false;
     bool Suspicious = false;
     bool SystemProfile = false;
     bool IdentityResolved = false;
@@ -84,6 +85,9 @@ public:
     static bool IsSystemProfileImage(const std::wstring& imageName, uint32_t pid);
     static std::wstring PrivilegeNameFromBit(uint32_t bitIndex);
     static std::wstring BuildPrivilegeFingerprint(uint64_t present, uint64_t enabled);
+    static bool HasStructuralMaskInconsistency(
+        uint64_t present,
+        uint64_t enabled);
 
 private:
     DeviceClient& device_;
@@ -91,3 +95,4 @@ private:
 };
 
 std::wstring BuildTokenPrivilegeJson(const TokenPrivilegeScanResult& result);
+bool TokenPrivilegeMaskInvariantSelfTest();

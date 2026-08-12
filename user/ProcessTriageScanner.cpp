@@ -2,14 +2,17 @@
 
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <Psapi.h>
 
 #include <algorithm>
 #include <cwchar>
 #include <cwctype>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
 #include <sstream>
+#include <unordered_set>
 
 namespace
 {
@@ -673,6 +676,7 @@ namespace
     {
         return
             left.Protection == right.Protection &&
+            left.Type == right.Type &&
             left.Committed == right.Committed &&
             left.Executable == right.Executable &&
             left.Writable == right.Writable &&
@@ -731,6 +735,7 @@ namespace
             record->EffectiveCopyOnWriteBytes = 0;
             record->EffectiveWritableExecutableBytes = 0;
             record->EffectiveCopyOnWriteExecutableBytes = 0;
+            record->EffectiveImageMapping = false;
             record->EffectiveProtectionText.clear();
             record->EffectiveProtectionRanges.clear();
 
@@ -778,7 +783,12 @@ namespace
                 protectionRange.StartAddress = overlapStart;
                 protectionRange.EndAddress = overlapEnd;
                 protectionRange.Protection = memory.Protect;
+                protectionRange.Type = memory.Type;
                 protectionRange.Committed = memory.State == MEM_COMMIT;
+                if (memory.Type == MEM_IMAGE)
+                {
+                    record->EffectiveImageMapping = true;
+                }
                 if (memory.State == MEM_COMMIT)
                 {
                     bool executable = WindowsProtectionExecutable(memory.Protect);
@@ -843,6 +853,7 @@ namespace
                 record->EffectiveCopyOnWriteBytes = 0;
                 record->EffectiveWritableExecutableBytes = 0;
                 record->EffectiveCopyOnWriteExecutableBytes = 0;
+                record->EffectiveImageMapping = false;
                 break;
             }
 
@@ -1094,9 +1105,11 @@ namespace
                 }
             }
 
+            // HiddenPteLimit is an internal safety bound.  The public /limit
+            // option is output-only and must never stop the page-table walk.
             uint32_t recordLimit = options.HiddenPteLimit != 0
                 ? options.HiddenPteLimit
-                : (options.Limit != 0 ? options.Limit : kDefaultHiddenPteRecordLimit);
+                : kDefaultHiddenPteRecordLimit;
             if (result->HiddenPteRecords.size() >= recordLimit)
             {
                 result->HiddenPteTruncated = true;
@@ -1441,6 +1454,21 @@ namespace
                     L"hidden PTE evidence suppressed because the page-table walk had read failures");
             }
         } while (false);
+    }
+
+    void ApplyHiddenPteOutputLimit(
+        const ProcessVadScanOptions& options,
+        ProcessVadScanResult* result)
+    {
+        if (result == nullptr ||
+            options.Limit == 0 ||
+            result->HiddenPteRecords.size() <= options.Limit)
+        {
+            return;
+        }
+
+        result->HiddenPteRecords.resize(options.Limit);
+        result->Truncated = true;
     }
 
     void NormalizeVadIntervals(std::vector<VadInterval>* intervals)
@@ -2236,10 +2264,190 @@ namespace
         return ok;
     }
 
+    bool ReadVadChildPointers(
+        DeviceClient& device,
+        const VadLayout& layout,
+        uint64_t nodeAddress,
+        uint64_t* left,
+        uint64_t* right,
+        std::wstring* error)
+    {
+        uint64_t leftAddress = 0;
+        uint64_t rightAddress = 0;
+        if (left == nullptr ||
+            right == nullptr ||
+            !TryAdd(nodeAddress, layout.Left.Offset, &leftAddress) ||
+            !TryAdd(nodeAddress, layout.Right.Offset, &rightAddress))
+        {
+            if (error != nullptr)
+            {
+                *error = L"VAD child pointer address overflow";
+            }
+            return false;
+        }
+
+        *left = 0;
+        *right = 0;
+        std::wstring leftError;
+        std::wstring rightError;
+        const bool leftRead = ReadKernelPointer(
+            device,
+            leftAddress,
+            left,
+            &leftError);
+        const bool rightRead = ReadKernelPointer(
+            device,
+            rightAddress,
+            right,
+            &rightError);
+        if ((!leftRead || !rightRead) && error != nullptr)
+        {
+            *error = !leftRead && !rightRead
+                ? L"left=" + leftError + L"; right=" + rightError
+                : (!leftRead
+                       ? L"left=" + leftError
+                       : L"right=" + rightError);
+        }
+        return leftRead && rightRead;
+    }
+
+    struct VadTraversalOutcome
+    {
+        uint64_t NodesVisited = 0;
+        bool CoverageReliable = true;
+        bool HitLimit = false;
+    };
+
+    using VadChildReader = std::function<bool(
+        uint64_t,
+        uint64_t*,
+        uint64_t*,
+        std::wstring*)>;
+    using VadRecordVisitor = std::function<bool(
+        uint64_t,
+        uint64_t,
+        uint64_t,
+        std::wstring*)>;
+
+    VadTraversalOutcome TraverseVadNodes(
+        uint64_t root,
+        uint64_t maxNodes,
+        const VadChildReader& readChildren,
+        const VadRecordVisitor& visitRecord,
+        std::vector<std::wstring>* warnings)
+    {
+        VadTraversalOutcome outcome = {};
+        if (root == 0 ||
+            maxNodes == 0 ||
+            !readChildren ||
+            !visitRecord)
+        {
+            return outcome;
+        }
+
+        std::vector<uint64_t> stack;
+        std::unordered_set<uint64_t> visited;
+        stack.push_back(root);
+        visited.reserve(static_cast<size_t>(
+            std::min<uint64_t>(maxNodes, 4096)));
+
+        while (!stack.empty() && outcome.NodesVisited < maxNodes)
+        {
+            const uint64_t node = stack.back();
+            stack.pop_back();
+
+            if (node == 0)
+            {
+                continue;
+            }
+            if (!IsKernelAddress(node))
+            {
+                outcome.CoverageReliable = false;
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"VAD node is not kernel-canonical: " +
+                        Hex(node, 16));
+                }
+                continue;
+            }
+            if (!visited.insert(node).second)
+            {
+                outcome.CoverageReliable = false;
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"VAD cycle or duplicate child detected at " +
+                        Hex(node, 16));
+                }
+                continue;
+            }
+
+            ++outcome.NodesVisited;
+
+            uint64_t left = 0;
+            uint64_t right = 0;
+            std::wstring childError;
+            const bool childrenComplete = readChildren(
+                    node,
+                    &left,
+                    &right,
+                    &childError);
+            if (!childrenComplete)
+            {
+                outcome.CoverageReliable = false;
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"failed to read VAD child links " +
+                        Hex(node, 16) + L": " + childError);
+                }
+            }
+
+            // Queue the descendants before decoding optional VAD metadata.
+            // A poisoned current record must not hide otherwise readable
+            // child subtrees.
+            if (right != 0)
+            {
+                stack.push_back(right);
+            }
+            if (left != 0)
+            {
+                stack.push_back(left);
+            }
+
+            std::wstring recordError;
+            if (!visitRecord(
+                    node,
+                    left,
+                    right,
+                    &recordError))
+            {
+                outcome.CoverageReliable = false;
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"failed to read VAD node " +
+                        Hex(node, 16) + L": " + recordError +
+                        L" (continuing descendants)");
+                }
+            }
+        }
+
+        if (!stack.empty())
+        {
+            outcome.HitLimit = true;
+            outcome.CoverageReliable = false;
+        }
+        return outcome;
+    }
+
     bool ReadVadRecord(
         DeviceClient& device,
         const VadLayout& layout,
         uint64_t nodeAddress,
+        uint64_t left,
+        uint64_t right,
         ProcessVadRecord* record,
         std::wstring* error)
     {
@@ -2254,30 +2462,14 @@ namespace
 
             *record = ProcessVadRecord{};
             record->NodeAddress = nodeAddress;
+            record->Left = left;
+            record->Right = right;
             if (!TrySub(nodeAddress, layout.VadNode.Offset, &record->VadAddress))
             {
                 if (error != nullptr)
                 {
                     *error = L"VAD node address underflow";
                 }
-                break;
-            }
-
-            uint64_t leftAddress = 0;
-            uint64_t rightAddress = 0;
-            if (!TryAdd(nodeAddress, layout.Left.Offset, &leftAddress) ||
-                !TryAdd(nodeAddress, layout.Right.Offset, &rightAddress))
-            {
-                if (error != nullptr)
-                {
-                    *error = L"VAD child pointer address overflow";
-                }
-                break;
-            }
-
-            if (!ReadKernelPointer(device, leftAddress, &record->Left, error) ||
-                !ReadKernelPointer(device, rightAddress, &record->Right, error))
-            {
                 break;
             }
 
@@ -2405,10 +2597,27 @@ namespace
 
     bool VadMatchesOptions(const ProcessVadRecord& record, const ProcessVadScanOptions& options)
     {
-        bool matched = true;
+        const uint64_t executableBytes =
+            record.EffectiveProtectionComplete
+                ? record.EffectiveExecutableBytes
+                : (record.Executable ? record.Size : 0);
+        bool matched = !options.InjectionScan ||
+            record.WritableExecutable ||
+            (record.Executable &&
+             record.HasPrivateMemory &&
+             record.PrivateMemory) ||
+            record.PeHeaderFound ||
+            (executableBytes >= kLargeVadThreshold &&
+             record.HasPrivateMemory &&
+             record.PrivateMemory);
 
         do
         {
+            if (!matched)
+            {
+                break;
+            }
+
             if (options.ExecOnly && !record.Executable)
             {
                 matched = false;
@@ -2435,6 +2644,29 @@ namespace
         } while (false);
 
         return matched;
+    }
+
+    void AccumulateMatchingVadRecord(
+        const ProcessVadRecord& record,
+        const ProcessVadScanOptions& options,
+        ProcessVadScanResult* result)
+    {
+        if (result == nullptr ||
+            !VadMatchesOptions(record, options))
+        {
+            return;
+        }
+
+        ++result->MatchingRecords;
+        if (options.Limit == 0 ||
+            result->Records.size() < options.Limit)
+        {
+            result->Records.push_back(record);
+        }
+        else
+        {
+            result->Truncated = true;
+        }
     }
 
     void ClassifyVad(ProcessVadRecord* record)
@@ -3056,6 +3288,344 @@ namespace
         return queue;
     }
 
+    void AddUniqueText(
+        std::vector<std::wstring>* values,
+        const std::wstring& value)
+    {
+        if (values == nullptr || value.empty())
+        {
+            return;
+        }
+        if (std::find(values->begin(), values->end(), value) ==
+            values->end())
+        {
+            values->push_back(value);
+        }
+    }
+
+    std::wstring PathLeafLocal(const std::wstring& path)
+    {
+        const size_t separator = path.find_last_of(L"\\/");
+        return separator == std::wstring::npos
+            ? path
+            : path.substr(separator + 1);
+    }
+
+    ProcessMappedPeRecord* FindMappedPeByBase(
+        std::vector<ProcessMappedPeRecord>* records,
+        uint64_t base)
+    {
+        if (records == nullptr || base == 0)
+        {
+            return nullptr;
+        }
+        const auto found = std::find_if(
+            records->begin(),
+            records->end(),
+            [base](const ProcessMappedPeRecord& record)
+            {
+                return record.Base == base;
+            });
+        return found == records->end() ? nullptr : &(*found);
+    }
+
+    const ProcessVadRecord* FindVadContainingBase(
+        const std::vector<ProcessVadRecord>& records,
+        uint64_t base)
+    {
+        const auto exact = std::find_if(
+            records.begin(),
+            records.end(),
+            [base](const ProcessVadRecord& record)
+            {
+                return record.StartAddress == base;
+            });
+        if (exact != records.end())
+        {
+            return &(*exact);
+        }
+
+        const auto containing = std::find_if(
+            records.begin(),
+            records.end(),
+            [base](const ProcessVadRecord& record)
+            {
+                return record.StartAddress <= base &&
+                    base <= record.EndAddress;
+            });
+        return containing == records.end() ? nullptr : &(*containing);
+    }
+
+    void ApplyPeProbeToMappedRecord(
+        const PeHeaderProbe& probe,
+        ProcessMappedPeRecord* record)
+    {
+        if (record == nullptr || !probe.IsPe)
+        {
+            return;
+        }
+
+        record->MemoryHeaderVisible = true;
+        record->HeaderImageSize = probe.SizeOfImage;
+        record->PreferredImageBase = probe.ImageBase;
+        record->EntryPointRva = probe.AddressOfEntryPoint;
+        record->SizeOfHeaders = probe.SizeOfHeaders;
+        record->TimeDateStamp = probe.TimeDateStamp;
+        record->Machine = probe.Machine;
+        record->NumberOfSections = probe.NumberOfSections;
+        record->Is64Bit = probe.Is64Bit;
+        record->MzWiped = probe.MzWiped;
+        record->PeSignatureWiped = probe.PeSignatureWiped;
+        record->ELfanewMismatch = probe.ELfanewMismatch;
+        AddUniqueText(&record->Sources, L"memory_header");
+
+        if (probe.MzWiped)
+        {
+            AddUniqueText(&record->Reasons, L"mz_header_wiped");
+            record->Suspicious = true;
+        }
+        if (probe.PeSignatureWiped)
+        {
+            AddUniqueText(&record->Reasons, L"pe_signature_wiped");
+            record->Suspicious = true;
+        }
+        if (probe.ELfanewMismatch)
+        {
+            AddUniqueText(&record->Reasons, L"e_lfanew_mismatch");
+            record->Suspicious = true;
+        }
+
+        if (probe.AddressOfEntryPoint == 0)
+        {
+            // Resource-only DLLs and data images legitimately have no entry.
+            record->EntryPointValid = true;
+        }
+        else
+        {
+            uint64_t entryPoint = 0;
+            record->EntryPointValid =
+                probe.SizeOfImage != 0 &&
+                probe.AddressOfEntryPoint < probe.SizeOfImage &&
+                TryAdd(
+                    record->Base,
+                    probe.AddressOfEntryPoint,
+                    &entryPoint);
+            if (record->EntryPointValid)
+            {
+                record->EntryPointVa = entryPoint;
+            }
+            else
+            {
+                AddUniqueText(
+                    &record->Reasons,
+                    L"entry_point_outside_image");
+                record->Suspicious = true;
+            }
+        }
+    }
+
+    void MergeVadIntoMappedRecord(
+        const ProcessVadRecord& vad,
+        ProcessMappedPeRecord* record)
+    {
+        if (record == nullptr)
+        {
+            return;
+        }
+        if (record->Base == 0)
+        {
+            record->Base = vad.StartAddress;
+        }
+        record->VadVisible = true;
+        record->VadAddress = vad.VadAddress;
+        record->VadStart = vad.StartAddress;
+        record->VadEnd = vad.EndAddress;
+        record->VadSize = vad.Size;
+        record->AllocationProtection = vad.ProtectionText;
+        record->EffectiveProtection = vad.EffectiveProtectionText;
+        record->PrivateMapping =
+            vad.HasPrivateMemory && vad.PrivateMemory;
+        record->ImageBacked =
+            record->ImageBacked ||
+            vad.EffectiveImageMapping ||
+            (vad.HasSubsection &&
+             !(vad.HasPrivateMemory && vad.PrivateMemory));
+        record->VirtualImageMapping =
+            record->VirtualImageMapping ||
+            vad.EffectiveImageMapping;
+        record->Executable = vad.EffectiveProtectionComplete
+            ? vad.EffectiveExecutableBytes != 0
+            : vad.Executable;
+        record->WritableExecutable = vad.EffectiveProtectionComplete
+            ? vad.EffectiveWritableExecutableBytes != 0
+            : vad.WritableExecutable;
+        if (record->Base == vad.StartAddress)
+        {
+            record->HeaderProbeAttempted =
+                record->HeaderProbeAttempted || vad.PeProbeAttempted;
+            record->HeaderProbeReadSucceeded =
+                record->HeaderProbeReadSucceeded ||
+                vad.PeProbeReadSucceeded;
+        }
+        AddUniqueText(&record->Sources, L"vad");
+        if (vad.EffectiveImageMapping)
+        {
+            AddUniqueText(
+                &record->Sources,
+                L"virtual_query_image");
+        }
+        if (vad.PeHeaderFound && record->Base == vad.StartAddress)
+        {
+            ApplyPeProbeToMappedRecord(vad.PeProbe, record);
+        }
+    }
+
+    bool QueryMappedPath(
+        HANDLE process,
+        uint64_t address,
+        std::wstring* path)
+    {
+        if (process == nullptr ||
+            process == INVALID_HANDLE_VALUE ||
+            address == 0 ||
+            path == nullptr)
+        {
+            return false;
+        }
+
+        for (DWORD capacity = 512; capacity <= 32768; capacity *= 2)
+        {
+            std::vector<wchar_t> buffer(capacity, L'\0');
+            const DWORD copied = K32GetMappedFileNameW(
+                process,
+                reinterpret_cast<LPVOID>(address),
+                buffer.data(),
+                capacity);
+            if (copied == 0)
+            {
+                return false;
+            }
+            if (copied < capacity - 1)
+            {
+                path->assign(buffer.data(), copied);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void FinalizeMappedPeRecord(ProcessMappedPeRecord* record)
+    {
+        if (record == nullptr)
+        {
+            return;
+        }
+        if (record->ImageName.empty())
+        {
+            if (!record->ImagePath.empty())
+            {
+                record->ImageName = PathLeafLocal(record->ImagePath);
+            }
+            else if (!record->MappedPath.empty())
+            {
+                record->ImageName = PathLeafLocal(record->MappedPath);
+            }
+        }
+
+        if (record->MemoryHeaderVisible &&
+            !record->LoaderVisible)
+        {
+            if (record->PrivateMapping)
+            {
+                AddUniqueText(
+                    &record->Reasons,
+                    L"private_pe_without_loader_entry");
+                record->Suspicious = true;
+            }
+            else
+            {
+                AddUniqueText(
+                    &record->Reasons,
+                    L"mapped_pe_without_loader_entry");
+            }
+        }
+        else if (record->VirtualImageMapping &&
+                 !record->LoaderVisible)
+        {
+            AddUniqueText(
+                &record->Reasons,
+                L"image_mapping_without_loader_entry");
+        }
+        if (record->LoaderVisible && !record->VadVisible)
+        {
+            AddUniqueText(
+                &record->Reasons,
+                L"loader_entry_without_vad_view");
+        }
+        if (record->LoaderVisible &&
+            record->HeaderProbeReadSucceeded &&
+            !record->MemoryHeaderVisible)
+        {
+            AddUniqueText(
+                &record->Reasons,
+                L"loader_entry_without_pe_header");
+            record->Suspicious = true;
+        }
+        if (record->WritableExecutable)
+        {
+            AddUniqueText(
+                &record->Reasons,
+                L"writable_executable_mapping");
+            record->Suspicious = true;
+        }
+    }
+
+    bool VadBasePageCommitted(const ProcessVadRecord& record)
+    {
+        if (record.EffectiveProtectionComplete)
+        {
+            const auto range = std::find_if(
+                record.EffectiveProtectionRanges.begin(),
+                record.EffectiveProtectionRanges.end(),
+                [&record](const ProcessVadProtectionRange& candidate)
+                {
+                    return candidate.StartAddress <=
+                            record.StartAddress &&
+                        record.StartAddress <= candidate.EndAddress;
+                });
+            return range != record.EffectiveProtectionRanges.end() &&
+                range->Committed;
+        }
+
+        // Kernel-only / inaccessible process handles have no VirtualQueryEx
+        // cross-view. Keep the conservative legacy candidates in that case.
+        return record.CommitCharge != 0 ||
+            record.Executable ||
+            record.HasSubsection;
+    }
+
+    bool PathLooksLikePeImage(const std::wstring& path)
+    {
+        const std::wstring lowered = ToLowerLocal(path);
+        static const wchar_t* extensions[] =
+        {
+            L".exe", L".dll", L".sys", L".ocx", L".cpl",
+            L".scr", L".efi", L".mui", L".mun"
+        };
+        for (const wchar_t* extension : extensions)
+        {
+            if (lowered.size() >= std::wcslen(extension) &&
+                lowered.compare(
+                    lowered.size() - std::wcslen(extension),
+                    std::wcslen(extension),
+                    extension) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool ThreadTraversalHitNodeLimit(
         uint64_t threadsVisited,
         uint64_t current,
@@ -3220,6 +3790,389 @@ bool ProcessTriageEffectiveProtectionSelfTest()
             listHead);
 }
 
+bool ProcessTriageVadTraversalSelfTest()
+{
+    const uint64_t root = 0xffff800000001000ull;
+    const uint64_t unreadable =
+        0xffff800000002000ull;
+    const uint64_t right = 0xffff800000003000ull;
+    const uint64_t leftLeaf =
+        0xffff800000004000ull;
+    const uint64_t rightLeaf =
+        0xffff800000005000ull;
+    const std::map<uint64_t, std::pair<uint64_t, uint64_t>> tree =
+    {
+        {root, {unreadable, right}},
+        {unreadable, {leftLeaf, rightLeaf}},
+        {right, {0, 0}},
+        {leftLeaf, {0, 0}},
+        {rightLeaf, {0, 0}}
+    };
+
+    std::vector<uint64_t> recordsVisited;
+    std::vector<std::wstring> warnings;
+    const VadTraversalOutcome outcome = TraverseVadNodes(
+        root,
+        32,
+        [&tree](
+            uint64_t node,
+            uint64_t* left,
+            uint64_t* rightChild,
+            std::wstring* error)
+        {
+            const auto found = tree.find(node);
+            if (found == tree.end() ||
+                left == nullptr ||
+                rightChild == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"fixture child missing";
+                }
+                return false;
+            }
+            *left = found->second.first;
+            *rightChild = found->second.second;
+            return true;
+        },
+        [&recordsVisited, unreadable](
+            uint64_t node,
+            uint64_t,
+            uint64_t,
+            std::wstring* error)
+        {
+            recordsVisited.push_back(node);
+            if (node == unreadable)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"fixture metadata unreadable";
+                }
+                return false;
+            }
+            return true;
+        },
+        &warnings);
+    if (outcome.NodesVisited != tree.size() ||
+        outcome.CoverageReliable ||
+        outcome.HitLimit ||
+        recordsVisited.size() != tree.size() ||
+        std::find(
+            recordsVisited.begin(),
+            recordsVisited.end(),
+            leftLeaf) == recordsVisited.end() ||
+        std::find(
+            recordsVisited.begin(),
+            recordsVisited.end(),
+            rightLeaf) == recordsVisited.end())
+    {
+        return false;
+    }
+
+    std::vector<uint64_t> partialChildRecords;
+    std::vector<std::wstring> partialChildWarnings;
+    const VadTraversalOutcome partialChild =
+        TraverseVadNodes(
+            root,
+            32,
+            [root, right](
+                uint64_t node,
+                uint64_t* left,
+                uint64_t* rightChild,
+                std::wstring* error)
+            {
+                *left = 0;
+                *rightChild = node == root ? right : 0;
+                if (node == root)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"fixture left child unreadable";
+                    }
+                    return false;
+                }
+                return true;
+            },
+            [&partialChildRecords](
+                uint64_t node,
+                uint64_t,
+                uint64_t,
+                std::wstring*)
+            {
+                partialChildRecords.push_back(node);
+                return true;
+            },
+            &partialChildWarnings);
+    if (partialChild.NodesVisited != 2 ||
+        partialChild.CoverageReliable ||
+        partialChild.HitLimit ||
+        std::find(
+            partialChildRecords.begin(),
+            partialChildRecords.end(),
+            right) == partialChildRecords.end())
+    {
+        return false;
+    }
+
+    std::vector<std::wstring> limitWarnings;
+    const VadTraversalOutcome limited = TraverseVadNodes(
+        root,
+        1,
+        [&tree](
+            uint64_t node,
+            uint64_t* left,
+            uint64_t* rightChild,
+            std::wstring*)
+        {
+            const auto found = tree.find(node);
+            if (found == tree.end())
+            {
+                return false;
+            }
+            *left = found->second.first;
+            *rightChild = found->second.second;
+            return true;
+        },
+        [](uint64_t, uint64_t, uint64_t, std::wstring*)
+        {
+            return true;
+        },
+        &limitWarnings);
+    return limited.NodesVisited == 1 &&
+        limited.HitLimit &&
+        !limited.CoverageReliable;
+}
+
+bool ProcessTriageVadFilterSelfTest()
+{
+    ProcessVadRecord imageCow = {};
+    imageCow.Executable = true;
+    imageCow.CopyOnWriteExecutable = true;
+    imageCow.HasPrivateMemory = true;
+    imageCow.PrivateMemory = false;
+
+    ProcessVadRecord privateRx = {};
+    privateRx.StartAddress = 0x1000;
+    privateRx.Executable = true;
+    privateRx.HasPrivateMemory = true;
+    privateRx.PrivateMemory = true;
+
+    ProcessVadRecord privateRwx = privateRx;
+    privateRwx.StartAddress = 0x2000;
+    privateRwx.Writable = true;
+    privateRwx.WritableExecutable = true;
+
+    ProcessVadRecord privatePe = privateRx;
+    privatePe.StartAddress = 0x3000;
+    privatePe.Executable = false;
+    privatePe.PeHeaderFound = true;
+
+    ProcessVadScanOptions scan = {};
+    scan.InjectionScan = true;
+    if (VadMatchesOptions(imageCow, scan) ||
+        !VadMatchesOptions(privateRx, scan) ||
+        !VadMatchesOptions(privateRwx, scan) ||
+        !VadMatchesOptions(privatePe, scan))
+    {
+        return false;
+    }
+
+    ProcessVadScanOptions wx = {};
+    wx.WxOnly = true;
+    if (VadMatchesOptions(privateRx, wx) ||
+        !VadMatchesOptions(privateRwx, wx))
+    {
+        return false;
+    }
+
+    scan.Limit = 1;
+    ProcessVadScanResult result = {};
+    AccumulateMatchingVadRecord(privateRx, scan, &result);
+    AccumulateMatchingVadRecord(privateRwx, scan, &result);
+    AccumulateMatchingVadRecord(privatePe, scan, &result);
+    if (result.MatchingRecords != 3 ||
+        result.Records.size() != 1 ||
+        !result.Truncated)
+    {
+        return false;
+    }
+
+    ProcessVadScanOptions hiddenOptions = {};
+    hiddenOptions.Limit = 1;
+    ProcessVadScanResult hiddenResult = {};
+    PteLeafMapping firstHidden = {};
+    firstHidden.StartAddress = 0x1000;
+    firstHidden.EndAddress = 0x1fff;
+    firstHidden.PageSize = kPageSize;
+    firstHidden.Executable = true;
+    firstHidden.UserAccessible = true;
+    AppendHiddenPteRecord(
+        hiddenOptions,
+        firstHidden,
+        firstHidden.StartAddress,
+        firstHidden.EndAddress,
+        &hiddenResult);
+    PteLeafMapping secondHidden = firstHidden;
+    secondHidden.StartAddress = 0x3000;
+    secondHidden.EndAddress = 0x3fff;
+    AppendHiddenPteRecord(
+        hiddenOptions,
+        secondHidden,
+        secondHidden.StartAddress,
+        secondHidden.EndAddress,
+        &hiddenResult);
+    if (hiddenResult.HiddenPteRanges != 2 ||
+        hiddenResult.HiddenPteRecords.size() != 2 ||
+        hiddenResult.HiddenPteTruncated)
+    {
+        return false;
+    }
+    ApplyHiddenPteOutputLimit(
+        hiddenOptions,
+        &hiddenResult);
+    return hiddenResult.HiddenPteRanges == 2 &&
+        hiddenResult.HiddenPteRecords.size() == 1 &&
+        !hiddenResult.HiddenPteTruncated &&
+        hiddenResult.Truncated;
+}
+
+bool ProcessTriageMappedPeSelfTest()
+{
+    ProcessVadRecord vad = {};
+    vad.VadAddress = 0xffff800000001000ull;
+    vad.StartAddress = 0x0000000010000000ull;
+    vad.EndAddress = 0x000000001001ffffull;
+    vad.Size = 0x20000;
+    vad.HasPrivateMemory = true;
+    vad.PrivateMemory = true;
+    vad.Executable = true;
+    vad.ProtectionText = L"PAGE_EXECUTE_READ";
+    vad.PeProbeAttempted = true;
+    vad.PeProbeReadSucceeded = true;
+    vad.PeHeaderFound = true;
+    vad.PeProbe.IsPe = true;
+    vad.PeProbe.Is64Bit = true;
+    vad.PeProbe.Machine = IMAGE_FILE_MACHINE_AMD64;
+    vad.PeProbe.NumberOfSections = 3;
+    vad.PeProbe.SizeOfHeaders = 0x400;
+    vad.PeProbe.SizeOfImage = 0x20000;
+    vad.PeProbe.AddressOfEntryPoint = 0x1234;
+    vad.PeProbe.ImageBase = 0x140000000ull;
+    ProcessVadProtectionRange baseRange = {};
+    baseRange.StartAddress = vad.StartAddress;
+    baseRange.EndAddress = vad.EndAddress;
+    baseRange.Committed = true;
+    vad.EffectiveProtectionComplete = true;
+    vad.EffectiveProtectionRanges.push_back(baseRange);
+    if (!VadBasePageCommitted(vad) ||
+        !PathLooksLikePeImage(
+            L"\\Device\\HarddiskVolume3\\Windows\\System32\\fixture.dll") ||
+        PathLooksLikePeImage(L"C:\\fixture.dat"))
+    {
+        return false;
+    }
+
+    ProcessVadRecord reservedBase = vad;
+    reservedBase.EffectiveProtectionRanges[0].Committed = false;
+    if (VadBasePageCommitted(reservedBase))
+    {
+        return false;
+    }
+
+    ProcessMappedPeRecord memoryOnly = {};
+    memoryOnly.Base = vad.StartAddress;
+    MergeVadIntoMappedRecord(vad, &memoryOnly);
+    FinalizeMappedPeRecord(&memoryOnly);
+    if (!memoryOnly.MemoryHeaderVisible ||
+        !memoryOnly.EntryPointValid ||
+        memoryOnly.EntryPointVa != vad.StartAddress + 0x1234 ||
+        !memoryOnly.Suspicious ||
+        std::find(
+            memoryOnly.Reasons.begin(),
+            memoryOnly.Reasons.end(),
+            L"private_pe_without_loader_entry") ==
+            memoryOnly.Reasons.end())
+    {
+        return false;
+    }
+
+    ProcessMappedPeRecord loaderVisible = {};
+    loaderVisible.Base = vad.StartAddress;
+    loaderVisible.LoaderVisible = true;
+    loaderVisible.ImagePath = L"C:\\Windows\\System32\\fixture.dll";
+    AddUniqueText(&loaderVisible.Sources, L"loader");
+    MergeVadIntoMappedRecord(vad, &loaderVisible);
+    MergeVadIntoMappedRecord(vad, &loaderVisible);
+    FinalizeMappedPeRecord(&loaderVisible);
+    if (loaderVisible.Suspicious ||
+        loaderVisible.ImageName != L"fixture.dll" ||
+        loaderVisible.Sources.size() != 3 ||
+        std::find(
+            loaderVisible.Reasons.begin(),
+            loaderVisible.Reasons.end(),
+            L"private_pe_without_loader_entry") !=
+            loaderVisible.Reasons.end())
+    {
+        return false;
+    }
+
+    ProcessMappedPeRecord invalidEntry = {};
+    invalidEntry.Base = 0x20000000;
+    PeHeaderProbe invalidProbe = vad.PeProbe;
+    invalidProbe.AddressOfEntryPoint = 0x30000;
+    ApplyPeProbeToMappedRecord(invalidProbe, &invalidEntry);
+    if (invalidEntry.EntryPointValid ||
+        !invalidEntry.Suspicious ||
+        std::find(
+            invalidEntry.Reasons.begin(),
+            invalidEntry.Reasons.end(),
+            L"entry_point_outside_image") ==
+            invalidEntry.Reasons.end())
+    {
+        return false;
+    }
+
+    ProcessVadRecord imageVad = vad;
+    imageVad.HasPrivateMemory = true;
+    imageVad.PrivateMemory = false;
+    imageVad.PeHeaderFound = false;
+    imageVad.PeProbe = {};
+    imageVad.EffectiveImageMapping = true;
+    ProcessMappedPeRecord imageWithoutHeader = {};
+    imageWithoutHeader.Base = imageVad.StartAddress;
+    MergeVadIntoMappedRecord(
+        imageVad,
+        &imageWithoutHeader);
+    FinalizeMappedPeRecord(&imageWithoutHeader);
+    if (!imageWithoutHeader.VirtualImageMapping ||
+        !imageWithoutHeader.ImageBacked ||
+        imageWithoutHeader.Suspicious ||
+        std::find(
+            imageWithoutHeader.Sources.begin(),
+            imageWithoutHeader.Sources.end(),
+            L"virtual_query_image") ==
+            imageWithoutHeader.Sources.end() ||
+        std::find(
+            imageWithoutHeader.Reasons.begin(),
+            imageWithoutHeader.Reasons.end(),
+            L"image_mapping_without_loader_entry") ==
+            imageWithoutHeader.Reasons.end())
+    {
+        return false;
+    }
+
+    std::vector<ProcessMappedPeRecord> records;
+    records.push_back(loaderVisible);
+    if (FindMappedPeByBase(&records, vad.StartAddress) == nullptr ||
+        FindMappedPeByBase(&records, 0x9999) != nullptr)
+    {
+        return false;
+    }
+    const std::vector<ProcessVadRecord> vads = {vad};
+    return FindVadContainingBase(vads, vad.StartAddress + 0x1000) ==
+        &vads[0];
+}
+
 ProcessTriageScanner::ProcessTriageScanner(DeviceClient& device, SymbolEngine& symbols) :
     device_(device),
     symbols_(symbols)
@@ -3250,6 +4203,17 @@ bool ProcessTriageScanner::ScanVad(
 
         *result = ProcessVadScanResult{};
         result->Target = options.Target;
+        result->InjectionScan = options.InjectionScan;
+        const bool kernelOnly =
+            IsKernelOnlyProcessTarget(options.Target);
+        result->EffectiveProtectionCoverageComplete =
+            kernelOnly;
+        const bool requiresEffectiveCoverage =
+            !kernelOnly &&
+            (options.ExecOnly ||
+             options.WxOnly ||
+             options.InjectionScan ||
+             options.ProbeAllPe);
 
         VadLayout layout = {};
         if (!ResolveVadLayout(symbols_, &layout, error))
@@ -3275,11 +4239,20 @@ bool ProcessTriageScanner::ScanVad(
             result->Warnings.push_back(
                 L"coverage incomplete: VAD PrivateMemory field unresolved; private-exec/PE probes are unavailable (not a clean empty private set)");
         }
-        if ((options.ExecOnly || options.WxOnly) && !layout.HasProtection)
+        if ((options.ExecOnly ||
+             options.WxOnly ||
+             options.InjectionScan ||
+             options.ProbeAllPe) &&
+            !layout.HasProtection)
         {
             result->Warnings.push_back(L"executable/W+X filters will match no records while Protection is unresolved");
         }
-        if ((options.PrivateOnly || options.PeOnly || options.ProbePe) && !layout.HasPrivateMemory)
+        if ((options.PrivateOnly ||
+             options.PeOnly ||
+             options.ProbePe ||
+             options.ProbeAllPe ||
+             options.InjectionScan) &&
+            !layout.HasPrivateMemory)
         {
             result->Warnings.push_back(L"private/PE filters and PE probes will match no records while PrivateMemory is unresolved");
         }
@@ -3311,6 +4284,13 @@ bool ProcessTriageScanner::ScanVad(
 
         if (root == 0)
         {
+            if (!kernelOnly)
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(
+                    L"coverage incomplete: user-process VAD root is empty");
+            }
             if (options.ScanHiddenPtes)
             {
                 if (options.RequireVadCoverageForHiddenPtes)
@@ -3322,15 +4302,12 @@ bool ProcessTriageScanner::ScanVad(
                     AddKnownVadlessUserMappings(&vadIntervals);
                     NormalizeVadIntervals(&vadIntervals);
                     ScanHiddenVadPtes(device_, options, vadIntervals, result);
+                    ApplyHiddenPteOutputLimit(options, result);
                 }
             }
             ok = true;
             break;
         }
-
-        std::vector<uint64_t> stack;
-        std::vector<uint64_t> visited;
-        stack.push_back(root);
 
         uint64_t dtb = TargetUserDtb(options.Target);
         HANDLE processQuery = nullptr;
@@ -3352,143 +4329,164 @@ bool ProcessTriageScanner::ScanVad(
                 }
             }
         }
-        bool vadTraversalHitLimit = false;
-        bool vadCoverageReliable = true;
-        while (!stack.empty() && result->NodesVisited < kMaxVadNodes)
-        {
-            uint64_t node = stack.back();
-            stack.pop_back();
-
-            if (node == 0)
+        result->EffectiveProtectionCoverageComplete =
+            kernelOnly || processQuery != nullptr;
+        const VadTraversalOutcome traversal = TraverseVadNodes(
+            root,
+            kMaxVadNodes,
+            [this, &layout](
+                uint64_t node,
+                uint64_t* left,
+                uint64_t* right,
+                std::wstring* readError)
             {
-                continue;
-            }
-
-            if (!IsKernelAddress(node))
+                return ReadVadChildPointers(
+                    device_,
+                    layout,
+                    node,
+                    left,
+                    right,
+                    readError);
+            },
+            [this,
+             &layout,
+              &options,
+              &vadIntervals,
+              processQuery,
+              kernelOnly,
+              dtb,
+             result](
+                uint64_t node,
+                uint64_t left,
+                uint64_t right,
+                std::wstring* readError)
             {
-                result->Warnings.push_back(L"VAD node is not kernel-canonical: " + Hex(node, 16));
-                vadCoverageReliable = false;
-                continue;
-            }
-
-            if (std::find(visited.begin(), visited.end(), node) != visited.end())
-            {
-                result->Warnings.push_back(L"VAD cycle detected at " + Hex(node, 16));
-                vadCoverageReliable = false;
-                continue;
-            }
-            visited.push_back(node);
-            ++result->NodesVisited;
-
-            ProcessVadRecord record = {};
-            std::wstring readError;
-            if (!ReadVadRecord(device_, layout, node, &record, &readError))
-            {
-                result->Warnings.push_back(L"failed to read VAD node " + Hex(node, 16) + L": " + readError);
-                vadCoverageReliable = false;
-                continue;
-            }
-            EnrichVadEffectiveProtection(processQuery, &record);
-
-            vadIntervals.push_back({record.StartAddress, record.EndAddress});
-
-            if (record.Right != 0)
-            {
-                stack.push_back(record.Right);
-            }
-            if (record.Left != 0)
-            {
-                stack.push_back(record.Left);
-            }
-
-            if (record.Executable)
-            {
-                ++result->ExecutableCount;
-            }
-            if (record.Executable && record.HasPrivateMemory && record.PrivateMemory)
-            {
-                ++result->PrivateExecutableCount;
-            }
-            if (record.WritableExecutable)
-            {
-                ++result->WxCount;
-            }
-
-            if ((options.ProbePe || options.PeOnly) &&
-                record.HasPrivateMemory &&
-                record.PrivateMemory &&
-                record.StartAddress != 0 &&
-                record.Size >= kPageSize &&
-                (dtb != 0 ||
-                 HasExactProcessIdentity(options.Target)))
-            {
-                std::vector<uint8_t> firstPage;
-                std::wstring ignored;
-                record.PeProbeAttempted = true;
-                if (ReadTargetProcessMemory(
+                ProcessVadRecord record = {};
+                if (!ReadVadRecord(
                         device_,
-                        options.Target,
-                        dtb,
-                        record.StartAddress,
-                        static_cast<uint32_t>(kPageSize),
-                        &firstPage,
-                        &ignored))
+                        layout,
+                        node,
+                        left,
+                        right,
+                        &record,
+                        readError))
                 {
-                    if (ProbeForPeHeader(firstPage.data(), firstPage.size(), &record.PeProbe))
+                    return false;
+                }
+
+                EnrichVadEffectiveProtection(processQuery, &record);
+                if (!kernelOnly &&
+                    !record.EffectiveProtectionComplete)
+                {
+                    result->EffectiveProtectionCoverageComplete =
+                        false;
+                }
+                vadIntervals.push_back(
+                    {record.StartAddress, record.EndAddress});
+
+                if (record.Executable)
+                {
+                    ++result->ExecutableCount;
+                }
+                if (record.Executable &&
+                    record.HasPrivateMemory &&
+                    record.PrivateMemory)
+                {
+                    ++result->PrivateExecutableCount;
+                }
+                if (record.WritableExecutable)
+                {
+                    ++result->WxCount;
+                }
+
+                const bool legacyPrivatePeProbe =
+                    (options.ProbePe || options.PeOnly) &&
+                    record.HasPrivateMemory &&
+                    record.PrivateMemory;
+                // A manual mapper may initially leave an image RW or even R;
+                // include committed VADs as well as executable and subsection-
+                // backed mappings. Pure reservations cannot contain a mapped
+                // image and are excluded to avoid meaningless read failures.
+                const bool mappedPeProbe =
+                    options.ProbeAllPe &&
+                    VadBasePageCommitted(record);
+                if ((legacyPrivatePeProbe || mappedPeProbe) &&
+                    record.StartAddress != 0 &&
+                    record.Size >= kPageSize &&
+                    (dtb != 0 ||
+                     HasExactProcessIdentity(options.Target)))
+                {
+                    std::vector<uint8_t> firstPage;
+                    std::wstring ignored;
+                    record.PeProbeAttempted = true;
+                    if (ReadTargetProcessMemory(
+                            device_,
+                            options.Target,
+                            dtb,
+                            record.StartAddress,
+                            static_cast<uint32_t>(kPageSize),
+                            &firstPage,
+                            &ignored))
                     {
-                        record.PeHeaderFound = record.PeProbe.IsPe;
-                        record.PeHeaderSuspicious =
-                            record.PeProbe.MzWiped ||
-                            record.PeProbe.PeSignatureWiped ||
-                            record.PeProbe.ELfanewMismatch;
+                        record.PeProbeReadSucceeded = true;
+                        if (ProbeForPeHeader(
+                                firstPage.data(),
+                                firstPage.size(),
+                                &record.PeProbe))
+                        {
+                            record.PeHeaderFound =
+                                record.PeProbe.IsPe;
+                            record.PeHeaderSuspicious =
+                                record.PeProbe.MzWiped ||
+                                record.PeProbe.PeSignatureWiped ||
+                                record.PeProbe.ELfanewMismatch;
+                        }
                     }
                 }
-            }
 
-            if (record.PeHeaderFound)
-            {
-                ++result->PeLikeCount;
-            }
+                if (record.PeHeaderFound)
+                {
+                    ++result->PeLikeCount;
+                }
 
-            ClassifyVad(&record);
-            bool suspicious =
-                record.WritableExecutable ||
-                (record.Executable && record.HasPrivateMemory && record.PrivateMemory) ||
-                record.PeHeaderFound ||
-                ((record.EffectiveProtectionComplete
+                ClassifyVad(&record);
+                const uint64_t executableBytes =
+                    record.EffectiveProtectionComplete
                         ? record.EffectiveExecutableBytes
-                        : (record.Executable ? record.Size : 0)) >= kLargeVadThreshold &&
-                    record.HasPrivateMemory &&
-                    record.PrivateMemory);
-            if (suspicious)
-            {
-                ++result->SuspiciousCount;
-            }
+                        : (record.Executable ? record.Size : 0);
+                const bool suspicious =
+                    record.WritableExecutable ||
+                    (record.Executable &&
+                     record.HasPrivateMemory &&
+                     record.PrivateMemory) ||
+                    record.PeHeaderFound ||
+                    (executableBytes >= kLargeVadThreshold &&
+                     record.HasPrivateMemory &&
+                     record.PrivateMemory);
+                if (suspicious)
+                {
+                    ++result->SuspiciousCount;
+                }
 
-            ++result->TotalRecords;
-            if (VadMatchesOptions(record, options))
-            {
-                if (options.Limit == 0 || result->Records.size() < options.Limit)
-                {
-                    result->Records.push_back(record);
-                }
-                else
-                {
-                    result->Truncated = true;
-                }
-                ++result->MatchingRecords;
-            }
-        }
+                ++result->TotalRecords;
+                AccumulateMatchingVadRecord(
+                    record,
+                    options,
+                    result);
+                return true;
+            },
+            &result->Warnings);
+        result->NodesVisited = traversal.NodesVisited;
+        const bool vadTraversalHitLimit = traversal.HitLimit;
+        const bool vadCoverageReliable = traversal.CoverageReliable;
         if (processQuery != nullptr)
         {
             CloseHandle(processQuery);
             processQuery = nullptr;
         }
 
-        if (result->NodesVisited >= kMaxVadNodes)
+        if (vadTraversalHitLimit)
         {
-            vadTraversalHitLimit = true;
-            vadCoverageReliable = false;
             result->Truncated = true;
             result->Warnings.push_back(L"VAD traversal hit the node limit");
         }
@@ -3499,6 +4497,15 @@ bool ProcessTriageScanner::ScanVad(
             result->CoverageComplete = false;
             result->Warnings.push_back(
                 L"coverage incomplete: VAD traversal had unreadable/poisoned nodes, cycles, or a node-limit stop");
+        }
+
+        if (requiresEffectiveCoverage &&
+            !result->EffectiveProtectionCoverageComplete)
+        {
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+            result->Warnings.push_back(
+                L"coverage incomplete: one or more VADs lack a complete exact-process VirtualQueryEx view");
         }
 
         if (options.ScanHiddenPtes)
@@ -3516,6 +4523,7 @@ bool ProcessTriageScanner::ScanVad(
                 AddKnownVadlessUserMappings(&vadIntervals);
                 NormalizeVadIntervals(&vadIntervals);
                 ScanHiddenVadPtes(device_, options, vadIntervals, result);
+                ApplyHiddenPteOutputLimit(options, result);
             }
         }
 
@@ -3525,6 +4533,392 @@ bool ProcessTriageScanner::ScanVad(
             result->CoverageComplete = false;
             result->Warnings.push_back(
                 L"coverage incomplete: hidden PTE scan hit the record limit");
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool ProcessTriageScanner::ScanMappedPe(
+    const ProcessMappedPeScanOptions& options,
+    ProcessMappedPeScanResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid mapped PE result output";
+            }
+            break;
+        }
+        *result = ProcessMappedPeScanResult{};
+        result->Target = options.Target;
+
+        if (options.Target.Eprocess == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"mapped PE scan requires a resolved EPROCESS";
+            }
+            break;
+        }
+
+        ProcessVadScanOptions vadOptions = {};
+        vadOptions.Target = options.Target;
+        vadOptions.ProbeAllPe = true;
+        ProcessVadScanResult vadResult = {};
+        std::wstring vadError;
+        if (!ScanVad(vadOptions, &vadResult, &vadError))
+        {
+            if (error != nullptr)
+            {
+                *error = L"mapped PE VAD scan failed: " + vadError;
+            }
+            break;
+        }
+
+        result->VadNodesVisited = vadResult.NodesVisited;
+        result->VadRecords = vadResult.TotalRecords;
+        result->VadCoverageComplete =
+            vadResult.CoverageComplete &&
+            vadResult.EffectiveProtectionCoverageComplete &&
+            !vadResult.Truncated;
+        result->HeaderProbeCoverageComplete =
+            result->VadCoverageComplete;
+        result->Warnings = vadResult.Warnings;
+
+        uint64_t failedVadHeaderProbes = 0;
+        for (const ProcessVadRecord& vad : vadResult.Records)
+        {
+            const bool probeEligible =
+                VadBasePageCommitted(vad);
+            if (probeEligible &&
+                (!vad.PeProbeAttempted ||
+                 !vad.PeProbeReadSucceeded))
+            {
+                ++failedVadHeaderProbes;
+                result->HeaderProbeCoverageComplete = false;
+            }
+
+            if (!vad.PeHeaderFound)
+            {
+                continue;
+            }
+
+            ProcessMappedPeRecord record = {};
+            record.Base = vad.StartAddress;
+            MergeVadIntoMappedRecord(vad, &record);
+            result->Records.push_back(std::move(record));
+        }
+        if (failedVadHeaderProbes != 0)
+        {
+            result->Warnings.push_back(
+                L"mapped PE header probe could not read " +
+                std::to_wstring(failedVadHeaderProbes) +
+                L" committed/executable/section-backed VAD base(s)");
+        }
+
+        const bool kernelOnly =
+            IsKernelOnlyProcessTarget(options.Target);
+        std::vector<ProcessUserModuleRange> modules;
+        if (kernelOnly)
+        {
+            result->LoaderCoverageComplete = true;
+        }
+        else if (options.Target.ProcessId == 0)
+        {
+            result->Warnings.push_back(
+                L"loader module enumeration unavailable: target PID is unresolved");
+        }
+        else
+        {
+            HANDLE identityHandle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                FALSE,
+                options.Target.ProcessId);
+            const bool identityMatched =
+                identityHandle != nullptr &&
+                ProcessHandleMatchesTriageTarget(
+                    identityHandle,
+                    options.Target);
+            if (!identityMatched)
+            {
+                result->Warnings.push_back(
+                    L"loader module enumeration skipped: exact target identity is no longer active");
+            }
+            else
+            {
+                std::wstring moduleWarning;
+                result->LoaderCoverageComplete =
+                    EnumerateUserModules(
+                        options.Target.ProcessId,
+                        &modules,
+                        &moduleWarning);
+                if (result->LoaderCoverageComplete &&
+                    !ProcessHandleMatchesTriageTarget(
+                        identityHandle,
+                        options.Target))
+                {
+                    modules.clear();
+                    result->LoaderCoverageComplete = false;
+                    moduleWarning =
+                        L"target exited while loader modules were enumerated";
+                }
+                if (!result->LoaderCoverageComplete)
+                {
+                    result->Warnings.push_back(
+                        moduleWarning.empty()
+                            ? L"loader module enumeration failed"
+                            : moduleWarning);
+                }
+            }
+            if (identityHandle != nullptr)
+            {
+                CloseHandle(identityHandle);
+            }
+        }
+        result->LoaderRecords = modules.size();
+
+        const uint64_t dtb = TargetUserDtb(options.Target);
+        for (const ProcessUserModuleRange& module : modules)
+        {
+            ProcessMappedPeRecord* record =
+                FindMappedPeByBase(&result->Records, module.Base);
+            if (record == nullptr)
+            {
+                ProcessMappedPeRecord created = {};
+                created.Base = module.Base;
+                result->Records.push_back(std::move(created));
+                record = &result->Records.back();
+            }
+
+            record->LoaderVisible = true;
+            record->LoaderSize = module.Size;
+            record->ImageName = module.ImageName;
+            record->ImagePath = module.ImagePath;
+            AddUniqueText(&record->Sources, L"loader");
+
+            const ProcessVadRecord* containingVad =
+                FindVadContainingBase(vadResult.Records, module.Base);
+            if (containingVad != nullptr)
+            {
+                MergeVadIntoMappedRecord(*containingVad, record);
+            }
+
+            if (!record->HeaderProbeReadSucceeded)
+            {
+                record->HeaderProbeAttempted = true;
+                std::vector<uint8_t> firstPage;
+                std::wstring readError;
+                if (ReadTargetProcessMemory(
+                        device_,
+                        options.Target,
+                        dtb,
+                        module.Base,
+                        static_cast<uint32_t>(kPageSize),
+                        &firstPage,
+                        &readError))
+                {
+                    record->HeaderProbeReadSucceeded = true;
+                    PeHeaderProbe probe = {};
+                    if (ProbeForPeHeader(
+                            firstPage.data(),
+                            firstPage.size(),
+                            &probe))
+                    {
+                        ApplyPeProbeToMappedRecord(probe, record);
+                    }
+                }
+                else
+                {
+                    result->HeaderProbeCoverageComplete = false;
+                    result->Warnings.push_back(
+                        L"loader module header read failed at " +
+                        Hex(module.Base, 16) +
+                        (module.ImageName.empty()
+                            ? L""
+                            : L" (" + module.ImageName + L")") +
+                        (readError.empty()
+                            ? L""
+                            : L": " + readError));
+                }
+            }
+        }
+
+        HANDLE process = nullptr;
+        if (kernelOnly)
+        {
+            result->MappedPathCoverageComplete = true;
+        }
+        else if (options.Target.ProcessId != 0 &&
+                 options.Target.HasCreateTime)
+        {
+            process = OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                FALSE,
+                options.Target.ProcessId);
+            if (process != nullptr &&
+                ProcessHandleMatchesTriageTarget(
+                    process,
+                    options.Target))
+            {
+                result->MappedPathCoverageComplete = true;
+            }
+            else
+            {
+                if (process != nullptr)
+                {
+                    CloseHandle(process);
+                    process = nullptr;
+                }
+                result->Warnings.push_back(
+                    L"mapped-file path view unavailable for the exact target identity");
+            }
+        }
+        else
+        {
+            result->Warnings.push_back(
+                L"mapped-file path view unavailable: exact PID/create-time identity is unresolved");
+        }
+
+        // Query every VAD base, not only records already found through a PE
+        // header or loader entry. This retains loader-invisible SEC_IMAGE and
+        // mapped PE files whose header page is intentionally decommitted.
+        uint64_t imageMappingPathFailures = 0;
+        if (process != nullptr)
+        {
+            for (const ProcessVadRecord& vad : vadResult.Records)
+            {
+                std::wstring mappedPath;
+                const bool mappedPathFound =
+                    QueryMappedPath(
+                        process,
+                        vad.StartAddress,
+                        &mappedPath);
+                const bool imageMapping =
+                    vad.EffectiveImageMapping;
+                const bool pathIdentifiesPe =
+                    mappedPathFound &&
+                    PathLooksLikePeImage(mappedPath);
+                if (!imageMapping && !pathIdentifiesPe)
+                {
+                    continue;
+                }
+
+                ProcessMappedPeRecord* record =
+                    FindMappedPeByBase(
+                        &result->Records,
+                        vad.StartAddress);
+                if (record == nullptr)
+                {
+                    ProcessMappedPeRecord created = {};
+                    created.Base = vad.StartAddress;
+                    result->Records.push_back(std::move(created));
+                    record = &result->Records.back();
+                }
+                MergeVadIntoMappedRecord(vad, record);
+                if (mappedPathFound)
+                {
+                    record->MappedPath = mappedPath;
+                    record->MappedPathVisible = true;
+                    AddUniqueText(
+                        &record->Sources,
+                        L"mapped_path");
+                }
+            }
+        }
+        for (ProcessMappedPeRecord& record : result->Records)
+        {
+            if (process != nullptr &&
+                !record.MappedPathVisible)
+            {
+                std::wstring mappedPath;
+                if (QueryMappedPath(process, record.Base, &mappedPath))
+                {
+                    record.MappedPath = mappedPath;
+                    record.MappedPathVisible = true;
+                    AddUniqueText(&record.Sources, L"mapped_path");
+                }
+            }
+            if (record.VirtualImageMapping &&
+                !record.MappedPathVisible)
+            {
+                ++imageMappingPathFailures;
+                result->MappedPathCoverageComplete = false;
+            }
+            FinalizeMappedPeRecord(&record);
+        }
+        if (imageMappingPathFailures != 0)
+        {
+            result->Warnings.push_back(
+                L"mapped-file path query failed for " +
+                std::to_wstring(imageMappingPathFailures) +
+                L" MEM_IMAGE VAD base(s)");
+        }
+        if (process != nullptr)
+        {
+            CloseHandle(process);
+            process = nullptr;
+        }
+
+        std::sort(
+            result->Records.begin(),
+            result->Records.end(),
+            [](const ProcessMappedPeRecord& left,
+               const ProcessMappedPeRecord& right)
+            {
+                return left.Base < right.Base;
+            });
+
+        result->CandidateMappings = result->Records.size();
+        for (const ProcessMappedPeRecord& record : result->Records)
+        {
+            if (record.MemoryHeaderVisible)
+            {
+                ++result->HeaderVisibleRecords;
+            }
+            if (record.LoaderVisible)
+            {
+                ++result->LoaderVisibleRecords;
+            }
+            if (record.MemoryHeaderVisible &&
+                !record.LoaderVisible)
+            {
+                ++result->MemoryOnlyRecords;
+            }
+            if (record.PrivateMapping)
+            {
+                ++result->PrivateRecords;
+            }
+            if (record.Suspicious)
+            {
+                ++result->SuspiciousRecords;
+            }
+        }
+
+        result->CoverageComplete =
+            result->VadCoverageComplete &&
+            result->LoaderCoverageComplete &&
+            result->HeaderProbeCoverageComplete &&
+            result->MappedPathCoverageComplete;
+        result->Incomplete = !result->CoverageComplete;
+
+        if (options.Limit != 0 &&
+            result->Records.size() > options.Limit)
+        {
+            result->Records.resize(options.Limit);
+            result->Truncated = true;
         }
 
         ok = true;
@@ -4021,6 +5415,9 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
     std::wstringstream json;
     json << L"{\n";
     json << L"  \"schema\":\"kn-live-dbg.vad.v1\",\n";
+    json << L"  \"mode\":\""
+         << (result.InjectionScan ? L"scan" : L"list")
+         << L"\",\n";
     json << L"  \"target\":{\"pid\":" << result.Target.ProcessId
          << L",\"image\":\"" << JsonEscape(result.Target.ImageName)
          << L"\",\"eprocess\":\"" << Hex(result.Target.Eprocess, 16) << L"\"},\n";
@@ -4037,9 +5434,13 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
          << L",\"pte_leaf_mappings\":" << result.PteLeafMappings
          << L",\"page_table_pages_read\":" << result.PageTablePagesRead
          << L",\"page_table_read_failures\":" << result.PageTableReadFailures
+         << L",\"injection_scan\":" << (result.InjectionScan ? L"true" : L"false")
+         << L",\"hidden_pte_scan_enabled\":" << (result.HiddenPteScanEnabled ? L"true" : L"false")
+         << L",\"hidden_pte_truncated\":" << (result.HiddenPteTruncated ? L"true" : L"false")
          << L",\"truncated\":" << (result.Truncated ? L"true" : L"false")
          << L",\"protection_resolved\":" << (result.ProtectionResolved ? L"true" : L"false")
          << L",\"private_memory_resolved\":" << (result.PrivateMemoryResolved ? L"true" : L"false")
+         << L",\"effective_protection_coverage_complete\":" << (result.EffectiveProtectionCoverageComplete ? L"true" : L"false")
          << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false")
          << L",\"incomplete\":" << (result.Incomplete ? L"true" : L"false") << L"},\n";
     json << L"  \"warnings\":[";
@@ -4069,6 +5470,7 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
              << L",\"copy_on_write_executable\":" << (r.CopyOnWriteExecutable ? L"true" : L"false")
              << L",\"effective_protection_queried\":" << (r.EffectiveProtectionQueried ? L"true" : L"false")
              << L",\"effective_protection_complete\":" << (r.EffectiveProtectionComplete ? L"true" : L"false")
+             << L",\"effective_image_mapping\":" << (r.EffectiveImageMapping ? L"true" : L"false")
              << L",\"effective_protection\":\"" << JsonEscape(r.EffectiveProtectionText)
              << L"\",\"effective_committed_bytes\":" << r.EffectiveCommittedBytes
              << L",\"effective_executable_bytes\":" << r.EffectiveExecutableBytes
@@ -4077,9 +5479,11 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
              << L",\"effective_wx_bytes\":" << r.EffectiveWritableExecutableBytes
              << L",\"effective_x_cow_bytes\":" << r.EffectiveCopyOnWriteExecutableBytes
              << L",\"private\":" << (r.HasPrivateMemory && r.PrivateMemory ? L"true" : L"false")
-             << L",\"commit_charge\":" << r.CommitCharge
-             << L",\"pe_like\":" << (r.PeHeaderFound ? L"true" : L"false")
-             << L",\"pe_suspicious\":" << (r.PeHeaderSuspicious ? L"true" : L"false")
+              << L",\"commit_charge\":" << r.CommitCharge
+              << L",\"pe_probe_attempted\":" << (r.PeProbeAttempted ? L"true" : L"false")
+              << L",\"pe_probe_read_succeeded\":" << (r.PeProbeReadSucceeded ? L"true" : L"false")
+              << L",\"pe_like\":" << (r.PeHeaderFound ? L"true" : L"false")
+              << L",\"pe_suspicious\":" << (r.PeHeaderSuspicious ? L"true" : L"false")
              << L",\"classification\":\"" << JsonEscape(r.Classification)
              << L"\"}";
         if (i + 1 != result.Records.size())
@@ -4108,6 +5512,141 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
              << L",\"notes\":\"" << JsonEscape(r.Notes)
              << L"\"}";
         if (i + 1 != result.HiddenPteRecords.size())
+        {
+            json << L",";
+        }
+        json << L"\n";
+    }
+    json << L"  ]\n";
+    json << L"}\n";
+    return json.str();
+}
+
+std::wstring BuildProcessMappedPeJson(
+    const ProcessMappedPeScanResult& result)
+{
+    std::wstringstream json;
+    json << L"{\n";
+    json << L"  \"schema\":\"kn-live-dbg.process-pe.v1\",\n";
+    json << L"  \"target\":{\"pid\":" << result.Target.ProcessId
+         << L",\"image\":\"" << JsonEscape(result.Target.ImageName)
+         << L"\",\"eprocess\":\"" << Hex(result.Target.Eprocess, 16)
+         << L"\"},\n";
+    json << L"  \"summary\":{\"vad_nodes_visited\":"
+         << result.VadNodesVisited
+         << L",\"vad_records\":" << result.VadRecords
+         << L",\"loader_records\":" << result.LoaderRecords
+         << L",\"candidate_mappings\":" << result.CandidateMappings
+         << L",\"header_visible\":" << result.HeaderVisibleRecords
+         << L",\"loader_visible\":" << result.LoaderVisibleRecords
+         << L",\"memory_only\":" << result.MemoryOnlyRecords
+         << L",\"private\":" << result.PrivateRecords
+         << L",\"suspicious\":" << result.SuspiciousRecords
+         << L",\"vad_coverage_complete\":"
+         << (result.VadCoverageComplete ? L"true" : L"false")
+         << L",\"loader_coverage_complete\":"
+         << (result.LoaderCoverageComplete ? L"true" : L"false")
+         << L",\"header_probe_coverage_complete\":"
+         << (result.HeaderProbeCoverageComplete ? L"true" : L"false")
+         << L",\"mapped_path_coverage_complete\":"
+         << (result.MappedPathCoverageComplete ? L"true" : L"false")
+         << L",\"coverage_complete\":"
+         << (result.CoverageComplete ? L"true" : L"false")
+         << L",\"incomplete\":"
+         << (result.Incomplete ? L"true" : L"false")
+         << L",\"truncated\":"
+         << (result.Truncated ? L"true" : L"false")
+         << L"},\n";
+    json << L"  \"warnings\":[";
+    for (size_t i = 0; i < result.Warnings.size(); ++i)
+    {
+        if (i != 0)
+        {
+            json << L",";
+        }
+        json << L"\"" << JsonEscape(result.Warnings[i]) << L"\"";
+    }
+    json << L"],\n";
+    json << L"  \"records\":[\n";
+    for (size_t i = 0; i < result.Records.size(); ++i)
+    {
+        const ProcessMappedPeRecord& record = result.Records[i];
+        json << L"    {\"base\":\"" << Hex(record.Base, 16)
+             << L"\",\"loader_size\":" << record.LoaderSize
+             << L",\"vad\":\"" << Hex(record.VadAddress, 16)
+             << L"\",\"vad_start\":\"" << Hex(record.VadStart, 16)
+             << L"\",\"vad_end\":\"" << Hex(record.VadEnd, 16)
+             << L"\",\"vad_size\":" << record.VadSize
+             << L",\"header_image_size\":" << record.HeaderImageSize
+             << L",\"preferred_image_base\":\""
+             << Hex(record.PreferredImageBase, 16)
+             << L"\",\"entry_point_rva\":" << record.EntryPointRva
+             << L",\"entry_point_va\":\"" << Hex(record.EntryPointVa, 16)
+             << L"\",\"entry_point_valid\":"
+             << (record.EntryPointValid ? L"true" : L"false")
+             << L",\"size_of_headers\":" << record.SizeOfHeaders
+             << L",\"timestamp\":" << record.TimeDateStamp
+             << L",\"machine\":" << record.Machine
+             << L",\"sections\":" << record.NumberOfSections
+             << L",\"image\":\"" << JsonEscape(record.ImageName)
+             << L"\",\"loader_path\":\"" << JsonEscape(record.ImagePath)
+             << L"\",\"mapped_path\":\"" << JsonEscape(record.MappedPath)
+             << L"\",\"allocation_protection\":\""
+             << JsonEscape(record.AllocationProtection)
+             << L"\",\"effective_protection\":\""
+             << JsonEscape(record.EffectiveProtection)
+             << L"\",\"loader_visible\":"
+             << (record.LoaderVisible ? L"true" : L"false")
+             << L",\"vad_visible\":"
+             << (record.VadVisible ? L"true" : L"false")
+             << L",\"header_probe_attempted\":"
+             << (record.HeaderProbeAttempted ? L"true" : L"false")
+             << L",\"header_probe_read_succeeded\":"
+             << (record.HeaderProbeReadSucceeded ? L"true" : L"false")
+             << L",\"memory_header_visible\":"
+             << (record.MemoryHeaderVisible ? L"true" : L"false")
+             << L",\"mapped_path_visible\":"
+             << (record.MappedPathVisible ? L"true" : L"false")
+             << L",\"virtual_image_mapping\":"
+             << (record.VirtualImageMapping ? L"true" : L"false")
+             << L",\"private_mapping\":"
+             << (record.PrivateMapping ? L"true" : L"false")
+             << L",\"image_backed\":"
+             << (record.ImageBacked ? L"true" : L"false")
+             << L",\"executable\":"
+             << (record.Executable ? L"true" : L"false")
+             << L",\"writable_executable\":"
+             << (record.WritableExecutable ? L"true" : L"false")
+             << L",\"is_64_bit\":"
+             << (record.Is64Bit ? L"true" : L"false")
+             << L",\"mz_wiped\":"
+             << (record.MzWiped ? L"true" : L"false")
+             << L",\"pe_signature_wiped\":"
+             << (record.PeSignatureWiped ? L"true" : L"false")
+             << L",\"e_lfanew_mismatch\":"
+             << (record.ELfanewMismatch ? L"true" : L"false")
+             << L",\"suspicious\":"
+             << (record.Suspicious ? L"true" : L"false")
+             << L",\"sources\":[";
+        for (size_t source = 0; source < record.Sources.size(); ++source)
+        {
+            if (source != 0)
+            {
+                json << L",";
+            }
+            json << L"\"" << JsonEscape(record.Sources[source]) << L"\"";
+        }
+        json << L"],\"reasons\":[";
+        for (size_t reason = 0; reason < record.Reasons.size(); ++reason)
+        {
+            if (reason != 0)
+            {
+                json << L",";
+            }
+            json << L"\"" << JsonEscape(record.Reasons[reason]) << L"\"";
+        }
+        json << L"]}";
+        if (i + 1 != result.Records.size())
         {
             json << L",";
         }

@@ -53,7 +53,7 @@ namespace
     const McpToolArg kArgsCallbacks[] = { {L"scope", L"string", false}, {L"module", L"string", false} };
     const McpToolArg kArgsWfp[] = { {L"scope", L"string", false}, {L"module", L"string", false}, {L"provider", L"string", false}, {L"layer", L"string", false} };
     const McpToolArg kArgsAlpc[] = { {L"scope", L"string", false}, {L"name", L"string", false}, {L"pid", L"string", false} };
-    const McpToolArg kArgsVad[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"exec", L"boolean", false}, {L"private", L"boolean", false}, {L"wx", L"boolean", false}, {L"pe", L"boolean", false}, {L"hiddenpte", L"boolean", false}, {L"dkom", L"boolean", false}, {L"summary", L"boolean", false}, {L"limit", L"string", false} };
+    const McpToolArg kArgsVad[] = { {L"mode", L"string", false}, {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"exec", L"boolean", false}, {L"private", L"boolean", false}, {L"wx", L"boolean", false}, {L"pe", L"boolean", false}, {L"hiddenpte", L"boolean", false}, {L"dkom", L"boolean", false}, {L"summary", L"boolean", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsThreads[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"apc", L"boolean", false}, {L"stacks", L"boolean", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsTokenInspect[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsNmi[] = { {L"scope", L"string", false} };
@@ -116,7 +116,7 @@ namespace
         { L"wfp.list", L"Enumerate Windows Filtering Platform providers/sublayers/callouts/filters/layers.", true, MCP_ARG_TABLE(kArgsWfp) },
         { L"wfp.kernel_callouts", L"Resolve kernel-mode WFP classify/notify/flowDelete callout pointers from netio.sys.", true, nullptr, 0 },
         { L"alpc.list", L"Enumerate ALPC ports and connections.", true, MCP_ARG_TABLE(kArgsAlpc) },
-        { L"vad.list", L"Enumerate process VADs with optional W+X / private / hidden-PTE / DKOM checks.", true, MCP_ARG_TABLE(kArgsVad) },
+        { L"vad.list", L"Enumerate VADs, scan a process for injected/hidden executable regions, or inventory loaded/mapped PEs (mode: list, scan, modules).", true, MCP_ARG_TABLE(kArgsVad) },
         { L"threads.list", L"Enumerate process threads, start addresses, APC and stack evidence.", true, MCP_ARG_TABLE(kArgsThreads) },
         { L"etw.integrity", L"Check ETW logger / GetCpuClock integrity (InfinityHook).", true, nullptr, 0 },
         { L"etw.providers", L"Heuristic/partial ETW provider registration surface and enable-callback ownership.", true, nullptr, 0 },
@@ -198,7 +198,7 @@ namespace
         { L"minifilter-review", L"Review minifilter callbacks for rogue filters.", nullptr,
           L"Run callbacks.list scope=minifilter, sort by altitude, and run module.integrity on each filter's owning driver. Flag unusual altitudes, missing names/unload routines, and out-of-module operation callbacks. Read-only." },
         { L"hunt-triage", L"Triage a process for user-mode injection / evasion.", L"pid",
-          L"For the given PID: process.find, then vad.list with exec/private/wx/hiddenpte/dkom, threads.list with stacks, and ti.query by pid. Rank findings by severity and keep raw VAD/thread/TI evidence. Read-only." },
+          L"For the given PID: process.find, then vad.list mode=scan, vad.list mode=modules, threads.list with stacks, and ti.query by pid. Rank findings by severity and keep raw VAD/PE/thread/TI evidence. Read-only." },
         { L"etw-infinityhook-check", L"Sweep for ETW/syscall tampering.", nullptr,
           L"Run etw.integrity and nmi.list. Correlate any flagged GetCpuClock or callback target with module ownership via address.inspect. Read-only." },
         { L"wfp-surface", L"Map the Windows Filtering Platform surface.", nullptr,

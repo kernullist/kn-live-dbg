@@ -34,6 +34,7 @@ struct ProcessVadProtectionRange
     uint64_t StartAddress = 0;
     uint64_t EndAddress = 0;
     uint32_t Protection = 0;
+    uint32_t Type = 0;
     bool Committed = false;
     bool Executable = false;
     bool Writable = false;
@@ -75,6 +76,7 @@ struct ProcessVadRecord
     uint64_t EffectiveCopyOnWriteBytes = 0;
     uint64_t EffectiveWritableExecutableBytes = 0;
     uint64_t EffectiveCopyOnWriteExecutableBytes = 0;
+    bool EffectiveImageMapping = false;
     std::wstring EffectiveProtectionText;
     std::vector<ProcessVadProtectionRange> EffectiveProtectionRanges;
     bool HasPrivateMemory = false;
@@ -86,6 +88,7 @@ struct ProcessVadRecord
     bool HasSubsection = false;
     uint64_t Subsection = 0;
     bool PeProbeAttempted = false;
+    bool PeProbeReadSucceeded = false;
     bool PeHeaderFound = false;
     bool PeHeaderSuspicious = false;
     PeHeaderProbe PeProbe = {};
@@ -119,6 +122,12 @@ struct ProcessVadScanOptions
     bool WxOnly = false;
     bool PeOnly = false;
     bool ProbePe = false;
+    // Probe every plausible image-backed or executable-private mapping rather
+    // than only legacy private-VAD candidates. Used by the mapped-PE inventory.
+    bool ProbeAllPe = false;
+    // Compose private executable, W+X, PE/manual-map, large executable, and
+    // hidden executable-PTE evidence into one target scan.
+    bool InjectionScan = false;
     bool ScanHiddenPtes = false;
     bool HiddenPteExecutableOnly = false;
     bool RequireVadCoverageForHiddenPtes = false;
@@ -155,9 +164,82 @@ struct ProcessVadScanResult
     // signals cannot be trusted as complete (not a clean empty result).
     bool ProtectionResolved = false;
     bool PrivateMemoryResolved = false;
+    bool EffectiveProtectionCoverageComplete = false;
     bool CoverageComplete = true;
     bool Incomplete = false;
+    bool InjectionScan = false;
     std::wstring LayoutSource;
+};
+
+struct ProcessMappedPeRecord
+{
+    uint64_t Base = 0;
+    uint64_t LoaderSize = 0;
+    uint64_t VadAddress = 0;
+    uint64_t VadStart = 0;
+    uint64_t VadEnd = 0;
+    uint64_t VadSize = 0;
+    uint64_t HeaderImageSize = 0;
+    uint64_t PreferredImageBase = 0;
+    uint64_t EntryPointVa = 0;
+    uint32_t EntryPointRva = 0;
+    uint32_t SizeOfHeaders = 0;
+    uint32_t TimeDateStamp = 0;
+    uint16_t Machine = 0;
+    uint16_t NumberOfSections = 0;
+    std::wstring ImageName;
+    std::wstring ImagePath;
+    std::wstring MappedPath;
+    std::wstring AllocationProtection;
+    std::wstring EffectiveProtection;
+    bool LoaderVisible = false;
+    bool VadVisible = false;
+    bool HeaderProbeAttempted = false;
+    bool HeaderProbeReadSucceeded = false;
+    bool MemoryHeaderVisible = false;
+    bool MappedPathVisible = false;
+    bool VirtualImageMapping = false;
+    bool PrivateMapping = false;
+    bool ImageBacked = false;
+    bool Executable = false;
+    bool WritableExecutable = false;
+    bool Is64Bit = false;
+    bool MzWiped = false;
+    bool PeSignatureWiped = false;
+    bool ELfanewMismatch = false;
+    bool EntryPointValid = false;
+    bool Suspicious = false;
+    std::vector<std::wstring> Sources;
+    std::vector<std::wstring> Reasons;
+};
+
+struct ProcessMappedPeScanOptions
+{
+    ProcessTriageTarget Target = {};
+    uint32_t Limit = 0;
+};
+
+struct ProcessMappedPeScanResult
+{
+    ProcessTriageTarget Target = {};
+    std::vector<ProcessMappedPeRecord> Records;
+    std::vector<std::wstring> Warnings;
+    uint64_t VadNodesVisited = 0;
+    uint64_t VadRecords = 0;
+    uint64_t LoaderRecords = 0;
+    uint64_t CandidateMappings = 0;
+    uint64_t HeaderVisibleRecords = 0;
+    uint64_t LoaderVisibleRecords = 0;
+    uint64_t MemoryOnlyRecords = 0;
+    uint64_t PrivateRecords = 0;
+    uint64_t SuspiciousRecords = 0;
+    bool VadCoverageComplete = false;
+    bool LoaderCoverageComplete = false;
+    bool HeaderProbeCoverageComplete = false;
+    bool MappedPathCoverageComplete = false;
+    bool CoverageComplete = false;
+    bool Incomplete = false;
+    bool Truncated = false;
 };
 
 struct ProcessApcEntryRecord
@@ -302,6 +384,7 @@ public:
     ProcessTriageScanner(DeviceClient& device, SymbolEngine& symbols);
 
     bool ScanVad(const ProcessVadScanOptions& options, ProcessVadScanResult* result, std::wstring* error);
+    bool ScanMappedPe(const ProcessMappedPeScanOptions& options, ProcessMappedPeScanResult* result, std::wstring* error);
     bool ScanThreads(const ProcessThreadScanOptions& options, ProcessThreadScanResult* result, std::wstring* error);
 
 private:
@@ -310,4 +393,9 @@ private:
 };
 
 std::wstring BuildProcessVadJson(const ProcessVadScanResult& result);
+std::wstring BuildProcessMappedPeJson(const ProcessMappedPeScanResult& result);
 std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result);
+
+bool ProcessTriageVadTraversalSelfTest();
+bool ProcessTriageVadFilterSelfTest();
+bool ProcessTriageMappedPeSelfTest();

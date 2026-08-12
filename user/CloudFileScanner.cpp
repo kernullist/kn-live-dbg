@@ -44,6 +44,30 @@ namespace
         Incomplete
     };
 
+    bool IsOrdinaryFilePlaceholderInfoStatus(
+        uint32_t status)
+    {
+        return status == static_cast<uint32_t>(
+                             HRESULT_FROM_WIN32(
+                                 ERROR_INVALID_FUNCTION)) ||
+            status == static_cast<uint32_t>(
+                          HRESULT_FROM_WIN32(
+                              ERROR_NOT_A_REPARSE_POINT));
+    }
+
+    bool HasAuthoritativeNonPlaceholderViews(
+        const CloudFilePlaceholderRecord& record)
+    {
+        return record.FileAttributeTagInfoAvailable &&
+            !record.CloudReparseTag &&
+            (record.FileAttributes &
+             FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+            record.FsctlReparseTagQueryError ==
+                ERROR_NOT_A_REPARSE_POINT &&
+            IsOrdinaryFilePlaceholderInfoStatus(
+                record.PlaceholderInfoQueryStatus);
+    }
+
     struct ReparseDataHeader
     {
         uint32_t Tag;
@@ -587,12 +611,27 @@ bool CloudFileScanner::QueryPlaceholder(
         }
         else
         {
-            if (!warning.empty() &&
-                !infoError.empty())
+            // CfGetPlaceholderInfo returns ERROR_INVALID_FUNCTION on ordinary
+            // local NTFS files on current Windows builds.  Treat that as a
+            // clean negative only when both FileAttributeTagInfo and an
+            // independent FSCTL_GET_REPARSE_POINT query agree that this is not
+            // a reparse point.  A visible Cloud tag or an indeterminate FSCTL
+            // result must remain coverage-incomplete.
+            if (HasAuthoritativeNonPlaceholderViews(
+                    *record))
             {
-                warning += L"; ";
+                record->PlaceholderInspectionComplete =
+                    true;
             }
-            warning += infoError;
+            else
+            {
+                if (!warning.empty() &&
+                    !infoError.empty())
+                {
+                    warning += L"; ";
+                }
+                warning += infoError;
+            }
         }
 
         if (record->PlaceholderStateAvailable &&
@@ -636,6 +675,42 @@ bool CloudFileScannerSelfTest()
             IO_REPARSE_TAG_WOF) ||
         IsCloudReparseTag(
             IO_REPARSE_TAG_SYMLINK))
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord ordinary = {};
+    ordinary.FileAttributeTagInfoAvailable = true;
+    ordinary.FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+    ordinary.FsctlReparseTagQueryError =
+        ERROR_NOT_A_REPARSE_POINT;
+    ordinary.PlaceholderInfoQueryStatus =
+        static_cast<uint32_t>(
+            HRESULT_FROM_WIN32(
+                ERROR_INVALID_FUNCTION));
+    if (!HasAuthoritativeNonPlaceholderViews(
+            ordinary))
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord cloudTagged =
+        ordinary;
+    cloudTagged.FileAttributes |=
+        FILE_ATTRIBUTE_REPARSE_POINT;
+    cloudTagged.CloudReparseTag = true;
+    if (HasAuthoritativeNonPlaceholderViews(
+            cloudTagged))
+    {
+        return false;
+    }
+
+    CloudFilePlaceholderRecord fsctlIndeterminate =
+        ordinary;
+    fsctlIndeterminate.FsctlReparseTagQueryError =
+        ERROR_ACCESS_DENIED;
+    if (HasAuthoritativeNonPlaceholderViews(
+            fsctlIndeterminate))
     {
         return false;
     }
