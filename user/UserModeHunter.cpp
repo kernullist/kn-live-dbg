@@ -26212,9 +26212,9 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
 
         AddThreatIntelCorrelationFindings(result, processes, options);
 
-        // Token privilege triage. Hunt uses elevated-signal mode so common
-        // admin SeDebug rights on developer desktops do not poison clean-host
-        // gates. PDB coverage is required for every privilege finding.
+        // Whole-system hunt promotes only a PDB-backed structural token mask
+        // inconsistency. High-risk privileges are useful interactive/snapshot
+        // telemetry, but their presence alone is not tampering evidence.
         if (options.Mode != HuntMode::Quick)
         {
             TokenPrivilegeScanner tokenScanner(device_, symbols_);
@@ -26236,30 +26236,18 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 }
                 for (const TokenPrivilegeRecord& token : tokenResult.Records)
                 {
-                    if (!token.Suspicious)
+                    if (!token.StructuralInconsistency)
                     {
                         continue;
                     }
 
-                    bool structural = false;
-                    for (const std::wstring& note : token.Notes)
-                    {
-                        if (note.find(L"not present in Present") != std::wstring::npos)
-                        {
-                            structural = true;
-                            break;
-                        }
-                    }
-
                     HuntFinding finding = {};
                     finding.Risk = L"high";
-                    finding.Confidence = structural ? L"high" : L"medium";
-                    finding.ClassName = structural
-                        ? L"token_privilege_inconsistency"
-                        : L"unexpected_enabled_privilege";
-                    finding.Title = structural
-                        ? L"token Enabled privileges not present in Present mask"
-                        : L"elevating token privileges enabled";
+                    finding.Confidence = L"high";
+                    finding.ClassName =
+                        L"token_privilege_inconsistency";
+                    finding.Title =
+                        L"token Enabled privileges not present in Present mask";
                     finding.ProcessId = token.ProcessId;
                     finding.Eprocess = token.Eprocess;
                     finding.ImageName = token.ImageName;

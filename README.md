@@ -259,6 +259,9 @@ callbacks [scope] /module <module>
 !dml_proc [pid|name]
 !hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
+!vad scan <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
+!vad modules <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
+!vad mappedpe <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|filters|layers]
 !wfp kernelcallouts
@@ -1078,10 +1081,21 @@ operator-facing console phrase is generalized.
 
 ```text
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
+!vad scan <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
+!vad modules <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
+!vad mappedpe <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
 !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
 ```
 
-Targets can be decimal PID, image name, or EPROCESS address. `!vad` resolves `_EPROCESS.VadRoot` through PDB/DIA type metadata, walks the balanced tree with bounded traversal and cycle detection, decodes VPN range, allocation/default protection, private-memory, commit, large/no-change, subsection, and PE-like first-page evidence when available, then enriches each VAD with current committed protection totals from `VirtualQueryEx`. `/exec`, `/private`, `/wx`, and `/pe` narrow the output; `/wx` means at least one currently writable-executable subrange when the effective query is complete, and `/pe` probes private VAD first pages with the same PE header detector used by pool PE hunting. `/hiddenpte` also walks the target process page tables from its DTB, subtracts the normalized VAD coverage plus known VAD-less OS shared mappings, and prints `[hidden-pte]` ranges where a present user PTE exists without VAD coverage, which is a DKOM-style hidden memory signal.
+Targets can be decimal PID, image name, or EPROCESS address. `!vad` resolves `_EPROCESS.VadRoot` through PDB/DIA type metadata, walks the complete balanced tree with bounded traversal and cycle detection, decodes VPN range, allocation/default protection, private-memory, commit, large/no-change, subsection, and PE-like first-page evidence when available, then enriches each VAD with current committed protection totals from `VirtualQueryEx`. Child links are queued before optional record metadata is decoded, so an unreadable or non-matching node cannot hide its descendants. `/exec`, `/private`, `/wx`, and `/pe` narrow only the emitted records; `/limit` caps output after the full tree has been counted. `/wx` means at least one currently writable-executable subrange when the effective query is complete, and `/pe` probes committed private VAD base pages with the same PE header detector used by pool PE hunting. `/hiddenpte` also walks the target process page tables from its DTB, subtracts the normalized VAD coverage plus known VAD-less OS shared mappings, and prints `[hidden-pte]` ranges where a present user PTE exists without VAD coverage, which is a DKOM-style hidden memory signal.
+
+`!vad scan` is the injection-oriented preset. It combines private executable, W+X, intact or signature-wiped private PE, large private executable, and executable present-PTE-without-VAD evidence, and emits `kn-live-dbg.vad.v1` JSON with explicit traversal, PE-probe, effective-protection, and hidden-PTE coverage fields. `!vad modules` produces a complete cross-view PE inventory rather than relying on the loader list alone: it merges Toolhelp loader modules, every decoded VAD, `VirtualQueryEx` `MEM_IMAGE` identity, in-memory PE headers and entry points, and mapped-file paths by allocation base. Its `kn-live-dbg.process-pe.v1` JSON preserves each source, path/header/protection evidence, suspicious reasons, and independent coverage flags, including loader-invisible private/manual mappings and SEC_IMAGE mappings whose header page was decommitted or whose file has no PE-like extension. `!vad mappedpe` is a compatibility alias for `!vad modules`; `/scan`, `/modules`, and `/mappedpe` remain accepted after a legacy target.
+
+The elevated positive-control gate exercises every VAD filter plus both new modes by PID and by EPROCESS, asserts full traversal and output-only `/limit` semantics, checks exact PID/EPROCESS result-set equality, and validates private RX/RWX, intact/wiped PE, large executable, hidden-PTE, and loader-invisible SEC_IMAGE scenarios:
+
+```powershell
+.\tools\validate-process-vad.ps1 -Configuration Release
+```
 
 `!threads` walks the process thread list, prints ETHREAD/TID/start/Win32StartAddress/TEB/module/VAD annotations, optionally includes user-stack bounds plus bounded stack references into suspicious executable memory, and `/apc` surfaces conservative APC queue evidence when ETHREAD/KAPC layouts are available. Address-to-VAD annotations use the exact current protection subrange when available. On current Windows user APCs whose `KAPC.NormalRoutine` is an `ntdll.dll` dispatcher, the scanner also checks the context/argument slots and promotes a caller callback only when it resolves to suspicious executable provenance; ordinary data arguments remain telemetry. Both commands support `/json <path>` with stable field names for diffing. Warnings are expected on PDB drift, protected process/module enumeration failures, partial reads, or APC layouts that cannot be interpreted confidently.
 

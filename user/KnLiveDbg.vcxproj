@@ -70,7 +70,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Psapi.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -94,7 +94,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Psapi.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>

@@ -319,6 +319,28 @@ std::wstring TokenPrivilegeScanner::BuildPrivilegeFingerprint(uint64_t present, 
     return stream.str();
 }
 
+bool TokenPrivilegeScanner::HasStructuralMaskInconsistency(
+    uint64_t present,
+    uint64_t enabled)
+{
+    // Enabled is a subset of privileges currently assigned to the token.
+    // EnabledByDefault is deliberately excluded: live Windows tokens retain
+    // default-policy bits that are not necessarily in the current Present
+    // mask (confirmed against PDB-resolved _SEP_TOKEN_PRIVILEGES on the host).
+    return (enabled & ~present) != 0;
+}
+
+bool TokenPrivilegeMaskInvariantSelfTest()
+{
+    return !TokenPrivilegeScanner::HasStructuralMaskInconsistency(
+               0x20800000ull,
+               0x20800000ull) &&
+        !TokenPrivilegeScanner::HasStructuralMaskInconsistency(0, 0) &&
+        TokenPrivilegeScanner::HasStructuralMaskInconsistency(
+            0x20800000ull,
+            0x60800000ull);
+}
+
 TokenPrivilegeScanner::TokenPrivilegeScanner(DeviceClient& device, SymbolEngine& symbols) :
     device_(device),
     symbols_(symbols)
@@ -661,17 +683,15 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             const bool privilegeFindingsAllowed =
                 !options.RequirePdbLayoutForPrivilegeFindings || result->LayoutFromPdb;
 
-            // Enabled and EnabledByDefault bits must be subsets of Present.
-            if (privilegeFindingsAllowed && (enabled & ~present) != 0)
+            // Only Enabled is a structural subset of Present. Windows may
+            // preserve EnabledByDefault policy bits outside the current
+            // Present mask; treating those as corruption poisons clean hosts.
+            if (privilegeFindingsAllowed &&
+                HasStructuralMaskInconsistency(present, enabled))
             {
+                record.StructuralInconsistency = true;
                 record.Suspicious = true;
                 record.Notes.push_back(L"Enabled privilege bits not present in Present mask");
-            }
-            if (privilegeFindingsAllowed && (enabledByDefault & ~present) != 0)
-            {
-                record.Suspicious = true;
-                record.Notes.push_back(
-                    L"EnabledByDefault privilege bits not present in Present mask");
             }
 
             for (uint32_t bit = 0; bit < kMaxPrivilegeBits; ++bit)
@@ -823,6 +843,8 @@ std::wstring BuildTokenPrivilegeJson(const TokenPrivilegeScanResult& result)
         out += record.SystemProfile ? L"true" : L"false";
         out += L",\"identityResolved\":";
         out += record.IdentityResolved ? L"true" : L"false";
+        out += L",\"structuralInconsistency\":";
+        out += record.StructuralInconsistency ? L"true" : L"false";
         out += L",\"suspicious\":";
         out += record.Suspicious ? L"true" : L"false";
         out += L",\"tokenResolved\":";

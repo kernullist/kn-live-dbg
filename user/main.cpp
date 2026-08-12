@@ -1756,7 +1756,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"\n";
     std::wcout << L"  help callbacks       callback scanners and module filters\n";
     std::wcout << L"  help !hunt           whole-system user-mode anomaly hunt\n";
-    std::wcout << L"  help !vad            VAD tree triage, hidden PTE checks, PE-like private memory\n";
+    std::wcout << L"  help !vad            VAD triage, injection scan, hidden PTEs, mapped-PE inventory\n";
     std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
     std::wcout << L"  help !pool           big-pool allocation triage and W+X annotation\n";
     std::wcout << L"  help !timeline       time-ordered TI/snapshot/live evidence store\n";
@@ -1783,7 +1783,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  memory        procctx <pid> | vtop /process <pid> <user-address> | pdb <pa> 80\n";
     std::wcout << L"  types/code    dt nt!_EPROCESS <address> | u nt!KiSystemCall64 8 | uf nt!KiSystemCall64 512\n";
     std::wcout << L"  callbacks     callbacks all | callbacks imageload | callbacks process WdFilter.sys\n";
-    std::wcout << L"  process       !hunt /deep /summary | !dml_proc [pid|name] | !vad <pid> /exec /private | !threads <pid> /apc\n";
+    std::wcout << L"  process       !hunt /deep /summary | !vad scan <pid> | !vad modules <pid> | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
     std::wcout << L"  quiet-surface !hal | !hive | !token <pid> | !dpc | !timer | !etw providers | !etw ti-cross\n";
@@ -3216,12 +3216,18 @@ static void AddVadOptionCompletionCandidates(std::vector<std::wstring>* candidat
 {
     static const wchar_t* values[] =
     {
+        L"scan",
+        L"modules",
+        L"mappedpe",
         L"/summary",
         L"/exec",
         L"/private",
         L"/wx",
         L"/pe",
         L"/hiddenpte",
+        L"/scan",
+        L"/modules",
+        L"/mappedpe",
         L"/limit",
         L"/json",
         L"help"
@@ -3929,7 +3935,9 @@ static std::wstring CompletionCanonicalCommand(const std::wstring& value)
     std::wstring command = NormalizeInputCommand(value);
 
     const CommandInfo* info = CommandRegistry::Find(value);
-    if (info != nullptr && info->Canonical != nullptr)
+    if (info != nullptr &&
+        info->Support == CommandSupport::Alias &&
+        info->Canonical != nullptr)
     {
         command = NormalizeInputCommand(info->Canonical);
     }
@@ -23509,6 +23517,14 @@ static void PrintVadHelp()
 {
     std::wcout << L"!vad command:\n";
     std::wcout << L"  !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !vad scan <pid|eprocess> [/summary] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !vad modules <pid|eprocess> [/summary] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !vad mappedpe <pid|eprocess> [/summary] [/limit <n>] [/json <path>]  (alias for modules)\n";
+    std::wcout << L"\n";
+    std::wcout << L"modes:\n";
+    std::wcout << L"  scan       find private executable, W+X, manual/wiped PE, large executable, and executable hidden-PTE regions\n";
+    std::wcout << L"  modules    cross-view all observable loaded/mapped PEs from loader, VAD, memory-header, and mapped-path evidence\n";
+    std::wcout << L"  mappedpe   compatibility alias for modules\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /summary   print only the summary and warnings\n";
@@ -23522,6 +23538,7 @@ static void PrintVadHelp()
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  The target can be a decimal PID, image name, or kernel EPROCESS address.\n";
+    std::wcout << L"  Compatibility aliases /scan, /modules, and /mappedpe are accepted after a legacy target.\n";
     std::wcout << L"  Layouts are resolved from nt PDBs at runtime; drift or protected targets may produce partial warnings.\n";
     std::wcout << L"  Flags are evidence for triage, not proof of malicious injection.\n";
 }
@@ -24628,6 +24645,68 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             ProcessTriageEffectiveProtectionSelfTest(),
             L"process-triage-effective-protection-range-bounds");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ProcessTriageVadTraversalSelfTest(),
+            L"process-triage-vad-continues-after-unreadable-node");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ProcessTriageVadFilterSelfTest(),
+            L"process-triage-vad-filter-and-output-limit-semantics");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ProcessTriageMappedPeSelfTest(),
+            L"process-triage-mapped-pe-cross-view-merge");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            TokenPrivilegeMaskInvariantSelfTest(),
+            L"token-privilege-enabled-present-invariant");
+        CheckCompletionCandidate(
+            &context,
+            {L"!vad"},
+            L"scan",
+            L"vad-scan-subcommand-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!vad"},
+            L"modules",
+            L"vad-modules-subcommand-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!vad"},
+            L"mappedpe",
+            L"vad-mappedpe-subcommand-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"help", L"!vad"},
+            L"mappedpe",
+            L"vad-mappedpe-subcommand-help-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"help", L"!vad"},
+            L"/mappedpe",
+            L"vad-mappedpe-alias-help-completion");
+        {
+            const std::wstring prefixHelp =
+                CaptureDetailedHelpOutput(
+                    {L"help", L"!vad"},
+                    1);
+            const std::wstring suffixHelp =
+                CaptureDetailedHelpOutput(
+                    {L"!vad", L"help"},
+                    0);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                prefixHelp.find(L"!vad mappedpe") !=
+                        std::wstring::npos &&
+                    prefixHelp.find(L"alias for modules") !=
+                        std::wstring::npos &&
+                    suffixHelp.find(L"!vad mappedpe") !=
+                        std::wstring::npos &&
+                    suffixHelp.find(L"alias for modules") !=
+                        std::wstring::npos,
+                L"vad-mappedpe-detailed-help-routes");
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             SnapshotDriverDispatchDiffSelfTest(),
@@ -27486,7 +27565,25 @@ static bool ValidateVadCommandArgumentShape(
             break;
         }
 
-        if (IsSwitchLikeToken(args[1]))
+        size_t targetIndex = 1;
+        const std::wstring requestedMode = ToLower(args[1]);
+        if (requestedMode == L"scan" ||
+            requestedMode == L"modules" ||
+            requestedMode == L"mappedpe")
+        {
+            targetIndex = 2;
+        }
+        if (targetIndex >= args.size())
+        {
+            if (reason != nullptr)
+            {
+                *reason = L"!vad " + requestedMode +
+                    L" requires a process target";
+            }
+            break;
+        }
+
+        if (IsSwitchLikeToken(args[targetIndex]))
         {
             if (reason != nullptr)
             {
@@ -27495,7 +27592,8 @@ static bool ValidateVadCommandArgumentShape(
             break;
         }
 
-        if (args[1].find_first_of(L"<>|") != std::wstring::npos)
+        if (args[targetIndex].find_first_of(L"<>|") !=
+            std::wstring::npos)
         {
             if (reason != nullptr)
             {
@@ -27504,7 +27602,7 @@ static bool ValidateVadCommandArgumentShape(
             break;
         }
 
-        size_t index = 2;
+        size_t index = targetIndex + 1;
         bool shapeOk = true;
         while (index < args.size())
         {
@@ -27514,9 +27612,12 @@ static bool ValidateVadCommandArgumentShape(
                 option == L"/private" ||
                 option == L"/wx" ||
                 option == L"/pe" ||
-                option == L"/hiddenpte" ||
-                option == L"/hidden" ||
-                option == L"/dkom")
+                 option == L"/hiddenpte" ||
+                 option == L"/hidden" ||
+                 option == L"/dkom" ||
+                 option == L"/scan" ||
+                 option == L"/modules" ||
+                 option == L"/mappedpe")
             {
                 ++index;
                 continue;
@@ -27540,7 +27641,7 @@ static bool ValidateVadCommandArgumentShape(
 
             if (reason != nullptr)
             {
-                *reason = L"!vad supports /summary, /exec, /private, /wx, /pe, /hiddenpte, /limit, and /json options";
+                *reason = L"!vad supports scan/modules modes and /summary, /exec, /private, /wx, /pe, /hiddenpte, /limit, /json, /scan, and /modules options";
             }
             shapeOk = false;
             break;
@@ -28714,7 +28815,7 @@ static std::wstring BuildAiPlanPrompt(const std::wstring& prompt)
     stream << L"Rules:\n";
     stream << L"- Use exact commands supported by KnLiveDbg where possible.\n";
     stream << L"- Prefer read-only commands such as lm, ln, x, d*, dt, callbacks, !dml_proc, !vad, !threads, !wfp, !alpc, !vbs, !ci, !securekernel, !etw, !nmi, !fwtable, !wnf, vtop, pdb, !db, u, uf, and kd for raw DbgEng.\n";
-    stream << L"- For VAD DKOM or hidden PTE checks, use !vad target /hiddenpte where target is a concrete PID, image name, or EPROCESS address. Add /summary or /limit <n> when the operator asks for concise output.\n";
+    stream << L"- For process injection or hidden executable memory, use !vad scan target. For every observable loaded/mapped PE, use !vad modules target. A target is a concrete PID, image name, or EPROCESS address; add /summary or /limit <n> for concise output.\n";
     stream << L"- Use one command per JSON item. Do not use semicolon command chaining or multiline commands.\n";
     stream << L"- Do not use backend, kdinit, kddetach, cls, probe service control, q, quit, exit, unload, or nested ai commands in plans.\n";
     stream << L"- If a write is requested, include backup and verification commands, but mark write_like=true for the mutation command.\n";
@@ -30961,7 +31062,8 @@ static void PrintHiddenVadPteRecord(const ProcessHiddenVadPteRecord& record)
 static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryOnly)
 {
     PrintColoredText(L"!vad", KNDBG_COLOR_TITLE);
-    std::wcout << L" pid=" << std::dec << result.Target.ProcessId
+    std::wcout << L" mode=" << (result.InjectionScan ? L"scan" : L"list")
+               << L" pid=" << std::dec << result.Target.ProcessId
                << L" image=" << result.Target.ImageName
                << L" eprocess=" << HexTextWidth(result.Target.Eprocess, 16, true)
                << L"\n";
@@ -30989,8 +31091,9 @@ static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryO
                << L" pe=" << result.PeLikeCount
                << L" suspicious=" << result.SuspiciousCount
                << L" truncated=" << (result.Truncated ? L"yes" : L"no")
-               << L" coverage_complete=" << (result.CoverageComplete ? L"yes" : L"no")
-               << L" protection_resolved=" << (result.ProtectionResolved ? L"yes" : L"no")
+                << L" coverage_complete=" << (result.CoverageComplete ? L"yes" : L"no")
+                << L" effective_coverage=" << (result.EffectiveProtectionCoverageComplete ? L"complete" : L"incomplete")
+                << L" protection_resolved=" << (result.ProtectionResolved ? L"yes" : L"no")
                << L" private_memory_resolved=" << (result.PrivateMemoryResolved ? L"yes" : L"no");
     if (result.Incomplete)
     {
@@ -31012,6 +31115,97 @@ static void PrintVadScanResult(const ProcessVadScanResult& result, bool summaryO
                    << L" truncated=" << (result.HiddenPteTruncated ? L"yes" : L"no")
                    << L"\n";
     }
+}
+
+static void PrintMappedPeRecord(const ProcessMappedPeRecord& record)
+{
+    PrintColoredText(
+        HexTextWidth(record.Base, 16, true),
+        record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_ACCENT);
+    std::wcout << L" image="
+               << (record.ImageName.empty() ? L"?" : record.ImageName)
+               << L" loader=" << (record.LoaderVisible ? L"yes" : L"no")
+               << L" vad=" << (record.VadVisible ? L"yes" : L"no")
+                << L" header=" << (record.MemoryHeaderVisible ? L"yes" : L"no")
+                << L" mem_image=" << (record.VirtualImageMapping ? L"yes" : L"no")
+                << L" private=" << (record.PrivateMapping ? L"yes" : L"no")
+               << L" exec=" << (record.Executable ? L"yes" : L"no")
+               << L" wx=" << (record.WritableExecutable ? L"yes" : L"no")
+               << L" image_size=" << HexText(record.HeaderImageSize)
+               << L" loader_size=" << HexText(record.LoaderSize)
+               << L" ep=" << HexTextWidth(record.EntryPointVa, 16, true)
+               << L" machine=" << HexText(record.Machine)
+               << L" sections=" << std::dec << record.NumberOfSections;
+    if (!record.EffectiveProtection.empty())
+    {
+        std::wcout << L" protect=" << record.EffectiveProtection;
+    }
+    else if (!record.AllocationProtection.empty())
+    {
+        std::wcout << L" protect=" << record.AllocationProtection;
+    }
+    if (!record.ImagePath.empty())
+    {
+        std::wcout << L" path=\"" << record.ImagePath << L"\"";
+    }
+    else if (!record.MappedPath.empty())
+    {
+        std::wcout << L" path=\"" << record.MappedPath << L"\"";
+    }
+    if (!record.Reasons.empty())
+    {
+        std::wcout << L" reasons=";
+        for (size_t i = 0; i < record.Reasons.size(); ++i)
+        {
+            if (i != 0)
+            {
+                std::wcout << L",";
+            }
+            std::wcout << record.Reasons[i];
+        }
+    }
+    std::wcout << L"\n";
+}
+
+static void PrintMappedPeScanResult(
+    const ProcessMappedPeScanResult& result,
+    bool summaryOnly)
+{
+    PrintColoredText(L"!vad modules", KNDBG_COLOR_TITLE);
+    std::wcout << L" pid=" << std::dec << result.Target.ProcessId
+               << L" image=" << result.Target.ImageName
+               << L" eprocess="
+               << HexTextWidth(result.Target.Eprocess, 16, true)
+               << L"\n";
+
+    if (!summaryOnly)
+    {
+        for (const ProcessMappedPeRecord& record : result.Records)
+        {
+            PrintMappedPeRecord(record);
+        }
+    }
+
+    PrintColoredText(L"[vad.modules.summary]", KNDBG_COLOR_TITLE);
+    std::wcout << L" candidates=" << result.CandidateMappings
+               << L" loader_records=" << result.LoaderRecords
+               << L" header_visible=" << result.HeaderVisibleRecords
+               << L" loader_visible=" << result.LoaderVisibleRecords
+               << L" memory_only=" << result.MemoryOnlyRecords
+               << L" private=" << result.PrivateRecords
+               << L" suspicious=" << result.SuspiciousRecords
+               << L" vad_coverage="
+               << (result.VadCoverageComplete ? L"complete" : L"incomplete")
+               << L" loader_coverage="
+               << (result.LoaderCoverageComplete ? L"complete" : L"incomplete")
+               << L" header_coverage="
+               << (result.HeaderProbeCoverageComplete ? L"complete" : L"incomplete")
+               << L" path_coverage="
+               << (result.MappedPathCoverageComplete ? L"complete" : L"incomplete")
+               << L" coverage_complete="
+               << (result.CoverageComplete ? L"yes" : L"no")
+               << L" truncated=" << (result.Truncated ? L"yes" : L"no")
+               << L"\n";
 }
 
 static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeStacks, bool includeApc)
@@ -33865,6 +34059,13 @@ static void HandleVadCommand(
     SymbolEngine& symbols,
     std::wstring* structuredJsonOut = nullptr)
 {
+    enum class VadCommandMode
+    {
+        List,
+        InjectionScan,
+        Modules
+    };
+
     std::wstring error;
 
     do
@@ -33875,23 +34076,58 @@ static void HandleVadCommand(
             break;
         }
 
-        ProcessVadScanOptions options = {};
+        VadCommandMode mode = VadCommandMode::List;
+        size_t targetIndex = 1;
+        const std::wstring modeToken = ToLower(args[1]);
+        if (modeToken == L"scan")
+        {
+            mode = VadCommandMode::InjectionScan;
+            targetIndex = 2;
+        }
+        else if (modeToken == L"modules" ||
+                 modeToken == L"mappedpe")
+        {
+            mode = VadCommandMode::Modules;
+            targetIndex = 2;
+        }
+        if (targetIndex >= args.size() ||
+            IsHelpToken(args[targetIndex]))
+        {
+            PrintVadHelp();
+            break;
+        }
+
+        ProcessTriageTarget target = {};
         std::vector<std::wstring> targetWarnings;
-        if (!ResolveProcessTriageTarget(args[1], state, device, symbols, &options.Target, &targetWarnings, &error))
+        if (!ResolveProcessTriageTarget(
+                args[targetIndex],
+                state,
+                device,
+                symbols,
+                &target,
+                &targetWarnings,
+                &error))
         {
             std::wcerr << L"!vad failed: " << error << L"\n";
             break;
         }
 
+        ProcessVadScanOptions options = {};
+        options.Target = target;
+
         std::wstring jsonPath;
+        bool summaryOnly = false;
+        uint32_t limit = 0;
         bool parseOk = true;
-        for (size_t index = 2; index < args.size(); ++index)
+        for (size_t index = targetIndex + 1;
+             index < args.size();
+             ++index)
         {
             std::wstring option = ToLower(args[index]);
 
             if (option == L"/summary")
             {
-                options.SummaryOnly = true;
+                summaryOnly = true;
             }
             else if (option == L"/exec")
             {
@@ -33914,6 +34150,27 @@ static void HandleVadCommand(
             {
                 options.ScanHiddenPtes = true;
             }
+            else if (option == L"/scan")
+            {
+                if (mode == VadCommandMode::Modules)
+                {
+                    std::wcerr << L"!vad failed: /scan conflicts with modules mode\n";
+                    parseOk = false;
+                    break;
+                }
+                mode = VadCommandMode::InjectionScan;
+            }
+            else if (option == L"/modules" ||
+                     option == L"/mappedpe")
+            {
+                if (mode == VadCommandMode::InjectionScan)
+                {
+                    std::wcerr << L"!vad failed: /modules conflicts with scan mode\n";
+                    parseOk = false;
+                    break;
+                }
+                mode = VadCommandMode::Modules;
+            }
             else if (option == L"/limit")
             {
                 if (index + 1 >= args.size())
@@ -33922,7 +34179,11 @@ static void HandleVadCommand(
                     parseOk = false;
                     break;
                 }
-                if (!ParseProcessTriageLimit(args[index + 1], state.NumberBase, &options.Limit, &error))
+                if (!ParseProcessTriageLimit(
+                        args[index + 1],
+                        state.NumberBase,
+                        &limit,
+                        &error))
                 {
                     std::wcerr << L"!vad failed: " << error << L"\n";
                     parseOk = false;
@@ -33954,7 +34215,75 @@ static void HandleVadCommand(
             break;
         }
 
+        if (mode == VadCommandMode::Modules &&
+            (options.ExecOnly ||
+             options.PrivateOnly ||
+             options.WxOnly ||
+             options.PeOnly ||
+             options.ScanHiddenPtes))
+        {
+            std::wcerr << L"!vad failed: modules mode accepts only /summary, /limit, and /json\n";
+            break;
+        }
+
         ProcessTriageScanner scanner(device, symbols);
+        if (mode == VadCommandMode::Modules)
+        {
+            ProcessMappedPeScanOptions mappedOptions = {};
+            mappedOptions.Target = target;
+            mappedOptions.Limit = limit;
+            ProcessMappedPeScanResult result = {};
+            if (!scanner.ScanMappedPe(
+                    mappedOptions,
+                    &result,
+                    &error))
+            {
+                std::wcerr << L"!vad modules failed: "
+                           << error << L"\n";
+                break;
+            }
+
+            result.Warnings.insert(
+                result.Warnings.begin(),
+                targetWarnings.begin(),
+                targetWarnings.end());
+            PrintMappedPeScanResult(result, summaryOnly);
+            PrintProcessTriageWarnings(
+                L"!vad modules",
+                result.Warnings);
+            const std::wstring json =
+                BuildProcessMappedPeJson(result);
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = json;
+            }
+            if (!jsonPath.empty())
+            {
+                if (WriteUtf8TextFile(jsonPath, json, &error))
+                {
+                    std::wcout << L"json written: "
+                               << jsonPath << L"\n";
+                }
+                else
+                {
+                    std::wcerr << L"!vad modules json failed: "
+                               << error << L"\n";
+                }
+            }
+            break;
+        }
+
+        options.SummaryOnly = summaryOnly;
+        options.Limit = limit;
+        if (mode == VadCommandMode::InjectionScan)
+        {
+            options.InjectionScan = true;
+            options.ProbePe = true;
+            options.ScanHiddenPtes = true;
+            options.HiddenPteExecutableOnly = true;
+            options.RequireVadCoverageForHiddenPtes = true;
+        }
+
         ProcessVadScanResult result = {};
         if (!scanner.ScanVad(options, &result, &error))
         {
@@ -33963,7 +34292,7 @@ static void HandleVadCommand(
         }
 
         result.Warnings.insert(result.Warnings.begin(), targetWarnings.begin(), targetWarnings.end());
-        PrintVadScanResult(result, options.SummaryOnly);
+        PrintVadScanResult(result, summaryOnly);
         PrintProcessTriageWarnings(L"!vad", result.Warnings);
 
         if (structuredJsonOut != nullptr)
@@ -35076,7 +35405,7 @@ static bool ValidateAiCapabilityToolArgKeys(
     }
     else if (tool == L"vad.list")
     {
-        allowed = {L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"exec", L"private", L"wx", L"pe", L"hiddenpte", L"dkom", L"summary", L"limit"};
+        allowed = {L"mode", L"source", L"image", L"name", L"process", L"pid", L"eprocess", L"exec", L"private", L"wx", L"pe", L"hiddenpte", L"dkom", L"summary", L"limit"};
     }
     else if (tool == L"threads.list")
     {
@@ -35370,7 +35699,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- wfp.list: list Windows Filtering Platform objects via fwpuclnt.dll. Args: scope (providers,sublayers,callouts,filters,layers; defaults to callouts), optional module (callouts/filters provider name or GUID), optional layer (filters only).\n";
     stream << L"- wfp.kernel_callouts: resolve kernel-mode WFP classify/notify/flowDelete pointers from netio.sys. Args: {}.\n";
     stream << L"- alpc.list: list ALPC ports discovered via Object Manager directory walk and CommunicationInfo links. Args: scope (ports,connections; defaults to ports), optional name substring, optional pid filter as decimal string.\n";
-    stream << L"- vad.list: list target process VADs and optionally detect present PTE ranges missing from the VAD tree. Args: image, pid, eprocess, or source; optional booleans exec, private, wx, pe, hiddenpte, dkom, summary; optional limit string.\n";
+    stream << L"- vad.list: list target VADs, scan injected/hidden executable regions, or inventory all observable loaded/mapped PEs. Args: image, pid, eprocess, or source; optional mode string list|scan|modules; optional booleans exec, private, wx, pe, hiddenpte, dkom, summary; optional limit string.\n";
     stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
     stream << L"- etw.integrity: check inline ETW GetCpuClock targets and suspicious callback redirects. Args: {}.\n";
     stream << L"- etw.providers: heuristic ETW provider registration surface and enable-callback ownership. Args: {}.\n";
@@ -35425,7 +35754,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For callback requests such as object callbacks for WdFilter.sys, use callbacks.list with scope \"object\" and module \"WdFilter.sys\".\n";
     stream << L"- For WFP questions such as callouts owned by tcpip or filters in the ALE auth connect layer, use wfp.list with the appropriate scope and module/layer. For kernel callout function pointers, use wfp.kernel_callouts.\n";
     stream << L"- For ALPC questions such as listing named ports or pairing csrss/lsass connections, use alpc.list with scope ports or connections and optional name/pid filters.\n";
-    stream << L"- For executable private memory, W+X, PE-like VADs, process memory region triage, or VAD DKOM/hidden PTE checks, use vad.list directly. Use hiddenpte=true for VAD DKOM checks.\n";
+    stream << L"- For injected or hidden executable process memory, use vad.list mode=scan. For every observable loaded/mapped PE, use mode=modules. Use mode=list plus filters for individual VAD views.\n";
     stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
     stream << L"- For inline ETW hook questions, use etw.integrity.\n";
     stream << L"- For NMI callback questions, use nmi.list.\n";
@@ -36542,6 +36871,24 @@ static bool ExecuteAiCapabilityVadList(
             break;
         }
 
+        std::wstring mode;
+        ExtractJsonStringValue(step.ArgsJson, L"mode", &mode);
+        mode = ToLower(TrimWhitespace(mode));
+        if (mode.empty())
+        {
+            mode = L"list";
+        }
+        if (mode != L"list" &&
+            mode != L"scan" &&
+            mode != L"modules")
+        {
+            if (error != nullptr)
+            {
+                *error = L"vad.list mode must be list, scan, or modules";
+            }
+            break;
+        }
+
         bool execOnly = false;
         bool privateOnly = false;
         bool wxOnly = false;
@@ -36559,6 +36906,16 @@ static bool ExecuteAiCapabilityVadList(
         {
             break;
         }
+        if (mode == L"modules" &&
+            (execOnly || privateOnly || wxOnly || peOnly ||
+             hiddenPte || dkom))
+        {
+            if (error != nullptr)
+            {
+                *error = L"vad.list modules mode accepts only summary and limit options";
+            }
+            break;
+        }
 
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": vad.list\n";
@@ -36567,6 +36924,10 @@ static bool ExecuteAiCapabilityVadList(
         {
             std::vector<std::wstring> args;
             args.push_back(L"!vad");
+            if (mode != L"list")
+            {
+                args.push_back(mode);
+            }
             args.push_back(HexTextWidth(record.Eprocess, 16, true));
             if (summaryOnly)
             {

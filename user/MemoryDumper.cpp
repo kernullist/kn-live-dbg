@@ -502,6 +502,8 @@ namespace
                 IMAGE_NT_HEADERS64 nt = {};
                 std::memcpy(&nt, buf + ntOffset, sizeof(nt));
                 probe->SizeOfHeaders = nt.OptionalHeader.SizeOfHeaders;
+                probe->AddressOfEntryPoint =
+                    nt.OptionalHeader.AddressOfEntryPoint;
                 probe->SizeOfImage = nt.OptionalHeader.SizeOfImage;
                 probe->ImageBase = nt.OptionalHeader.ImageBase;
             }
@@ -513,6 +515,8 @@ namespace
                 IMAGE_NT_HEADERS32 nt = {};
                 std::memcpy(&nt, buf + ntOffset, sizeof(nt));
                 probe->SizeOfHeaders = nt.OptionalHeader.SizeOfHeaders;
+                probe->AddressOfEntryPoint =
+                    nt.OptionalHeader.AddressOfEntryPoint;
                 probe->SizeOfImage = nt.OptionalHeader.SizeOfImage;
                 probe->ImageBase = nt.OptionalHeader.ImageBase;
             }
