@@ -14,6 +14,7 @@ Completed core slices:
 2. AI capability catalog expansion, including implicit `ai <goal>` routing.
 3. Module integrity scanning.
 4. Driver dispatch integrity.
+5. Live complete dump (`dump-kernel`) and OS live dump (`dump-live`).
 
 Remaining priority order:
 

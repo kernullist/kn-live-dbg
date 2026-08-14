@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DeviceClient.h"
+#include "SymbolEngine.h"
 
 #include <cstdint>
 #include <string>
@@ -101,4 +102,74 @@ bool DumpKernelPeToFile(
     uint64_t address,
     const std::wstring& path,
     DumpPeResult* result,
+    std::wstring* error);
+
+// WinDbg complete-dump header is a fixed 8 KB prefix.
+constexpr uint32_t kCrashDumpHeaderBytes = 0x2000;
+constexpr uint32_t kCrashDumpMaxPhysicalRuns = 42;
+
+struct DumpKernelHeaderInfo
+{
+    uint64_t DirectoryTableBase = 0;
+    uint64_t PfnDataBase = 0;
+    uint64_t PsLoadedModuleList = 0;
+    uint64_t PsActiveProcessHead = 0;
+    uint64_t KdDebuggerDataBlock = 0;
+    uint32_t MajorVersion = 0;
+    uint32_t MinorVersion = 0;
+    uint32_t NumberProcessors = 1;
+    uint32_t ProductType = 1;
+    uint32_t SuiteMask = 0;
+    std::string Comment;
+};
+
+struct DumpKernelCrashResult
+{
+    uint64_t HeaderBytes = 0;
+    uint64_t PayloadBytes = 0;
+    uint64_t BytesRead = 0;
+    uint64_t BytesZeroFilled = 0;
+    uint64_t BytesWritten = 0;
+    uint32_t RangeCount = 0;
+    uint32_t ChunksRead = 0;
+    uint32_t ChunksFailed = 0;
+    bool Complete = false;
+    std::vector<std::wstring> Warnings;
+};
+
+struct DumpOsLiveResult
+{
+    uint64_t BytesWritten = 0;
+    uint32_t ApiVersionUsed = 0;
+    long Status = 0;
+    bool IncludedUserPages = false;
+    bool Compressed = false;
+    bool IncludedHypervisorPages = false;
+    std::vector<std::wstring> Warnings;
+};
+
+// Builds a DUMP_HEADER64 complete-dump prefix. Exposed for self-tests.
+bool BuildCompleteDumpHeader(
+    const std::vector<PhysicalMemoryRange>& ranges,
+    const DumpKernelHeaderInfo& info,
+    std::vector<uint8_t>* header,
+    std::wstring* error);
+
+// Streams a WinDbg-openable complete dump: 8 KB header + physical RAM runs.
+bool DumpPhysicalMemoryToCrashDump(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const std::wstring& path,
+    uint64_t maxPayloadBytes,
+    bool abortOnReadFailure,
+    DumpKernelCrashResult* result,
+    std::wstring* error);
+
+// Asks the OS to write a live kernel dump (NtSystemDebugControl).
+bool DumpOsLiveKernel(
+    const std::wstring& path,
+    bool includeUserPages,
+    bool compress,
+    bool includeHypervisorPages,
+    DumpOsLiveResult* result,
     std::wstring* error);

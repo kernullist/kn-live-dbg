@@ -3,8 +3,11 @@
 #include "../shared/KnLiveDbgIoctl.h"
 
 #include <Windows.h>
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <limits>
 #include <sstream>
 #include <cstring>
 
@@ -1105,6 +1108,984 @@ bool DumpKernelPeToFile(
 
         ok = true;
     } while (false);
+
+    return ok;
+}
+
+namespace
+{
+    constexpr uint32_t kPageSize = 0x1000;
+    constexpr uint32_t kDumpSignature = 0x45474150u; // 'PAGE'
+    constexpr uint32_t kDumpValid64 = 0x34365544u;   // 'DU64'
+    constexpr uint32_t kDumpTypeFull = 1;
+    constexpr uint32_t kMachineAmd64 = 0x8664;
+    constexpr uint32_t kBugCheckLiveSystemDump = 0x161;
+    constexpr uint32_t kPhysBlockOffset = 0x088;
+    constexpr uint32_t kDumpTypeOffset = 0xF94;
+    constexpr uint32_t kRequiredSpaceOffset = 0xF98;
+    constexpr uint32_t kSystemTimeOffset = 0xFA0;
+    constexpr uint32_t kCommentOffset = 0xFA8;
+    constexpr uint32_t kProductTypeOffset = 0x1038;
+    constexpr uint32_t kSuiteMaskOffset = 0x103C;
+    constexpr uint32_t kSysDbgGetLiveKernelDump = 37;
+    constexpr uint32_t kLiveDumpControlVersion1 = 1;
+    constexpr uint32_t kLiveDumpControlVersion2 = 2;
+    constexpr uint64_t kProgressStepBytes = 0x10000000ull; // 256 MB
+
+    void WriteU32At(std::vector<uint8_t>* header, size_t offset, uint32_t value)
+    {
+        if (header != nullptr && offset + sizeof(value) <= header->size())
+        {
+            std::memcpy(header->data() + offset, &value, sizeof(value));
+        }
+    }
+
+    void WriteU64At(std::vector<uint8_t>* header, size_t offset, uint64_t value)
+    {
+        if (header != nullptr && offset + sizeof(value) <= header->size())
+        {
+            std::memcpy(header->data() + offset, &value, sizeof(value));
+        }
+    }
+
+    bool IsKernelCanonicalVa(uint64_t address)
+    {
+        return address >= 0xff00000000000000ull;
+    }
+
+    uint64_t DecodeU64(const std::vector<uint8_t>& bytes)
+    {
+        uint64_t value = 0;
+        if (bytes.size() >= sizeof(value))
+        {
+            std::memcpy(&value, bytes.data(), sizeof(value));
+        }
+        return value;
+    }
+
+    bool EnableSeDebugPrivilege(std::wstring* warning)
+    {
+        bool ok = false;
+        HANDLE token = nullptr;
+
+        do
+        {
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"OpenProcessToken failed (gle=" +
+                        std::to_wstring(GetLastError()) + L")";
+                }
+                break;
+            }
+
+            LUID luid = {};
+            if (!LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"LookupPrivilegeValue(SeDebugPrivilege) failed (gle=" +
+                        std::to_wstring(GetLastError()) + L")";
+                }
+                break;
+            }
+
+            TOKEN_PRIVILEGES privileges = {};
+            privileges.PrivilegeCount = 1;
+            privileges.Privileges[0].Luid = luid;
+            privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (!AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr))
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"AdjustTokenPrivileges(SeDebugPrivilege) failed (gle=" +
+                        std::to_wstring(GetLastError()) + L")";
+                }
+                break;
+            }
+
+            if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"SeDebugPrivilege not assigned (not running elevated?)";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        if (token != nullptr)
+        {
+            CloseHandle(token);
+        }
+
+        return ok;
+    }
+
+    bool NormalizePhysicalRanges(
+        std::vector<PhysicalMemoryRange>* ranges,
+        uint64_t maxPayloadBytes,
+        uint64_t* payloadBytes,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (ranges == nullptr || payloadBytes == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid physical-range output";
+                }
+                break;
+            }
+
+            std::vector<PhysicalMemoryRange> normalized;
+            uint64_t total = 0;
+            bool failed = false;
+            for (const PhysicalMemoryRange& range : *ranges)
+            {
+                if (range.ByteCount == 0)
+                {
+                    continue;
+                }
+
+                if ((range.BaseAddress & (kPageSize - 1ull)) != 0 ||
+                    (range.ByteCount & (kPageSize - 1ull)) != 0)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"physical range is not page-aligned";
+                    }
+                    failed = true;
+                    break;
+                }
+
+                PhysicalMemoryRange kept = range;
+                if (maxPayloadBytes != 0)
+                {
+                    if (total >= maxPayloadBytes)
+                    {
+                        break;
+                    }
+
+                    const uint64_t remaining = maxPayloadBytes - total;
+                    if (kept.ByteCount > remaining)
+                    {
+                        kept.ByteCount = remaining & ~(static_cast<uint64_t>(kPageSize) - 1ull);
+                    }
+
+                    if (kept.ByteCount == 0)
+                    {
+                        break;
+                    }
+                }
+
+                if (total > (std::numeric_limits<uint64_t>::max)() - kept.ByteCount)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"physical range byte count overflow";
+                    }
+                    failed = true;
+                    break;
+                }
+
+                total += kept.ByteCount;
+                normalized.push_back(kept);
+            }
+
+            if (failed)
+            {
+                break;
+            }
+
+            if (normalized.empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = (maxPayloadBytes != 0)
+                        ? L"/max is smaller than one page or excludes every RAM run"
+                        : L"no physical RAM ranges to dump";
+                }
+                break;
+            }
+
+            if (normalized.size() > kCrashDumpMaxPhysicalRuns)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"complete dump header supports at most " +
+                        std::to_wstring(kCrashDumpMaxPhysicalRuns) +
+                        L" physical runs (got " + std::to_wstring(normalized.size()) +
+                        L"); use /max to dump a prefix";
+                }
+                break;
+            }
+
+            *ranges = std::move(normalized);
+            *payloadBytes = total;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ResolveOptionalSymbol(
+        SymbolEngine& symbols,
+        const wchar_t* name,
+        uint64_t* address,
+        std::vector<std::wstring>* warnings)
+    {
+        bool ok = false;
+        std::wstring resolveError;
+        uint64_t resolved = 0;
+        if (symbols.ResolveSymbol(name, &resolved, &resolveError) && resolved != 0)
+        {
+            *address = resolved;
+            ok = true;
+        }
+        else if (warnings != nullptr)
+        {
+            warnings->push_back(std::wstring(name) + L" unresolved: " + resolveError);
+        }
+
+        return ok;
+    }
+
+    uint64_t ResolveKernelPointerTarget(
+        DeviceClient& device,
+        uint64_t symbolAddress)
+    {
+        uint64_t value = 0;
+        std::vector<uint8_t> bytes;
+        std::wstring ignored;
+        if (device.ReadMemory(symbolAddress, sizeof(uint64_t), &bytes, &ignored) &&
+            bytes.size() >= sizeof(uint64_t))
+        {
+            const uint64_t pointed = DecodeU64(bytes);
+            if (IsKernelCanonicalVa(pointed))
+            {
+                value = pointed;
+            }
+        }
+
+        return value;
+    }
+
+    bool WriteAll(HANDLE file, const void* data, DWORD length, std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            const uint8_t* bytes = static_cast<const uint8_t*>(data);
+            DWORD remaining = length;
+            while (remaining > 0)
+            {
+                DWORD written = 0;
+                if (!WriteFile(file, bytes, remaining, &written, nullptr) || written == 0)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"WriteFile failed (gle=" +
+                            std::to_wstring(GetLastError()) + L")";
+                    }
+                    break;
+                }
+
+                bytes += written;
+                remaining -= written;
+            }
+
+            if (remaining != 0)
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    const wchar_t* NtStatusName(long status)
+    {
+        const wchar_t* name = L"";
+        switch (static_cast<unsigned long>(status))
+        {
+        case 0x00000000ul:
+            name = L"STATUS_SUCCESS";
+            break;
+        case 0xC0000002ul:
+            name = L"STATUS_NOT_IMPLEMENTED";
+            break;
+        case 0xC000000Dul:
+            name = L"STATUS_INVALID_PARAMETER";
+            break;
+        case 0xC0000022ul:
+            name = L"STATUS_ACCESS_DENIED";
+            break;
+        case 0xC0000061ul:
+            name = L"STATUS_PRIVILEGE_NOT_HELD";
+            break;
+        case 0xC000009Aul:
+            name = L"STATUS_INSUFFICIENT_RESOURCES";
+            break;
+        case 0xC00000BBul:
+            name = L"STATUS_NOT_SUPPORTED";
+            break;
+        default:
+            break;
+        }
+
+        return name;
+    }
+
+    struct LiveDumpFlags
+    {
+        unsigned long UseDumpStorageStack : 1;
+        unsigned long CompressMemoryPagesData : 1;
+        unsigned long IncludeUserSpaceMemoryPages : 1;
+        unsigned long AbortIfMemoryPressure : 1;
+        unsigned long SelectiveDump : 1;
+        unsigned long Reserved : 27;
+    };
+
+    struct LiveDumpAddPages
+    {
+        unsigned long HypervisorPages : 1;
+        unsigned long NonEssentialHypervisorPages : 1;
+        unsigned long Reserved : 30;
+    };
+
+    struct LiveDumpControlV1
+    {
+        unsigned long Version;
+        unsigned long BugCheckCode;
+        ULONG_PTR BugCheckParam1;
+        ULONG_PTR BugCheckParam2;
+        ULONG_PTR BugCheckParam3;
+        ULONG_PTR BugCheckParam4;
+        HANDLE DumpFileHandle;
+        HANDLE CancelEventHandle;
+        LiveDumpFlags Flags;
+        LiveDumpAddPages AddPagesControl;
+    };
+
+    struct LiveDumpControlV2
+    {
+        LiveDumpControlV1 V1;
+        void* SelectiveControl;
+    };
+
+    typedef long (WINAPI* NtSystemDebugControlFn)(
+        unsigned long command,
+        void* inputBuffer,
+        unsigned long inputLength,
+        void* outputBuffer,
+        unsigned long outputLength,
+        unsigned long* returnLength);
+}
+
+bool BuildCompleteDumpHeader(
+    const std::vector<PhysicalMemoryRange>& ranges,
+    const DumpKernelHeaderInfo& info,
+    std::vector<uint8_t>* header,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (header == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid dump-header output";
+            }
+            break;
+        }
+
+        if (ranges.empty() || ranges.size() > kCrashDumpMaxPhysicalRuns)
+        {
+            if (error != nullptr)
+            {
+                *error = L"complete dump header supports 1.." +
+                    std::to_wstring(kCrashDumpMaxPhysicalRuns) +
+                    L" physical runs (got " + std::to_wstring(ranges.size()) + L")";
+            }
+            break;
+        }
+
+        uint64_t numberOfPages = 0;
+        bool invalidRange = false;
+        for (const PhysicalMemoryRange& range : ranges)
+        {
+            if (range.ByteCount == 0 ||
+                (range.BaseAddress & (kPageSize - 1ull)) != 0 ||
+                (range.ByteCount & (kPageSize - 1ull)) != 0)
+            {
+                invalidRange = true;
+                break;
+            }
+
+            const uint64_t pages = range.ByteCount / kPageSize;
+            if (numberOfPages > (std::numeric_limits<uint64_t>::max)() - pages)
+            {
+                invalidRange = true;
+                break;
+            }
+
+            numberOfPages += pages;
+        }
+
+        if (invalidRange || numberOfPages == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"physical runs must be non-empty page-aligned RAM ranges";
+            }
+            break;
+        }
+
+        header->assign(kCrashDumpHeaderBytes, 0);
+        WriteU32At(header, 0x000, kDumpSignature);
+        WriteU32At(header, 0x004, kDumpValid64);
+        WriteU32At(header, 0x008, info.MajorVersion);
+        WriteU32At(header, 0x00C, info.MinorVersion);
+        WriteU64At(header, 0x010, info.DirectoryTableBase);
+        WriteU64At(header, 0x018, info.PfnDataBase);
+        WriteU64At(header, 0x020, info.PsLoadedModuleList);
+        WriteU64At(header, 0x028, info.PsActiveProcessHead);
+        WriteU32At(header, 0x030, kMachineAmd64);
+        WriteU32At(header, 0x034, info.NumberProcessors == 0 ? 1u : info.NumberProcessors);
+        WriteU32At(header, 0x038, kBugCheckLiveSystemDump);
+        const char versionUser[] = "KnLiveDbg";
+        std::memcpy(header->data() + 0x060, versionUser, sizeof(versionUser) - 1);
+        WriteU64At(header, 0x080, info.KdDebuggerDataBlock);
+
+        WriteU32At(header, kPhysBlockOffset, static_cast<uint32_t>(ranges.size()));
+        WriteU64At(header, kPhysBlockOffset + 8, numberOfPages);
+        for (size_t index = 0; index < ranges.size(); ++index)
+        {
+            const size_t runOffset = kPhysBlockOffset + 16 + (index * 16);
+            WriteU64At(header, runOffset, ranges[index].BaseAddress / kPageSize);
+            WriteU64At(header, runOffset + 8, ranges[index].ByteCount / kPageSize);
+        }
+
+        const uint64_t payloadBytes = numberOfPages * kPageSize;
+        WriteU32At(header, kDumpTypeOffset, kDumpTypeFull);
+        WriteU64At(header, kRequiredSpaceOffset, kCrashDumpHeaderBytes + payloadBytes);
+
+        FILETIME fileTime = {};
+        GetSystemTimeAsFileTime(&fileTime);
+        ULARGE_INTEGER systemTime = {};
+        systemTime.LowPart = fileTime.dwLowDateTime;
+        systemTime.HighPart = fileTime.dwHighDateTime;
+        WriteU64At(header, kSystemTimeOffset, systemTime.QuadPart);
+
+        std::string comment = info.Comment.empty()
+            ? "KnLiveDbg live complete dump (inconsistent)"
+            : info.Comment;
+        if (comment.size() > 127)
+        {
+            comment.resize(127);
+        }
+        std::memcpy(header->data() + kCommentOffset, comment.data(), comment.size());
+
+        WriteU32At(header, kProductTypeOffset, info.ProductType);
+        WriteU32At(header, kSuiteMaskOffset, info.SuiteMask);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DumpPhysicalMemoryToCrashDump(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const std::wstring& path,
+    uint64_t maxPayloadBytes,
+    bool abortOnReadFailure,
+    DumpKernelCrashResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"DumpPhysicalMemoryToCrashDump called without result buffer";
+            }
+            break;
+        }
+
+        *result = DumpKernelCrashResult{};
+
+        if (path.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"dump-kernel requires an output path";
+            }
+            break;
+        }
+
+        std::vector<PhysicalMemoryRange> ranges;
+        uint64_t reportedTotal = 0;
+        std::wstring rangeError;
+        if (!device.GetPhysicalMemoryRanges(&ranges, &reportedTotal, &rangeError))
+        {
+            if (error != nullptr)
+            {
+                *error = rangeError;
+            }
+            break;
+        }
+
+        uint64_t payloadBytes = 0;
+        if (!NormalizePhysicalRanges(&ranges, maxPayloadBytes, &payloadBytes, &rangeError))
+        {
+            if (error != nullptr)
+            {
+                *error = rangeError;
+            }
+            break;
+        }
+
+        result->RangeCount = static_cast<uint32_t>(ranges.size());
+        result->PayloadBytes = payloadBytes;
+
+        DumpKernelHeaderInfo info = {};
+        info.NumberProcessors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        if (info.NumberProcessors == 0)
+        {
+            info.NumberProcessors = 1;
+        }
+        info.MajorVersion = 15;
+        info.ProductType = VER_NT_WORKSTATION;
+
+        OSVERSIONINFOEXW version = {};
+        version.dwOSVersionInfoSize = sizeof(version);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        using RtlGetVersionFn = LONG (WINAPI*)(OSVERSIONINFOW*);
+        RtlGetVersionFn rtlGetVersion = ntdll == nullptr
+            ? nullptr
+            : reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"));
+        if (rtlGetVersion != nullptr &&
+            rtlGetVersion(reinterpret_cast<OSVERSIONINFOW*>(&version)) >= 0)
+        {
+            if (version.dwMajorVersion < 10)
+            {
+                info.MajorVersion = version.dwMajorVersion;
+            }
+            info.MinorVersion = version.dwBuildNumber;
+            if (version.wProductType != 0)
+            {
+                info.ProductType = version.wProductType;
+            }
+            info.SuiteMask = version.wSuiteMask;
+        }
+
+        ControlRegisters registers = {};
+        std::wstring crError;
+        if (device.ReadControlRegisters(0, &registers, &crError))
+        {
+            info.DirectoryTableBase = registers.Cr3;
+        }
+        else
+        {
+            result->Warnings.push_back(L"CR3 read failed: " + crError);
+        }
+
+        uint64_t kdBlock = 0;
+        uint64_t pfnDatabase = 0;
+        uint64_t loadedModules = 0;
+        uint64_t activeProcesses = 0;
+        ResolveOptionalSymbol(symbols, L"nt!KdDebuggerDataBlock", &kdBlock, &result->Warnings);
+        ResolveOptionalSymbol(symbols, L"nt!MmPfnDatabase", &pfnDatabase, &result->Warnings);
+        ResolveOptionalSymbol(symbols, L"nt!PsLoadedModuleList", &loadedModules, &result->Warnings);
+        ResolveOptionalSymbol(symbols, L"nt!PsActiveProcessHead", &activeProcesses, &result->Warnings);
+        if (kdBlock != 0)
+        {
+            info.KdDebuggerDataBlock = kdBlock;
+        }
+        if (loadedModules != 0)
+        {
+            info.PsLoadedModuleList = loadedModules;
+        }
+        if (activeProcesses != 0)
+        {
+            info.PsActiveProcessHead = activeProcesses;
+        }
+        if (pfnDatabase != 0)
+        {
+            info.PfnDataBase = ResolveKernelPointerTarget(device, pfnDatabase);
+            if (info.PfnDataBase == 0)
+            {
+                result->Warnings.push_back(
+                    L"nt!MmPfnDatabase did not dereference to a kernel pointer");
+            }
+        }
+
+        std::vector<uint8_t> header;
+        std::wstring headerError;
+        if (!BuildCompleteDumpHeader(ranges, info, &header, &headerError))
+        {
+            if (error != nullptr)
+            {
+                *error = headerError;
+            }
+            break;
+        }
+
+        file = CreateFileW(
+            path.c_str(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"failed to create dump file (gle=" +
+                    std::to_wstring(GetLastError()) + L")";
+            }
+            break;
+        }
+
+        std::wstring writeError;
+        if (!WriteAll(file, header.data(), static_cast<DWORD>(header.size()), &writeError))
+        {
+            if (error != nullptr)
+            {
+                *error = writeError;
+            }
+            break;
+        }
+
+        result->HeaderBytes = header.size();
+        result->BytesWritten = header.size();
+
+        std::wcout << L"[dump-kernel] writing complete dump payload="
+                   << (payloadBytes / (1024ull * 1024ull)) << L" MB"
+                   << L" runs=" << ranges.size()
+                   << L" path=" << path << L"\n";
+
+        bool aborted = false;
+        uint64_t nextProgress = kProgressStepBytes;
+        std::vector<uint8_t> zeroChunk(kReadChunkBytes, 0);
+        for (const PhysicalMemoryRange& range : ranges)
+        {
+            uint64_t remaining = range.ByteCount;
+            uint64_t offset = 0;
+            while (remaining > 0)
+            {
+                const uint32_t chunk = remaining > kReadChunkBytes
+                    ? kReadChunkBytes
+                    : static_cast<uint32_t>(remaining);
+
+                std::vector<uint8_t> bytes;
+                std::wstring readError;
+                const bool readOk = device.ReadPhysical(
+                    range.BaseAddress + offset,
+                    chunk,
+                    &bytes,
+                    &readError);
+                uint32_t got = 0;
+                if (readOk)
+                {
+                    got = static_cast<uint32_t>((std::min)(bytes.size(), static_cast<size_t>(chunk)));
+                }
+
+                if (!readOk || got < chunk)
+                {
+                    ++result->ChunksFailed;
+                    result->BytesZeroFilled += (chunk - got);
+                    if (got > 0)
+                    {
+                        result->BytesRead += got;
+                        if (!WriteAll(file, bytes.data(), got, &writeError))
+                        {
+                            if (error != nullptr)
+                            {
+                                *error = writeError;
+                            }
+                            aborted = true;
+                            break;
+                        }
+                        result->BytesWritten += got;
+                    }
+
+                    if (abortOnReadFailure)
+                    {
+                        std::wstringstream stream;
+                        stream << L"physical read failed at 0x" << std::hex
+                               << (range.BaseAddress + offset) << L": "
+                               << (readOk ? L"short read" : readError);
+                        if (error != nullptr)
+                        {
+                            *error = stream.str();
+                        }
+                        aborted = true;
+                        break;
+                    }
+
+                    if (!WriteAll(file, zeroChunk.data(), chunk - got, &writeError))
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = writeError;
+                        }
+                        aborted = true;
+                        break;
+                    }
+                    result->BytesWritten += (chunk - got);
+                }
+                else
+                {
+                    ++result->ChunksRead;
+                    result->BytesRead += got;
+                    if (!WriteAll(file, bytes.data(), got, &writeError))
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = writeError;
+                        }
+                        aborted = true;
+                        break;
+                    }
+                    result->BytesWritten += got;
+                }
+
+                offset += chunk;
+                remaining -= chunk;
+
+                const uint64_t copiedPayload = result->BytesWritten - result->HeaderBytes;
+                if (copiedPayload >= nextProgress)
+                {
+                    const uint64_t copiedMb = copiedPayload / (1024ull * 1024ull);
+                    const uint64_t totalMb = payloadBytes / (1024ull * 1024ull);
+                    std::wcout << L"[dump-kernel] copied=" << copiedMb << L" / " << totalMb
+                               << L" MB failed_chunks=" << result->ChunksFailed << L"\n";
+                    nextProgress += kProgressStepBytes;
+                }
+            }
+
+            if (aborted)
+            {
+                break;
+            }
+        }
+
+        if (aborted)
+        {
+            result->Complete = false;
+            break;
+        }
+
+        result->Complete = result->ChunksFailed == 0 &&
+            (result->BytesWritten == result->HeaderBytes + result->PayloadBytes);
+        if (result->ChunksFailed > 0)
+        {
+            result->Warnings.push_back(
+                L"zero-filled " + std::to_wstring(result->ChunksFailed) +
+                L" incomplete physical chunk(s)");
+        }
+
+        ok = true;
+    } while (false);
+
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+    }
+
+    return ok;
+}
+
+bool DumpOsLiveKernel(
+    const std::wstring& path,
+    bool includeUserPages,
+    bool compress,
+    bool includeHypervisorPages,
+    DumpOsLiveResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"DumpOsLiveKernel called without result buffer";
+            }
+            break;
+        }
+
+        *result = DumpOsLiveResult{};
+        result->IncludedUserPages = includeUserPages;
+        result->Compressed = compress;
+        result->IncludedHypervisorPages = includeHypervisorPages;
+
+        if (path.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"dump-live requires an output path";
+            }
+            break;
+        }
+
+        std::wstring privilegeWarning;
+        if (!EnableSeDebugPrivilege(&privilegeWarning))
+        {
+            if (error != nullptr)
+            {
+                *error = L"dump-live needs SeDebugPrivilege: " + privilegeWarning;
+            }
+            break;
+        }
+
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"ntdll.dll is not loaded";
+            }
+            break;
+        }
+
+        auto ntSystemDebugControl = reinterpret_cast<NtSystemDebugControlFn>(
+            GetProcAddress(ntdll, "NtSystemDebugControl"));
+        if (ntSystemDebugControl == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"NtSystemDebugControl is not exported";
+            }
+            break;
+        }
+
+        file = CreateFileW(
+            path.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"failed to create live-dump file (gle=" +
+                    std::to_wstring(GetLastError()) + L")";
+            }
+            break;
+        }
+
+        LiveDumpControlV2 control = {};
+        control.V1.BugCheckCode = kBugCheckLiveSystemDump;
+        control.V1.DumpFileHandle = file;
+        control.V1.Flags.CompressMemoryPagesData = compress ? 1u : 0u;
+        control.V1.Flags.IncludeUserSpaceMemoryPages = includeUserPages ? 1u : 0u;
+        control.V1.AddPagesControl.HypervisorPages = includeHypervisorPages ? 1u : 0u;
+
+        long status = static_cast<long>(0xC000000D);
+        unsigned long versionUsed = 0;
+
+        control.V1.Version = kLiveDumpControlVersion2;
+        status = ntSystemDebugControl(
+            kSysDbgGetLiveKernelDump,
+            &control,
+            sizeof(control),
+            nullptr,
+            0,
+            nullptr);
+        if (status >= 0)
+        {
+            versionUsed = kLiveDumpControlVersion2;
+        }
+        else
+        {
+            control.V1.Version = kLiveDumpControlVersion1;
+            status = ntSystemDebugControl(
+                kSysDbgGetLiveKernelDump,
+                &control.V1,
+                sizeof(control.V1),
+                nullptr,
+                0,
+                nullptr);
+            if (status >= 0)
+            {
+                versionUsed = kLiveDumpControlVersion1;
+            }
+        }
+
+        result->Status = status;
+        result->ApiVersionUsed = versionUsed;
+
+        LARGE_INTEGER fileSize = {};
+        if (GetFileSizeEx(file, &fileSize) && fileSize.QuadPart > 0)
+        {
+            result->BytesWritten = static_cast<uint64_t>(fileSize.QuadPart);
+        }
+
+        if (status < 0)
+        {
+            std::wstringstream stream;
+            stream << L"NtSystemDebugControl(SysDbgGetLiveKernelDump) failed ntstatus=0x"
+                   << std::hex << std::uppercase
+                   << static_cast<unsigned long>(status);
+            const wchar_t* name = NtStatusName(status);
+            if (name[0] != L'\0')
+            {
+                stream << L" (" << name << L")";
+            }
+            stream << L". This OS path needs elevation, SeDebugPrivilege, and a Windows "
+                   << L"build that allows live kernel dumps.";
+            if (error != nullptr)
+            {
+                *error = stream.str();
+            }
+            if (result->BytesWritten == 0)
+            {
+                CloseHandle(file);
+                file = INVALID_HANDLE_VALUE;
+                DeleteFileW(path.c_str());
+            }
+            break;
+        }
+
+        if (result->BytesWritten == 0)
+        {
+            result->Warnings.push_back(L"OS reported success but the dump file is empty");
+        }
+
+        ok = true;
+    } while (false);
+
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+    }
 
     return ok;
 }

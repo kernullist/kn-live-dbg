@@ -2,6 +2,7 @@
 
 #include "../shared/KnLiveDbgIoctl.h"
 
+#include <limits>
 #include <sstream>
 
 static std::wstring DeviceErrorText(const wchar_t* prefix, DWORD error)
@@ -1255,6 +1256,98 @@ bool DeviceClient::ReadPhysical(uint64_t physicalAddress, uint32_t length, std::
         bytes->assign(
             buffer.begin() + FIELD_OFFSET(KNDBG_PHYSICAL_READ_REQUEST, Data),
             buffer.begin() + FIELD_OFFSET(KNDBG_PHYSICAL_READ_REQUEST, Data) + copied);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DeviceClient::GetPhysicalMemoryRanges(
+    std::vector<PhysicalMemoryRange>* ranges,
+    uint64_t* totalBytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (ranges == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid physical-range output";
+            }
+            break;
+        }
+
+        ranges->clear();
+        if (totalBytes != nullptr)
+        {
+            *totalBytes = 0;
+        }
+
+        KNDBG_PHYSICAL_RANGES_RESPONSE response = {};
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_GET_PHYSICAL_RANGES,
+                &response,
+                0,
+                sizeof(response),
+                &returned,
+                error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(response) ||
+            response.RangeCount > KNDBG_MAX_PHYSICAL_RANGES)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short or invalid physical-range response";
+            }
+            break;
+        }
+
+        uint64_t summed = 0;
+        bool overflow = false;
+        ranges->reserve(response.RangeCount);
+        for (uint32_t index = 0; index < response.RangeCount; ++index)
+        {
+            const KNDBG_PHYSICAL_RANGE& entry = response.Ranges[index];
+            if (entry.ByteCount == 0)
+            {
+                continue;
+            }
+
+            if (summed > (std::numeric_limits<uint64_t>::max)() - entry.ByteCount)
+            {
+                overflow = true;
+                break;
+            }
+
+            PhysicalMemoryRange range = {};
+            range.BaseAddress = entry.BaseAddress;
+            range.ByteCount = entry.ByteCount;
+            ranges->push_back(range);
+            summed += entry.ByteCount;
+        }
+
+        if (overflow)
+        {
+            ranges->clear();
+            if (error != nullptr)
+            {
+                *error = L"Physical-range byte count overflow";
+            }
+            break;
+        }
+
+        if (totalBytes != nullptr)
+        {
+            *totalBytes = summed;
+        }
+
         ok = true;
     } while (false);
 

@@ -73,6 +73,12 @@ struct IdtInfo
     uint32_t Limit;
 };
 
+struct PhysicalMemoryRange
+{
+    uint64_t BaseAddress = 0;
+    uint64_t ByteCount = 0;
+};
+
 struct TimelineLiveStatus
 {
     uint32_t Flags;
@@ -152,6 +158,10 @@ public:
         uint64_t directoryTableBase,
         std::wstring* error);
     bool ReadPhysical(uint64_t physicalAddress, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error);
+    bool GetPhysicalMemoryRanges(
+        std::vector<PhysicalMemoryRange>* ranges,
+        uint64_t* totalBytes,
+        std::wstring* error);
     bool WritePhysical(uint64_t physicalAddress, const std::vector<uint8_t>& bytes, std::wstring* error);
 
     // Writes a single byte to (EPROCESS + ProtectionFieldOffset) inside the

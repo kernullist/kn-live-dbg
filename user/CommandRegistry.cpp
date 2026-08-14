@@ -343,6 +343,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!pool", L"!pool", L"kernel", L"enumerate big pool allocations via NtQuerySystemInformation(SystemBigPoolInformation) and filter by tag/size/address/W+X with optional PTE annotation", CommandSupport::Native),
         Make(L"dump-raw", L"dump-raw", L"memory", L"dump a kernel virtual range to file verbatim via the driver ReadMemory IOCTL", CommandSupport::Native),
         Make(L"dump-pe", L"dump-pe", L"memory", L"reconstruct an on-disk PE image from an in-memory loaded kernel PE by walking the section table", CommandSupport::Native),
+        Make(L"dump-kernel", L"dump-kernel", L"memory", L"write a WinDbg-openable complete dump from live physical RAM runs", CommandSupport::Native),
+        Make(L"dump-live", L"dump-live", L"memory", L"ask Windows to write a live kernel dump via NtSystemDebugControl", CommandSupport::Native),
         Make(L"pool-scan-pe", L"pool-scan-pe", L"kernel", L"scan big pool allocations for hidden / signature-wiped PE images, surfacing reflective-load and unpacker stages", CommandSupport::Native),
         Make(L"!wnf", L"!wnf", L"kernel", L"decode Windows Notification Facility state names and walk live name instances", CommandSupport::Native),
         Make(L"dv", L"dv", L"locals", kRequiresDbgEng, CommandSupport::DbgEng),
