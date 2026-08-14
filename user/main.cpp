@@ -48,6 +48,7 @@
 
 #include "../shared/KnLiveDbgIoctl.h"
 #include "../shared/KnLiveDbgProbeIoctl.h"
+#include "KnLiveDbgVersion.h"
 
 #include <Windows.h>
 #include <conio.h>
@@ -55,7 +56,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
@@ -826,9 +829,14 @@ static std::wstring NormalizeInputCommand(const std::wstring& value)
 {
     std::wstring result;
 
-    if (value == L"dS")
+    if (value.size() == 2 &&
+        (value[0] == L'd' || value[0] == L'D') &&
+        value[1] == L'S')
     {
-        result = L"du";
+        // Preserve WinDbg's counted UTF-16 form. The first letter is
+        // case-insensitive; lowercasing the second letter would collapse
+        // DS/dS onto ds (counted ASCII).
+        result = L"dS";
     }
     else if (value == L"dW")
     {
@@ -2217,6 +2225,14 @@ static bool ParseUnsigned(const std::wstring& value, uint32_t numberBase, uint64
         }
 
         int base = static_cast<int>(numberBase);
+        if (base == 0)
+        {
+            // Callers pass 0 to mean "decimal, unless the token has an explicit
+            // 0x/hex-digit hint". wcstoull base 0 would treat a leading 0 as
+            // octal, so !ti /pid 010 would become 8.
+            base = 10;
+        }
+
         if (text.size() > 2 && text[0] == L'0' && (text[1] == L'x' || text[1] == L'X'))
         {
             base = 16;
@@ -2231,9 +2247,10 @@ static bool ParseUnsigned(const std::wstring& value, uint32_t numberBase, uint64
             base = 16;
         }
 
+        errno = 0;
         wchar_t* end = nullptr;
         uint64_t parsed = wcstoull(text.c_str(), &end, base);
-        if (end == nullptr || *end != L'\0')
+        if (end == nullptr || *end != L'\0' || errno == ERANGE)
         {
             break;
         }
@@ -2477,6 +2494,67 @@ static std::vector<uint8_t> EncodeInteger(uint64_t value, size_t width)
     return bytes;
 }
 
+static bool IntegerFitsWidth(uint64_t value, size_t width)
+{
+    bool fits = false;
+
+    do
+    {
+        if (width == 0 || width > sizeof(uint64_t))
+        {
+            break;
+        }
+
+        if (width == sizeof(uint64_t))
+        {
+            fits = true;
+            break;
+        }
+
+        const uint64_t maxValue = (1ull << (width * 8)) - 1ull;
+        fits = value <= maxValue;
+    } while (false);
+
+    return fits;
+}
+
+static bool EncodeIntegerChecked(
+    uint64_t value,
+    size_t width,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (bytes == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid integer encode output";
+            }
+            break;
+        }
+
+        if (!IntegerFitsWidth(value, width))
+        {
+            if (error != nullptr)
+            {
+                *error = L"value 0x" + HexText(value) +
+                    L" does not fit in a " + std::to_wstring(width) +
+                    L"-byte field; refusing silent truncate";
+            }
+            break;
+        }
+
+        *bytes = EncodeInteger(value, width);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static uint64_t DecodeInteger(const uint8_t* bytes, size_t width)
 {
     uint64_t value = 0;
@@ -2604,7 +2682,12 @@ static void HexDump(uint64_t address, const MemoryReadView& view)
     }
 }
 
-static void UnitDump(uint64_t address, const MemoryReadView& view, size_t width, SymbolEngine* symbols)
+static void UnitDump(
+    uint64_t address,
+    const MemoryReadView& view,
+    size_t width,
+    SymbolEngine* symbols,
+    bool ascii = false)
 {
     for (size_t offset = 0; offset + width <= view.Bytes.size(); offset += width)
     {
@@ -2634,6 +2717,25 @@ static void UnitDump(uint64_t address, const MemoryReadView& view, size_t width,
                     std::wcout << L"+0x" << displacement;
                 }
             }
+        }
+
+        if (ascii)
+        {
+            std::wcout << L"  \"";
+            for (size_t index = 0; index < width; ++index)
+            {
+                wchar_t ch = L'?';
+                if (MemoryByteIsKnown(view, offset + index))
+                {
+                    ch = static_cast<wchar_t>(view.Bytes[offset + index]);
+                    if (ch < 32 || ch > 126)
+                    {
+                        ch = L'.';
+                    }
+                }
+                std::wcout << ch;
+            }
+            std::wcout << L"\"";
         }
 
         std::wcout << std::dec << L"\n";
@@ -2715,6 +2817,97 @@ static void PrintUnicodeString(uint64_t address, const std::vector<uint8_t>& byt
     PrintUnicodeString(address, MakeKnownMemoryReadView(bytes));
 }
 
+static void PrintCountedAsciiString(uint64_t address, const MemoryReadView& view)
+{
+    PrintColoredText(HexText(address), KNDBG_COLOR_ACCENT);
+    std::wcout << L": ";
+
+    if (view.Bytes.size() < sizeof(uint16_t) || !MemoryRangeIsKnown(view, 0, sizeof(uint16_t)))
+    {
+        std::wcout << L"<unreadable counted-string length>\n";
+        return;
+    }
+
+    uint16_t count = 0;
+    memcpy(&count, view.Bytes.data(), sizeof(count));
+    std::wcout << L"len=" << std::dec << count << L" ";
+
+    const size_t available = view.Bytes.size() - sizeof(uint16_t);
+    const size_t printCount = (std::min)(static_cast<size_t>(count), available);
+    for (size_t offset = 0; offset < printCount; ++offset)
+    {
+        if (!MemoryByteIsKnown(view, sizeof(uint16_t) + offset))
+        {
+            std::wcout << L"?";
+            continue;
+        }
+
+        uint8_t ch = view.Bytes[sizeof(uint16_t) + offset];
+        if (ch < 32 || ch > 126)
+        {
+            std::wcout << L".";
+        }
+        else
+        {
+            std::wcout << static_cast<wchar_t>(ch);
+        }
+    }
+
+    if (static_cast<size_t>(count) > available)
+    {
+        std::wcout << L" <truncated>";
+    }
+
+    std::wcout << L"\n";
+}
+
+static void PrintCountedUnicodeString(uint64_t address, const MemoryReadView& view)
+{
+    PrintColoredText(HexText(address), KNDBG_COLOR_ACCENT);
+    std::wcout << L": ";
+
+    if (view.Bytes.size() < sizeof(uint16_t) || !MemoryRangeIsKnown(view, 0, sizeof(uint16_t)))
+    {
+        std::wcout << L"<unreadable counted-string length>\n";
+        return;
+    }
+
+    uint16_t count = 0;
+    memcpy(&count, view.Bytes.data(), sizeof(count));
+    std::wcout << L"len=" << std::dec << count << L" ";
+
+    const size_t availableChars =
+        (view.Bytes.size() - sizeof(uint16_t)) / sizeof(wchar_t);
+    const size_t printCount = (std::min)(static_cast<size_t>(count), availableChars);
+    for (size_t index = 0; index < printCount; ++index)
+    {
+        const size_t offset = sizeof(uint16_t) + (index * sizeof(wchar_t));
+        if (!MemoryRangeIsKnown(view, offset, sizeof(wchar_t)))
+        {
+            std::wcout << L"?";
+            continue;
+        }
+
+        wchar_t ch = 0;
+        memcpy(&ch, view.Bytes.data() + offset, sizeof(ch));
+        if (ch < 32)
+        {
+            std::wcout << L".";
+        }
+        else
+        {
+            std::wcout << ch;
+        }
+    }
+
+    if (static_cast<size_t>(count) > availableChars)
+    {
+        std::wcout << L" <truncated>";
+    }
+
+    std::wcout << L"\n";
+}
+
 static size_t UnitWidthForDisplayCommand(const std::wstring& command)
 {
     size_t width = 1;
@@ -2746,7 +2939,7 @@ static bool IsDisplayCommand(const std::wstring& command)
         command == L"dda" || command == L"ddp" || command == L"ddu" || command == L"dpa" ||
         command == L"dpp" || command == L"dpu" || command == L"dqa" || command == L"dqp" ||
         command == L"dqu" || command == L"dds" || command == L"dps" || command == L"dqs" ||
-        command == L"ds";
+        command == L"ds" || command == L"dS";
 }
 
 static bool IsEnterCommand(const std::wstring& command)
@@ -2927,6 +3120,7 @@ static bool IsNativeOwnedCommand(const std::wstring& command)
             command == L"modules" ||
             command == L"x" ||
             command == L"ln" ||
+            command == L"addr" ||
             command == L"ld" ||
             command == L"reload" ||
             command == L".reload" ||
@@ -2962,6 +3156,7 @@ static bool IsWfpScopeName(const std::wstring& value)
         lowered == L"sublayers" ||
         lowered == L"callouts" ||
         lowered == L"kernelcallouts" ||
+        lowered == L"kernel-callouts" ||
         lowered == L"filters" ||
         lowered == L"layers";
 }
@@ -3465,6 +3660,7 @@ static void AddWfpScopeCompletionCandidates(std::vector<std::wstring>* candidate
         L"sublayers",
         L"callouts",
         L"kernelcallouts",
+        L"kernel-callouts",
         L"filters",
         L"layers",
         L"help"
@@ -6193,7 +6389,20 @@ static void PrintDtTypeMatches(const DtRequest& request, const std::vector<TypeM
     }
 }
 
-static void PrintFieldValue(DeviceClient& device, const TypeFieldInfo& field, uint64_t address)
+static bool ReadMemoryWithProcessContext(
+    DeviceClient& device,
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address,
+    uint32_t length,
+    std::vector<uint8_t>* bytes,
+    std::wstring* error);
+
+static void PrintFieldValue(
+    DeviceClient& device,
+    const DebuggerState& state,
+    const TypeFieldInfo& field,
+    uint64_t address)
 {
     std::wstring error;
     uint32_t width = static_cast<uint32_t>(field.Length);
@@ -6201,6 +6410,30 @@ static void PrintFieldValue(DeviceClient& device, const TypeFieldInfo& field, ui
     if (field.ChildTag == KNDBG_SYMTAG_POINTER_TYPE)
     {
         width = sizeof(uint64_t);
+    }
+
+    if (field.IsBitField)
+    {
+        // DIA/DbgHelp store Length as a bit count for bitfields. Read the
+        // containing integer that covers BitPosition..BitPosition+Length-1.
+        const uint64_t bitEnd = static_cast<uint64_t>(field.BitPosition) + field.Length;
+        uint32_t needed = static_cast<uint32_t>((bitEnd + 7ull) / 8ull);
+        if (needed <= 1)
+        {
+            width = 1;
+        }
+        else if (needed <= 2)
+        {
+            width = 2;
+        }
+        else if (needed <= 4)
+        {
+            width = 4;
+        }
+        else
+        {
+            width = 8;
+        }
     }
 
     if (width == 0 || width > sizeof(uint64_t))
@@ -6217,7 +6450,8 @@ static void PrintFieldValue(DeviceClient& device, const TypeFieldInfo& field, ui
         return;
     }
 
-    if (!device.ReadMemory(fieldAddress, width, &bytes, &error))
+    if (!ReadMemoryWithProcessContext(device, state, nullptr, fieldAddress, width, &bytes, &error) ||
+        bytes.size() < width)
     {
         std::wcout << L" <read failed: " << error << L">";
         return;
@@ -6235,6 +6469,7 @@ static void PrintFieldValue(DeviceClient& device, const TypeFieldInfo& field, ui
 
 static void DumpTypeLayout(
     DeviceClient& device,
+    const DebuggerState& state,
     SymbolEngine& symbols,
     const TypeLayoutInfo& layout,
     const DtRequest& request,
@@ -6284,7 +6519,7 @@ static void DumpTypeLayout(
 
         if (request.HasAddress)
         {
-            PrintFieldValue(device, field, address);
+            PrintFieldValue(device, state, field, address);
         }
 
         std::wcout << L"\n";
@@ -6299,7 +6534,15 @@ static void DumpTypeLayout(
             {
                 DtRequest childRequest = request;
                 childRequest.FieldFilters.clear();
-                DumpTypeLayout(device, symbols, childLayout, childRequest, childAddress, indent + 4, remainingDepth - 1);
+                DumpTypeLayout(
+                    device,
+                    state,
+                    symbols,
+                    childLayout,
+                    childRequest,
+                    childAddress,
+                    indent + 4,
+                    remainingDepth - 1);
             }
         }
     }
@@ -6349,7 +6592,7 @@ static void HandleDtCommand(
             break;
         }
 
-        DumpTypeLayout(device, symbols, layout, request, request.Address, 0, request.RecursionDepth);
+        DumpTypeLayout(device, state, symbols, layout, request, request.Address, 0, request.RecursionDepth);
     } while (false);
 }
 
@@ -6749,7 +6992,7 @@ static void HandleDisplayCommand(
             defaultCount = 16;
         }
 
-        if (command == L"da" || command == L"du" || command == L"ds")
+        if (command == L"da" || command == L"du" || command == L"ds" || command == L"dS")
         {
             defaultCount = 128;
         }
@@ -6761,12 +7004,18 @@ static void HandleDisplayCommand(
             break;
         }
 
+        if (args.size() > argIndex + 2)
+        {
+            std::wcerr << L"unexpected extra argument: " << args[argIndex + 2] << L"\n";
+            break;
+        }
+
         uint64_t byteUnit = unit;
         if (command == L"da" || command == L"ds")
         {
             byteUnit = 1;
         }
-        else if (command == L"du")
+        else if (command == L"du" || command == L"dS")
         {
             byteUnit = sizeof(wchar_t);
         }
@@ -6776,6 +7025,22 @@ static void HandleDisplayCommand(
         {
             std::wcerr << L"read size exceeds native transfer limit\n";
             break;
+        }
+
+        if (command == L"ds" || command == L"dS")
+        {
+            if (byteCount > 0xffffffffu - 2u)
+            {
+                std::wcerr << L"read size exceeds native transfer limit\n";
+                break;
+            }
+
+            byteCount += 2;
+            if (!IsSafeTransferSize(byteCount))
+            {
+                std::wcerr << L"read size exceeds native transfer limit\n";
+                break;
+            }
         }
 
         MemoryReadView memory;
@@ -6790,9 +7055,17 @@ static void HandleDisplayCommand(
         {
             HexDump(address, memory);
         }
-        else if (command == L"da" || command == L"ds")
+        else if (command == L"da")
         {
             PrintAsciiString(address, memory);
+        }
+        else if (command == L"ds")
+        {
+            PrintCountedAsciiString(address, memory);
+        }
+        else if (command == L"dS")
+        {
+            PrintCountedUnicodeString(address, memory);
         }
         else if (command == L"du")
         {
@@ -6859,7 +7132,7 @@ static void HandleDisplayCommand(
         }
         else
         {
-            UnitDump(address, memory, unit, nullptr);
+            UnitDump(address, memory, unit, nullptr, command == L"dc");
         }
 
         if (structuredJsonOut != nullptr)
@@ -7577,11 +7850,18 @@ static bool DmlProcessMatchesFilter(
     const DmlProcessRecord& record,
     bool hasPidFilter,
     uint64_t pidFilter,
+    bool hasEprocessFilter,
+    uint64_t eprocessFilter,
     const std::wstring& nameFilter)
 {
     if (hasPidFilter)
     {
         return record.ProcessId == pidFilter;
+    }
+
+    if (hasEprocessFilter)
+    {
+        return record.Eprocess == eprocessFilter;
     }
 
     if (!nameFilter.empty())
@@ -7630,6 +7910,77 @@ static bool ParseDmlProcessPidFilter(const std::wstring& value, uint64_t* pid)
     } while (false);
 
     return ok;
+}
+
+// Classify a free-form process token the way operators actually type it:
+//   decimal digits          -> PID
+//   0x/0n/hex-letter value  -> PID if it fits 32 bits, else EPROCESS if
+//                               the value is a canonical kernel VA
+//   anything unparsable     -> image-name filter
+// A parsed integer that is neither a 32-bit PID nor a kernel VA is None
+// (do not silently treat "0x100000000" as an image name).
+enum class ProcessSpecifierKind
+{
+    None = 0,
+    Pid,
+    Eprocess,
+    Image
+};
+
+static ProcessSpecifierKind ClassifyProcessSpecifier(
+    const std::wstring& text,
+    uint32_t numberBase,
+    uint64_t* pid,
+    uint64_t* eprocess)
+{
+    ProcessSpecifierKind kind = ProcessSpecifierKind::None;
+
+    do
+    {
+        if (text.empty() || IsSwitchLikeToken(text))
+        {
+            break;
+        }
+
+        uint64_t parsedPid = 0;
+        if (ParseDmlProcessPidFilter(text, &parsedPid))
+        {
+            if (pid != nullptr)
+            {
+                *pid = parsedPid;
+            }
+            kind = ProcessSpecifierKind::Pid;
+            break;
+        }
+
+        uint64_t parsed = 0;
+        if (!ParseUnsigned(text, numberBase, &parsed))
+        {
+            kind = ProcessSpecifierKind::Image;
+            break;
+        }
+
+        if (IsLikelyKernelVirtualAddress(parsed))
+        {
+            if (eprocess != nullptr)
+            {
+                *eprocess = parsed;
+            }
+            kind = ProcessSpecifierKind::Eprocess;
+            break;
+        }
+
+        if (parsed <= 0xffffffffull)
+        {
+            if (pid != nullptr)
+            {
+                *pid = parsed;
+            }
+            kind = ProcessSpecifierKind::Pid;
+        }
+    } while (false);
+
+    return kind;
 }
 
 struct DmlProcessCollection
@@ -8575,12 +8926,14 @@ static void HandleDmlProcCommand(
     {
         if (args.size() > 2)
         {
-            std::wcerr << L"usage: !dml_proc [pid|name]\n";
+            std::wcerr << L"usage: !dml_proc [pid|name|eprocess]\n";
             break;
         }
 
         bool hasPidFilter = false;
+        bool hasEprocessFilter = false;
         uint64_t pidFilter = 0;
+        uint64_t eprocessFilter = 0;
         std::wstring nameFilter;
         if (args.size() == 2)
         {
@@ -8590,20 +8943,27 @@ static void HandleDmlProcCommand(
                 break;
             }
 
-            if (ParseDmlProcessPidFilter(args[1], &pidFilter))
+            const ProcessSpecifierKind kind = ClassifyProcessSpecifier(
+                args[1],
+                0,
+                &pidFilter,
+                &eprocessFilter);
+            if (kind == ProcessSpecifierKind::Pid)
             {
                 hasPidFilter = true;
             }
-            else if (IsSwitchLikeToken(args[1]))
+            else if (kind == ProcessSpecifierKind::Eprocess)
             {
-                std::wcerr << L"usage: !dml_proc [pid|name]\n";
-                break;
+                hasEprocessFilter = true;
+            }
+            else if (kind == ProcessSpecifierKind::Image)
+            {
+                nameFilter = args[1];
             }
             else
             {
-                // A non-decimal argument is a case-insensitive image-name
-                // substring filter, e.g. !dml_proc lsass.
-                nameFilter = args[1];
+                std::wcerr << L"usage: !dml_proc [pid|name|eprocess]\n";
+                break;
             }
         }
 
@@ -8621,7 +8981,13 @@ static void HandleDmlProcCommand(
         PrintDmlProcessHeader();
         for (const DmlProcessRecord& record : collection.Records)
         {
-            if (DmlProcessMatchesFilter(record, hasPidFilter, pidFilter, nameFilter))
+            if (DmlProcessMatchesFilter(
+                    record,
+                    hasPidFilter,
+                    pidFilter,
+                    hasEprocessFilter,
+                    eprocessFilter,
+                    nameFilter))
             {
                 PrintDmlProcessRecord(record);
                 ++count;
@@ -8640,6 +9006,12 @@ static void HandleDmlProcCommand(
             std::wcout << L" ";
             PrintColoredText(L"pid", KNDBG_COLOR_ACCENT);
             std::wcout << L"=" << std::dec << pidFilter;
+        }
+        else if (hasEprocessFilter)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"eprocess", KNDBG_COLOR_ACCENT);
+            std::wcout << L"=" << HexTextWidth(eprocessFilter, 16, true);
         }
         else if (!nameFilter.empty())
         {
@@ -9703,6 +10075,12 @@ static void HandleTranslateVirtualCommand(
             hasProcessContext = true;
         }
 
+        if (args.size() > index + 1)
+        {
+            std::wcerr << L"unexpected extra argument: " << args[index + 1] << L"\n";
+            break;
+        }
+
         if (args.size() > index && !ParseUnsigned(args[index], state.NumberBase, &length))
         {
             std::wcerr << L"invalid vtop length\n";
@@ -9820,6 +10198,7 @@ static void HandleProcessContextCommand(
         {
             state.HasProcessContext = false;
             state.ProcessContext = {};
+            state.HasLastDisassemblyAddress = false;
             PrintColoredText(L"process context", KNDBG_COLOR_TITLE);
             std::wcout << L": off\n";
             break;
@@ -9841,6 +10220,7 @@ static void HandleProcessContextCommand(
 
         state.ProcessContext = context;
         state.HasProcessContext = true;
+        state.HasLastDisassemblyAddress = false;
         PrintColoredText(L"process context", KNDBG_COLOR_TITLE);
         std::wcout << L": ";
         PrintProcessAddressContext(state.ProcessContext);
@@ -9877,6 +10257,12 @@ static void HandlePhysicalDisplayCommand(
         if (!GetCountArgument(args, 2, defaultCount, state, &count))
         {
             std::wcerr << L"invalid count\n";
+            break;
+        }
+
+        if (args.size() > 3)
+        {
+            std::wcerr << L"unexpected extra argument: " << args[3] << L"\n";
             break;
         }
 
@@ -9974,7 +10360,14 @@ static void HandlePhysicalEnterCommand(
                     break;
                 }
 
-                std::vector<uint8_t> encoded = EncodeInteger(value, width);
+                std::vector<uint8_t> encoded;
+                if (!EncodeIntegerChecked(value, width, &encoded, &error))
+                {
+                    std::wcerr << L"invalid value: " << args[index] << L": " << error << L"\n";
+                    valuesOk = false;
+                    break;
+                }
+
                 bytes.insert(bytes.end(), encoded.begin(), encoded.end());
             }
 
@@ -10128,7 +10521,18 @@ static bool PromptForPhysicalEnterBytes(
                 break;
             }
 
-            std::vector<uint8_t> encoded = EncodeInteger(value, width);
+            std::vector<uint8_t> encoded;
+            std::wstring encodeError;
+            if (!EncodeIntegerChecked(value, width, &encoded, &encodeError))
+            {
+                if (error != nullptr)
+                {
+                    *error = encodeError;
+                }
+                valuesOk = false;
+                break;
+            }
+
             bytes->insert(bytes->end(), encoded.begin(), encoded.end());
         }
 
@@ -10247,7 +10651,18 @@ static bool PromptForEnterBytes(
                 break;
             }
 
-            std::vector<uint8_t> encoded = EncodeInteger(value, width);
+            std::vector<uint8_t> encoded;
+            std::wstring encodeError;
+            if (!EncodeIntegerChecked(value, width, &encoded, &encodeError))
+            {
+                if (error != nullptr)
+                {
+                    *error = encodeError;
+                }
+                valuesOk = false;
+                break;
+            }
+
             bytes->insert(bytes->end(), encoded.begin(), encoded.end());
         }
 
@@ -10390,7 +10805,14 @@ static void HandleEnterCommand(
                     break;
                 }
 
-                std::vector<uint8_t> encoded = EncodeInteger(value, width);
+                std::vector<uint8_t> encoded;
+                if (!EncodeIntegerChecked(value, width, &encoded, &error))
+                {
+                    std::wcerr << L"invalid value: " << args[index] << L": " << error << L"\n";
+                    valuesOk = false;
+                    break;
+                }
+
                 bytes.insert(bytes.end(), encoded.begin(), encoded.end());
             }
 
@@ -10605,15 +11027,15 @@ static void HandleFill(const std::vector<std::wstring>& args, DebuggerState& sta
                 break;
             }
 
-            if (width == 1)
+            std::vector<uint8_t> encoded;
+            if (!EncodeIntegerChecked(value, width, &encoded, &error))
             {
-                pattern.push_back(static_cast<uint8_t>(value & 0xff));
+                std::wcerr << L"invalid fill value: " << error << L"\n";
+                valuesOk = false;
+                break;
             }
-            else
-            {
-                std::vector<uint8_t> encoded = EncodeInteger(value, width);
-                pattern.insert(pattern.end(), encoded.begin(), encoded.end());
-            }
+
+            pattern.insert(pattern.end(), encoded.begin(), encoded.end());
         }
 
         if (!valuesOk)
@@ -10840,22 +11262,23 @@ static void HandleSearch(const std::vector<std::wstring>& args, const DebuggerSt
 
         size_t argIndex = 1;
         size_t width = 1;
-        if (args[argIndex] == L"-w")
+        const std::wstring widthOption = ToLower(args[argIndex]);
+        if (widthOption == L"-w")
         {
             width = 2;
             ++argIndex;
         }
-        else if (args[argIndex] == L"-d")
+        else if (widthOption == L"-d")
         {
             width = 4;
             ++argIndex;
         }
-        else if (args[argIndex] == L"-q")
+        else if (widthOption == L"-q")
         {
             width = 8;
             ++argIndex;
         }
-        else if (args[argIndex] == L"-b")
+        else if (widthOption == L"-b")
         {
             width = 1;
             ++argIndex;
@@ -10894,7 +11317,14 @@ static void HandleSearch(const std::vector<std::wstring>& args, const DebuggerSt
                 break;
             }
 
-            std::vector<uint8_t> encoded = EncodeInteger(value, width);
+            std::vector<uint8_t> encoded;
+            if (!EncodeIntegerChecked(value, width, &encoded, &error))
+            {
+                std::wcerr << L"invalid search value: " << error << L"\n";
+                valuesOk = false;
+                break;
+            }
+
             pattern.insert(pattern.end(), encoded.begin(), encoded.end());
         }
 
@@ -10945,7 +11375,11 @@ static void PrintVersion(DeviceClient& device)
     std::wstring error;
 
     PrintColoredText(L"KnLiveDbg", KNDBG_COLOR_TITLE);
-    std::wcout << L" version 0.4\n";
+    {
+        const char* versionText = KN_LIVE_DBG_VERSION_TEXT;
+        std::wstring wideVersion(versionText, versionText + strlen(versionText));
+        std::wcout << L" version " << wideVersion << L"\n";
+    }
     if (device.QueryVersion(&error))
     {
         PrintColoredText(L"driver ABI ok", KNDBG_COLOR_OK);
@@ -12830,6 +13264,7 @@ static void PrintWfpHelp()
     std::wcout << L"  !wfp sublayers\n";
     std::wcout << L"  !wfp callouts [/module <name|GUID>]\n";
     std::wcout << L"  !wfp kernelcallouts\n";
+    std::wcout << L"  !wfp kernel-callouts\n";
     std::wcout << L"  !wfp filters [/layer <name|GUID>] [/provider <name|GUID>]\n";
     std::wcout << L"  !wfp layers\n";
     std::wcout << L"\n";
@@ -12840,6 +13275,7 @@ static void PrintWfpHelp()
     std::wcout << L"  kernelcallouts  kernel-mode classify/notify/flowDelete function pointers from the netio.sys\n";
     std::wcout << L"                  callout table, joined to callout metadata; flags classify targets outside\n";
     std::wcout << L"                  loaded kernel modules. Requires the driver device and netio.sys symbols.\n";
+    std::wcout << L"                  kernel-callouts is accepted as an alias.\n";
     std::wcout << L"  filters         installed WFP filters with layer, sublayer, provider, action, and weight\n";
     std::wcout << L"  layers          active WFP management layers with kernel/builtin/buffered flags\n";
     std::wcout << L"\n";
@@ -12991,16 +13427,65 @@ static void PrintWfpRecord(const WfpRecord& record)
     }
 }
 
+static std::wstring BuildWfpKernelCalloutsJson(const WfpCalloutScanResult& result)
+{
+    std::wstringstream stream;
+    stream << L"{\"schema\":\"kn-live-dbg.wfp-kernel-callouts.v1\""
+           << L",\"resolved\":" << (result.Resolved ? L"true" : L"false")
+           << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false")
+           << L",\"incomplete\":" << (result.Incomplete ? L"true" : L"false")
+           << L",\"any_suspicious\":" << (result.AnySuspicious ? L"true" : L"false")
+           << L",\"suspicious_count\":" << std::dec << result.SuspiciousCount
+           << L",\"count\":" << result.Count
+           << L",\"array\":\"" << HexTextWidth(result.ArrayAddress, 16, true) << L"\""
+           << L",\"layout\":" << mcpjson::Quote(result.LayoutSource)
+           << L",\"callouts\":[";
+    for (size_t i = 0; i < result.Callouts.size(); ++i)
+    {
+        const WfpKernelCallout& callout = result.Callouts[i];
+        if (i != 0)
+        {
+            stream << L",";
+        }
+        stream << L"{\"id\":" << std::dec << callout.CalloutId
+               << L",\"classify\":\"" << HexTextWidth(callout.ClassifyFn, 16, true) << L"\""
+               << L",\"module\":" << mcpjson::Quote(callout.ClassifyModule)
+               << L",\"symbol\":" << mcpjson::Quote(callout.ClassifySymbol)
+               << L",\"name\":" << mcpjson::Quote(callout.Name)
+               << L",\"suspicious\":" << (callout.ClassifySuspicious ? L"true" : L"false")
+               << L"}";
+    }
+    stream << L"],\"warnings\":[";
+    for (size_t i = 0; i < result.Warnings.size(); ++i)
+    {
+        if (i != 0)
+        {
+            stream << L",";
+        }
+        stream << mcpjson::Quote(result.Warnings[i]);
+    }
+    stream << L"]}";
+    return stream.str();
+}
+
 static void HandleWfpKernelCalloutsCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
 {
     do
     {
         if (HasHelpToken(args, 2))
         {
             PrintWfpHelp();
+            break;
+        }
+
+        if (args.size() > 2)
+        {
+            std::wcerr << L"!wfp kernelcallouts does not accept extra arguments\n";
+            std::wcerr << L"usage: !wfp kernelcallouts\n";
             break;
         }
 
@@ -13030,7 +13515,16 @@ static void HandleWfpKernelCalloutsCommand(
             {
                 std::wcerr << L"!wfp kernelcallouts warning: " << warning << L"\n";
             }
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildWfpKernelCalloutsJson(result);
+            }
             break;
+        }
+
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildWfpKernelCalloutsJson(result);
         }
 
         for (const std::wstring& warning : result.Warnings)
@@ -13185,6 +13679,13 @@ static void HandleWfpCommand(const std::vector<std::wstring>& args, std::wstring
 
             if (IsWfpScopeName(args[index]))
             {
+                const std::wstring scope = ToLower(args[index]);
+                if (scope == L"kernelcallouts" || scope == L"kernel-callouts")
+                {
+                    std::wcerr << L"usage: !wfp kernelcallouts\n";
+                    break;
+                }
+
                 ResolveWfpScope(args[index], &options.Target);
                 ++index;
             }
@@ -15764,40 +16265,17 @@ static void HandleTokenCommand(
             }
 
             uint64_t pidValue = 0;
-            if (ParseUnsigned(args[index], 10, &pidValue))
-            {
-                if (pidValue > 0xffffffffull)
-                {
-                    std::wcerr << L"!token: pid exceeds 32-bit range\n";
-                    parseOk = false;
-                    break;
-                }
-                if (options.HasProcessId || options.HasEprocess || !options.ImageFilter.empty())
-                {
-                    std::wcerr << L"!token: specify only one pid, image, or eprocess target\n";
-                    parseOk = false;
-                    break;
-                }
-                options.HasProcessId = true;
-                options.ProcessId = static_cast<uint32_t>(pidValue);
-                ++index;
-                continue;
-            }
-
             uint64_t eprocess = 0;
-            if ((args[index].rfind(L"0x", 0) == 0 || args[index].rfind(L"0X", 0) == 0) &&
-                ParseUnsigned(args[index], 16, &eprocess))
+            const ProcessSpecifierKind kind = ClassifyProcessSpecifier(
+                args[index],
+                0,
+                &pidValue,
+                &eprocess);
+            if (kind == ProcessSpecifierKind::None)
             {
-                if (options.HasProcessId || options.HasEprocess || !options.ImageFilter.empty())
-                {
-                    std::wcerr << L"!token: specify only one pid, image, or eprocess target\n";
-                    parseOk = false;
-                    break;
-                }
-                options.HasEprocess = true;
-                options.Eprocess = eprocess;
-                ++index;
-                continue;
+                std::wcerr << L"!token: invalid process target " << args[index] << L"\n";
+                parseOk = false;
+                break;
             }
 
             if (options.HasProcessId || options.HasEprocess || !options.ImageFilter.empty())
@@ -15806,7 +16284,21 @@ static void HandleTokenCommand(
                 parseOk = false;
                 break;
             }
-            options.ImageFilter = args[index];
+
+            if (kind == ProcessSpecifierKind::Pid)
+            {
+                options.HasProcessId = true;
+                options.ProcessId = static_cast<uint32_t>(pidValue);
+            }
+            else if (kind == ProcessSpecifierKind::Eprocess)
+            {
+                options.HasEprocess = true;
+                options.Eprocess = eprocess;
+            }
+            else
+            {
+                options.ImageFilter = args[index];
+            }
             ++index;
         }
 
@@ -16467,12 +16959,12 @@ static void HandleFirmwareTableCommand(
             break;
         }
 
+        ApplyFirmwareTableFilters(moduleFilter, hasProviderFilter, providerFilter, &result);
+
         if (structuredJsonOut != nullptr)
         {
             *structuredJsonOut = BuildFirmwareTableJson(result);
         }
-
-        ApplyFirmwareTableFilters(moduleFilter, hasProviderFilter, providerFilter, &result);
 
         for (const std::wstring& warning : result.Warnings)
         {
@@ -16722,6 +17214,7 @@ static void PrintAddressHelp()
     std::wcout << L"\n";
     std::wcout << L"arguments:\n";
     std::wcout << L"  <va>   virtual address (hex/decimal value, symbol like nt!Foo, or expression).\n";
+    std::wcout << L"  User VAs require procctx <pid>. Kernel VAs use the live CR3.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  The page-table walk runs through the KnLiveDbg.sys TranslateVirtual IOCTL and\n";
@@ -19083,7 +19576,7 @@ static void HandleTiCommand(
             if (kind == L"pid")
             {
                 uint64_t v = 0;
-                if (!ParseUnsigned(args[3], 0, &v) || v == 0)
+                if (!ParseUnsigned(args[3], 0, &v) || v == 0 || v > 0xFFFFFFFFull)
                 {
                     std::wcerr << L"!ti by pid: invalid PID: " << args[3] << L"\n";
                     break;
@@ -19118,7 +19611,8 @@ static void HandleTiCommand(
                 std::wcerr << L"!ti grep: usage: !ti grep <pattern>\n";
                 break;
             }
-            std::vector<TiEventRecord> filtered = sub.Grep(args[2], 200);
+            const std::wstring pattern = JoinArgs(args, 2);
+            std::vector<TiEventRecord> filtered = sub.Grep(pattern, 200);
             for (const TiEventRecord& r : filtered)
             {
                 PrintTiEventLine(r);
@@ -19940,6 +20434,7 @@ static bool ParseTimelineQueryOptions(
     TimelineQueryOptions* options,
     std::wstring* error)
 {
+    (void)numberBase;
     bool ok = false;
 
     do
@@ -19996,7 +20491,7 @@ static bool ParseTimelineQueryOptions(
                     break;
                 }
                 uint64_t pid = 0;
-                if (!ParseUnsigned(args[index + 1], numberBase, &pid) || pid == 0 || pid > 0xffffffffull)
+                if (!ParseUnsigned(args[index + 1], 10, &pid) || pid == 0 || pid > 0xffffffffull)
                 {
                     if (error != nullptr)
                     {
@@ -20059,6 +20554,7 @@ static bool ParseTimelineReconcileOptions(
     TimelineReconcileOptions* options,
     std::wstring* error)
 {
+    (void)numberBase;
     bool ok = false;
 
     do
@@ -20115,7 +20611,7 @@ static bool ParseTimelineReconcileOptions(
                     break;
                 }
                 uint64_t pid = 0;
-                if (!ParseUnsigned(args[index + 1], numberBase, &pid) || pid == 0 || pid > 0xffffffffull)
+                if (!ParseUnsigned(args[index + 1], 10, &pid) || pid == 0 || pid > 0xffffffffull)
                 {
                     if (error != nullptr)
                     {
@@ -20166,6 +20662,7 @@ static bool ParseTimelineGraphOptions(
     TimelineGraphQueryOptions* options,
     std::wstring* error)
 {
+    (void)numberBase;
     bool ok = false;
 
     do
@@ -20236,7 +20733,7 @@ static bool ParseTimelineGraphOptions(
                     break;
                 }
                 uint64_t pid = 0;
-                if (!ParseUnsigned(args[index + 1], numberBase, &pid) || pid == 0 || pid > 0xffffffffull)
+                if (!ParseUnsigned(args[index + 1], 10, &pid) || pid == 0 || pid > 0xffffffffull)
                 {
                     if (error != nullptr)
                     {
@@ -21588,9 +22085,20 @@ static void HandleAddressCommand(
             break;
         }
 
+        uint64_t directoryTableBase = 0;
+        if (state.HasProcessContext)
+        {
+            directoryTableBase = SelectProcessDirectoryTableBase(state.ProcessContext, address);
+        }
+        else if (IsLikelyUserVirtualAddress(address))
+        {
+            std::wcerr << L"!address: user virtual address requires procctx <pid>\n";
+            break;
+        }
+
         AddressInspectResult result;
         std::wstring inspectError;
-        if (!InspectAddress(device, symbols, address, &result, &inspectError))
+        if (!InspectAddress(device, symbols, address, &result, &inspectError, directoryTableBase))
         {
             std::wcerr << L"!address failed: " << inspectError << L"\n";
             break;
@@ -22177,6 +22685,7 @@ static void HandlePoolCommand(
         options.Target = PoolScanner::Scope::Big;
         options.Paged = PoolScanner::PagedFilter::NonPagedOnly;
         bool summaryOnly = false;
+        std::wstring error;
 
         size_t index = 1;
         if (index < args.size() && IsPoolScopeName(args[index]))
@@ -22275,7 +22784,17 @@ static void HandlePoolCommand(
                     break;
                 }
                 uint64_t value = 0;
-                if (!ParseUnsigned(args[index + 1], state.NumberBase, &value))
+                if (opt == L"/addr")
+                {
+                    if (!ParseAddressOrSymbol(symbols, state, args[index + 1], &value, &error))
+                    {
+                        std::wcerr << L"!pool: failed to parse address \"" << args[index + 1]
+                                   << L"\": " << error << L"\n";
+                        parseError = true;
+                        break;
+                    }
+                }
+                else if (!ParseUnsigned(args[index + 1], state.NumberBase, &value))
                 {
                     std::wcerr << L"!pool: failed to parse \"" << args[index + 1] << L"\" for " << opt << L"\n";
                     parseError = true;
@@ -22342,7 +22861,6 @@ static void HandlePoolCommand(
 
         PoolScanner scanner(device, symbols);
         PoolScanResult result = {};
-        std::wstring error;
         if (!scanner.Scan(options, &result, &error))
         {
             std::wcerr << L"!pool failed: " << error << L"\n";
@@ -23205,27 +23723,81 @@ static void HandleUnassembleCommand(
     do
     {
         bool isFunction = command == L"uf";
-        if (isFunction)
+        size_t argIndex = 1;
+        ProcessAddressContext explicitContext = {};
+        bool hasExplicitContext = false;
+
+        if (args.size() >= 2 && IsDeprecatedProcessContextOption(args[1]))
         {
-            if (args.size() < 2)
+            std::wcerr << L"usage: " << command
+                       << L" [/process <process-id>] <address|symbol> [instruction-count]\n";
+            break;
+        }
+
+        if (args.size() >= 2 && IsProcessContextOption(args[1]))
+        {
+            if (args.size() < 4)
             {
-                std::wcerr << L"usage: uf <address|symbol> [max-instructions]\n";
+                std::wcerr << L"usage: " << command
+                           << L" /process <process-id> <address|symbol> [instruction-count]\n";
                 break;
             }
+
+            uint64_t processId = 0;
+            if (!ParseUnsigned(args[2], 10, &processId) || processId == 0 || processId > 0xffffffffull)
+            {
+                std::wcerr << L"invalid process id\n";
+                break;
+            }
+
+            if (!ResolveProcessAddressContext(
+                    device,
+                    symbols,
+                    static_cast<uint32_t>(processId),
+                    &explicitContext,
+                    &error))
+            {
+                std::wcerr << L"process context failed: " << error << L"\n";
+                break;
+            }
+
+            hasExplicitContext = true;
+            argIndex = 3;
+        }
+
+        if (isFunction && argIndex >= args.size())
+        {
+            std::wcerr << L"usage: uf [/process <process-id>] <address|symbol> [max-instructions]\n";
+            break;
         }
 
         uint64_t address = 0;
         bool hasAddress = false;
-        if (args.size() >= 2)
+        if (argIndex < args.size())
         {
+            if (IsSwitchLikeToken(args[argIndex]))
+            {
+                std::wcerr << L"unknown option: " << args[argIndex] << L"\n";
+                std::wcerr << L"usage: " << command
+                           << L" [/process <process-id>] <address|symbol> [instruction-count]\n";
+                break;
+            }
+
             if (symbols.Modules().empty())
             {
                 symbols.LoadKernelModules(nullptr);
             }
 
-            if (ParseAddressOrSymbol(symbols, state, args[1], &address, &error))
+            if (ParseAddressOrSymbol(symbols, state, args[argIndex], &address, &error))
             {
                 hasAddress = true;
+            }
+            else if (hasExplicitContext)
+            {
+                // /process is native-only. Sending the original line to DbgEng
+                // would either fail or ignore the requested DTB.
+                std::wcerr << command << L" failed: " << error << L"\n";
+                break;
             }
             else
             {
@@ -23255,16 +23827,22 @@ static void HandleUnassembleCommand(
         }
 
         std::wstring countText;
-        if (args.size() >= 3)
+        if (args.size() > argIndex + 1)
         {
-            countText = args[2];
+            countText = args[argIndex + 1];
             if (countText.size() > 1 && (countText[0] == L'L' || countText[0] == L'l'))
             {
                 countText = countText.substr(1);
             }
         }
 
-        if (args.size() >= 3 && !ParseUnsigned(countText, state.NumberBase, &count))
+        if (args.size() > argIndex + 2)
+        {
+            std::wcerr << L"unexpected extra argument: " << args[argIndex + 2] << L"\n";
+            break;
+        }
+
+        if (args.size() > argIndex + 1 && !ParseUnsigned(countText, state.NumberBase, &count))
         {
             std::wcerr << L"invalid instruction count\n";
             break;
@@ -23281,7 +23859,9 @@ static void HandleUnassembleCommand(
         {
             uint32_t bytesToRead = static_cast<uint32_t>(count * 16);
             std::vector<uint8_t> codeBytes;
-            if (!ReadMemoryWithProcessContext(device, state, nullptr, address, bytesToRead, &codeBytes, &error))
+            const ProcessAddressContext* memoryContext =
+                hasExplicitContext ? &explicitContext : nullptr;
+            if (!ReadMemoryWithProcessContext(device, state, memoryContext, address, bytesToRead, &codeBytes, &error))
             {
                 std::wcerr << command << L" failed: driver code read failed: " << error << L"\n";
                 break;
@@ -23474,16 +24054,18 @@ static void PrintWriteHelp()
 static void PrintDmlProcHelp()
 {
     std::wcout << L"!dml_proc command:\n";
-    std::wcout << L"  !dml_proc [pid|name]\n";
+    std::wcout << L"  !dml_proc [pid|name|eprocess]\n";
     std::wcout << L"\n";
     std::wcout << L"subcommands/options:\n";
-    std::wcout << L"  pid    optional decimal process ID filter, for example !dml_proc 4\n";
-    std::wcout << L"  name   optional case-insensitive image-name substring, for example !dml_proc lsass\n";
+    std::wcout << L"  pid      optional process ID filter (decimal, 0x, or 0n), for example !dml_proc 4\n";
+    std::wcout << L"  name     optional case-insensitive image-name substring, for example !dml_proc lsass\n";
+    std::wcout << L"  eprocess optional kernel EPROCESS address filter\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Native process listing that does not require a DbgEng current process/thread.\n";
     std::wcout << L"  The all-process form resolves PID 4, then walks _EPROCESS.ActiveProcessLinks.\n";
-    std::wcout << L"  A decimal argument filters by PID; any other argument is an image-name substring.\n";
+    std::wcout << L"  Decimal/0x/0n values are PID filters; canonical kernel VAs are EPROCESS filters;\n";
+    std::wcout << L"  anything else is an image-name substring.\n";
     std::wcout << L"  With a PID or name argument, only matching process records are printed.\n";
     std::wcout << L"  Output includes EPROCESS, PID, parent PID, active thread count, DTB, and image name.\n";
 }
@@ -23607,12 +24189,14 @@ static void PrintDtHelp(const std::wstring& command)
 static void PrintDisassemblyHelp()
 {
     std::wcout << L"disassembly commands:\n";
-    std::wcout << L"  u [address|symbol] [instruction-count]\n";
-    std::wcout << L"  uf <address|symbol> [max-instructions]\n";
+    std::wcout << L"  u [/process <pid>] [address|symbol] [instruction-count]\n";
+    std::wcout << L"  uf [/process <pid>] <address|symbol> [max-instructions]\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  u disassembles forward and remembers the next address.\n";
-    std::wcout << L"  uf uses native byte reads when the driver is open, then follows local branch targets.\n";
+    std::wcout << L"  uf uses native byte reads when the driver is open and walks linearly until a terminal instruction.\n";
+    std::wcout << L"  u and uf accept [/process <pid>] like d*/e*; a switch-like first argument is not sent to DbgEng.\n";
+    std::wcout << L"  Changing procctx clears the remembered u address so a later bare u cannot reuse a stale DTB.\n";
     std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  u defaults to 8 instructions and caps explicit counts at 256.\n";
     std::wcout << L"  uf defaults to 512 instructions and caps explicit counts at 4096.\n";
@@ -23625,6 +24209,7 @@ static void PrintDisplayHelp(const std::wstring& command)
     std::wcout << L"\n";
     std::wcout << L"families:\n";
     std::wcout << L"  d/db/da/dc/dd/df/dp/dq/du/dw/dyb/dyd\n";
+    std::wcout << L"  ds/dS counted ASCII or UTF-16 strings (USHORT length prefix)\n";
     std::wcout << L"  dda/ddp/ddu/dpa/dpp/dpu/dqa/dqp/dqu\n";
     std::wcout << L"  dds/dps/dqs\n";
     std::wcout << L"\n";
@@ -23633,6 +24218,8 @@ static void PrintDisplayHelp(const std::wstring& command)
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  count is element count for unit dumps and character count for string dumps.\n";
+    std::wcout << L"  ds/dS read a 16-bit character count first, then that many characters.\n";
+    std::wcout << L"  dc prints each dword plus its ASCII bytes.\n";
     std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  unreadable bytes are shown as ?? when sparse reads can continue.\n";
     std::wcout << L"  dds/dps/dqs annotate values with nearest loaded symbols.\n";
@@ -23656,7 +24243,7 @@ static void PrintEnterHelp(const std::wstring& command)
     std::wcout << L"  /process <process-id> writes through that process page table for this command only.\n";
     std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20.\n";
     std::wcout << L"  Read-only leaf PTEs are temporarily marked writable, flushed, written, and restored.\n";
-    std::wcout << L"  Integer values are little-endian and clipped to the command width.\n";
+    std::wcout << L"  Integer values are little-endian and must fit the command width.\n";
 }
 
 static void PrintPhysicalDisplayHelp(const std::wstring& command)
@@ -23687,7 +24274,7 @@ static void PrintPhysicalEnterHelp(const std::wstring& command)
     std::wcout << L"notes:\n";
     std::wcout << L"  Address-only form prompts with the current physical value, like WinDbg eb-style editing.\n";
     std::wcout << L"  Physical writes bypass process page-table context and use the physical address directly.\n";
-    std::wcout << L"  Integer values are little-endian and clipped to the command width.\n";
+    std::wcout << L"  Integer values are little-endian and must fit the command width.\n";
 }
 
 static void PrintSearchHelp()
@@ -24369,7 +24956,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         }
         else if (command == L"!timeline")
         {
-            PrintTimelineHelp();
+            if (detailIndex < args.size() && ToLower(args[detailIndex]) == L"advanced")
+            {
+                PrintTimelineAdvancedHelp();
+            }
+            else
+            {
+                PrintTimelineHelp();
+            }
         }
         else if (command == L"!wnf")
         {
@@ -24958,6 +25552,19 @@ static int RunConsoleSurfaceSelfTest()
             L"advanced",
             L"timeline-help-advanced-completion");
 
+        {
+            const std::wstring suffixAdvanced =
+                CaptureDetailedHelpOutput({L"!timeline", L"help", L"advanced"}, 0);
+            const std::wstring prefixAdvanced =
+                CaptureDetailedHelpOutput({L"help", L"!timeline", L"advanced"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                suffixAdvanced.find(L"ingest") != std::wstring::npos &&
+                    suffixAdvanced.find(L"query") != std::wstring::npos &&
+                    prefixAdvanced.find(L"ingest") != std::wstring::npos,
+                L"timeline-help-advanced-routes");
+        }
+
         TimelineUpdateOptions updateOptions = {};
         std::wstring parseError;
         CheckConsoleSurfaceSelfTest(
@@ -24987,6 +25594,72 @@ static int RunConsoleSurfaceSelfTest()
                 &updateOptions,
                 &parseError),
             L"timeline-update-parser-rejects-unknown-option");
+
+        uint64_t parsedNumber = 0;
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ParseUnsigned(L"010", 0, &parsedNumber) && parsedNumber == 10,
+            L"parse-unsigned-base0-is-decimal-not-octal");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ParseUnsigned(L"0x10", 0, &parsedNumber) && parsedNumber == 0x10,
+            L"parse-unsigned-base0-honors-hex-prefix");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !ParseUnsigned(L"fffffffffffffffff", 16, &parsedNumber),
+            L"parse-unsigned-rejects-range-overflow");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ParseDmlProcessPidFilter(L"1234", &parsedNumber) && parsedNumber == 1234 &&
+                !ParseDmlProcessPidFilter(L"0x1234", &parsedNumber) &&
+                !ParseDmlProcessPidFilter(L"ffffa80212345678", &parsedNumber),
+            L"token-pid-filter-is-decimal-only");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ParseUnsigned(L"0xffff800000001000", 16, &parsedNumber) &&
+                IsLikelyKernelVirtualAddress(parsedNumber) &&
+                !ParseDmlProcessPidFilter(L"0xffff800000001000", &parsedNumber),
+            L"token-eprocess-hex-is-not-a-pid");
+        {
+            uint64_t classifiedPid = 0;
+            uint64_t classifiedEprocess = 0;
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                ClassifyProcessSpecifier(L"4", 0, &classifiedPid, &classifiedEprocess) == ProcessSpecifierKind::Pid &&
+                    classifiedPid == 4 &&
+                    ClassifyProcessSpecifier(L"0x4", 0, &classifiedPid, &classifiedEprocess) == ProcessSpecifierKind::Pid &&
+                    classifiedPid == 4 &&
+                    ClassifyProcessSpecifier(L"0n4", 0, &classifiedPid, &classifiedEprocess) == ProcessSpecifierKind::Pid &&
+                    classifiedPid == 4,
+                L"process-specifier-accepts-0x-and-0n-pid");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                ClassifyProcessSpecifier(L"0xffff800000001000", 0, &classifiedPid, &classifiedEprocess) == ProcessSpecifierKind::Eprocess &&
+                    IsLikelyKernelVirtualAddress(classifiedEprocess) &&
+                    ClassifyProcessSpecifier(L"notepad.exe", 0, &classifiedPid, &classifiedEprocess) == ProcessSpecifierKind::Image &&
+                    ClassifyProcessSpecifier(L"0x100000000", 0, &classifiedPid, &classifiedEprocess) == ProcessSpecifierKind::None,
+                L"process-specifier-splits-eprocess-image-and-invalid");
+        }
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IntegerFitsWidth(0xff, 1) &&
+                !IntegerFitsWidth(0x100, 1) &&
+                IntegerFitsWidth(0xffffffffull, 4) &&
+                !IntegerFitsWidth(0x100000000ull, 4) &&
+                IntegerFitsWidth(~0ull, 8),
+            L"integer-write-width-rejects-overflow");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            NormalizeInputCommand(L"dS") == L"dS" &&
+                NormalizeInputCommand(L"DS") == L"dS" &&
+                IsDisplayCommand(L"dS") &&
+                IsDisplayCommand(L"ds"),
+            L"display-preserves-counted-unicode-ds-alias");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IsWfpScopeName(L"kernel-callouts") &&
+                IsWfpScopeName(L"kernelcallouts"),
+            L"wfp-kernel-callouts-alias-is-recognized");
 
         TimelineStats populatedTimelineStats = {};
         populatedTimelineStats.Stored = 1;
@@ -26800,6 +27473,7 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
         {
             std::wstring inner = NormalizeInputCommand(args[1]);
             if (inner == L"setfield" || inner == L"write" || inner == L"f" || inner == L"fp" || inner == L"m" ||
+                inner == L"wrmsr" ||
                 IsEnterCommand(inner) || IsPhysicalEnterCommand(inner))
             {
                 writeLike = true;
@@ -26834,6 +27508,7 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             if (action == L"clear" ||
                 action == L"reset" ||
                 action == L"ingest" ||
+                action == L"update" ||
                 action == L"save" ||
                 action == L"export" ||
                 action == L"dashboard")
@@ -26852,6 +27527,27 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
                 {
                     writeLike = true;
                 }
+            }
+            break;
+        }
+
+        if (command == L"set-ppl-antimalware")
+        {
+            if (args.size() < 2 || ToLower(args[1]) != L"status")
+            {
+                writeLike = true;
+            }
+            break;
+        }
+
+        if ((command == L"byovd" || command == L"!byovd") &&
+            args.size() >= 3 &&
+            ToLower(args[1]) == L"fixture")
+        {
+            const std::wstring fixtureAction = ToLower(args[2]);
+            if (fixtureAction == L"load" || fixtureAction == L"unload")
+            {
+                writeLike = true;
             }
             break;
         }
@@ -27674,7 +28370,8 @@ static bool ValidateHuntCommandArgumentShape(
             if (IsHelpToken(option) ||
                 option == L"/quick" ||
                 option == L"/deep" ||
-                option == L"/summary")
+                option == L"/summary" ||
+                option == L"/details")
             {
                 ++index;
                 continue;
@@ -27708,7 +28405,7 @@ static bool ValidateHuntCommandArgumentShape(
 
             if (reason != nullptr)
             {
-                *reason = L"!hunt supports /quick, /deep, /summary, /limit, and /json options";
+                *reason = L"!hunt supports /quick, /deep, /summary, /details, /limit, and /json options";
             }
             shapeOk = false;
             break;
@@ -30876,13 +31573,26 @@ static bool ResolveProcessTriageTarget(
         uint64_t pid = 0;
         uint64_t eprocess = 0;
 
-        if (ParseDmlProcessPidFilter(input, &pid))
+        const ProcessSpecifierKind kind = ClassifyProcessSpecifier(
+            input,
+            state.NumberBase,
+            &pid,
+            &eprocess);
+        if (kind == ProcessSpecifierKind::Pid)
         {
             wantPid = true;
         }
-        else if (ParseUnsigned(input, state.NumberBase, &eprocess) && IsLikelyKernelVirtualAddress(eprocess))
+        else if (kind == ProcessSpecifierKind::Eprocess)
         {
             wantEprocess = true;
+        }
+        else if (kind != ProcessSpecifierKind::Image)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid process target: " + input;
+            }
+            break;
         }
 
         DmlProcessCollection collection = {};
@@ -34457,7 +35167,9 @@ static bool TryExtractPidFromAiQuery(const std::vector<std::wstring>& tokens, ui
             }
 
             uint64_t parsed = 0;
-            if (!value.empty() && ParseDmlProcessPidFilter(value, &parsed))
+            uint64_t ignoredEprocess = 0;
+            if (!value.empty() &&
+                ClassifyProcessSpecifier(value, 0, &parsed, &ignoredEprocess) == ProcessSpecifierKind::Pid)
             {
                 *pid = parsed;
                 found = true;
@@ -34995,7 +35707,12 @@ static bool ParseAiCapabilityProcessFilter(
         if (ExtractJsonScalarValue(argsJson, L"pid", &pidText) && !TrimWhitespace(pidText).empty())
         {
             uint64_t parsed = 0;
-            if (!ParseDmlProcessPidFilter(TrimWhitespace(pidText), &parsed))
+            uint64_t ignoredEprocess = 0;
+            if (ClassifyProcessSpecifier(
+                    TrimWhitespace(pidText),
+                    0,
+                    &parsed,
+                    &ignoredEprocess) != ProcessSpecifierKind::Pid)
             {
                 if (error != nullptr)
                 {
@@ -36540,7 +37257,6 @@ static bool ExecuteAiCapabilityWfpKernelCallouts(
     do
     {
         (void)step;
-        (void)structuredJsonOut;
 
         if (!device.IsOpen())
         {
@@ -36558,7 +37274,7 @@ static bool ExecuteAiCapabilityWfpKernelCallouts(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": wfp.kernel_callouts\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleWfpKernelCalloutsCommand(args, device, symbols);
+        HandleWfpKernelCalloutsCommand(args, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -41122,6 +41838,8 @@ static bool HandleCommand(
         else if (command == L"kddetach")
         {
             dbgeng.Shutdown();
+            state.DbgEngRemoteKernel = false;
+            state.DbgEngConnectOptions.clear();
             if (state.Backend == DebuggerState::BackendMode::DbgEng)
             {
                 state.Backend = DebuggerState::BackendMode::Auto;
@@ -41381,7 +42099,8 @@ static bool HandleCommand(
         }
         else if (command == L"!wfp")
         {
-            if (args.size() >= 2 && ToLower(args[1]) == L"kernelcallouts")
+            if (args.size() >= 2 &&
+                (ToLower(args[1]) == L"kernelcallouts" || ToLower(args[1]) == L"kernel-callouts"))
             {
                 HandleWfpKernelCalloutsCommand(args, device, symbols);
             }
@@ -42128,7 +42847,7 @@ static McpEngineResult DispatchMcpWriteTool(
                 result.Text = L"invalid argument: " + argError;
                 break;
             }
-            command = L"setfield " + address + L" " + type + L" " + field + L" " + value;
+            command = L"setfield " + type + L" " + address + L" " + field + L" " + value;
         }
         else if (tool == L"process.set_protection")
         {

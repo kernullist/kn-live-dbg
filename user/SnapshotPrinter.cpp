@@ -89,7 +89,7 @@ namespace
 
     uint32_t PrintedLimit(const SnapshotDiffOptions& options)
     {
-        return options.Limit == 0 ? 10 : options.Limit;
+        return options.Limit == 0 ? 0xffffffffu : options.Limit;
     }
 
     void AppendFindingMarkdown(std::wstringstream& stream, const SnapshotDiffFinding& finding)

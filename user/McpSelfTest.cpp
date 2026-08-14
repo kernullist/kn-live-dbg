@@ -323,6 +323,7 @@ int RunMcpToolCatalogSelfTest()
             &context,
             L"token.inspect",
             {L"pid", L"image", L"eprocess", L"limit"});
+        CheckReadOnlyTool(&context, L"ti.subscribe", {L"action"});
         CheckReadOnlyTool(&context, L"etw.providers", {});
         CheckReadOnlyTool(&context, L"etw.ti_cross", {});
         CheckReadOnlyTool(&context, L"hal.scan", {});
