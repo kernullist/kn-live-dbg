@@ -107,7 +107,8 @@ bool InspectAddress(
     SymbolEngine& symbols,
     uint64_t address,
     AddressInspectResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    uint64_t directoryTableBase)
 {
     if (result == nullptr)
     {
@@ -167,7 +168,7 @@ bool InspectAddress(
         std::wstring translateError;
         result->TranslationAttempted = true;
 
-        if (device.TranslateVirtual(0, address, 1, &info, &translateError))
+        if (device.TranslateVirtual(directoryTableBase, address, 1, &info, &translateError))
         {
             result->TranslationSucceeded = true;
             result->DirectoryTableBase = info.DirectoryTableBase;

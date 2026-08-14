@@ -301,6 +301,14 @@ namespace
                 break;
             }
 
+            const uint32_t ntSize = (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+                ? static_cast<uint32_t>(sizeof(IMAGE_NT_HEADERS64))
+                : static_cast<uint32_t>(sizeof(IMAGE_NT_HEADERS32));
+            if (static_cast<uint64_t>(offset) + ntSize > totalSize)
+            {
+                break;
+            }
+
             // SizeOfHeaders / SizeOfImage sanity (these fields live further
             // into OptionalHeader; only check when fully in-buffer). The
             // 256 MB upper bound on SizeOfImage tightens phase-2 false

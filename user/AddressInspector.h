@@ -70,6 +70,7 @@ bool InspectAddress(
     SymbolEngine& symbols,
     uint64_t address,
     AddressInspectResult* result,
-    std::wstring* error);
+    std::wstring* error,
+    uint64_t directoryTableBase = 0);
 
 std::wstring BuildAddressInspectJson(const AddressInspectResult& result);
