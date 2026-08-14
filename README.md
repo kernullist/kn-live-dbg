@@ -68,7 +68,7 @@ kn-live-dbg/
 28. Scans loaded kernel modules for BYOVD risk with `byovd` / `!byovd` -- maintaining a local catalog from the Microsoft vulnerable driver blocklist plus LOLDrivers hash/YARA feeds, auto-refreshing it when older than 24 hours, hashing loaded module images on disk, optionally running LOLDrivers YARA rules through an operator-supplied `yara64.exe` / `yara.exe`, and reporting exact hash/YARA matches as `HIGH` confidence plus Microsoft file-name/version blocklist hints as `MEDIUM` confidence. A benign no-op fixture driver (`amdryzenmasterdriver.sys`) can be loaded with `byovd fixture load` to exercise the Microsoft name/version positive-control path without shipping an actual vulnerable driver.
 29. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), W+X page attributes (`/wx`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
 30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, reporting added/escalated records plus coverage-gated callback removal and `_EPROCESS.Protection` changes, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first.
-31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- and reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, which parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
+31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, writes a WinDbg-openable complete dump with `dump-kernel <path>` (8 KB `DUMP_HEADER64` plus streamed physical RAM runs from `MmGetPhysicalMemoryRanges`), and asks Windows for an OS live kernel dump with `dump-live <path>` via `NtSystemDebugControl(SysDbgGetLiveKernelDump)`. `dump-pe` parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
 32. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
 33. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
 34. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
@@ -294,6 +294,8 @@ byovd fixture [status|load [sys-path]|unload|path]
 !diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
 dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
+dump-kernel <path> [/max <bytes>] [/strict]
+dump-live <path> [/user] [/compress] [/hv]
 pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
 !address <va>
 set-ppl-antimalware [on|off|status]
@@ -1404,9 +1406,15 @@ Two file-emitting commands turn live kernel memory into on-disk artefacts for of
 ```text
 dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
+dump-kernel <path> [/max <bytes>] [/strict]
+dump-live <path> [/user] [/compress] [/hv]
 ```
 
 `dump-raw` reads `<length>` bytes starting at `<address>` and writes them verbatim. The read is chunked into 256 KB IOCTL calls (matching the driver's read window). The default behaviour aborts on the first per-chunk failure and reports the failing VA; pass `/zerofill` to fall back to zero-filling the failed chunk and continuing -- useful when sweeping ranges that straddle unmapped or paged-out pages. The total request is capped at 1 GB as a sanity guard.
+
+`dump-kernel` writes a WinDbg-openable complete dump: an 8 KB `DUMP_HEADER64` plus every RAM run returned by `MmGetPhysicalMemoryRanges`. Pages are streamed through `IOCTL_KNDBG_READ_PHYSICAL` (no whole-image buffer). Unreadable PFNs are zero-filled unless `/strict` is set. The system stays live, so the file is inconsistent by design. `/max` truncates the payload and the header together.
+
+`dump-live` is the separate OS path. It does not use KnLiveDbg.sys. It calls `NtSystemDebugControl(SysDbgGetLiveKernelDump)` after enabling `SeDebugPrivilege`, matching Task Manager live kernel dumps. `/user` adds user pages, `/compress` requests compression, and `/hv` asks for hypervisor pages. Builds or policies that disable live dumps fail closed with the NTSTATUS.
 
 `dump-pe` rebuilds an on-disk PE image from a kernel-loaded module. It:
 
@@ -1429,6 +1437,8 @@ dump-raw nt!KiSystemServiceUser 0x200 .\kiSystemServiceUser.bin
 dump-raw 0xffffae8000123000 0x10000 .\pool-region.bin /zerofill
 dump-pe nt .\ntoskrnl-live.exe
 dump-pe Wdf01000 .\wdf01000-live.sys
+dump-kernel .\live-complete.dmp
+dump-live .\os-live.dmp
 ```
 
 Caveats:

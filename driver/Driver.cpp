@@ -1383,7 +1383,7 @@ static NTSTATUS KnDbgHandleGetVersion(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID 
         response->Size = sizeof(KNDBG_VERSION_RESPONSE);
         response->AbiVersion = KNDBG_ABI_VERSION;
         response->DriverMajor = 0;
-        response->DriverMinor = 5;
+        response->DriverMinor = 6;
         response->MaxTransferSize = KNDBG_MAX_TRANSFER_SIZE;
         response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER;
         if (KnDbgIsLa57Active())
@@ -2896,6 +2896,105 @@ static NTSTATUS KnDbgHandleReadIdt(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buf
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+static NTSTATUS KnDbgHandleGetPhysicalRanges(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+    PPHYSICAL_MEMORY_RANGE ranges = nullptr;
+
+    do
+    {
+        if (Buffer == nullptr ||
+            Stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(KNDBG_PHYSICAL_RANGES_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, Stack->Parameters.DeviceIoControl.OutputBufferLength);
+
+        ranges = MmGetPhysicalMemoryRanges();
+        if (ranges == nullptr)
+        {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+
+        ULONG count = 0;
+        ULONGLONG totalBytes = 0;
+        BOOLEAN tooMany = FALSE;
+        BOOLEAN overflow = FALSE;
+        BOOLEAN unterminated = FALSE;
+        const ULONG kMaxScanEntries = KNDBG_MAX_PHYSICAL_RANGES + 8u;
+        for (ULONG index = 0; index < kMaxScanEntries; ++index)
+        {
+            const PHYSICAL_MEMORY_RANGE entry = ranges[index];
+            if (entry.BaseAddress.QuadPart == 0 && entry.NumberOfBytes.QuadPart == 0)
+            {
+                unterminated = FALSE;
+                break;
+            }
+
+            unterminated = TRUE;
+            if (entry.NumberOfBytes.QuadPart <= 0)
+            {
+                continue;
+            }
+
+            if (count >= KNDBG_MAX_PHYSICAL_RANGES)
+            {
+                tooMany = TRUE;
+                break;
+            }
+
+            const ULONGLONG byteCount = static_cast<ULONGLONG>(entry.NumberOfBytes.QuadPart);
+            if (totalBytes > (MAXULONG64 - byteCount))
+            {
+                overflow = TRUE;
+                break;
+            }
+
+            KNDBG_PHYSICAL_RANGES_RESPONSE* response =
+                reinterpret_cast<KNDBG_PHYSICAL_RANGES_RESPONSE*>(Buffer);
+            response->Ranges[count].BaseAddress =
+                static_cast<ULONGLONG>(entry.BaseAddress.QuadPart);
+            response->Ranges[count].ByteCount = byteCount;
+            totalBytes += byteCount;
+            ++count;
+        }
+
+        if (overflow)
+        {
+            status = STATUS_INTEGER_OVERFLOW;
+            break;
+        }
+
+        if (tooMany || unterminated)
+        {
+            status = STATUS_BUFFER_OVERFLOW;
+            break;
+        }
+
+        KNDBG_PHYSICAL_RANGES_RESPONSE* response =
+            reinterpret_cast<KNDBG_PHYSICAL_RANGES_RESPONSE*>(Buffer);
+        response->Size = sizeof(KNDBG_PHYSICAL_RANGES_RESPONSE);
+        response->Flags = 0;
+        response->RangeCount = count;
+        response->Reserved = 0;
+        response->TotalBytes = totalBytes;
+
+        information = sizeof(KNDBG_PHYSICAL_RANGES_RESPONSE);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    if (ranges != nullptr)
+    {
+        ExFreePool(ranges);
+    }
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -2962,6 +3061,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_READ_PROCESS_VIRTUAL:
         status = KnDbgHandleReadProcessVirtual(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_GET_PHYSICAL_RANGES:
+        status = KnDbgHandleGetPhysicalRanges(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

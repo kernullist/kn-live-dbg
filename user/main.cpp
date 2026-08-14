@@ -1779,6 +1779,8 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help dt              type layout, wildcard, and field filters\n";
     std::wcout << L"  help e               virtual memory editing and /process behavior\n";
     std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
+    std::wcout << L"  help dump-kernel     WinDbg complete dump from live physical RAM runs\n";
+    std::wcout << L"  help dump-live       OS live kernel dump via NtSystemDebugControl\n";
     std::wcout << L"  ai help              AI question, config, plan, explain, run, and write commands\n";
     std::wcout << L"\n";
 
@@ -1798,7 +1800,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
     std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
     std::wcout << L"  hunting       !hunt | !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
-    std::wcout << L"  dumping       dump-raw <address> <length> <path> | dump-pe <address> <path>\n";
+    std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
     std::wcout << L"  timeline      !timeline | !timeline dashboard | !timeline help advanced\n";
@@ -3094,6 +3096,8 @@ static bool IsNativeOwnedCommand(const std::wstring& command)
             command == L"set-ppl-antimalware" ||
             command == L"dump-raw" ||
             command == L"dump-pe" ||
+            command == L"dump-kernel" ||
+            command == L"dump-live" ||
             command == L"pool-scan-pe" ||
             command == L"byovd" ||
             command == L"callbacks" ||
@@ -4394,6 +4398,16 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"/zerofill");
                 }
+                else if (topic == L"dump-kernel")
+                {
+                    static const wchar_t* values[] = { L"/max", L"/strict" };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"dump-live")
+                {
+                    static const wchar_t* values[] = { L"/user", L"/compress", L"/hv" };
+                    AddCompletionCandidates(&candidates, values);
+                }
                 else if (topic == L"set-ppl-antimalware")
                 {
                     static const wchar_t* values[] =
@@ -4688,6 +4702,16 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         else if (command == L"dump-pe")
         {
             AddCompletionCandidate(&candidates, L"help");
+        }
+        else if (command == L"dump-kernel")
+        {
+            static const wchar_t* values[] = { L"/max", L"/strict", L"help" };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"dump-live")
+        {
+            static const wchar_t* values[] = { L"/user", L"/compress", L"/hv", L"help" };
+            AddCompletionCandidates(&candidates, values);
         }
         else if (command == L"!address")
         {
@@ -22570,6 +22594,301 @@ static void HandleDumpPeCommand(
     } while (false);
 }
 
+static void PrintDumpKernelHelp()
+{
+    std::wcout << L"dump-kernel command:\n";
+    std::wcout << L"  dump-kernel <path> [/max <bytes>] [/strict]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Writes a WinDbg-openable complete dump (DUMP_HEADER64 + physical RAM runs).\n";
+    std::wcout << L"  Physical ranges come from the driver (MmGetPhysicalMemoryRanges). Pages are\n";
+    std::wcout << L"  streamed through IOCTL_KNDBG_READ_PHYSICAL so the TUI never buffers the whole\n";
+    std::wcout << L"  image. This is a live dump: pages can change while the file is written.\n";
+    std::wcout << L"\n";
+    std::wcout << L"arguments:\n";
+    std::wcout << L"  <path>        output .dmp path. Existing file is overwritten.\n";
+    std::wcout << L"  /max <bytes>  stop after this many payload bytes (page-aligned). Header\n";
+    std::wcout << L"                describes only the included runs.\n";
+    std::wcout << L"  /strict       abort on the first unreadable physical chunk instead of zero-fill.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Requires KnLiveDbg.sys. Failed HVCI/VTL1/device PFNs are zero-filled unless\n";
+    std::wcout << L"  /strict is set. Complete-dump headers accept at most 42 RAM runs.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  dump-kernel .\\live-complete.dmp\n";
+    std::wcout << L"  dump-kernel C:\\Dumps\\host.dmp /max 0x40000000\n";
+}
+
+static void PrintDumpLiveHelp()
+{
+    std::wcout << L"dump-live command:\n";
+    std::wcout << L"  dump-live <path> [/user] [/compress] [/hv]\n";
+    std::wcout << L"\n";
+    std::wcout << L"description:\n";
+    std::wcout << L"  Asks Windows to write a live kernel dump through NtSystemDebugControl\n";
+    std::wcout << L"  (SysDbgGetLiveKernelDump). This is the Task Manager / OS path, not a\n";
+    std::wcout << L"  KnLiveDbg physical walk. The driver is not required.\n";
+    std::wcout << L"\n";
+    std::wcout << L"arguments:\n";
+    std::wcout << L"  <path>      output .dmp path. Existing file is overwritten.\n";
+    std::wcout << L"  /user       include user-space pages (much larger).\n";
+    std::wcout << L"  /compress   request compressed pages when the OS supports it.\n";
+    std::wcout << L"  /hv         include hypervisor pages when the OS supports it.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Needs elevation and SeDebugPrivilege. Some builds or policies reject live\n";
+    std::wcout << L"  dumps with STATUS_NOT_IMPLEMENTED / ACCESS_DENIED / PRIVILEGE_NOT_HELD.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  dump-live .\\os-live.dmp\n";
+    std::wcout << L"  dump-live C:\\Dumps\\os-live-user.dmp /user /compress\n";
+}
+
+static void HandleDumpKernelCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintDumpKernelHelp();
+            break;
+        }
+
+        if (args.size() < 2)
+        {
+            std::wcerr << L"usage: dump-kernel <path> [/max <bytes>] [/strict]\n";
+            PrintDumpKernelHelp();
+            break;
+        }
+
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"dump-kernel requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring path;
+        uint64_t maxPayloadBytes = 0;
+        bool abortOnReadFailure = false;
+        bool parseError = false;
+        for (size_t index = 1; index < args.size(); ++index)
+        {
+            const std::wstring option = ToLower(args[index]);
+            if (option == L"/strict")
+            {
+                abortOnReadFailure = true;
+                continue;
+            }
+
+            if (option == L"/max")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"dump-kernel: /max requires a value\n";
+                    parseError = true;
+                    break;
+                }
+
+                uint64_t parsed = 0;
+                if (!ParseUnsigned(args[index + 1], state.NumberBase, &parsed) || parsed == 0)
+                {
+                    std::wcerr << L"dump-kernel: invalid /max value\n";
+                    parseError = true;
+                    break;
+                }
+
+                maxPayloadBytes = parsed;
+                ++index;
+                continue;
+            }
+
+            if (!option.empty() && option[0] == L'/')
+            {
+                std::wcerr << L"dump-kernel: unrecognised argument \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+
+            if (!path.empty())
+            {
+                std::wcerr << L"dump-kernel: unexpected extra argument \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+
+            path = args[index];
+        }
+
+        if (parseError)
+        {
+            PrintDumpKernelHelp();
+            break;
+        }
+
+        if (path.empty())
+        {
+            std::wcerr << L"usage: dump-kernel <path> [/max <bytes>] [/strict]\n";
+            break;
+        }
+
+        if (symbols.Modules().empty())
+        {
+            symbols.LoadKernelModules(nullptr);
+        }
+
+        DumpKernelCrashResult result = {};
+        std::wstring dumpError;
+        if (!DumpPhysicalMemoryToCrashDump(
+                device,
+                symbols,
+                path,
+                maxPayloadBytes,
+                abortOnReadFailure,
+                &result,
+                &dumpError))
+        {
+            std::wcerr << L"dump-kernel failed: " << dumpError << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"dump-kernel warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"dump-kernel warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"[dump-kernel]", KNDBG_COLOR_TITLE);
+        std::wcout << L" header=0x" << std::hex << result.HeaderBytes
+                   << L" payload=0x" << result.PayloadBytes << std::dec
+                   << L" kernel_bytes=" << result.BytesRead
+                   << L" zero_bytes=" << result.BytesZeroFilled
+                   << L" wrote=" << result.BytesWritten
+                   << L" runs=" << result.RangeCount
+                   << L" chunks_ok=" << result.ChunksRead
+                   << L" complete=" << (result.Complete ? L"yes" : L"no");
+        if (result.ChunksFailed > 0)
+        {
+            std::wcout << L" ";
+            PrintColoredText(
+                L"zero_filled_chunks=" + std::to_wstring(result.ChunksFailed),
+                KNDBG_COLOR_WARN);
+        }
+        std::wcout << L" path=";
+        PrintColoredText(path, KNDBG_COLOR_OK);
+        std::wcout << L"\n";
+    } while (false);
+}
+
+static void HandleDumpLiveCommand(const std::vector<std::wstring>& args)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintDumpLiveHelp();
+            break;
+        }
+
+        if (args.size() < 2)
+        {
+            std::wcerr << L"usage: dump-live <path> [/user] [/compress] [/hv]\n";
+            PrintDumpLiveHelp();
+            break;
+        }
+
+        std::wstring path;
+        bool includeUserPages = false;
+        bool compress = false;
+        bool includeHypervisorPages = false;
+        bool parseError = false;
+        for (size_t index = 1; index < args.size(); ++index)
+        {
+            const std::wstring option = ToLower(args[index]);
+            if (option == L"/user")
+            {
+                includeUserPages = true;
+                continue;
+            }
+            if (option == L"/compress")
+            {
+                compress = true;
+                continue;
+            }
+            if (option == L"/hv" || option == L"/hypervisor")
+            {
+                includeHypervisorPages = true;
+                continue;
+            }
+            if (!option.empty() && option[0] == L'/')
+            {
+                std::wcerr << L"dump-live: unrecognised argument \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            if (!path.empty())
+            {
+                std::wcerr << L"dump-live: unexpected extra argument \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            path = args[index];
+        }
+
+        if (parseError)
+        {
+            PrintDumpLiveHelp();
+            break;
+        }
+
+        if (path.empty())
+        {
+            std::wcerr << L"usage: dump-live <path> [/user] [/compress] [/hv]\n";
+            break;
+        }
+
+        DumpOsLiveResult result = {};
+        std::wstring dumpError;
+        if (!DumpOsLiveKernel(
+                path,
+                includeUserPages,
+                compress,
+                includeHypervisorPages,
+                &result,
+                &dumpError))
+        {
+            std::wcerr << L"dump-live failed: " << dumpError << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"dump-live warning: " << warning << L"\n";
+            }
+            break;
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"dump-live warning: " << warning << L"\n";
+        }
+
+        PrintColoredText(L"[dump-live]", KNDBG_COLOR_TITLE);
+        std::wcout << L" wrote=" << result.BytesWritten
+                   << L" api_version=" << result.ApiVersionUsed
+                   << L" user=" << (result.IncludedUserPages ? L"yes" : L"no")
+                   << L" compress=" << (result.Compressed ? L"yes" : L"no")
+                   << L" hv=" << (result.IncludedHypervisorPages ? L"yes" : L"no")
+                   << L" path=";
+        PrintColoredText(path, KNDBG_COLOR_OK);
+        std::wcout << L"\n";
+    } while (false);
+}
+
 static void PrintPoolHelp()
 {
     std::wcout << L"!pool command:\n";
@@ -24938,6 +25257,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintDumpPeHelp();
         }
+        else if (command == L"dump-kernel")
+        {
+            PrintDumpKernelHelp();
+        }
+        else if (command == L"dump-live")
+        {
+            PrintDumpLiveHelp();
+        }
         else if (command == L"pool-scan-pe")
         {
             PrintPoolScanPeHelp();
@@ -25660,6 +25987,81 @@ static int RunConsoleSurfaceSelfTest()
             IsWfpScopeName(L"kernel-callouts") &&
                 IsWfpScopeName(L"kernelcallouts"),
             L"wfp-kernel-callouts-alias-is-recognized");
+        CheckCompletionCandidate(&context, {}, L"dump-kernel", L"dump-kernel-root-completion");
+        CheckCompletionCandidate(&context, {}, L"dump-live", L"dump-live-root-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"dump-kernel", L"help-dump-kernel-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"dump-live", L"help-dump-live-completion");
+        CheckCompletionCandidate(&context, {L"dump-kernel"}, L"/max", L"dump-kernel-max-completion");
+        CheckCompletionCandidate(&context, {L"dump-kernel"}, L"/strict", L"dump-kernel-strict-completion");
+        CheckCompletionCandidate(&context, {L"dump-live"}, L"/user", L"dump-live-user-completion");
+        CheckCompletionCandidate(&context, {L"dump-live"}, L"/compress", L"dump-live-compress-completion");
+        CheckCompletionCandidate(&context, {L"help", L"dump-kernel"}, L"/max", L"help-dump-kernel-option-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IsNativeOwnedCommand(L"dump-kernel") &&
+                IsNativeOwnedCommand(L"dump-live"),
+            L"dump-kernel-and-dump-live-are-native-owned");
+        {
+            PhysicalMemoryRange run = {};
+            run.BaseAddress = 0x1000;
+            run.ByteCount = 0x2000;
+            DumpKernelHeaderInfo headerInfo = {};
+            headerInfo.DirectoryTableBase = 0x1aa000;
+            headerInfo.NumberProcessors = 2;
+            headerInfo.MajorVersion = 15;
+            headerInfo.MinorVersion = 26100;
+            std::vector<uint8_t> header;
+            std::wstring headerError;
+            const bool headerOk = BuildCompleteDumpHeader({run}, headerInfo, &header, &headerError);
+            uint32_t signature = 0;
+            uint32_t validDump = 0;
+            uint32_t dumpType = 0;
+            uint32_t runCount = 0;
+            uint64_t required = 0;
+            if (header.size() >= kCrashDumpHeaderBytes)
+            {
+                std::memcpy(&signature, header.data(), sizeof(signature));
+                std::memcpy(&validDump, header.data() + 4, sizeof(validDump));
+                std::memcpy(&dumpType, header.data() + 0xF94, sizeof(dumpType));
+                std::memcpy(&runCount, header.data() + 0x088, sizeof(runCount));
+                std::memcpy(&required, header.data() + 0xF98, sizeof(required));
+            }
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                headerOk &&
+                    header.size() == kCrashDumpHeaderBytes &&
+                    signature == 0x45474150u &&
+                    validDump == 0x34365544u &&
+                    dumpType == 1 &&
+                    runCount == 1 &&
+                    required == kCrashDumpHeaderBytes + 0x2000ull,
+                L"dump-kernel-header-is-complete-dump64");
+            std::vector<PhysicalMemoryRange> tooMany(kCrashDumpMaxPhysicalRuns + 1);
+            for (PhysicalMemoryRange& extra : tooMany)
+            {
+                extra.BaseAddress = 0x1000;
+                extra.ByteCount = 0x1000;
+            }
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                !BuildCompleteDumpHeader(tooMany, headerInfo, &header, &headerError),
+                L"dump-kernel-header-rejects-too-many-runs");
+        }
+        {
+            const std::wstring kernelHelp = CaptureDetailedHelpOutput({L"help", L"dump-kernel"}, 1);
+            const std::wstring liveHelp = CaptureDetailedHelpOutput({L"help", L"dump-live"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                kernelHelp.find(L"DUMP_HEADER64") != std::wstring::npos &&
+                    liveHelp.find(L"NtSystemDebugControl") != std::wstring::npos,
+                L"dump-kernel-and-dump-live-help-routes");
+            const std::wstring rootHelp = CaptureDetailedHelpOutput({L"help"}, 0);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                rootHelp.find(L"help dump-kernel") != std::wstring::npos &&
+                    rootHelp.find(L"help dump-live") != std::wstring::npos,
+                L"help-root-lists-dump-kernel-and-dump-live");
+        }
 
         TimelineStats populatedTimelineStats = {};
         populatedTimelineStats.Stored = 1;
@@ -29319,6 +29721,16 @@ static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason
                 }
                 break;
             }
+        }
+
+        if (command == L"dump-kernel" || command == L"dump-live")
+        {
+            blocked = true;
+            if (reason != nullptr)
+            {
+                *reason = L"full-memory dump commands require manual execution";
+            }
+            break;
         }
 
         if (IsWriteLikeCommandLine(line))
@@ -42200,6 +42612,14 @@ static bool HandleCommand(
         else if (command == L"dump-pe")
         {
             HandleDumpPeCommand(args, state, device, symbols);
+        }
+        else if (command == L"dump-kernel")
+        {
+            HandleDumpKernelCommand(args, state, device, symbols);
+        }
+        else if (command == L"dump-live")
+        {
+            HandleDumpLiveCommand(args);
         }
         else if (command == L"pool-scan-pe")
         {

@@ -118,6 +118,8 @@ byovd fixture [status|load [sys-path]|unload|path]
 !timeline export <path> [/jsonl]
 dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
+dump-kernel <path> [/max <bytes>] [/strict]
+dump-live <path> [/user] [/compress] [/hv]
 pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
 !address <va>
 set-ppl-antimalware [on|off|status]
