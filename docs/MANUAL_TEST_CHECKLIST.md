@@ -111,6 +111,38 @@ suspicious row on a clean box is a false positive to fix.
   `!diff baseline` as a cpu-state escalation (value/fingerprint change), and a
   new hook appears as a high-risk added `cpu-state` record.
 
+## Leftover payload detectors
+
+On a clean machine these commands must not invent a live mapper. Coverage
+warnings for unresolved private symbols are acceptable; fabricated hook
+bodies or a flood of `SUSPICIOUS` rows are not.
+
+### `!payload` / `!payload scan`
+- `help !payload` shows `scan`, `/limit`, `/disasm`, `/json`, and the example
+  `!payload scan`.
+- `!payload nt!KiSystemCall64` classifies `inside_module` / risk `low`.
+- `!payload scan` may take a while. Expect `unique=0 traced=0` on a clean box,
+  or only coverage warnings from an incomplete hook surface. No high-risk
+  unbacked PE/`W+X` traces.
+- Confirm Tab completion offers `!payload`, `scan`, `/limit`, and
+  `help !payload`.
+
+### `!mapper` / `!unloaded` / `!piddb` / `!cihash`
+- `help !mapper` mentions `MmUnloadedDrivers`, `PiDDBCacheTable`, and
+  `ci!g_KernelHashBucketList`.
+- `!mapper` on a clean box may list historical `STALE` names from legitimate
+  unloads. That is telemetry, not a finding. `SUSPICIOUS` requires a wiped
+  name, TimeDateStamp 0, or an unloaded range that is still present+executable.
+- `!snapshot show baseline /domains` includes `leftover-mapper` after a full
+  baseline. It must not include a leftover-pages/`!kpage` domain.
+
+### `!kpage`
+- `help !kpage` shows `/deep`, `/wx`, `/pe`, `/session`, `/nosession`.
+- Bare `!kpage` may emit session-space `low` rows. High-risk requires `W+X`
+  or a PE header outside every loaded module.
+- Do not treat `/deep` as the default; run it once and confirm it is slower
+  and still fail-closed if `_MMPFN.PteAddress` is missing.
+
 ## WFP kernel callouts
 
 ### `!wfp kernelcallouts`

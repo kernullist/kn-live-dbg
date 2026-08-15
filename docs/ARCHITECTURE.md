@@ -6,6 +6,7 @@ Kn Live Dbg follows a LiveKD-style split:
 
 1. Kernel driver
    - Owns only privileged memory operations.
+   - Optionally takes device/symbolic names from the service Parameters key so `--cloak` can avoid compiled `KnLiveDbg` object names.
    - Creates the device with an Administrators/SYSTEM-only security descriptor.
    - Validates IOCTL buffers and sizes.
    - Uses `MmCopyMemory` for virtual reads.
@@ -32,6 +33,8 @@ Kn Live Dbg follows a LiveKD-style split:
    - Optionally attaches a DbgEng local-kernel backend for commands that need debugger-engine semantics.
 
 This keeps the driver small and reduces the amount of complex parser/symbol code running in kernel mode.
+
+`--cloak` is an opt-in ephemeral identity: user mode generates a leaf name, copies the EXE/SYS/runtime DLLs, relaunches, and publishes `DeviceName`/`SymbolicLink` under the new service `Parameters` key. `DriverEntry` reads `RegistryPath\Parameters` and uses those UNICODE_STRING values for `IoCreateDeviceSecure` / `IoCreateSymbolicLink`; missing or invalid values keep the compiled `KnLiveDbg` names. Shutdown stops/deletes the random service and removes the copied SYS/sidecars. The running copy of the EXE is marked for reboot-delete.
 
 ## IOCTL Contract
 
@@ -119,7 +122,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 ## Callback Scanner Flow
 
 1. Object callbacks: resolve `_OBJECT_TYPE.CallbackList`, discover object type objects from `ObTypeIndexTable`, read `_OBJECT_TYPE.Name` and table index, then walk each callback list. Human output carries the object type name/index alongside the `_OBJECT_TYPE` address. If the target nt PDB exposes `_OBJECT_TYPE` but omits the private callback item type, the scanner falls back to the guarded x64 object-callback item field layout, validates live list pointers, callback-entry pointers, operation masks, and callback routine pointers, and treats that as the normal public-symbol path unless validation fails.
-2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk callback context records. Public nt PDBs can omit `_CM_CALLBACK_CONTEXT_BLOCK`, so the scanner uses guarded x64 fallback layouts and accepts only records whose callback routine fields resolve inside loaded kernel images. Callback context values are module-annotated only when they also point into a loaded kernel image.
+2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk callback context records. Public nt PDBs can omit `_CM_CALLBACK_CONTEXT_BLOCK`, so the scanner uses guarded x64 fallback layouts. Pre/post routine pointers that are kernel-canonical are kept even when they sit outside every loaded module -- that is the primary Cm hook signal for pool shellcode and manual-map leftovers -- and are tagged `function outside loaded modules`. Callback context values are module-annotated only when they also point into a loaded kernel image.
 3. Process callbacks: enumerate `PspCreateProcessNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks. Public nt PDBs can omit `_EX_CALLBACK_ROUTINE_BLOCK`, so the scanner uses the stable x64 function/context fallback layout for this block. The block context value is decoded as `notifyType` metadata and is not module-annotated.
 4. Thread callbacks: enumerate `PspCreateThreadNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
 5. Image-load callbacks: enumerate `PspLoadImageNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
@@ -233,6 +236,17 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 4. When the address is canonical, `DeviceClient::TranslateVirtual` is called with `DirectoryTableBase = 0`; the driver substitutes the live CR3 and walks PML5/PML4/PDPTE/PDE/PTE (auto-detecting LA57 via CR4.LA57), returning per-level values and physical addresses plus the `KNDBG_TRANSLATE_FLAG_LARGE_PAGE` / `KNDBG_TRANSLATE_FLAG_LA57_ACTIVE` markers.
 5. Effective permissions are then re-computed by `WalkPtePermissions`: present = AND of bit 0 across every traversed level, writable = AND of bit 1, executable = AND of `(NX == 0)`, user-accessible = AND of bit 2. The starting index in the level array is 0 for LA57 and 1 for LA48, gated on the LA57 flag from the driver. The large-page short-circuit is implemented inside `WalkPtePermissions` itself by testing the PS bit (bit 7) at the PDPTE and PDE levels and breaking before walking the unused PTE level -- without this, the driver's zero-valued PTE for 1 GB / 2 MB mappings would erroneously clear Present and Writable on what is actually a valid large mapping.
 6. The TUI handler `HandleAddressCommand` renders the result in three coloured blocks: `[address]` summary, `[address.translation]` per-level PTE listing with the `(P W U PS NX)` annotation, and `[address.physical]` PA/offset. A `[W+X]` tag is highlighted in red when the page allows both writes and executes.
+
+## Leftover Payload Flow
+
+1. These scanners stay in user mode and reuse `ReadMemory`, `TranslateVirtual`, `ReadPhysical`, `ReadControlRegisters`, and `GetPhysicalMemoryRanges`. The driver ABI does not change.
+2. `!payload <addr>` (`PayloadTracer`) inspects one kernel VA: module containment from `SystemModuleInformation`, `InspectAddress` page-walk permissions, one `SystemBigPoolInformation` snapshot, a PE-header probe at the pool base or page-aligned VA (intact or signature-wiped), and a bounded Zydis disassembly. Classification is evidence, not proof.
+3. `!payload scan` first collects function pointers that sit outside every loaded module from the existing hook scanners (callbacks, SSDT, IDT, NMI, HAL, SYSCALL MSRs, ETW, WFP callouts, DPC/timer, driver dispatch, firmware table handlers). A failed surface is a coverage warning. Unique addresses are then traced with the same path as `!payload <addr>`, capped by `/limit` (default 16, max 128).
+4. `!mapper` (`MapperRemnantScanner`) walks `nt!MmUnloadedDrivers` (PDB `_MM_UNLOADED_DRIVER` or a guarded 0x28 x64 fallback), `nt!PiDDBCacheTable` as an `RTL_AVL_TABLE` whose root parent must point back at the table, and `ci!g_KernelHashBucketList` (or nearby ci symbols) as either a `LIST_ENTRY` head or a singly-linked chain. Missing symbols fail closed. Names that are not in the live module list, wiped names with a non-zero range, or an unloaded range that is still present+executable are flagged.
+5. `!kpage` (`OrphanKernelPageScanner`) walks the kernel half of the live CR3 page tables, coalesces adjacent executable leaves that do not overlap any loaded module, and skips the `MmPteBase` self-map window. Session-space hits stay low-risk unless they are W+X or PE-like. `/wx` and `/pe` filter after classification.
+6. `!kpage /deep` additionally walks `nt!MmPfnDatabase` using the PDB `_MMPFN` layout and `PteAddress`, decodes the VA as `(PteAddress - MmPteBase) << 9`, and keeps ActiveAndValid executable kernel pages the page-table walk did not emit. The PFN pass is capped and is not part of `!snapshot`.
+7. Snapshots store `leftover-mapper` only. `!kpage` and `!payload scan` stay operator commands: a kernel page-table walk is too expensive for every baseline, and hook surfaces are already captured in their own domains.
+8. MCP/AI tools are `payload.inspect`, `payload.scan`, `mapper.list`, and `kpage.list`. `kpage.list` must not set `deep=true` unless the operator asks for a PFN walk.
 
 ## Module And Driver Integrity Flow
 

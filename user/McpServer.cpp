@@ -83,6 +83,10 @@ namespace
 
     // Read-only detection tools added by the catalog expansion (anti-cheat surface).
     const McpToolArg kArgsPoolScanPe[] = { {L"tag", L"string", false}, {L"limit", L"string", false}, {L"suspicious", L"boolean", false} };
+    const McpToolArg kArgsPayloadInspect[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false} };
+    const McpToolArg kArgsPayloadScan[] = { {L"limit", L"string", false} };
+    const McpToolArg kArgsMapperList[] = { {L"scope", L"string", false}, {L"limit", L"string", false} };
+    const McpToolArg kArgsKpageList[] = { {L"deep", L"boolean", false}, {L"wx", L"boolean", false}, {L"pe", L"boolean", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsHuntRun[] = { {L"mode", L"string", false} };
     const McpToolArg kArgsSnapshotCapture[] = { {L"name", L"string", false} };
     const McpToolArg kArgsSnapshotShow[] = { {L"source", L"string", false}, {L"path", L"string", false}, {L"domains", L"boolean", false}, {L"warnings", L"boolean", false} };
@@ -122,6 +126,10 @@ namespace
         { L"etw.providers", L"Heuristic/partial ETW provider registration surface and enable-callback ownership.", true, nullptr, 0 },
         { L"etw.ti_cross", L"Correlate active Threat-Intelligence subscription reception with silence/drop signals.", true, nullptr, 0 },
         { L"nmi.list", L"Enumerate registered NMI callbacks.", true, MCP_ARG_TABLE(kArgsNmi) },
+        { L"payload.inspect", L"Trace one kernel address: page walk, big-pool lookup, PE probe, disassembly.", true, MCP_ARG_TABLE(kArgsPayloadInspect) },
+        { L"payload.scan", L"Sweep hook surfaces for unbacked pointers and trace each unique target.", true, MCP_ARG_TABLE(kArgsPayloadScan) },
+        { L"mapper.list", L"Walk MmUnloadedDrivers, PiDDBCacheTable, and ci hash-bucket leftovers.", true, MCP_ARG_TABLE(kArgsMapperList) },
+        { L"kpage.list", L"Find executable kernel pages outside loaded modules. deep=true enables the PFN pass.", true, MCP_ARG_TABLE(kArgsKpageList) },
         { L"hal.scan", L"Check HalDispatchTable / HalPrivateDispatchTable function-pointer ownership.", true, nullptr, 0 },
         { L"hive.list", L"Walk registry hive list and flag GetCellRoutine handlers outside ntoskrnl.", true, nullptr, 0 },
         { L"token.inspect", L"Inspect process token privilege Present/Enabled masks.", true, MCP_ARG_TABLE(kArgsTokenInspect) },

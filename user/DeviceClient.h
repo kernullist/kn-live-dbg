@@ -112,6 +112,7 @@ public:
     ~DeviceClient();
 
     bool Open(std::wstring* error);
+    bool Open(const std::wstring& userDeviceName, std::wstring* error);
     void Close();
     bool IsOpen() const;
 

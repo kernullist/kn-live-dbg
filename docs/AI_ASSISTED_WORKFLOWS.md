@@ -152,6 +152,10 @@ ai list NMI callbacks
 ai check NMI handler chain
 ai show W+X pool allocations
 ai pool tag Wmem larger than 0x10000
+ai find leftover unbacked kernel hook targets
+ai scan unloaded mapper remnants
+ai show MmUnloadedDrivers and PiDDB leftovers
+ai find executable kernel pages outside loaded modules
 ai decode WNF state name 0x41c64e6da3bc0075
 ai list live WNF instances
 ai query recent TI WriteVM events
@@ -215,6 +219,9 @@ The command now behaves like a small tool-using agent and intent router. The ope
 - "list NMI callbacks" or "check NMI handler chain" -> `nmi.list`
 - "show W+X pool allocations" -> `pool.find` with `wx=true`
 - "pool tag Wmem larger than 0x10000" -> `pool.find` with `tag=Wmem` and `min=0x10000`
+- "find leftover unbacked kernel hook targets" -> `payload.scan`
+- "scan unloaded mapper remnants" or "show MmUnloadedDrivers and PiDDB leftovers" -> `mapper.list`
+- "find executable kernel pages outside loaded modules" -> `kpage.list` without `deep`
 - "why is this address suspicious?" -> `address.inspect` with `address=<va-or-symbol>`
 - "decode WNF state name 0x41c64e6da3bc0075" -> `wnf.decode` with `hash=0x41c64e6da3bc0075`
 - "list live WNF instances" -> `wnf.list` with `scope=instances`

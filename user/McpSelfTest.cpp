@@ -330,6 +330,16 @@ int RunMcpToolCatalogSelfTest()
         CheckReadOnlyTool(&context, L"hive.list", {});
         CheckReadOnlyTool(&context, L"dpc.list", {});
         CheckReadOnlyTool(&context, L"timer.list", {});
+        CheckReadOnlyTool(
+            &context,
+            L"payload.inspect",
+            {L"address", L"va", L"symbol"});
+        CheckReadOnlyTool(&context, L"payload.scan", {L"limit"});
+        CheckReadOnlyTool(&context, L"mapper.list", {L"scope", L"limit"});
+        CheckReadOnlyTool(
+            &context,
+            L"kpage.list",
+            {L"deep", L"wx", L"pe", L"limit"});
 
         EtwTiCrossInput silentInput = {};
         silentInput.TiActive = true;

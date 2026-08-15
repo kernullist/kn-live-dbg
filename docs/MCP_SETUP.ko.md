@@ -508,6 +508,10 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `threads.list` | 스레드/시작주소/APC/스택 증거 | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
 | `etw.integrity` | ETW logger/GetCpuClock 무결성(InfinityHook) | (없음) |
 | `nmi.list` | 등록된 NMI 콜백 열거 | `scope` |
+| `payload.inspect` | 커널 주소 하나 추적(페이지워크/big pool/PE/디스어셈) | `address`, `va`, `symbol` |
+| `payload.scan` | 모듈 밖 훅 포인터를 모아 각각 추적 | `limit` |
+| `mapper.list` | MmUnloadedDrivers / PiDDB / ci hash 잔흔 | `scope`, `limit` |
+| `kpage.list` | 로드 모듈 밖 실행 가능 커널 페이지 | `deep`, `wx`, `pe`, `limit` |
 | `fwtable.list` | 펌웨어 테이블 provider 열거 | `scope`, `module`, `provider`, `signature` |
 | `pool.find` | 커널 big pool 할당 열거(tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
 | `address.inspect` | 가상주소 검사(페이지테이블 워크/권한/소유 모듈) | `address`, `va`, `symbol` |
@@ -705,6 +709,15 @@ LOLDrivers 카탈로그와 대조해줘. 의심 PE는 pool.find 로 할당 맥�
 code.disasm 로 엔트리 바이트까지 확인.
 ```
 → `pool.scan_pe {suspicious:true}` + `byovd.scan` + `pool.find` + `address.inspect` + `code.disasm`.
+
+### 9.8b 언로드된 매퍼 / 잔존 커널 코드
+
+```
+최초 드라이버는 사라졌다. 논페이지드 풀이나 독립 페이지에 남은 실행 코드와
+MmUnloadedDrivers / PiDDB / ci hash 잔흔을 찾아줘. PFN 전수는 내가 말하기 전에는 하지 마.
+```
+→ `payload.scan` + `mapper.list` + `kpage.list`, 모듈 밖 주소는 `payload.inspect`.
+`kpage.list`의 `deep=true`는 운영자가 요청할 때만.
 
 ### 9.9 물리 메모리 / VA 별칭 (후킹된 매핑 우회)
 

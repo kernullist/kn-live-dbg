@@ -15,6 +15,9 @@ Completed core slices:
 3. Module integrity scanning.
 4. Driver dispatch integrity.
 5. Live complete dump (`dump-kernel`) and OS live dump (`dump-live`).
+6. Leftover payload detectors: `!payload` hook-to-body trace, `!mapper`
+   (`MmUnloadedDrivers` / PiDDB / ci hash), `!kpage` orphan executable
+   kernel pages, and optional `!kpage /deep` PFN walk.
 
 Remaining priority order:
 
@@ -37,7 +40,7 @@ Implemented:
 5. `!etw ti-cross` / `etw.ti_cross` — TI reception/drop health view; silence alone is inconclusive.
 6. `!dpc` / `!timer` / `!workitem` + `dpc.list` / `timer.list` — PDB-bounded deferred execution callbacks; non-image high risk; workitem best-effort incomplete.
 
-Snapshot domains: `hal`, `hive`, `dpc-timer`, extended `etw` providers, extended `process-security` token fingerprint.
+Snapshot domains: `hal`, `hive`, `dpc-timer`, extended `etw` providers, extended `process-security` token fingerprint, `leftover-mapper`.
 
 ## Cross-Cutting Rules
 
@@ -77,9 +80,10 @@ Implemented behavior:
 2. Stores the session baseline in memory and automatically writes JSON plus a
    Markdown report under `.kn-live-dbg\snapshots` and `.kn-live-dbg\reports`.
 3. Captures process inventory, modules, drivers/dispatch, callbacks, ETW,
-   NMI, cpu-state (SYSCALL MSRs / control registers / SSDT / IDT),
-   firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, and
-   BYOVD in the default full snapshot.
+   NMI, leftover-mapper, cpu-state (SYSCALL MSRs / control registers /
+   SSDT / IDT), firmware-table providers, pool, pool-PE, WFP, ALPC, WNF,
+   VBS/CI, and BYOVD in the default full snapshot. `!kpage` is not part
+   of the snapshot path.
 4. Uses new-focused diff semantics: records absent from baseline but present
    now, plus selected high-risk escalations. Removed records are intentionally
    not shown by default.

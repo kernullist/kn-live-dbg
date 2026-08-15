@@ -14,12 +14,17 @@
 #include "HalDispatchScanner.h"
 #include "HiveScanner.h"
 #include "IntegrityScanner.h"
+#include "LeftoverCommon.h"
+#include "MapperRemnantScanner.h"
+#include "OrphanKernelPageScanner.h"
+#include "PayloadTracer.h"
 #include "DpcTimerScanner.h"
 #include "TokenPrivilegeScanner.h"
 #include "McpJson.h"
 #include "McpServer.h"
 #include "McpSelfTest.h"
 #include "MemoryDumper.h"
+#include "CloakSession.h"
 #include "MinifilterAttachmentScanner.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
@@ -75,6 +80,7 @@
 static std::atomic_bool g_StopRequested = false;
 static HANDLE g_MainThreadHandle = nullptr;
 static HANDLE g_InstanceMutexHandle = nullptr;
+static HANDLE g_CloakMutexHandle = nullptr;
 
 // Set by the !ti handler while a subscription is active. The console control
 // handler reads this on hard-exit paths (window close / logoff / system
@@ -609,6 +615,8 @@ struct DebuggerState
     bool ProbeDriverUnloaded;
     bool ByovdFixtureCleanupRequested;
     bool ByovdFixtureUnloaded;
+    bool CloakActive;
+    CloakSession Cloak;
     std::vector<std::wstring> CommandHistory;
     std::wstring DbgEngConnectOptions;
     bool DbgEngRemoteKernel;
@@ -1781,6 +1789,10 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
     std::wcout << L"  help dump-kernel     WinDbg complete dump from live physical RAM runs\n";
     std::wcout << L"  help dump-live       OS live kernel dump via NtSystemDebugControl\n";
+    std::wcout << L"  help !payload        unbacked hook-target trace (translate/pool/PE/disasm)\n";
+    std::wcout << L"  help !mapper         MmUnloadedDrivers / PiDDB / ci hash-bucket leftovers\n";
+    std::wcout << L"  help !kpage          executable kernel pages outside loaded modules\n";
+    std::wcout << L"  --cloak              relaunch from a random EXE/service/device session\n";
     std::wcout << L"  ai help              AI question, config, plan, explain, run, and write commands\n";
     std::wcout << L"\n";
 
@@ -1800,6 +1812,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
     std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
     std::wcout << L"  hunting       !hunt | !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
+    std::wcout << L"                !payload scan | !mapper | !kpage | !kpage /deep\n";
     std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
@@ -2127,6 +2140,12 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!securekernel" ||
         command == L"!etw" ||
         command == L"!nmi" ||
+        command == L"!payload" ||
+        command == L"!mapper" ||
+        command == L"!kpage" ||
+        command == L"!unloaded" ||
+        command == L"!piddb" ||
+        command == L"!cihash" ||
         command == L"!msrcheck" ||
         command == L"!cr" ||
         command == L"!ssdt" ||
@@ -4318,6 +4337,21 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddCompletionCandidate(&candidates, L"callbacks");
                 }
+                else if (topic == L"!payload")
+                {
+                    static const wchar_t* values[] = { L"scan", L"/limit", L"/disasm", L"/json" };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!mapper" || topic == L"!unloaded" || topic == L"!piddb" || topic == L"!cihash")
+                {
+                    static const wchar_t* values[] = { L"all", L"unloaded", L"piddb", L"cihash", L"/limit", L"/json" };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!kpage")
+                {
+                    static const wchar_t* values[] = { L"/deep", L"/wx", L"/pe", L"/session", L"/nosession", L"/limit", L"/json" };
+                    AddCompletionCandidates(&candidates, values);
+                }
                 else if (topic == L"!fwtable")
                 {
                     AddFirmwareTableCompletionCandidates(&candidates, false);
@@ -4602,6 +4636,75 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 };
                 AddCompletionCandidates(&candidates, values);
             }
+        }
+        else if (command == L"!payload")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"scan",
+                    L"/limit",
+                    L"/disasm",
+                    L"/json",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/limit",
+                    L"/disasm",
+                    L"/json"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"!mapper" ||
+                 command == L"!unloaded" ||
+                 command == L"!piddb" ||
+                 command == L"!cihash")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"all",
+                    L"unloaded",
+                    L"piddb",
+                    L"cihash",
+                    L"/limit",
+                    L"/json",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/limit",
+                    L"/json"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"!kpage")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/deep",
+                L"/wx",
+                L"/pe",
+                L"/session",
+                L"/nosession",
+                L"/limit",
+                L"/json",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
         }
         else if (command == L"!fwtable")
         {
@@ -11625,7 +11728,8 @@ static bool LoadDriverServiceWithUx(
     DriverService& service,
     const std::wstring& title,
     const std::wstring& driverPath,
-    std::wstring* error);
+    std::wstring* error,
+    const CloakSession* cloakSession = nullptr);
 static bool UnloadDriverServiceWithUx(
     DriverService& service,
     const std::wstring& title,
@@ -12201,7 +12305,8 @@ static bool LoadDriverServiceWithUx(
     DriverService& service,
     const std::wstring& title,
     const std::wstring& driverPath,
-    std::wstring* error)
+    std::wstring* error,
+    const CloakSession* cloakSession)
 {
     bool ok = false;
 
@@ -12225,6 +12330,17 @@ static bool LoadDriverServiceWithUx(
             break;
         }
         PrintLifecycleOk(L"install/update service", L"configured");
+
+        if (cloakSession != nullptr)
+        {
+            PrintLifecycleStep(L"write cloak parameters", L"DeviceName/SymbolicLink");
+            if (!WriteCloakServiceParameters(*cloakSession, error))
+            {
+                PrintLifecycleFail(L"write cloak parameters", error != nullptr ? *error : L"unknown error");
+                break;
+            }
+            PrintLifecycleOk(L"write cloak parameters", cloakSession->UserDeviceName);
+        }
 
         PrintLifecycleStep(L"load driver", L"start service");
         if (!service.Start(error))
@@ -12339,6 +12455,21 @@ static bool CleanupMainDriverOnExit(DebuggerState& state, DeviceClient& device, 
         }
 
         state.MainDriverUnloaded = true;
+
+        if (state.CloakActive)
+        {
+            PrintLifecycleStep(L"cloak cleanup", L"remove ephemeral copies");
+            std::wstring cloakError;
+            if (!CleanupCloakArtifacts(state.Cloak, true, &cloakError))
+            {
+                PrintLifecycleWarn(L"cloak cleanup", cloakError);
+            }
+            else
+            {
+                PrintLifecycleOk(L"cloak cleanup", L"sys/sidecars removed; exe delayed-delete");
+            }
+        }
+
         ok = true;
     } while (false);
 
@@ -12413,26 +12544,34 @@ static bool CleanupByovdFixtureDriverOnExit(DebuggerState& state)
     return ok;
 }
 
-static bool AcquireSingleInstanceLock(std::wstring* error)
+static bool AcquireNamedMutex(const wchar_t* mutexName, HANDLE* slot, std::wstring* error)
 {
     bool ok = false;
-    constexpr const wchar_t* MutexName = L"Global\\KnLiveDbg.Exe.SingleInstance";
 
     do
     {
-        g_InstanceMutexHandle = CreateMutexW(nullptr, TRUE, MutexName);
-        if (g_InstanceMutexHandle == nullptr)
+        if (mutexName == nullptr || slot == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid mutex arguments";
+            }
+            break;
+        }
+
+        HANDLE handle = CreateMutexW(nullptr, TRUE, mutexName);
+        if (handle == nullptr)
         {
             DWORD lastError = GetLastError();
             if (lastError == ERROR_ACCESS_DENIED)
             {
-                HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, MutexName);
+                HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, mutexName);
                 if (existing != nullptr)
                 {
                     CloseHandle(existing);
                     if (error != nullptr)
                     {
-                        *error = L"another KnLiveDbg.exe instance is already running";
+                        *error = L"another instance is already running";
                     }
                     break;
                 }
@@ -12447,12 +12586,32 @@ static bool AcquireSingleInstanceLock(std::wstring* error)
 
         if (GetLastError() == ERROR_ALREADY_EXISTS)
         {
-            CloseHandle(g_InstanceMutexHandle);
-            g_InstanceMutexHandle = nullptr;
+            CloseHandle(handle);
             if (error != nullptr)
             {
-                *error = L"another KnLiveDbg.exe instance is already running";
+                *error = L"another instance is already running";
             }
+            break;
+        }
+
+        *slot = handle;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool AcquireSingleInstanceLock(std::wstring* error, const wchar_t* mutexName = nullptr)
+{
+    bool ok = false;
+    const wchar_t* name = (mutexName != nullptr && mutexName[0] != L'\0')
+        ? mutexName
+        : L"Global\\KnLiveDbg.Exe.SingleInstance";
+
+    do
+    {
+        if (!AcquireNamedMutex(name, &g_InstanceMutexHandle, error))
+        {
             break;
         }
 
@@ -12465,6 +12624,13 @@ static bool AcquireSingleInstanceLock(std::wstring* error)
 
 static void ReleaseSingleInstanceLock()
 {
+    if (g_CloakMutexHandle != nullptr)
+    {
+        ReleaseMutex(g_CloakMutexHandle);
+        CloseHandle(g_CloakMutexHandle);
+        g_CloakMutexHandle = nullptr;
+    }
+
     if (g_InstanceMutexHandle != nullptr)
     {
         if (g_InstanceMutexOwned)
@@ -15334,6 +15500,798 @@ static void HandleNmiCommand(
         for (const NmiCallbackRecord& record : result.Callbacks)
         {
             PrintNmiCallbackRecord(record);
+        }
+    } while (false);
+}
+
+static void PrintPayloadHelp()
+{
+    std::wcout << L"!payload command:\n";
+    std::wcout << L"  !payload <address|symbol> [/disasm <n>] [/json <path>]\n";
+    std::wcout << L"  !payload scan [/limit <n>] [/disasm <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Trace one hook target, or sweep scanned hook surfaces for pointers that\n";
+    std::wcout << L"  sit outside every loaded kernel module and trace each unique address.\n";
+    std::wcout << L"  Each trace walks page tables, looks up SystemBigPoolInformation, probes\n";
+    std::wcout << L"  for an intact or signature-wiped PE header, and disassembles the first\n";
+    std::wcout << L"  instructions. No new driver IOCTL is used.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  scan           collect unbacked pointers first, then trace unique addresses.\n";
+    std::wcout << L"  /limit <n>     cap unique traces (default 16, max 128). scan only.\n";
+    std::wcout << L"  /disasm <n>    instructions to decode (default 16, max 32).\n";
+    std::wcout << L"  /json <path>   write kn-live-dbg.payload.v1 JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"  scan collects unbacked pointers from callbacks, SSDT, IDT, NMI, HAL,\n";
+    std::wcout << L"  SYSCALL MSRs, ETW, WFP callouts, DPC/timer, driver dispatch, and firmware\n";
+    std::wcout << L"  table handlers. A failed surface is a coverage warning, not a clean miss.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !payload fffffc0000123456\n";
+    std::wcout << L"  !payload scan\n";
+    std::wcout << L"  !payload scan /limit 32 /json .\\payload.json\n";
+}
+
+static void PrintMapperHelp()
+{
+    std::wcout << L"!mapper command:\n";
+    std::wcout << L"  !mapper [all|unloaded|piddb|cihash] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !unloaded    alias for !mapper unloaded\n";
+    std::wcout << L"  !piddb       alias for !mapper piddb\n";
+    std::wcout << L"  !cihash      alias for !mapper cihash\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Walks mapper leftovers after a driver image has disappeared:\n";
+    std::wcout << L"    unloaded  nt!MmUnloadedDrivers circular log\n";
+    std::wcout << L"    piddb     nt!PiDDBCacheTable AVL cache\n";
+    std::wcout << L"    cihash    ci!g_KernelHashBucketList (or nearby ci symbols)\n";
+    std::wcout << L"    all       every surface (default)\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /limit <n>   keep leftover/suspicious records first, then truncate.\n";
+    std::wcout << L"  /json <path> write kn-live-dbg.mapper.v1 JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Missing symbols fail closed with an explicit coverage note. Names that\n";
+    std::wcout << L"  are not in the live module list print as STALE. Wiped names, a zero\n";
+    std::wcout << L"  TimeDateStamp, or an unloaded range that is still present+executable\n";
+    std::wcout << L"  print as SUSPICIOUS. !snapshot captures leftover-mapper only.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !mapper\n";
+    std::wcout << L"  !mapper unloaded\n";
+    std::wcout << L"  !piddb /json .\\piddb.json\n";
+}
+
+static void PrintKpageHelp()
+{
+    std::wcout << L"!kpage command:\n";
+    std::wcout << L"  !kpage [/deep] [/wx] [/pe] [/session|/nosession] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Walks the kernel half of the live CR3 page tables and reports executable\n";
+    std::wcout << L"  leaves that do not overlap any SystemModuleInformation range. Adjacent\n";
+    std::wcout << L"  pages with the same permissions are coalesced. Page-table self-map windows\n";
+    std::wcout << L"  are skipped. Session-space hits are kept at low risk unless W+X or PE.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /deep         also walk nt!MmPfnDatabase (expensive; not default).\n";
+    std::wcout << L"  /wx           keep only effective W+X regions.\n";
+    std::wcout << L"  /pe           keep only regions with a PE header probe hit.\n";
+    std::wcout << L"  /session      include session-space hits (default).\n";
+    std::wcout << L"  /nosession    drop session-space hits.\n";
+    std::wcout << L"  /limit <n>    cap printed regions (default 64, max 512).\n";
+    std::wcout << L"  /json <path>  write kn-live-dbg.kpage.v1 JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"  /deep requires _MMPFN.PteAddress and MmPteBase from the PDB and is capped.\n";
+    std::wcout << L"  Do not use /deep as the default scan. !snapshot does not run !kpage.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !kpage\n";
+    std::wcout << L"  !kpage /wx /pe /limit 20\n";
+    std::wcout << L"  !kpage /deep /nosession /json .\\kpage.json\n";
+}
+
+static void PrintPayloadTraceRecord(const PayloadTraceRecord& record)
+{
+    PrintColoredText(L"[payload]", KNDBG_COLOR_TITLE);
+    std::wcout << L" " << HexTextWidth(record.Address, 16, true);
+    std::wcout << L" class=";
+    PrintColoredText(record.Classification, KNDBG_COLOR_ACCENT);
+    std::wcout << L" risk=";
+    PrintColoredText(
+        record.Risk,
+        record.Risk == L"high" ? KNDBG_COLOR_FAIL : (record.Risk == L"medium" ? KNDBG_COLOR_WARN : KNDBG_COLOR_DIM));
+    if (!record.Source.empty())
+    {
+        std::wcout << L" source=" << record.Source;
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  module=";
+    if (record.InLoadedModule)
+    {
+        PrintColoredText(record.ModuleName, KNDBG_COLOR_OK);
+    }
+    else
+    {
+        PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+    }
+    if (!record.SymbolName.empty())
+    {
+        std::wcout << L" symbol=" << record.SymbolName;
+    }
+    std::wcout << L"\n";
+
+    std::wcout << L"  present=" << (record.Inspect.EffectivePresent ? L"yes" : L"no");
+    std::wcout << L" W=" << (record.Inspect.EffectiveWritable ? L"1" : L"0");
+    std::wcout << L" X=" << (record.Inspect.EffectiveExecutable ? L"1" : L"0");
+    if (record.Inspect.TranslationSucceeded)
+    {
+        std::wcout << L" PA=" << HexTextWidth(record.Inspect.PhysicalAddress, 16, true);
+    }
+    if (record.Inspect.EffectivePresent &&
+        record.Inspect.EffectiveWritable &&
+        record.Inspect.EffectiveExecutable)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"[W+X]", KNDBG_COLOR_FAIL);
+    }
+    std::wcout << L"\n";
+
+    if (record.InBigPool)
+    {
+        std::wcout << L"  pool=" << HexTextWidth(record.PoolAddress, 16, true)
+                   << L" size=0x" << std::hex << record.PoolSize << std::dec
+                   << L" tag=" << LeftoverFormatTag(record.PoolTag)
+                   << L" " << (record.PoolNonPaged ? L"NonPaged" : L"Paged") << L"\n";
+    }
+    else
+    {
+        std::wcout << L"  pool=<not in SystemBigPoolInformation>\n";
+    }
+
+    if (record.PeProbed && record.Pe.IsPe)
+    {
+        std::wcout << L"  pe=" << HexTextWidth(record.PeProbeAddress, 16, true)
+                   << L" sections=" << record.Pe.NumberOfSections
+                   << L" sizeOfImage=0x" << std::hex << record.Pe.SizeOfImage << std::dec;
+        if (record.Pe.MzWiped || record.Pe.PeSignatureWiped || record.Pe.ELfanewMismatch)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"WIPED", KNDBG_COLOR_FAIL);
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!record.Notes.empty())
+    {
+        std::wcout << L"  notes=" << record.Notes << L"\n";
+    }
+    if (record.DisasmOk && !record.Disasm.Text.empty())
+    {
+        PrintColoredText(L"  [payload.disasm]", KNDBG_COLOR_TITLE);
+        std::wcout << L"\n" << record.Disasm.Text;
+        if (!record.Disasm.Text.empty() && record.Disasm.Text.back() != L'\n')
+        {
+            std::wcout << L"\n";
+        }
+    }
+}
+
+static bool ParseLeftoverJsonAndLimit(
+    const std::vector<std::wstring>& args,
+    size_t startIndex,
+    uint32_t* limit,
+    uint32_t* disasm,
+    bool* deep,
+    bool* wx,
+    bool* pe,
+    bool* includeSession,
+    std::wstring* jsonPath,
+    std::wstring* error)
+{
+    bool ok = true;
+
+    for (size_t index = startIndex; index < args.size(); ++index)
+    {
+        const std::wstring opt = ToLower(args[index]);
+        if (opt == L"/limit")
+        {
+            if (index + 1 >= args.size())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"/limit requires a value";
+                }
+                ok = false;
+                break;
+            }
+            uint64_t value = 0;
+            if (!ParseUnsigned(args[index + 1], 0, &value) || value > 0xffffffffull)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid /limit";
+                }
+                ok = false;
+                break;
+            }
+            if (limit != nullptr)
+            {
+                *limit = static_cast<uint32_t>(value);
+            }
+            ++index;
+            continue;
+        }
+        if (opt == L"/disasm")
+        {
+            if (index + 1 >= args.size())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"/disasm requires a value";
+                }
+                ok = false;
+                break;
+            }
+            uint64_t value = 0;
+            if (!ParseUnsigned(args[index + 1], 0, &value) || value == 0 || value > 32)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"/disasm must be 1..32";
+                }
+                ok = false;
+                break;
+            }
+            if (disasm != nullptr)
+            {
+                *disasm = static_cast<uint32_t>(value);
+            }
+            ++index;
+            continue;
+        }
+        if (opt == L"/json")
+        {
+            if (index + 1 >= args.size())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"/json requires a path";
+                }
+                ok = false;
+                break;
+            }
+            if (jsonPath != nullptr)
+            {
+                *jsonPath = args[index + 1];
+            }
+            ++index;
+            continue;
+        }
+        if (opt == L"/deep")
+        {
+            if (deep != nullptr)
+            {
+                *deep = true;
+            }
+            continue;
+        }
+        if (opt == L"/wx")
+        {
+            if (wx != nullptr)
+            {
+                *wx = true;
+            }
+            continue;
+        }
+        if (opt == L"/pe")
+        {
+            if (pe != nullptr)
+            {
+                *pe = true;
+            }
+            continue;
+        }
+        if (opt == L"/session")
+        {
+            if (includeSession != nullptr)
+            {
+                *includeSession = true;
+            }
+            continue;
+        }
+        if (opt == L"/nosession")
+        {
+            if (includeSession != nullptr)
+            {
+                *includeSession = false;
+            }
+            continue;
+        }
+
+        if (error != nullptr)
+        {
+            *error = L"unrecognised argument \"" + args[index] + L"\"";
+        }
+        ok = false;
+        break;
+    }
+
+    return ok;
+}
+
+static void HandlePayloadCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!payload requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1))
+        {
+            PrintPayloadHelp();
+            break;
+        }
+
+        bool scan = false;
+        size_t optionIndex = 1;
+        std::wstring addressText;
+        if (args.size() >= 2 && ToLower(args[1]) == L"scan")
+        {
+            scan = true;
+            optionIndex = 2;
+        }
+        else if (args.size() >= 2 && !IsSwitchLikeToken(args[1]))
+        {
+            addressText = args[1];
+            optionIndex = 2;
+        }
+        else
+        {
+            std::wcerr << L"usage: !payload <address|symbol> | !payload scan\n";
+            PrintPayloadHelp();
+            break;
+        }
+
+        uint32_t limit = 16;
+        uint32_t disasm = 16;
+        std::wstring jsonPath;
+        std::wstring parseError;
+        if (!ParseLeftoverJsonAndLimit(
+                args,
+                optionIndex,
+                &limit,
+                &disasm,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                &jsonPath,
+                &parseError))
+        {
+            std::wcerr << L"!payload: " << parseError << L"\n";
+            break;
+        }
+
+        PayloadTracer tracer(device, symbols);
+        PayloadTraceOptions options = {};
+        options.DisasmInstructions = disasm;
+        options.Limit = limit;
+        options.ScanHooks = scan;
+
+        PayloadTraceResult result = {};
+        std::wstring error;
+        if (scan)
+        {
+            std::wcout << L"!payload scan: sweeping hook surfaces for unbacked pointers...\n";
+            if (!tracer.Scan(options, &result, &error))
+            {
+                std::wcerr << L"!payload scan failed: " << error << L"\n";
+                break;
+            }
+        }
+        else
+        {
+            uint64_t address = 0;
+            if (!ParseAddressOrSymbol(symbols, state, addressText, &address, &parseError))
+            {
+                std::wcerr << L"!payload: failed to parse \"" << addressText << L"\": " << parseError << L"\n";
+                break;
+            }
+
+            PayloadTraceRecord record = {};
+            if (!tracer.TraceAddress(address, L"user", options, &record, &error))
+            {
+                std::wcerr << L"!payload failed: " << error << L"\n";
+                break;
+            }
+            result.Records.push_back(record);
+            result.Traced = 1;
+        }
+
+        const std::wstring json = BuildPayloadTraceJson(result);
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = json;
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+            {
+                std::wcerr << L"!payload: failed to write JSON: " << writeError << L"\n";
+            }
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!payload warning: " << warning << L"\n";
+        }
+        for (const std::wstring& note : result.CoverageNotes)
+        {
+            std::wcerr << L"!payload coverage: " << note << L"\n";
+        }
+
+        PrintColoredText(L"payload", KNDBG_COLOR_TITLE);
+        if (scan)
+        {
+            std::wcout << L" scan hooks=" << result.HookPointersSeen
+                       << L" unique=" << result.UniqueUnbacked
+                       << L" traced=" << result.Traced
+                       << L" complete=" << (result.HookSweepComplete ? L"yes" : L"no");
+            if (result.Incomplete)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"incomplete", KNDBG_COLOR_WARN);
+            }
+            std::wcout << L"\n";
+        }
+        else
+        {
+            std::wcout << L" inspect\n";
+        }
+
+        for (const PayloadTraceRecord& record : result.Records)
+        {
+            PrintPayloadTraceRecord(record);
+        }
+    } while (false);
+}
+
+static void HandleMapperCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!mapper requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1))
+        {
+            PrintMapperHelp();
+            break;
+        }
+
+        MapperScanOptions options = {};
+        size_t optionIndex = 1;
+        if (args.size() >= 2 && !IsSwitchLikeToken(args[1]))
+        {
+            const std::wstring scope = ToLower(args[1]);
+            if (scope == L"all")
+            {
+                optionIndex = 2;
+            }
+            else if (scope == L"unloaded")
+            {
+                options.IncludePiddb = false;
+                options.IncludeHash = false;
+                optionIndex = 2;
+            }
+            else if (scope == L"piddb")
+            {
+                options.IncludeUnloaded = false;
+                options.IncludeHash = false;
+                optionIndex = 2;
+            }
+            else if (scope == L"cihash" || scope == L"hash")
+            {
+                options.IncludeUnloaded = false;
+                options.IncludePiddb = false;
+                optionIndex = 2;
+            }
+            else
+            {
+                std::wcerr << L"!mapper scope must be all, unloaded, piddb, or cihash\n";
+                PrintMapperHelp();
+                break;
+            }
+        }
+
+        std::wstring jsonPath;
+        std::wstring parseError;
+        if (!ParseLeftoverJsonAndLimit(
+                args,
+                optionIndex,
+                &options.Limit,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                &jsonPath,
+                &parseError))
+        {
+            std::wcerr << L"!mapper: " << parseError << L"\n";
+            break;
+        }
+
+        MapperRemnantScanner scanner(device, symbols);
+        MapperScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!mapper failed: " << error << L"\n";
+            break;
+        }
+
+        const std::wstring json = BuildMapperJson(result);
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = json;
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+            {
+                std::wcerr << L"!mapper: failed to write JSON: " << writeError << L"\n";
+            }
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!mapper warning: " << warning << L"\n";
+        }
+        for (const std::wstring& note : result.CoverageNotes)
+        {
+            std::wcerr << L"!mapper coverage: " << note << L"\n";
+        }
+
+        PrintColoredText(L"mapper", KNDBG_COLOR_TITLE);
+        std::wcout << L" suspicious=" << (result.AnySuspicious ? L"yes" : L"no")
+                   << L" unloaded=" << result.Unloaded.size()
+                   << L"(" << (result.UnloadedComplete ? L"complete" : L"partial") << L")"
+                   << L" piddb=" << result.Piddb.size()
+                   << L"(" << (result.PiddbComplete ? L"complete" : L"partial") << L")"
+                   << L" hash=" << result.HashEntries.size()
+                   << L"(" << (result.HashComplete ? L"complete" : L"partial") << L")\n";
+
+        for (const MapperUnloadedRecord& record : result.Unloaded)
+        {
+            PrintColoredText(L"[unloaded]", KNDBG_COLOR_TITLE);
+            std::wcout << L" [" << record.Index << L"] ";
+            if (record.Name.empty())
+            {
+                PrintColoredText(L"<unnamed>", KNDBG_COLOR_WARN);
+            }
+            else
+            {
+                std::wcout << record.Name;
+            }
+            std::wcout << L" start=" << HexTextWidth(record.StartAddress, 16, true)
+                       << L" end=" << HexTextWidth(record.EndAddress, 16, true);
+            if (record.StillExecutable)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"STILL-X", KNDBG_COLOR_FAIL);
+            }
+            if (record.Suspicious)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"SUSPICIOUS", KNDBG_COLOR_FAIL);
+            }
+            std::wcout << L"\n";
+            if (!record.Notes.empty())
+            {
+                std::wcout << L"  notes=" << record.Notes << L"\n";
+            }
+        }
+
+        uint32_t piddbPrinted = 0;
+        for (const MapperPiddbRecord& record : result.Piddb)
+        {
+            if (record.InLoadedModules && !record.Suspicious)
+            {
+                continue;
+            }
+            if (piddbPrinted >= 32)
+            {
+                std::wcout << L"  ... additional PiDDB leftovers omitted\n";
+                break;
+            }
+            PrintColoredText(L"[piddb]", KNDBG_COLOR_TITLE);
+            std::wcout << L" " << record.DriverName
+                       << L" stamp=0x" << std::hex << record.TimeDateStamp << std::dec
+                       << L" loaded=" << (record.InLoadedModules ? L"yes" : L"no") << L" ";
+            PrintColoredText(
+                record.Suspicious ? L"SUSPICIOUS" : L"STALE",
+                record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN);
+            std::wcout << L"\n";
+            if (!record.Notes.empty())
+            {
+                std::wcout << L"  notes=" << record.Notes << L"\n";
+            }
+            ++piddbPrinted;
+        }
+
+        uint32_t hashPrinted = 0;
+        for (const MapperHashRecord& record : result.HashEntries)
+        {
+            if (record.InLoadedModules && !record.Suspicious)
+            {
+                continue;
+            }
+            if (hashPrinted >= 32)
+            {
+                std::wcout << L"  ... additional hash-bucket leftovers omitted\n";
+                break;
+            }
+            PrintColoredText(L"[cihash]", KNDBG_COLOR_TITLE);
+            std::wcout << L" " << record.DriverName
+                       << L" loaded=" << (record.InLoadedModules ? L"yes" : L"no") << L" ";
+            PrintColoredText(
+                record.Suspicious ? L"SUSPICIOUS" : L"STALE",
+                record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN);
+            std::wcout << L"\n";
+            if (!record.Notes.empty())
+            {
+                std::wcout << L"  notes=" << record.Notes << L"\n";
+            }
+            ++hashPrinted;
+        }
+    } while (false);
+}
+
+static void HandleKpageCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!kpage requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1))
+        {
+            PrintKpageHelp();
+            break;
+        }
+
+        OrphanKernelPageOptions options = {};
+        options.IncludeSession = true;
+        std::wstring jsonPath;
+        std::wstring parseError;
+        if (!ParseLeftoverJsonAndLimit(
+                args,
+                1,
+                &options.Limit,
+                nullptr,
+                &options.DeepPfn,
+                &options.WxOnly,
+                &options.PeOnly,
+                &options.IncludeSession,
+                &jsonPath,
+                &parseError))
+        {
+            std::wcerr << L"!kpage: " << parseError << L"\n";
+            break;
+        }
+
+        if (options.DeepPfn)
+        {
+            std::wcout << L"!kpage: walking kernel page tables then MmPfnDatabase (/deep)...\n";
+        }
+        else
+        {
+            std::wcout << L"!kpage: walking kernel page tables for executable leaves outside modules...\n";
+        }
+
+        OrphanKernelPageScanner scanner(device, symbols);
+        OrphanKernelPageResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!kpage failed: " << error << L"\n";
+            break;
+        }
+
+        const std::wstring json = BuildOrphanKernelPageJson(result);
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = json;
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+            {
+                std::wcerr << L"!kpage: failed to write JSON: " << writeError << L"\n";
+            }
+        }
+
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!kpage warning: " << warning << L"\n";
+        }
+        for (const std::wstring& note : result.CoverageNotes)
+        {
+            std::wcerr << L"!kpage coverage: " << note << L"\n";
+        }
+
+        PrintColoredText(L"kpage", KNDBG_COLOR_TITLE);
+        std::wcout << L" regions=" << result.Regions.size()
+                   << L" leaves=" << result.ExecutableLeaves
+                   << L" skippedModule=" << result.ModuleLeavesSkipped
+                   << L" skippedSelfMap=" << result.SelfMapLeavesSkipped
+                   << L" tables=" << result.TablePagesWalked
+                   << L" walk=" << (result.PageWalkComplete ? L"complete" : L"partial");
+        if (result.PfnWalkAttempted)
+        {
+            std::wcout << L" pfnExamined=" << result.PfnEntriesExamined
+                       << L" pfnHits=" << result.PfnHits
+                       << L" pfn=" << (result.PfnWalkComplete ? L"complete" : L"partial");
+        }
+        std::wcout << L"\n";
+
+        for (const OrphanKernelPageRegion& region : result.Regions)
+        {
+            PrintColoredText(L"[kpage]", KNDBG_COLOR_TITLE);
+            std::wcout << L" " << HexTextWidth(region.Start, 16, true)
+                       << L"-" << HexTextWidth(region.End, 16, true)
+                       << L" size=0x" << std::hex << region.Size << std::dec
+                       << L" class=" << region.Classification
+                       << L" risk=";
+            PrintColoredText(
+                region.Risk,
+                region.Risk == L"high" ? KNDBG_COLOR_FAIL : (region.Risk == L"medium" ? KNDBG_COLOR_WARN : KNDBG_COLOR_DIM));
+            if (region.Writable && region.Executable)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"[W+X]", KNDBG_COLOR_FAIL);
+            }
+            if (region.HasPe)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"PE", KNDBG_COLOR_FAIL);
+            }
+            if (region.InBigPool)
+            {
+                std::wcout << L" pool=" << LeftoverFormatTag(region.PoolTag);
+            }
+            if (region.FromPfn)
+            {
+                std::wcout << L" pfn";
+            }
+            std::wcout << L"\n";
+            if (!region.Notes.empty())
+            {
+                std::wcout << L"  notes=" << region.Notes << L"\n";
+            }
         }
     } while (false);
 }
@@ -25193,6 +26151,21 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintNmiHelp();
         }
+        else if (command == L"!payload")
+        {
+            PrintPayloadHelp();
+        }
+        else if (command == L"!mapper" ||
+                 command == L"!unloaded" ||
+                 command == L"!piddb" ||
+                 command == L"!cihash")
+        {
+            PrintMapperHelp();
+        }
+        else if (command == L"!kpage")
+        {
+            PrintKpageHelp();
+        }
         else if (command == L"!msrcheck")
         {
             PrintMsrCheckHelp();
@@ -26001,6 +26974,34 @@ static int RunConsoleSurfaceSelfTest()
             IsNativeOwnedCommand(L"dump-kernel") &&
                 IsNativeOwnedCommand(L"dump-live"),
             L"dump-kernel-and-dump-live-are-native-owned");
+        CheckCompletionCandidate(&context, {}, L"!payload", L"payload-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!mapper", L"mapper-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!kpage", L"kpage-root-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!payload", L"help-payload-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!mapper", L"help-mapper-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!kpage", L"help-kpage-completion");
+        CheckCompletionCandidate(&context, {L"!payload"}, L"scan", L"payload-scan-completion");
+        CheckCompletionCandidate(&context, {L"!payload"}, L"/limit", L"payload-limit-completion");
+        CheckCompletionCandidate(&context, {L"!payload", L"scan"}, L"/json", L"payload-scan-json-completion");
+        CheckCompletionCandidate(&context, {L"!mapper"}, L"unloaded", L"mapper-unloaded-completion");
+        CheckCompletionCandidate(&context, {L"!mapper"}, L"piddb", L"mapper-piddb-completion");
+        CheckCompletionCandidate(&context, {L"!mapper"}, L"cihash", L"mapper-cihash-completion");
+        CheckCompletionCandidate(&context, {L"!unloaded"}, L"/limit", L"unloaded-alias-limit-completion");
+        CheckCompletionCandidate(&context, {L"!kpage"}, L"/deep", L"kpage-deep-completion");
+        CheckCompletionCandidate(&context, {L"!kpage"}, L"/wx", L"kpage-wx-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!payload"}, L"scan", L"help-payload-scan-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!kpage"}, L"/deep", L"help-kpage-deep-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IsNativeOwnedCommand(L"!payload") &&
+                IsNativeOwnedCommand(L"!mapper") &&
+                IsNativeOwnedCommand(L"!kpage") &&
+                IsNativeOwnedCommand(L"!unloaded"),
+            L"leftover-commands-are-native-owned");
+        CheckConsoleSurfaceSelfTest(&context, LeftoverCommonSelfTest(), L"leftover-common-self-test");
+        CheckConsoleSurfaceSelfTest(&context, PayloadTracerSelfTest(), L"payload-tracer-self-test");
+        CheckConsoleSurfaceSelfTest(&context, MapperRemnantSelfTest(), L"mapper-remnant-self-test");
+        CheckConsoleSurfaceSelfTest(&context, OrphanKernelPageSelfTest(), L"orphan-kpage-self-test");
         {
             PhysicalMemoryRange run = {};
             run.BaseAddress = 0x1000;
@@ -26061,6 +27062,55 @@ static int RunConsoleSurfaceSelfTest()
                 rootHelp.find(L"help dump-kernel") != std::wstring::npos &&
                     rootHelp.find(L"help dump-live") != std::wstring::npos,
                 L"help-root-lists-dump-kernel-and-dump-live");
+            const std::wstring payloadHelp = CaptureDetailedHelpOutput({L"help", L"!payload"}, 1);
+            const std::wstring mapperHelp = CaptureDetailedHelpOutput({L"help", L"!mapper"}, 1);
+            const std::wstring kpageHelp = CaptureDetailedHelpOutput({L"help", L"!kpage"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                payloadHelp.find(L"!payload scan") != std::wstring::npos &&
+                    mapperHelp.find(L"MmUnloadedDrivers") != std::wstring::npos &&
+                    kpageHelp.find(L"/deep") != std::wstring::npos,
+                L"leftover-help-routes");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                rootHelp.find(L"help !payload") != std::wstring::npos &&
+                    rootHelp.find(L"help !mapper") != std::wstring::npos &&
+                    rootHelp.find(L"help !kpage") != std::wstring::npos &&
+                    rootHelp.find(L"!payload scan") != std::wstring::npos,
+                L"help-root-lists-leftover-commands");
+        }
+
+        {
+            const wchar_t* cloakLaunch[] = { L"KnLiveDbg.exe", L"--cloak" };
+            const wchar_t* cloakResume[] = { L"host.exe", L"--cloak-resume", L"C:\\temp\\cfg.dat" };
+            const wchar_t* cloakCleanup[] = { L"KnLiveDbg.exe", L"--cloak-cleanup", L"C:\\temp\\cfg.dat" };
+            CloakArgs parsed = {};
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                ParseCloakArgs(2, cloakLaunch, &parsed) && parsed.Mode == CloakMode::Launch,
+                L"cloak-args-parse-launch");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                ParseCloakArgs(3, cloakResume, &parsed) &&
+                    parsed.Mode == CloakMode::Resume &&
+                    parsed.SessionPath == L"C:\\temp\\cfg.dat",
+                L"cloak-args-parse-resume");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                ParseCloakArgs(3, cloakCleanup, &parsed) && parsed.Mode == CloakMode::Cleanup,
+                L"cloak-args-parse-cleanup");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                IsValidCloakLeafName(L"AuxMonkari") &&
+                    !IsValidCloakLeafName(L"aux") &&
+                    !IsValidCloakLeafName(L"KnLiveDbg") &&
+                    !IsValidCloakLeafName(L"bad-name"),
+                L"cloak-leaf-name-rules");
+            const std::wstring generated = GenerateCloakLeafName();
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                generated.empty() || IsValidCloakLeafName(generated),
+                L"cloak-generated-name-is-valid-or-empty");
         }
 
         TimelineStats populatedTimelineStats = {};
@@ -28118,6 +29168,17 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
+            if (command == L"!payload" ||
+                command == L"!mapper" ||
+                command == L"!kpage" ||
+                command == L"!unloaded" ||
+                command == L"!piddb" ||
+                command == L"!cihash")
+            {
+                commandClass = L"leftover";
+                break;
+            }
+
             if (command == L"!fwtable")
             {
                 commandClass = L"firmware-table";
@@ -29401,6 +30462,38 @@ static bool ValidateAiPlanArgumentShape(
                 if (reason != nullptr)
                 {
                     *reason = L"!nmi scope must be callbacks";
+                }
+                break;
+            }
+        }
+        else if (command == L"!payload")
+        {
+            if (args.size() < 2)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!payload requires an address or scan";
+                }
+                break;
+            }
+        }
+        else if (command == L"!mapper" ||
+                 command == L"!unloaded" ||
+                 command == L"!piddb" ||
+                 command == L"!cihash")
+        {
+            if (args.size() >= 2 &&
+                !IsSwitchLikeToken(args[1]) &&
+                ToLower(args[1]) != L"all" &&
+                ToLower(args[1]) != L"unloaded" &&
+                ToLower(args[1]) != L"piddb" &&
+                ToLower(args[1]) != L"cihash" &&
+                ToLower(args[1]) != L"hash" &&
+                !IsHelpToken(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!mapper scope must be all, unloaded, piddb, or cihash";
                 }
                 break;
             }
@@ -36439,6 +37532,10 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"etw.providers" ||
         tool == L"etw.ti_cross" ||
         tool == L"nmi.list" ||
+        tool == L"payload.inspect" ||
+        tool == L"payload.scan" ||
+        tool == L"mapper.list" ||
+        tool == L"kpage.list" ||
         tool == L"hal.scan" ||
         tool == L"hive.list" ||
         tool == L"token.inspect" ||
@@ -36560,6 +37657,22 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"nmi.list")
     {
         allowed = {L"scope"};
+    }
+    else if (tool == L"payload.inspect")
+    {
+        allowed = {L"address", L"va", L"symbol"};
+    }
+    else if (tool == L"payload.scan")
+    {
+        allowed = {L"limit"};
+    }
+    else if (tool == L"mapper.list")
+    {
+        allowed = {L"scope", L"limit"};
+    }
+    else if (tool == L"kpage.list")
+    {
+        allowed = {L"deep", L"wx", L"pe", L"limit"};
     }
     else if (tool == L"fwtable.list" || tool == L"firmwaretable.list")
     {
@@ -36818,7 +37931,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|etw.providers|etw.ti_cross|nmi.list|hal.scan|hive.list|token.inspect|dpc.list|timer.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|etw.providers|etw.ti_cross|nmi.list|payload.inspect|payload.scan|mapper.list|kpage.list|hal.scan|hive.list|token.inspect|dpc.list|timer.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -36834,6 +37947,10 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- etw.providers: heuristic ETW provider registration surface and enable-callback ownership. Args: {}.\n";
     stream << L"- etw.ti_cross: correlate active Threat-Intelligence subscription reception with silence/drop signals. Args: {}.\n";
     stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
+    stream << L"- payload.inspect: trace one kernel address through translation, big pool, PE, and disassembly. Args: address/va/symbol.\n";
+    stream << L"- payload.scan: collect unbacked hook pointers and trace them. Args: optional limit.\n";
+    stream << L"- mapper.list: walk MmUnloadedDrivers, PiDDB, and ci hash leftovers. Args: optional scope all|unloaded|piddb|cihash, limit.\n";
+    stream << L"- kpage.list: find executable kernel pages outside loaded modules. Args: optional deep/wx/pe booleans and limit. Do not set deep unless asked.\n";
     stream << L"- hal.scan: check HalDispatchTable ownership. Args: {}.\n";
     stream << L"- hive.list: walk registry hive GetCellRoutine ownership. Args: {}.\n";
     stream << L"- token.inspect: inspect process token privileges (pid optional, default 4). Args: optional pid.\n";
@@ -36887,6 +38004,9 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
     stream << L"- For inline ETW hook questions, use etw.integrity.\n";
     stream << L"- For NMI callback questions, use nmi.list.\n";
+    stream << L"- For unbacked hook targets or leftover pool/independent-page code, use payload.inspect or payload.scan.\n";
+    stream << L"- For unloaded-driver / mapper remnants, use mapper.list.\n";
+    stream << L"- For executable kernel pages outside modules, use kpage.list. Use deep=true only when the operator asks for a PFN walk.\n";
     stream << L"- For firmware table provider, SystemRegisterFirmwareTableInformationHandler, or firmware-table cheat-channel questions, use fwtable.list.\n";
     stream << L"- For W+X pool or suspicious big pool allocation questions, use pool.find with wx=true or explicit filters.\n";
     stream << L"- For address suspicion or page permission questions, use address.inspect.\n";
@@ -38349,6 +39469,225 @@ static bool ExecuteAiCapabilityNmiList(
         std::wcout << L": nmi.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
         HandleNmiCommand(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityPayloadInspect(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"payload.inspect requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring address;
+        if (!ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &address))
+        {
+            if (error != nullptr)
+            {
+                *error = L"payload.inspect requires address, va, or symbol";
+            }
+            break;
+        }
+        if (!ValidateAiCapabilityScalarText(address, L"address", error))
+        {
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!payload");
+        args.push_back(address);
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": payload.inspect\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandlePayloadCommand(args, state, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityPayloadScan(
+    const AiCapabilityStep& step,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"payload.scan requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!payload");
+        args.push_back(L"scan");
+        std::wstring limit;
+        if (ExtractJsonStringValue(step.ArgsJson, L"limit", &limit) && !limit.empty())
+        {
+            if (!ValidateAiCapabilityScalarText(limit, L"limit", error))
+            {
+                break;
+            }
+            args.push_back(L"/limit");
+            args.push_back(limit);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": payload.scan\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandlePayloadCommand(args, state, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityMapperList(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"mapper.list requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring scope;
+        ExtractJsonStringValue(step.ArgsJson, L"scope", &scope);
+        scope = ToLower(TrimWhitespace(scope));
+        if (scope.empty())
+        {
+            scope = L"all";
+        }
+        if (scope != L"all" &&
+            scope != L"unloaded" &&
+            scope != L"piddb" &&
+            scope != L"cihash" &&
+            scope != L"hash")
+        {
+            if (error != nullptr)
+            {
+                *error = L"mapper.list scope must be all, unloaded, piddb, or cihash";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!mapper");
+        args.push_back(scope);
+        std::wstring limit;
+        if (ExtractJsonStringValue(step.ArgsJson, L"limit", &limit) && !limit.empty())
+        {
+            if (!ValidateAiCapabilityScalarText(limit, L"limit", error))
+            {
+                break;
+            }
+            args.push_back(L"/limit");
+            args.push_back(limit);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": mapper.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleMapperCommand(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityKpageList(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"kpage.list requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> args;
+        args.push_back(L"!kpage");
+        bool deep = false;
+        bool wx = false;
+        bool pe = false;
+        ExtractJsonBoolValue(step.ArgsJson, L"deep", &deep);
+        ExtractJsonBoolValue(step.ArgsJson, L"wx", &wx);
+        ExtractJsonBoolValue(step.ArgsJson, L"pe", &pe);
+        if (deep)
+        {
+            args.push_back(L"/deep");
+        }
+        if (wx)
+        {
+            args.push_back(L"/wx");
+        }
+        if (pe)
+        {
+            args.push_back(L"/pe");
+        }
+
+        std::wstring limit;
+        if (ExtractJsonStringValue(step.ArgsJson, L"limit", &limit) && !limit.empty())
+        {
+            if (!ValidateAiCapabilityScalarText(limit, L"limit", error))
+            {
+                break;
+            }
+            args.push_back(L"/limit");
+            args.push_back(limit);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": kpage.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleKpageCommand(args, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -41118,6 +42457,22 @@ static bool ExecuteAiCapabilityPlan(
             {
                 stepOk = ExecuteAiCapabilityNmiList(step, device, symbols, error, structuredJsonOut);
             }
+            else if (step.Tool == L"payload.inspect")
+            {
+                stepOk = ExecuteAiCapabilityPayloadInspect(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"payload.scan")
+            {
+                stepOk = ExecuteAiCapabilityPayloadScan(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"mapper.list")
+            {
+                stepOk = ExecuteAiCapabilityMapperList(step, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"kpage.list")
+            {
+                stepOk = ExecuteAiCapabilityKpageList(step, device, symbols, error, structuredJsonOut);
+            }
             else if (step.Tool == L"fwtable.list" || step.Tool == L"firmwaretable.list")
             {
                 stepOk = ExecuteAiCapabilityFirmwareTableList(step, state, device, symbols, error, structuredJsonOut);
@@ -42544,6 +43899,39 @@ static bool HandleCommand(
         else if (command == L"!nmi")
         {
             HandleNmiCommand(args, device, symbols);
+        }
+        else if (command == L"!payload")
+        {
+            HandlePayloadCommand(args, state, device, symbols);
+        }
+        else if (command == L"!mapper")
+        {
+            HandleMapperCommand(args, device, symbols);
+        }
+        else if (command == L"!unloaded")
+        {
+            std::vector<std::wstring> mapped = args;
+            mapped[0] = L"!mapper";
+            mapped.insert(mapped.begin() + 1, L"unloaded");
+            HandleMapperCommand(mapped, device, symbols);
+        }
+        else if (command == L"!piddb")
+        {
+            std::vector<std::wstring> mapped = args;
+            mapped[0] = L"!mapper";
+            mapped.insert(mapped.begin() + 1, L"piddb");
+            HandleMapperCommand(mapped, device, symbols);
+        }
+        else if (command == L"!cihash")
+        {
+            std::vector<std::wstring> mapped = args;
+            mapped[0] = L"!mapper";
+            mapped.insert(mapped.begin() + 1, L"cihash");
+            HandleMapperCommand(mapped, device, symbols);
+        }
+        else if (command == L"!kpage")
+        {
+            HandleKpageCommand(args, device, symbols);
         }
         else if (command == L"!msrcheck")
         {
@@ -44948,6 +46336,40 @@ int wmain(int argc, wchar_t** argv)
         return 2;
     }
 
+    CloakArgs cloakArgs = {};
+    if (!ParseCloakArgs(argc, argv, &cloakArgs))
+    {
+        std::wcerr << L"usage: KnLiveDbg.exe [--cloak | --cloak-resume <session> | --cloak-cleanup <session>]\n";
+        return 2;
+    }
+
+    if (cloakArgs.Mode == CloakMode::Cleanup)
+    {
+        return RunCloakCleanup(cloakArgs.SessionPath);
+    }
+
+    if (cloakArgs.Mode == CloakMode::Launch)
+    {
+        if (!IsElevated())
+        {
+            std::wcerr << L"KnLiveDbg --cloak must run elevated.\n";
+            return 1;
+        }
+
+        CloakSession session = {};
+        std::wstring cloakError;
+        if (!BuildCloakSession(&session, &cloakError) ||
+            !SaveCloakSession(session, &cloakError) ||
+            !LaunchCloakChild(session, argc, argv, &cloakError))
+        {
+            std::wcerr << L"cloak launch failed: " << cloakError << L"\n";
+            CleanupCloakArtifacts(session, false, nullptr);
+            return 1;
+        }
+
+        return 0;
+    }
+
     int exitCode = 1;
     DebuggerState state = {};
     state.NumberBase = 16;
@@ -44958,13 +46380,27 @@ int wmain(int argc, wchar_t** argv)
     state.ProbeDriverUnloaded = false;
     state.ByovdFixtureCleanupRequested = false;
     state.ByovdFixtureUnloaded = false;
+    state.CloakActive = false;
     state.HasSnapshotBaseline = false;
     state.SnapshotBaseline = SnapshotDocument{};
     state.SnapshotBaselineJsonPath.clear();
     state.SnapshotBaselineReportPath.clear();
     state.Backend = DebuggerState::BackendMode::Auto;
 
-    DriverService service;
+    if (cloakArgs.Mode == CloakMode::Resume)
+    {
+        std::wstring cloakError;
+        if (!LoadCloakSession(cloakArgs.SessionPath, &state.Cloak, &cloakError))
+        {
+            std::wcerr << L"cloak resume failed: " << cloakError << L"\n";
+            return 1;
+        }
+        state.CloakActive = true;
+    }
+
+    DriverService service(
+        state.CloakActive ? state.Cloak.ServiceName.c_str() : KNDBG_SERVICE_NAME,
+        state.CloakActive ? state.Cloak.DisplayName.c_str() : KNDBG_DISPLAY_NAME);
     DeviceClient device;
     SymbolEngine symbols;
     DbgEngBackend dbgeng;
@@ -44994,14 +46430,36 @@ int wmain(int argc, wchar_t** argv)
         }
         PrintLifecycleOk(L"elevation", L"administrator");
 
-        PrintLifecycleStep(L"single instance", L"Global\\KnLiveDbg.Exe.SingleInstance");
-        if (!AcquireSingleInstanceLock(&error))
+        if (state.CloakActive)
         {
-            PrintLifecycleFail(L"single instance", error);
-            std::wcerr << error << L"\n";
-            break;
+            const std::wstring cloakMutex = L"Global\\" + state.Cloak.ServiceName + L".s";
+            PrintLifecycleStep(L"single instance", cloakMutex);
+            if (!AcquireNamedMutex(cloakMutex.c_str(), &g_CloakMutexHandle, &error))
+            {
+                PrintLifecycleFail(L"single instance", error);
+                std::wcerr << error << L"\n";
+                break;
+            }
+            if (!AcquireSingleInstanceLock(&error))
+            {
+                PrintLifecycleFail(L"single instance", error);
+                std::wcerr << error << L"\n";
+                break;
+            }
+            PrintLifecycleOk(L"single instance", L"cloak+session");
+            SetConsoleTitleW(state.Cloak.ServiceName.c_str());
         }
-        PrintLifecycleOk(L"single instance", L"acquired");
+        else
+        {
+            PrintLifecycleStep(L"single instance", L"Global\\KnLiveDbg.Exe.SingleInstance");
+            if (!AcquireSingleInstanceLock(&error))
+            {
+                PrintLifecycleFail(L"single instance", error);
+                std::wcerr << error << L"\n";
+                break;
+            }
+            PrintLifecycleOk(L"single instance", L"acquired");
+        }
 
         state.MainDriverCleanupRequested = true;
 
@@ -45036,18 +46494,28 @@ int wmain(int argc, wchar_t** argv)
             symbols.SetSymbolPath(startupSymbolPath.Path);
         }
 
-        std::wstring driverPath = exeDir + L"\\KnLiveDbg.sys";
+        std::wstring driverPath = state.CloakActive
+            ? state.Cloak.CopiedSysPath
+            : (exeDir + L"\\KnLiveDbg.sys");
+        const std::wstring userDeviceName = state.CloakActive
+            ? state.Cloak.UserDeviceName
+            : KNDBG_USER_DEVICE_NAME;
 
-        if (!LoadDriverServiceWithUx(service, L"Main driver startup", driverPath, &error))
+        if (!LoadDriverServiceWithUx(
+                service,
+                L"Main driver startup",
+                driverPath,
+                &error,
+                state.CloakActive ? &state.Cloak : nullptr))
         {
             std::wcerr << L"driver load failed\n";
             break;
         }
 
-        PrintLifecycleStep(L"open device", KNDBG_USER_DEVICE_NAME);
+        PrintLifecycleStep(L"open device", userDeviceName);
         for (int attempt = 0; attempt < 50; ++attempt)
         {
-            if (device.Open(&error))
+            if (device.Open(userDeviceName, &error))
             {
                 break;
             }
