@@ -352,6 +352,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!unloaded", L"!mapper", L"kernel", L"alias for !mapper unloaded", CommandSupport::Alias),
         Make(L"!piddb", L"!mapper", L"kernel", L"alias for !mapper piddb", CommandSupport::Alias),
         Make(L"!cihash", L"!mapper", L"kernel", L"alias for !mapper cihash", CommandSupport::Alias),
+        Make(L"!minifilter", L"!minifilter", L"kernel", L"list filesystem minifilters and enable or disable one or all IRP pre/post handlers", CommandSupport::Native),
+        Make(L"!fltmgr", L"!minifilter", L"kernel", L"alias for !minifilter", CommandSupport::Alias),
         Make(L"!wnf", L"!wnf", L"kernel", L"decode Windows Notification Facility state names and walk live name instances", CommandSupport::Native),
         Make(L"dv", L"dv", L"locals", kRequiresDbgEng, CommandSupport::DbgEng),
         Make(L"dx", L"dx", L"data-model", kRequiresDbgEng, CommandSupport::DbgEng),

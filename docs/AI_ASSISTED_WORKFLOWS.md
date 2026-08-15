@@ -156,6 +156,8 @@ ai find leftover unbacked kernel hook targets
 ai scan unloaded mapper remnants
 ai show MmUnloadedDrivers and PiDDB leftovers
 ai find executable kernel pages outside loaded modules
+ai list filesystem minifilters
+ai show IRP handlers for filter UnionFS
 ai decode WNF state name 0x41c64e6da3bc0075
 ai list live WNF instances
 ai query recent TI WriteVM events
@@ -222,6 +224,11 @@ The command now behaves like a small tool-using agent and intent router. The ope
 - "find leftover unbacked kernel hook targets" -> `payload.scan`
 - "scan unloaded mapper remnants" or "show MmUnloadedDrivers and PiDDB leftovers" -> `mapper.list`
 - "find executable kernel pages outside loaded modules" -> `kpage.list` without `deep`
+- "list filesystem minifilters" -> `minifilter.list`
+- "show IRP handlers for filter UnionFS" -> `minifilter.list` with `filter=UnionFS`
+- Disable/enable of minifilter IRP handlers is not on the AI planner. Use the
+  console (`!minifilter disable <name> all` / `disable-all`) or MCP
+  `minifilter.set_irp` with `irp=all` under `--allow-write`.
 - "why is this address suspicious?" -> `address.inspect` with `address=<va-or-symbol>`
 - "decode WNF state name 0x41c64e6da3bc0075" -> `wnf.decode` with `hash=0x41c64e6da3bc0075`
 - "list live WNF instances" -> `wnf.list` with `scope=instances`

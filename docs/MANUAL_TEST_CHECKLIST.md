@@ -143,6 +143,23 @@ bodies or a flood of `SUSPICIOUS` rows are not.
 - Do not treat `/deep` as the default; run it once and confirm it is slower
   and still fail-closed if `_MMPFN.PteAddress` is missing.
 
+## Minifilter IRP control
+
+### `!minifilter`
+- `help !minifilter` shows `list`, `show`, `disable`, `disable-all`, `enable-all`,
+  `IRP_MJ_CREATE`, `disable UnionFS all`, and `disable-all UnionFS`.
+- Tab after `!minifilter` offers `disable-all` / `enable-all`. Tab after
+  `!minifilter disable` offers `all` and `IRP_MJ_CREATE`. Tab after
+  `help !minifilter` offers `disable-all`.
+- `!minifilter` on a clean box lists inbox filters (FileInfo, WdFilter, ...) with
+  no crash and `complete=yes` when fltmgr symbols loaded.
+- `!minifilter show FileInfo` prints IRP slots; CREATE/CLEANUP should be active.
+- `!minifilter disable <lab-filter> CREATE` without `write on` must fail.
+- `!minifilter disable-all <lab-filter>` without `write on` must fail the same way.
+- After `write on`, disable then enable of a lab/test filter must restore the
+  same pre/post pointers. `disable-all` then `enable-all` must restore every
+  slot this session disabled. Do not disable WdFilter on a production box.
+
 ## WFP kernel callouts
 
 ### `!wfp kernelcallouts`

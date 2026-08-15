@@ -103,6 +103,9 @@
     <ClCompile Include="MinifilterAttachmentScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="MinifilterIrpScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PoolPeHunter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -262,6 +265,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MinifilterAttachmentScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MinifilterIrpScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PoolPeHunter.h">

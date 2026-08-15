@@ -57,6 +57,14 @@ namespace
     const McpToolArg kArgsThreads[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"apc", L"boolean", false}, {L"stacks", L"boolean", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsTokenInspect[] = { {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"limit", L"string", false} };
     const McpToolArg kArgsNmi[] = { {L"scope", L"string", false} };
+    const McpToolArg kArgsMinifilterList[] = { {L"filter", L"string", false}, {L"name", L"string", false} };
+    const McpToolArg kArgsMinifilterSetIrp[] =
+    {
+        {L"filter", L"string", true},
+        {L"irp", L"string", true},
+        {L"action", L"string", true},
+        {L"which", L"string", false}
+    };
     const McpToolArg kArgsFwtable[] = { {L"scope", L"string", false}, {L"module", L"string", false}, {L"provider", L"string", false}, {L"signature", L"string", false} };
     const McpToolArg kArgsPool[] = { {L"tag", L"string", false}, {L"min", L"string", false}, {L"max", L"string", false}, {L"addr", L"string", false}, {L"limit", L"string", false}, {L"paged", L"string", false}, {L"annotate", L"boolean", false}, {L"wx", L"boolean", false} };
     const McpToolArg kArgsAddress[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"symbol", L"string", false} };
@@ -126,6 +134,7 @@ namespace
         { L"etw.providers", L"Heuristic/partial ETW provider registration surface and enable-callback ownership.", true, nullptr, 0 },
         { L"etw.ti_cross", L"Correlate active Threat-Intelligence subscription reception with silence/drop signals.", true, nullptr, 0 },
         { L"nmi.list", L"Enumerate registered NMI callbacks.", true, MCP_ARG_TABLE(kArgsNmi) },
+        { L"minifilter.list", L"List filesystem minifilters and IRP pre/post registrations.", true, MCP_ARG_TABLE(kArgsMinifilterList) },
         { L"payload.inspect", L"Trace one kernel address: page walk, big-pool lookup, PE probe, disassembly.", true, MCP_ARG_TABLE(kArgsPayloadInspect) },
         { L"payload.scan", L"Sweep hook surfaces for unbacked pointers and trace each unique target.", true, MCP_ARG_TABLE(kArgsPayloadScan) },
         { L"mapper.list", L"Walk MmUnloadedDrivers, PiDDBCacheTable, and ci hash-bucket leftovers.", true, MCP_ARG_TABLE(kArgsMapperList) },
@@ -178,6 +187,7 @@ namespace
         { L"memory.fill", L"[WRITE] Fill a kernel range with a byte pattern.", false, MCP_ARG_TABLE(kArgsFill) },
         { L"memory.move", L"[WRITE] Copy a kernel range from source to dest.", false, MCP_ARG_TABLE(kArgsMove) },
         { L"type.set_field", L"[WRITE] Set a struct field at an address (setfield).", false, MCP_ARG_TABLE(kArgsSetField) },
+        { L"minifilter.set_irp", L"[WRITE] Enable or disable a minifilter IRP pre/post handler. action=enable|disable; irp=IRP_MJ_* or all; which=pre|post|both.", false, MCP_ARG_TABLE(kArgsMinifilterSetIrp) },
         { L"process.set_protection", L"[WRITE] Set a process PS_PROTECTION. pid (optional, defaults to self); level=none|ppl-antimalware|ppl-lsa|ppl-windows|ppl-wintcb|pp-windows|pp-wintcb|pp-winsystem.", false, MCP_ARG_TABLE(kArgsSetProtection) },
         { L"ti.export", L"[WRITE] Export the Threat-Intelligence ETW ring to a JSONL file.", false, MCP_ARG_TABLE(kArgsTiExport) },
         { L"ti.clear", L"[WRITE] Clear the in-memory Threat-Intelligence ETW ring.", false, nullptr, 0 },
