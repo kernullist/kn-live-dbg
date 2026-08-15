@@ -34,6 +34,9 @@
     <ClCompile Include="CloudFileScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="CloakSession.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="CallbackScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -62,6 +65,18 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="IntegrityScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LeftoverCommon.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MapperRemnantScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="OrphanKernelPageScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PayloadTracer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="AddressInspector.cpp">
@@ -174,6 +189,9 @@
     <ClInclude Include="CloudFileScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="CloakSession.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="CallbackScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -205,6 +223,18 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="IntegrityScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="LeftoverCommon.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MapperRemnantScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="OrphanKernelPageScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PayloadTracer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="LayoutResolver.h">

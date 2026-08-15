@@ -8,6 +8,7 @@
 #include "HalDispatchScanner.h"
 #include "HiveScanner.h"
 #include "IntegrityScanner.h"
+#include "MapperRemnantScanner.h"
 #include "MinifilterAttachmentScanner.h"
 #include "NmiScanner.h"
 #include "MsrScanner.h"
@@ -1212,6 +1213,84 @@ namespace
         }
     }
 
+    void CaptureMapperRemnants(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        MapperRemnantScanner scanner(device, symbols);
+        MapperScanOptions options = {};
+        MapperScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"leftover-mapper", error);
+            AddWarnings(document, L"leftover-mapper", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"leftover-mapper", result.Warnings);
+        document->Metadata[L"leftover_mapper_unloaded_complete"] =
+            BoolText(result.UnloadedComplete);
+        document->Metadata[L"leftover_mapper_piddb_complete"] =
+            BoolText(result.PiddbComplete);
+        document->Metadata[L"leftover_mapper_hash_complete"] =
+            BoolText(result.HashComplete);
+
+        for (const MapperUnloadedRecord& item : result.Unloaded)
+        {
+            SnapshotRecord record;
+            record.Domain = L"leftover-mapper";
+            record.Identity = L"unloaded:" + SnapshotToLower(item.Name) + L":" +
+                SnapshotHex(item.StartAddress, 16);
+            record.Display = item.Name.empty() ? L"<unnamed unloaded>" : item.Name;
+            record.Risk = item.Suspicious ? L"high" : L"medium";
+            record.Tags = {L"unloaded"};
+            if (item.Suspicious)
+            {
+                record.Tags.push_back(L"suspicious");
+            }
+            record.Evidence[L"start"] = SnapshotHex(item.StartAddress, 16);
+            record.Evidence[L"end"] = SnapshotHex(item.EndAddress, 16);
+            record.Evidence[L"still_executable"] = BoolText(item.StillExecutable);
+            record.Evidence[L"notes"] = item.Notes;
+            AddRecord(document, std::move(record));
+        }
+
+        for (const MapperPiddbRecord& item : result.Piddb)
+        {
+            if (item.InLoadedModules && !item.Suspicious)
+            {
+                continue;
+            }
+            SnapshotRecord record;
+            record.Domain = L"leftover-mapper";
+            record.Identity = L"piddb:" + SnapshotToLower(item.DriverName) + L":" +
+                DecText(item.TimeDateStamp);
+            record.Display = item.DriverName;
+            record.Risk = item.Suspicious ? L"high" : L"medium";
+            record.Tags = {L"piddb"};
+            record.Tags.push_back(item.Suspicious ? L"suspicious" : L"stale");
+            record.Evidence[L"time_date_stamp"] = DecText(item.TimeDateStamp);
+            record.Evidence[L"notes"] = item.Notes;
+            AddRecord(document, std::move(record));
+        }
+
+        for (const MapperHashRecord& item : result.HashEntries)
+        {
+            if (item.InLoadedModules && !item.Suspicious)
+            {
+                continue;
+            }
+            SnapshotRecord record;
+            record.Domain = L"leftover-mapper";
+            record.Identity = L"cihash:" + SnapshotToLower(item.DriverName);
+            record.Display = item.DriverName;
+            record.Risk = item.Suspicious ? L"high" : L"medium";
+            record.Tags = {L"cihash"};
+            record.Tags.push_back(item.Suspicious ? L"suspicious" : L"stale");
+            record.Evidence[L"notes"] = item.Notes;
+            AddRecord(document, std::move(record));
+        }
+    }
+
     uint64_t Fnv1aFold(uint64_t hash, uint64_t value)
     {
         for (int i = 0; i < 8; ++i)
@@ -1985,6 +2064,7 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
         CaptureMinifilterAttachments(document);
         CaptureEtw(device_, symbols_, document);
         CaptureNmi(device_, symbols_, document);
+        CaptureMapperRemnants(device_, symbols_, document);
         CaptureCpuState(device_, symbols_, document);
         CaptureHal(device_, symbols_, document);
         CaptureHive(device_, symbols_, document);

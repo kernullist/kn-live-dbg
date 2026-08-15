@@ -34,14 +34,28 @@ DeviceClient::~DeviceClient()
 
 bool DeviceClient::Open(std::wstring* error)
 {
+    return Open(KNDBG_USER_DEVICE_NAME, error);
+}
+
+bool DeviceClient::Open(const std::wstring& userDeviceName, std::wstring* error)
+{
     bool ok = false;
 
     do
     {
         Close();
 
+        if (userDeviceName.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"device name is empty";
+            }
+            break;
+        }
+
         device_ = CreateFileW(
-            KNDBG_USER_DEVICE_NAME,
+            userDeviceName.c_str(),
             GENERIC_READ | GENERIC_WRITE,
             0,
             nullptr,

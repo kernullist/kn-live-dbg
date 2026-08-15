@@ -108,6 +108,7 @@
     <ClCompile Include="ByovdScanner.cpp" />
     <ClCompile Include="CallbackScanner.cpp" />
     <ClCompile Include="CloudFileScanner.cpp" />
+    <ClCompile Include="CloakSession.cpp" />
     <ClCompile Include="CommandRegistry.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
     <ClCompile Include="DeviceClient.cpp" />
@@ -117,7 +118,11 @@
     <ClCompile Include="HalDispatchScanner.cpp" />
     <ClCompile Include="HiveScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
+    <ClCompile Include="LeftoverCommon.cpp" />
+    <ClCompile Include="MapperRemnantScanner.cpp" />
     <ClCompile Include="NmiScanner.cpp" />
+    <ClCompile Include="OrphanKernelPageScanner.cpp" />
+    <ClCompile Include="PayloadTracer.cpp" />
     <ClCompile Include="MsrScanner.cpp" />
     <ClCompile Include="CrScanner.cpp" />
     <ClCompile Include="SsdtScanner.cpp" />
@@ -165,6 +170,7 @@
     <ClInclude Include="ByovdScanner.h" />
     <ClInclude Include="CallbackScanner.h" />
     <ClInclude Include="CloudFileScanner.h" />
+    <ClInclude Include="CloakSession.h" />
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />
@@ -175,6 +181,10 @@
     <ClInclude Include="HiveScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />
     <ClInclude Include="LayoutResolver.h" />
+    <ClInclude Include="LeftoverCommon.h" />
+    <ClInclude Include="MapperRemnantScanner.h" />
+    <ClInclude Include="OrphanKernelPageScanner.h" />
+    <ClInclude Include="PayloadTracer.h" />
     <ClInclude Include="McpJson.h" />
     <ClInclude Include="McpServer.h" />
     <ClInclude Include="McpSelfTest.h" />

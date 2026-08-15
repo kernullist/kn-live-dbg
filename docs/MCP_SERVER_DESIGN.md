@@ -561,6 +561,10 @@ Added kernel anti-cheat detections not in the initial catalog (the 18 tools used
 | `vbs.scan` | `!vbs` | `BuildVbsJson` (`.vbs.v1`) | VBS/HVCI/CI/SecureKernel/trustlet (a single tool covering !ci/!securekernel) |
 | `byovd.scan` | `byovd scan /no-update` | `BuildByovdScanJson` (existing) | `/no-update` forced (blocks network/subprocess) |
 | `pool.scan_pe` | `pool-scan-pe` | `BuildPoolPeJson` (`.pool-pe.v1`) | args tag/limit/suspicious; `/dump` not exposed |
+| `payload.inspect` | `!payload` | `BuildPayloadTraceJson` (`.payload.v1`) | args address/va/symbol |
+| `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | args limit |
+| `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | args scope/limit |
+| `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | args deep/wx/pe/limit; deep is not default |
 | `hunt.run` | `!hunt` | `BuildHuntJson` (existing) | args mode (quick/deep); `/summary` forced |
 | `snapshot.capture` | `!snapshot baseline` | `BuildSnapshotJson` (existing) | args name; baseline file write (not a kernel write -> allowed in read-only mode) |
 

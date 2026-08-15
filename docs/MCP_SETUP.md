@@ -509,6 +509,10 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `threads.list` | Thread/start-address/APC/stack evidence | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
 | `etw.integrity` | ETW logger/GetCpuClock integrity (InfinityHook) | (none) |
 | `nmi.list` | Enumerate registered NMI callbacks | `scope` |
+| `payload.inspect` | Trace one kernel address (page walk, big pool, PE, disasm) | `address`, `va`, `symbol` |
+| `payload.scan` | Sweep unbacked hook pointers and trace each unique target | `limit` |
+| `mapper.list` | Walk MmUnloadedDrivers, PiDDB, and ci hash leftovers | `scope`, `limit` |
+| `kpage.list` | Find executable kernel pages outside loaded modules | `deep`, `wx`, `pe`, `limit` |
 | `fwtable.list` | Enumerate firmware-table providers | `scope`, `module`, `provider`, `signature` |
 | `pool.find` | Enumerate kernel big pool allocations (tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
 | `address.inspect` | Inspect a virtual address (page-table walk/permissions/owning module) | `address`, `va`, `symbol` |
@@ -663,6 +667,15 @@ Scan SSDT/shadow-SSDT, the IDT, the SYSCALL MSRs (LSTAR etc.), and the control r
 pointing outside the kernel image and attach which module each target belongs to.
 ```
 -> `ssdt.scan` + `idt.scan` + `msr.check` + `cr.scan`, with `address.inspect` for each flagged address.
+
+### 9.3b Leftover mapper / unbacked kernel code
+
+```
+The original cheat driver is gone. Find leftover functional code in nonpaged
+pool or independent pages, plus MmUnloadedDrivers / PiDDB / ci hash remnants.
+Do not run a PFN walk unless I ask.
+```
+-> `payload.scan` + `mapper.list` + `kpage.list`, then `payload.inspect` on each unbacked address. Set `kpage.list` `deep=true` only when the operator asks.
 
 ### 9.4 Callback target verification (down to the code)
 

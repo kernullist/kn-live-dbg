@@ -53,6 +53,11 @@ static const GUID KNDBG_DEVICE_CLASS_GUID =
     {0x95, 0x92, 0x6f, 0x9f, 0xb0, 0x2d, 0x46, 0x78}
 };
 
+static WCHAR g_KnDbgDeviceNameChars[96] = KNDBG_DEVICE_NAME;
+static WCHAR g_KnDbgSymbolicLinkChars[96] = KNDBG_DOS_DEVICE_NAME;
+static UNICODE_STRING g_KnDbgDeviceName = RTL_CONSTANT_STRING(KNDBG_DEVICE_NAME);
+static UNICODE_STRING g_KnDbgSymbolicLink = RTL_CONSTANT_STRING(KNDBG_DOS_DEVICE_NAME);
+
 static FAST_MUTEX g_KnDbgOwnerLock;
 static ULONG g_KnDbgOwnerPid = 0;
 static ULONG g_KnDbgOwnerOpenCount = 0;
@@ -2484,14 +2489,188 @@ static NTSTATUS KnDbgHandleSetProcessProtection(PIRP Irp, PIO_STACK_LOCATION Sta
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+static bool KnDbgIsValidNameLeaf(const WCHAR* Leaf)
+{
+    bool ok = false;
+
+    do
+    {
+        if (Leaf == nullptr || *Leaf == L'\0')
+        {
+            break;
+        }
+
+        size_t length = 0;
+        while (Leaf[length] != L'\0')
+        {
+            const WCHAR ch = Leaf[length];
+            const bool letter = (ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z');
+            const bool digit = (ch >= L'0' && ch <= L'9');
+            if (!letter && !digit)
+            {
+                break;
+            }
+            ++length;
+            if (length > 16)
+            {
+                break;
+            }
+        }
+
+        if (Leaf[length] != L'\0' || length < 8)
+        {
+            break;
+        }
+
+        if (!((Leaf[0] >= L'A' && Leaf[0] <= L'Z') || (Leaf[0] >= L'a' && Leaf[0] <= L'z')))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static NTSTATUS KnDbgQueryRegistrySz(
+    HANDLE Key,
+    const WCHAR* ValueName,
+    WCHAR* Buffer,
+    USHORT BufferChars)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    do
+    {
+        if (Key == nullptr || ValueName == nullptr || Buffer == nullptr || BufferChars < 8)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        UNICODE_STRING name = {};
+        RtlInitUnicodeString(&name, ValueName);
+
+        UCHAR infoBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 96 * sizeof(WCHAR)] = {};
+        ULONG resultLength = 0;
+        status = ZwQueryValueKey(
+            Key,
+            &name,
+            KeyValuePartialInformation,
+            infoBuffer,
+            sizeof(infoBuffer),
+            &resultLength);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+
+        const KEY_VALUE_PARTIAL_INFORMATION* info =
+            reinterpret_cast<const KEY_VALUE_PARTIAL_INFORMATION*>(infoBuffer);
+        if (info->Type != REG_SZ || info->DataLength < sizeof(WCHAR))
+        {
+            status = STATUS_OBJECT_TYPE_MISMATCH;
+            break;
+        }
+
+        const USHORT wcharCount = static_cast<USHORT>(info->DataLength / sizeof(WCHAR));
+        if (wcharCount == 0 || wcharCount >= BufferChars)
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlCopyMemory(Buffer, info->Data, wcharCount * sizeof(WCHAR));
+        Buffer[wcharCount] = L'\0';
+        if (Buffer[wcharCount - 1] == L'\0')
+        {
+            // already terminated inside DataLength
+        }
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return status;
+}
+
+static void KnDbgLoadNamesFromRegistry(PUNICODE_STRING RegistryPath)
+{
+    HANDLE key = nullptr;
+
+    do
+    {
+        if (RegistryPath == nullptr || RegistryPath->Buffer == nullptr)
+        {
+            break;
+        }
+
+        UNICODE_STRING suffix = RTL_CONSTANT_STRING(L"\\Parameters");
+        WCHAR pathChars[256] = {};
+        UNICODE_STRING path = {};
+        path.Buffer = pathChars;
+        path.MaximumLength = sizeof(pathChars);
+        path.Length = 0;
+        if (!NT_SUCCESS(RtlAppendUnicodeStringToString(&path, RegistryPath)) ||
+            !NT_SUCCESS(RtlAppendUnicodeStringToString(&path, &suffix)))
+        {
+            break;
+        }
+
+        OBJECT_ATTRIBUTES attributes;
+        InitializeObjectAttributes(
+            &attributes,
+            &path,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+            nullptr,
+            nullptr);
+
+        if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &attributes)))
+        {
+            break;
+        }
+
+        WCHAR deviceChars[96] = {};
+        WCHAR linkChars[96] = {};
+        if (!NT_SUCCESS(KnDbgQueryRegistrySz(key, L"DeviceName", deviceChars, 96)) ||
+            !NT_SUCCESS(KnDbgQueryRegistrySz(key, L"SymbolicLink", linkChars, 96)))
+        {
+            break;
+        }
+
+        const WCHAR devicePrefix[] = L"\\Device\\";
+        const WCHAR dosPrefix[] = L"\\DosDevices\\";
+        if (RtlCompareMemory(deviceChars, devicePrefix, sizeof(devicePrefix) - sizeof(WCHAR)) !=
+                (sizeof(devicePrefix) - sizeof(WCHAR)) ||
+            RtlCompareMemory(linkChars, dosPrefix, sizeof(dosPrefix) - sizeof(WCHAR)) !=
+                (sizeof(dosPrefix) - sizeof(WCHAR)))
+        {
+            break;
+        }
+
+        if (!KnDbgIsValidNameLeaf(deviceChars + 8) ||
+            !KnDbgIsValidNameLeaf(linkChars + 12))
+        {
+            break;
+        }
+
+        RtlCopyMemory(g_KnDbgDeviceNameChars, deviceChars, sizeof(g_KnDbgDeviceNameChars));
+        RtlCopyMemory(g_KnDbgSymbolicLinkChars, linkChars, sizeof(g_KnDbgSymbolicLinkChars));
+        RtlInitUnicodeString(&g_KnDbgDeviceName, g_KnDbgDeviceNameChars);
+        RtlInitUnicodeString(&g_KnDbgSymbolicLink, g_KnDbgSymbolicLinkChars);
+    } while (false);
+
+    if (key != nullptr)
+    {
+        ZwClose(key);
+    }
+}
+
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
-    UNREFERENCED_PARAMETER(RegistryPath);
+    KnDbgLoadNamesFromRegistry(RegistryPath);
 
     NTSTATUS status = STATUS_UNSUCCESSFUL;
-    UNICODE_STRING deviceName = RTL_CONSTANT_STRING(KNDBG_DEVICE_NAME);
-    UNICODE_STRING symbolicLinkName = RTL_CONSTANT_STRING(KNDBG_DOS_DEVICE_NAME);
     UNICODE_STRING defaultSddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
     PDEVICE_OBJECT deviceObject = nullptr;
     bool symbolicLinkCreated = false;
@@ -2527,7 +2706,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         status = IoCreateDeviceSecure(
             DriverObject,
             0,
-            &deviceName,
+            &g_KnDbgDeviceName,
             FILE_DEVICE_UNKNOWN,
             FILE_DEVICE_SECURE_OPEN,
             FALSE,
@@ -2542,7 +2721,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
         deviceObject->Flags |= DO_BUFFERED_IO;
 
-        status = IoCreateSymbolicLink(&symbolicLinkName, &deviceName);
+        status = IoCreateSymbolicLink(&g_KnDbgSymbolicLink, &g_KnDbgDeviceName);
         if (!NT_SUCCESS(status))
         {
             break;
@@ -2557,7 +2736,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     {
         if (symbolicLinkCreated)
         {
-            IoDeleteSymbolicLink(&symbolicLinkName);
+            IoDeleteSymbolicLink(&g_KnDbgSymbolicLink);
         }
 
         if (deviceObject != nullptr)
@@ -2571,8 +2750,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
 static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
 {
-    UNICODE_STRING symbolicLinkName = RTL_CONSTANT_STRING(KNDBG_DOS_DEVICE_NAME);
-
     ExAcquireFastMutex(&g_KnDbgTimelineControlLock);
     KnDbgTimelineUnregisterCallbacks();
     ExReleaseFastMutex(&g_KnDbgTimelineControlLock);
@@ -2583,7 +2760,7 @@ static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
         g_KnDbgTimelineRing = nullptr;
     }
 
-    IoDeleteSymbolicLink(&symbolicLinkName);
+    IoDeleteSymbolicLink(&g_KnDbgSymbolicLink);
 
     if (DriverObject->DeviceObject != nullptr)
     {
@@ -2948,7 +3125,7 @@ static NTSTATUS KnDbgHandleGetPhysicalRanges(PIRP Irp, PIO_STACK_LOCATION Stack,
             }
 
             const ULONGLONG byteCount = static_cast<ULONGLONG>(entry.NumberOfBytes.QuadPart);
-            if (totalBytes > (MAXULONG64 - byteCount))
+            if (totalBytes > (~0ull - byteCount))
             {
                 overflow = TRUE;
                 break;

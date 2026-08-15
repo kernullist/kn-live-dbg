@@ -560,6 +560,10 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 | `vbs.scan` | `!vbs` | `BuildVbsJson`(`.vbs.v1`) | VBS/HVCI/CI/SecureKernel/trustlet (단일 툴로 !ci/!securekernel 포함) |
 | `byovd.scan` | `byovd scan /no-update` | `BuildByovdScanJson`(기존) | `/no-update` 강제(네트워크/subprocess 차단) |
 | `pool.scan_pe` | `pool-scan-pe` | `BuildPoolPeJson`(`.pool-pe.v1`) | args tag/limit/suspicious; `/dump` 미노출 |
+| `payload.inspect` | `!payload` | `BuildPayloadTraceJson` (`.payload.v1`) | args address/va/symbol |
+| `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | args limit |
+| `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | args scope/limit |
+| `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | args deep/wx/pe/limit; deep는 기본 아님 |
 | `hunt.run` | `!hunt` | `BuildHuntJson`(기존) | args mode(quick/deep); `/summary` 강제 |
 | `snapshot.capture` | `!snapshot baseline` | `BuildSnapshotJson`(기존) | args name; baseline 파일 write(커널 write 아님 → read-only 모드 허용) |
 
