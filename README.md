@@ -70,7 +70,8 @@ kn-live-dbg/
 30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, reporting added/escalated records plus coverage-gated callback removal and `_EPROCESS.Protection` changes, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first.
 31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, writes a WinDbg-openable complete dump with `dump-kernel <path>` (8 KB `DUMP_HEADER64` plus streamed physical RAM runs from `MmGetPhysicalMemoryRanges`), and asks Windows for an OS live kernel dump with `dump-live <path>` via `NtSystemDebugControl(SysDbgGetLiveKernelDump)`. `dump-pe` parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
 32. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
-33. Traces leftover mapper payloads after the original driver image is gone. `!payload <addr>` follows one hook target through page-table translation, big-pool membership, PE-header probe, and disassembly. `!payload scan` collects unbacked pointers from the hook scanners first. `!mapper` walks `MmUnloadedDrivers`, `PiDDBCacheTable`, and the ci hash-bucket list. `!kpage` reports executable kernel pages outside loaded modules; `!kpage /deep` adds a capped PFN-database pass. None of these add driver IOCTLs.
+33. Lists filesystem minifilters and can disable or restore one IRP pre/post handler, or every registered slot, with `!minifilter`. The walk uses `fltmgr!FltGlobals` and PDB `_FLT_OPERATION_REGISTRATION` offsets. `disable` writes NULL through the existing write IOCTL after saving the original pointers in this session; `enable` puts them back. `disable <name> all` and `disable-all` walk every slot. Inbox filters warn. No new driver IOCTL.
+34. Traces leftover mapper payloads after the original driver image is gone. `!payload <addr>` follows one hook target through page-table translation, big-pool membership, PE-header probe, and disassembly. `!payload scan` collects unbacked pointers from the hook scanners first. `!mapper` walks `MmUnloadedDrivers`, `PiDDBCacheTable`, and the ci hash-bucket list. `!kpage` reports executable kernel pages outside loaded modules; `!kpage /deep` adds a capped PFN-database pass. None of these add driver IOCTLs.
 34. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
 34. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
 35. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
@@ -208,7 +209,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `ai <Tab>` for primary AI actions, `ai explain callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -305,6 +306,7 @@ pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged
 !mapper [all|unloaded|piddb|cihash] [/limit <n>] [/json <path>]
 !unloaded | !piddb | !cihash
 !kpage [/deep] [/wx] [/pe] [/session|/nosession] [/limit <n>] [/json <path>]
+!minifilter [list|show <name|addr>|irp <name|addr> <mj>|disable <name|addr> <mj|all>|enable <name|addr> <mj|all>|disable-all <name|addr>|enable-all <name|addr>] [/pre|/post|/both] [/json <path>]
 !address <va>
 set-ppl-antimalware [on|off|status]
 !ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]
@@ -422,6 +424,15 @@ knkd> !mapper
 knkd> !mapper unloaded
 knkd> !kpage
 knkd> !kpage /wx /pe /limit 20
+knkd> !minifilter
+knkd> !minifilter show UnionFS
+knkd> !minifilter irp UnionFS IRP_MJ_CREATE
+knkd> write on
+knkd> !minifilter disable UnionFS CREATE
+knkd> !minifilter disable UnionFS all
+knkd> !minifilter disable-all UnionFS
+knkd> !minifilter enable-all UnionFS
+knkd> !minifilter enable UnionFS CREATE
 knkd> !address nt!ExpWnfSiloState
 knkd> !address 0xffffe78fcd778000
 knkd> write on
@@ -526,7 +537,7 @@ Supported keys:
 
 Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
 
-For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `payload.inspect`, `payload.scan`, `mapper.list`, `kpage.list`, `fwtable.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, and `driver.integrity`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback/WFP/ALPC prompts route through their native scanners with validated scope/filter args. Firmware table provider prompts route through the passive `!fwtable` scanner and never invoke firmware handlers. Requests that ask to list, show, recommend, or suggest commands route to the planner first, so command-advice prompts do not run native scanners immediately. Process memory prompts route through `!vad` or `!threads`, including VAD DKOM prompts that set `hiddenpte=true` and run `!vad <target> /hiddenpte`. Integrity prompts such as `ai any inline ETW hook?`, `ai list NMI callbacks`, `ai list firmware table providers`, `ai show W+X pool allocations`, `ai why is nt!Foo suspicious?`, `ai decode this WNF state name 0x41c64e6da3bc0075`, `ai list live WNF instances`, `ai query recent TI WriteVM events`, `ai inspect module text integrity with headers and sections`, `ai find W+X kernel modules`, and `ai check driver dispatch integrity` route through the corresponding local read-only tool. Exact read-only commands after `ai`, such as `ai callbacks all WdFilter.sys`, `ai dt nt!_EPROCESS <address>`, `ai uf nt!Foo`, `ai !ci options`, `ai !vbs`, or `ai !fwtable providers`, are treated as evidence commands: Kn Live Dbg runs the command, captures stdout/stderr, and asks the selected model to explain the evidence. If neither a local capability nor an evidence command fits but the request looks investigative, `ai <question>` automatically builds a validated `kn-live-dbg.ai-plan.v2` command plan and leaves execution to `ai run`. `module.integrity` accepts validated `target`/`module`/`name`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, and `mismatch` args before the local executor builds the native command. The capability parser rejects unknown tools, unknown fields, unsafe characters, invalid scalars, write-like actions, raw `kd`, nested `ai`, session mutation, unload/shutdown, and command chaining before any native handler is called. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
+For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `minifilter.list`, `payload.inspect`, `payload.scan`, `mapper.list`, `kpage.list`, `fwtable.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, and `driver.integrity`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback/WFP/ALPC prompts route through their native scanners with validated scope/filter args. Firmware table provider prompts route through the passive `!fwtable` scanner and never invoke firmware handlers. Requests that ask to list, show, recommend, or suggest commands route to the planner first, so command-advice prompts do not run native scanners immediately. Process memory prompts route through `!vad` or `!threads`, including VAD DKOM prompts that set `hiddenpte=true` and run `!vad <target> /hiddenpte`. Integrity prompts such as `ai any inline ETW hook?`, `ai list NMI callbacks`, `ai list firmware table providers`, `ai show W+X pool allocations`, `ai why is nt!Foo suspicious?`, `ai decode this WNF state name 0x41c64e6da3bc0075`, `ai list live WNF instances`, `ai query recent TI WriteVM events`, `ai inspect module text integrity with headers and sections`, `ai find W+X kernel modules`, and `ai check driver dispatch integrity` route through the corresponding local read-only tool. Exact read-only commands after `ai`, such as `ai callbacks all WdFilter.sys`, `ai dt nt!_EPROCESS <address>`, `ai uf nt!Foo`, `ai !ci options`, `ai !vbs`, or `ai !fwtable providers`, are treated as evidence commands: Kn Live Dbg runs the command, captures stdout/stderr, and asks the selected model to explain the evidence. If neither a local capability nor an evidence command fits but the request looks investigative, `ai <question>` automatically builds a validated `kn-live-dbg.ai-plan.v2` command plan and leaves execution to `ai run`. `module.integrity` accepts validated `target`/`module`/`name`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, and `mismatch` args before the local executor builds the native command. The capability parser rejects unknown tools, unknown fields, unsafe characters, invalid scalars, write-like actions, raw `kd`, nested `ai`, session mutation, unload/shutdown, and command chaining before any native handler is called. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
 
 `ai plan <prompt>` asks the selected model to return a strict `kn-live-dbg.ai-plan.v2` command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose, risk, backend, and expected-output notes. Empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. Conceptual `what`/`how`/`why` questions stay advisory, while investigative requests such as `check`, `show`, `list`, `scan`, `status`, `integrity`, `ci options`, or `module integrity` automatically build a command plan when no direct local tool matches. `ai explain <read-only-command...>` is still available as an explicit evidence-analysis form; it preserves stdout/stderr, adds a deterministic output summary, then asks the selected model for analysis. It has tuned prompts for `callbacks`, `dt`/`dtx`, and `u`/`uf`, so the older `ai analyze callbacks` and `ai annotate` flows are now covered by the shorter explain form and by implicit `ai <read-only-command...>` routing.
 
@@ -547,7 +558,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!payload`, `!mapper`, `!kpage`, `!fwtable`, `!module`, `!driver`, `!pool`, `!snapshot`, `!diff`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!payload`, `!mapper`, `!kpage`, `!minifilter`, `!fwtable`, `!module`, `!driver`, `!pool`, `!snapshot`, `!diff`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -1627,6 +1638,49 @@ knkd> !payload scan
 knkd> !mapper
 knkd> !kpage /wx /pe
 knkd> !kpage /deep /nosession
+```
+
+## Minifilter IRP control
+
+A helper minifilter can sit on `IRP_MJ_CREATE` / directory / set-info and
+interfere with an anti-cheat file path. `!minifilter` walks
+`fltmgr!FltGlobals` with PDB `_FLT_OPERATION_REGISTRATION` offsets and can
+null one slot or every registered slot. No new driver IOCTL; writes go
+through the existing virtual-write path after `write on`.
+
+```text
+!minifilter [list] [/json <path>]
+!minifilter show <name|address> [/json <path>]
+!minifilter irp <name|address> <IRP_MJ_*> [/json <path>]
+!minifilter disable <name|address> <IRP_MJ_*|all> [/pre|/post|/both]
+!minifilter enable <name|address> <IRP_MJ_*|all> [/pre|/post|/both]
+!minifilter disable-all <name|address> [/pre|/post|/both]
+!minifilter enable-all <name|address> [/pre|/post|/both]
+```
+
+1. `list` / `show` / `irp` are read-only. `!fltmgr` is an alias.
+2. `disable` NULLs the selected Pre/Post and keeps the original pointers in
+   this session. `enable` restores that backup only.
+3. `disable <name> all`, `disable *`, `disable every`, `disable IRP_MJ_ALL`,
+   and `disable-all` walk every registered slot. Already-null slots are
+   skipped. A later slot failure does not undo earlier writes; the command
+   fails only when nothing changed.
+4. `enable-all` restores every same-session backup and skips slots this
+   session never disabled. It fails closed when this session has no backup
+   for that filter.
+5. Ambiguous filter names fail closed. Inbox names such as `WdFilter` warn
+   and are not blocked. Do not disable inbox filters on a production box.
+6. JSON schemas are `kn-live-dbg.minifilter.v1`,
+   `kn-live-dbg.minifilter-irp.v1`, and `kn-live-dbg.minifilter-irp-batch.v1`.
+   MCP write tool is `minifilter.set_irp` with `irp=all` for the batch path.
+
+```text
+knkd> !minifilter
+knkd> !minifilter show UnionFS
+knkd> write on
+knkd> !minifilter disable UnionFS all
+knkd> !minifilter disable-all UnionFS
+knkd> !minifilter enable-all UnionFS
 ```
 
 ## Threat-Intelligence ETW (`!ti`)

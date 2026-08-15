@@ -564,6 +564,8 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 | `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | args limit |
 | `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | args scope/limit |
 | `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | args deep/wx/pe/limit; deep는 기본 아님 |
+| `minifilter.list` | `!minifilter` | `BuildMinifilterIrpJson` (`.minifilter.v1`) | args filter/name |
+| `minifilter.set_irp` | `!minifilter disable/enable` | `BuildMinifilterIrpChangeJson` (`.minifilter-irp.v1`) 또는 `BuildMinifilterIrpBatchJson` (`.minifilter-irp-batch.v1`) | WRITE; action enable/disable; `irp=all`이면 배치 |
 | `hunt.run` | `!hunt` | `BuildHuntJson`(기존) | args mode(quick/deep); `/summary` 강제 |
 | `snapshot.capture` | `!snapshot baseline` | `BuildSnapshotJson`(기존) | args name; baseline 파일 write(커널 write 아님 → read-only 모드 허용) |
 

@@ -509,6 +509,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `threads.list` | Thread/start-address/APC/stack evidence | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
 | `etw.integrity` | ETW logger/GetCpuClock integrity (InfinityHook) | (none) |
 | `nmi.list` | Enumerate registered NMI callbacks | `scope` |
+| `minifilter.list` | List filesystem minifilters and IRP registrations | `filter`, `name` |
 | `payload.inspect` | Trace one kernel address (page walk, big pool, PE, disasm) | `address`, `va`, `symbol` |
 | `payload.scan` | Sweep unbacked hook pointers and trace each unique target | `limit` |
 | `mapper.list` | Walk MmUnloadedDrivers, PiDDB, and ci hash leftovers | `scope`, `limit` |
@@ -551,7 +552,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 
 > `snapshot.capture`/`snapshot.diff` **do not write files to disk** on the MCP path (in-memory). Read the baseline via `kn://snapshot/current` or use `snapshot.show` for summary + structuredContent. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show`/`timeline.status`/`timeline.query`/`timeline.reconcile`/`graph.query` return structuredContent (JSON), and the remaining new tools return text content. `timeline.export` returns JSONL text in the MCP response and does not write a file. `ti.subscribe` is a read category, but because of the side effect of starting/stopping the ETW session, only start/stop require write mode (status is always available, the same data as `kn://ti/stats`).
 
-### 6.2 Write tools (10, `--allow-write` required)
+### 6.2 Write tools (11, `--allow-write` required)
 
 | Tool | Description | Required args | Optional args |
 |-----|------|-----------|-----------|
@@ -560,6 +561,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `memory.fill` | Fill a kernel range with a pattern | `address`, `length`, `pattern` | — |
 | `memory.move` | Copy a kernel range (src->dest) | `source`, `dest`, `length` | — |
 | `type.set_field` | Set a struct field at an address (setfield) | `address`, `type`, `field`, `value` | — |
+| `minifilter.set_irp` | Enable or disable a minifilter IRP pre/post handler (`irp=all` for every slot) | `filter`, `irp`, `action` | `which` (pre/post/both) |
 | `process.set_protection` | Set PS_PROTECTION on an arbitrary target (PPL/PP) | `level` (none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid` (unspecified=self) |
 | `ti.export` | Export the current Threat-Intelligence ETW ring to JSONL | `path` | — |
 | `ti.clear` | Clear the in-memory Threat-Intelligence ETW ring | — | — |
@@ -567,6 +569,8 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `dump.pe` | Reconstruct an on-disk PE image from memory | `address`, `path` | — |
 
 > **Caution — `process.set_protection` arbitrary target**: with `pid` you can raise the PPL/PP of an arbitrary process (e.g. promote a process to un-killable PP) or strip it (e.g. neutralize a PPL anti-cheat/AV). The driver IOCTL supports arbitrary targets (gated only by write-ack + write mode) and is for `--allow-write` lab mode only. Capturing a target-process baseline and a VM snapshot before the change is recommended. The response includes the before/after/requested bytes + the verification (readback) result.
+>
+> **`minifilter.set_irp`**: `irp` is a major name (`IRP_MJ_CREATE`, `CREATE`, `0x00`) or `all`. `irp=all` (or `action=disable-all`/`enable-all` with `irp=all`) walks every registered slot on that filter and returns `kn-live-dbg.minifilter-irp-batch.v1`. Enable restores only pointers saved in this session. Inbox names warn and are not blocked.
 
 ### 6.3 Resources (8)
 

@@ -18,6 +18,9 @@ Completed core slices:
 6. Leftover payload detectors: `!payload` hook-to-body trace, `!mapper`
    (`MmUnloadedDrivers` / PiDDB / ci hash), `!kpage` orphan executable
    kernel pages, and optional `!kpage /deep` PFN walk.
+7. Minifilter IRP control: `!minifilter` list/show plus session-backed
+   enable/disable of one filter IRP, or every registered slot
+   (`disable-all` / `irp=all`).
 
 Remaining priority order:
 

@@ -26,6 +26,7 @@
 #include "MemoryDumper.h"
 #include "CloakSession.h"
 #include "MinifilterAttachmentScanner.h"
+#include "MinifilterIrpScanner.h"
 #include "NativeDisassembler.h"
 #include "PoolPeHunter.h"
 #include "ProcessTriageScanner.h"
@@ -1792,6 +1793,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !payload        unbacked hook-target trace (translate/pool/PE/disasm)\n";
     std::wcout << L"  help !mapper         MmUnloadedDrivers / PiDDB / ci hash-bucket leftovers\n";
     std::wcout << L"  help !kpage          executable kernel pages outside loaded modules\n";
+    std::wcout << L"  help !minifilter     list minifilters and enable/disable IRP handlers\n";
     std::wcout << L"  --cloak              relaunch from a random EXE/service/device session\n";
     std::wcout << L"  ai help              AI question, config, plan, explain, run, and write commands\n";
     std::wcout << L"\n";
@@ -1813,6 +1815,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
     std::wcout << L"  hunting       !hunt | !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
     std::wcout << L"                !payload scan | !mapper | !kpage | !kpage /deep\n";
+    std::wcout << L"                !minifilter | !minifilter show <name> | !minifilter disable <name> all\n";
     std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
@@ -2140,6 +2143,8 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!securekernel" ||
         command == L"!etw" ||
         command == L"!nmi" ||
+        command == L"!minifilter" ||
+        command == L"!fltmgr" ||
         command == L"!payload" ||
         command == L"!mapper" ||
         command == L"!kpage" ||
@@ -4352,6 +4357,25 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     static const wchar_t* values[] = { L"/deep", L"/wx", L"/pe", L"/session", L"/nosession", L"/limit", L"/json" };
                     AddCompletionCandidates(&candidates, values);
                 }
+                else if (topic == L"!minifilter" || topic == L"!fltmgr")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"list",
+                        L"show",
+                        L"irp",
+                        L"disable",
+                        L"enable",
+                        L"disable-all",
+                        L"enable-all",
+                        L"all",
+                        L"/pre",
+                        L"/post",
+                        L"/both",
+                        L"/json"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
                 else if (topic == L"!fwtable")
                 {
                     AddFirmwareTableCompletionCandidates(&candidates, false);
@@ -4705,6 +4729,40 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"help"
             };
             AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!minifilter" || command == L"!fltmgr")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"list",
+                    L"show",
+                    L"irp",
+                    L"disable",
+                    L"enable",
+                    L"disable-all",
+                    L"enable-all",
+                    L"/json",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else
+            {
+                static const wchar_t* values[] =
+                {
+                    L"all",
+                    L"/pre",
+                    L"/post",
+                    L"/both",
+                    L"/json",
+                    L"IRP_MJ_CREATE",
+                    L"IRP_MJ_DIRECTORY_CONTROL",
+                    L"IRP_MJ_SET_INFORMATION"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"!fwtable")
         {
@@ -16296,6 +16354,458 @@ static void HandleKpageCommand(
     } while (false);
 }
 
+static void PrintMinifilterHelp()
+{
+    std::wcout << L"!minifilter command:\n";
+    std::wcout << L"  !minifilter [list] [/json <path>]\n";
+    std::wcout << L"  !minifilter show <name|address> [/json <path>]\n";
+    std::wcout << L"  !minifilter irp <name|address> <IRP_MJ_*> [/json <path>]\n";
+    std::wcout << L"  !minifilter disable <name|address> <IRP_MJ_*|all> [/pre|/post|/both]\n";
+    std::wcout << L"  !minifilter enable <name|address> <IRP_MJ_*|all> [/pre|/post|/both]\n";
+    std::wcout << L"  !minifilter disable-all <name|address> [/pre|/post|/both]\n";
+    std::wcout << L"  !minifilter enable-all <name|address> [/pre|/post|/both]\n";
+    std::wcout << L"  !fltmgr is an alias for !minifilter\n";
+    std::wcout << L"\n";
+    std::wcout << L"  Walks fltmgr!FltGlobals frames and FLT_FILTER.Operations (PDB layout).\n";
+    std::wcout << L"  list/show/irp are read-only. disable/enable write the PreOperation and/or\n";
+    std::wcout << L"  PostOperation pointers through the existing write IOCTL. disable saves the\n";
+    std::wcout << L"  original pointers in this session so enable can restore them.\n";
+    std::wcout << L"  disable <name> all and disable-all walk every registered slot; already-null\n";
+    std::wcout << L"  slots are skipped. enable-all restores every same-session backup.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /pre /post /both  which callback to change (default both).\n";
+    std::wcout << L"  /json <path>      write kn-live-dbg.minifilter.v1, minifilter-irp.v1, or minifilter-irp-batch.v1.\n";
+    std::wcout << L"\n";
+    std::wcout << L"  IRP majors accept IRP_MJ_CREATE, CREATE, directory_control, ioctl, 0x00, 0n12.\n";
+    std::wcout << L"  all / * / every / IRP_MJ_ALL / disable-all / enable-all apply to every slot.\n";
+    std::wcout << L"  Ambiguous filter names fail closed. Inbox names (WdFilter, FileInfo, ...) warn\n";
+    std::wcout << L"  but are not blocked. disable/enable/disable-all/enable-all require 'write on'.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !minifilter\n";
+    std::wcout << L"  !minifilter show UnionFS\n";
+    std::wcout << L"  !minifilter irp UnionFS IRP_MJ_CREATE\n";
+    std::wcout << L"  write on\n";
+    std::wcout << L"  !minifilter disable UnionFS CREATE\n";
+    std::wcout << L"  !minifilter disable UnionFS all\n";
+    std::wcout << L"  !minifilter disable-all UnionFS\n";
+    std::wcout << L"  !minifilter enable-all UnionFS\n";
+}
+
+static void PrintMinifilterSlot(const MinifilterIrpSlot& slot)
+{
+    PrintColoredText(L"[minifilter.irp]", KNDBG_COLOR_TITLE);
+    std::wcout << L" " << slot.MajorName
+               << L" mj=0x" << std::hex << slot.MajorFunction << std::dec
+               << L" slot=" << slot.Index
+               << L" entry=" << HexTextWidth(slot.Entry, 16, true);
+    if (slot.Disabled)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"DISABLED", KNDBG_COLOR_WARN);
+    }
+    std::wcout << L"\n";
+    std::wcout << L"  pre=" << HexTextWidth(slot.Pre, 16, true);
+    if (!slot.PreModule.empty())
+    {
+        std::wcout << L" module=";
+        PrintColoredText(slot.PreModule, KNDBG_COLOR_OK);
+    }
+    else if (slot.Pre != 0)
+    {
+        std::wcout << L" module=";
+        PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+    }
+    if (!slot.PreSymbol.empty())
+    {
+        std::wcout << L" symbol=" << slot.PreSymbol;
+    }
+    std::wcout << L"\n  post=" << HexTextWidth(slot.Post, 16, true);
+    if (!slot.PostModule.empty())
+    {
+        std::wcout << L" module=";
+        PrintColoredText(slot.PostModule, KNDBG_COLOR_OK);
+    }
+    else if (slot.Post != 0)
+    {
+        std::wcout << L" module=";
+        PrintColoredText(L"<non-image>", KNDBG_COLOR_WARN);
+    }
+    if (!slot.PostSymbol.empty())
+    {
+        std::wcout << L" symbol=" << slot.PostSymbol;
+    }
+    std::wcout << L"\n";
+}
+
+static void PrintMinifilterFilter(const MinifilterFilterRecord& filter, bool verboseSlots)
+{
+    PrintColoredText(L"[minifilter]", KNDBG_COLOR_TITLE);
+    std::wcout << L" " << (filter.Name.empty() ? L"<unnamed>" : filter.Name);
+    if (!filter.Altitude.empty())
+    {
+        std::wcout << L" altitude=" << filter.Altitude;
+    }
+    std::wcout << L" frame=" << filter.FrameId
+               << L" filter=" << HexTextWidth(filter.Filter, 16, true)
+               << L" ops=" << filter.ActiveOperationCount << L"/" << filter.OperationCount;
+    if (!filter.DriverModule.empty())
+    {
+        std::wcout << L" driver=";
+        PrintColoredText(filter.DriverModule, KNDBG_COLOR_OK);
+    }
+    if (filter.WellKnownInbox)
+    {
+        std::wcout << L" ";
+        PrintColoredText(L"inbox", KNDBG_COLOR_DIM);
+    }
+    std::wcout << L"\n";
+    if (!filter.Notes.empty())
+    {
+        std::wcout << L"  notes=" << filter.Notes << L"\n";
+    }
+    if (verboseSlots)
+    {
+        for (const MinifilterIrpSlot& slot : filter.OperationsTable)
+        {
+            PrintMinifilterSlot(slot);
+        }
+    }
+}
+
+static void HandleMinifilterCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!minifilter requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        if (HasHelpToken(args, 1))
+        {
+            PrintMinifilterHelp();
+            break;
+        }
+
+        std::wstring action = L"list";
+        size_t index = 1;
+        if (index < args.size() && !IsSwitchLikeToken(args[index]))
+        {
+            const std::wstring token = ToLower(args[index]);
+            if (token == L"list" ||
+                token == L"show" ||
+                token == L"irp" ||
+                token == L"disable" ||
+                token == L"enable" ||
+                token == L"disable-all" ||
+                token == L"enable-all" ||
+                token == L"status")
+            {
+                action = (token == L"status") ? L"irp" : token;
+                ++index;
+            }
+            else
+            {
+                action = L"show";
+            }
+        }
+
+        std::wstring specifier;
+        std::wstring irpText;
+        MinifilterIrpWhich which = MinifilterIrpWhich::Both;
+        std::wstring jsonPath;
+        bool parseOk = true;
+        while (index < args.size())
+        {
+            const std::wstring opt = ToLower(args[index]);
+            if (opt == L"/pre")
+            {
+                which = MinifilterIrpWhich::Pre;
+                ++index;
+                continue;
+            }
+            if (opt == L"/post")
+            {
+                which = MinifilterIrpWhich::Post;
+                ++index;
+                continue;
+            }
+            if (opt == L"/both")
+            {
+                which = MinifilterIrpWhich::Both;
+                ++index;
+                continue;
+            }
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!minifilter: /json requires a path\n";
+                    parseOk = false;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"!minifilter: unrecognised argument \"" << args[index] << L"\"\n";
+                parseOk = false;
+                break;
+            }
+            if (specifier.empty() && action != L"list")
+            {
+                specifier = args[index];
+                ++index;
+                continue;
+            }
+            if (irpText.empty() &&
+                (action == L"irp" ||
+                 action == L"disable" ||
+                 action == L"enable"))
+            {
+                irpText = args[index];
+                ++index;
+                continue;
+            }
+            std::wcerr << L"!minifilter: unexpected extra argument \"" << args[index] << L"\"\n";
+            parseOk = false;
+            break;
+        }
+        if (!parseOk)
+        {
+            break;
+        }
+
+        if (action != L"list" && specifier.empty())
+        {
+            const bool needsIrp =
+                action == L"irp" || action == L"disable" || action == L"enable";
+            std::wcerr << L"usage: !minifilter " << action << L" <name|address>"
+                       << (needsIrp ? L" <IRP_MJ_*|all>" : L"") << L"\n";
+            PrintMinifilterHelp();
+            break;
+        }
+
+        MinifilterIrpScanner scanner(device, symbols);
+        MinifilterIrpScanResult scan = {};
+        std::wstring error;
+
+        if (action == L"list")
+        {
+            if (!scanner.Scan(&scan, &error))
+            {
+                std::wcerr << L"!minifilter failed: " << error << L"\n";
+                break;
+            }
+            const std::wstring json = BuildMinifilterIrpJson(scan);
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = json;
+            }
+            if (!jsonPath.empty())
+            {
+                std::wstring writeError;
+                if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+                {
+                    std::wcerr << L"!minifilter: failed to write JSON: " << writeError << L"\n";
+                }
+            }
+            for (const std::wstring& warning : scan.Warnings)
+            {
+                std::wcerr << L"!minifilter warning: " << warning << L"\n";
+            }
+            for (const std::wstring& note : scan.CoverageNotes)
+            {
+                std::wcerr << L"!minifilter coverage: " << note << L"\n";
+            }
+            PrintColoredText(L"minifilter", KNDBG_COLOR_TITLE);
+            std::wcout << L" filters=" << scan.Filters.size()
+                       << L" globals=" << scan.FltGlobalsSymbol
+                       << L" complete=" << (scan.CoverageComplete ? L"yes" : L"no") << L"\n";
+            for (const MinifilterFilterRecord& filter : scan.Filters)
+            {
+                PrintMinifilterFilter(filter, false);
+            }
+            break;
+        }
+
+        if (action == L"show")
+        {
+            MinifilterFilterRecord filter = {};
+            if (!scanner.Show(specifier, &filter, &scan, &error))
+            {
+                std::wcerr << L"!minifilter failed: " << error << L"\n";
+                break;
+            }
+            const std::wstring json = BuildMinifilterIrpJson(scan);
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = json;
+            }
+            if (!jsonPath.empty())
+            {
+                std::wstring writeError;
+                if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+                {
+                    std::wcerr << L"!minifilter: failed to write JSON: " << writeError << L"\n";
+                }
+            }
+            PrintMinifilterFilter(filter, true);
+            break;
+        }
+
+        MinifilterIrpAction irpAction = MinifilterIrpAction::Status;
+        bool allSlots = false;
+        if (action == L"disable-all")
+        {
+            irpAction = MinifilterIrpAction::Disable;
+            allSlots = true;
+            action = L"disable";
+        }
+        else if (action == L"enable-all")
+        {
+            irpAction = MinifilterIrpAction::Enable;
+            allSlots = true;
+            action = L"enable";
+        }
+        else if (action == L"disable")
+        {
+            irpAction = MinifilterIrpAction::Disable;
+        }
+        else if (action == L"enable")
+        {
+            irpAction = MinifilterIrpAction::Enable;
+        }
+
+        if (!allSlots && !irpText.empty() && IsMinifilterIrpAllToken(irpText))
+        {
+            allSlots = true;
+        }
+
+        if (allSlots)
+        {
+            if (irpAction != MinifilterIrpAction::Disable &&
+                irpAction != MinifilterIrpAction::Enable)
+            {
+                std::wcerr << L"!minifilter: all is only valid for disable/enable\n";
+                break;
+            }
+
+            MinifilterIrpBatchResult batch = {};
+            if (!scanner.SetAllIrps(specifier, irpAction, which, &batch, &scan, &error))
+            {
+                std::wcerr << L"!minifilter failed: " << error << L"\n";
+                break;
+            }
+
+            const std::wstring json = BuildMinifilterIrpBatchJson(batch);
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = json;
+            }
+            if (!jsonPath.empty())
+            {
+                std::wstring writeError;
+                if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+                {
+                    std::wcerr << L"!minifilter: failed to write JSON: " << writeError << L"\n";
+                }
+            }
+
+            if (batch.WellKnownInbox)
+            {
+                std::wcerr << L"!minifilter warning: " << batch.FilterName
+                           << L" looks like an inbox filter\n";
+            }
+            for (const std::wstring& failure : batch.Failures)
+            {
+                std::wcerr << L"!minifilter warning: " << failure << L"\n";
+            }
+
+            PrintColoredText(L"minifilter.change", KNDBG_COLOR_TITLE);
+            std::wcout << L" " << (batch.FilterName.empty() ? L"<unnamed>" : batch.FilterName)
+                       << L" ALL action=" << action
+                       << L" changed=" << batch.Changed
+                       << L" skipped=" << batch.Skipped
+                       << L" failed=" << batch.Failed
+                       << L" attempted=" << batch.Attempted << L"\n";
+            for (const MinifilterIrpChange& change : batch.Changes)
+            {
+                if (!change.PreChanged && !change.PostChanged)
+                {
+                    continue;
+                }
+                std::wcout << L"  " << change.Before.MajorName
+                           << L" pre " << HexTextWidth(change.Before.Pre, 16, true)
+                           << L" -> " << HexTextWidth(change.After.Pre, 16, true)
+                           << L" post " << HexTextWidth(change.Before.Post, 16, true)
+                           << L" -> " << HexTextWidth(change.After.Post, 16, true)
+                           << L" ";
+                PrintColoredText(L"UPDATED", KNDBG_COLOR_WARN);
+                std::wcout << L"\n";
+            }
+            break;
+        }
+
+        uint32_t major = 0;
+        if (irpText.empty() || !ParseMinifilterIrpMajor(irpText, &major, &error))
+        {
+            std::wcerr << L"!minifilter: " << (error.empty() ? L"IRP major required (or all)" : error) << L"\n";
+            break;
+        }
+
+        MinifilterIrpChange change = {};
+        if (!scanner.SetIrp(specifier, major, irpAction, which, &change, &scan, &error))
+        {
+            std::wcerr << L"!minifilter failed: " << error << L"\n";
+            break;
+        }
+
+        const std::wstring json = BuildMinifilterIrpChangeJson(change);
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = json;
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+            {
+                std::wcerr << L"!minifilter: failed to write JSON: " << writeError << L"\n";
+            }
+        }
+
+        if (change.WellKnownInbox && irpAction != MinifilterIrpAction::Status)
+        {
+            std::wcerr << L"!minifilter warning: " << change.FilterName
+                       << L" looks like an inbox filter\n";
+        }
+
+        PrintColoredText(L"minifilter.change", KNDBG_COLOR_TITLE);
+        std::wcout << L" " << (change.FilterName.empty() ? L"<unnamed>" : change.FilterName)
+                   << L" " << change.Before.MajorName
+                   << L" action=" << action << L"\n";
+        std::wcout << L"  before pre=" << HexTextWidth(change.Before.Pre, 16, true)
+                   << L" post=" << HexTextWidth(change.Before.Post, 16, true) << L"\n";
+        std::wcout << L"  after  pre=" << HexTextWidth(change.After.Pre, 16, true)
+                   << L" post=" << HexTextWidth(change.After.Post, 16, true);
+        if (change.PreChanged || change.PostChanged)
+        {
+            std::wcout << L" ";
+            PrintColoredText(L"UPDATED", KNDBG_COLOR_WARN);
+        }
+        std::wcout << L"\n";
+    } while (false);
+}
+
 static void PrintMsrCheckHelp()
 {
     std::wcout << L"!msrcheck command:\n";
@@ -26166,6 +26676,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintKpageHelp();
         }
+        else if (command == L"!minifilter" || command == L"!fltmgr")
+        {
+            PrintMinifilterHelp();
+        }
         else if (command == L"!msrcheck")
         {
             PrintMsrCheckHelp();
@@ -26991,6 +27505,22 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"!kpage"}, L"/wx", L"kpage-wx-completion");
         CheckCompletionCandidate(&context, {L"help", L"!payload"}, L"scan", L"help-payload-scan-completion");
         CheckCompletionCandidate(&context, {L"help", L"!kpage"}, L"/deep", L"help-kpage-deep-completion");
+        CheckCompletionCandidate(&context, {}, L"!minifilter", L"minifilter-root-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!minifilter", L"help-minifilter-completion");
+        CheckCompletionCandidate(&context, {L"!minifilter"}, L"disable", L"minifilter-disable-completion");
+        CheckCompletionCandidate(&context, {L"!minifilter"}, L"disable-all", L"minifilter-disable-all-completion");
+        CheckCompletionCandidate(&context, {L"!minifilter"}, L"enable-all", L"minifilter-enable-all-completion");
+        CheckCompletionCandidate(&context, {L"!minifilter", L"disable"}, L"IRP_MJ_CREATE", L"minifilter-create-completion");
+        CheckCompletionCandidate(&context, {L"!minifilter", L"disable"}, L"all", L"minifilter-all-irp-completion");
+        CheckCompletionCandidate(&context, {L"!fltmgr"}, L"disable-all", L"fltmgr-disable-all-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!minifilter"}, L"disable-all", L"help-minifilter-disable-all-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!minifilter"}, L"all", L"help-minifilter-all-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IsNativeOwnedCommand(L"!minifilter") &&
+                IsNativeOwnedCommand(L"!fltmgr") &&
+                MinifilterIrpScannerSelfTest(),
+            L"minifilter-command-native-and-self-test");
         CheckConsoleSurfaceSelfTest(
             &context,
             IsNativeOwnedCommand(L"!payload") &&
@@ -27078,6 +27608,19 @@ static int RunConsoleSurfaceSelfTest()
                     rootHelp.find(L"help !kpage") != std::wstring::npos &&
                     rootHelp.find(L"!payload scan") != std::wstring::npos,
                 L"help-root-lists-leftover-commands");
+            const std::wstring minifilterHelp = CaptureDetailedHelpOutput({L"help", L"!minifilter"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                minifilterHelp.find(L"disable") != std::wstring::npos &&
+                    minifilterHelp.find(L"disable-all") != std::wstring::npos &&
+                    minifilterHelp.find(L"enable-all") != std::wstring::npos &&
+                    minifilterHelp.find(L"IRP_MJ_CREATE") != std::wstring::npos &&
+                    minifilterHelp.find(L"disable UnionFS all") != std::wstring::npos &&
+                    minifilterHelp.find(L"disable-all UnionFS") != std::wstring::npos &&
+                    minifilterHelp.find(L"minifilter-irp-batch.v1") != std::wstring::npos &&
+                    rootHelp.find(L"help !minifilter") != std::wstring::npos &&
+                    rootHelp.find(L"disable <name> all") != std::wstring::npos,
+                L"minifilter-help-routes");
         }
 
         {
@@ -28933,6 +29476,15 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             break;
         }
 
+        if ((command == L"!minifilter" || command == L"!fltmgr") && args.size() >= 2)
+        {
+            if (IsMinifilterWriteAction(args[1]))
+            {
+                writeLike = true;
+            }
+            break;
+        }
+
         if (command == L"!ti" && args.size() >= 2)
         {
             std::wstring action = ToLower(args[1]);
@@ -29165,6 +29717,12 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
             if (command == L"!nmi")
             {
                 commandClass = L"nmi";
+                break;
+            }
+
+            if (command == L"!minifilter" || command == L"!fltmgr")
+            {
+                commandClass = L"minifilter";
                 break;
             }
 
@@ -30498,6 +31056,23 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
+        else if (command == L"!minifilter" || command == L"!fltmgr")
+        {
+            if (args.size() >= 2 &&
+                !IsSwitchLikeToken(args[1]) &&
+                ToLower(args[1]) != L"list" &&
+                ToLower(args[1]) != L"show" &&
+                ToLower(args[1]) != L"irp" &&
+                ToLower(args[1]) != L"disable" &&
+                ToLower(args[1]) != L"enable" &&
+                ToLower(args[1]) != L"disable-all" &&
+                ToLower(args[1]) != L"enable-all" &&
+                ToLower(args[1]) != L"status" &&
+                !IsHelpToken(args[1]))
+            {
+                // Bare !minifilter <name> is show.
+            }
+        }
         else if (command == L"!fwtable")
         {
             if (!ValidateFirmwareTableCommandArgumentShape(args, reason))
@@ -31681,6 +32256,43 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             else
             {
                 plan.Warning = L"unrecognized !timeline write-like action";
+            }
+        }
+        else if (command == L"!minifilter" || command == L"!fltmgr")
+        {
+            const std::wstring action = commandArgs.size() >= 2 ? ToLower(commandArgs[1]) : L"";
+            plan.TargetKind = L"minifilter-irp";
+            plan.Target = commandLine;
+            plan.ByteCountText = L"8";
+            std::wstring specifier;
+            if (commandArgs.size() >= 3)
+            {
+                specifier = commandArgs[2];
+            }
+            if (!specifier.empty())
+            {
+                plan.BackupCommand = L"!minifilter show " + specifier;
+                plan.VerifyCommand = plan.BackupCommand;
+            }
+            const bool allSlots =
+                action == L"disable-all" ||
+                action == L"enable-all" ||
+                (commandArgs.size() >= 4 && IsMinifilterIrpAllToken(commandArgs[3]));
+            if (action == L"disable" || action == L"disable-all")
+            {
+                plan.Warning = allSlots
+                    ? L"nulls every registered Pre/Post on the filter; originals stay in this session for enable-all"
+                    : L"nulls the selected FLT_OPERATION_REGISTRATION Pre/Post; enable restores the same-session backup";
+            }
+            else if (action == L"enable" || action == L"enable-all")
+            {
+                plan.Warning = allSlots
+                    ? L"restores every same-session backup for that filter; slots never disabled in this session are skipped"
+                    : L"restores the same-session Pre/Post backup; fails if this session never disabled that IRP";
+            }
+            else
+            {
+                plan.Warning = L"unrecognized !minifilter write-like action";
             }
         }
         else
@@ -37532,6 +38144,7 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"etw.providers" ||
         tool == L"etw.ti_cross" ||
         tool == L"nmi.list" ||
+        tool == L"minifilter.list" ||
         tool == L"payload.inspect" ||
         tool == L"payload.scan" ||
         tool == L"mapper.list" ||
@@ -37657,6 +38270,10 @@ static bool ValidateAiCapabilityToolArgKeys(
     else if (tool == L"nmi.list")
     {
         allowed = {L"scope"};
+    }
+    else if (tool == L"minifilter.list")
+    {
+        allowed = {L"filter", L"name"};
     }
     else if (tool == L"payload.inspect")
     {
@@ -37931,7 +38548,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
     stream << L"Schema:\n";
     stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|etw.providers|etw.ti_cross|nmi.list|payload.inspect|payload.scan|mapper.list|kpage.list|hal.scan|hive.list|token.inspect|dpc.list|timer.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
+    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|etw.providers|etw.ti_cross|nmi.list|minifilter.list|payload.inspect|payload.scan|mapper.list|kpage.list|hal.scan|hive.list|token.inspect|dpc.list|timer.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
     stream << L"]}\n";
     stream << L"Available tools:\n";
     stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
@@ -37947,6 +38564,7 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- etw.providers: heuristic ETW provider registration surface and enable-callback ownership. Args: {}.\n";
     stream << L"- etw.ti_cross: correlate active Threat-Intelligence subscription reception with silence/drop signals. Args: {}.\n";
     stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
+    stream << L"- minifilter.list: list filesystem minifilters and IRP registrations. Optional filter/name string selects one filter.\n";
     stream << L"- payload.inspect: trace one kernel address through translation, big pool, PE, and disassembly. Args: address/va/symbol.\n";
     stream << L"- payload.scan: collect unbacked hook pointers and trace them. Args: optional limit.\n";
     stream << L"- mapper.list: walk MmUnloadedDrivers, PiDDB, and ci hash leftovers. Args: optional scope all|unloaded|piddb|cihash, limit.\n";
@@ -39469,6 +40087,50 @@ static bool ExecuteAiCapabilityNmiList(
         std::wcout << L": nmi.list\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
         HandleNmiCommand(args, device, symbols, structuredJsonOut);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExecuteAiCapabilityMinifilterList(
+    const AiCapabilityStep& step,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* error,
+    std::wstring* structuredJsonOut)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"minifilter.list requires the KnLiveDbg.sys driver device to be open";
+            }
+            break;
+        }
+
+        std::wstring filter;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"filter", L"name"}, &filter);
+        std::vector<std::wstring> args;
+        args.push_back(L"!minifilter");
+        if (!filter.empty())
+        {
+            if (!ValidateAiCapabilityScalarText(filter, L"filter", error))
+            {
+                break;
+            }
+            args.push_back(L"show");
+            args.push_back(filter);
+        }
+
+        PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
+        std::wcout << L": minifilter.list\n";
+        std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
+        HandleMinifilterCommand(args, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -42457,6 +43119,10 @@ static bool ExecuteAiCapabilityPlan(
             {
                 stepOk = ExecuteAiCapabilityNmiList(step, device, symbols, error, structuredJsonOut);
             }
+            else if (step.Tool == L"minifilter.list")
+            {
+                stepOk = ExecuteAiCapabilityMinifilterList(step, device, symbols, error, structuredJsonOut);
+            }
             else if (step.Tool == L"payload.inspect")
             {
                 stepOk = ExecuteAiCapabilityPayloadInspect(step, state, device, symbols, error, structuredJsonOut);
@@ -43933,6 +44599,10 @@ static bool HandleCommand(
         {
             HandleKpageCommand(args, device, symbols);
         }
+        else if (command == L"!minifilter" || command == L"!fltmgr")
+        {
+            HandleMinifilterCommand(args, device, symbols);
+        }
         else if (command == L"!msrcheck")
         {
             HandleMsrCheckCommand(args, device, symbols);
@@ -44656,6 +45326,60 @@ static McpEngineResult DispatchMcpWriteTool(
                 break;
             }
             command = L"setfield " + type + L" " + address + L" " + field + L" " + value;
+        }
+        else if (tool == L"minifilter.set_irp")
+        {
+            std::wstring filter;
+            std::wstring irp;
+            std::wstring action;
+            std::wstring which;
+            if (!McpGetArg(argsJson, L"filter", &filter) ||
+                !McpGetArg(argsJson, L"irp", &irp) ||
+                !McpGetArg(argsJson, L"action", &action))
+            {
+                result.IsError = true;
+                result.Text = L"minifilter.set_irp requires 'filter', 'irp', 'action'";
+                break;
+            }
+            McpGetArg(argsJson, L"which", &which);
+            if (!McpValidateToken(filter, &argError) ||
+                !McpValidateToken(irp, &argError) ||
+                !McpValidateToken(action, &argError))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            action = ToLower(action);
+            if (action == L"disable-all" || action == L"enable-all")
+            {
+                if (!IsMinifilterIrpAllToken(irp))
+                {
+                    result.IsError = true;
+                    result.Text = L"minifilter.set_irp " + action + L" requires irp=all";
+                    break;
+                }
+                action = (action == L"disable-all") ? L"disable" : L"enable";
+                irp = L"all";
+            }
+            if (action != L"enable" && action != L"disable")
+            {
+                result.IsError = true;
+                result.Text = L"minifilter.set_irp action must be enable, disable, enable-all, or disable-all";
+                break;
+            }
+            which = ToLower(which);
+            command = L"!minifilter " + action + L" " + filter + L" " + irp;
+            if (which == L"pre" || which == L"post" || which == L"both")
+            {
+                command += L" /" + which;
+            }
+            else if (!which.empty())
+            {
+                result.IsError = true;
+                result.Text = L"minifilter.set_irp which must be pre, post, or both";
+                break;
+            }
         }
         else if (tool == L"process.set_protection")
         {

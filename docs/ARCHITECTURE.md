@@ -248,6 +248,13 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 7. Snapshots store `leftover-mapper` only. `!kpage` and `!payload scan` stay operator commands: a kernel page-table walk is too expensive for every baseline, and hook surfaces are already captured in their own domains.
 8. MCP/AI tools are `payload.inspect`, `payload.scan`, `mapper.list`, and `kpage.list`. `kpage.list` must not set `deep=true` unless the operator asks for a PFN walk.
 
+## Minifilter IRP Control Flow
+
+1. `!minifilter` (`MinifilterIrpScanner`) resolves `fltmgr!FltGlobals` and PDB layouts for `_GLOBALS`, `_FLTP_FRAME`, `_FLT_FILTER`, `_FLT_OBJECT`, `_FLT_RESOURCE_LIST_HEAD`, and `_FLT_OPERATION_REGISTRATION`. Missing symbols or an implausible operation-entry size fail closed.
+2. Frame and filter lists are walked with cycle guards. Each filter records name, altitude, driver, and every `Operations` slot until `IRP_MJ_OPERATION_END`, including already-null pre/post slots so a disabled handler remains visible.
+3. `disable`/`enable` write only the selected `PreOperation`/`PostOperation` pointer through `IOCTL_KNDBG_WRITE_VIRTUAL`. The driver write gate must be on. Original pointers are saved in-process so `enable` can restore them in the same session. The slot is read back after each write. `disable-all` / `disable <name> all` walk every registered slot, skip already-null handlers, and keep going if a later slot fails; the batch fails closed only when nothing changed and at least one write failed. `enable-all` fails closed when this session has no backup for that filter.
+4. `minifilter.list` is the read-only MCP/AI tool. `minifilter.set_irp` is write-gated and is not on the AI planner catalog. `irp=all` uses the same batch path.
+
 ## Module And Driver Integrity Flow
 
 1. `IntegrityScanner` is a user-mode scanner layered on the existing `DeviceClient` and `SymbolEngine`; no new kernel IOCTLs or driver-side parsers are added.

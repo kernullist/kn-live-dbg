@@ -565,6 +565,8 @@ Added kernel anti-cheat detections not in the initial catalog (the 18 tools used
 | `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | args limit |
 | `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | args scope/limit |
 | `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | args deep/wx/pe/limit; deep is not default |
+| `minifilter.list` | `!minifilter` | `BuildMinifilterIrpJson` (`.minifilter.v1`) | args filter/name |
+| `minifilter.set_irp` | `!minifilter disable/enable` | `BuildMinifilterIrpChangeJson` (`.minifilter-irp.v1`) or `BuildMinifilterIrpBatchJson` (`.minifilter-irp-batch.v1`) | WRITE; action enable/disable; `irp=all` batches |
 | `hunt.run` | `!hunt` | `BuildHuntJson` (existing) | args mode (quick/deep); `/summary` forced |
 | `snapshot.capture` | `!snapshot baseline` | `BuildSnapshotJson` (existing) | args name; baseline file write (not a kernel write -> allowed in read-only mode) |
 

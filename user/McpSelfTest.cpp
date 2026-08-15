@@ -330,6 +330,7 @@ int RunMcpToolCatalogSelfTest()
         CheckReadOnlyTool(&context, L"hive.list", {});
         CheckReadOnlyTool(&context, L"dpc.list", {});
         CheckReadOnlyTool(&context, L"timer.list", {});
+        CheckReadOnlyTool(&context, L"minifilter.list", {L"filter", L"name"});
         CheckReadOnlyTool(
             &context,
             L"payload.inspect",
