@@ -16,6 +16,7 @@ namespace
     constexpr uint32_t kIrpMjOperationEnd = 0x80;
     constexpr uint32_t kMaxFrames = 32;
     constexpr uint32_t kMaxFilters = 512;
+    constexpr uint32_t kMaxInstances = 2048;
     constexpr uint32_t kMaxOperations = 256;
 
     struct MinifilterLayout
@@ -38,8 +39,31 @@ namespace
         uint32_t OperationPost = 0;
         uint32_t OperationSize = 0;
         uint32_t DriverStart = 0;
+        uint32_t FilterInstanceList = 0;
+        uint32_t InstanceFilterLink = 0;
+        uint32_t InstanceFilter = 0;
+        uint32_t InstanceCallbackNodes = 0;
+        uint32_t CallbackNodePre = 0x18;
+        uint32_t CallbackNodePost = 0x20;
+        uint32_t CallbackNodeInstance = 0x10;
+        uint32_t CallbackNodeSize = 0x28;
+        uint32_t CallbackNodeCount = 50;
+        bool CallbackNodesArePointers = true;
         bool HasDriverStart = false;
+        bool HasLiveCallbackLayout = false;
     };
+
+    bool CollectFilterInstances(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t filter,
+        std::vector<uint64_t>* instances,
+        std::wstring* error);
+    uint32_t CountLiveCallbackNodes(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        const std::vector<uint64_t>& instances);
+    void InferCallbackNodeArray(SymbolEngine& symbols, MinifilterLayout* layout);
 
     struct IrpBackupKey
     {
@@ -56,6 +80,17 @@ namespace
         return left.MajorFunction < right.MajorFunction;
     }
 
+    struct LiveNodeBackup
+    {
+        uint64_t Filter = 0;
+        uint64_t Node = 0;
+        uint64_t PreAddr = 0;
+        uint64_t PostAddr = 0;
+        uint64_t Pre = 0;
+        uint64_t Post = 0;
+        uint32_t MajorFunction = 0xffffffffu;
+    };
+
     struct IrpBackupValue
     {
         uint64_t Pre = 0;
@@ -65,6 +100,43 @@ namespace
 
     std::mutex g_BackupLock;
     std::map<IrpBackupKey, IrpBackupValue> g_Backups;
+    std::map<uint64_t, LiveNodeBackup> g_NodeBackups;
+
+    uint32_t CountNodeBackupsForFilter(uint64_t filter)
+    {
+        uint32_t count = 0;
+        std::lock_guard<std::mutex> guard(g_BackupLock);
+        for (const auto& entry : g_NodeBackups)
+        {
+            if (entry.second.Filter == filter &&
+                (entry.second.Pre != 0 || entry.second.Post != 0))
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    constexpr uint32_t kIrpMjMaximumFunction = 0x1b;
+    constexpr uint32_t kSweepMajor = 0xffffffffu;
+
+    uint32_t CallbackIndexFromMajor(uint32_t major)
+    {
+        uint32_t index = 0xffffffffu;
+        if (major <= kIrpMjMaximumFunction)
+        {
+            index = major;
+        }
+        else if (major > kIrpMjMaximumFunction && major <= 0xffu)
+        {
+            // FltMgr stores UCHAR-negative FS-filter / FastIO majors
+            // after the 0x00-0x1B IRP slots. 0xFF -> 0x1C.
+            const uint8_t inverted = static_cast<uint8_t>(~static_cast<uint8_t>(major));
+            index = kIrpMjMaximumFunction + 1u + inverted;
+        }
+
+        return index;
+    }
 
     std::wstring ToLowerCopy(const std::wstring& value)
     {
@@ -139,6 +211,97 @@ namespace
             }
         } while (false);
         return ok;
+    }
+
+    void InferCallbackNodeArray(SymbolEngine& symbols, MinifilterLayout* layout)
+    {
+        do
+        {
+            if (layout == nullptr)
+            {
+                break;
+            }
+
+            TypeLayoutInfo instanceLayout = {};
+            std::wstring ignored;
+            if (!symbols.GetTypeLayout(L"fltmgr!_FLT_INSTANCE", &instanceLayout, &ignored) &&
+                !symbols.GetTypeLayout(L"_FLT_INSTANCE", &instanceLayout, &ignored))
+            {
+                break;
+            }
+
+            const TypeFieldInfo* nodesField = nullptr;
+            for (const TypeFieldInfo& field : instanceLayout.Fields)
+            {
+                if (field.Name == L"CallbackNodes" || field.Name == L"CallbackNode")
+                {
+                    nodesField = &field;
+                    layout->InstanceCallbackNodes = field.Offset;
+                    break;
+                }
+            }
+            if (nodesField == nullptr)
+            {
+                break;
+            }
+
+            // SymbolEngine reports the element size for array fields. Use the
+            // gap to the next FLT_INSTANCE field as the real array bytes.
+            uint32_t nextOffset = 0;
+            bool haveNext = false;
+            for (const TypeFieldInfo& field : instanceLayout.Fields)
+            {
+                if (field.Offset > nodesField->Offset &&
+                    (!haveNext || field.Offset < nextOffset))
+                {
+                    nextOffset = field.Offset;
+                    haveNext = true;
+                }
+            }
+
+            uint64_t arrayBytes = 0;
+            if (haveNext)
+            {
+                arrayBytes = static_cast<uint64_t>(nextOffset) - nodesField->Offset;
+            }
+            else if (instanceLayout.Size > nodesField->Offset)
+            {
+                arrayBytes = instanceLayout.Size - nodesField->Offset;
+            }
+            if (arrayBytes < 16 * sizeof(uint64_t))
+            {
+                break;
+            }
+
+            TypeLayoutInfo nodeLayout = {};
+            const bool haveNodeType =
+                symbols.GetTypeLayout(L"fltmgr!_CALLBACK_NODE", &nodeLayout, &ignored) ||
+                symbols.GetTypeLayout(L"_CALLBACK_NODE", &nodeLayout, &ignored);
+            if (haveNodeType &&
+                nodeLayout.Size >= 24 &&
+                arrayBytes >= nodeLayout.Size &&
+                (arrayBytes % nodeLayout.Size) == 0)
+            {
+                const uint32_t count = static_cast<uint32_t>(arrayBytes / nodeLayout.Size);
+                if (count >= 16 && count <= 64)
+                {
+                    layout->CallbackNodesArePointers = false;
+                    layout->CallbackNodeCount = count;
+                    layout->CallbackNodeSize = static_cast<uint32_t>(nodeLayout.Size);
+                    break;
+                }
+            }
+
+            if ((arrayBytes % sizeof(uint64_t)) == 0)
+            {
+                const uint32_t count = static_cast<uint32_t>(arrayBytes / sizeof(uint64_t));
+                if (count >= 16 && count <= 64)
+                {
+                    layout->CallbackNodesArePointers = true;
+                    layout->CallbackNodeCount = count;
+                }
+            }
+        } while (false);
     }
 
     bool BuildLayout(SymbolEngine& symbols, MinifilterLayout* layout, std::wstring* error)
@@ -226,6 +389,87 @@ namespace
                 layout->DriverStart = driverStart.Offset;
                 layout->HasDriverStart = true;
             }
+
+            const std::wstring instanceTypes[] = { L"fltmgr!_FLT_INSTANCE", L"_FLT_INSTANCE" };
+            const std::wstring instanceListNames[] = { L"InstanceList" };
+            const std::wstring filterLinkNames[] = { L"FilterLink", L"FilterList" };
+            const std::wstring instanceFilterNames[] = { L"Filter" };
+            FindFieldOffset(
+                symbols,
+                filterTypes,
+                2,
+                instanceListNames,
+                1,
+                &layout->FilterInstanceList,
+                &ignored);
+
+            TypeFieldInfo instanceBase = {};
+            uint32_t instanceBaseOffset = 0;
+            if (symbols.FindField(L"fltmgr!_FLT_INSTANCE", L"Base", &instanceBase, &ignored) ||
+                symbols.FindField(L"_FLT_INSTANCE", L"Base", &instanceBase, &ignored))
+            {
+                instanceBaseOffset = instanceBase.Offset;
+            }
+            layout->InstanceFilterLink = instanceBaseOffset + layout->ObjectPrimaryLink;
+            FindFieldOffset(
+                symbols,
+                instanceTypes,
+                2,
+                filterLinkNames,
+                2,
+                &layout->InstanceFilterLink,
+                &ignored);
+            FindFieldOffset(
+                symbols,
+                instanceTypes,
+                2,
+                instanceFilterNames,
+                1,
+                &layout->InstanceFilter,
+                &ignored);
+
+            InferCallbackNodeArray(symbols, layout);
+
+            const std::wstring callbackTypes[] =
+            {
+                L"fltmgr!_CALLBACK_NODE",
+                L"_CALLBACK_NODE"
+            };
+            const std::wstring callbackPreNames[] = { L"PreOperation", L"Pre" };
+            const std::wstring callbackPostNames[] = { L"PostOperation", L"Post" };
+            const std::wstring callbackInstanceNames[] = { L"Instance" };
+            FindFieldOffset(
+                symbols,
+                callbackTypes,
+                2,
+                callbackPreNames,
+                2,
+                &layout->CallbackNodePre,
+                &ignored);
+            FindFieldOffset(
+                symbols,
+                callbackTypes,
+                2,
+                callbackPostNames,
+                2,
+                &layout->CallbackNodePost,
+                &ignored);
+            FindFieldOffset(
+                symbols,
+                callbackTypes,
+                2,
+                callbackInstanceNames,
+                1,
+                &layout->CallbackNodeInstance,
+                &ignored);
+
+            layout->HasLiveCallbackLayout =
+                layout->FilterInstanceList != 0 &&
+                layout->InstanceCallbackNodes != 0 &&
+                layout->InstanceFilterLink != 0 &&
+                layout->InstanceFilter != 0 &&
+                layout->CallbackNodeCount != 0 &&
+                layout->CallbackNodePre != layout->CallbackNodePost;
 
             ok = true;
         } while (false);
@@ -618,6 +862,36 @@ namespace
                         LeftoverAppendNote(&filter.Notes, L"well-known inbox filter");
                     }
                     ReadFilterOperations(device, symbols, layout, &filter);
+                    filter.LiveLayoutAvailable = layout.HasLiveCallbackLayout;
+                    if (layout.HasLiveCallbackLayout)
+                    {
+                        std::vector<uint64_t> instances;
+                        std::wstring instanceError;
+                        if (CollectFilterInstances(
+                                device,
+                                layout,
+                                filterAddress,
+                                &instances,
+                                &instanceError))
+                        {
+                            filter.InstanceCount = static_cast<uint32_t>(instances.size());
+                            filter.LiveCallbackCount = CountLiveCallbackNodes(
+                                device,
+                                layout,
+                                instances);
+                            if (filter.ActiveOperationCount == 0 &&
+                                filter.LiveCallbackCount > 0)
+                            {
+                                LeftoverAppendNote(
+                                    &filter.Notes,
+                                    L"Operations table is empty but live CallbackNodes still fire");
+                            }
+                        }
+                        else if (!instanceError.empty())
+                        {
+                            LeftoverAppendNote(&filter.Notes, instanceError);
+                        }
+                    }
                     result->Filters.push_back(filter);
                     filterLink = nextFilter;
                 }
@@ -781,6 +1055,667 @@ namespace
         }
         return enabled;
     }
+
+    bool CollectFilterInstances(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t filter,
+        std::vector<uint64_t>* instances,
+        std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            if (instances == nullptr)
+            {
+                break;
+            }
+            instances->clear();
+            if (!layout.HasLiveCallbackLayout)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"PDB is missing FLT_INSTANCE.CallbackNodes; "
+                             L"writing FLT_FILTER.Operations does not stop live FltMgr dispatch";
+                }
+                break;
+            }
+
+            uint64_t listField = 0;
+            uint64_t head = 0;
+            if (!LeftoverTryAdd(filter, layout.FilterInstanceList, &listField) ||
+                !LeftoverTryAdd(listField, layout.ResourceList, &head))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"FLT_FILTER.InstanceList address overflow";
+                }
+                break;
+            }
+
+            uint64_t flink = 0;
+            uint64_t blink = 0;
+            if (!ReadListEntry(device, head, &flink, &blink))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"failed to read FLT_FILTER.InstanceList";
+                }
+                break;
+            }
+
+            std::set<uint64_t> seen;
+            uint64_t link = flink;
+            bool recoveredAny = false;
+            for (uint32_t index = 0;
+                 index < kMaxInstances && link != 0 && link != head;
+                 ++index)
+            {
+                if (!LeftoverIsKernelCanonical(link) || !seen.insert(link).second)
+                {
+                    break;
+                }
+
+                uint64_t next = 0;
+                uint64_t ignoredBlink = 0;
+                if (!ReadListEntry(device, link, &next, &ignoredBlink))
+                {
+                    break;
+                }
+
+                if (layout.InstanceFilterLink > link)
+                {
+                    link = next;
+                    continue;
+                }
+
+                const uint64_t instance = link - layout.InstanceFilterLink;
+                if (!LeftoverIsKernelCanonical(instance))
+                {
+                    link = next;
+                    continue;
+                }
+
+                recoveredAny = true;
+                if (layout.InstanceFilter != 0)
+                {
+                    uint64_t filterField = 0;
+                    uint64_t owner = 0;
+                    if (!LeftoverTryAdd(instance, layout.InstanceFilter, &filterField) ||
+                        !LeftoverReadU64(device, filterField, &owner, nullptr) ||
+                        owner != filter)
+                    {
+                        link = next;
+                        continue;
+                    }
+                }
+
+                instances->push_back(instance);
+                link = next;
+            }
+
+            if (flink != head && instances->empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = recoveredAny
+                        ? L"FLT_FILTER.InstanceList entries did not resolve to this filter"
+                        : L"could not recover FLT_INSTANCE from InstanceList";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool ReadCallbackNodePointers(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t node,
+        uint64_t* pre,
+        uint64_t* post,
+        uint64_t* instance)
+    {
+        bool ok = false;
+        do
+        {
+            if (node == 0 || !LeftoverIsKernelCanonical(node))
+            {
+                break;
+            }
+
+            uint64_t preValue = 0;
+            uint64_t postValue = 0;
+            uint64_t instanceValue = 0;
+            uint64_t preAddr = 0;
+            uint64_t postAddr = 0;
+            uint64_t instanceAddr = 0;
+            if (!LeftoverTryAdd(node, layout.CallbackNodePre, &preAddr) ||
+                !LeftoverTryAdd(node, layout.CallbackNodePost, &postAddr))
+            {
+                break;
+            }
+            LeftoverReadU64(device, preAddr, &preValue, nullptr);
+            LeftoverReadU64(device, postAddr, &postValue, nullptr);
+            if (layout.CallbackNodeInstance != 0 &&
+                LeftoverTryAdd(node, layout.CallbackNodeInstance, &instanceAddr))
+            {
+                LeftoverReadU64(device, instanceAddr, &instanceValue, nullptr);
+            }
+
+            if (pre != nullptr)
+            {
+                *pre = LeftoverIsKernelCanonical(preValue) ? preValue : 0;
+            }
+            if (post != nullptr)
+            {
+                *post = LeftoverIsKernelCanonical(postValue) ? postValue : 0;
+            }
+            if (instance != nullptr)
+            {
+                *instance = LeftoverIsKernelCanonical(instanceValue) ? instanceValue : 0;
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool ResolveCallbackNode(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t instance,
+        uint32_t index,
+        uint64_t* node)
+    {
+        bool ok = false;
+        do
+        {
+            if (node == nullptr || index >= layout.CallbackNodeCount)
+            {
+                break;
+            }
+
+            uint64_t array = 0;
+            if (!LeftoverTryAdd(instance, layout.InstanceCallbackNodes, &array))
+            {
+                break;
+            }
+
+            uint64_t resolved = 0;
+            if (layout.CallbackNodesArePointers)
+            {
+                uint64_t slot = 0;
+                uint64_t pointer = 0;
+                if (!LeftoverTryAdd(array, static_cast<uint64_t>(index) * sizeof(uint64_t), &slot) ||
+                    !LeftoverReadU64(device, slot, &pointer, nullptr) ||
+                    !LeftoverIsKernelCanonical(pointer))
+                {
+                    break;
+                }
+                resolved = pointer;
+            }
+            else
+            {
+                if (!LeftoverTryAdd(array, static_cast<uint64_t>(index) * layout.CallbackNodeSize, &resolved))
+                {
+                    break;
+                }
+            }
+
+            uint64_t nodeInstance = 0;
+            uint64_t pre = 0;
+            uint64_t post = 0;
+            if (!ReadCallbackNodePointers(device, layout, resolved, &pre, &post, &nodeInstance))
+            {
+                break;
+            }
+            if (layout.CallbackNodeInstance != 0 && nodeInstance != instance)
+            {
+                break;
+            }
+
+            *node = resolved;
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    void CollectInstanceCallbackNodes(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t instance,
+        std::vector<uint64_t>* nodes)
+    {
+        if (nodes == nullptr)
+        {
+            return;
+        }
+        for (uint32_t index = 0; index < layout.CallbackNodeCount; ++index)
+        {
+            uint64_t node = 0;
+            if (ResolveCallbackNode(device, layout, instance, index, &node))
+            {
+                nodes->push_back(node);
+            }
+        }
+    }
+
+    uint32_t CountLiveCallbackNodes(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        const std::vector<uint64_t>& instances)
+    {
+        uint32_t live = 0;
+        for (uint64_t instance : instances)
+        {
+            std::vector<uint64_t> nodes;
+            CollectInstanceCallbackNodes(device, layout, instance, &nodes);
+            for (uint64_t node : nodes)
+            {
+                uint64_t pre = 0;
+                uint64_t post = 0;
+                if (ReadCallbackNodePointers(device, layout, node, &pre, &post, nullptr) &&
+                    (pre != 0 || post != 0))
+                {
+                    ++live;
+                }
+            }
+        }
+        return live;
+    }
+
+    void RememberLiveNode(
+        uint64_t filter,
+        uint32_t majorFunction,
+        uint64_t node,
+        uint64_t preAddr,
+        uint64_t postAddr,
+        uint64_t pre,
+        uint64_t post)
+    {
+        if (preAddr == 0 || (pre == 0 && post == 0))
+        {
+            return;
+        }
+
+        LiveNodeBackup backup = {};
+        backup.Filter = filter;
+        backup.Node = node;
+        backup.PreAddr = preAddr;
+        backup.PostAddr = postAddr;
+        backup.Pre = pre;
+        backup.Post = post;
+        backup.MajorFunction = majorFunction;
+
+        std::lock_guard<std::mutex> guard(g_BackupLock);
+        auto existing = g_NodeBackups.find(preAddr);
+        if (existing == g_NodeBackups.end())
+        {
+            g_NodeBackups[preAddr] = backup;
+        }
+        else
+        {
+            if (existing->second.Pre == 0 && pre != 0)
+            {
+                existing->second.Pre = pre;
+            }
+            if (existing->second.Post == 0 && post != 0)
+            {
+                existing->second.Post = post;
+            }
+            if (existing->second.MajorFunction == kSweepMajor &&
+                majorFunction != kSweepMajor)
+            {
+                existing->second.MajorFunction = majorFunction;
+            }
+        }
+    }
+
+    bool PatchCallbackNode(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t filter,
+        uint32_t majorFunction,
+        uint64_t node,
+        MinifilterIrpAction action,
+        MinifilterIrpWhich which,
+        uint32_t* changed,
+        uint32_t* failed,
+        std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            if (changed == nullptr || failed == nullptr)
+            {
+                break;
+            }
+
+            uint64_t preAddr = 0;
+            uint64_t postAddr = 0;
+            if (!LeftoverTryAdd(node, layout.CallbackNodePre, &preAddr) ||
+                !LeftoverTryAdd(node, layout.CallbackNodePost, &postAddr))
+            {
+                ++(*failed);
+                break;
+            }
+
+            uint64_t currentPre = 0;
+            uint64_t currentPost = 0;
+            LeftoverReadU64(device, preAddr, &currentPre, nullptr);
+            LeftoverReadU64(device, postAddr, &currentPost, nullptr);
+            if (!LeftoverIsKernelCanonical(currentPre))
+            {
+                currentPre = 0;
+            }
+            if (!LeftoverIsKernelCanonical(currentPost))
+            {
+                currentPost = 0;
+            }
+
+            const bool touchPre = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Pre);
+            const bool touchPost = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
+            uint64_t newPre = currentPre;
+            uint64_t newPost = currentPost;
+
+            if (action == MinifilterIrpAction::Disable)
+            {
+                RememberLiveNode(
+                    filter,
+                    majorFunction,
+                    node,
+                    preAddr,
+                    postAddr,
+                    currentPre,
+                    currentPost);
+                if (touchPre)
+                {
+                    newPre = 0;
+                }
+                if (touchPost)
+                {
+                    newPost = 0;
+                }
+            }
+            else
+            {
+                LiveNodeBackup backup = {};
+                bool haveBackup = false;
+                {
+                    std::lock_guard<std::mutex> guard(g_BackupLock);
+                    auto existing = g_NodeBackups.find(preAddr);
+                    if (existing != g_NodeBackups.end())
+                    {
+                        backup = existing->second;
+                        haveBackup = true;
+                    }
+                }
+                if (!haveBackup)
+                {
+                    ok = true;
+                    break;
+                }
+                if (touchPre)
+                {
+                    newPre = backup.Pre;
+                }
+                if (touchPost)
+                {
+                    newPost = backup.Post;
+                }
+            }
+
+            bool wrote = false;
+            if (touchPre && newPre != currentPre)
+            {
+                std::wstring writeError;
+                if (!WritePointer(device, preAddr, newPre, &writeError))
+                {
+                    ++(*failed);
+                    if (error != nullptr && error->empty())
+                    {
+                        *error = writeError;
+                    }
+                    break;
+                }
+                wrote = true;
+            }
+            if (touchPost && newPost != currentPost)
+            {
+                std::wstring writeError;
+                if (!WritePointer(device, postAddr, newPost, &writeError))
+                {
+                    ++(*failed);
+                    if (error != nullptr && error->empty())
+                    {
+                        *error = writeError;
+                    }
+                    break;
+                }
+                wrote = true;
+            }
+            if (wrote)
+            {
+                ++(*changed);
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool PatchLiveCallbackNodes(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t filter,
+        uint32_t majorFunction,
+        uint64_t matchPre,
+        uint64_t matchPost,
+        MinifilterIrpAction action,
+        MinifilterIrpWhich which,
+        uint32_t* changed,
+        uint32_t* failed,
+        std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            if (changed == nullptr || failed == nullptr)
+            {
+                break;
+            }
+
+            std::vector<uint64_t> instances;
+            if (!CollectFilterInstances(device, layout, filter, &instances, error))
+            {
+                break;
+            }
+
+            std::set<uint64_t> patched;
+            const uint32_t index = CallbackIndexFromMajor(majorFunction);
+            for (uint64_t instance : instances)
+            {
+                uint64_t indexed = 0;
+                if (index != 0xffffffffu &&
+                    ResolveCallbackNode(device, layout, instance, index, &indexed))
+                {
+                    if (patched.insert(indexed).second)
+                    {
+                        PatchCallbackNode(
+                            device,
+                            layout,
+                            filter,
+                            majorFunction,
+                            indexed,
+                            action,
+                            which,
+                            changed,
+                            failed,
+                            error);
+                    }
+                    continue;
+                }
+
+                std::vector<uint64_t> nodes;
+                CollectInstanceCallbackNodes(device, layout, instance, &nodes);
+                for (uint64_t node : nodes)
+                {
+                    if (!patched.insert(node).second)
+                    {
+                        continue;
+                    }
+                    uint64_t pre = 0;
+                    uint64_t post = 0;
+                    if (!ReadCallbackNodePointers(device, layout, node, &pre, &post, nullptr))
+                    {
+                        continue;
+                    }
+                    if (matchPre == 0 && matchPost == 0)
+                    {
+                        continue;
+                    }
+                    const bool preMatch = (matchPre == 0) || (pre == matchPre);
+                    const bool postMatch = (matchPost == 0) || (post == matchPost);
+                    if (preMatch && postMatch)
+                    {
+                        PatchCallbackNode(
+                            device,
+                            layout,
+                            filter,
+                            majorFunction,
+                            node,
+                            action,
+                            which,
+                            changed,
+                            failed,
+                            error);
+                    }
+                }
+            }
+
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool SlotStillHasLiveCallback(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        const std::vector<uint64_t>& instances,
+        uint32_t majorFunction,
+        uint64_t matchPre,
+        uint64_t matchPost,
+        MinifilterIrpWhich which)
+    {
+        bool live = false;
+        const bool touchPre = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Pre);
+        const bool touchPost = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
+        const uint32_t index = CallbackIndexFromMajor(majorFunction);
+
+        for (uint64_t instance : instances)
+        {
+            uint64_t indexed = 0;
+            if (index != 0xffffffffu &&
+                ResolveCallbackNode(device, layout, instance, index, &indexed))
+            {
+                uint64_t pre = 0;
+                uint64_t post = 0;
+                if (ReadCallbackNodePointers(device, layout, indexed, &pre, &post, nullptr) &&
+                    ((touchPre && pre != 0) || (touchPost && post != 0)))
+                {
+                    live = true;
+                    break;
+                }
+                continue;
+            }
+
+            if (matchPre == 0 && matchPost == 0)
+            {
+                continue;
+            }
+
+            std::vector<uint64_t> nodes;
+            CollectInstanceCallbackNodes(device, layout, instance, &nodes);
+            for (uint64_t node : nodes)
+            {
+                uint64_t pre = 0;
+                uint64_t post = 0;
+                if (!ReadCallbackNodePointers(device, layout, node, &pre, &post, nullptr))
+                {
+                    continue;
+                }
+                const bool preMatch = (matchPre == 0) || (pre == matchPre);
+                const bool postMatch = (matchPost == 0) || (post == matchPost);
+                if (preMatch &&
+                    postMatch &&
+                    ((touchPre && pre != 0) || (touchPost && post != 0)))
+                {
+                    live = true;
+                    break;
+                }
+            }
+            if (live)
+            {
+                break;
+            }
+        }
+
+        return live;
+    }
+
+    bool SweepRemainingLiveNodes(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t filter,
+        MinifilterIrpAction action,
+        MinifilterIrpWhich which,
+        uint32_t* changed,
+        uint32_t* failed,
+        std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            std::vector<uint64_t> instances;
+            if (!CollectFilterInstances(device, layout, filter, &instances, error))
+            {
+                break;
+            }
+
+            for (uint64_t instance : instances)
+            {
+                std::vector<uint64_t> nodes;
+                CollectInstanceCallbackNodes(device, layout, instance, &nodes);
+                for (uint64_t node : nodes)
+                {
+                    uint64_t pre = 0;
+                    uint64_t post = 0;
+                    if (!ReadCallbackNodePointers(device, layout, node, &pre, &post, nullptr))
+                    {
+                        continue;
+                    }
+                    if (action == MinifilterIrpAction::Disable && pre == 0 && post == 0)
+                    {
+                        continue;
+                    }
+                    PatchCallbackNode(
+                        device,
+                        layout,
+                        filter,
+                        kSweepMajor,
+                        node,
+                        action,
+                        which,
+                        changed,
+                        failed,
+                        error);
+                }
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
 }
 
 std::wstring MinifilterIrpMajorName(uint32_t majorFunction)
@@ -841,6 +1776,11 @@ std::wstring MinifilterIrpMajorName(uint32_t majorFunction)
         break;
     }
     return name;
+}
+
+uint32_t MinifilterCallbackIndexFromMajor(uint32_t majorFunction)
+{
+    return CallbackIndexFromMajor(majorFunction);
 }
 
 bool IsMinifilterIrpAllToken(const std::wstring& text)
@@ -1001,6 +1941,7 @@ bool MinifilterIrpNameLooksInbox(const std::wstring& name)
     const wchar_t* known[] =
     {
         L"wdfilter",
+        L"mssecflt",
         L"fileinfo",
         L"luafv",
         L"npsvctrig",
@@ -1216,6 +2157,15 @@ bool MinifilterIrpScanner::SetIrp(
         {
             break;
         }
+        if (!layout.HasLiveCallbackLayout)
+        {
+            if (error != nullptr)
+            {
+                *error = L"PDB is missing FLT_INSTANCE.CallbackNodes; "
+                         L"writing FLT_FILTER.Operations does not stop live FltMgr dispatch";
+            }
+            break;
+        }
 
         uint64_t preAddr = 0;
         uint64_t postAddr = 0;
@@ -1233,6 +2183,7 @@ bool MinifilterIrpScanner::SetIrp(
         const bool touchPost = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
         uint64_t newPre = found->Pre;
         uint64_t newPost = found->Post;
+        bool haveOperationsBackup = false;
 
         if (action == MinifilterIrpAction::Disable)
         {
@@ -1243,6 +2194,7 @@ bool MinifilterIrpScanner::SetIrp(
             value.Pre = found->Pre;
             value.Post = found->Post;
             value.FilterName = filter.Name;
+            if (value.Pre != 0 || value.Post != 0)
             {
                 std::lock_guard<std::mutex> guard(g_BackupLock);
                 auto existing = g_Backups.find(key);
@@ -1277,36 +2229,109 @@ bool MinifilterIrpScanner::SetIrp(
             key.Filter = filter.Filter;
             key.MajorFunction = majorFunction;
             IrpBackupValue value = {};
-            bool haveBackup = false;
             {
                 std::lock_guard<std::mutex> guard(g_BackupLock);
                 auto existing = g_Backups.find(key);
                 if (existing != g_Backups.end())
                 {
                     value = existing->second;
-                    haveBackup = true;
+                    haveOperationsBackup = true;
                 }
             }
-            if (!haveBackup)
+            if (haveOperationsBackup)
             {
-                if (error != nullptr)
+                change->UsedBackup = true;
+                if (touchPre)
                 {
-                    *error = L"no saved pre/post for " +
-                             (filter.Name.empty() ? LeftoverFormatHex(filter.Filter, 16) : filter.Name) +
-                             L" " + MinifilterIrpMajorName(majorFunction) +
-                             L"; enable only works after a disable in this session";
+                    newPre = value.Pre;
                 }
-                break;
+                if (touchPost)
+                {
+                    newPost = value.Post;
+                }
             }
-            change->UsedBackup = true;
-            if (touchPre)
+        }
+
+        // Live CallbackNodes are what FltMgr dispatches. Patch them first so a
+        // failed instance walk cannot leave Operations zeroed and the filter live.
+        std::wstring liveError;
+        if (!PatchLiveCallbackNodes(
+                device_,
+                layout,
+                filter.Filter,
+                majorFunction,
+                found->Pre,
+                found->Post,
+                action,
+                which,
+                &change->LiveNodesChanged,
+                &change->LiveNodesFailed,
+                &liveError))
+        {
+            if (error != nullptr)
             {
-                newPre = value.Pre;
+                *error = liveError.empty()
+                    ? L"failed to patch live FLT_INSTANCE.CallbackNodes"
+                    : liveError;
             }
-            if (touchPost)
+            break;
+        }
+
+        if (action == MinifilterIrpAction::Disable)
+        {
+            std::vector<uint64_t> instances;
+            std::wstring instanceError;
+            if (CollectFilterInstances(
+                    device_,
+                    layout,
+                    filter.Filter,
+                    &instances,
+                    &instanceError) &&
+                !instances.empty())
             {
-                newPost = value.Post;
+                if (SlotStillHasLiveCallback(
+                        device_,
+                        layout,
+                        instances,
+                        majorFunction,
+                        found->Pre,
+                        found->Post,
+                        which))
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"live FLT_INSTANCE.CallbackNodes still have handlers; "
+                                 L"FltMgr would still call the original callback";
+                    }
+                    break;
+                }
+                if (change->LiveNodesChanged == 0 &&
+                    (found->PreActive || found->PostActive) &&
+                    CountLiveCallbackNodes(device_, layout, instances) == 0)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"attached instances were found but no live "
+                                 L"CallbackNodes could be read; refusing to touch "
+                                 L"FLT_FILTER.Operations only";
+                    }
+                    break;
+                }
             }
+        }
+
+        if (action == MinifilterIrpAction::Enable &&
+            !haveOperationsBackup &&
+            change->LiveNodesChanged == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"no saved pre/post for " +
+                         (filter.Name.empty() ? LeftoverFormatHex(filter.Filter, 16) : filter.Name) +
+                         L" " + MinifilterIrpMajorName(majorFunction) +
+                         L"; enable only works after a disable in this session";
+            }
+            break;
         }
 
         if (touchPre && newPre != found->Pre)
@@ -1401,7 +2426,7 @@ bool MinifilterIrpScanner::SetAllIrps(
                     ++backupHits;
                 }
             }
-            if (backupHits == 0)
+            if (backupHits == 0 && CountNodeBackupsForFilter(filter.Filter) == 0)
             {
                 if (error != nullptr)
                 {
@@ -1438,20 +2463,7 @@ bool MinifilterIrpScanner::SetAllIrps(
                     std::lock_guard<std::mutex> guard(g_BackupLock);
                     haveBackup = g_Backups.find(key) != g_Backups.end();
                 }
-                if (!haveBackup)
-                {
-                    ++batch->Skipped;
-                    continue;
-                }
-            }
-            else if (action == MinifilterIrpAction::Disable)
-            {
-                const bool preNeeded = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Pre);
-                const bool postNeeded = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
-                const bool alreadyOff =
-                    (!preNeeded || !slot.PreActive) &&
-                    (!postNeeded || !slot.PostActive);
-                if (alreadyOff)
+                if (!haveBackup && CountNodeBackupsForFilter(filter.Filter) == 0)
                 {
                     ++batch->Skipped;
                     continue;
@@ -1468,7 +2480,7 @@ bool MinifilterIrpScanner::SetAllIrps(
                 batch->Failures.push_back(slot.MajorName + L": " + slotError);
                 continue;
             }
-            if (change.PreChanged || change.PostChanged)
+            if (change.PreChanged || change.PostChanged || change.LiveNodesChanged > 0)
             {
                 ++batch->Changed;
             }
@@ -1476,7 +2488,41 @@ bool MinifilterIrpScanner::SetAllIrps(
             {
                 ++batch->Skipped;
             }
+            batch->LiveNodesChanged += change.LiveNodesChanged;
+            batch->LiveNodesFailed += change.LiveNodesFailed;
             batch->Changes.push_back(change);
+        }
+
+        MinifilterLayout layout = {};
+        std::wstring layoutError;
+        if (BuildLayout(symbols_, &layout, &layoutError) && layout.HasLiveCallbackLayout)
+        {
+            uint32_t swept = 0;
+            uint32_t sweepFailed = 0;
+            std::wstring sweepError;
+            if (SweepRemainingLiveNodes(
+                    device_,
+                    layout,
+                    filter.Filter,
+                    action,
+                    which,
+                    &swept,
+                    &sweepFailed,
+                    &sweepError))
+            {
+                batch->LiveNodesChanged += swept;
+                batch->LiveNodesFailed += sweepFailed;
+                if (swept > 0)
+                {
+                    ++batch->Changed;
+                }
+            }
+            else if (!sweepError.empty())
+            {
+                batch->Failures.push_back(L"live CallbackNodes sweep: " + sweepError);
+                ++batch->Failed;
+                anyWriteFailed = true;
+            }
         }
 
         if (anyWriteFailed && batch->Changed == 0)
@@ -1522,6 +2568,10 @@ std::wstring BuildMinifilterIrpJson(const MinifilterIrpScanResult& result)
         out += L",\"operations\":" + mcpjson::Quote(LeftoverFormatHex(filter.Operations, 16));
         out += L",\"operationCount\":" + std::to_wstring(filter.OperationCount);
         out += L",\"activeOperationCount\":" + std::to_wstring(filter.ActiveOperationCount);
+        out += L",\"instanceCount\":" + std::to_wstring(filter.InstanceCount);
+        out += L",\"liveCallbackCount\":" + std::to_wstring(filter.LiveCallbackCount);
+        out += L",\"liveLayoutAvailable\":";
+        out += filter.LiveLayoutAvailable ? L"true" : L"false";
         out += L",\"wellKnownInbox\":";
         out += filter.WellKnownInbox ? L"true" : L"false";
         out += L",\"slots\":[";
@@ -1577,6 +2627,8 @@ std::wstring BuildMinifilterIrpChangeJson(const MinifilterIrpChange& change)
     out += change.UsedBackup ? L"true" : L"false";
     out += L",\"wellKnownInbox\":";
     out += change.WellKnownInbox ? L"true" : L"false";
+    out += L",\"liveNodesChanged\":" + std::to_wstring(change.LiveNodesChanged);
+    out += L",\"liveNodesFailed\":" + std::to_wstring(change.LiveNodesFailed);
     out += L"}";
     return out;
 }
@@ -1590,6 +2642,8 @@ std::wstring BuildMinifilterIrpBatchJson(const MinifilterIrpBatchResult& batch)
     out += L",\"changed\":" + std::to_wstring(batch.Changed);
     out += L",\"skipped\":" + std::to_wstring(batch.Skipped);
     out += L",\"failed\":" + std::to_wstring(batch.Failed);
+    out += L",\"liveNodesChanged\":" + std::to_wstring(batch.LiveNodesChanged);
+    out += L",\"liveNodesFailed\":" + std::to_wstring(batch.LiveNodesFailed);
     out += L",\"wellKnownInbox\":";
     out += batch.WellKnownInbox ? L"true" : L"false";
     out += L",\"changes\":[";
@@ -1668,6 +2722,15 @@ bool MinifilterIrpScannerSelfTest()
         }
         if (MinifilterIrpMajorName(0x00) != L"IRP_MJ_CREATE" ||
             MinifilterIrpMajorName(0xff) != L"IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION")
+        {
+            ok = false;
+            break;
+        }
+        if (MinifilterCallbackIndexFromMajor(0x00) != 0 ||
+            MinifilterCallbackIndexFromMajor(0x1b) != 0x1b ||
+            MinifilterCallbackIndexFromMajor(0xff) != 0x1c ||
+            MinifilterCallbackIndexFromMajor(0xfe) != 0x1d ||
+            MinifilterCallbackIndexFromMajor(0xec) != 0x2f)
         {
             ok = false;
             break;
