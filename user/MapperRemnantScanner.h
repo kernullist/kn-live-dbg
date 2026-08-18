@@ -20,7 +20,10 @@ struct MapperUnloadedRecord
     bool StillPresent = false;
     bool StillExecutable = false;
     bool OverlapsLoadedModule = false;
+    bool RangeReused = false;
+    bool SameImageReload = false;
     bool Suspicious = false;
+    uint32_t RepeatCount = 1;
 };
 
 struct MapperPiddbRecord
@@ -33,6 +36,7 @@ struct MapperPiddbRecord
     std::wstring DriverName;
     std::wstring Notes;
     bool InLoadedModules = false;
+    bool Expected = false;
     bool Suspicious = false;
 };
 
@@ -44,6 +48,7 @@ struct MapperHashRecord
     std::wstring DriverName;
     std::wstring Notes;
     bool InLoadedModules = false;
+    bool Expected = false;
     bool Suspicious = false;
 };
 
@@ -71,6 +76,7 @@ struct MapperScanResult
     uint64_t HashListSymbol = 0;
     std::wstring HashListSymbolName;
     std::wstring HashWalkMode;
+    std::wstring PiddbWalkMode;
     bool UnloadedResolved = false;
     bool UnloadedComplete = false;
     bool PiddbResolved = false;

@@ -9,32 +9,150 @@
 
 namespace
 {
+    std::wstring MapperToLower(const std::wstring& value)
+    {
+        std::wstring lower = value;
+        for (wchar_t& ch : lower)
+        {
+            if (ch >= L'A' && ch <= L'Z')
+            {
+                ch = static_cast<wchar_t>(ch - L'A' + L'a');
+            }
+        }
+
+        return lower;
+    }
+
     constexpr uint32_t kDefaultUnloadedSlots = 50;
     constexpr uint32_t kMaxUnloadedSlots = 64;
     constexpr uint32_t kMaxAvlNodes = 4096;
     constexpr uint32_t kMaxHashEntries = 4096;
-    constexpr uint64_t kAvlParent = 0x00;
+    constexpr uint32_t kMaxPiddbListEntries = 4096;
     constexpr uint64_t kAvlLeft = 0x08;
     constexpr uint64_t kAvlRight = 0x10;
     constexpr uint64_t kAvlLinksSize = 0x20;
-    constexpr uint64_t kAvlNumberOfElements = 0x2c;
-    constexpr uint64_t kAvlCompareRoutine = 0x30;
-    constexpr uint64_t kAvlAllocateRoutine = 0x38;
-    constexpr uint64_t kAvlFreeRoutine = 0x40;
 
-    bool LooksLikeAvlTable(DeviceClient& device, SymbolEngine& symbols, uint64_t tableAddr)
+    // x64 RTL_AVL_TABLE: BalancedRoot (0x20) + OrderedPointer + two ULONGS,
+    // then DepthOfTree/RestartKey/DeleteCount, then the three routines.
+    // Older mapper code treated 0x30 as CompareRoutine (that is DepthOfTree).
+    struct AvlTableLayout
+    {
+        uint32_t BalancedRoot = 0x00;
+        uint32_t NumberGenericTableElements = 0x2c;
+        uint32_t CompareRoutine = 0x48;
+        uint32_t AllocateRoutine = 0x50;
+        uint32_t FreeRoutine = 0x58;
+    };
+
+    void SanitizeAvlTableLayout(AvlTableLayout* layout)
+    {
+        if (layout == nullptr)
+        {
+            return;
+        }
+
+        // x64 CompareRoutine cannot sit on DepthOfTree (0x30). A bad PDB
+        // match that is 8-byte-strided at 0x30/0x38/0x40 is the old mapper bug.
+        if (layout->CompareRoutine < 0x40 ||
+            layout->AllocateRoutine != layout->CompareRoutine + 8 ||
+            layout->FreeRoutine != layout->AllocateRoutine + 8)
+        {
+            layout->CompareRoutine = 0x48;
+            layout->AllocateRoutine = 0x50;
+            layout->FreeRoutine = 0x58;
+        }
+    }
+
+    AvlTableLayout ResolveAvlTableLayout(SymbolEngine& symbols)
+    {
+        AvlTableLayout layout;
+        TypeFieldInfo field = {};
+        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"BalancedRoot", &field, nullptr) &&
+            field.Offset <= 0x40)
+        {
+            layout.BalancedRoot = field.Offset;
+        }
+        if ((symbols.FindField(
+                 L"nt!_RTL_AVL_TABLE",
+                 L"NumberGenericTableElements",
+                 &field,
+                 nullptr) ||
+             symbols.FindField(
+                 L"nt!_RTL_AVL_TABLE",
+                 L"NumberOfElements",
+                 &field,
+                 nullptr)) &&
+            field.Offset <= 0x80)
+        {
+            layout.NumberGenericTableElements = field.Offset;
+        }
+        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"CompareRoutine", &field, nullptr) &&
+            field.Offset >= 0x20 &&
+            field.Offset <= 0x100)
+        {
+            layout.CompareRoutine = field.Offset;
+        }
+        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"AllocateRoutine", &field, nullptr) &&
+            field.Offset >= 0x20 &&
+            field.Offset <= 0x100)
+        {
+            layout.AllocateRoutine = field.Offset;
+        }
+        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"FreeRoutine", &field, nullptr) &&
+            field.Offset >= 0x20 &&
+            field.Offset <= 0x100)
+        {
+            layout.FreeRoutine = field.Offset;
+        }
+
+        SanitizeAvlTableLayout(&layout);
+        return layout;
+    }
+
+    bool RoutinePointsAtLoadedImage(
+        SymbolEngine& symbols,
+        uint64_t value)
+    {
+        bool ok = false;
+        if (!LeftoverIsKernelCanonical(value))
+        {
+            return false;
+        }
+
+        for (const KernelModuleInfo& module : symbols.Modules())
+        {
+            uint64_t end = 0;
+            if (!LeftoverTryAdd(module.Base, module.Size, &end))
+            {
+                continue;
+            }
+            if (value >= module.Base && value < end)
+            {
+                ok = true;
+                break;
+            }
+        }
+
+        return ok;
+    }
+
+    bool LooksLikeAvlTable(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t tableAddr,
+        const AvlTableLayout& layout)
     {
         bool ok = false;
 
         do
         {
             uint32_t goodRoutines = 0;
-            const uint64_t routineOffs[3] = {
-                kAvlCompareRoutine,
-                kAvlAllocateRoutine,
-                kAvlFreeRoutine
+            const uint32_t routineOffs[3] = {
+                layout.CompareRoutine,
+                layout.AllocateRoutine,
+                layout.FreeRoutine
             };
-            for (uint64_t off : routineOffs)
+            for (uint32_t off : routineOffs)
             {
                 uint64_t field = 0;
                 uint64_t value = 0;
@@ -43,50 +161,38 @@ namespace
                 {
                     continue;
                 }
-                if (!LeftoverIsKernelCanonical(value))
+                if (RoutinePointsAtLoadedImage(symbols, value))
                 {
-                    continue;
+                    ++goodRoutines;
                 }
-                for (const KernelModuleInfo& module : symbols.Modules())
-                {
-                    uint64_t end = 0;
-                    if (!LeftoverTryAdd(module.Base, module.Size, &end))
-                    {
-                        continue;
-                    }
-                    if (value >= module.Base && value < end)
-                    {
-                        ++goodRoutines;
-                        break;
-                    }
-                }
-            }
-            if (goodRoutines < 2)
-            {
-                break;
             }
 
             uint32_t count = 0;
             uint64_t countAddr = 0;
-            if (!LeftoverTryAdd(tableAddr, kAvlNumberOfElements, &countAddr) ||
-                !LeftoverReadU32(device, countAddr, &count, nullptr))
+            if (!LeftoverTryAdd(tableAddr, layout.NumberGenericTableElements, &countAddr) ||
+                !LeftoverReadU32(device, countAddr, &count, nullptr) ||
+                count > 0x100000)
             {
-                break;
-            }
-            if (count > 0x100000)
-            {
-                break;
-            }
-            if (count == 0)
-            {
-                ok = true;
                 break;
             }
 
             uint64_t rootField = 0;
             uint64_t root = 0;
-            if (!LeftoverTryAdd(tableAddr, kAvlRight, &rootField) ||
+            const uint64_t rootOffset =
+                static_cast<uint64_t>(layout.BalancedRoot) + kAvlRight;
+            if (!LeftoverTryAdd(tableAddr, rootOffset, &rootField) ||
                 !LeftoverReadU64(device, rootField, &root, nullptr))
+            {
+                break;
+            }
+
+            if (count == 0)
+            {
+                ok = (goodRoutines >= 2) || (root == 0);
+                break;
+            }
+
+            if (goodRoutines < 2)
             {
                 break;
             }
@@ -96,7 +202,13 @@ namespace
             }
 
             uint64_t parent = 0;
-            if (!LeftoverReadU64(device, root, &parent, nullptr) || parent != tableAddr)
+            uint64_t sentinel = 0;
+            if (!LeftoverTryAdd(tableAddr, layout.BalancedRoot, &sentinel) ||
+                !LeftoverReadU64(device, root, &parent, nullptr))
+            {
+                break;
+            }
+            if (parent != tableAddr && parent != sentinel)
             {
                 break;
             }
@@ -109,6 +221,7 @@ namespace
     bool WalkAvlInOrder(
         DeviceClient& device,
         uint64_t tableAddr,
+        const AvlTableLayout& layout,
         std::vector<uint64_t>* nodes,
         bool* complete)
     {
@@ -125,7 +238,9 @@ namespace
 
             uint64_t rootField = 0;
             uint64_t root = 0;
-            if (!LeftoverTryAdd(tableAddr, kAvlRight, &rootField) ||
+            const uint64_t rootOffset =
+                static_cast<uint64_t>(layout.BalancedRoot) + kAvlRight;
+            if (!LeftoverTryAdd(tableAddr, rootOffset, &rootField) ||
                 !LeftoverReadU64(device, rootField, &root, nullptr))
             {
                 break;
@@ -160,6 +275,7 @@ namespace
                 {
                     if (!LeftoverIsKernelCanonical(current) || !visited.insert(current).second)
                     {
+                        truncated = true;
                         current = 0;
                         break;
                     }
@@ -260,6 +376,175 @@ namespace
 
         return ok;
     }
+
+    bool ProbePiddbDriverName(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t node,
+        bool listEntry,
+        uint32_t preferredNameOffset,
+        uint64_t* entryOut,
+        uint32_t* nameOffsetOut,
+        std::wstring* nameOut)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (entryOut == nullptr || nameOffsetOut == nullptr || nameOut == nullptr)
+            {
+                break;
+            }
+            *entryOut = 0;
+            *nameOffsetOut = 0;
+            nameOut->clear();
+
+            uint64_t bases[2] = { node, 0 };
+            uint32_t baseCount = 1;
+            if (!listEntry)
+            {
+                uint64_t afterLinks = 0;
+                if (LeftoverTryAdd(node, kAvlLinksSize, &afterLinks) && afterLinks != node)
+                {
+                    bases[1] = afterLinks;
+                    baseCount = 2;
+                }
+            }
+
+            const uint32_t offsets[] = { preferredNameOffset, 0x10, 0x30, 0x20 };
+            for (uint32_t baseIndex = 0; baseIndex < baseCount && !ok; ++baseIndex)
+            {
+                for (uint32_t off : offsets)
+                {
+                    if (off == 0)
+                    {
+                        continue;
+                    }
+
+                    uint64_t nameAddr = 0;
+                    std::wstring name;
+                    if (!LeftoverTryAdd(bases[baseIndex], off, &nameAddr))
+                    {
+                        continue;
+                    }
+                    if (!ProbeUnicodeAt(device, symbols, nameAddr, &name) ||
+                        name.empty() ||
+                        !LeftoverLooksLikeDriverName(name))
+                    {
+                        continue;
+                    }
+
+                    *entryOut = bases[baseIndex];
+                    *nameOffsetOut = off;
+                    *nameOut = std::move(name);
+                    ok = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool LooksLikeDumpStackDriver(const std::wstring& name)
+    {
+        const std::wstring base = MapperToLower(LeftoverModuleBaseName(name));
+        bool ok = false;
+        if (base.size() >= 5 && base.compare(0, 5, L"dump_") == 0)
+        {
+            ok = true;
+        }
+        else if (base.size() >= 4 && base.compare(0, 4, L"dump") == 0 &&
+                 (base == L"dumpfve.sys" ||
+                  base == L"dumpstorport.sys" ||
+                  base == L"dumpstornvme.sys"))
+        {
+            ok = true;
+        }
+
+        return ok;
+    }
+
+    bool NameInRecordList(
+        const std::vector<MapperUnloadedRecord>& unloaded,
+        const std::wstring& name)
+    {
+        bool found = false;
+        for (const MapperUnloadedRecord& record : unloaded)
+        {
+            if (!record.Name.empty() && LeftoverNamesMatch(record.Name, name))
+            {
+                found = true;
+                break;
+            }
+        }
+
+        return found;
+    }
+
+    bool ExplainedByUnloadOrBootStack(
+        const std::vector<MapperUnloadedRecord>& unloaded,
+        const std::wstring& name)
+    {
+        return NameInRecordList(unloaded, name) || LooksLikeDumpStackDriver(name);
+    }
+
+    void CoalesceUnloadedRecords(std::vector<MapperUnloadedRecord>* records)
+    {
+        if (records == nullptr || records->size() < 2)
+        {
+            return;
+        }
+
+        std::vector<MapperUnloadedRecord> coalesced;
+        coalesced.reserve(records->size());
+        for (const MapperUnloadedRecord& record : *records)
+        {
+            if (!coalesced.empty())
+            {
+                MapperUnloadedRecord& last = coalesced.back();
+                if (!record.Name.empty() &&
+                    LeftoverNamesMatch(last.Name, record.Name) &&
+                    last.StartAddress == record.StartAddress)
+                {
+                    last.RepeatCount += 1;
+                    if (record.EndAddress > last.EndAddress)
+                    {
+                        last.EndAddress = record.EndAddress;
+                    }
+                    if (record.Suspicious)
+                    {
+                        last.Suspicious = true;
+                    }
+                    if (record.StillExecutable)
+                    {
+                        last.StillExecutable = true;
+                    }
+                    if (record.SameImageReload)
+                    {
+                        last.SameImageReload = true;
+                    }
+                    if (record.RangeReused)
+                    {
+                        last.RangeReused = true;
+                    }
+                    if (record.StillPresent)
+                    {
+                        last.StillPresent = true;
+                    }
+                    if (record.OverlapsLoadedModule)
+                    {
+                        last.OverlapsLoadedModule = true;
+                    }
+                    continue;
+                }
+            }
+
+            coalesced.push_back(record);
+        }
+
+        *records = std::move(coalesced);
+    }
 }
 
 MapperRemnantScanner::MapperRemnantScanner(DeviceClient& device, SymbolEngine& symbols) :
@@ -322,34 +607,46 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
         uint32_t timeOffset = 0x20;
         uint32_t entrySize = 0x28;
         TypeLayoutInfo layout = {};
-        std::wstring layoutError;
-        if (symbols_.GetTypeLayout(L"nt!_MM_UNLOADED_DRIVER", &layout, &layoutError) &&
-            layout.Size != 0 &&
-            layout.Size <= 0x80)
+        const wchar_t* unloadedTypes[] = {
+            L"nt!_MM_UNLOADED_DRIVER",
+            L"_MM_UNLOADED_DRIVER",
+            L"nt!_UNLOADED_DRIVERS",
+            L"_UNLOADED_DRIVERS"
+        };
+        bool layoutFromPdb = false;
+        for (const wchar_t* typeName : unloadedTypes)
         {
+            TypeFieldInfo nameField = {};
+            TypeFieldInfo startField = {};
+            if (!symbols_.GetTypeLayout(typeName, &layout, nullptr) ||
+                layout.Size < 0x28 ||
+                layout.Size > 0x80 ||
+                !symbols_.FindField(typeName, L"Name", &nameField, nullptr) ||
+                !symbols_.FindField(typeName, L"StartAddress", &startField, nullptr))
+            {
+                continue;
+            }
+
             entrySize = static_cast<uint32_t>(layout.Size);
+            nameOffset = nameField.Offset;
+            startOffset = startField.Offset;
             TypeFieldInfo field = {};
-            if (symbols_.FindField(L"nt!_MM_UNLOADED_DRIVER", L"Name", &field, nullptr))
-            {
-                nameOffset = field.Offset;
-            }
-            if (symbols_.FindField(L"nt!_MM_UNLOADED_DRIVER", L"StartAddress", &field, nullptr))
-            {
-                startOffset = field.Offset;
-            }
-            if (symbols_.FindField(L"nt!_MM_UNLOADED_DRIVER", L"EndAddress", &field, nullptr))
+            if (symbols_.FindField(typeName, L"EndAddress", &field, nullptr))
             {
                 endOffset = field.Offset;
             }
-            if (symbols_.FindField(L"nt!_MM_UNLOADED_DRIVER", L"CurrentTime", &field, nullptr))
+            if (symbols_.FindField(typeName, L"CurrentTime", &field, nullptr) ||
+                symbols_.FindField(typeName, L"UnloadTime", &field, nullptr))
             {
                 timeOffset = field.Offset;
             }
+            layoutFromPdb = true;
+            break;
         }
-        else
+        if (!layoutFromPdb)
         {
-            result->Warnings.push_back(
-                L"nt!_MM_UNLOADED_DRIVER was not in the PDB; using guarded x64 fallback 0x28");
+            result->CoverageNotes.push_back(
+                L"nt!_MM_UNLOADED_DRIVER not in PDB; using x64 UNICODE_STRING+range layout 0x28");
         }
 
         if (array == 0)
@@ -390,12 +687,13 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
         }
 
         result->UnloadedSlotCount = kDefaultUnloadedSlots;
+        bool walkedAll = true;
         for (uint32_t index = 0; index < kDefaultUnloadedSlots && index < kMaxUnloadedSlots; ++index)
         {
             uint64_t entry = 0;
             if (!LeftoverTryAdd(array, static_cast<uint64_t>(index) * entrySize, &entry))
             {
-                result->UnloadedComplete = false;
+                walkedAll = false;
                 result->Warnings.push_back(L"unloaded-driver entry address overflow");
                 break;
             }
@@ -444,7 +742,20 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                 if (owner != nullptr)
                 {
                     record.OverlapsLoadedModule = true;
-                    LeftoverAppendNote(&record.Notes, L"start still overlaps " + owner->Name);
+                    if (!name.empty() && LeftoverNamesMatch(owner->Name, name))
+                    {
+                        record.SameImageReload = true;
+                        LeftoverAppendNote(
+                            &record.Notes,
+                            L"same image still loaded at this range (reload)");
+                    }
+                    else
+                    {
+                        record.RangeReused = true;
+                        LeftoverAppendNote(
+                            &record.Notes,
+                            L"range reused by " + owner->Name);
+                    }
                 }
 
                 AddressInspectResult inspect = {};
@@ -474,7 +785,8 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
             result->Unloaded.push_back(record);
         }
 
-        result->UnloadedComplete = true;
+        CoalesceUnloadedRecords(&result->Unloaded);
+        result->UnloadedComplete = walkedAll;
         ok = true;
     } while (false);
 
@@ -494,62 +806,105 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
 
         uint64_t table = 0;
         std::wstring resolveError;
-        const std::wstring candidates[] = {
-            L"nt!PiDDBCacheTable",
-            L"nt!PiDDBCacheList"
-        };
-        for (const std::wstring& name : candidates)
+        if (!symbols_.ResolveSymbol(L"nt!PiDDBCacheTable", &table, &resolveError))
         {
-            if (symbols_.ResolveSymbol(name, &table, &resolveError))
-            {
-                break;
-            }
             table = 0;
-        }
-        if (table == 0)
-        {
-            result->CoverageNotes.push_back(
-                L"nt!PiDDBCacheTable was not resolved; PiDDB coverage is absent");
-            if (error != nullptr)
-            {
-                *error = resolveError;
-            }
-            break;
         }
 
         result->PiDDBCacheTable = table;
-        if (!LooksLikeAvlTable(device_, symbols_, table))
+        const AvlTableLayout avlLayout = ResolveAvlTableLayout(symbols_);
+        std::vector<uint64_t> nodes;
+        bool complete = false;
+        bool usedAvl = false;
+        if (table != 0 && LooksLikeAvlTable(device_, symbols_, table, avlLayout))
         {
-            result->Warnings.push_back(
-                L"nt!PiDDBCacheTable does not look like RTL_AVL_TABLE; walk aborted");
+            if (!WalkAvlInOrder(device_, table, avlLayout, &nodes, &complete))
+            {
+                result->Warnings.push_back(L"PiDDB AVL walk failed");
+            }
+            else
+            {
+                usedAvl = true;
+                result->PiddbWalkMode = L"avl";
+                uint32_t declared = 0;
+                uint64_t countAddr = 0;
+                if (LeftoverTryAdd(table, avlLayout.NumberGenericTableElements, &countAddr))
+                {
+                    LeftoverReadU32(device_, countAddr, &declared, nullptr);
+                }
+                result->PiddbElementCount = declared;
+            }
+        }
+
+        if (!usedAvl)
+        {
+            uint64_t listHead = 0;
+            if (symbols_.ResolveSymbol(L"nt!PiDDBCacheList", &listHead, nullptr) &&
+                LeftoverIsKernelCanonical(listHead))
+            {
+                uint64_t flink = 0;
+                if (LeftoverReadU64(device_, listHead, &flink, nullptr))
+                {
+                    uint64_t current = flink;
+                    uint32_t steps = 0;
+                    complete = true;
+                    while (current != 0 && current != listHead && steps < kMaxPiddbListEntries)
+                    {
+                        ++steps;
+                        if (!LeftoverIsKernelCanonical(current))
+                        {
+                            complete = false;
+                            break;
+                        }
+                        nodes.push_back(current);
+                        uint64_t next = 0;
+                        if (!LeftoverReadU64(device_, current, &next, nullptr) || next == current)
+                        {
+                            complete = false;
+                            break;
+                        }
+                        current = next;
+                    }
+                    if (steps >= kMaxPiddbListEntries)
+                    {
+                        complete = false;
+                    }
+                    result->PiddbWalkMode = L"list";
+                    result->PiddbElementCount = static_cast<uint32_t>(nodes.size());
+                    result->Warnings.push_back(
+                        L"PiDDB AVL header did not validate; walked nt!PiDDBCacheList");
+                }
+            }
+        }
+
+        if (nodes.empty() && result->PiddbWalkMode.empty())
+        {
+            if (table == 0)
+            {
+                result->CoverageNotes.push_back(
+                    L"nt!PiDDBCacheTable was not resolved; PiDDB coverage is absent");
+                if (error != nullptr)
+                {
+                    *error = resolveError;
+                }
+            }
+            else
+            {
+                result->Warnings.push_back(
+                    L"nt!PiDDBCacheTable does not look like RTL_AVL_TABLE and PiDDBCacheList was empty");
+            }
             break;
         }
         result->PiddbResolved = true;
-
-        uint32_t declared = 0;
-        uint64_t countAddr = 0;
-        if (LeftoverTryAdd(table, kAvlNumberOfElements, &countAddr))
-        {
-            LeftoverReadU32(device_, countAddr, &declared, nullptr);
-        }
-        result->PiddbElementCount = declared;
-
-        std::vector<uint64_t> nodes;
-        bool complete = false;
-        if (!WalkAvlInOrder(device_, table, &nodes, &complete))
-        {
-            result->Warnings.push_back(L"PiDDB AVL walk failed");
-            break;
-        }
         result->PiddbComplete = complete;
         if (!complete)
         {
-            result->Warnings.push_back(L"PiDDB AVL walk hit the node cap or a cycle");
+            result->Warnings.push_back(L"PiDDB walk hit the node cap or a cycle");
         }
 
+        const bool listEntries = (result->PiddbWalkMode == L"list");
+
         uint32_t nameOffset = 0x10;
-        uint32_t timeOffset = 0x20;
-        uint32_t statusOffset = 0x24;
         const std::wstring typeNames[] = {
             L"nt!_DDBCACHE_ENTRY",
             L"nt!_PIDDB_CACHE_ENTRY",
@@ -559,26 +914,16 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
         for (const std::wstring& typeName : typeNames)
         {
             TypeFieldInfo field = {};
-            if (symbols_.FindField(typeName, L"DriverName", &field, nullptr))
+            if (symbols_.FindField(typeName, L"DriverName", &field, nullptr) &&
+                field.Offset != 0 &&
+                field.Offset <= 0x40)
             {
                 nameOffset = field.Offset;
                 layoutFromPdb = true;
-            }
-            if (symbols_.FindField(typeName, L"TimeDateStamp", &field, nullptr))
-            {
-                timeOffset = field.Offset;
-                layoutFromPdb = true;
-            }
-            if (symbols_.FindField(typeName, L"LoadStatus", &field, nullptr))
-            {
-                statusOffset = field.Offset;
-            }
-            if (layoutFromPdb)
-            {
                 break;
             }
         }
-        if (!layoutFromPdb)
+        if (!layoutFromPdb && !nodes.empty())
         {
             result->Warnings.push_back(
                 L"PiDDB cache entry type was not in the PDB; using LIST_ENTRY+UNICODE_STRING fallback");
@@ -588,22 +933,21 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
         for (uint64_t node : nodes)
         {
             uint64_t entry = 0;
-            if (!LeftoverTryAdd(node, kAvlLinksSize, &entry))
-            {
-                continue;
-            }
-
-            uint64_t nameAddr = 0;
-            if (!LeftoverTryAdd(entry, nameOffset, &nameAddr))
-            {
-                continue;
-            }
-
+            uint32_t usedNameOffset = nameOffset;
             std::wstring name;
-            if (!ProbeUnicodeAt(device_, symbols_, nameAddr, &name) || name.empty())
+            if (!ProbePiddbDriverName(
+                    device_,
+                    symbols_,
+                    node,
+                    listEntries,
+                    nameOffset,
+                    &entry,
+                    &usedNameOffset,
+                    &name))
             {
                 continue;
             }
+            nameOffset = usedNameOffset;
 
             MapperPiddbRecord record = {};
             record.Index = index++;
@@ -612,25 +956,35 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
             record.DriverName = name;
             record.InLoadedModules = NameInLoadedModules(name);
 
+            const uint32_t usedTimeOffset = usedNameOffset + 0x10;
+            const uint32_t usedStatusOffset = usedNameOffset + 0x14;
             uint64_t timeAddr = 0;
             uint64_t statusAddr = 0;
-            if (LeftoverTryAdd(entry, timeOffset, &timeAddr))
+            if (LeftoverTryAdd(entry, usedTimeOffset, &timeAddr))
             {
                 LeftoverReadU32(device_, timeAddr, &record.TimeDateStamp, nullptr);
             }
-            if (LeftoverTryAdd(entry, statusOffset, &statusAddr))
+            if (LeftoverTryAdd(entry, usedStatusOffset, &statusAddr))
             {
                 LeftoverReadU32(device_, statusAddr, &record.LoadStatus, nullptr);
             }
 
             if (!record.InLoadedModules)
             {
-                LeftoverAppendNote(&record.Notes, L"name is not in the live module list");
-                if (!LeftoverLooksLikeDriverName(name) || record.TimeDateStamp == 0)
+                if (ExplainedByUnloadOrBootStack(result->Unloaded, name))
                 {
-                    record.Suspicious = true;
-                    LeftoverAppendNote(&record.Notes, L"implausible leftover cache entry");
-                    result->AnySuspicious = true;
+                    record.Expected = true;
+                    LeftoverAppendNote(&record.Notes, L"explained by unload log or dump/boot stack");
+                }
+                else
+                {
+                    LeftoverAppendNote(&record.Notes, L"name is not in the live module list");
+                    if (!LeftoverLooksLikeDriverName(name) || record.TimeDateStamp == 0)
+                    {
+                        record.Suspicious = true;
+                        LeftoverAppendNote(&record.Notes, L"implausible leftover cache entry");
+                        result->AnySuspicious = true;
+                    }
                 }
             }
             result->Piddb.push_back(record);
@@ -772,7 +1126,9 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
                 {
                     continue;
                 }
-                if (ProbeUnicodeAt(device_, symbols_, nameAddr, &name) && !name.empty())
+                if (ProbeUnicodeAt(device_, symbols_, nameAddr, &name) &&
+                    !name.empty() &&
+                    LeftoverLooksLikeDriverName(name))
                 {
                     named = true;
                     nameOffset = off;
@@ -791,17 +1147,23 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
                 record.Next = next;
                 record.DriverName = name;
                 record.InLoadedModules = NameInLoadedModules(name);
-                if (!LeftoverLooksLikeDriverName(name))
-                {
-                    continue;
-                }
                 if (!record.InLoadedModules)
                 {
-                    LeftoverAppendNote(&record.Notes, L"name is not in the live module list");
-                    if (name.find(L'.') == std::wstring::npos)
+                    if (ExplainedByUnloadOrBootStack(result->Unloaded, name))
                     {
-                        record.Suspicious = true;
-                        result->AnySuspicious = true;
+                        record.Expected = true;
+                        LeftoverAppendNote(
+                            &record.Notes,
+                            L"explained by unload log or dump/boot stack");
+                    }
+                    else
+                    {
+                        LeftoverAppendNote(&record.Notes, L"name is not in the live module list");
+                        if (name.find(L'.') == std::wstring::npos)
+                        {
+                            record.Suspicious = true;
+                            result->AnySuspicious = true;
+                        }
                     }
                 }
                 result->HashEntries.push_back(record);
@@ -815,6 +1177,10 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
             {
                 if (!LeftoverIsKernelCanonical(next))
                 {
+                    if (next != 0)
+                    {
+                        truncated = true;
+                    }
                     break;
                 }
                 current = next;
@@ -865,7 +1231,8 @@ bool MapperRemnantScanner::Scan(
         }
         LeftoverBuildModuleRanges(symbols_, &modules_);
 
-        if (options.IncludeUnloaded)
+        const bool keepUnloaded = options.IncludeUnloaded;
+        if (keepUnloaded || options.IncludePiddb || options.IncludeHash)
         {
             std::wstring localError;
             if (!ScanUnloaded(result, &localError) && !result->UnloadedResolved)
@@ -899,6 +1266,17 @@ bool MapperRemnantScanner::Scan(
             }
         }
 
+        if (!keepUnloaded)
+        {
+            result->Unloaded.clear();
+            result->MmUnloadedDrivers = 0;
+            result->MmUnloadedArray = 0;
+            result->MmLastUnloadedDriver = 0;
+            result->UnloadedSlotCount = 0;
+            result->UnloadedResolved = false;
+            result->UnloadedComplete = false;
+        }
+
         if (options.Limit != 0)
         {
             auto keepSuspiciousFirst = [](auto* items, uint32_t limit)
@@ -928,12 +1306,35 @@ bool MapperRemnantScanner::Scan(
                     items->end(),
                     [](const auto& item)
                     {
-                        return item.Suspicious || !item.InLoadedModules;
+                        return item.Suspicious || (!item.InLoadedModules && !item.Expected);
                     });
                 items->resize(limit);
             };
             keepLeftoverFirst(&result->Piddb, options.Limit);
             keepLeftoverFirst(&result->HashEntries, options.Limit);
+        }
+
+        result->AnySuspicious = false;
+        for (const MapperUnloadedRecord& record : result->Unloaded)
+        {
+            if (record.Suspicious)
+            {
+                result->AnySuspicious = true;
+            }
+        }
+        for (const MapperPiddbRecord& record : result->Piddb)
+        {
+            if (record.Suspicious)
+            {
+                result->AnySuspicious = true;
+            }
+        }
+        for (const MapperHashRecord& record : result->HashEntries)
+        {
+            if (record.Suspicious)
+            {
+                result->AnySuspicious = true;
+            }
         }
 
         ok = true;
@@ -960,6 +1361,7 @@ std::wstring BuildMapperJson(const MapperScanResult& result)
     out += L",\"hashComplete\":";
     out += result.HashComplete ? L"true" : L"false";
     out += L",\"hashWalkMode\":" + mcpjson::Quote(result.HashWalkMode);
+    out += L",\"piddbWalkMode\":" + mcpjson::Quote(result.PiddbWalkMode);
     out += L",\"mmUnloadedDrivers\":" + mcpjson::Quote(LeftoverFormatHex(result.MmUnloadedDrivers, 16));
     out += L",\"piDDBCacheTable\":" + mcpjson::Quote(LeftoverFormatHex(result.PiDDBCacheTable, 16));
     out += L",\"hashListSymbol\":" + mcpjson::Quote(result.HashListSymbolName);
@@ -980,6 +1382,11 @@ std::wstring BuildMapperJson(const MapperScanResult& result)
         out += record.StillPresent ? L"true" : L"false";
         out += L",\"stillExecutable\":";
         out += record.StillExecutable ? L"true" : L"false";
+        out += L",\"rangeReused\":";
+        out += record.RangeReused ? L"true" : L"false";
+        out += L",\"sameImageReload\":";
+        out += record.SameImageReload ? L"true" : L"false";
+        out += L",\"repeatCount\":" + std::to_wstring(record.RepeatCount);
         out += L",\"suspicious\":";
         out += record.Suspicious ? L"true" : L"false";
         out += L",\"notes\":" + mcpjson::Quote(record.Notes);
@@ -999,6 +1406,8 @@ std::wstring BuildMapperJson(const MapperScanResult& result)
         out += L",\"timeDateStamp\":" + std::to_wstring(record.TimeDateStamp);
         out += L",\"inLoadedModules\":";
         out += record.InLoadedModules ? L"true" : L"false";
+        out += L",\"expected\":";
+        out += record.Expected ? L"true" : L"false";
         out += L",\"suspicious\":";
         out += record.Suspicious ? L"true" : L"false";
         out += L",\"notes\":" + mcpjson::Quote(record.Notes);
@@ -1017,6 +1426,8 @@ std::wstring BuildMapperJson(const MapperScanResult& result)
         out += L",\"name\":" + mcpjson::Quote(record.DriverName);
         out += L",\"inLoadedModules\":";
         out += record.InLoadedModules ? L"true" : L"false";
+        out += L",\"expected\":";
+        out += record.Expected ? L"true" : L"false";
         out += L",\"suspicious\":";
         out += record.Suspicious ? L"true" : L"false";
         out += L",\"notes\":" + mcpjson::Quote(record.Notes);
@@ -1057,6 +1468,76 @@ bool MapperRemnantSelfTest()
             break;
         }
         if (!LeftoverLooksLikeUnicodeString(8, 16, 0xFFFFF80000001000ull))
+        {
+            ok = false;
+            break;
+        }
+
+        const AvlTableLayout fallback = {};
+        if (fallback.CompareRoutine != 0x48 ||
+            fallback.AllocateRoutine != 0x50 ||
+            fallback.FreeRoutine != 0x58 ||
+            fallback.NumberGenericTableElements != 0x2c)
+        {
+            ok = false;
+            break;
+        }
+
+        AvlTableLayout badRoutines = fallback;
+        badRoutines.CompareRoutine = 0x30;
+        badRoutines.AllocateRoutine = 0x38;
+        badRoutines.FreeRoutine = 0x40;
+        SanitizeAvlTableLayout(&badRoutines);
+        if (badRoutines.CompareRoutine != 0x48 ||
+            badRoutines.AllocateRoutine != 0x50 ||
+            badRoutines.FreeRoutine != 0x58)
+        {
+            ok = false;
+            break;
+        }
+
+        if (!LooksLikeDumpStackDriver(L"dump_storport.sys") ||
+            !LooksLikeDumpStackDriver(L"\\SystemRoot\\System32\\drivers\\Dumpstorport.sys") ||
+            !LooksLikeDumpStackDriver(L"dumpfve.sys") ||
+            LooksLikeDumpStackDriver(L"WdBoot.sys") ||
+            LooksLikeDumpStackDriver(L"capcom.sys"))
+        {
+            ok = false;
+            break;
+        }
+
+        std::vector<MapperUnloadedRecord> repeats;
+        MapperUnloadedRecord first = {};
+        first.Name = L"KnLiveDbg.sys";
+        first.StartAddress = 0xFFFFF80010000000ull;
+        first.EndAddress = 0xFFFFF80010001000ull;
+        first.SameImageReload = true;
+        MapperUnloadedRecord second = first;
+        second.EndAddress = 0xFFFFF80010001400ull;
+        repeats.push_back(first);
+        repeats.push_back(second);
+        CoalesceUnloadedRecords(&repeats);
+        if (repeats.size() != 1 ||
+            repeats[0].RepeatCount != 2 ||
+            repeats[0].EndAddress != 0xFFFFF80010001400ull)
+        {
+            ok = false;
+            break;
+        }
+
+        std::vector<MapperUnloadedRecord> damOnly;
+        MapperUnloadedRecord dam = {};
+        dam.Name = L"dam.sys";
+        dam.StartAddress = 0xFFFFF80020000000ull;
+        damOnly.push_back(dam);
+        if (!ExplainedByUnloadOrBootStack(
+                damOnly,
+                L"\\Windows\\System32\\drivers\\dam.sys") ||
+            ExplainedByUnloadOrBootStack(
+                repeats,
+                L"\\Windows\\System32\\DriverStore\\FileRepository\\x\\NetworkPrivacyPolicy.sys") ||
+            ExplainedByUnloadOrBootStack(damOnly, L"capcom.sys") ||
+            !ExplainedByUnloadOrBootStack(damOnly, L"dumpfve.sys"))
         {
             ok = false;
             break;
