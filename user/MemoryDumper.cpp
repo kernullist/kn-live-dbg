@@ -1835,13 +1835,33 @@ namespace
         ranges->push_back(range);
     }
 
+    void AddTranslationPathToRuns(
+        const PhysicalTranslationInfo& translation,
+        std::vector<PhysicalMemoryRange>* ranges)
+    {
+        if (ranges == nullptr)
+        {
+            return;
+        }
+
+        // WinDbg walks the dumped DTB. A leaf PFN without its PT/PD pages
+        // is invisible even when the data page itself is in the file.
+        AddPhysicalPageToRuns(translation.Pml5eAddress, ranges);
+        AddPhysicalPageToRuns(translation.Pml4eAddress, ranges);
+        AddPhysicalPageToRuns(translation.PdpteAddress, ranges);
+        AddPhysicalPageToRuns(translation.PdeAddress, ranges);
+        AddPhysicalPageToRuns(translation.PteAddress, ranges);
+        AddPhysicalPageToRuns(translation.PhysicalAddress, ranges);
+    }
+
     bool AddTranslatedVirtualPage(
         DeviceClient& device,
         uint64_t directoryTableBase,
         uint64_t virtualAddress,
         std::vector<PhysicalMemoryRange>* ranges,
         std::vector<std::wstring>* warnings,
-        const wchar_t* label)
+        const wchar_t* label,
+        bool allowCurrentCr3 = false)
     {
         bool ok = false;
 
@@ -1852,10 +1872,13 @@ namespace
                 break;
             }
 
-            const uint64_t dtb = MaskDirectoryTableBase(directoryTableBase);
+            uint64_t dtb = MaskDirectoryTableBase(directoryTableBase);
             if (dtb == 0)
             {
-                break;
+                if (!allowCurrentCr3)
+                {
+                    break;
+                }
             }
 
             PhysicalTranslationInfo translation = {};
@@ -1877,11 +1900,40 @@ namespace
                 break;
             }
 
-            AddPhysicalPageToRuns(translation.PhysicalAddress, ranges);
+            AddTranslationPathToRuns(translation, ranges);
             ok = true;
         } while (false);
 
         return ok;
+    }
+
+    bool AddTranslatedVirtualPageAnyCr3(
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        uint64_t virtualAddress,
+        std::vector<PhysicalMemoryRange>* ranges,
+        std::vector<std::wstring>* warnings,
+        const wchar_t* label)
+    {
+        if (AddTranslatedVirtualPage(
+                device,
+                directoryTableBase,
+                virtualAddress,
+                ranges,
+                nullptr,
+                nullptr))
+        {
+            return true;
+        }
+
+        return AddTranslatedVirtualPage(
+            device,
+            0,
+            virtualAddress,
+            ranges,
+            warnings,
+            label,
+            true);
     }
 
     bool ReadVirtualThroughDtb(
@@ -1993,20 +2045,99 @@ namespace
         HANDLE process = nullptr;
         if (processId != 0)
         {
-            process = OpenProcess(
+            const DWORD attempts[] = {
+                PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION,
                 PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE,
-                processId);
-            if (process == nullptr)
+                PROCESS_VM_READ | PROCESS_QUERY_INFORMATION
+            };
+            for (DWORD access : attempts)
             {
-                process = OpenProcess(
-                    PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-                    FALSE,
-                    processId);
+                process = OpenProcess(access, FALSE, processId);
+                if (process != nullptr)
+                {
+                    break;
+                }
             }
         }
 
         return process;
+    }
+
+    bool ForceUserPagePresent(HANDLE processHandle, uint64_t virtualAddress)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (processHandle == nullptr || virtualAddress == 0)
+            {
+                break;
+            }
+
+            const uintptr_t page = static_cast<uintptr_t>(virtualAddress & ~0xFFFull);
+            uint8_t bytes[0x1000] = {};
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(
+                    processHandle,
+                    reinterpret_cast<LPCVOID>(page),
+                    bytes,
+                    sizeof(bytes),
+                    &got) ||
+                got == 0)
+            {
+                uint8_t probe[8] = {};
+                if (!ReadProcessMemory(
+                        processHandle,
+                        reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(virtualAddress)),
+                        probe,
+                        sizeof(probe),
+                        &got) ||
+                    got == 0)
+                {
+                    break;
+                }
+
+                ok = true;
+                break;
+            }
+
+            using NtLockVirtualMemoryFn = LONG (NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
+            static NtLockVirtualMemoryFn ntLockVirtualMemory = nullptr;
+            static bool resolvedLock = false;
+            if (!resolvedLock)
+            {
+                HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+                if (ntdll != nullptr)
+                {
+                    ntLockVirtualMemory = reinterpret_cast<NtLockVirtualMemoryFn>(
+                        GetProcAddress(ntdll, "NtLockVirtualMemory"));
+                }
+                resolvedLock = true;
+            }
+
+            if (ntLockVirtualMemory != nullptr)
+            {
+                PVOID lockBase = reinterpret_cast<PVOID>(page);
+                SIZE_T lockSize = got;
+                ntLockVirtualMemory(processHandle, &lockBase, &lockSize, 1);
+            }
+
+            // Same-byte write forces a private hardware PTE for prototype
+            // / file-backed image pages that RPM can read without making
+            // the process PTE Present.
+            SIZE_T written = 0;
+            WriteProcessMemory(
+                processHandle,
+                reinterpret_cast<LPVOID>(page),
+                bytes,
+                got,
+                &written);
+            ok = true;
+        } while (false);
+
+        return ok;
     }
 
     bool ReadUserVirtualForDump(
@@ -2071,33 +2202,28 @@ namespace
         return ok;
     }
 
-    // ReadProcessMemory can page in prototype/file-backed user pages.
-    // The driver ReadProcessVirtual path uses MmCopyMemory and will not.
-    void FaultAndPinUserPage(
+    // ReadProcessMemory can copy file-backed bytes without installing a
+    // hardware PTE. Lock + same-byte WriteProcessMemory force Present.
+    bool FaultAndPinUserPage(
         DeviceClient& device,
         HANDLE processHandle,
         uint32_t processId,
         uint64_t eprocess,
         uint64_t createTime,
         uint64_t directoryTableBase,
+        uint64_t alternateDtb,
         uint64_t virtualAddress,
         std::vector<PhysicalMemoryRange>* ranges)
     {
+        bool ok = false;
         if (virtualAddress == 0 || ranges == nullptr)
         {
-            return;
+            return false;
         }
 
         if (processHandle != nullptr)
         {
-            uint8_t probe[8] = {};
-            SIZE_T got = 0;
-            ReadProcessMemory(
-                processHandle,
-                reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(virtualAddress)),
-                probe,
-                sizeof(probe),
-                &got);
+            ForceUserPagePresent(processHandle, virtualAddress);
         }
         else if (processId != 0 && eprocess != 0 && createTime != 0)
         {
@@ -2112,24 +2238,30 @@ namespace
                 nullptr);
         }
 
-        if (!AddTranslatedVirtualPage(
+        ok = AddTranslatedVirtualPage(
+            device,
+            directoryTableBase,
+            virtualAddress,
+            ranges,
+            nullptr,
+            nullptr);
+        if (!ok &&
+            alternateDtb != 0 &&
+            MaskDirectoryTableBase(alternateDtb) != MaskDirectoryTableBase(directoryTableBase))
+        {
+            ok = AddTranslatedVirtualPage(
                 device,
-                directoryTableBase,
+                alternateDtb,
                 virtualAddress,
                 ranges,
                 nullptr,
-                nullptr) &&
-            processHandle != nullptr)
+                nullptr);
+        }
+
+        if (!ok && processHandle != nullptr)
         {
-            uint8_t probe[8] = {};
-            SIZE_T got = 0;
-            ReadProcessMemory(
-                processHandle,
-                reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(virtualAddress)),
-                probe,
-                sizeof(probe),
-                &got);
-            AddTranslatedVirtualPage(
+            ForceUserPagePresent(processHandle, virtualAddress);
+            ok = AddTranslatedVirtualPage(
                 device,
                 directoryTableBase,
                 virtualAddress,
@@ -2137,6 +2269,8 @@ namespace
                 nullptr,
                 nullptr);
         }
+
+        return ok;
     }
 
     void PinUserUnicodeStringPages(
@@ -2146,6 +2280,7 @@ namespace
         uint64_t eprocess,
         uint64_t createTime,
         uint64_t directoryTableBase,
+        uint64_t alternateDtb,
         uint64_t stringVa,
         std::vector<PhysicalMemoryRange>* ranges)
     {
@@ -2161,6 +2296,7 @@ namespace
             eprocess,
             createTime,
             directoryTableBase,
+            alternateDtb,
             stringVa,
             ranges);
 
@@ -2194,6 +2330,7 @@ namespace
             eprocess,
             createTime,
             directoryTableBase,
+            alternateDtb,
             buffer,
             ranges);
         FaultAndPinUserPage(
@@ -2203,6 +2340,7 @@ namespace
             eprocess,
             createTime,
             directoryTableBase,
+            alternateDtb,
             buffer + static_cast<uint64_t>(length) - 1,
             ranges);
     }
@@ -2215,6 +2353,7 @@ namespace
         uint64_t eprocess,
         uint64_t createTime,
         uint64_t userDtb,
+        uint64_t kernelDtb,
         uint64_t peb,
         std::vector<PhysicalMemoryRange>* ranges,
         std::vector<std::wstring>* warnings)
@@ -2287,6 +2426,7 @@ namespace
                 eprocess,
                 createTime,
                 userDtb,
+                kernelDtb,
                 peb,
                 ranges);
             FaultAndPinUserPage(
@@ -2296,6 +2436,7 @@ namespace
                 eprocess,
                 createTime,
                 userDtb,
+                kernelDtb,
                 peb + ldrField.Offset,
                 ranges);
 
@@ -2323,6 +2464,7 @@ namespace
                         eprocess,
                         createTime,
                         userDtb,
+                        kernelDtb,
                         imageBase,
                         ranges);
                 }
@@ -2358,13 +2500,14 @@ namespace
                 break;
             }
 
-            FaultAndPinUserPage(
+            const bool ldrPinned = FaultAndPinUserPage(
                 device,
                 processHandle,
                 processId,
                 eprocess,
                 createTime,
                 userDtb,
+                kernelDtb,
                 ldr,
                 ranges);
             FaultAndPinUserPage(
@@ -2374,6 +2517,7 @@ namespace
                 eprocess,
                 createTime,
                 userDtb,
+                kernelDtb,
                 ldr + listField.Offset,
                 ranges);
             FaultAndPinUserPage(
@@ -2383,20 +2527,22 @@ namespace
                 eprocess,
                 createTime,
                 userDtb,
+                kernelDtb,
                 ldr + 0x80,
                 ranges);
             const uint64_t listHead = ldr + listField.Offset;
             std::vector<uint8_t> headBytes;
-            if (!ReadUserVirtualForDump(
-                    device,
-                    processHandle,
-                    processId,
-                    eprocess,
-                    createTime,
-                    userDtb,
-                    listHead,
-                    8,
-                    &headBytes))
+            const bool ldrReadable = ReadUserVirtualForDump(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                userDtb,
+                listHead,
+                8,
+                &headBytes);
+            if (!ldrReadable)
             {
                 if (warnings != nullptr)
                 {
@@ -2404,6 +2550,12 @@ namespace
                         L"PEB.Ldr page did not become present after fault-in");
                 }
                 break;
+            }
+
+            if (!ldrPinned && warnings != nullptr)
+            {
+                warnings->push_back(
+                    L"PEB.Ldr bytes were readable but the PFN still did not translate");
             }
 
             uint64_t flink = 0;
@@ -2430,6 +2582,7 @@ namespace
                     eprocess,
                     createTime,
                     userDtb,
+                    kernelDtb,
                     entry,
                     ranges);
                 FaultAndPinUserPage(
@@ -2439,6 +2592,7 @@ namespace
                     eprocess,
                     createTime,
                     userDtb,
+                    kernelDtb,
                     entry + 0x100,
                     ranges);
                 PinUserUnicodeStringPages(
@@ -2448,6 +2602,7 @@ namespace
                     eprocess,
                     createTime,
                     userDtb,
+                    kernelDtb,
                     entry + baseNameField.Offset,
                     ranges);
                 PinUserUnicodeStringPages(
@@ -2457,6 +2612,7 @@ namespace
                     eprocess,
                     createTime,
                     userDtb,
+                    kernelDtb,
                     entry + fullNameField.Offset,
                     ranges);
                 ++pinned;
@@ -3002,6 +3158,70 @@ namespace
         return ok;
     }
 
+    bool WriteDumpVirtualRangeAnyCr3(
+        HANDLE file,
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t virtualAddress,
+        const uint8_t* data,
+        uint32_t length,
+        std::wstring* error,
+        const wchar_t* what)
+    {
+        bool ok = false;
+        std::wstring firstError;
+        if (WriteDumpVirtualRange(
+                file,
+                device,
+                directoryTableBase,
+                ranges,
+                virtualAddress,
+                data,
+                length,
+                &firstError,
+                what))
+        {
+            ok = true;
+        }
+        else if (WriteDumpVirtualRange(
+                     file,
+                     device,
+                     0,
+                     ranges,
+                     virtualAddress,
+                     data,
+                     length,
+                     error,
+                     what))
+        {
+            ok = true;
+        }
+        else
+        {
+            PhysicalTranslationInfo translation = {};
+            std::wstring translateError;
+            if (device.TranslateVirtual(0, virtualAddress, length, &translation, &translateError) &&
+                translation.PhysicalAddress != 0 &&
+                translation.TranslatedLength != 0)
+            {
+                ok = WriteDumpPhysicalBytes(
+                    file,
+                    ranges,
+                    translation.PhysicalAddress,
+                    data,
+                    (std::min)(length, translation.TranslatedLength),
+                    error);
+            }
+            else if (error != nullptr)
+            {
+                *error = firstError.empty() ? translateError : firstError;
+            }
+        }
+
+        return ok;
+    }
+
     bool WritePrcbProcessorContext(
         HANDLE file,
         DeviceClient& device,
@@ -3050,7 +3270,7 @@ namespace
             context.Rip = rip;
             context.Rsp = rsp;
 
-            if (!WriteDumpVirtualRange(
+            if (!WriteDumpVirtualRangeAnyCr3(
                     file,
                     device,
                     directoryTableBase,
@@ -3068,7 +3288,7 @@ namespace
             {
                 const uint64_t specialCr3 = MaskDirectoryTableBase(directoryTableBase);
                 std::wstring cr3Error;
-                WriteDumpVirtualRange(
+                WriteDumpVirtualRangeAnyCr3(
                     file,
                     device,
                     directoryTableBase,
@@ -3084,6 +3304,84 @@ namespace
         } while (false);
 
         return ok;
+    }
+
+    void PatchPrcbLeftoverLiveDumpRip(
+        HANDLE file,
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t directoryTableBase,
+        uint64_t prcb,
+        uint64_t replacementRip,
+        std::vector<std::wstring>* warnings)
+    {
+        do
+        {
+            if (prcb == 0 || replacementRip == 0)
+            {
+                break;
+            }
+
+            uint64_t leftoverRip = 0;
+            symbols.ResolveSymbol(L"nt!IopLiveDumpCollectPages", &leftoverRip, nullptr);
+            if (!IsKernelCanonicalVa(leftoverRip))
+            {
+                break;
+            }
+
+            constexpr uint32_t kScanBytes = 0x20000;
+            std::vector<uint8_t> block;
+            if (!ReadKernelBytes(device, prcb, kScanBytes, &block) || block.size() < 16)
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"could not scan KPRCB for leftover live-dump RIP");
+                }
+                break;
+            }
+
+            uint32_t patched = 0;
+            for (size_t offset = 0; offset + sizeof(uint64_t) <= block.size(); offset += 8)
+            {
+                uint64_t value = 0;
+                std::memcpy(&value, block.data() + offset, sizeof(value));
+                if (value < leftoverRip || value > leftoverRip + 0x400)
+                {
+                    continue;
+                }
+
+                std::wstring patchError;
+                if (WriteDumpVirtualRangeAnyCr3(
+                        file,
+                        device,
+                        directoryTableBase,
+                        ranges,
+                        prcb + offset,
+                        reinterpret_cast<const uint8_t*>(&replacementRip),
+                        sizeof(replacementRip),
+                        &patchError,
+                        L"leftover IopLiveDumpCollectPages RIP"))
+                {
+                    ++patched;
+                }
+            }
+
+            if (warnings != nullptr)
+            {
+                if (patched > 0)
+                {
+                    warnings->push_back(
+                        L"replaced " + std::to_wstring(patched) +
+                        L" leftover IopLiveDumpCollectPages RIP value(s) in KPRCB");
+                }
+                else
+                {
+                    warnings->push_back(
+                        L"KPRCB scan found no leftover IopLiveDumpCollectPages RIP");
+                }
+            }
+        } while (false);
     }
 
     void ApplyProcessDumpWinDbgFixups(
@@ -3295,6 +3593,48 @@ namespace
                 {
                     result->Warnings.push_back(
                         L"KPRCB.ProcessorState patch failed: " + contextError);
+                }
+
+                PatchPrcbLeftoverLiveDumpRip(
+                    file,
+                    device,
+                    symbols,
+                    ranges,
+                    kernelDtb,
+                    prcb,
+                    fixup.HeaderRip,
+                    &result->Warnings);
+
+                uint64_t processorBlock = 0;
+                if (symbols.ResolveSymbol(L"nt!KiProcessorBlock", &processorBlock, nullptr) &&
+                    IsKernelCanonicalVa(processorBlock))
+                {
+                    uint64_t blockPrcb = 0;
+                    if (ReadKernelU64(device, processorBlock, &blockPrcb) &&
+                        IsKernelCanonicalVa(blockPrcb) &&
+                        blockPrcb != prcb)
+                    {
+                        std::wstring blockError;
+                        WritePrcbProcessorContext(
+                            file,
+                            device,
+                            symbols,
+                            ranges,
+                            kernelDtb,
+                            blockPrcb,
+                            fixup.HeaderRip,
+                            fixup.HeaderRsp,
+                            &blockError);
+                        PatchPrcbLeftoverLiveDumpRip(
+                            file,
+                            device,
+                            symbols,
+                            ranges,
+                            kernelDtb,
+                            blockPrcb,
+                            fixup.HeaderRip,
+                            &result->Warnings);
+                    }
                 }
             }
         } while (false);
@@ -5873,6 +6213,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
                 eprocess,
                 fixup.CreateTime,
                 userPinDtb,
+                pinDtb,
                 peb,
                 &ranges,
                 &walkWarnings);
@@ -5881,22 +6222,33 @@ bool DumpProcessVisibleMemoryToCrashDump(
         uint64_t kpcr = 0;
         if (ResolveLiveKpcr(device, &kpcr, nullptr, &walkWarnings) && kpcr != 0)
         {
-            AddTranslatedVirtualPage(device, pinDtb, kpcr, &ranges, &walkWarnings, L"KPCR");
-            AddTranslatedVirtualPage(device, pinDtb, kpcr + 0x180, &ranges, nullptr, nullptr);
+            AddTranslatedVirtualPageAnyCr3(device, pinDtb, kpcr, &ranges, &walkWarnings, L"KPCR");
+            AddTranslatedVirtualPageAnyCr3(device, pinDtb, kpcr + 0x180, &ranges, nullptr, nullptr);
             const uint64_t prcb = ResolveKpcrPrcb(device, symbols, kpcr);
-            AddTranslatedVirtualPage(device, pinDtb, prcb, &ranges, &walkWarnings, L"KPRCB");
+            AddTranslatedVirtualPageAnyCr3(device, pinDtb, prcb, &ranges, &walkWarnings, L"KPRCB");
+            for (uint32_t prcbOff = 0; prcbOff < 0x20000; prcbOff += kPageSize)
+            {
+                AddTranslatedVirtualPageAnyCr3(
+                    device,
+                    pinDtb,
+                    prcb + prcbOff,
+                    &ranges,
+                    nullptr,
+                    nullptr);
+            }
+
             uint64_t contextVa = 0;
             uint64_t specialVa = 0;
             if (ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, &specialVa))
             {
-                AddTranslatedVirtualPage(
+                AddTranslatedVirtualPageAnyCr3(
                     device,
                     pinDtb,
                     contextVa,
                     &ranges,
                     &walkWarnings,
                     L"ProcessorState.ContextFrame");
-                AddTranslatedVirtualPage(
+                AddTranslatedVirtualPageAnyCr3(
                     device,
                     pinDtb,
                     contextVa + (kDumpAmd64ContextBytes - 1),
@@ -5905,7 +6257,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
                     nullptr);
                 if (specialVa != 0)
                 {
-                    AddTranslatedVirtualPage(
+                    AddTranslatedVirtualPageAnyCr3(
                         device,
                         pinDtb,
                         specialVa,
@@ -6541,6 +6893,18 @@ bool DumpLiveProcessFilterSelfTest()
         std::memcpy(kernelBlob + 8, &kernelBuffer, sizeof(kernelBuffer));
         std::memcpy(kernelBlob, &nameBytes, sizeof(nameBytes));
         if (ParseUserUnicodeString64(kernelBlob, sizeof(kernelBlob), &parsedBuffer, &parsedLength))
+        {
+            break;
+        }
+
+        std::vector<PhysicalMemoryRange> pathRuns;
+        PhysicalTranslationInfo pathInfo = {};
+        pathInfo.PteAddress = 0xABC000 + 0x18;
+        pathInfo.PhysicalAddress = 0xDEF000 + 0x80;
+        AddTranslationPathToRuns(pathInfo, &pathRuns);
+        if (pathRuns.size() < 2 ||
+            pathRuns[0].BaseAddress != 0xABC000 ||
+            pathRuns[1].BaseAddress != 0xDEF000)
         {
             break;
         }
