@@ -45,6 +45,8 @@ struct MinifilterFilterRecord
     uint32_t Flags = 0;
     uint32_t OperationCount = 0;
     uint32_t ActiveOperationCount = 0;
+    uint32_t InstanceCount = 0;
+    uint32_t LiveCallbackCount = 0;
     uint64_t Frame = 0;
     uint64_t Filter = 0;
     uint64_t DriverObject = 0;
@@ -55,6 +57,7 @@ struct MinifilterFilterRecord
     std::wstring DriverModule;
     std::wstring Notes;
     bool WellKnownInbox = false;
+    bool LiveLayoutAvailable = false;
     std::vector<MinifilterIrpSlot> OperationsTable;
 };
 
@@ -68,6 +71,8 @@ struct MinifilterIrpChange
     bool PostChanged = false;
     bool UsedBackup = false;
     bool WellKnownInbox = false;
+    uint32_t LiveNodesChanged = 0;
+    uint32_t LiveNodesFailed = 0;
 };
 
 struct MinifilterIrpBatchResult
@@ -80,6 +85,8 @@ struct MinifilterIrpBatchResult
     uint32_t Changed = 0;
     uint32_t Skipped = 0;
     uint32_t Failed = 0;
+    uint32_t LiveNodesChanged = 0;
+    uint32_t LiveNodesFailed = 0;
     bool WellKnownInbox = false;
 };
 
@@ -135,3 +142,4 @@ std::wstring BuildMinifilterIrpJson(const MinifilterIrpScanResult& result);
 std::wstring BuildMinifilterIrpChangeJson(const MinifilterIrpChange& change);
 std::wstring BuildMinifilterIrpBatchJson(const MinifilterIrpBatchResult& batch);
 bool MinifilterIrpScannerSelfTest();
+uint32_t MinifilterCallbackIndexFromMajor(uint32_t majorFunction);

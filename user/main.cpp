@@ -16366,12 +16366,15 @@ static void PrintMinifilterHelp()
     std::wcout << L"  !minifilter enable-all <name|address> [/pre|/post|/both]\n";
     std::wcout << L"  !fltmgr is an alias for !minifilter\n";
     std::wcout << L"\n";
-    std::wcout << L"  Walks fltmgr!FltGlobals frames and FLT_FILTER.Operations (PDB layout).\n";
-    std::wcout << L"  list/show/irp are read-only. disable/enable write the PreOperation and/or\n";
-    std::wcout << L"  PostOperation pointers through the existing write IOCTL. disable saves the\n";
+    std::wcout << L"  Walks fltmgr!FltGlobals frames, FLT_FILTER.Operations, and the live\n";
+    std::wcout << L"  FLT_INSTANCE.CallbackNodes that FltMgr actually dispatches (PDB layout).\n";
+    std::wcout << L"  list/show/irp are read-only. disable/enable write PreOperation/PostOperation\n";
+    std::wcout << L"  on both the registration table and every attached instance. Operations-only\n";
+    std::wcout << L"  writes do not stop WdFilter; the instance nodes do. disable saves the\n";
     std::wcout << L"  original pointers in this session so enable can restore them.\n";
-    std::wcout << L"  disable <name> all and disable-all walk every registered slot; already-null\n";
-    std::wcout << L"  slots are skipped. enable-all restores every same-session backup.\n";
+    std::wcout << L"  disable <name> all and disable-all walk every registered slot and sweep any\n";
+    std::wcout << L"  leftover live nodes; already-null slots are skipped. enable-all restores\n";
+    std::wcout << L"  every same-session backup.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /pre /post /both  which callback to change (default both).\n";
@@ -16450,6 +16453,11 @@ static void PrintMinifilterFilter(const MinifilterFilterRecord& filter, bool ver
     std::wcout << L" frame=" << filter.FrameId
                << L" filter=" << HexTextWidth(filter.Filter, 16, true)
                << L" ops=" << filter.ActiveOperationCount << L"/" << filter.OperationCount;
+    if (filter.LiveLayoutAvailable)
+    {
+        std::wcout << L" instances=" << filter.InstanceCount
+                   << L" live=" << filter.LiveCallbackCount;
+    }
     if (!filter.DriverModule.empty())
     {
         std::wcout << L" driver=";
@@ -16736,7 +16744,13 @@ static void HandleMinifilterCommand(
                        << L" changed=" << batch.Changed
                        << L" skipped=" << batch.Skipped
                        << L" failed=" << batch.Failed
-                       << L" attempted=" << batch.Attempted << L"\n";
+                       << L" attempted=" << batch.Attempted
+                       << L" live_nodes=" << batch.LiveNodesChanged;
+            if (batch.LiveNodesFailed > 0)
+            {
+                std::wcout << L" live_failed=" << batch.LiveNodesFailed;
+            }
+            std::wcout << L"\n";
             for (const MinifilterIrpChange& change : batch.Changes)
             {
                 if (!change.PreChanged && !change.PostChanged)
@@ -16797,10 +16811,15 @@ static void HandleMinifilterCommand(
                    << L" post=" << HexTextWidth(change.Before.Post, 16, true) << L"\n";
         std::wcout << L"  after  pre=" << HexTextWidth(change.After.Pre, 16, true)
                    << L" post=" << HexTextWidth(change.After.Post, 16, true);
-        if (change.PreChanged || change.PostChanged)
+        if (change.PreChanged || change.PostChanged || change.LiveNodesChanged > 0)
         {
             std::wcout << L" ";
             PrintColoredText(L"UPDATED", KNDBG_COLOR_WARN);
+        }
+        std::wcout << L" live_nodes=" << change.LiveNodesChanged;
+        if (change.LiveNodesFailed > 0)
+        {
+            std::wcout << L" live_failed=" << change.LiveNodesFailed;
         }
         std::wcout << L"\n";
     } while (false);
@@ -27863,6 +27882,7 @@ static int RunConsoleSurfaceSelfTest()
                     minifilterHelp.find(L"IRP_MJ_CREATE") != std::wstring::npos &&
                     minifilterHelp.find(L"disable UnionFS all") != std::wstring::npos &&
                     minifilterHelp.find(L"disable-all UnionFS") != std::wstring::npos &&
+                    minifilterHelp.find(L"CallbackNodes") != std::wstring::npos &&
                     minifilterHelp.find(L"minifilter-irp-batch.v1") != std::wstring::npos &&
                     rootHelp.find(L"help !minifilter") != std::wstring::npos &&
                     rootHelp.find(L"disable <name> all") != std::wstring::npos,
