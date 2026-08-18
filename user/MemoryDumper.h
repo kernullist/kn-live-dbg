@@ -145,6 +145,7 @@ struct DumpKernelCrashResult
     bool KdbgWasEncoded = false;
     bool KptiRootMerged = false;
     bool CurrentProcessPatched = false;
+    bool Wow64Target = false;
     std::vector<std::wstring> Warnings;
 };
 
@@ -160,6 +161,7 @@ struct ProcessDumpWinDbgFixup
     uint64_t UserDirectoryTableBase = 0;
     uint64_t Peb = 0;
     uint64_t Thread = 0;
+    bool Wow64 = false;
 };
 
 struct DumpOsLiveResult
@@ -189,9 +191,9 @@ bool BuildCompleteDumpHeader(
 // rangesOverride, when non-null, replaces MmGetPhysicalMemoryRanges.
 // directoryTableBaseOverride, when non-zero, is stored as DirectoryTableBase
 // instead of CPU0 CR3. commentOverride replaces the default header comment.
-// processFixup, when non-null, marks the dump as a filtered live dump, merges
-// the KPTI user/kernel page-table root, and points CPU0 CurrentThread at the
-// target process so WinDbg's default context is that process.
+// processFixup, when non-null, marks the dump as a filtered live dump and
+// merges the KPTI user/kernel page-table root. CPU0 CurrentThread is left
+// alone so dbgeng keeps an AMD64 kernel context.
 bool DumpPhysicalMemoryToCrashDump(
     DeviceClient& device,
     SymbolEngine& symbols,
