@@ -73,7 +73,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 8. Virtual and physical display commands perform sparse reads for dump output. Readable bytes are printed normally, while unreadable bytes keep the requested layout and are shown as `??` or `0x????...` for wider units.
 9. `phys`, `pdb`, `pdw`, `pdd`, `pdq`, `!db`, `!dw`, `!dd`, and `!dq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
 10. `peb`, `pew`, `ped`, `peq`, `!eb`, `!ew`, `!ed`, and `!eq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; address-only form prompts with the current physical value before writing, and write mode starts enabled and can be disabled with `write off`.
-11. `dump-kernel <path>` asks the driver for RAM runs, writes a WinDbg `DUMP_HEADER64`, then streams each run through `IOCTL_KNDBG_READ_PHYSICAL`. Failed pages are zero-filled unless `/strict` is set. `dump-live <path>` does not use the driver; it calls `NtSystemDebugControl(SysDbgGetLiveKernelDump)`.
+11. `dump-kernel <path>` asks the driver for RAM runs, writes a WinDbg `DUMP_HEADER64`, then streams each run through `IOCTL_KNDBG_READ_PHYSICAL`. Failed pages are zero-filled unless `/strict` is set. `dump-live <path>` does not use the driver; it calls `NtSystemDebugControl(SysDbgGetLiveKernelDump)`. `dump-live /user <pid|eprocess>` walks that process DTB through the driver and writes a filtered complete dump, merging the KPTI user/kernel page-table root and retargeting CPU0 `CurrentThread` so WinDbg's default process is the target.
 
 ## Native Process Listing Flow
 
