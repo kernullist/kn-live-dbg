@@ -291,6 +291,270 @@ namespace
         return ok;
     }
 
+    bool ReadPe64NtHeaders(
+        DeviceClient& device,
+        uint64_t moduleBase,
+        IMAGE_NT_HEADERS64* nt)
+    {
+        bool ok = false;
+        do
+        {
+            if (nt == nullptr || moduleBase == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> dosBytes;
+            if (!device.ReadMemory(
+                    moduleBase,
+                    sizeof(IMAGE_DOS_HEADER),
+                    &dosBytes,
+                    nullptr,
+                    KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                dosBytes.size() < sizeof(IMAGE_DOS_HEADER))
+            {
+                break;
+            }
+
+            IMAGE_DOS_HEADER dos = {};
+            memcpy(&dos, dosBytes.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
+            {
+                break;
+            }
+
+            uint64_t ntVa = 0;
+            if (!LeftoverTryAdd(moduleBase, static_cast<uint32_t>(dos.e_lfanew), &ntVa))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> ntBytes;
+            if (!device.ReadMemory(
+                    ntVa,
+                    sizeof(IMAGE_NT_HEADERS64),
+                    &ntBytes,
+                    nullptr,
+                    KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                ntBytes.size() < sizeof(IMAGE_NT_HEADERS64))
+            {
+                break;
+            }
+
+            memcpy(nt, ntBytes.data(), sizeof(*nt));
+            if (nt->Signature != IMAGE_NT_SIGNATURE ||
+                nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            {
+                break;
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool FindPeExportByName(
+        DeviceClient& device,
+        uint64_t moduleBase,
+        uint64_t moduleSize,
+        const char* exportName,
+        uint64_t* address)
+    {
+        bool ok = false;
+        do
+        {
+            if (address == nullptr || exportName == nullptr || exportName[0] == 0)
+            {
+                break;
+            }
+
+            IMAGE_NT_HEADERS64 nt = {};
+            if (!ReadPe64NtHeaders(device, moduleBase, &nt) ||
+                nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
+            {
+                break;
+            }
+
+            const IMAGE_DATA_DIRECTORY dir =
+                nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (dir.VirtualAddress == 0 || dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY))
+            {
+                break;
+            }
+
+            uint64_t exportVa = 0;
+            if (!LeftoverTryAdd(moduleBase, dir.VirtualAddress, &exportVa))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> exportBytes;
+            if (!device.ReadMemory(
+                    exportVa,
+                    sizeof(IMAGE_EXPORT_DIRECTORY),
+                    &exportBytes,
+                    nullptr,
+                    KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                exportBytes.size() < sizeof(IMAGE_EXPORT_DIRECTORY))
+            {
+                break;
+            }
+
+            IMAGE_EXPORT_DIRECTORY exports = {};
+            memcpy(&exports, exportBytes.data(), sizeof(exports));
+            if (exports.NumberOfNames == 0 || exports.NumberOfNames > 4096 ||
+                exports.NumberOfFunctions == 0 || exports.NumberOfFunctions > 4096)
+            {
+                break;
+            }
+
+            uint64_t namesVa = 0;
+            uint64_t ordsVa = 0;
+            uint64_t funcsVa = 0;
+            if (!LeftoverTryAdd(moduleBase, exports.AddressOfNames, &namesVa) ||
+                !LeftoverTryAdd(moduleBase, exports.AddressOfNameOrdinals, &ordsVa) ||
+                !LeftoverTryAdd(moduleBase, exports.AddressOfFunctions, &funcsVa))
+            {
+                break;
+            }
+
+            const uint32_t nameBytes = exports.NumberOfNames * sizeof(uint32_t);
+            const uint32_t ordBytes = exports.NumberOfNames * sizeof(uint16_t);
+            const uint32_t funcBytes = exports.NumberOfFunctions * sizeof(uint32_t);
+            if (nameBytes > 0x2000 || ordBytes > 0x2000 || funcBytes > 0x2000)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> names;
+            std::vector<uint8_t> ords;
+            std::vector<uint8_t> funcs;
+            if (!device.ReadMemory(namesVa, nameBytes, &names, nullptr, KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                !device.ReadMemory(ordsVa, ordBytes, &ords, nullptr, KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                !device.ReadMemory(funcsVa, funcBytes, &funcs, nullptr, KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                names.size() < nameBytes ||
+                ords.size() < ordBytes ||
+                funcs.size() < funcBytes)
+            {
+                break;
+            }
+
+            const size_t wantedLen = strlen(exportName);
+            for (uint32_t index = 0; index < exports.NumberOfNames; ++index)
+            {
+                uint32_t nameRva = 0;
+                memcpy(&nameRva, names.data() + (index * sizeof(uint32_t)), sizeof(nameRva));
+                uint64_t nameVa = 0;
+                if (nameRva == 0 || !LeftoverTryAdd(moduleBase, nameRva, &nameVa))
+                {
+                    continue;
+                }
+
+                std::vector<uint8_t> label;
+                if (!device.ReadMemory(
+                        nameVa,
+                        static_cast<uint32_t>(wantedLen + 1),
+                        &label,
+                        nullptr,
+                        KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                    label.size() < wantedLen + 1)
+                {
+                    continue;
+                }
+                if (memcmp(label.data(), exportName, wantedLen) != 0 ||
+                    label[wantedLen] != 0)
+                {
+                    continue;
+                }
+
+                uint16_t ordinal = 0;
+                memcpy(&ordinal, ords.data() + (index * sizeof(uint16_t)), sizeof(ordinal));
+                if (ordinal >= exports.NumberOfFunctions)
+                {
+                    break;
+                }
+
+                uint32_t funcRva = 0;
+                memcpy(&funcRva, funcs.data() + (ordinal * sizeof(uint32_t)), sizeof(funcRva));
+                if (funcRva == 0 ||
+                    (funcRva >= dir.VirtualAddress &&
+                     funcRva < dir.VirtualAddress + dir.Size))
+                {
+                    // Forwarder, not a RVA in this image.
+                    break;
+                }
+                if (static_cast<uint64_t>(funcRva) >= moduleSize)
+                {
+                    break;
+                }
+
+                uint64_t funcVa = 0;
+                if (!LeftoverTryAdd(moduleBase, funcRva, &funcVa))
+                {
+                    break;
+                }
+                *address = funcVa;
+                ok = true;
+                break;
+            }
+        } while (false);
+        return ok;
+    }
+
+    bool ModuleLooksLikeKnLiveDbg(const std::wstring& imageName)
+    {
+        std::wstring stem = ToLowerCopy(LeftoverModuleBaseName(imageName));
+        const size_t dot = stem.find_last_of(L'.');
+        if (dot != std::wstring::npos)
+        {
+            stem = stem.substr(0, dot);
+        }
+        std::wstring compact;
+        compact.reserve(stem.size());
+        for (wchar_t ch : stem)
+        {
+            if (ch != L'-' && ch != L'_')
+            {
+                compact.push_back(ch);
+            }
+        }
+        return compact == L"knlivedbg";
+    }
+
+    bool FindDriverNopExport(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t* address)
+    {
+        bool ok = false;
+        do
+        {
+            if (address == nullptr)
+            {
+                break;
+            }
+
+            for (const KernelModuleInfo& module : symbols.Modules())
+            {
+                if (!ModuleLooksLikeKnLiveDbg(module.ImageName) &&
+                    !LeftoverNamesMatch(module.ImageName, L"KnLiveDbg.sys"))
+                {
+                    continue;
+                }
+                if (FindPeExportByName(
+                        device,
+                        module.Base,
+                        module.Size,
+                        "KnDbgMinifilterCallbackNop",
+                        address))
+                {
+                    ok = true;
+                    break;
+                }
+            }
+        } while (false);
+        return ok;
+    }
+
     bool FindGuardCfReturnZero(
         DeviceClient& device,
         uint64_t moduleBase,
@@ -305,55 +569,8 @@ namespace
                 break;
             }
 
-            // LeftoverReadBytes caps at 8 KB. Headers fit; the CFG table does not.
-            std::vector<uint8_t> headers;
-            if (!device.ReadMemory(
-                    moduleBase,
-                    0x1000,
-                    &headers,
-                    nullptr,
-                    KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
-                headers.size() < sizeof(IMAGE_DOS_HEADER))
-            {
-                break;
-            }
-
-            IMAGE_DOS_HEADER dos = {};
-            memcpy(&dos, headers.data(), sizeof(dos));
-            if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
-            {
-                break;
-            }
-
-            const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
-            if (ntOffset + sizeof(IMAGE_NT_HEADERS64) > headers.size())
-            {
-                uint64_t ntVa = 0;
-                if (!LeftoverTryAdd(moduleBase, ntOffset, &ntVa) ||
-                    !LeftoverReadBytes(device, ntVa, sizeof(IMAGE_NT_HEADERS64), &headers, nullptr) ||
-                    headers.size() < sizeof(IMAGE_NT_HEADERS64))
-                {
-                    break;
-                }
-            }
-
             IMAGE_NT_HEADERS64 nt = {};
-            if (ntOffset + sizeof(nt) <= headers.size() &&
-                headers.size() != sizeof(IMAGE_NT_HEADERS64))
-            {
-                memcpy(&nt, headers.data() + ntOffset, sizeof(nt));
-            }
-            else if (headers.size() >= sizeof(nt))
-            {
-                memcpy(&nt, headers.data(), sizeof(nt));
-            }
-            else
-            {
-                break;
-            }
-
-            if (nt.Signature != IMAGE_NT_SIGNATURE ||
-                nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+            if (!ReadPe64NtHeaders(device, moduleBase, &nt) ||
                 nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
             {
                 break;
@@ -503,16 +720,33 @@ namespace
             uint64_t found = 0;
             uint64_t base = 0;
             uint64_t size = 0;
-            std::wstring resolveError;
-            if (symbols.ResolveSymbol(L"KnLiveDbg!KnDbgMinifilterCallbackNop", &found, &resolveError) &&
-                LeftoverIsKernelCanonical(found))
-            {
-            }
-            else
+
+            // Prefer our exported nop. Do not require xor-eax-eax-ret bytes;
+            // /O2+/GS may add a frame. The function is written to return 0.
+            if (!FindDriverNopExport(device, symbols, &found))
             {
                 found = 0;
             }
-
+            if (found == 0)
+            {
+                uint64_t symbol = 0;
+                std::wstring resolveError;
+                if (symbols.ResolveSymbol(
+                        L"KnLiveDbg!KnDbgMinifilterCallbackNop",
+                        &symbol,
+                        &resolveError) &&
+                    LeftoverIsKernelCanonical(symbol))
+                {
+                    uint64_t driverBase = 0;
+                    uint64_t driverSize = 0;
+                    if (FindModuleRange(symbols, L"KnLiveDbg.sys", &driverBase, &driverSize) &&
+                        symbol >= driverBase &&
+                        symbol < driverBase + driverSize)
+                    {
+                        found = symbol;
+                    }
+                }
+            }
             if (found == 0 && FindModuleRange(symbols, L"KnLiveDbg.sys", &base, &size))
             {
                 FindGuardCfReturnZero(device, base, size, &found);
@@ -3192,6 +3426,13 @@ bool MinifilterIrpScannerSelfTest()
                 !BytesAreReturnZero(xorRaxRet, sizeof(xorRaxRet)) ||
                 !BytesAreReturnZero(endbrXorRet, sizeof(endbrXorRet)) ||
                 BytesAreReturnZero(notNop, sizeof(notNop)))
+            {
+                ok = false;
+                break;
+            }
+            if (!ModuleLooksLikeKnLiveDbg(L"KnLiveDbg.sys") ||
+                !ModuleLooksLikeKnLiveDbg(L"kn-live-dbg.sys") ||
+                ModuleLooksLikeKnLiveDbg(L"fltmgr.sys"))
             {
                 ok = false;
                 break;
