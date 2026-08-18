@@ -3,6 +3,7 @@
 #include "../shared/KnLiveDbgIoctl.h"
 
 #include <Windows.h>
+#include <intrin.h>
 #include <mindumpdef.h>
 #include <algorithm>
 #include <cstddef>
@@ -1227,6 +1228,7 @@ namespace
         const wchar_t* name,
         uint64_t* address,
         std::vector<std::wstring>* warnings);
+    bool WriteAll(HANDLE file, const void* data, DWORD length, std::wstring* error);
 
     bool ModuleNameIsNt(const std::wstring& imageName)
     {
@@ -1418,6 +1420,407 @@ namespace
         }
 
         return kdBlock;
+    }
+
+    uint64_t Rol64(uint64_t value, unsigned bits)
+    {
+        return _rotl64(value, bits & 63);
+    }
+
+    uint64_t Ror64(uint64_t value, unsigned bits)
+    {
+        return _rotr64(value, bits & 63);
+    }
+
+    void TransformKdbgBlock(
+        std::vector<uint8_t>* block,
+        uint64_t waitNever,
+        uint64_t waitAlways,
+        uint64_t swapXor,
+        bool decode)
+    {
+        if (block == nullptr || block->size() < 8)
+        {
+            return;
+        }
+
+        const unsigned rotate = static_cast<unsigned>(waitNever & 0xFFu);
+        const size_t count = block->size() / sizeof(uint64_t);
+        for (size_t index = 0; index < count; ++index)
+        {
+            uint64_t entry = 0;
+            std::memcpy(&entry, block->data() + (index * sizeof(entry)), sizeof(entry));
+            if (decode)
+            {
+                entry ^= waitNever;
+                entry = Rol64(entry, rotate);
+                entry ^= swapXor;
+                entry = _byteswap_uint64(entry);
+                entry ^= waitAlways;
+            }
+            else
+            {
+                entry ^= waitAlways;
+                entry = _byteswap_uint64(entry);
+                entry ^= swapXor;
+                entry = Ror64(entry, rotate);
+                entry ^= waitNever;
+            }
+
+            std::memcpy(block->data() + (index * sizeof(entry)), &entry, sizeof(entry));
+        }
+    }
+
+    bool KdbgTagIsPlain(const std::vector<uint8_t>& block)
+    {
+        uint32_t tag = 0;
+        if (block.size() < kKdbgHeaderTagOffset + sizeof(tag))
+        {
+            return false;
+        }
+
+        std::memcpy(&tag, block.data() + kKdbgHeaderTagOffset, sizeof(tag));
+        return tag == kKdbgOwnerTag;
+    }
+
+    bool DecodeEncodedKdbg(
+        std::vector<uint8_t>* block,
+        uint64_t waitNever,
+        uint64_t waitAlways,
+        uint64_t encodedFlagAddress,
+        uint64_t kdbgAddress)
+    {
+        bool ok = false;
+        if (block == nullptr)
+        {
+            return ok;
+        }
+
+        const uint64_t candidates[] = {
+            encodedFlagAddress | 0xffff000000000000ull,
+            encodedFlagAddress,
+            kdbgAddress | 0xffff000000000000ull,
+            kdbgAddress
+        };
+        const std::vector<uint8_t> original = *block;
+        for (uint64_t swapXor : candidates)
+        {
+            *block = original;
+            TransformKdbgBlock(block, waitNever, waitAlways, swapXor, true);
+            if (KdbgTagIsPlain(*block))
+            {
+                ok = true;
+                break;
+            }
+        }
+
+        if (!ok)
+        {
+            *block = original;
+        }
+
+        return ok;
+    }
+
+    uint32_t PlainKdbgSize(const std::vector<uint8_t>& block)
+    {
+        uint32_t size = 0;
+        if (block.size() >= kKdbgHeaderSizeOffset + sizeof(size))
+        {
+            std::memcpy(&size, block.data() + kKdbgHeaderSizeOffset, sizeof(size));
+        }
+
+        if (size < 0x200 || size > 0x800 || size > block.size())
+        {
+            size = static_cast<uint32_t>((std::min)(block.size(), static_cast<size_t>(0x400)));
+        }
+
+        size &= ~7u;
+        return size;
+    }
+
+    bool PhysicalToDumpOffset(
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t physicalAddress,
+        uint64_t* dumpOffset)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (dumpOffset == nullptr)
+            {
+                break;
+            }
+
+            uint64_t cursor = kCrashDumpHeaderBytes;
+            for (const PhysicalMemoryRange& range : ranges)
+            {
+                if (physicalAddress >= range.BaseAddress &&
+                    physicalAddress < range.BaseAddress + range.ByteCount)
+                {
+                    *dumpOffset = cursor + (physicalAddress - range.BaseAddress);
+                    ok = true;
+                    break;
+                }
+
+                cursor += range.ByteCount;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool WriteDumpVirtualRange(
+        HANDLE file,
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t virtualAddress,
+        const uint8_t* data,
+        uint32_t length,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (file == INVALID_HANDLE_VALUE || data == nullptr || length == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid dump-virtual patch request";
+                }
+                break;
+            }
+
+            uint32_t done = 0;
+            bool failed = false;
+            while (done < length)
+            {
+                PhysicalTranslationInfo translation = {};
+                std::wstring translateError;
+                if (!device.TranslateVirtual(
+                        directoryTableBase,
+                        virtualAddress + done,
+                        length - done,
+                        &translation,
+                        &translateError) ||
+                    translation.TranslatedLength == 0)
+                {
+                    if (error != nullptr)
+                    {
+                        std::wstringstream stream;
+                        stream << L"KDBG VA 0x" << std::hex << (virtualAddress + done)
+                               << L" did not translate: " << translateError;
+                        *error = stream.str();
+                    }
+                    failed = true;
+                    break;
+                }
+
+                uint32_t chunk = translation.TranslatedLength;
+                if (chunk > length - done)
+                {
+                    chunk = length - done;
+                }
+
+                uint64_t dumpOffset = 0;
+                if (!PhysicalToDumpOffset(ranges, translation.PhysicalAddress, &dumpOffset))
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"KDBG physical page is outside dumped RAM runs";
+                    }
+                    failed = true;
+                    break;
+                }
+
+                LARGE_INTEGER position = {};
+                position.QuadPart = static_cast<LONGLONG>(dumpOffset);
+                if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN))
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"SetFilePointerEx failed while patching KDBG";
+                    }
+                    failed = true;
+                    break;
+                }
+
+                std::wstring writeError;
+                if (!WriteAll(file, data + done, chunk, &writeError))
+                {
+                    if (error != nullptr)
+                    {
+                        *error = writeError;
+                    }
+                    failed = true;
+                    break;
+                }
+
+                done += chunk;
+            }
+
+            if (!failed && done == length)
+            {
+                ok = true;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    struct PreparedKdbg
+    {
+        uint64_t Address = 0;
+        uint64_t EncodedFlagAddress = 0;
+        std::vector<uint8_t> PlainBlock;
+        bool WasEncoded = false;
+        bool Ready = false;
+    };
+
+    PreparedKdbg PreparePlainKdbg(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t kdBlock,
+        std::vector<std::wstring>* warnings)
+    {
+        PreparedKdbg prepared;
+        prepared.Address = kdBlock;
+
+        do
+        {
+            if (kdBlock == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> block;
+            if (!ReadKernelBytes(device, kdBlock, 0x800, &block))
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"failed to read KdDebuggerDataBlock for decode");
+                }
+                break;
+            }
+
+            if (KdbgTagIsPlain(block))
+            {
+                block.resize(PlainKdbgSize(block));
+                prepared.PlainBlock = std::move(block);
+                prepared.Ready = true;
+                break;
+            }
+
+            uint64_t waitNever = 0;
+            uint64_t waitAlways = 0;
+            uint64_t encodedFlag = 0;
+            ResolveOptionalSymbol(symbols, L"nt!KiWaitNever", &waitNever, warnings);
+            ResolveOptionalSymbol(symbols, L"nt!KiWaitAlways", &waitAlways, warnings);
+            ResolveOptionalSymbol(symbols, L"nt!KdpDataBlockEncoded", &encodedFlag, warnings);
+            if (waitNever == 0 || waitAlways == 0 || encodedFlag == 0)
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"KdDebuggerDataBlock is encoded and KiWaitNever/Always/KdpDataBlockEncoded were not all resolved");
+                }
+                break;
+            }
+
+            uint64_t neverValue = 0;
+            uint64_t alwaysValue = 0;
+            if (!ReadKernelU64(device, waitNever, &neverValue) ||
+                !ReadKernelU64(device, waitAlways, &alwaysValue))
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"failed to read KDBG decode keys");
+                }
+                break;
+            }
+
+            prepared.EncodedFlagAddress = encodedFlag;
+            prepared.WasEncoded = true;
+            if (!DecodeEncodedKdbg(&block, neverValue, alwaysValue, encodedFlag, kdBlock))
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"KdCopyDataBlock-style decode did not produce a KDBG owner tag");
+                }
+                break;
+            }
+
+            block.resize(PlainKdbgSize(block));
+            prepared.PlainBlock = std::move(block);
+            prepared.Ready = true;
+        } while (false);
+
+        return prepared;
+    }
+
+    bool PatchPlainKdbgIntoDump(
+        HANDLE file,
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        const PreparedKdbg& prepared,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (!prepared.Ready || prepared.PlainBlock.empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"no decoded KDBG available to patch";
+                }
+                break;
+            }
+
+            if (!WriteDumpVirtualRange(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    prepared.Address,
+                    prepared.PlainBlock.data(),
+                    static_cast<uint32_t>(prepared.PlainBlock.size()),
+                    error))
+            {
+                break;
+            }
+
+            if (prepared.WasEncoded && prepared.EncodedFlagAddress != 0)
+            {
+                const uint8_t zero = 0;
+                std::wstring flagError;
+                if (!WriteDumpVirtualRange(
+                        file,
+                        device,
+                        directoryTableBase,
+                        ranges,
+                        prepared.EncodedFlagAddress,
+                        &zero,
+                        1,
+                        &flagError) &&
+                    error != nullptr)
+                {
+                    *error = L"decoded KDBG was written but KdpDataBlockEncoded clear failed: " +
+                        flagError;
+                    break;
+                }
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
     }
 
     bool ReadFieldU64(
@@ -2385,6 +2788,13 @@ bool DumpPhysicalMemoryToCrashDump(
 
         result->DirectoryTableBase = info.DirectoryTableBase;
         result->KdDebuggerDataBlock = info.KdDebuggerDataBlock;
+        PreparedKdbg preparedKdbg = PreparePlainKdbg(
+            device,
+            symbols,
+            info.KdDebuggerDataBlock,
+            &result->Warnings);
+        result->KdbgWasEncoded = preparedKdbg.WasEncoded;
+        result->KdbgPlain = preparedKdbg.Ready && !preparedKdbg.WasEncoded;
 
         CaptureLiveProcessorContext(
             device,
@@ -2559,6 +2969,37 @@ bool DumpPhysicalMemoryToCrashDump(
             result->Warnings.push_back(
                 L"zero-filled " + std::to_wstring(result->ChunksFailed) +
                 L" incomplete physical chunk(s)");
+        }
+
+        if (preparedKdbg.Ready && preparedKdbg.WasEncoded)
+        {
+            std::wstring patchError;
+            bool patched = PatchPlainKdbgIntoDump(
+                file,
+                device,
+                info.DirectoryTableBase,
+                ranges,
+                preparedKdbg,
+                &patchError);
+            if (!patched && (info.DirectoryTableBase & (kPageSize - 1ull)) != 0)
+            {
+                patched = PatchPlainKdbgIntoDump(
+                    file,
+                    device,
+                    info.DirectoryTableBase & ~(static_cast<uint64_t>(kPageSize) - 1ull),
+                    ranges,
+                    preparedKdbg,
+                    &patchError);
+            }
+
+            if (patched)
+            {
+                result->KdbgPlain = true;
+            }
+            else
+            {
+                result->Warnings.push_back(L"KDBG dump patch failed: " + patchError);
+            }
         }
 
         ok = true;
@@ -2838,6 +3279,44 @@ bool DumpOsLiveControlSelfTest()
         pages.HypervisorPages = 1;
         std::memcpy(&raw, &pages, sizeof(raw));
         if (raw != 1ul)
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DecodeKdbgSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        std::vector<uint8_t> plain(64, 0);
+        const uint32_t tag = kKdbgOwnerTag;
+        const uint32_t size = 0x380;
+        const uint64_t kernBase = 0xfffff804afa00000ull;
+        std::memcpy(plain.data() + kKdbgHeaderTagOffset, &tag, sizeof(tag));
+        std::memcpy(plain.data() + kKdbgHeaderSizeOffset, &size, sizeof(size));
+        std::memcpy(plain.data() + kKdbgKernBaseOffset, &kernBase, sizeof(kernBase));
+
+        const uint64_t waitNever = 0x0123456789abcdefull;
+        const uint64_t waitAlways = 0xfedcba9876543210ull;
+        const uint64_t encodedFlag = 0xfffff80012340000ull;
+        const uint64_t swapXor = encodedFlag | 0xffff000000000000ull;
+
+        std::vector<uint8_t> encoded = plain;
+        TransformKdbgBlock(&encoded, waitNever, waitAlways, swapXor, false);
+        if (KdbgTagIsPlain(encoded))
+        {
+            break;
+        }
+
+        if (!DecodeEncodedKdbg(&encoded, waitNever, waitAlways, encodedFlag, 0xfffff804b0801070ull) ||
+            encoded != plain)
         {
             break;
         }

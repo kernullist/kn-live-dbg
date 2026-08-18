@@ -137,6 +137,8 @@ struct DumpKernelCrashResult
     uint32_t ChunksRead = 0;
     uint32_t ChunksFailed = 0;
     bool Complete = false;
+    bool KdbgPlain = false;
+    bool KdbgWasEncoded = false;
     std::vector<std::wstring> Warnings;
 };
 
@@ -179,3 +181,6 @@ bool DumpOsLiveKernel(
 
 // Compile/runtime ABI check for SYSDBG_LIVEDUMP_CONTROL V1/V2. Self-test only.
 bool DumpOsLiveControlSelfTest();
+
+// Round-trip check for the Win8+ KdCopyDataBlock decoder. Self-test only.
+bool DecodeKdbgSelfTest();
