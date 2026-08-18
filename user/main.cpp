@@ -24179,6 +24179,13 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  writer. Only PID or _EPROCESS tokens are consumed after /user so a path\n";
     std::wcout << L"  like dump.dmp is not stolen as a process name. A bare image name such as\n";
     std::wcout << L"  notepad.exe after /user is an error, not an output path.\n";
+    std::wcout << L"  The process-filtered file is a kernel complete dump (PAGE/DU64), not a\n";
+    std::wcout << L"  user minidump (MDMP). WinDbg opens it as kd. The writer merges the KPTI\n";
+    std::wcout << L"  user+kernel page-table root, pins KDBG/EPROCESS/PEB, and points CPU0\n";
+    std::wcout << L"  CurrentThread at the target so !peb and lm u see that process. If the\n";
+    std::wcout << L"  default context is still wrong: .process /p /r <eprocess>\n";
+    std::wcout << L"  If WinDbg shows kd:x86 or truncates _ETHREAD to 32 bits: .effmach amd64\n";
+    std::wcout << L"  then .thread /p /r <ethread>. Header CONTEXT stays kernel x64 on purpose.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  dump-live .\\os-live.dmp\n";
@@ -24497,6 +24504,7 @@ static void HandleDumpLiveCommand(
                     target.Eprocess,
                     target.DirectoryTableBase,
                     target.UserDirectoryTableBase,
+                    target.HasPeb ? target.Peb : 0,
                     false,
                     &dumpResult,
                     &dumpError))
@@ -24520,6 +24528,9 @@ static void HandleDumpLiveCommand(
                        << L" dtb=0x" << dumpResult.DirectoryTableBase
                        << L" kdbg=0x" << dumpResult.KdDebuggerDataBlock
                        << L" kdbg_plain=" << (dumpResult.KdbgPlain ? L"yes" : L"no")
+                       << L" kpti_merged=" << (dumpResult.KptiRootMerged ? L"yes" : L"no")
+                       << L" current_thread=0x" << dumpResult.CurrentThread
+                       << L" current_process=" << (dumpResult.CurrentProcessPatched ? L"yes" : L"no")
                        << std::dec
                        << L" wrote=" << dumpResult.BytesWritten
                        << L" runs=" << dumpResult.RangeCount
@@ -24527,6 +24538,10 @@ static void HandleDumpLiveCommand(
                        << L" path=";
             PrintColoredText(path, KNDBG_COLOR_OK);
             std::wcout << L"\n";
+            std::wcout << L"  windbg: kernel complete dump of this process, not a user MDMP. "
+                          L".process /p /r 0x"
+                       << std::hex << target.Eprocess << std::dec
+                       << L" then !peb / lm u\n";
             break;
         }
 
@@ -27780,6 +27795,7 @@ static int RunConsoleSurfaceSelfTest()
             uint64_t pageCount = 0;
             uint32_t attributes = 0;
             uint32_t storedContextFlags = 0;
+            uint8_t kdSecondaryVersion = 0;
             char comment[32] = {};
             if (header.size() >= kCrashDumpHeaderBytes)
             {
@@ -27796,6 +27812,7 @@ static int RunConsoleSurfaceSelfTest()
                 std::memcpy(comment, header.data() + 0xFB0, sizeof(comment) - 1);
                 std::memcpy(&productType, header.data() + 0x1040, sizeof(productType));
                 std::memcpy(&suiteMask, header.data() + 0x1044, sizeof(suiteMask));
+                std::memcpy(&kdSecondaryVersion, header.data() + 0x104D, sizeof(kdSecondaryVersion));
                 std::memcpy(&attributes, header.data() + 0x1050, sizeof(attributes));
                 std::memcpy(&storedContextFlags, header.data() + 0x348 + 0x30, sizeof(storedContextFlags));
             }
@@ -27815,6 +27832,7 @@ static int RunConsoleSurfaceSelfTest()
                     required == kCrashDumpHeaderBytes + 0x2000ull &&
                     productType == 1 &&
                     suiteMask == 0x100 &&
+                    kdSecondaryVersion == 2 &&
                     attributes == 0 &&
                     storedContextFlags == 0x10000Bul &&
                     std::strncmp(comment, "kn-live-dbg header self-test", 27) == 0,
@@ -27829,6 +27847,28 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 !BuildCompleteDumpHeader(tooMany, headerInfo, &header, &headerError),
                 L"dump-kernel-header-rejects-too-many-runs");
+            headerInfo.DumpAttributes = 0x50;
+            headerInfo.BugCheckParameter1 = 0x1234;
+            headerInfo.BugCheckParameter2 = 0xffffaa0000001000ull;
+            std::vector<uint8_t> filterHeader;
+            std::wstring filterError;
+            uint32_t filterAttributes = 0;
+            uint64_t filterParam1 = 0;
+            uint64_t filterParam2 = 0;
+            const bool filterOk = BuildCompleteDumpHeader({run}, headerInfo, &filterHeader, &filterError);
+            if (filterHeader.size() >= kCrashDumpHeaderBytes)
+            {
+                std::memcpy(&filterParam1, filterHeader.data() + 0x40, sizeof(filterParam1));
+                std::memcpy(&filterParam2, filterHeader.data() + 0x48, sizeof(filterParam2));
+                std::memcpy(&filterAttributes, filterHeader.data() + 0x1050, sizeof(filterAttributes));
+            }
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                filterOk &&
+                    filterAttributes == 0x50 &&
+                    filterParam1 == 0x1234 &&
+                    filterParam2 == 0xffffaa0000001000ull,
+                L"dump-live-process-header-marks-filtered-live-dump");
         }
         {
             const std::wstring kernelHelp = CaptureDetailedHelpOutput({L"help", L"dump-kernel"}, 1);
@@ -27849,7 +27889,9 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 kernelHelp.find(L"DUMP_HEADER64") != std::wstring::npos &&
                     liveHelp.find(L"NtSystemDebugControl") != std::wstring::npos &&
-                    liveHelp.find(L"_EPROCESS") != std::wstring::npos,
+                    liveHelp.find(L"_EPROCESS") != std::wstring::npos &&
+                    liveHelp.find(L"KPTI") != std::wstring::npos &&
+                    liveHelp.find(L".process /p /r") != std::wstring::npos,
                 L"dump-kernel-and-dump-live-help-routes");
             const std::wstring rootHelp = CaptureDetailedHelpOutput({L"help"}, 0);
             CheckConsoleSurfaceSelfTest(

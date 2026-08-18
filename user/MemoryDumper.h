@@ -115,11 +115,14 @@ struct DumpKernelHeaderInfo
     uint64_t PsLoadedModuleList = 0;
     uint64_t PsActiveProcessHead = 0;
     uint64_t KdDebuggerDataBlock = 0;
+    uint64_t BugCheckParameter1 = 0;
+    uint64_t BugCheckParameter2 = 0;
     uint32_t MajorVersion = 0;
     uint32_t MinorVersion = 0;
     uint32_t NumberProcessors = 1;
     uint32_t ProductType = 1;
     uint32_t SuiteMask = 0;
+    uint32_t DumpAttributes = 0;
     std::string Comment;
     std::vector<uint8_t> ContextRecord;
 };
@@ -133,13 +136,30 @@ struct DumpKernelCrashResult
     uint64_t BytesWritten = 0;
     uint64_t DirectoryTableBase = 0;
     uint64_t KdDebuggerDataBlock = 0;
+    uint64_t CurrentThread = 0;
     uint32_t RangeCount = 0;
     uint32_t ChunksRead = 0;
     uint32_t ChunksFailed = 0;
     bool Complete = false;
     bool KdbgPlain = false;
     bool KdbgWasEncoded = false;
+    bool KptiRootMerged = false;
+    bool CurrentProcessPatched = false;
     std::vector<std::wstring> Warnings;
+};
+
+// Optional process-filter fixups for dump-live /user <pid|eprocess>.
+// WinDbg treats DUMP_TYPE_FULL as a kernel dump and walks header DTB plus
+// KPRCB.CurrentThread. KPTI leaves the process kernel CR3 user-half empty,
+// so user VA translation fails unless the dumped root is merged.
+struct ProcessDumpWinDbgFixup
+{
+    uint32_t ProcessId = 0;
+    uint64_t Eprocess = 0;
+    uint64_t KernelDirectoryTableBase = 0;
+    uint64_t UserDirectoryTableBase = 0;
+    uint64_t Peb = 0;
+    uint64_t Thread = 0;
 };
 
 struct DumpOsLiveResult
@@ -169,6 +189,9 @@ bool BuildCompleteDumpHeader(
 // rangesOverride, when non-null, replaces MmGetPhysicalMemoryRanges.
 // directoryTableBaseOverride, when non-zero, is stored as DirectoryTableBase
 // instead of CPU0 CR3. commentOverride replaces the default header comment.
+// processFixup, when non-null, marks the dump as a filtered live dump, merges
+// the KPTI user/kernel page-table root, and points CPU0 CurrentThread at the
+// target process so WinDbg's default context is that process.
 bool DumpPhysicalMemoryToCrashDump(
     DeviceClient& device,
     SymbolEngine& symbols,
@@ -179,7 +202,8 @@ bool DumpPhysicalMemoryToCrashDump(
     std::wstring* error,
     const std::vector<PhysicalMemoryRange>* rangesOverride = nullptr,
     uint64_t directoryTableBaseOverride = 0,
-    const char* commentOverride = nullptr);
+    const char* commentOverride = nullptr,
+    const ProcessDumpWinDbgFixup* processFixup = nullptr);
 
 // Walks the process DTB (user + kernel halves) and writes a complete dump of
 // resident pages so WinDbg can see that process's user address space.
@@ -191,6 +215,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
     uint64_t eprocess,
     uint64_t directoryTableBase,
     uint64_t userDirectoryTableBase,
+    uint64_t peb,
     bool abortOnReadFailure,
     DumpKernelCrashResult* result,
     std::wstring* error);

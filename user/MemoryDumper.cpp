@@ -1142,10 +1142,21 @@ namespace
         "SystemTime offset");
     static_assert(offsetof(DUMP_HEADER64, Comment) == 0xFB0,
         "Comment offset");
+    static_assert(offsetof(DUMP_HEADER64, BugCheckParameter1) == 0x40,
+        "BugCheckParameter1 offset");
     static_assert(offsetof(DUMP_HEADER64, ProductType) == 0x1040,
         "ProductType offset");
     static_assert(offsetof(DUMP_HEADER64, SuiteMask) == 0x1044,
         "SuiteMask offset");
+    static_assert(offsetof(DUMP_HEADER64, Attributes) == 0x1050,
+        "Attributes offset");
+    static_assert(offsetof(DUMP_HEADER64, KdSecondaryVersion) == 0x104D,
+        "KdSecondaryVersion must be 0x104D");
+
+    // WDBGEXTS.H: 0 = obsolete AMD64 CONTEXT_1, 2 = current CONTEXT.
+    // Leaving this 0 makes WinDbg parse ContextRecord as the pre-Vista
+    // layout, drop into kd:x86, and truncate KTHREAD to 32 bits.
+    constexpr UCHAR kKdSecondaryVersionAmd64Context = 2;
     static_assert(offsetof(PHYSICAL_MEMORY_DESCRIPTOR64, NumberOfPages) == 8,
         "NumberOfPages is 8-byte aligned after NumberOfRuns");
     static_assert(offsetof(PHYSICAL_MEMORY_DESCRIPTOR64, Run) == 16,
@@ -1153,10 +1164,24 @@ namespace
     static_assert(16 + (kCrashDumpMaxPhysicalRuns * 16) <= 700,
         "42 runs must fit in DMP_PHYSICAL_MEMORY_BLOCK_SIZE_64");
 
+    // DUMP_FILE_ATTRIBUTES bit layout from mindumpdef.h.
+    constexpr uint32_t kDumpAttrLiveDumpGenerated = 1u << 4;
+    constexpr uint32_t kDumpAttrFilterDumpFile = 1u << 6;
+    constexpr uint32_t kDumpAttrProcessFilter =
+        kDumpAttrLiveDumpGenerated | kDumpAttrFilterDumpFile;
+    constexpr uint32_t kPageTableRootHalfBytes = 256u * 8u;
+
     constexpr uint32_t kKdbgOwnerTag = 0x4742444B; // 'KDBG'
     constexpr uint32_t kKdbgHeaderTagOffset = 0x10;
     constexpr uint32_t kKdbgHeaderSizeOffset = 0x14;
     constexpr uint32_t kKdbgKernBaseOffset = 0x18;
+    // WinDbg with KdSecondaryVersion=2 expects AMD64 CONTEXT (0x4D0) then
+    // KSPECIAL_REGISTERS. Do not use sizeof(CONTEXT): a newer SDK CONTEXT
+    // can grow and overwrite the special-register block.
+    constexpr uint32_t kDumpAmd64ContextBytes = 0x4D0;
+    static_assert(sizeof(CONTEXT) >= 0x4D0, "AMD64 CONTEXT shrank below dump layout");
+    static_assert(kDumpAmd64ContextBytes + 0xF0 <= DMP_CONTEXT_RECORD_SIZE_64,
+        "CONTEXT + KSPECIAL_REGISTERS must fit in ContextRecord[3000]");
     constexpr uint32_t kSpecialCr0Offset = 0x00;
     constexpr uint32_t kSpecialCr2Offset = 0x08;
     constexpr uint32_t kSpecialCr3Offset = 0x10;
@@ -1230,6 +1255,16 @@ namespace
         uint64_t* address,
         std::vector<std::wstring>* warnings);
     bool WriteAll(HANDLE file, const void* data, DWORD length, std::wstring* error);
+    uint64_t MaskDirectoryTableBase(uint64_t value);
+    uint64_t RangeEnd(uint64_t base, uint64_t count);
+    bool ReadFieldU64(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t object,
+        const wchar_t* typeName,
+        const wchar_t* fieldName,
+        const uint32_t* fallbackOffset,
+        uint64_t* value);
 
     bool ModuleNameIsNt(const std::wstring& imageName)
     {
@@ -1557,8 +1592,8 @@ namespace
             uint64_t cursor = kCrashDumpHeaderBytes;
             for (const PhysicalMemoryRange& range : ranges)
             {
-                if (physicalAddress >= range.BaseAddress &&
-                    physicalAddress < range.BaseAddress + range.ByteCount)
+                const uint64_t rangeEnd = RangeEnd(range.BaseAddress, range.ByteCount);
+                if (physicalAddress >= range.BaseAddress && physicalAddress < rangeEnd)
                 {
                     *dumpOffset = cursor + (physicalAddress - range.BaseAddress);
                     ok = true;
@@ -1580,7 +1615,8 @@ namespace
         uint64_t virtualAddress,
         const uint8_t* data,
         uint32_t length,
-        std::wstring* error)
+        std::wstring* error,
+        const wchar_t* what = L"virtual")
     {
         bool ok = false;
 
@@ -1595,6 +1631,7 @@ namespace
                 break;
             }
 
+            const wchar_t* tag = (what != nullptr && what[0] != 0) ? what : L"virtual";
             uint32_t done = 0;
             bool failed = false;
             while (done < length)
@@ -1612,7 +1649,7 @@ namespace
                     if (error != nullptr)
                     {
                         std::wstringstream stream;
-                        stream << L"KDBG VA 0x" << std::hex << (virtualAddress + done)
+                        stream << tag << L" VA 0x" << std::hex << (virtualAddress + done)
                                << L" did not translate: " << translateError;
                         *error = stream.str();
                     }
@@ -1631,7 +1668,7 @@ namespace
                 {
                     if (error != nullptr)
                     {
-                        *error = L"KDBG physical page is outside dumped RAM runs";
+                        *error = std::wstring(tag) + L" physical page is outside dumped RAM runs";
                     }
                     failed = true;
                     break;
@@ -1670,6 +1707,495 @@ namespace
         } while (false);
 
         return ok;
+    }
+
+    bool WriteDumpPhysicalBytes(
+        HANDLE file,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t physicalAddress,
+        const uint8_t* data,
+        uint32_t length,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (file == INVALID_HANDLE_VALUE || data == nullptr || length == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"invalid dump-physical patch request";
+                }
+                break;
+            }
+
+            uint64_t dumpOffset = 0;
+            if (!PhysicalToDumpOffset(ranges, physicalAddress, &dumpOffset))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"physical page is outside dumped RAM runs";
+                }
+                break;
+            }
+
+            uint64_t remainingInRun = 0;
+            for (const PhysicalMemoryRange& range : ranges)
+            {
+                const uint64_t rangeEnd = RangeEnd(range.BaseAddress, range.ByteCount);
+                if (physicalAddress >= range.BaseAddress && physicalAddress < rangeEnd)
+                {
+                    remainingInRun = rangeEnd - physicalAddress;
+                    break;
+                }
+            }
+
+            if (remainingInRun < length)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"dump physical write crosses a run boundary";
+                }
+                break;
+            }
+
+            LARGE_INTEGER position = {};
+            position.QuadPart = static_cast<LONGLONG>(dumpOffset);
+            if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"SetFilePointerEx failed while patching dump page";
+                }
+                break;
+            }
+
+            if (!WriteAll(file, data, length, error))
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void MergeKptiDirectoryRoot(
+        std::vector<uint8_t>* kernelRoot,
+        const std::vector<uint8_t>& userRoot)
+    {
+        if (kernelRoot == nullptr ||
+            kernelRoot->size() < kPageSize ||
+            userRoot.size() < kPageSize)
+        {
+            return;
+        }
+
+        // User half is entries 0..255, kernel half is 256..511. Same split
+        // for PML4 (4-level) and PML5 (LA57). Copy only the user half into
+        // the process kernel CR3 root so one DTB translates both halves.
+        std::memcpy(kernelRoot->data(), userRoot.data(), kPageTableRootHalfBytes);
+    }
+
+    void AddPhysicalPageToRuns(
+        uint64_t physicalAddress,
+        std::vector<PhysicalMemoryRange>* ranges)
+    {
+        const uint64_t page = MaskDirectoryTableBase(physicalAddress);
+        if (page == 0 || ranges == nullptr)
+        {
+            return;
+        }
+
+        PhysicalMemoryRange range = {};
+        range.BaseAddress = page;
+        range.ByteCount = kPageSize;
+        ranges->push_back(range);
+    }
+
+    bool AddTranslatedVirtualPage(
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        uint64_t virtualAddress,
+        std::vector<PhysicalMemoryRange>* ranges,
+        std::vector<std::wstring>* warnings,
+        const wchar_t* label)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (ranges == nullptr || virtualAddress == 0)
+            {
+                break;
+            }
+
+            const uint64_t dtb = MaskDirectoryTableBase(directoryTableBase);
+            if (dtb == 0)
+            {
+                break;
+            }
+
+            PhysicalTranslationInfo translation = {};
+            std::wstring translateError;
+            if (!device.TranslateVirtual(
+                    dtb,
+                    virtualAddress,
+                    8,
+                    &translation,
+                    &translateError) ||
+                translation.TranslatedLength == 0 ||
+                translation.PhysicalAddress == 0)
+            {
+                if (warnings != nullptr && label != nullptr)
+                {
+                    warnings->push_back(
+                        std::wstring(L"could not pin ") + label + L": " + translateError);
+                }
+                break;
+            }
+
+            AddPhysicalPageToRuns(translation.PhysicalAddress, ranges);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ResolveLiveKpcr(
+        DeviceClient& device,
+        uint64_t* kpcr,
+        uint64_t* kernelGsOut,
+        std::vector<std::wstring>* warnings)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (kpcr == nullptr)
+            {
+                break;
+            }
+
+            *kpcr = 0;
+            uint64_t gsBase = 0;
+            uint64_t kernelGs = 0;
+            uint32_t ignoredCpu = 0;
+            std::wstring msrError;
+            if (!device.ReadMsr(KNDBG_MSR_IA32_GS_BASE, 0, &gsBase, &ignoredCpu, &msrError) &&
+                warnings != nullptr)
+            {
+                warnings->push_back(L"IA32_GS_BASE read failed: " + msrError);
+            }
+            device.ReadMsr(KNDBG_MSR_IA32_KERNEL_GS_BASE, 0, &kernelGs, &ignoredCpu, nullptr);
+            if (kernelGsOut != nullptr)
+            {
+                *kernelGsOut = kernelGs;
+            }
+
+            uint64_t candidate = 0;
+            if (IsKernelCanonicalVa(gsBase))
+            {
+                candidate = gsBase;
+            }
+            else if (IsKernelCanonicalVa(kernelGs))
+            {
+                candidate = kernelGs;
+            }
+
+            uint64_t self = 0;
+            if (candidate != 0 &&
+                ReadKernelU64(device, candidate + kKpcrSelfOffset, &self) &&
+                self != candidate)
+            {
+                if (IsKernelCanonicalVa(kernelGs) &&
+                    ReadKernelU64(device, kernelGs + kKpcrSelfOffset, &self) &&
+                    self == kernelGs)
+                {
+                    candidate = kernelGs;
+                }
+                else
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(L"GS_BASE did not validate as KPCR.Self");
+                    }
+                    candidate = 0;
+                }
+            }
+
+            if (candidate == 0)
+            {
+                break;
+            }
+
+            *kpcr = candidate;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    uint64_t FindFirstProcessThread(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t eprocess,
+        std::vector<std::wstring>* warnings)
+    {
+        uint64_t thread = 0;
+
+        do
+        {
+            if (eprocess == 0)
+            {
+                break;
+            }
+
+            TypeFieldInfo headField = {};
+            TypeFieldInfo entryField = {};
+            std::wstring headError;
+            std::wstring entryError;
+            bool haveList = false;
+            // KPROCESS/KTHREAD is the unambiguous pair. EPROCESS.ThreadListHead
+            // can resolve to the inherited KPROCESS field on flattened PDB
+            // layouts; pairing that with ETHREAD.ThreadListEntry yields a
+            // garbage CONTAINING_RECORD.
+            if (symbols.FindField(L"nt!_KPROCESS", L"ThreadListHead", &headField, &headError) &&
+                symbols.FindField(L"nt!_KTHREAD", L"ThreadListEntry", &entryField, &entryError))
+            {
+                haveList = true;
+            }
+            else if (
+                symbols.FindField(L"nt!_EPROCESS", L"ThreadListHead", &headField, &headError) &&
+                symbols.FindField(L"nt!_ETHREAD", L"ThreadListEntry", &entryField, &entryError) &&
+                headField.Offset > 0x200)
+            {
+                haveList = true;
+            }
+
+            if (!haveList)
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"process thread list offsets unavailable; WinDbg current process stays CPU0");
+                }
+                break;
+            }
+
+            uint32_t tebOffset = 0;
+            TypeFieldInfo tebField = {};
+            if (symbols.FindField(L"nt!_KTHREAD", L"Teb", &tebField, nullptr) &&
+                tebField.Offset <= 0x4000)
+            {
+                tebOffset = tebField.Offset;
+            }
+
+            uint32_t processOffset = 0;
+            TypeFieldInfo processField = {};
+            if (symbols.FindField(L"nt!_KTHREAD", L"Process", &processField, nullptr) &&
+                processField.Offset <= 0x4000)
+            {
+                processOffset = processField.Offset;
+            }
+
+            const uint64_t listHead = eprocess + headField.Offset;
+            uint64_t flink = 0;
+            if (!ReadKernelU64(device, listHead, &flink) ||
+                flink == 0 ||
+                flink == listHead)
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"target process thread list is empty");
+                }
+                break;
+            }
+
+            uint64_t first = 0;
+            uint64_t current = flink;
+            for (uint32_t index = 0; index < 64; ++index)
+            {
+                if (current == 0 || current == listHead)
+                {
+                    break;
+                }
+
+                if (current < entryField.Offset)
+                {
+                    break;
+                }
+
+                const uint64_t candidate = current - entryField.Offset;
+                if (!IsKernelCanonicalVa(candidate))
+                {
+                    break;
+                }
+
+                if (processOffset != 0)
+                {
+                    uint64_t owner = 0;
+                    if (!ReadKernelU64(device, candidate + processOffset, &owner) ||
+                        owner != eprocess)
+                    {
+                        uint64_t next = 0;
+                        if (!ReadKernelU64(device, current, &next) || next == current)
+                        {
+                            break;
+                        }
+
+                        current = next;
+                        continue;
+                    }
+                }
+
+                if (first == 0)
+                {
+                    first = candidate;
+                }
+
+                if (tebOffset != 0)
+                {
+                    uint64_t teb = 0;
+                    if (ReadKernelU64(device, candidate + tebOffset, &teb) &&
+                        teb != 0 &&
+                        teb < 0x00FFFFFFFFFFFFFFull)
+                    {
+                        thread = candidate;
+                        break;
+                    }
+                }
+
+                uint64_t next = 0;
+                if (!ReadKernelU64(device, current, &next) || next == current)
+                {
+                    break;
+                }
+
+                current = next;
+            }
+
+            if (thread == 0)
+            {
+                thread = first;
+            }
+        } while (false);
+
+        return thread;
+    }
+
+    void ApplyProcessDumpWinDbgFixups(
+        HANDLE file,
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        const ProcessDumpWinDbgFixup& fixup,
+        DumpKernelCrashResult* result)
+    {
+        do
+        {
+            if (result == nullptr || file == INVALID_HANDLE_VALUE)
+            {
+                break;
+            }
+
+            const uint64_t kernelDtb = MaskDirectoryTableBase(fixup.KernelDirectoryTableBase);
+            const uint64_t userDtb = MaskDirectoryTableBase(fixup.UserDirectoryTableBase);
+            result->CurrentThread = fixup.Thread;
+
+            if (userDtb != 0 && kernelDtb != 0 && userDtb != kernelDtb)
+            {
+                std::vector<uint8_t> kernelRoot;
+                std::vector<uint8_t> userRoot;
+                std::wstring readError;
+                if (device.ReadPhysical(kernelDtb, kPageSize, &kernelRoot, &readError) &&
+                    device.ReadPhysical(userDtb, kPageSize, &userRoot, &readError) &&
+                    kernelRoot.size() >= kPageSize &&
+                    userRoot.size() >= kPageSize)
+                {
+                    MergeKptiDirectoryRoot(&kernelRoot, userRoot);
+                    std::wstring patchError;
+                    if (WriteDumpPhysicalBytes(
+                            file,
+                            ranges,
+                            kernelDtb,
+                            kernelRoot.data(),
+                            kPageSize,
+                            &patchError))
+                    {
+                        result->KptiRootMerged = true;
+                    }
+                    else
+                    {
+                        result->Warnings.push_back(
+                            L"KPTI page-table root merge failed: " + patchError);
+                    }
+                }
+                else
+                {
+                    result->Warnings.push_back(
+                        L"could not read process CR3 roots for KPTI merge: " + readError);
+                }
+            }
+
+            if (fixup.Thread == 0 || kernelDtb == 0)
+            {
+                break;
+            }
+
+            uint64_t kpcr = 0;
+            if (!ResolveLiveKpcr(device, &kpcr, nullptr, &result->Warnings) || kpcr == 0)
+            {
+                result->Warnings.push_back(
+                    L"could not resolve CPU0 KPCR to retarget CurrentThread");
+                break;
+            }
+
+            uint64_t prcb = 0;
+            if (!ReadFieldU64(
+                    device,
+                    symbols,
+                    kpcr,
+                    L"nt!_KPCR",
+                    L"CurrentPrcb",
+                    &kKpcrCurrentPrcbOffset,
+                    &prcb) ||
+                !IsKernelCanonicalVa(prcb))
+            {
+                prcb = kpcr + 0x180;
+            }
+
+            uint32_t currentThreadOffset = kKprcbCurrentThreadFallback;
+            TypeFieldInfo currentThreadField = {};
+            if (symbols.FindField(L"nt!_KPRCB", L"CurrentThread", &currentThreadField, nullptr) &&
+                currentThreadField.Offset <= 0x4000)
+            {
+                currentThreadOffset = currentThreadField.Offset;
+            }
+
+            const uint64_t threadVa = fixup.Thread;
+            std::wstring patchError;
+            if (WriteDumpVirtualRange(
+                    file,
+                    device,
+                    kernelDtb,
+                    ranges,
+                    prcb + currentThreadOffset,
+                    reinterpret_cast<const uint8_t*>(&threadVa),
+                    sizeof(threadVa),
+                    &patchError,
+                    L"CurrentThread"))
+            {
+                result->CurrentProcessPatched = true;
+            }
+            else
+            {
+                result->Warnings.push_back(
+                    L"CurrentThread dump patch failed: " + patchError);
+            }
+        } while (false);
     }
 
     struct PreparedKdbg
@@ -1792,7 +2318,8 @@ namespace
                     prepared.Address,
                     prepared.PlainBlock.data(),
                     static_cast<uint32_t>(prepared.PlainBlock.size()),
-                    error))
+                    error,
+                    L"KDBG"))
             {
                 break;
             }
@@ -1809,7 +2336,8 @@ namespace
                         prepared.EncodedFlagAddress,
                         &zero,
                         1,
-                        &flagError) &&
+                        &flagError,
+                        L"KdpDataBlockEncoded") &&
                     error != nullptr)
                 {
                     *error = L"decoded KDBG was written but KdpDataBlockEncoded clear failed: " +
@@ -1872,17 +2400,22 @@ namespace
         SymbolEngine& symbols,
         const ControlRegisters& registers,
         std::vector<uint8_t>* contextRecord,
-        std::vector<std::wstring>* warnings)
+        std::vector<std::wstring>* warnings,
+        uint64_t specialCr3Override = 0)
     {
         if (contextRecord == nullptr)
         {
             return;
         }
 
-        contextRecord->assign(sizeof(CONTEXT) + kSpecialRegistersBytes, 0);
+        contextRecord->assign(kDumpAmd64ContextBytes + kSpecialRegistersBytes, 0);
 
         CONTEXT context = {};
-        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+        // CONTEXT_* already includes CONTEXT_AMD64 on x64. FLOATING_POINT is
+        // required because we publish MxCsr; without it dbgeng treats the
+        // record as a partial x86 user context.
+        context.ContextFlags =
+            CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
         context.MxCsr = 0x1F80;
         context.SegCs = 0x10;
         context.SegDs = 0x2B;
@@ -1892,7 +2425,6 @@ namespace
         context.SegGs = 0x2B;
         context.EFlags = 0x2;
 
-        uint64_t gsBase = 0;
         uint64_t kernelGs = 0;
         uint64_t fsBase = 0;
         uint64_t star = 0;
@@ -1900,13 +2432,6 @@ namespace
         uint64_t cstar = 0;
         uint64_t fmask = 0;
         uint32_t ignoredCpu = 0;
-        std::wstring msrError;
-        if (!device.ReadMsr(KNDBG_MSR_IA32_GS_BASE, 0, &gsBase, &ignoredCpu, &msrError) &&
-            warnings != nullptr)
-        {
-            warnings->push_back(L"IA32_GS_BASE read failed: " + msrError);
-        }
-        device.ReadMsr(KNDBG_MSR_IA32_KERNEL_GS_BASE, 0, &kernelGs, &ignoredCpu, nullptr);
         device.ReadMsr(KNDBG_MSR_IA32_FS_BASE, 0, &fsBase, &ignoredCpu, nullptr);
         device.ReadMsr(KNDBG_MSR_IA32_STAR, 0, &star, &ignoredCpu, nullptr);
         device.ReadMsr(KNDBG_MSR_IA32_LSTAR, 0, &lstar, &ignoredCpu, nullptr);
@@ -1914,35 +2439,7 @@ namespace
         device.ReadMsr(KNDBG_MSR_IA32_FMASK, 0, &fmask, &ignoredCpu, nullptr);
 
         uint64_t kpcr = 0;
-        if (IsKernelCanonicalVa(gsBase))
-        {
-            kpcr = gsBase;
-        }
-        else if (IsKernelCanonicalVa(kernelGs))
-        {
-            kpcr = kernelGs;
-        }
-
-        uint64_t self = 0;
-        if (kpcr != 0 &&
-            ReadKernelU64(device, kpcr + kKpcrSelfOffset, &self) &&
-            self != kpcr)
-        {
-            if (IsKernelCanonicalVa(kernelGs) &&
-                ReadKernelU64(device, kernelGs + kKpcrSelfOffset, &self) &&
-                self == kernelGs)
-            {
-                kpcr = kernelGs;
-            }
-            else
-            {
-                if (warnings != nullptr)
-                {
-                    warnings->push_back(L"GS_BASE did not validate as KPCR.Self");
-                }
-                kpcr = 0;
-            }
-        }
+        ResolveLiveKpcr(device, &kpcr, &kernelGs, warnings);
 
         uint64_t currentThread = 0;
         if (kpcr != 0)
@@ -1975,6 +2472,9 @@ namespace
             }
         }
 
+        // Header RIP must stay a kernel address from CPU0. Do not substitute
+        // the target process thread: a user/WOW64 trap frame makes dbgeng
+        // report "only x86 user-mode context" and truncate _ETHREAD to 32 bits.
         if (currentThread != 0)
         {
             uint64_t trapFrame = 0;
@@ -1995,7 +2495,8 @@ namespace
                 if (symbols.FindField(L"nt!_KTRAP_FRAME", L"Rip", &ripField, nullptr) &&
                     symbols.FindField(L"nt!_KTRAP_FRAME", L"Rsp", &rspField, nullptr) &&
                     ReadKernelU64(device, trapFrame + ripField.Offset, &rip) &&
-                    ReadKernelU64(device, trapFrame + rspField.Offset, &rsp))
+                    ReadKernelU64(device, trapFrame + rspField.Offset, &rsp) &&
+                    IsKernelCanonicalVa(rip))
                 {
                     context.Rip = rip;
                     context.Rsp = rsp;
@@ -2003,20 +2504,24 @@ namespace
             }
         }
 
-        std::memcpy(contextRecord->data(), &context, sizeof(context));
+        const size_t contextBytes = (std::min)(sizeof(context), static_cast<size_t>(kDumpAmd64ContextBytes));
+        std::memcpy(contextRecord->data(), &context, contextBytes);
 
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr0Offset, registers.Cr0);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr2Offset, registers.Cr2);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr3Offset, registers.Cr3);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr4Offset, registers.Cr4);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr8Offset, registers.Cr8);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialGsBaseOffset, kpcr != 0 ? kpcr : gsBase);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialGsSwapOffset, kernelGs);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialStarOffset, star);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialLstarOffset, lstar);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCstarOffset, cstar);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialFmaskOffset, fmask);
-        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialFsBaseOffset, fsBase);
+        const uint64_t specialCr3 = specialCr3Override != 0
+            ? MaskDirectoryTableBase(specialCr3Override)
+            : registers.Cr3;
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialCr0Offset, registers.Cr0);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialCr2Offset, registers.Cr2);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialCr3Offset, specialCr3);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialCr4Offset, registers.Cr4);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialCr8Offset, registers.Cr8);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialGsBaseOffset, kpcr);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialGsSwapOffset, kernelGs);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialStarOffset, star);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialLstarOffset, lstar);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialCstarOffset, cstar);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialFmaskOffset, fmask);
+        WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialFsBaseOffset, fsBase);
 
         IdtInfo idt = {};
         if (device.ReadIdt(0, &idt, nullptr) && idt.Base != 0)
@@ -2024,10 +2529,10 @@ namespace
             // KDESCRIPTOR: Pad[3], Limit, Base at +8.
             const uint16_t limit = static_cast<uint16_t>(idt.Limit);
             std::memcpy(
-                contextRecord->data() + sizeof(CONTEXT) + kSpecialIdtrOffset + 6,
+                contextRecord->data() + kDumpAmd64ContextBytes + kSpecialIdtrOffset + 6,
                 &limit,
                 sizeof(limit));
-            WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialIdtrOffset + 8, idt.Base);
+            WriteU64Raw(contextRecord, kDumpAmd64ContextBytes + kSpecialIdtrOffset + 8, idt.Base);
         }
 
         if (kpcr == 0 && warnings != nullptr)
@@ -3128,6 +3633,8 @@ bool BuildCompleteDumpHeader(
         dump.MachineImageType = IMAGE_FILE_MACHINE_AMD64;
         dump.NumberProcessors = info.NumberProcessors == 0 ? 1u : info.NumberProcessors;
         dump.BugCheckCode = kBugCheckLiveSystemDump;
+        dump.BugCheckParameter1 = info.BugCheckParameter1;
+        dump.BugCheckParameter2 = info.BugCheckParameter2;
         const char versionUser[] = "KnLiveDbg";
         std::memcpy(dump.VersionUser, versionUser, sizeof(versionUser) - 1);
         dump.KdDebuggerDataBlock = info.KdDebuggerDataBlock;
@@ -3163,6 +3670,8 @@ bool BuildCompleteDumpHeader(
 
         dump.ProductType = info.ProductType;
         dump.SuiteMask = info.SuiteMask;
+        dump.KdSecondaryVersion = kKdSecondaryVersionAmd64Context;
+        dump.Attributes.Attributes = info.DumpAttributes;
         if (!info.ContextRecord.empty())
         {
             const size_t copied = (std::min)(info.ContextRecord.size(), sizeof(dump.ContextRecord));
@@ -3187,7 +3696,8 @@ bool DumpPhysicalMemoryToCrashDump(
     std::wstring* error,
     const std::vector<PhysicalMemoryRange>* rangesOverride,
     uint64_t directoryTableBaseOverride,
-    const char* commentOverride)
+    const char* commentOverride,
+    const ProcessDumpWinDbgFixup* processFixup)
 {
     bool ok = false;
     HANDLE file = INVALID_HANDLE_VALUE;
@@ -3248,6 +3758,15 @@ bool DumpPhysicalMemoryToCrashDump(
         if (info.NumberProcessors == 0)
         {
             info.NumberProcessors = 1;
+        }
+        if (processFixup != nullptr)
+        {
+            // One processor context is enough for a process-filtered dump and
+            // stops WinDbg walking KiProcessorBlock[1..] that we did not pin.
+            info.NumberProcessors = 1;
+            info.DumpAttributes = kDumpAttrProcessFilter;
+            info.BugCheckParameter1 = processFixup->ProcessId;
+            info.BugCheckParameter2 = processFixup->Eprocess;
         }
         info.MajorVersion = 15;
         info.ProductType = VER_NT_WORKSTATION;
@@ -3337,7 +3856,8 @@ bool DumpPhysicalMemoryToCrashDump(
             symbols,
             registers,
             &info.ContextRecord,
-            &result->Warnings);
+            &result->Warnings,
+            info.DirectoryTableBase);
 
         std::vector<uint8_t> header;
         std::wstring headerError;
@@ -3553,6 +4073,17 @@ bool DumpPhysicalMemoryToCrashDump(
             }
         }
 
+        if (processFixup != nullptr)
+        {
+            ApplyProcessDumpWinDbgFixups(
+                file,
+                device,
+                symbols,
+                ranges,
+                *processFixup,
+                result);
+        }
+
         ok = true;
     } while (false);
 
@@ -3572,6 +4103,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
     uint64_t eprocess,
     uint64_t directoryTableBase,
     uint64_t userDirectoryTableBase,
+    uint64_t peb,
     bool abortOnReadFailure,
     DumpKernelCrashResult* result,
     std::wstring* error)
@@ -3706,6 +4238,78 @@ bool DumpProcessVisibleMemoryToCrashDump(
                 L"could not clip process PFNs to RAM map: " + ramError);
         }
 
+        ProcessDumpWinDbgFixup fixup = {};
+        fixup.ProcessId = processId;
+        fixup.Eprocess = eprocess;
+        fixup.KernelDirectoryTableBase = plan.HeaderDtb;
+        fixup.UserDirectoryTableBase = userDirectoryTableBase;
+        fixup.Peb = peb;
+        fixup.Thread = FindFirstProcessThread(device, symbols, eprocess, &walkWarnings);
+
+        AddPhysicalPageToRuns(plan.HeaderDtb, &ranges);
+        AddPhysicalPageToRuns(plan.PrimaryDtb, &ranges);
+        AddPhysicalPageToRuns(plan.SecondaryDtb, &ranges);
+        AddPhysicalPageToRuns(userDirectoryTableBase, &ranges);
+
+        const uint64_t pinDtb = plan.HeaderDtb != 0 ? plan.HeaderDtb : plan.PrimaryDtb;
+        const uint64_t userPinDtb =
+            MaskDirectoryTableBase(userDirectoryTableBase) != 0
+                ? userDirectoryTableBase
+                : pinDtb;
+        const uint64_t kdbg = ResolveKdDebuggerDataBlock(device, symbols, &walkWarnings);
+        AddTranslatedVirtualPage(device, pinDtb, kdbg, &ranges, &walkWarnings, L"KDBG");
+        AddTranslatedVirtualPage(device, pinDtb, eprocess, &ranges, &walkWarnings, L"EPROCESS");
+        if (eprocess != 0)
+        {
+            AddTranslatedVirtualPage(device, pinDtb, eprocess + kPageSize, &ranges, nullptr, nullptr);
+        }
+        AddTranslatedVirtualPage(device, pinDtb, fixup.Thread, &ranges, &walkWarnings, L"ETHREAD");
+        if (fixup.Thread != 0)
+        {
+            AddTranslatedVirtualPage(device, pinDtb, fixup.Thread + kPageSize, &ranges, nullptr, nullptr);
+        }
+        AddTranslatedVirtualPage(device, userPinDtb, peb, &ranges, &walkWarnings, L"PEB");
+        if (peb != 0)
+        {
+            AddTranslatedVirtualPage(device, userPinDtb, peb + kPageSize, &ranges, nullptr, nullptr);
+        }
+
+        uint64_t kpcr = 0;
+        if (ResolveLiveKpcr(device, &kpcr, nullptr, &walkWarnings) && kpcr != 0)
+        {
+            AddTranslatedVirtualPage(device, pinDtb, kpcr, &ranges, &walkWarnings, L"KPCR");
+            AddTranslatedVirtualPage(device, pinDtb, kpcr + 0x180, &ranges, nullptr, nullptr);
+        }
+
+        uint64_t loadedModules = 0;
+        if (ResolveOptionalSymbol(symbols, L"nt!PsLoadedModuleList", &loadedModules, &walkWarnings))
+        {
+            AddTranslatedVirtualPage(
+                device,
+                pinDtb,
+                loadedModules,
+                &ranges,
+                &walkWarnings,
+                L"PsLoadedModuleList");
+        }
+
+        const KernelModuleInfo* nt = FindNtModule(symbols);
+        if (nt != nullptr)
+        {
+            AddTranslatedVirtualPage(
+                device,
+                pinDtb,
+                nt->Base,
+                &ranges,
+                &walkWarnings,
+                L"ntoskrnl image header");
+        }
+
+        if (!ramRanges.empty())
+        {
+            IntersectPhysicalRunsWithAllowed(&ranges, ramRanges);
+        }
+
         if (ranges.empty())
         {
             if (error != nullptr)
@@ -3727,6 +4331,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
                    << L" eprocess=0x" << std::hex << eprocess
                    << L" dtb=0x" << headerDtb
                    << L" user_dtb=0x" << MaskDirectoryTableBase(userDirectoryTableBase)
+                   << L" thread=0x" << fixup.Thread
                    << std::dec
                    << L" runs=" << ranges.size()
                    << L" pages=" << pageCount << L"\n";
@@ -3750,7 +4355,8 @@ bool DumpProcessVisibleMemoryToCrashDump(
                 error,
                 &ranges,
                 headerDtb,
-                comment))
+                comment,
+                &fixup))
         {
             result->Warnings.insert(
                 result->Warnings.end(),
@@ -4186,6 +4792,37 @@ bool DumpLiveProcessFilterSelfTest()
             overlap[0].ByteCount != 0x2000 ||
             overlap[1].BaseAddress != 0x4000 ||
             overlap[1].ByteCount != 0x1000)
+        {
+            break;
+        }
+
+        std::vector<uint8_t> kernelRoot(0x1000, 0);
+        std::vector<uint8_t> userRoot(0x1000, 0);
+        for (uint32_t index = 0; index < 512; ++index)
+        {
+            const uint64_t userValue = 0x1000ull + index;
+            const uint64_t kernelValue = 0x2000ull + index;
+            std::memcpy(userRoot.data() + (index * 8), &userValue, sizeof(userValue));
+            std::memcpy(kernelRoot.data() + (index * 8), &kernelValue, sizeof(kernelValue));
+        }
+
+        MergeKptiDirectoryRoot(&kernelRoot, userRoot);
+        bool mergeOk = true;
+        for (uint32_t index = 0; index < 512; ++index)
+        {
+            uint64_t value = 0;
+            std::memcpy(&value, kernelRoot.data() + (index * 8), sizeof(value));
+            const uint64_t expected = index < 256
+                ? (0x1000ull + index)
+                : (0x2000ull + index);
+            if (value != expected)
+            {
+                mergeOk = false;
+                break;
+            }
+        }
+
+        if (!mergeOk)
         {
             break;
         }
