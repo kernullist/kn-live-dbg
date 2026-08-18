@@ -24240,7 +24240,9 @@ static void HandleDumpKernelCommand(
         std::wcout << L" header=0x" << std::hex << result.HeaderBytes
                    << L" payload=0x" << result.PayloadBytes
                    << L" dtb=0x" << result.DirectoryTableBase
-                   << L" kdbg=0x" << result.KdDebuggerDataBlock << std::dec
+                   << L" kdbg=0x" << result.KdDebuggerDataBlock
+                   << L" kdbg_plain=" << (result.KdbgPlain ? L"yes" : L"no")
+                   << L" kdbg_encoded=" << (result.KdbgWasEncoded ? L"yes" : L"no") << std::dec
                    << L" kernel_bytes=" << result.BytesRead
                    << L" zero_bytes=" << result.BytesZeroFilled
                    << L" wrote=" << result.BytesWritten
@@ -27627,6 +27629,10 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 DumpOsLiveControlSelfTest(),
                 L"dump-live-control-layout-is-sysdbg-v1-v2");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                DecodeKdbgSelfTest(),
+                L"dump-kernel-kdbg-decoder-round-trip");
             CheckConsoleSurfaceSelfTest(
                 &context,
                 kernelHelp.find(L"DUMP_HEADER64") != std::wstring::npos &&
