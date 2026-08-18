@@ -2323,12 +2323,18 @@ namespace
         if (!ParseUserUnicodeString64(raw.data(), raw.size(), &buffer, &length))
         {
             std::memcpy(&buffer, raw.data() + 8, sizeof(buffer));
-            if (!IsUserModeVa(buffer))
+            if (!IsUserModeVa(buffer) ||
+                (nameLength == 0 && nameMaximum == 0) ||
+                nameMaximum > 0x10000)
             {
                 return;
             }
 
-            length = nameMaximum != 0 ? nameMaximum : 2;
+            length = nameMaximum != 0 ? nameMaximum : nameLength;
+            if (length == 0 || length > 0x10000)
+            {
+                return;
+            }
         }
 
         FaultAndPinUserPage(
@@ -2351,7 +2357,7 @@ namespace
             alternateDtb,
             buffer + static_cast<uint64_t>(length) - 1,
             ranges);
-        if (nameMaximum > length)
+        if (nameMaximum > length && nameMaximum <= 0x10000)
         {
             FaultAndPinUserPage(
                 device,
@@ -3163,6 +3169,13 @@ namespace
             fixup->PrcbProcStateContextOffset = contextOffset;
         }
 
+        uint16_t specialOffset = 0;
+        if (ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbProcStateSpecialReg", &specialOffset) &&
+            specialOffset >= 0x40)
+        {
+            fixup->PrcbProcStateSpecialRegOffset = specialOffset;
+        }
+
         if (ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbContext", &pointerOffset) &&
             pointerOffset >= 0x8)
         {
@@ -3303,6 +3316,54 @@ namespace
         return ok;
     }
 
+    bool LooksLikeAmd64Context(DeviceClient& device, uint64_t contextVa)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (!IsKernelCanonicalVa(contextVa))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> flagBytes;
+            if (!ReadKernelBytes(
+                    device,
+                    contextVa + offsetof(CONTEXT, ContextFlags),
+                    sizeof(uint32_t),
+                    &flagBytes) ||
+                flagBytes.size() < sizeof(uint32_t))
+            {
+                break;
+            }
+
+            uint32_t flags = 0;
+            std::memcpy(&flags, flagBytes.data(), sizeof(flags));
+            ok = (flags & 0x100001ul) == 0x100001ul;
+        } while (false);
+
+        return ok;
+    }
+
+    uint32_t QueryPrcbSizeCap(SymbolEngine& symbols, uint32_t kdbgPrcbSize)
+    {
+        TypeLayoutInfo prcbLayout = {};
+        if (symbols.GetTypeLayout(L"nt!_KPRCB", &prcbLayout, nullptr) &&
+            prcbLayout.Size >= 0x400 &&
+            prcbLayout.Size <= 0x40000)
+        {
+            return static_cast<uint32_t>(prcbLayout.Size);
+        }
+
+        if (kdbgPrcbSize >= 0x400 && kdbgPrcbSize < 0xFFFF)
+        {
+            return kdbgPrcbSize;
+        }
+
+        return 0x40000;
+    }
+
     bool WriteKernelDumpContext(
         HANDLE file,
         DeviceClient& device,
@@ -3347,6 +3408,8 @@ namespace
         uint64_t prcb,
         uint32_t kdbgContextOffset,
         uint32_t kdbgContextPointerOffset,
+        uint32_t kdbgSpecialOffset,
+        uint32_t kdbgPrcbSize,
         uint64_t rip,
         uint64_t rsp,
         std::wstring* error)
@@ -3364,74 +3427,102 @@ namespace
                 break;
             }
 
-            uint64_t contextVa = 0;
-            uint64_t specialVa = 0;
-            if (!ResolvePrcbProcessorStateAddresses(
-                    symbols,
-                    prcb,
-                    kdbgContextOffset,
-                    &contextVa,
-                    &specialVa))
+            const uint32_t prcbCap = QueryPrcbSizeCap(symbols, kdbgPrcbSize);
+            uint64_t candidates[2] = {};
+            uint32_t candidateCount = 0;
+            if (kdbgContextOffset >= 0x40 &&
+                kdbgContextOffset <= 0x40000 &&
+                kdbgContextOffset + kDumpAmd64ContextBytes <= prcbCap)
             {
-                if (error != nullptr)
-                {
-                    *error = L"KPRCB.ProcessorState offset unavailable";
-                }
-                break;
-            }
-
-            if (!WriteKernelDumpContext(
-                    file,
-                    device,
-                    directoryTableBase,
-                    ranges,
-                    contextVa,
-                    rip,
-                    rsp,
-                    error,
-                    L"KPRCB.ProcessorState.ContextFrame"))
-            {
-                break;
+                candidates[candidateCount++] = prcb + kdbgContextOffset;
             }
 
             uint64_t pdbContextVa = 0;
             uint64_t pdbSpecialVa = 0;
             if (ResolvePrcbProcessorStateAddresses(symbols, prcb, 0, &pdbContextVa, &pdbSpecialVa) &&
-                pdbContextVa != 0 &&
-                pdbContextVa != contextVa)
+                pdbContextVa != 0)
             {
-                std::wstring pdbError;
-                WriteKernelDumpContext(
-                    file,
-                    device,
-                    directoryTableBase,
-                    ranges,
-                    pdbContextVa,
-                    rip,
-                    rsp,
-                    &pdbError,
-                    L"KPRCB PDB ContextFrame");
+                bool already = false;
+                for (uint32_t index = 0; index < candidateCount; ++index)
+                {
+                    if (candidates[index] == pdbContextVa)
+                    {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already && candidateCount < 2)
+                {
+                    candidates[candidateCount++] = pdbContextVa;
+                }
+            }
+
+            std::wstring lastError;
+            uint32_t wrote = 0;
+            for (uint32_t index = 0; index < candidateCount; ++index)
+            {
+                std::wstring writeError;
+                if (WriteKernelDumpContext(
+                        file,
+                        device,
+                        directoryTableBase,
+                        ranges,
+                        candidates[index],
+                        rip,
+                        rsp,
+                        &writeError,
+                        L"KPRCB processor context"))
+                {
+                    ++wrote;
+                }
+                else
+                {
+                    lastError = writeError;
+                }
             }
 
             if (kdbgContextPointerOffset >= 8 && kdbgContextPointerOffset <= 0x40000)
             {
                 uint64_t pointed = 0;
                 if (ReadKernelU64(device, prcb + kdbgContextPointerOffset, &pointed) &&
-                    IsKernelCanonicalVa(pointed) &&
-                    pointed != contextVa)
+                    LooksLikeAmd64Context(device, pointed))
                 {
-                    std::wstring pointerError;
-                    WriteKernelDumpContext(
-                        file,
-                        device,
-                        directoryTableBase,
-                        ranges,
-                        pointed,
-                        rip,
-                        rsp,
-                        &pointerError,
-                        L"KPRCB.Context");
+                    bool already = false;
+                    for (uint32_t index = 0; index < candidateCount; ++index)
+                    {
+                        if (candidates[index] == pointed)
+                        {
+                            already = true;
+                            break;
+                        }
+                    }
+                    if (!already)
+                    {
+                        std::wstring pointerError;
+                        WriteKernelDumpContext(
+                            file,
+                            device,
+                            directoryTableBase,
+                            ranges,
+                            pointed,
+                            rip,
+                            rsp,
+                            &pointerError,
+                            L"KPRCB.Context");
+                    }
                 }
+            }
+
+            uint64_t specialVa = 0;
+            if (kdbgSpecialOffset >= 0x40 &&
+                kdbgSpecialOffset <= 0x40000 &&
+                kdbgSpecialOffset + kSpecialCr3Offset + sizeof(uint64_t) <= prcbCap)
+            {
+                specialVa = prcb + kdbgSpecialOffset;
+            }
+            else if (pdbSpecialVa != 0)
+            {
+                specialVa = pdbSpecialVa;
             }
 
             if (specialVa != 0)
@@ -3448,6 +3539,17 @@ namespace
                     sizeof(specialCr3),
                     &cr3Error,
                     L"KPRCB.ProcessorState.Cr3");
+            }
+
+            if (wrote == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = lastError.empty()
+                        ? L"KPRCB.ProcessorState offset unavailable"
+                        : lastError;
+                }
+                break;
             }
 
             ok = true;
@@ -3483,61 +3585,111 @@ namespace
                 break;
             }
 
-            uint64_t contextVa = 0;
-            if (!ResolvePrcbProcessorStateAddresses(
+            uint64_t ripVas[3] = {};
+            uint32_t ripCount = 0;
+            uint64_t kdbgContextVa = 0;
+            if (ResolvePrcbProcessorStateAddresses(
                     symbols,
                     prcb,
                     kdbgContextOffset,
-                    &contextVa,
-                    nullptr) ||
-                contextVa == 0)
+                    &kdbgContextVa,
+                    nullptr) &&
+                kdbgContextVa != 0)
             {
-                break;
+                ripVas[ripCount++] = kdbgContextVa + offsetof(CONTEXT, Rip);
             }
 
-            const uint64_t ripVa = contextVa + offsetof(CONTEXT, Rip);
-            uint64_t liveRip = 0;
-            if (!ReadKernelU64(device, ripVa, &liveRip))
+            uint64_t pdbContextVa = 0;
+            if (kdbgContextOffset != 0 &&
+                ResolvePrcbProcessorStateAddresses(symbols, prcb, 0, &pdbContextVa, nullptr) &&
+                pdbContextVa != 0 &&
+                pdbContextVa != kdbgContextVa)
+            {
+                ripVas[ripCount++] = pdbContextVa + offsetof(CONTEXT, Rip);
+            }
+
+            uint32_t patched = 0;
+            for (uint32_t index = 0; index < ripCount; ++index)
+            {
+                uint64_t liveRip = 0;
+                if (!ReadKernelU64(device, ripVas[index], &liveRip) ||
+                    liveRip < leftoverRip ||
+                    liveRip > leftoverRip + 0x800)
+                {
+                    continue;
+                }
+
+                std::wstring patchError;
+                if (WriteDumpVirtualRangeAnyCr3(
+                        file,
+                        device,
+                        directoryTableBase,
+                        ranges,
+                        ripVas[index],
+                        reinterpret_cast<const uint8_t*>(&replacementRip),
+                        sizeof(replacementRip),
+                        &patchError,
+                        L"ProcessorState.ContextFrame.Rip"))
+                {
+                    ++patched;
+                }
+            }
+
+            const uint32_t prcbCap = QueryPrcbSizeCap(symbols, 0);
+            const uint32_t scanBytes = prcbCap > 0x20000 ? 0x20000 : prcbCap;
+            for (uint32_t pageOff = 0; pageOff < scanBytes; pageOff += kPageSize)
+            {
+                std::vector<uint8_t> page;
+                if (!ReadKernelBytes(device, prcb + pageOff, kPageSize, &page) ||
+                    page.size() < kPageSize)
+                {
+                    continue;
+                }
+
+                for (uint32_t inner = 0; inner + offsetof(CONTEXT, Rip) + 8 <= kPageSize; inner += 16)
+                {
+                    uint32_t flags = 0;
+                    uint16_t segCs = 0;
+                    uint64_t liveRip = 0;
+                    std::memcpy(&flags, page.data() + inner + offsetof(CONTEXT, ContextFlags), sizeof(flags));
+                    std::memcpy(&segCs, page.data() + inner + offsetof(CONTEXT, SegCs), sizeof(segCs));
+                    std::memcpy(&liveRip, page.data() + inner + offsetof(CONTEXT, Rip), sizeof(liveRip));
+                    if ((flags & 0x100001ul) != 0x100001ul ||
+                        segCs != 0x10 ||
+                        liveRip < leftoverRip ||
+                        liveRip > leftoverRip + 0x800)
+                    {
+                        continue;
+                    }
+
+                    const uint64_t ripVa = prcb + pageOff + inner + offsetof(CONTEXT, Rip);
+                    std::wstring scanError;
+                    if (WriteDumpVirtualRangeAnyCr3(
+                            file,
+                            device,
+                            directoryTableBase,
+                            ranges,
+                            ripVa,
+                            reinterpret_cast<const uint8_t*>(&replacementRip),
+                            sizeof(replacementRip),
+                            &scanError,
+                            L"KPRCB leftover CONTEXT.Rip"))
+                    {
+                        ++patched;
+                    }
+                }
+            }
+
+            if (patched > 0)
             {
                 if (warnings != nullptr)
                 {
                     warnings->push_back(
-                        L"could not read ProcessorState.ContextFrame.Rip for leftover dump RIP");
+                        L"replaced leftover IopLiveDumpCollectPages RIP in " +
+                        std::to_wstring(patched) + L" CONTEXT slot(s)");
                 }
-                break;
+                ok = true;
             }
-
-            if (liveRip < leftoverRip || liveRip > leftoverRip + 0x400)
-            {
-                break;
-            }
-
-            std::wstring patchError;
-            if (!WriteDumpVirtualRangeAnyCr3(
-                    file,
-                    device,
-                    directoryTableBase,
-                    ranges,
-                    ripVa,
-                    reinterpret_cast<const uint8_t*>(&replacementRip),
-                    sizeof(replacementRip),
-                    &patchError,
-                    L"ProcessorState.ContextFrame.Rip"))
-            {
-                if (warnings != nullptr)
-                {
-                    warnings->push_back(
-                        L"leftover IopLiveDumpCollectPages RIP patch failed: " + patchError);
-                }
-                break;
-            }
-
-            if (warnings != nullptr)
-            {
-                warnings->push_back(
-                    L"replaced leftover IopLiveDumpCollectPages RIP in ProcessorState.ContextFrame");
-            }
-            ok = true;
         } while (false);
 
         return ok;
@@ -3755,6 +3907,8 @@ namespace
                         prcb,
                         fixup.PrcbProcStateContextOffset,
                         fixup.PrcbContextOffset,
+                        fixup.PrcbProcStateSpecialRegOffset,
+                        fixup.PrcbSize,
                         fixup.HeaderRip,
                         fixup.HeaderRsp,
                         &contextError))
@@ -3800,6 +3954,8 @@ namespace
                             blockPrcb,
                             fixup.PrcbProcStateContextOffset,
                             fixup.PrcbContextOffset,
+                            fixup.PrcbProcStateSpecialRegOffset,
+                            fixup.PrcbSize,
                             fixup.HeaderRip,
                             fixup.HeaderRsp,
                             &blockError);
