@@ -153,24 +153,89 @@ namespace
         return out;
     }
 
+    size_t SkipIcallPrefixes(const uint8_t* bytes, size_t length)
+    {
+        size_t index = 0;
+        while (bytes != nullptr && index < length && index < 16)
+        {
+            if (index + 4 <= length &&
+                bytes[index] == 0xf3 &&
+                bytes[index + 1] == 0x0f &&
+                bytes[index + 2] == 0x1e &&
+                bytes[index + 3] == 0xfa)
+            {
+                index += 4;
+                continue;
+            }
+            if (index + 5 <= length &&
+                bytes[index] == 0x0f &&
+                bytes[index + 1] == 0x1f &&
+                bytes[index + 2] == 0x44 &&
+                bytes[index + 3] == 0x00 &&
+                bytes[index + 4] == 0x00)
+            {
+                index += 5;
+                continue;
+            }
+            if (index + 3 <= length &&
+                bytes[index] == 0x0f &&
+                bytes[index + 1] == 0x1f &&
+                bytes[index + 2] == 0x00)
+            {
+                index += 3;
+                continue;
+            }
+            if (index + 2 <= length &&
+                bytes[index] == 0x66 &&
+                bytes[index + 1] == 0x90)
+            {
+                index += 2;
+                continue;
+            }
+            if (bytes[index] == 0x90 || bytes[index] == 0xcc)
+            {
+                ++index;
+                continue;
+            }
+            break;
+        }
+        return index;
+    }
+
     bool BytesAreReturnZero(const uint8_t* bytes, size_t length)
     {
         bool match = false;
-        if (bytes != nullptr)
+        if (bytes != nullptr && length >= 3)
         {
-            if (length >= 3 &&
-                ((bytes[0] == 0x33 && bytes[1] == 0xc0 && bytes[2] == 0xc3) ||
-                 (bytes[0] == 0x31 && bytes[1] == 0xc0 && bytes[2] == 0xc3)))
+            const size_t prefix = SkipIcallPrefixes(bytes, length);
+            if (prefix < length)
             {
-                match = true;
-            }
-            else if (length >= 4 &&
-                     bytes[0] == 0x48 &&
-                     (bytes[1] == 0x33 || bytes[1] == 0x31) &&
-                     bytes[2] == 0xc0 &&
-                     bytes[3] == 0xc3)
-            {
-                match = true;
+                const uint8_t* body = bytes + prefix;
+                const size_t remaining = length - prefix;
+                if (remaining >= 3 &&
+                    ((body[0] == 0x33 && body[1] == 0xc0 && body[2] == 0xc3) ||
+                     (body[0] == 0x31 && body[1] == 0xc0 && body[2] == 0xc3)))
+                {
+                    match = true;
+                }
+                else if (remaining >= 4 &&
+                         body[0] == 0x48 &&
+                         (body[1] == 0x33 || body[1] == 0x31) &&
+                         body[2] == 0xc0 &&
+                         body[3] == 0xc3)
+                {
+                    match = true;
+                }
+                else if (remaining >= 6 &&
+                         body[0] == 0xb8 &&
+                         body[1] == 0x00 &&
+                         body[2] == 0x00 &&
+                         body[3] == 0x00 &&
+                         body[4] == 0x00 &&
+                         body[5] == 0xc3)
+                {
+                    match = true;
+                }
             }
         }
         return match;
@@ -189,9 +254,32 @@ namespace
             {
                 break;
             }
+            const std::wstring wanted = ToLowerCopy(LeftoverModuleBaseName(name));
+            std::wstring wantedStem = wanted;
+            const size_t wantedDot = wantedStem.find_last_of(L'.');
+            if (wantedDot != std::wstring::npos)
+            {
+                wantedStem = wantedStem.substr(0, wantedDot);
+            }
             for (const KernelModuleInfo& module : symbols.Modules())
             {
-                if (LeftoverNamesMatch(module.ImageName, name))
+                const std::wstring image = ToLowerCopy(LeftoverModuleBaseName(module.ImageName));
+                std::wstring imageStem = image;
+                const size_t imageDot = imageStem.find_last_of(L'.');
+                if (imageDot != std::wstring::npos)
+                {
+                    imageStem = imageStem.substr(0, imageDot);
+                }
+                const bool ntWanted =
+                    wantedStem == L"nt" ||
+                    wantedStem == L"ntoskrnl" ||
+                    wantedStem.rfind(L"ntkrnl", 0) == 0;
+                const bool ntImage =
+                    imageStem == L"ntoskrnl" ||
+                    imageStem.rfind(L"ntkrnl", 0) == 0;
+                if (LeftoverNamesMatch(module.ImageName, name) ||
+                    imageStem == wantedStem ||
+                    (ntWanted && ntImage))
                 {
                     *base = module.Base;
                     *size = module.Size;
@@ -219,7 +307,12 @@ namespace
 
             // LeftoverReadBytes caps at 8 KB. Headers fit; the CFG table does not.
             std::vector<uint8_t> headers;
-            if (!LeftoverReadBytes(device, moduleBase, 0x1000, &headers, nullptr) ||
+            if (!device.ReadMemory(
+                    moduleBase,
+                    0x1000,
+                    &headers,
+                    nullptr,
+                    KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
                 headers.size() < sizeof(IMAGE_DOS_HEADER))
             {
                 break;
@@ -363,7 +456,13 @@ namespace
                     }
 
                     std::vector<uint8_t> bytes;
-                    if (!LeftoverReadBytes(device, codeVa, 8, &bytes, nullptr) || bytes.size() < 3)
+                    if (!device.ReadMemory(
+                            codeVa,
+                            32,
+                            &bytes,
+                            nullptr,
+                            KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                        bytes.size() < 3)
                     {
                         continue;
                     }
@@ -404,7 +503,21 @@ namespace
             uint64_t found = 0;
             uint64_t base = 0;
             uint64_t size = 0;
-            if (FindModuleRange(symbols, L"fltmgr.sys", &base, &size))
+            std::wstring resolveError;
+            if (symbols.ResolveSymbol(L"KnLiveDbg!KnDbgMinifilterCallbackNop", &found, &resolveError) &&
+                LeftoverIsKernelCanonical(found))
+            {
+            }
+            else
+            {
+                found = 0;
+            }
+
+            if (found == 0 && FindModuleRange(symbols, L"KnLiveDbg.sys", &base, &size))
+            {
+                FindGuardCfReturnZero(device, base, size, &found);
+            }
+            if (found == 0 && FindModuleRange(symbols, L"fltmgr.sys", &base, &size))
             {
                 FindGuardCfReturnZero(device, base, size, &found);
             }
@@ -412,17 +525,13 @@ namespace
             {
                 FindGuardCfReturnZero(device, base, size, &found);
             }
-            if (found == 0 && FindModuleRange(symbols, L"ntkrnlmp.exe", &base, &size))
-            {
-                FindGuardCfReturnZero(device, base, size, &found);
-            }
             if (found == 0)
             {
                 if (error != nullptr)
                 {
-                    *error = L"no CFG-valid return-0 thunk in fltmgr/nt; "
-                             L"refusing to NULL or unlink live CallbackNodes "
-                             L"(those crash with 0x139)";
+                    *error = L"no CFG-valid return-0 thunk in KnLiveDbg/fltmgr/nt "
+                             L"(CET targets start with endbr64; rebuild KnLiveDbg.sys "
+                             L"for KnDbgMinifilterCallbackNop). Refusing NULL/unlink.";
                 }
                 break;
             }
@@ -3077,9 +3186,11 @@ bool MinifilterIrpScannerSelfTest()
         {
             const uint8_t xorRet[] = { 0x33, 0xc0, 0xc3 };
             const uint8_t xorRaxRet[] = { 0x48, 0x33, 0xc0, 0xc3 };
-            const uint8_t notNop[] = { 0x90, 0x90, 0xc3 };
+            const uint8_t endbrXorRet[] = { 0xf3, 0x0f, 0x1e, 0xfa, 0x33, 0xc0, 0xc3 };
+            const uint8_t notNop[] = { 0x48, 0x89, 0x5c, 0x24 };
             if (!BytesAreReturnZero(xorRet, sizeof(xorRet)) ||
                 !BytesAreReturnZero(xorRaxRet, sizeof(xorRaxRet)) ||
+                !BytesAreReturnZero(endbrXorRet, sizeof(endbrXorRet)) ||
                 BytesAreReturnZero(notNop, sizeof(notNop)))
             {
                 ok = false;

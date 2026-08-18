@@ -74,6 +74,26 @@ static ULONG g_KnDbgTimelineCount = 0;
 static ULONGLONG g_KnDbgTimelineDropped = 0;
 static ULONGLONG g_KnDbgTimelineNextSequence = 1;
 
+// CFG-valid minifilter Pre/Post stand-in. Returns 0 so Pre is
+// FLT_PREOP_SUCCESS_NO_CALLBACK and Post is FLT_POSTOP_FINISHED_PROCESSING.
+extern "C"
+__declspec(dllexport)
+__declspec(noinline)
+ULONG_PTR
+NTAPI
+KnDbgMinifilterCallbackNop(
+    PVOID Unused1,
+    PVOID Unused2,
+    PVOID Unused3,
+    PVOID Unused4)
+{
+    UNREFERENCED_PARAMETER(Unused1);
+    UNREFERENCED_PARAMETER(Unused2);
+    UNREFERENCED_PARAMETER(Unused3);
+    UNREFERENCED_PARAMETER(Unused4);
+    return 0;
+}
+
 static bool KnDbgIsLa57Active();
 static bool KnDbgIsCanonicalAddress(ULONGLONG VirtualAddress, bool La57Active);
 static VOID KnDbgTimelineProcessNotify(
@@ -2677,6 +2697,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     do
     {
+        // Keep the nop export live so /guard:cf emits a GFIDS entry.
+        if (KnDbgMinifilterCallbackNop(nullptr, nullptr, nullptr, nullptr) != 0)
+        {
+            status = STATUS_UNSUCCESSFUL;
+            break;
+        }
+
         ExInitializeFastMutex(&g_KnDbgOwnerLock);
         ExInitializeFastMutex(&g_KnDbgTimelineControlLock);
         KeInitializeSpinLock(&g_KnDbgTimelineLock);
