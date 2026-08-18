@@ -24181,8 +24181,8 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  notepad.exe after /user is an error, not an output path.\n";
     std::wcout << L"  The process-filtered file is a kernel complete dump (PAGE/DU64), not a\n";
     std::wcout << L"  user minidump (MDMP). WinDbg opens it as kd. The writer merges the KPTI\n";
-    std::wcout << L"  user+kernel page-table root and pins KDBG/EPROCESS/PEB. CPU0 CurrentThread\n";
-    std::wcout << L"  is left unchanged so the header CONTEXT stays AMD64 kernel. Switch to the\n";
+    std::wcout << L"  user+kernel page-table root, pins KDBG/EPROCESS/PEB, and forces CPU0\n";
+    std::wcout << L"  CurrentThread to IdleThread so the session stays amd64 kd. Switch to the\n";
     std::wcout << L"  target with .process /p /r <eprocess> then !peb / lm u.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
@@ -24528,8 +24528,12 @@ static void HandleDumpLiveCommand(
                        << L" kdbg_plain=" << (dumpResult.KdbgPlain ? L"yes" : L"no")
                        << L" kpti_merged=" << (dumpResult.KptiRootMerged ? L"yes" : L"no")
                        << L" wow64=" << (dumpResult.Wow64Target ? L"yes" : L"no")
-                       << L" current_thread=0x" << dumpResult.CurrentThread
-                       << L" current_process=" << (dumpResult.CurrentProcessPatched ? L"yes" : L"no")
+                       << L" idle_thread=0x" << dumpResult.CurrentThread
+                       << L" current_idle=" << (dumpResult.CurrentProcessPatched ? L"yes" : L"no")
+                       << L" trap_frame=" << (dumpResult.TrapFrameSynthesized ? L"yes" : L"no")
+                       << L" ctx_rip=0x" << dumpResult.ContextRip
+                       << L" ctx_rsp=0x" << dumpResult.ContextRsp
+                       << L" ctx_flags=0x" << dumpResult.ContextFlags
                        << std::dec
                        << L" wrote=" << dumpResult.BytesWritten
                        << L" runs=" << dumpResult.RangeCount
@@ -27913,6 +27917,7 @@ static int RunConsoleSurfaceSelfTest()
                     liveHelp.find(L"NtSystemDebugControl") != std::wstring::npos &&
                     liveHelp.find(L"_EPROCESS") != std::wstring::npos &&
                     liveHelp.find(L"KPTI") != std::wstring::npos &&
+                    liveHelp.find(L"IdleThread") != std::wstring::npos &&
                     liveHelp.find(L".process /p /r") != std::wstring::npos,
                 L"dump-kernel-and-dump-live-help-routes");
             const std::wstring rootHelp = CaptureDetailedHelpOutput({L"help"}, 0);
