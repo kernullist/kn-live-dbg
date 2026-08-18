@@ -1174,6 +1174,12 @@ namespace
     constexpr uint32_t kKdbgOwnerTag = 0x4742444B; // 'KDBG'
     constexpr uint32_t kKdbgHeaderTagOffset = 0x10;
     constexpr uint32_t kKdbgHeaderSizeOffset = 0x14;
+    // KDDEBUGGER_DATA64 fallbacks from wdbgexts.h (MSVC bitfield packing).
+    constexpr uint32_t kKdbgSavedContextOffset = 0x28;
+    constexpr uint32_t kKdbgSizePrcbOffset = 0x2B0;
+    constexpr uint32_t kKdbgOffsetPrcbProcStateContext = 0x2BC;
+    constexpr uint32_t kKdbgOffsetPrcbProcStateSpecialReg = 0x2F2;
+    constexpr uint32_t kKdbgOffsetPrcbContext = 0x338;
     constexpr uint32_t kKdbgKernBaseOffset = 0x18;
     // WinDbg with KdSecondaryVersion=2 expects AMD64 CONTEXT (0x4D0) then
     // KSPECIAL_REGISTERS. Do not use sizeof(CONTEXT): a newer SDK CONTEXT
@@ -1797,6 +1803,260 @@ namespace
                 break;
             }
 
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadDumpPhysicalBytes(
+        HANDLE file,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t physicalAddress,
+        uint32_t length,
+        void* data,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (file == INVALID_HANDLE_VALUE || data == nullptr || length == 0)
+            {
+                break;
+            }
+
+            uint64_t dumpOffset = 0;
+            if (!PhysicalToDumpOffset(ranges, physicalAddress, &dumpOffset))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"physical page is outside dumped RAM runs";
+                }
+                break;
+            }
+
+            LARGE_INTEGER position = {};
+            position.QuadPart = static_cast<LONGLONG>(dumpOffset);
+            if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"SetFilePointerEx failed while reading dump page";
+                }
+                break;
+            }
+
+            DWORD got = 0;
+            if (!ReadFile(file, data, length, &got, nullptr) || got != length)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"ReadFile failed while reading dump page";
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool TranslateToDumpPhysical(
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        uint64_t virtualAddress,
+        uint64_t* physicalAddress)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (physicalAddress == nullptr)
+            {
+                break;
+            }
+
+            *physicalAddress = 0;
+            PhysicalTranslationInfo translation = {};
+            if (device.TranslateVirtual(
+                    directoryTableBase,
+                    virtualAddress,
+                    8,
+                    &translation,
+                    nullptr) &&
+                translation.PhysicalAddress != 0 &&
+                translation.TranslatedLength != 0)
+            {
+                *physicalAddress = translation.PhysicalAddress;
+                ok = true;
+                break;
+            }
+
+            if (device.TranslateVirtual(0, virtualAddress, 8, &translation, nullptr) &&
+                translation.PhysicalAddress != 0 &&
+                translation.TranslatedLength != 0)
+            {
+                *physicalAddress = translation.PhysicalAddress;
+                ok = true;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool PatchDumpHeaderContext(
+        HANDLE file,
+        uint64_t rip,
+        uint64_t rsp,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (file == INVALID_HANDLE_VALUE || rip == 0)
+            {
+                break;
+            }
+
+            const uint16_t kernelCs = 0x10;
+            const uint32_t flags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+            const struct
+            {
+                LONGLONG Offset;
+                const void* Data;
+                DWORD Length;
+            } writes[] = {
+                {
+                    static_cast<LONGLONG>(
+                        offsetof(DUMP_HEADER64, ContextRecord) + offsetof(CONTEXT, Rip)),
+                    &rip,
+                    sizeof(rip)
+                },
+                {
+                    static_cast<LONGLONG>(
+                        offsetof(DUMP_HEADER64, ContextRecord) + offsetof(CONTEXT, Rsp)),
+                    &rsp,
+                    sizeof(rsp)
+                },
+                {
+                    static_cast<LONGLONG>(
+                        offsetof(DUMP_HEADER64, ContextRecord) + offsetof(CONTEXT, SegCs)),
+                    &kernelCs,
+                    sizeof(kernelCs)
+                },
+                {
+                    static_cast<LONGLONG>(
+                        offsetof(DUMP_HEADER64, ContextRecord) + offsetof(CONTEXT, ContextFlags)),
+                    &flags,
+                    sizeof(flags)
+                },
+                {
+                    static_cast<LONGLONG>(
+                        offsetof(DUMP_HEADER64, Exception) + offsetof(EXCEPTION_RECORD64, ExceptionAddress)),
+                    &rip,
+                    sizeof(rip)
+                }
+            };
+
+            bool failed = false;
+            for (const auto& write : writes)
+            {
+                LARGE_INTEGER position = {};
+                position.QuadPart = write.Offset;
+                if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN) ||
+                    !WriteAll(file, write.Data, write.Length, error))
+                {
+                    failed = true;
+                    break;
+                }
+            }
+
+            ok = !failed;
+        } while (false);
+
+        return ok;
+    }
+
+    bool PatchDumpFileContextRip(
+        HANDLE file,
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t contextVa,
+        uint64_t replacementRip,
+        std::vector<std::wstring>* warnings)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (contextVa == 0 || replacementRip == 0)
+            {
+                break;
+            }
+
+            uint64_t physical = 0;
+            if (!TranslateToDumpPhysical(device, directoryTableBase, contextVa, &physical))
+            {
+                break;
+            }
+
+            uint64_t ripPa = 0;
+            if (!TranslateToDumpPhysical(
+                    device,
+                    directoryTableBase,
+                    contextVa + offsetof(CONTEXT, Rip),
+                    &ripPa))
+            {
+                ripPa = physical + offsetof(CONTEXT, Rip);
+            }
+
+            uint64_t dumpRip = 0;
+            std::wstring readError;
+            if (!ReadDumpPhysicalBytes(
+                    file,
+                    ranges,
+                    ripPa,
+                    sizeof(dumpRip),
+                    &dumpRip,
+                    &readError))
+            {
+                break;
+            }
+
+            if (dumpRip == replacementRip)
+            {
+                ok = true;
+                break;
+            }
+
+            std::wstring writeError;
+            if (!WriteDumpPhysicalBytes(
+                    file,
+                    ranges,
+                    ripPa,
+                    reinterpret_cast<const uint8_t*>(&replacementRip),
+                    sizeof(replacementRip),
+                    &writeError))
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"dump-file CONTEXT.Rip write failed: " + writeError);
+                }
+                break;
+            }
+
+            if (warnings != nullptr)
+            {
+                std::wstringstream stream;
+                stream << L"dump-file CONTEXT.Rip 0x" << std::hex << dumpRip
+                       << L" -> 0x" << replacementRip;
+                warnings->push_back(stream.str());
+            }
             ok = true;
         } while (false);
 
@@ -3163,29 +3423,67 @@ namespace
         uint16_t contextOffset = 0;
         uint16_t pointerOffset = 0;
         uint16_t prcbSize = 0;
-        if (ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbProcStateContext", &contextOffset) &&
-            contextOffset >= 0x40)
+        uint16_t specialOffset = 0;
+        if (!ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbProcStateContext", &contextOffset) &&
+            kdbg.size() >= kKdbgOffsetPrcbProcStateContext + sizeof(uint16_t))
+        {
+            std::memcpy(
+                &contextOffset,
+                kdbg.data() + kKdbgOffsetPrcbProcStateContext,
+                sizeof(contextOffset));
+        }
+        if (contextOffset >= 0x40)
         {
             fixup->PrcbProcStateContextOffset = contextOffset;
         }
 
-        uint16_t specialOffset = 0;
-        if (ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbProcStateSpecialReg", &specialOffset) &&
-            specialOffset >= 0x40)
+        if (!ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbProcStateSpecialReg", &specialOffset) &&
+            kdbg.size() >= kKdbgOffsetPrcbProcStateSpecialReg + sizeof(uint16_t))
+        {
+            std::memcpy(
+                &specialOffset,
+                kdbg.data() + kKdbgOffsetPrcbProcStateSpecialReg,
+                sizeof(specialOffset));
+        }
+        if (specialOffset >= 0x40)
         {
             fixup->PrcbProcStateSpecialRegOffset = specialOffset;
         }
 
-        if (ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbContext", &pointerOffset) &&
-            pointerOffset >= 0x8)
+        if (!ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbContext", &pointerOffset) &&
+            kdbg.size() >= kKdbgOffsetPrcbContext + sizeof(uint16_t))
+        {
+            std::memcpy(
+                &pointerOffset,
+                kdbg.data() + kKdbgOffsetPrcbContext,
+                sizeof(pointerOffset));
+        }
+        if (pointerOffset >= 0x8)
         {
             fixup->PrcbContextOffset = pointerOffset;
         }
 
-        if (ReadKdbgFieldU16(kdbg, symbols, L"SizePrcb", &prcbSize) &&
-            prcbSize >= 0x400)
+        if (!ReadKdbgFieldU16(kdbg, symbols, L"SizePrcb", &prcbSize) &&
+            kdbg.size() >= kKdbgSizePrcbOffset + sizeof(uint16_t))
+        {
+            std::memcpy(&prcbSize, kdbg.data() + kKdbgSizePrcbOffset, sizeof(prcbSize));
+        }
+        if (prcbSize >= 0x400)
         {
             fixup->PrcbSize = prcbSize;
+        }
+
+        if (kdbg.size() >= kKdbgSavedContextOffset + sizeof(uint64_t))
+        {
+            uint64_t savedContext = 0;
+            std::memcpy(
+                &savedContext,
+                kdbg.data() + kKdbgSavedContextOffset,
+                sizeof(savedContext));
+            if (IsKernelCanonicalVa(savedContext))
+            {
+                fixup->SavedContext = savedContext;
+            }
         }
     }
 
@@ -3970,6 +4268,68 @@ namespace
                             fixup.HeaderRip,
                             &result->Warnings);
                     }
+                }
+
+                std::wstring headerError;
+                if (!PatchDumpHeaderContext(
+                        file,
+                        fixup.HeaderRip,
+                        fixup.HeaderRsp,
+                        &headerError))
+                {
+                    result->Warnings.push_back(
+                        L"dump header CONTEXT patch failed: " + headerError);
+                }
+
+                uint64_t fileContextVa = 0;
+                ResolvePrcbProcessorStateAddresses(
+                    symbols,
+                    prcb,
+                    fixup.PrcbProcStateContextOffset,
+                    &fileContextVa,
+                    nullptr);
+                if (PatchDumpFileContextRip(
+                        file,
+                        device,
+                        kernelDtb,
+                        ranges,
+                        fileContextVa,
+                        fixup.HeaderRip,
+                        &result->Warnings))
+                {
+                    result->ProcessorStatePatched = true;
+                }
+
+                uint64_t pdbFileContextVa = 0;
+                if (ResolvePrcbProcessorStateAddresses(
+                        symbols,
+                        prcb,
+                        0,
+                        &pdbFileContextVa,
+                        nullptr) &&
+                    pdbFileContextVa != 0 &&
+                    pdbFileContextVa != fileContextVa)
+                {
+                    PatchDumpFileContextRip(
+                        file,
+                        device,
+                        kernelDtb,
+                        ranges,
+                        pdbFileContextVa,
+                        fixup.HeaderRip,
+                        &result->Warnings);
+                }
+
+                if (fixup.SavedContext != 0)
+                {
+                    PatchDumpFileContextRip(
+                        file,
+                        device,
+                        kernelDtb,
+                        ranges,
+                        fixup.SavedContext,
+                        fixup.HeaderRip,
+                        &result->Warnings);
                 }
             }
         } while (false);
@@ -6641,6 +7001,24 @@ bool DumpProcessVisibleMemoryToCrashDump(
                         nullptr,
                         nullptr);
                 }
+            }
+
+            if (fixup.SavedContext != 0)
+            {
+                AddTranslatedVirtualPageAnyCr3(
+                    device,
+                    pinDtb,
+                    fixup.SavedContext,
+                    &ranges,
+                    &walkWarnings,
+                    L"KDBG.SavedContext");
+                AddTranslatedVirtualPageAnyCr3(
+                    device,
+                    pinDtb,
+                    fixup.SavedContext + (kDumpAmd64ContextBytes - 1),
+                    &ranges,
+                    nullptr,
+                    nullptr);
             }
 
             if (fixup.PrcbContextOffset >= 8 && fixup.PrcbContextOffset <= 0x40000)
