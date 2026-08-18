@@ -43,6 +43,7 @@ namespace
         uint32_t InstanceFilterLink = 0;
         uint32_t InstanceFilter = 0;
         uint32_t InstanceCallbackNodes = 0;
+        uint32_t CallbackNodeLinks = 0;
         uint32_t CallbackNodePre = 0x18;
         uint32_t CallbackNodePost = 0x20;
         uint32_t CallbackNodeInstance = 0x10;
@@ -84,11 +85,13 @@ namespace
     {
         uint64_t Filter = 0;
         uint64_t Node = 0;
-        uint64_t PreAddr = 0;
-        uint64_t PostAddr = 0;
+        uint64_t Links = 0;
+        uint64_t Flink = 0;
+        uint64_t Blink = 0;
         uint64_t Pre = 0;
         uint64_t Post = 0;
         uint32_t MajorFunction = 0xffffffffu;
+        bool Unlinked = false;
     };
 
     struct IrpBackupValue
@@ -109,7 +112,7 @@ namespace
         for (const auto& entry : g_NodeBackups)
         {
             if (entry.second.Filter == filter &&
-                (entry.second.Pre != 0 || entry.second.Post != 0))
+                (entry.second.Unlinked || entry.second.Flink != 0 || entry.second.Blink != 0))
             {
                 ++count;
             }
@@ -435,9 +438,18 @@ namespace
                 L"fltmgr!_CALLBACK_NODE",
                 L"_CALLBACK_NODE"
             };
+            const std::wstring callbackLinkNames[] = { L"CallbackLinks", L"Links" };
             const std::wstring callbackPreNames[] = { L"PreOperation", L"Pre" };
             const std::wstring callbackPostNames[] = { L"PostOperation", L"Post" };
             const std::wstring callbackInstanceNames[] = { L"Instance" };
+            FindFieldOffset(
+                symbols,
+                callbackTypes,
+                2,
+                callbackLinkNames,
+                2,
+                &layout->CallbackNodeLinks,
+                &ignored);
             FindFieldOffset(
                 symbols,
                 callbackTypes,
@@ -1222,6 +1234,206 @@ namespace
         return ok;
     }
 
+    bool CallbackNodeLinksAddress(
+        const MinifilterLayout& layout,
+        uint64_t node,
+        uint64_t* links)
+    {
+        return links != nullptr && LeftoverTryAdd(node, layout.CallbackNodeLinks, links);
+    }
+
+    bool ReadNeighborPointers(
+        DeviceClient& device,
+        uint64_t entry,
+        uint64_t* flink,
+        uint64_t* blink)
+    {
+        return ReadListEntry(device, entry, flink, blink);
+    }
+
+    bool IsCallbackNodeLinked(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t node)
+    {
+        bool linked = false;
+        do
+        {
+            uint64_t links = 0;
+            uint64_t flink = 0;
+            uint64_t blink = 0;
+            if (!CallbackNodeLinksAddress(layout, node, &links) ||
+                !ReadNeighborPointers(device, links, &flink, &blink))
+            {
+                break;
+            }
+            if (!LeftoverIsKernelCanonical(flink) || !LeftoverIsKernelCanonical(blink))
+            {
+                break;
+            }
+            if (flink == links || blink == links)
+            {
+                break;
+            }
+
+            uint64_t flinkBlink = 0;
+            uint64_t blinkFlink = 0;
+            uint64_t flinkBlinkAddr = 0;
+            if (!LeftoverTryAdd(flink, sizeof(uint64_t), &flinkBlinkAddr) ||
+                !LeftoverReadU64(device, flinkBlinkAddr, &flinkBlink, nullptr) ||
+                !LeftoverReadU64(device, blink, &blinkFlink, nullptr))
+            {
+                break;
+            }
+            linked = (flinkBlink == links && blinkFlink == links);
+        } while (false);
+        return linked;
+    }
+
+    bool UnlinkCallbackNode(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t node,
+        uint64_t* savedFlink,
+        uint64_t* savedBlink,
+        std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            uint64_t links = 0;
+            uint64_t flink = 0;
+            uint64_t blink = 0;
+            if (!CallbackNodeLinksAddress(layout, node, &links) ||
+                !ReadNeighborPointers(device, links, &flink, &blink))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"failed to read CALLBACK_NODE.CallbackLinks";
+                }
+                break;
+            }
+            if (flink == links && blink == links)
+            {
+                if (savedFlink != nullptr)
+                {
+                    *savedFlink = 0;
+                }
+                if (savedBlink != nullptr)
+                {
+                    *savedBlink = 0;
+                }
+                ok = true;
+                break;
+            }
+            if (!IsCallbackNodeLinked(device, layout, node))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"CALLBACK_NODE list links are not well-formed";
+                }
+                break;
+            }
+
+            uint64_t flinkBlinkAddr = 0;
+            if (!LeftoverTryAdd(flink, sizeof(uint64_t), &flinkBlinkAddr))
+            {
+                break;
+            }
+            if (!WritePointer(device, flinkBlinkAddr, blink, error) ||
+                !WritePointer(device, blink, flink, error) ||
+                !WritePointer(device, links, links, error))
+            {
+                break;
+            }
+            uint64_t linksBlink = 0;
+            if (!LeftoverTryAdd(links, sizeof(uint64_t), &linksBlink) ||
+                !WritePointer(device, linksBlink, links, error))
+            {
+                break;
+            }
+            if (savedFlink != nullptr)
+            {
+                *savedFlink = flink;
+            }
+            if (savedBlink != nullptr)
+            {
+                *savedBlink = blink;
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool RelinkCallbackNode(
+        DeviceClient& device,
+        const MinifilterLayout& layout,
+        uint64_t node,
+        uint64_t savedFlink,
+        uint64_t savedBlink,
+        std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            uint64_t links = 0;
+            if (!CallbackNodeLinksAddress(layout, node, &links))
+            {
+                break;
+            }
+            if (IsCallbackNodeLinked(device, layout, node))
+            {
+                ok = true;
+                break;
+            }
+            if (!LeftoverIsKernelCanonical(savedFlink) || !LeftoverIsKernelCanonical(savedBlink))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"no saved CALLBACK_NODE list neighbors to restore";
+                }
+                break;
+            }
+
+            uint64_t flinkBlink = 0;
+            uint64_t blinkFlink = 0;
+            uint64_t flinkBlinkAddr = 0;
+            if (!LeftoverTryAdd(savedFlink, sizeof(uint64_t), &flinkBlinkAddr) ||
+                !LeftoverReadU64(device, flinkBlinkAddr, &flinkBlink, nullptr) ||
+                !LeftoverReadU64(device, savedBlink, &blinkFlink, nullptr))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"failed to read saved CALLBACK_NODE neighbors";
+                }
+                break;
+            }
+            if (flinkBlink != savedBlink || blinkFlink != savedFlink)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"CALLBACK_NODE list changed; refusing to splice into a moved list";
+                }
+                break;
+            }
+
+            if (!WritePointer(device, flinkBlinkAddr, links, error) ||
+                !WritePointer(device, savedBlink, links, error) ||
+                !WritePointer(device, links, savedFlink, error))
+            {
+                break;
+            }
+            uint64_t linksBlink = 0;
+            if (!LeftoverTryAdd(links, sizeof(uint64_t), &linksBlink) ||
+                !WritePointer(device, linksBlink, savedBlink, error))
+            {
+                break;
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
     bool ResolveCallbackNode(
         DeviceClient& device,
         const MinifilterLayout& layout,
@@ -1314,10 +1526,7 @@ namespace
             CollectInstanceCallbackNodes(device, layout, instance, &nodes);
             for (uint64_t node : nodes)
             {
-                uint64_t pre = 0;
-                uint64_t post = 0;
-                if (ReadCallbackNodePointers(device, layout, node, &pre, &post, nullptr) &&
-                    (pre != 0 || post != 0))
+                if (IsCallbackNodeLinked(device, layout, node))
                 {
                     ++live;
                 }
@@ -1330,12 +1539,13 @@ namespace
         uint64_t filter,
         uint32_t majorFunction,
         uint64_t node,
-        uint64_t preAddr,
-        uint64_t postAddr,
+        uint64_t links,
+        uint64_t flink,
+        uint64_t blink,
         uint64_t pre,
         uint64_t post)
     {
-        if (preAddr == 0 || (pre == 0 && post == 0))
+        if (node == 0)
         {
             return;
         }
@@ -1343,20 +1553,30 @@ namespace
         LiveNodeBackup backup = {};
         backup.Filter = filter;
         backup.Node = node;
-        backup.PreAddr = preAddr;
-        backup.PostAddr = postAddr;
+        backup.Links = links;
+        backup.Flink = flink;
+        backup.Blink = blink;
         backup.Pre = pre;
         backup.Post = post;
         backup.MajorFunction = majorFunction;
+        backup.Unlinked = true;
 
         std::lock_guard<std::mutex> guard(g_BackupLock);
-        auto existing = g_NodeBackups.find(preAddr);
+        auto existing = g_NodeBackups.find(node);
         if (existing == g_NodeBackups.end())
         {
-            g_NodeBackups[preAddr] = backup;
+            g_NodeBackups[node] = backup;
         }
         else
         {
+            if (existing->second.Flink == 0 && flink != 0)
+            {
+                existing->second.Flink = flink;
+            }
+            if (existing->second.Blink == 0 && blink != 0)
+            {
+                existing->second.Blink = blink;
+            }
             if (existing->second.Pre == 0 && pre != 0)
             {
                 existing->second.Pre = pre;
@@ -1365,6 +1585,7 @@ namespace
             {
                 existing->second.Post = post;
             }
+            existing->second.Unlinked = true;
             if (existing->second.MajorFunction == kSweepMajor &&
                 majorFunction != kSweepMajor)
             {
@@ -1393,113 +1614,89 @@ namespace
                 break;
             }
 
-            uint64_t preAddr = 0;
-            uint64_t postAddr = 0;
-            if (!LeftoverTryAdd(node, layout.CallbackNodePre, &preAddr) ||
-                !LeftoverTryAdd(node, layout.CallbackNodePost, &postAddr))
+            // FltMgr calls Pre/Post through kCFG. Writing NULL here yields
+            // FAST_FAIL_GUARD_ICALL_CHECK_FAILURE. Unlink the node instead
+            // and leave the original function pointers intact.
+            (void)which;
+
+            uint64_t links = 0;
+            uint64_t currentPre = 0;
+            uint64_t currentPost = 0;
+            if (!CallbackNodeLinksAddress(layout, node, &links) ||
+                !ReadCallbackNodePointers(device, layout, node, &currentPre, &currentPost, nullptr))
             {
                 ++(*failed);
                 break;
             }
 
-            uint64_t currentPre = 0;
-            uint64_t currentPost = 0;
-            LeftoverReadU64(device, preAddr, &currentPre, nullptr);
-            LeftoverReadU64(device, postAddr, &currentPost, nullptr);
-            if (!LeftoverIsKernelCanonical(currentPre))
-            {
-                currentPre = 0;
-            }
-            if (!LeftoverIsKernelCanonical(currentPost))
-            {
-                currentPost = 0;
-            }
-
-            const bool touchPre = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Pre);
-            const bool touchPost = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
-            uint64_t newPre = currentPre;
-            uint64_t newPost = currentPost;
-
             if (action == MinifilterIrpAction::Disable)
             {
-                RememberLiveNode(
-                    filter,
-                    majorFunction,
-                    node,
-                    preAddr,
-                    postAddr,
-                    currentPre,
-                    currentPost);
-                if (touchPre)
-                {
-                    newPre = 0;
-                }
-                if (touchPost)
-                {
-                    newPost = 0;
-                }
-            }
-            else
-            {
-                LiveNodeBackup backup = {};
-                bool haveBackup = false;
-                {
-                    std::lock_guard<std::mutex> guard(g_BackupLock);
-                    auto existing = g_NodeBackups.find(preAddr);
-                    if (existing != g_NodeBackups.end())
-                    {
-                        backup = existing->second;
-                        haveBackup = true;
-                    }
-                }
-                if (!haveBackup)
+                if (!IsCallbackNodeLinked(device, layout, node))
                 {
                     ok = true;
                     break;
                 }
-                if (touchPre)
+
+                uint64_t flink = 0;
+                uint64_t blink = 0;
+                std::wstring unlinkError;
+                if (!UnlinkCallbackNode(device, layout, node, &flink, &blink, &unlinkError))
                 {
-                    newPre = backup.Pre;
+                    ++(*failed);
+                    if (error != nullptr && error->empty())
+                    {
+                        *error = unlinkError;
+                    }
+                    break;
                 }
-                if (touchPost)
-                {
-                    newPost = backup.Post;
-                }
+                RememberLiveNode(
+                    filter,
+                    majorFunction,
+                    node,
+                    links,
+                    flink,
+                    blink,
+                    currentPre,
+                    currentPost);
+                ++(*changed);
+                ok = true;
+                break;
             }
 
-            bool wrote = false;
-            if (touchPre && newPre != currentPre)
+            LiveNodeBackup backup = {};
+            bool haveBackup = false;
             {
-                std::wstring writeError;
-                if (!WritePointer(device, preAddr, newPre, &writeError))
+                std::lock_guard<std::mutex> guard(g_BackupLock);
+                auto existing = g_NodeBackups.find(node);
+                if (existing != g_NodeBackups.end())
                 {
-                    ++(*failed);
-                    if (error != nullptr && error->empty())
-                    {
-                        *error = writeError;
-                    }
-                    break;
+                    backup = existing->second;
+                    haveBackup = true;
                 }
-                wrote = true;
             }
-            if (touchPost && newPost != currentPost)
+            if (!haveBackup)
             {
-                std::wstring writeError;
-                if (!WritePointer(device, postAddr, newPost, &writeError))
+                ok = true;
+                break;
+            }
+
+            std::wstring relinkError;
+            if (!RelinkCallbackNode(
+                    device,
+                    layout,
+                    node,
+                    backup.Flink,
+                    backup.Blink,
+                    &relinkError))
+            {
+                ++(*failed);
+                if (error != nullptr && error->empty())
                 {
-                    ++(*failed);
-                    if (error != nullptr && error->empty())
-                    {
-                        *error = writeError;
-                    }
-                    break;
+                    *error = relinkError;
                 }
-                wrote = true;
+                break;
             }
-            if (wrote)
-            {
-                ++(*changed);
-            }
+            ++(*changed);
             ok = true;
         } while (false);
         return ok;
@@ -1609,8 +1806,7 @@ namespace
         MinifilterIrpWhich which)
     {
         bool live = false;
-        const bool touchPre = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Pre);
-        const bool touchPost = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
+        (void)which;
         const uint32_t index = CallbackIndexFromMajor(majorFunction);
 
         for (uint64_t instance : instances)
@@ -1619,10 +1815,7 @@ namespace
             if (index != 0xffffffffu &&
                 ResolveCallbackNode(device, layout, instance, index, &indexed))
             {
-                uint64_t pre = 0;
-                uint64_t post = 0;
-                if (ReadCallbackNodePointers(device, layout, indexed, &pre, &post, nullptr) &&
-                    ((touchPre && pre != 0) || (touchPost && post != 0)))
+                if (IsCallbackNodeLinked(device, layout, indexed))
                 {
                     live = true;
                     break;
@@ -1649,7 +1842,7 @@ namespace
                 const bool postMatch = (matchPost == 0) || (post == matchPost);
                 if (preMatch &&
                     postMatch &&
-                    ((touchPre && pre != 0) || (touchPost && post != 0)))
+                    IsCallbackNodeLinked(device, layout, node))
                 {
                     live = true;
                     break;
@@ -1695,7 +1888,8 @@ namespace
                     {
                         continue;
                     }
-                    if (action == MinifilterIrpAction::Disable && pre == 0 && post == 0)
+                    if (action == MinifilterIrpAction::Disable &&
+                        !IsCallbackNodeLinked(device, layout, node))
                     {
                         continue;
                     }
