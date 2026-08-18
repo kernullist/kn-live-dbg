@@ -1664,7 +1664,8 @@ namespace
                         length - done,
                         &translation,
                         &translateError) ||
-                    translation.TranslatedLength == 0)
+                    translation.TranslatedLength == 0 ||
+                    translation.PhysicalAddress == 0)
                 {
                     if (error != nullptr)
                     {
@@ -2079,6 +2080,7 @@ namespace
             const uintptr_t page = static_cast<uintptr_t>(virtualAddress & ~0xFFFull);
             uint8_t bytes[0x1000] = {};
             SIZE_T got = 0;
+            PVOID writeVa = reinterpret_cast<LPVOID>(page);
             if (!ReadProcessMemory(
                     processHandle,
                     reinterpret_cast<LPCVOID>(page),
@@ -2087,21 +2089,25 @@ namespace
                     &got) ||
                 got == 0)
             {
-                uint8_t probe[8] = {};
                 if (!ReadProcessMemory(
                         processHandle,
                         reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(virtualAddress)),
-                        probe,
-                        sizeof(probe),
+                        bytes,
+                        8,
                         &got) ||
                     got == 0)
                 {
                     break;
                 }
 
-                ok = true;
-                break;
+                writeVa = reinterpret_cast<LPVOID>(static_cast<uintptr_t>(virtualAddress));
             }
+
+            // Same-byte write first so a prototype/file-backed page becomes a
+            // private hardware PTE. Locking before the write pins the old
+            // shared page and then CoW replaces it.
+            SIZE_T written = 0;
+            WriteProcessMemory(processHandle, writeVa, bytes, got, &written);
 
             using NtLockVirtualMemoryFn = LONG (NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
             static NtLockVirtualMemoryFn ntLockVirtualMemory = nullptr;
@@ -2120,20 +2126,12 @@ namespace
             if (ntLockVirtualMemory != nullptr)
             {
                 PVOID lockBase = reinterpret_cast<PVOID>(page);
-                SIZE_T lockSize = got;
+                SIZE_T lockSize = (got > 0 && writeVa == reinterpret_cast<LPVOID>(page))
+                    ? got
+                    : static_cast<SIZE_T>(kPageSize);
                 ntLockVirtualMemory(processHandle, &lockBase, &lockSize, 1);
             }
 
-            // Same-byte write forces a private hardware PTE for prototype
-            // / file-backed image pages that RPM can read without making
-            // the process PTE Present.
-            SIZE_T written = 0;
-            WriteProcessMemory(
-                processHandle,
-                reinterpret_cast<LPVOID>(page),
-                bytes,
-                got,
-                &written);
             ok = true;
         } while (false);
 
@@ -3197,26 +3195,9 @@ namespace
         {
             ok = true;
         }
-        else
+        else if (error != nullptr && error->empty())
         {
-            PhysicalTranslationInfo translation = {};
-            std::wstring translateError;
-            if (device.TranslateVirtual(0, virtualAddress, length, &translation, &translateError) &&
-                translation.PhysicalAddress != 0 &&
-                translation.TranslatedLength != 0)
-            {
-                ok = WriteDumpPhysicalBytes(
-                    file,
-                    ranges,
-                    translation.PhysicalAddress,
-                    data,
-                    (std::min)(length, translation.TranslatedLength),
-                    error);
-            }
-            else if (error != nullptr)
-            {
-                *error = firstError.empty() ? translateError : firstError;
-            }
+            *error = firstError;
         }
 
         return ok;
@@ -3306,7 +3287,7 @@ namespace
         return ok;
     }
 
-    void PatchPrcbLeftoverLiveDumpRip(
+    bool PatchPrcbLeftoverLiveDumpRip(
         HANDLE file,
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -3316,6 +3297,8 @@ namespace
         uint64_t replacementRip,
         std::vector<std::wstring>* warnings)
     {
+        bool ok = false;
+
         do
         {
             if (prcb == 0 || replacementRip == 0)
@@ -3330,58 +3313,59 @@ namespace
                 break;
             }
 
-            constexpr uint32_t kScanBytes = 0x20000;
-            std::vector<uint8_t> block;
-            if (!ReadKernelBytes(device, prcb, kScanBytes, &block) || block.size() < 16)
+            uint64_t contextVa = 0;
+            if (!ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, nullptr) ||
+                contextVa == 0)
+            {
+                break;
+            }
+
+            const uint64_t ripVa = contextVa + offsetof(CONTEXT, Rip);
+            uint64_t liveRip = 0;
+            if (!ReadKernelU64(device, ripVa, &liveRip))
             {
                 if (warnings != nullptr)
                 {
-                    warnings->push_back(L"could not scan KPRCB for leftover live-dump RIP");
+                    warnings->push_back(
+                        L"could not read ProcessorState.ContextFrame.Rip for leftover dump RIP");
                 }
                 break;
             }
 
-            uint32_t patched = 0;
-            for (size_t offset = 0; offset + sizeof(uint64_t) <= block.size(); offset += 8)
+            if (liveRip < leftoverRip || liveRip > leftoverRip + 0x400)
             {
-                uint64_t value = 0;
-                std::memcpy(&value, block.data() + offset, sizeof(value));
-                if (value < leftoverRip || value > leftoverRip + 0x400)
-                {
-                    continue;
-                }
+                break;
+            }
 
-                std::wstring patchError;
-                if (WriteDumpVirtualRangeAnyCr3(
-                        file,
-                        device,
-                        directoryTableBase,
-                        ranges,
-                        prcb + offset,
-                        reinterpret_cast<const uint8_t*>(&replacementRip),
-                        sizeof(replacementRip),
-                        &patchError,
-                        L"leftover IopLiveDumpCollectPages RIP"))
+            std::wstring patchError;
+            if (!WriteDumpVirtualRangeAnyCr3(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    ripVa,
+                    reinterpret_cast<const uint8_t*>(&replacementRip),
+                    sizeof(replacementRip),
+                    &patchError,
+                    L"ProcessorState.ContextFrame.Rip"))
+            {
+                if (warnings != nullptr)
                 {
-                    ++patched;
+                    warnings->push_back(
+                        L"leftover IopLiveDumpCollectPages RIP patch failed: " + patchError);
                 }
+                break;
             }
 
             if (warnings != nullptr)
             {
-                if (patched > 0)
-                {
-                    warnings->push_back(
-                        L"replaced " + std::to_wstring(patched) +
-                        L" leftover IopLiveDumpCollectPages RIP value(s) in KPRCB");
-                }
-                else
-                {
-                    warnings->push_back(
-                        L"KPRCB scan found no leftover IopLiveDumpCollectPages RIP");
-                }
+                warnings->push_back(
+                    L"replaced leftover IopLiveDumpCollectPages RIP in ProcessorState.ContextFrame");
             }
+            ok = true;
         } while (false);
+
+        return ok;
     }
 
     void ApplyProcessDumpWinDbgFixups(
@@ -3540,7 +3524,7 @@ namespace
             const uint64_t displayVa = displayThread;
             const uint64_t zeroVa = 0;
             std::wstring patchError;
-            if (!WriteDumpVirtualRange(
+            if (!WriteDumpVirtualRangeAnyCr3(
                     file,
                     device,
                     kernelDtb,
@@ -3556,7 +3540,7 @@ namespace
             }
 
             std::wstring nextError;
-            if (!WriteDumpVirtualRange(
+            if (!WriteDumpVirtualRangeAnyCr3(
                     file,
                     device,
                     kernelDtb,
@@ -3595,15 +3579,18 @@ namespace
                         L"KPRCB.ProcessorState patch failed: " + contextError);
                 }
 
-                PatchPrcbLeftoverLiveDumpRip(
-                    file,
-                    device,
-                    symbols,
-                    ranges,
-                    kernelDtb,
-                    prcb,
-                    fixup.HeaderRip,
-                    &result->Warnings);
+                if (PatchPrcbLeftoverLiveDumpRip(
+                        file,
+                        device,
+                        symbols,
+                        ranges,
+                        kernelDtb,
+                        prcb,
+                        fixup.HeaderRip,
+                        &result->Warnings))
+                {
+                    result->ProcessorStatePatched = true;
+                }
 
                 uint64_t processorBlock = 0;
                 if (symbols.ResolveSymbol(L"nt!KiProcessorBlock", &processorBlock, nullptr) &&
@@ -6226,7 +6213,32 @@ bool DumpProcessVisibleMemoryToCrashDump(
             AddTranslatedVirtualPageAnyCr3(device, pinDtb, kpcr + 0x180, &ranges, nullptr, nullptr);
             const uint64_t prcb = ResolveKpcrPrcb(device, symbols, kpcr);
             AddTranslatedVirtualPageAnyCr3(device, pinDtb, prcb, &ranges, &walkWarnings, L"KPRCB");
-            for (uint32_t prcbOff = 0; prcbOff < 0x20000; prcbOff += kPageSize)
+
+            uint64_t contextVa = 0;
+            uint64_t specialVa = 0;
+            ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, &specialVa);
+            uint64_t prcbPinEnd = prcb + kPageSize;
+            TypeLayoutInfo prcbLayout = {};
+            if (symbols.GetTypeLayout(L"nt!_KPRCB", &prcbLayout, nullptr) &&
+                prcbLayout.Size >= 0x400 &&
+                prcbLayout.Size <= 0x40000)
+            {
+                prcbPinEnd = prcb + prcbLayout.Size;
+            }
+            if (contextVa >= prcb &&
+                contextVa + kDumpAmd64ContextBytes > prcbPinEnd &&
+                (contextVa - prcb) <= 0x40000)
+            {
+                prcbPinEnd = contextVa + kDumpAmd64ContextBytes;
+            }
+            if (specialVa >= prcb &&
+                specialVa + 0xF0 > prcbPinEnd &&
+                (specialVa - prcb) <= 0x40000)
+            {
+                prcbPinEnd = specialVa + 0xF0;
+            }
+
+            for (uint64_t prcbOff = 0; prcb + prcbOff < prcbPinEnd; prcbOff += kPageSize)
             {
                 AddTranslatedVirtualPageAnyCr3(
                     device,
@@ -6237,9 +6249,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
                     nullptr);
             }
 
-            uint64_t contextVa = 0;
-            uint64_t specialVa = 0;
-            if (ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, &specialVa))
+            if (contextVa != 0)
             {
                 AddTranslatedVirtualPageAnyCr3(
                     device,
