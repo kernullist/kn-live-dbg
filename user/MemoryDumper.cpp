@@ -2101,9 +2101,12 @@ namespace
                 break;
             }
 
+            (void)symbols;
+
             const uint64_t kernelDtb = MaskDirectoryTableBase(fixup.KernelDirectoryTableBase);
             const uint64_t userDtb = MaskDirectoryTableBase(fixup.UserDirectoryTableBase);
             result->CurrentThread = fixup.Thread;
+            result->Wow64Target = fixup.Wow64;
 
             if (userDtb != 0 && kernelDtb != 0 && userDtb != kernelDtb)
             {
@@ -2140,61 +2143,11 @@ namespace
                 }
             }
 
-            if (fixup.Thread == 0 || kernelDtb == 0)
-            {
-                break;
-            }
-
-            uint64_t kpcr = 0;
-            if (!ResolveLiveKpcr(device, &kpcr, nullptr, &result->Warnings) || kpcr == 0)
-            {
-                result->Warnings.push_back(
-                    L"could not resolve CPU0 KPCR to retarget CurrentThread");
-                break;
-            }
-
-            uint64_t prcb = 0;
-            if (!ReadFieldU64(
-                    device,
-                    symbols,
-                    kpcr,
-                    L"nt!_KPCR",
-                    L"CurrentPrcb",
-                    &kKpcrCurrentPrcbOffset,
-                    &prcb) ||
-                !IsKernelCanonicalVa(prcb))
-            {
-                prcb = kpcr + 0x180;
-            }
-
-            uint32_t currentThreadOffset = kKprcbCurrentThreadFallback;
-            TypeFieldInfo currentThreadField = {};
-            if (symbols.FindField(L"nt!_KPRCB", L"CurrentThread", &currentThreadField, nullptr) &&
-                currentThreadField.Offset <= 0x4000)
-            {
-                currentThreadOffset = currentThreadField.Offset;
-            }
-
-            const uint64_t threadVa = fixup.Thread;
-            std::wstring patchError;
-            if (WriteDumpVirtualRange(
-                    file,
-                    device,
-                    kernelDtb,
-                    ranges,
-                    prcb + currentThreadOffset,
-                    reinterpret_cast<const uint8_t*>(&threadVa),
-                    sizeof(threadVa),
-                    &patchError,
-                    L"CurrentThread"))
-            {
-                result->CurrentProcessPatched = true;
-            }
-            else
-            {
-                result->Warnings.push_back(
-                    L"CurrentThread dump patch failed: " + patchError);
-            }
+            // Do not retarget KPRCB.CurrentThread. A native x64 user thread
+            // still makes dbgeng drop the dump CONTEXT and switch to that
+            // thread's user record, which is how kd:x86 appeared on a
+            // non-WOW64 image. CPU0 keeps its live thread; the operator
+            // switches with .process /p /r.
         } while (false);
     }
 
@@ -2395,6 +2348,23 @@ namespace
         return ok;
     }
 
+    uint64_t ReadCanonicalFieldU64(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t object,
+        const wchar_t* typeName,
+        const wchar_t* fieldName)
+    {
+        uint64_t value = 0;
+        if (ReadFieldU64(device, symbols, object, typeName, fieldName, nullptr, &value) &&
+            IsKernelCanonicalVa(value))
+        {
+            return value;
+        }
+
+        return 0;
+    }
+
     void CaptureLiveProcessorContext(
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -2411,11 +2381,11 @@ namespace
         contextRecord->assign(kDumpAmd64ContextBytes + kSpecialRegistersBytes, 0);
 
         CONTEXT context = {};
-        // CONTEXT_* already includes CONTEXT_AMD64 on x64. FLOATING_POINT is
-        // required because we publish MxCsr; without it dbgeng treats the
-        // record as a partial x86 user context.
-        context.ContextFlags =
-            CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
+        // Do not set CONTEXT_FLOATING_POINT. MxCsr lives in the integer
+        // header, but FltSave is zeros here. Claiming FP state makes dbgeng
+        // mark the record "partially valid" and fall back to the current
+        // thread's user/WOW64 context (kd:x86, 32-bit _ETHREAD).
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
         context.MxCsr = 0x1F80;
         context.SegCs = 0x10;
         context.SegDs = 0x2B;
@@ -2472,9 +2442,8 @@ namespace
             }
         }
 
-        // Header RIP must stay a kernel address from CPU0. Do not substitute
-        // the target process thread: a user/WOW64 trap frame makes dbgeng
-        // report "only x86 user-mode context" and truncate _ETHREAD to 32 bits.
+        // Header RIP/RSP must be kernel. A zero RIP makes dbgeng discard the
+        // AMD64 record and load the current thread's user context instead.
         if (currentThread != 0)
         {
             uint64_t trapFrame = 0;
@@ -2499,8 +2468,69 @@ namespace
                     IsKernelCanonicalVa(rip))
                 {
                     context.Rip = rip;
-                    context.Rsp = rsp;
+                    if (IsKernelCanonicalVa(rsp))
+                    {
+                        context.Rsp = rsp;
+                    }
                 }
+            }
+
+            if (context.Rsp == 0)
+            {
+                context.Rsp = ReadCanonicalFieldU64(
+                    device,
+                    symbols,
+                    currentThread,
+                    L"nt!_KTHREAD",
+                    L"KernelStack");
+            }
+
+            if (context.Rsp == 0)
+            {
+                context.Rsp = ReadCanonicalFieldU64(
+                    device,
+                    symbols,
+                    currentThread,
+                    L"nt!_KTHREAD",
+                    L"InitialStack");
+            }
+        }
+
+        if (context.Rsp == 0 && kpcr != 0)
+        {
+            uint64_t prcb = 0;
+            if (!ReadFieldU64(
+                    device,
+                    symbols,
+                    kpcr,
+                    L"nt!_KPCR",
+                    L"CurrentPrcb",
+                    &kKpcrCurrentPrcbOffset,
+                    &prcb) ||
+                !IsKernelCanonicalVa(prcb))
+            {
+                prcb = kpcr + 0x180;
+            }
+
+            context.Rsp = ReadCanonicalFieldU64(
+                device,
+                symbols,
+                prcb,
+                L"nt!_KPRCB",
+                L"RspBase");
+        }
+
+        if (context.Rip == 0 && IsKernelCanonicalVa(lstar))
+        {
+            context.Rip = lstar;
+        }
+
+        if (context.Rip == 0)
+        {
+            const KernelModuleInfo* nt = FindNtModule(symbols);
+            if (nt != nullptr && IsKernelCanonicalVa(nt->Base))
+            {
+                context.Rip = nt->Base;
             }
         }
 
@@ -3676,6 +3706,16 @@ bool BuildCompleteDumpHeader(
         {
             const size_t copied = (std::min)(info.ContextRecord.size(), sizeof(dump.ContextRecord));
             std::memcpy(dump.ContextRecord, info.ContextRecord.data(), copied);
+            if (info.ContextRecord.size() >= offsetof(CONTEXT, Rip) + sizeof(uint64_t))
+            {
+                uint64_t rip = 0;
+                std::memcpy(&rip, info.ContextRecord.data() + offsetof(CONTEXT, Rip), sizeof(rip));
+                if (rip != 0)
+                {
+                    dump.Exception.ExceptionCode = 0x80000003ul; // STATUS_BREAKPOINT
+                    dump.Exception.ExceptionAddress = rip;
+                }
+            }
         }
 
         header->resize(sizeof(dump));
@@ -4245,6 +4285,20 @@ bool DumpProcessVisibleMemoryToCrashDump(
         fixup.UserDirectoryTableBase = userDirectoryTableBase;
         fixup.Peb = peb;
         fixup.Thread = FindFirstProcessThread(device, symbols, eprocess, &walkWarnings);
+
+        uint64_t wow64Process = 0;
+        if (ReadFieldU64(
+                device,
+                symbols,
+                eprocess,
+                L"nt!_EPROCESS",
+                L"Wow64Process",
+                nullptr,
+                &wow64Process) &&
+            wow64Process != 0)
+        {
+            fixup.Wow64 = true;
+        }
 
         AddPhysicalPageToRuns(plan.HeaderDtb, &ranges);
         AddPhysicalPageToRuns(plan.PrimaryDtb, &ranges);

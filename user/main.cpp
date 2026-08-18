@@ -24181,11 +24181,9 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  notepad.exe after /user is an error, not an output path.\n";
     std::wcout << L"  The process-filtered file is a kernel complete dump (PAGE/DU64), not a\n";
     std::wcout << L"  user minidump (MDMP). WinDbg opens it as kd. The writer merges the KPTI\n";
-    std::wcout << L"  user+kernel page-table root, pins KDBG/EPROCESS/PEB, and points CPU0\n";
-    std::wcout << L"  CurrentThread at the target so !peb and lm u see that process. If the\n";
-    std::wcout << L"  default context is still wrong: .process /p /r <eprocess>\n";
-    std::wcout << L"  If WinDbg shows kd:x86 or truncates _ETHREAD to 32 bits: .effmach amd64\n";
-    std::wcout << L"  then .thread /p /r <ethread>. Header CONTEXT stays kernel x64 on purpose.\n";
+    std::wcout << L"  user+kernel page-table root and pins KDBG/EPROCESS/PEB. CPU0 CurrentThread\n";
+    std::wcout << L"  is left unchanged so the header CONTEXT stays AMD64 kernel. Switch to the\n";
+    std::wcout << L"  target with .process /p /r <eprocess> then !peb / lm u.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  dump-live .\\os-live.dmp\n";
@@ -24529,6 +24527,7 @@ static void HandleDumpLiveCommand(
                        << L" kdbg=0x" << dumpResult.KdDebuggerDataBlock
                        << L" kdbg_plain=" << (dumpResult.KdbgPlain ? L"yes" : L"no")
                        << L" kpti_merged=" << (dumpResult.KptiRootMerged ? L"yes" : L"no")
+                       << L" wow64=" << (dumpResult.Wow64Target ? L"yes" : L"no")
                        << L" current_thread=0x" << dumpResult.CurrentThread
                        << L" current_process=" << (dumpResult.CurrentProcessPatched ? L"yes" : L"no")
                        << std::dec
@@ -27869,6 +27868,29 @@ static int RunConsoleSurfaceSelfTest()
                     filterParam1 == 0x1234 &&
                     filterParam2 == 0xffffaa0000001000ull,
                 L"dump-live-process-header-marks-filtered-live-dump");
+            headerInfo.ContextRecord.assign(0x100, 0);
+            const uint64_t fakeRip = 0xfffff80012345678ull;
+            std::memcpy(headerInfo.ContextRecord.data() + 0xF8, &fakeRip, sizeof(fakeRip));
+            std::vector<uint8_t> exceptionHeader;
+            std::wstring exceptionError;
+            uint32_t exceptionCode = 0;
+            uint64_t exceptionAddress = 0;
+            const bool exceptionOk = BuildCompleteDumpHeader(
+                {run},
+                headerInfo,
+                &exceptionHeader,
+                &exceptionError);
+            if (exceptionHeader.size() >= kCrashDumpHeaderBytes)
+            {
+                std::memcpy(&exceptionCode, exceptionHeader.data() + 0xF00, sizeof(exceptionCode));
+                std::memcpy(&exceptionAddress, exceptionHeader.data() + 0xF10, sizeof(exceptionAddress));
+            }
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                exceptionOk &&
+                    exceptionCode == 0x80000003ul &&
+                    exceptionAddress == fakeRip,
+                L"dump-header-stores-breakpoint-exception-from-context-rip");
         }
         {
             const std::wstring kernelHelp = CaptureDetailedHelpOutput({L"help", L"dump-kernel"}, 1);
