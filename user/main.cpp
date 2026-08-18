@@ -24088,6 +24088,47 @@ static void PrintDumpKernelHelp()
     std::wcout << L"  dump-kernel C:\\Dumps\\host.dmp /max 0x40000000\n";
 }
 
+static bool LooksLikeDumpOutputPath(const std::wstring& text)
+{
+    bool looksLikePath = false;
+
+    do
+    {
+        if (text.empty())
+        {
+            break;
+        }
+
+        if (text.find(L'\\') != std::wstring::npos ||
+            text.find(L'/') != std::wstring::npos)
+        {
+            looksLikePath = true;
+            break;
+        }
+
+        const std::wstring lowered = ToLower(text);
+        if (lowered == L"." ||
+            lowered.rfind(L".\\", 0) == 0 ||
+            lowered.rfind(L"./", 0) == 0)
+        {
+            looksLikePath = true;
+            break;
+        }
+
+        const size_t dot = lowered.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot + 1 < lowered.size())
+        {
+            const std::wstring ext = lowered.substr(dot);
+            if (ext == L".dmp" || ext == L".mdmp" || ext == L".dump")
+            {
+                looksLikePath = true;
+            }
+        }
+    } while (false);
+
+    return looksLikePath;
+}
+
 static void PrintDumpLiveHelp()
 {
     std::wcout << L"dump-live command:\n";
@@ -24097,8 +24138,9 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  Asks Windows to write a live kernel dump through NtSystemDebugControl\n";
     std::wcout << L"  (SysDbgGetLiveKernelDump). This is the Task Manager / OS path, not a\n";
     std::wcout << L"  KnLiveDbg physical walk. The driver is not required unless /user names a\n";
-    std::wcout << L"  process. /user <pid|eprocess> walks that process DTB and writes a complete\n";
-    std::wcout << L"  dump of its resident kernel+user pages so WinDbg can see that user AS.\n";
+    std::wcout << L"  process. /user <pid|eprocess> walks that process user CR3 plus the kernel\n";
+    std::wcout << L"  CR3 and writes a complete dump of resident pages so WinDbg can see that\n";
+    std::wcout << L"  user AS. Image names after /user are rejected.\n";
     std::wcout << L"\n";
     std::wcout << L"arguments:\n";
     std::wcout << L"  <path>             output .dmp path. Existing file is overwritten.\n";
@@ -24116,7 +24158,8 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  STATUS_DEBUGGER_INACTIVE unless a kernel debugger is configured.\n";
     std::wcout << L"  /user <pid|eprocess> ignores /compress and /hv; it uses the complete-dump\n";
     std::wcout << L"  writer. Only PID or _EPROCESS tokens are consumed after /user so a path\n";
-    std::wcout << L"  like dump.dmp is not stolen as a process name.\n";
+    std::wcout << L"  like dump.dmp is not stolen as a process name. A bare image name such as\n";
+    std::wcout << L"  notepad.exe after /user is an error, not an output path.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  dump-live .\\os-live.dmp\n";
@@ -24329,6 +24372,13 @@ static void HandleDumpLiveCommand(
                     {
                         userTarget = args[index + 1];
                         ++index;
+                    }
+                    else if (kind == ProcessSpecifierKind::Image &&
+                             !LooksLikeDumpOutputPath(args[index + 1]))
+                    {
+                        std::wcerr << L"dump-live /user accepts a PID or _EPROCESS, not an image name\n";
+                        parseError = true;
+                        break;
                     }
                 }
                 continue;
@@ -27623,6 +27673,13 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"dump-live"}, L"/compress", L"dump-live-compress-completion");
         CheckCompletionCandidate(&context, {L"dump-live"}, L"/hv", L"dump-live-hv-completion");
         CheckCompletionCandidate(&context, {L"help", L"dump-kernel"}, L"/max", L"help-dump-kernel-option-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            LooksLikeDumpOutputPath(L"C:\\Dumps\\out.dmp") &&
+                LooksLikeDumpOutputPath(L"out.dmp") &&
+                !LooksLikeDumpOutputPath(L"notepad.exe") &&
+                !LooksLikeDumpOutputPath(L"lsass"),
+            L"dump-live-user-path-vs-image-token");
         CheckConsoleSurfaceSelfTest(
             &context,
             IsNativeOwnedCommand(L"dump-kernel") &&

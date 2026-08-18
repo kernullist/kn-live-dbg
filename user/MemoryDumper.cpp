@@ -2109,6 +2109,8 @@ namespace
         return ok;
     }
 
+    void SortAndMergePhysicalRuns(std::vector<PhysicalMemoryRange>* runs);
+
     bool NormalizePhysicalRanges(
         std::vector<PhysicalMemoryRange>* ranges,
         uint64_t maxPayloadBytes,
@@ -2127,6 +2129,8 @@ namespace
                 }
                 break;
             }
+
+            SortAndMergePhysicalRuns(ranges);
 
             std::vector<PhysicalMemoryRange> normalized;
             uint64_t total = 0;
@@ -2219,10 +2223,37 @@ namespace
         return ok;
     }
 
+    uint64_t RangeEnd(uint64_t base, uint64_t count)
+    {
+        uint64_t end = base;
+        if (count != 0)
+        {
+            if (base > (std::numeric_limits<uint64_t>::max)() - count)
+            {
+                end = (std::numeric_limits<uint64_t>::max)();
+            }
+            else
+            {
+                end = base + count;
+            }
+        }
+
+        return end;
+    }
+
     void SortAndMergePhysicalRuns(std::vector<PhysicalMemoryRange>* runs)
     {
-        if (runs == nullptr || runs->size() < 2)
+        if (runs == nullptr)
         {
+            return;
+        }
+
+        if (runs->size() < 2)
+        {
+            if (!runs->empty() && (*runs)[0].ByteCount == 0)
+            {
+                runs->clear();
+            }
             return;
         }
 
@@ -2250,14 +2281,14 @@ namespace
             }
 
             PhysicalMemoryRange& last = merged.back();
-            const uint64_t lastEnd = last.BaseAddress + last.ByteCount;
+            const uint64_t lastEnd = RangeEnd(last.BaseAddress, last.ByteCount);
             if (run.BaseAddress > lastEnd)
             {
                 merged.push_back(run);
                 continue;
             }
 
-            const uint64_t runEnd = run.BaseAddress + run.ByteCount;
+            const uint64_t runEnd = RangeEnd(run.BaseAddress, run.ByteCount);
             if (runEnd > lastEnd)
             {
                 last.ByteCount = runEnd - last.BaseAddress;
@@ -2294,7 +2325,7 @@ namespace
             for (size_t index = 0; index + 1 < runs->size(); ++index)
             {
                 const uint64_t leftEnd =
-                    (*runs)[index].BaseAddress + (*runs)[index].ByteCount;
+                    RangeEnd((*runs)[index].BaseAddress, (*runs)[index].ByteCount);
                 if (leftEnd > (*runs)[index + 1].BaseAddress)
                 {
                     continue;
@@ -2308,8 +2339,9 @@ namespace
                 }
             }
 
-            const uint64_t newEnd =
-                (*runs)[best + 1].BaseAddress + (*runs)[best + 1].ByteCount;
+            const uint64_t newEnd = RangeEnd(
+                (*runs)[best + 1].BaseAddress,
+                (*runs)[best + 1].ByteCount);
             if (newEnd < (*runs)[best].BaseAddress)
             {
                 break;
@@ -2320,12 +2352,133 @@ namespace
         }
     }
 
+    void IntersectPhysicalRunsWithAllowed(
+        std::vector<PhysicalMemoryRange>* runs,
+        const std::vector<PhysicalMemoryRange>& allowed)
+    {
+        if (runs == nullptr || runs->empty() || allowed.empty())
+        {
+            return;
+        }
+
+        SortAndMergePhysicalRuns(runs);
+        std::vector<PhysicalMemoryRange> windows = allowed;
+        SortAndMergePhysicalRuns(&windows);
+        if (windows.empty())
+        {
+            return;
+        }
+
+        std::vector<PhysicalMemoryRange> clipped;
+        clipped.reserve(runs->size());
+        size_t windowIndex = 0;
+        for (const PhysicalMemoryRange& run : *runs)
+        {
+            const uint64_t runEnd = RangeEnd(run.BaseAddress, run.ByteCount);
+            while (windowIndex < windows.size() &&
+                   RangeEnd(windows[windowIndex].BaseAddress, windows[windowIndex].ByteCount) <=
+                       run.BaseAddress)
+            {
+                ++windowIndex;
+            }
+
+            for (size_t index = windowIndex; index < windows.size(); ++index)
+            {
+                const PhysicalMemoryRange& window = windows[index];
+                if (window.BaseAddress >= runEnd)
+                {
+                    break;
+                }
+
+                const uint64_t start = (std::max)(run.BaseAddress, window.BaseAddress);
+                const uint64_t end = (std::min)(
+                    runEnd,
+                    RangeEnd(window.BaseAddress, window.ByteCount));
+                if (end <= start)
+                {
+                    continue;
+                }
+
+                PhysicalMemoryRange piece = {};
+                piece.BaseAddress = start;
+                piece.ByteCount = end - start;
+                clipped.push_back(piece);
+            }
+        }
+
+        *runs = std::move(clipped);
+        SortAndMergePhysicalRuns(runs);
+    }
+
     enum class PageTableHalf
     {
         Both = 0,
         User,
         Kernel
     };
+
+    uint64_t MaskDirectoryTableBase(uint64_t value)
+    {
+        return value & 0x000FFFFFFFFFF000ull;
+    }
+
+    struct ProcessDumpWalkPlan
+    {
+        uint64_t HeaderDtb = 0;
+        uint64_t PrimaryDtb = 0;
+        PageTableHalf PrimaryHalf = PageTableHalf::Both;
+        uint64_t SecondaryDtb = 0;
+        PageTableHalf SecondaryHalf = PageTableHalf::Kernel;
+    };
+
+    // KPTI keeps user pages on UserDirectoryTableBase. Walking only the
+    // kernel CR3 misses the process user address space. The dump header
+    // still needs a kernel CR3 so WinDbg can translate nt/KDBG.
+    ProcessDumpWalkPlan MakeProcessDumpWalkPlan(
+        uint64_t kernelDtb,
+        uint64_t userDtb,
+        uint64_t liveKernelCr3)
+    {
+        ProcessDumpWalkPlan plan;
+        const uint64_t kernel = MaskDirectoryTableBase(kernelDtb);
+        const uint64_t user = MaskDirectoryTableBase(userDtb);
+        const uint64_t live = MaskDirectoryTableBase(liveKernelCr3);
+
+        if (user != 0 && kernel != 0 && user != kernel)
+        {
+            plan.PrimaryDtb = user;
+            plan.PrimaryHalf = PageTableHalf::User;
+            plan.SecondaryDtb = kernel;
+            plan.SecondaryHalf = PageTableHalf::Kernel;
+            plan.HeaderDtb = kernel;
+        }
+        else
+        {
+            const uint64_t dtb = kernel != 0 ? kernel : user;
+            plan.PrimaryDtb = dtb;
+            plan.PrimaryHalf = PageTableHalf::Both;
+            plan.HeaderDtb = dtb;
+            if (kernel == 0 && user != 0 && live != 0 && live != user)
+            {
+                plan.SecondaryDtb = live;
+                plan.SecondaryHalf = PageTableHalf::Kernel;
+                plan.HeaderDtb = live;
+            }
+        }
+
+        return plan;
+    }
+
+    uint64_t CountPhysicalRunPages(const std::vector<PhysicalMemoryRange>& runs)
+    {
+        uint64_t pages = 0;
+        for (const PhysicalMemoryRange& run : runs)
+        {
+            pages += run.ByteCount / kPageSize;
+        }
+
+        return pages;
+    }
 
     uint64_t SumPhysicalRunBytes(const std::vector<PhysicalMemoryRange>& runs)
     {
@@ -2351,14 +2504,13 @@ namespace
         std::vector<PhysicalMemoryRange>* ranges,
         uint64_t* pageCount,
         uint32_t* skippedTables,
-        uint64_t* extraCoalescedBytes,
         std::wstring* error)
     {
         bool ok = false;
 
         do
         {
-            if (ranges == nullptr || pageCount == nullptr)
+            if (ranges == nullptr)
             {
                 if (error != nullptr)
                 {
@@ -2368,17 +2520,16 @@ namespace
             }
 
             ranges->clear();
-            *pageCount = 0;
+            if (pageCount != nullptr)
+            {
+                *pageCount = 0;
+            }
             if (skippedTables != nullptr)
             {
                 *skippedTables = 0;
             }
-            if (extraCoalescedBytes != nullptr)
-            {
-                *extraCoalescedBytes = 0;
-            }
 
-            const uint64_t dtb = directoryTableBase & 0x000FFFFFFFFFF000ull;
+            const uint64_t dtb = MaskDirectoryTableBase(directoryTableBase);
             if (dtb == 0)
             {
                 if (error != nullptr)
@@ -2393,6 +2544,8 @@ namespace
             const int* shifts = la57 ? &shifts5[0] : &shifts5[1];
             constexpr uint64_t presentBit = 1ull;
             constexpr uint64_t largeBit = 1ull << 7;
+            constexpr uint64_t prototypeBit = 1ull << 10;
+            constexpr uint64_t transitionBit = 1ull << 11;
             constexpr uint64_t pfnMask = 0x000FFFFFFFFFF000ull;
             constexpr uint32_t maxTables = 2000000;
             constexpr uint32_t maxLeaves = 8000000;
@@ -2491,6 +2644,26 @@ namespace
                 std::memcpy(&entry, frame.Entries.data() + (index * sizeof(entry)), sizeof(entry));
                 if ((entry & presentBit) == 0)
                 {
+                    // Transition PTEs are still in RAM. Prototype PTEs store a
+                    // proto-PTE VA, not a PFN, so they must not be collected.
+                    const bool leafLevel = (frame.Level + 1u) == levels;
+                    if (leafLevel &&
+                        (entry & prototypeBit) == 0 &&
+                        (entry & transitionBit) != 0)
+                    {
+                        const uint64_t transPa = entry & pfnMask;
+                        if (transPa != 0)
+                        {
+                            if (leaves >= maxLeaves)
+                            {
+                                overflow = true;
+                                break;
+                            }
+
+                            addRange(transPa, kPageSize);
+                            ++leaves;
+                        }
+                    }
                     continue;
                 }
 
@@ -2551,20 +2724,11 @@ namespace
                 break;
             }
 
-            const uint64_t exactBytes = SumPhysicalRunBytes(collected);
-            CoalescePhysicalRunsToMax(&collected, kCrashDumpMaxPhysicalRuns);
-            const uint64_t coalescedBytes = SumPhysicalRunBytes(collected);
-            uint64_t pages = 0;
-            for (const PhysicalMemoryRange& run : collected)
-            {
-                pages += run.ByteCount / kPageSize;
-            }
-
+            SortAndMergePhysicalRuns(&collected);
             *ranges = std::move(collected);
-            *pageCount = pages;
-            if (extraCoalescedBytes != nullptr && coalescedBytes > exactBytes)
+            if (pageCount != nullptr)
             {
-                *extraCoalescedBytes = coalescedBytes - exactBytes;
+                *pageCount = CountPhysicalRunPages(*ranges);
             }
             ok = true;
         } while (false);
@@ -3365,6 +3529,19 @@ bool DumpPhysicalMemoryToCrashDump(
                     preparedKdbg,
                     &patchError);
             }
+            if (!patched &&
+                registers.Cr3 != 0 &&
+                MaskDirectoryTableBase(registers.Cr3) !=
+                    MaskDirectoryTableBase(info.DirectoryTableBase))
+            {
+                patched = PatchPlainKdbgIntoDump(
+                    file,
+                    device,
+                    MaskDirectoryTableBase(registers.Cr3),
+                    ranges,
+                    preparedKdbg,
+                    &patchError);
+            }
 
             if (patched)
             {
@@ -3447,96 +3624,32 @@ bool DumpProcessVisibleMemoryToCrashDump(
             break;
         }
 
+        const ProcessDumpWalkPlan plan = MakeProcessDumpWalkPlan(
+            directoryTableBase,
+            userDirectoryTableBase,
+            registers.Cr3);
+        if (plan.PrimaryDtb == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"process directory table base is zero";
+            }
+            break;
+        }
+
+        std::vector<std::wstring> walkWarnings;
         std::vector<PhysicalMemoryRange> ranges;
-        uint64_t pageCount = 0;
         uint32_t skippedTables = 0;
-        uint64_t extraBytes = 0;
         std::wstring walkError;
-        const uint64_t kernelDtb = directoryTableBase;
-        const uint64_t userDtb = userDirectoryTableBase;
-        bool walked = false;
-        if (kernelDtb != 0)
-        {
-            walked = CollectResidentPhysicalRunsFromDtb(
-                device,
-                kernelDtb,
-                la57,
-                PageTableHalf::Both,
-                &ranges,
-                &pageCount,
-                &skippedTables,
-                &extraBytes,
-                &walkError);
-        }
-        else if (userDtb != 0)
-        {
-            // KPTI user CR3 has almost no kernel mappings. Walk its user
-            // half, then the live kernel CR3 kernel half so WinDbg still
-            // has nt/KDBG pages.
-            uint64_t userPages = 0;
-            uint32_t userSkipped = 0;
-            uint64_t userExtra = 0;
-            walked = CollectResidentPhysicalRunsFromDtb(
-                device,
-                userDtb,
-                la57,
-                PageTableHalf::User,
-                &ranges,
-                &userPages,
-                &userSkipped,
-                &userExtra,
-                &walkError);
-            if (walked && registers.Cr3 != 0)
-            {
-                std::vector<PhysicalMemoryRange> kernelRanges;
-                uint64_t kernelPages = 0;
-                uint32_t kernelSkipped = 0;
-                uint64_t kernelExtra = 0;
-                std::wstring kernelError;
-                if (CollectResidentPhysicalRunsFromDtb(
-                        device,
-                        registers.Cr3,
-                        la57,
-                        PageTableHalf::Kernel,
-                        &kernelRanges,
-                        &kernelPages,
-                        &kernelSkipped,
-                        &kernelExtra,
-                        &kernelError))
-                {
-                    ranges.insert(ranges.end(), kernelRanges.begin(), kernelRanges.end());
-                    userSkipped += kernelSkipped;
-                    const uint64_t beforeMerge = SumPhysicalRunBytes(ranges);
-                    CoalescePhysicalRunsToMax(&ranges, kCrashDumpMaxPhysicalRuns);
-                    const uint64_t afterMerge = SumPhysicalRunBytes(ranges);
-                    userPages = 0;
-                    for (const PhysicalMemoryRange& run : ranges)
-                    {
-                        userPages += run.ByteCount / kPageSize;
-                    }
-                    userExtra = userExtra + kernelExtra;
-                    if (afterMerge > beforeMerge)
-                    {
-                        userExtra += afterMerge - beforeMerge;
-                    }
-                }
-                else if (result != nullptr)
-                {
-                    result->Warnings.push_back(
-                        L"kernel-half walk failed; dump may lack nt/KDBG: " + kernelError);
-                }
-            }
-            else if (walked && result != nullptr)
-            {
-                result->Warnings.push_back(
-                    L"only user DTB was available; dump may lack kernel pages");
-            }
-
-            pageCount = userPages;
-            skippedTables = userSkipped;
-            extraBytes = userExtra;
-        }
-
+        const bool walked = CollectResidentPhysicalRunsFromDtb(
+            device,
+            plan.PrimaryDtb,
+            la57,
+            plan.PrimaryHalf,
+            &ranges,
+            nullptr,
+            &skippedTables,
+            &walkError);
         if (!walked)
         {
             if (error != nullptr)
@@ -3548,10 +3661,73 @@ bool DumpProcessVisibleMemoryToCrashDump(
             break;
         }
 
-        const uint64_t headerDtb = kernelDtb != 0 ? kernelDtb : userDtb;
+        if (plan.SecondaryDtb != 0)
+        {
+            std::vector<PhysicalMemoryRange> kernelRanges;
+            uint32_t kernelSkipped = 0;
+            std::wstring kernelError;
+            if (CollectResidentPhysicalRunsFromDtb(
+                    device,
+                    plan.SecondaryDtb,
+                    la57,
+                    plan.SecondaryHalf,
+                    &kernelRanges,
+                    nullptr,
+                    &kernelSkipped,
+                    &kernelError))
+            {
+                ranges.insert(ranges.end(), kernelRanges.begin(), kernelRanges.end());
+                skippedTables += kernelSkipped;
+            }
+            else
+            {
+                walkWarnings.push_back(
+                    L"kernel-half walk failed; dump may lack nt/KDBG: " + kernelError);
+            }
+        }
+        else if (MaskDirectoryTableBase(directoryTableBase) == 0 &&
+                 MaskDirectoryTableBase(userDirectoryTableBase) != 0)
+        {
+            walkWarnings.push_back(
+                L"only user DTB was available; dump may lack kernel pages");
+        }
+
+        std::vector<PhysicalMemoryRange> ramRanges;
+        uint64_t ramTotal = 0;
+        std::wstring ramError;
+        if (device.GetPhysicalMemoryRanges(&ramRanges, &ramTotal, &ramError) &&
+            !ramRanges.empty())
+        {
+            IntersectPhysicalRunsWithAllowed(&ranges, ramRanges);
+        }
+        else
+        {
+            walkWarnings.push_back(
+                L"could not clip process PFNs to RAM map: " + ramError);
+        }
+
+        if (ranges.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"process DTB walk found no RAM-resident pages";
+            }
+            break;
+        }
+
+        const uint64_t exactBytes = SumPhysicalRunBytes(ranges);
+        CoalescePhysicalRunsToMax(&ranges, kCrashDumpMaxPhysicalRuns);
+        const uint64_t coalescedBytes = SumPhysicalRunBytes(ranges);
+        const uint64_t extraBytes =
+            coalescedBytes > exactBytes ? coalescedBytes - exactBytes : 0;
+        const uint64_t pageCount = CountPhysicalRunPages(ranges);
+
+        const uint64_t headerDtb = plan.HeaderDtb;
         std::wcout << L"[dump-live] process filter pid=" << processId
                    << L" eprocess=0x" << std::hex << eprocess
-                   << L" dtb=0x" << headerDtb << std::dec
+                   << L" dtb=0x" << headerDtb
+                   << L" user_dtb=0x" << MaskDirectoryTableBase(userDirectoryTableBase)
+                   << std::dec
                    << L" runs=" << ranges.size()
                    << L" pages=" << pageCount << L"\n";
 
@@ -3576,9 +3752,17 @@ bool DumpProcessVisibleMemoryToCrashDump(
                 headerDtb,
                 comment))
         {
+            result->Warnings.insert(
+                result->Warnings.end(),
+                walkWarnings.begin(),
+                walkWarnings.end());
             break;
         }
 
+        result->Warnings.insert(
+            result->Warnings.end(),
+            walkWarnings.begin(),
+            walkWarnings.end());
         if (skippedTables > 0)
         {
             result->Warnings.push_back(
@@ -3589,7 +3773,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
         {
             std::wstringstream extraStream;
             extraStream << L"coalesced physical runs to 42 by including 0x" << std::hex
-                        << extraBytes << L" extra bytes from gaps";
+                        << extraBytes << L" extra RAM bytes from gaps";
             result->Warnings.push_back(extraStream.str());
         }
 
@@ -3956,6 +4140,52 @@ bool DumpLiveProcessFilterSelfTest()
 
         CoalescePhysicalRunsToMax(&keep, 1);
         if (keep.size() != 1)
+        {
+            break;
+        }
+
+        const ProcessDumpWalkPlan kpti = MakeProcessDumpWalkPlan(0x1aa000, 0x2bb000, 0x1aa000);
+        if (kpti.PrimaryDtb != 0x2bb000 ||
+            kpti.PrimaryHalf != PageTableHalf::User ||
+            kpti.SecondaryDtb != 0x1aa000 ||
+            kpti.SecondaryHalf != PageTableHalf::Kernel ||
+            kpti.HeaderDtb != 0x1aa000)
+        {
+            break;
+        }
+
+        const ProcessDumpWalkPlan same = MakeProcessDumpWalkPlan(0x1aa001, 0x1aa002, 0x1aa000);
+        if (same.PrimaryDtb != 0x1aa000 ||
+            same.PrimaryHalf != PageTableHalf::Both ||
+            same.SecondaryDtb != 0 ||
+            same.HeaderDtb != 0x1aa000)
+        {
+            break;
+        }
+
+        const ProcessDumpWalkPlan userOnly = MakeProcessDumpWalkPlan(0, 0x2bb000, 0x1aa000);
+        if (userOnly.PrimaryDtb != 0x2bb000 ||
+            userOnly.PrimaryHalf != PageTableHalf::Both ||
+            userOnly.SecondaryDtb != 0x1aa000 ||
+            userOnly.HeaderDtb != 0x1aa000)
+        {
+            break;
+        }
+
+        std::vector<PhysicalMemoryRange> overlap(1);
+        overlap[0].BaseAddress = 0x1000;
+        overlap[0].ByteCount = 0x5000;
+        std::vector<PhysicalMemoryRange> allowed(2);
+        allowed[0].BaseAddress = 0;
+        allowed[0].ByteCount = 0x3000;
+        allowed[1].BaseAddress = 0x4000;
+        allowed[1].ByteCount = 0x1000;
+        IntersectPhysicalRunsWithAllowed(&overlap, allowed);
+        if (overlap.size() != 2 ||
+            overlap[0].BaseAddress != 0x1000 ||
+            overlap[0].ByteCount != 0x2000 ||
+            overlap[1].BaseAddress != 0x4000 ||
+            overlap[1].ByteCount != 0x1000)
         {
             break;
         }
