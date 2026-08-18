@@ -148,6 +148,7 @@ struct DumpKernelCrashResult
     bool KdbgWasEncoded = false;
     bool KptiRootMerged = false;
     bool CurrentProcessPatched = false;
+    bool ProcessorStatePatched = false;
     bool Wow64Target = false;
     bool TrapFrameSynthesized = false;
     std::vector<std::wstring> Warnings;
@@ -167,7 +168,9 @@ struct ProcessDumpWinDbgFixup
     uint64_t Thread = 0;
     uint64_t HeaderRip = 0;
     uint64_t HeaderRsp = 0;
+    uint64_t CreateTime = 0;
     bool Wow64 = false;
+    bool HasKernelTrap = false;
 };
 
 struct DumpOsLiveResult
@@ -198,8 +201,10 @@ bool BuildCompleteDumpHeader(
 // directoryTableBaseOverride, when non-zero, is stored as DirectoryTableBase
 // instead of CPU0 CR3. commentOverride replaces the default header comment.
 // processFixup, when non-null, marks the dump as a filtered live dump,
-// merges the KPTI user/kernel page-table root, and pins CPU0 CurrentThread
-// to IdleThread so dbgeng stays in AMD64 kernel context.
+// merges the KPTI user/kernel page-table root, overwrites CPU0
+// ProcessorState.ContextFrame, and pins CurrentThread to a target
+// thread that has a kernel trap or a synthesized kernel KTRAP_FRAME
+// so dbgeng stays in AMD64 kernel context. IdleThread is the fallback.
 bool DumpPhysicalMemoryToCrashDump(
     DeviceClient& device,
     SymbolEngine& symbols,

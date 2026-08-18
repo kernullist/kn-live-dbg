@@ -1988,8 +1988,163 @@ namespace
         return ok;
     }
 
+    HANDLE OpenTargetProcessReadHandle(uint32_t processId)
+    {
+        HANDLE process = nullptr;
+        if (processId != 0)
+        {
+            process = OpenProcess(
+                PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+                FALSE,
+                processId);
+            if (process == nullptr)
+            {
+                process = OpenProcess(
+                    PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+                    FALSE,
+                    processId);
+            }
+        }
+
+        return process;
+    }
+
+    bool ReadUserVirtualForDump(
+        DeviceClient& device,
+        HANDLE processHandle,
+        uint32_t processId,
+        uint64_t eprocess,
+        uint64_t createTime,
+        uint64_t directoryTableBase,
+        uint64_t virtualAddress,
+        uint32_t length,
+        std::vector<uint8_t>* bytes)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (bytes == nullptr || length == 0 || virtualAddress == 0)
+            {
+                break;
+            }
+
+            if (processHandle != nullptr)
+            {
+                bytes->assign(length, 0);
+                SIZE_T got = 0;
+                if (ReadProcessMemory(
+                        processHandle,
+                        reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(virtualAddress)),
+                        bytes->data(),
+                        length,
+                        &got) &&
+                    got == length)
+                {
+                    ok = true;
+                    break;
+                }
+            }
+
+            if (processId != 0 && eprocess != 0 && createTime != 0)
+            {
+                std::vector<uint8_t> copied;
+                if (device.ReadProcessVirtual(
+                        processId,
+                        eprocess,
+                        createTime,
+                        virtualAddress,
+                        length,
+                        &copied,
+                        nullptr) &&
+                    copied.size() >= length)
+                {
+                    *bytes = std::move(copied);
+                    ok = true;
+                    break;
+                }
+            }
+
+            ok = ReadVirtualThroughDtb(device, directoryTableBase, virtualAddress, length, bytes);
+        } while (false);
+
+        return ok;
+    }
+
+    // ReadProcessMemory can page in prototype/file-backed user pages.
+    // The driver ReadProcessVirtual path uses MmCopyMemory and will not.
+    void FaultAndPinUserPage(
+        DeviceClient& device,
+        HANDLE processHandle,
+        uint32_t processId,
+        uint64_t eprocess,
+        uint64_t createTime,
+        uint64_t directoryTableBase,
+        uint64_t virtualAddress,
+        std::vector<PhysicalMemoryRange>* ranges)
+    {
+        if (virtualAddress == 0 || ranges == nullptr)
+        {
+            return;
+        }
+
+        if (processHandle != nullptr)
+        {
+            uint8_t probe[8] = {};
+            SIZE_T got = 0;
+            ReadProcessMemory(
+                processHandle,
+                reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(virtualAddress)),
+                probe,
+                sizeof(probe),
+                &got);
+        }
+        else if (processId != 0 && eprocess != 0 && createTime != 0)
+        {
+            std::vector<uint8_t> ignored;
+            device.ReadProcessVirtual(
+                processId,
+                eprocess,
+                createTime,
+                virtualAddress,
+                8,
+                &ignored,
+                nullptr);
+        }
+
+        if (!AddTranslatedVirtualPage(
+                device,
+                directoryTableBase,
+                virtualAddress,
+                ranges,
+                nullptr,
+                nullptr) &&
+            processHandle != nullptr)
+        {
+            uint8_t probe[8] = {};
+            SIZE_T got = 0;
+            ReadProcessMemory(
+                processHandle,
+                reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(virtualAddress)),
+                probe,
+                sizeof(probe),
+                &got);
+            AddTranslatedVirtualPage(
+                device,
+                directoryTableBase,
+                virtualAddress,
+                ranges,
+                nullptr,
+                nullptr);
+        }
+    }
+
     void PinUserUnicodeStringPages(
         DeviceClient& device,
+        HANDLE processHandle,
+        uint32_t processId,
+        uint64_t eprocess,
+        uint64_t createTime,
         uint64_t directoryTableBase,
         uint64_t stringVa,
         std::vector<PhysicalMemoryRange>* ranges)
@@ -1999,10 +2154,27 @@ namespace
             return;
         }
 
-        AddTranslatedVirtualPage(device, directoryTableBase, stringVa, ranges, nullptr, nullptr);
+        FaultAndPinUserPage(
+            device,
+            processHandle,
+            processId,
+            eprocess,
+            createTime,
+            directoryTableBase,
+            stringVa,
+            ranges);
 
         std::vector<uint8_t> raw;
-        if (!ReadVirtualThroughDtb(device, directoryTableBase, stringVa, 16, &raw) ||
+        if (!ReadUserVirtualForDump(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                directoryTableBase,
+                stringVa,
+                16,
+                &raw) ||
             raw.size() < 16)
         {
             return;
@@ -2015,19 +2187,33 @@ namespace
             return;
         }
 
-        AddTranslatedVirtualPage(device, directoryTableBase, buffer, ranges, nullptr, nullptr);
-        AddTranslatedVirtualPage(
+        FaultAndPinUserPage(
             device,
+            processHandle,
+            processId,
+            eprocess,
+            createTime,
+            directoryTableBase,
+            buffer,
+            ranges);
+        FaultAndPinUserPage(
+            device,
+            processHandle,
+            processId,
+            eprocess,
+            createTime,
             directoryTableBase,
             buffer + static_cast<uint64_t>(length) - 1,
-            ranges,
-            nullptr,
-            nullptr);
+            ranges);
     }
 
     void PinProcessLdrNamePages(
         DeviceClient& device,
         SymbolEngine& symbols,
+        HANDLE processHandle,
+        uint32_t processId,
+        uint64_t eprocess,
+        uint64_t createTime,
         uint64_t userDtb,
         uint64_t peb,
         std::vector<PhysicalMemoryRange>* ranges,
@@ -2041,6 +2227,7 @@ namespace
             }
 
             TypeFieldInfo ldrField = {};
+            TypeFieldInfo imageBaseField = {};
             TypeFieldInfo listField = {};
             TypeFieldInfo linksField = {};
             TypeFieldInfo baseNameField = {};
@@ -2049,6 +2236,12 @@ namespace
                 !symbols.FindField(L"_PEB", L"Ldr", &ldrField, nullptr))
             {
                 ldrField.Offset = 0x18;
+            }
+
+            if (!symbols.FindField(L"nt!_PEB", L"ImageBaseAddress", &imageBaseField, nullptr) &&
+                !symbols.FindField(L"_PEB", L"ImageBaseAddress", &imageBaseField, nullptr))
+            {
+                imageBaseField.Offset = 0x10;
             }
 
             if (!symbols.FindField(L"nt!_PEB_LDR_DATA", L"InLoadOrderModuleList", &listField, nullptr) &&
@@ -2087,8 +2280,65 @@ namespace
                 fullNameField.Offset = 0x48;
             }
 
+            FaultAndPinUserPage(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                userDtb,
+                peb,
+                ranges);
+            FaultAndPinUserPage(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                userDtb,
+                peb + ldrField.Offset,
+                ranges);
+
+            std::vector<uint8_t> imageBaseBytes;
+            if (ReadUserVirtualForDump(
+                    device,
+                    processHandle,
+                    processId,
+                    eprocess,
+                    createTime,
+                    userDtb,
+                    peb + imageBaseField.Offset,
+                    8,
+                    &imageBaseBytes) &&
+                imageBaseBytes.size() >= 8)
+            {
+                uint64_t imageBase = 0;
+                std::memcpy(&imageBase, imageBaseBytes.data(), sizeof(imageBase));
+                if (IsUserModeVa(imageBase))
+                {
+                    FaultAndPinUserPage(
+                        device,
+                        processHandle,
+                        processId,
+                        eprocess,
+                        createTime,
+                        userDtb,
+                        imageBase,
+                        ranges);
+                }
+            }
+
             std::vector<uint8_t> pebBytes;
-            if (!ReadVirtualThroughDtb(device, userDtb, peb + ldrField.Offset, 8, &pebBytes))
+            if (!ReadUserVirtualForDump(
+                    device,
+                    processHandle,
+                    processId,
+                    eprocess,
+                    createTime,
+                    userDtb,
+                    peb + ldrField.Offset,
+                    8,
+                    &pebBytes))
             {
                 if (warnings != nullptr)
                 {
@@ -2101,14 +2351,58 @@ namespace
             std::memcpy(&ldr, pebBytes.data(), sizeof(ldr));
             if (!IsUserModeVa(ldr))
             {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"PEB.Ldr is not a user-mode pointer");
+                }
                 break;
             }
 
-            AddTranslatedVirtualPage(device, userDtb, ldr, ranges, nullptr, nullptr);
+            FaultAndPinUserPage(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                userDtb,
+                ldr,
+                ranges);
+            FaultAndPinUserPage(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                userDtb,
+                ldr + listField.Offset,
+                ranges);
+            FaultAndPinUserPage(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                userDtb,
+                ldr + 0x80,
+                ranges);
             const uint64_t listHead = ldr + listField.Offset;
             std::vector<uint8_t> headBytes;
-            if (!ReadVirtualThroughDtb(device, userDtb, listHead, 8, &headBytes))
+            if (!ReadUserVirtualForDump(
+                    device,
+                    processHandle,
+                    processId,
+                    eprocess,
+                    createTime,
+                    userDtb,
+                    listHead,
+                    8,
+                    &headBytes))
             {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(
+                        L"PEB.Ldr page did not become present after fault-in");
+                }
                 break;
             }
 
@@ -2129,14 +2423,55 @@ namespace
                 }
 
                 const uint64_t entry = current - linksField.Offset;
-                AddTranslatedVirtualPage(device, userDtb, entry, ranges, nullptr, nullptr);
-                AddTranslatedVirtualPage(device, userDtb, entry + 0x100, ranges, nullptr, nullptr);
-                PinUserUnicodeStringPages(device, userDtb, entry + baseNameField.Offset, ranges);
-                PinUserUnicodeStringPages(device, userDtb, entry + fullNameField.Offset, ranges);
+                FaultAndPinUserPage(
+                    device,
+                    processHandle,
+                    processId,
+                    eprocess,
+                    createTime,
+                    userDtb,
+                    entry,
+                    ranges);
+                FaultAndPinUserPage(
+                    device,
+                    processHandle,
+                    processId,
+                    eprocess,
+                    createTime,
+                    userDtb,
+                    entry + 0x100,
+                    ranges);
+                PinUserUnicodeStringPages(
+                    device,
+                    processHandle,
+                    processId,
+                    eprocess,
+                    createTime,
+                    userDtb,
+                    entry + baseNameField.Offset,
+                    ranges);
+                PinUserUnicodeStringPages(
+                    device,
+                    processHandle,
+                    processId,
+                    eprocess,
+                    createTime,
+                    userDtb,
+                    entry + fullNameField.Offset,
+                    ranges);
                 ++pinned;
 
                 std::vector<uint8_t> nextBytes;
-                if (!ReadVirtualThroughDtb(device, userDtb, current, 8, &nextBytes))
+                if (!ReadUserVirtualForDump(
+                        device,
+                        processHandle,
+                        processId,
+                        eprocess,
+                        createTime,
+                        userDtb,
+                        current,
+                        8,
+                        &nextBytes))
                 {
                     break;
                 }
@@ -2151,10 +2486,18 @@ namespace
                 current = next;
             }
 
-            if (warnings != nullptr && pinned > 0)
+            if (warnings != nullptr)
             {
-                warnings->push_back(
-                    L"pinned PEB LDR names for " + std::to_wstring(pinned) + L" module(s)");
+                if (pinned > 0)
+                {
+                    warnings->push_back(
+                        L"pinned PEB LDR names for " + std::to_wstring(pinned) + L" module(s)");
+                }
+                else
+                {
+                    warnings->push_back(
+                        L"PEB.Ldr was readable but InLoadOrderModuleList walked 0 modules");
+                }
             }
         } while (false);
     }
@@ -2381,6 +2724,368 @@ namespace
         return thread;
     }
 
+    bool FindProcessThreadKernelTrap(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t eprocess,
+        uint64_t* thread,
+        uint64_t* rip,
+        uint64_t* rsp)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (thread == nullptr || rip == nullptr || rsp == nullptr || eprocess == 0)
+            {
+                break;
+            }
+
+            *thread = 0;
+            *rip = 0;
+            *rsp = 0;
+
+            TypeFieldInfo headField = {};
+            TypeFieldInfo entryField = {};
+            bool haveList = false;
+            if (symbols.FindField(L"nt!_KPROCESS", L"ThreadListHead", &headField, nullptr) &&
+                symbols.FindField(L"nt!_KTHREAD", L"ThreadListEntry", &entryField, nullptr))
+            {
+                haveList = true;
+            }
+            else if (
+                symbols.FindField(L"nt!_EPROCESS", L"ThreadListHead", &headField, nullptr) &&
+                symbols.FindField(L"nt!_ETHREAD", L"ThreadListEntry", &entryField, nullptr) &&
+                headField.Offset > 0x200)
+            {
+                haveList = true;
+            }
+
+            if (!haveList)
+            {
+                break;
+            }
+
+            uint32_t tebOffset = 0;
+            TypeFieldInfo tebField = {};
+            if (symbols.FindField(L"nt!_KTHREAD", L"Teb", &tebField, nullptr) &&
+                tebField.Offset <= 0x4000)
+            {
+                tebOffset = tebField.Offset;
+            }
+
+            uint32_t processOffset = 0;
+            TypeFieldInfo processField = {};
+            if (symbols.FindField(L"nt!_KTHREAD", L"Process", &processField, nullptr) &&
+                processField.Offset <= 0x4000)
+            {
+                processOffset = processField.Offset;
+            }
+
+            TypeFieldInfo csField = {};
+            TypeFieldInfo ripField = {};
+            TypeFieldInfo rspField = {};
+            if (!symbols.FindField(L"nt!_KTRAP_FRAME", L"Rip", &ripField, nullptr))
+            {
+                break;
+            }
+
+            if (!symbols.FindField(L"nt!_KTRAP_FRAME", L"Rsp", &rspField, nullptr) &&
+                !symbols.FindField(L"nt!_KTRAP_FRAME", L"HardwareRsp", &rspField, nullptr))
+            {
+                break;
+            }
+
+            symbols.FindField(L"nt!_KTRAP_FRAME", L"SegCs", &csField, nullptr);
+
+            const uint64_t listHead = eprocess + headField.Offset;
+            uint64_t flink = 0;
+            if (!ReadKernelU64(device, listHead, &flink) ||
+                flink == 0 ||
+                flink == listHead)
+            {
+                break;
+            }
+
+            uint64_t fallback = 0;
+            uint64_t tebFallback = 0;
+            uint64_t current = flink;
+            for (uint32_t index = 0; index < 64; ++index)
+            {
+                if (current == 0 || current == listHead)
+                {
+                    break;
+                }
+
+                if (current < entryField.Offset)
+                {
+                    break;
+                }
+
+                const uint64_t candidate = current - entryField.Offset;
+                if (!IsKernelCanonicalVa(candidate))
+                {
+                    break;
+                }
+
+                uint64_t next = 0;
+                if (!ReadKernelU64(device, current, &next) || next == current)
+                {
+                    next = 0;
+                }
+
+                if (processOffset != 0)
+                {
+                    uint64_t owner = 0;
+                    if (!ReadKernelU64(device, candidate + processOffset, &owner) ||
+                        owner != eprocess)
+                    {
+                        if (next == 0)
+                        {
+                            break;
+                        }
+
+                        current = next;
+                        continue;
+                    }
+                }
+
+                if (fallback == 0)
+                {
+                    fallback = candidate;
+                }
+
+                if (tebOffset != 0 && tebFallback == 0)
+                {
+                    uint64_t teb = 0;
+                    if (ReadKernelU64(device, candidate + tebOffset, &teb) &&
+                        teb != 0 &&
+                        teb < 0x00FFFFFFFFFFFFFFull)
+                    {
+                        tebFallback = candidate;
+                    }
+                }
+
+                uint64_t trapFrame = 0;
+                if (ReadFieldU64(
+                        device,
+                        symbols,
+                        candidate,
+                        L"nt!_KTHREAD",
+                        L"TrapFrame",
+                        nullptr,
+                        &trapFrame) &&
+                    IsKernelCanonicalVa(trapFrame))
+                {
+                    bool kernelCs = true;
+                    if (!csField.Name.empty())
+                    {
+                        std::vector<uint8_t> csBytes;
+                        if (ReadKernelBytes(
+                                device,
+                                trapFrame + csField.Offset,
+                                sizeof(uint16_t),
+                                &csBytes) &&
+                            csBytes.size() >= sizeof(uint16_t))
+                        {
+                            uint16_t segCs = 0;
+                            std::memcpy(&segCs, csBytes.data(), sizeof(segCs));
+                            kernelCs = (segCs == 0x10);
+                        }
+                    }
+
+                    uint64_t trapRip = 0;
+                    uint64_t trapRsp = 0;
+                    if (kernelCs &&
+                        ReadKernelU64(device, trapFrame + ripField.Offset, &trapRip) &&
+                        ReadKernelU64(device, trapFrame + rspField.Offset, &trapRsp) &&
+                        IsKernelCanonicalVa(trapRip))
+                    {
+                        *thread = candidate;
+                        *rip = trapRip;
+                        *rsp = trapRsp;
+                        ok = true;
+                        break;
+                    }
+                }
+
+                if (next == 0)
+                {
+                    break;
+                }
+
+                current = next;
+            }
+
+            if (!ok)
+            {
+                if (tebFallback != 0)
+                {
+                    *thread = tebFallback;
+                }
+                else
+                {
+                    *thread = fallback;
+                }
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool ResolvePrcbProcessorStateAddresses(
+        SymbolEngine& symbols,
+        uint64_t prcb,
+        uint64_t* contextVa,
+        uint64_t* specialVa)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (contextVa == nullptr || prcb == 0)
+            {
+                break;
+            }
+
+            *contextVa = 0;
+            if (specialVa != nullptr)
+            {
+                *specialVa = 0;
+            }
+
+            TypeFieldInfo nestedField = {};
+            TypeFieldInfo stateField = {};
+            TypeFieldInfo frameField = {};
+            uint64_t frame = 0;
+            uint64_t special = 0;
+            if (symbols.FindField(
+                    L"nt!_KPRCB",
+                    L"ProcessorState.ContextFrame",
+                    &nestedField,
+                    nullptr) &&
+                nestedField.Offset >= 0xF0)
+            {
+                frame = prcb + nestedField.Offset;
+                special = prcb + nestedField.Offset - 0xF0;
+            }
+            else if (symbols.FindField(L"nt!_KPRCB", L"ProcessorState", &stateField, nullptr) &&
+                     symbols.FindField(L"nt!_KPROCESSOR_STATE", L"ContextFrame", &frameField, nullptr))
+            {
+                frame = prcb + stateField.Offset + frameField.Offset;
+                special = prcb + stateField.Offset;
+            }
+            else if (symbols.FindField(L"nt!_KPRCB", L"ProcessorState", &stateField, nullptr))
+            {
+                frame = prcb + stateField.Offset + 0xF0;
+                special = prcb + stateField.Offset;
+            }
+            else
+            {
+                break;
+            }
+
+            if (frame == 0 || !IsKernelCanonicalVa(frame))
+            {
+                break;
+            }
+
+            *contextVa = frame;
+            if (specialVa != nullptr && IsKernelCanonicalVa(special))
+            {
+                *specialVa = special;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool WritePrcbProcessorContext(
+        HANDLE file,
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t directoryTableBase,
+        uint64_t prcb,
+        uint64_t rip,
+        uint64_t rsp,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (prcb == 0 || rip == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"no KPRCB/RIP for ProcessorState patch";
+                }
+                break;
+            }
+
+            uint64_t contextVa = 0;
+            uint64_t specialVa = 0;
+            if (!ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, &specialVa))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"KPRCB.ProcessorState offset unavailable";
+                }
+                break;
+            }
+
+            CONTEXT context = {};
+            context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+            context.MxCsr = 0x1F80;
+            context.SegCs = 0x10;
+            context.SegDs = 0x2B;
+            context.SegEs = 0x2B;
+            context.SegSs = 0x18;
+            context.SegFs = 0x53;
+            context.SegGs = 0x2B;
+            context.EFlags = 0x2;
+            context.Rip = rip;
+            context.Rsp = rsp;
+
+            if (!WriteDumpVirtualRange(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    contextVa,
+                    reinterpret_cast<const uint8_t*>(&context),
+                    kDumpAmd64ContextBytes,
+                    error,
+                    L"KPRCB.ProcessorState.ContextFrame"))
+            {
+                break;
+            }
+
+            if (specialVa != 0)
+            {
+                const uint64_t specialCr3 = MaskDirectoryTableBase(directoryTableBase);
+                std::wstring cr3Error;
+                WriteDumpVirtualRange(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    specialVa + kSpecialCr3Offset,
+                    reinterpret_cast<const uint8_t*>(&specialCr3),
+                    sizeof(specialCr3),
+                    &cr3Error,
+                    L"KPRCB.ProcessorState.Cr3");
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     void ApplyProcessDumpWinDbgFixups(
         HANDLE file,
         DeviceClient& device,
@@ -2436,25 +3141,86 @@ namespace
                 }
             }
 
-            // Force CPU0 onto IdleThread. Leaving a live user thread as
-            // CurrentThread makes dbgeng replace the dump CONTEXT with that
-            // thread's user record and switch the session to kd:x86 even
-            // when the image is native x64.
+            // WinDbg 10.0.29617 uses KPRCB.ProcessorState.ContextFrame, not
+            // the header CONTEXT. Leave a live user TrapFrame on CurrentThread
+            // and dbgeng still drops into kd:x86. Point CurrentThread at the
+            // target process when we have a kernel trap, otherwise synthesize
+            // a kernel KTRAP_FRAME on that thread. IdleThread is fallback.
             uint64_t kpcr = 0;
             if (!ResolveLiveKpcr(device, &kpcr, nullptr, &result->Warnings) || kpcr == 0)
             {
                 result->Warnings.push_back(
-                    L"could not resolve CPU0 KPCR to pin IdleThread");
+                    L"could not resolve CPU0 KPCR to pin CurrentThread");
                 break;
             }
 
             const uint64_t prcb = ResolveKpcrPrcb(device, symbols, kpcr);
             const uint64_t idleThread = ResolvePrcbIdleThread(device, symbols, prcb);
-            if (idleThread == 0 || kernelDtb == 0)
+            uint64_t displayThread = 0;
+            if (fixup.Thread != 0 && IsKernelCanonicalVa(fixup.Thread))
+            {
+                displayThread = fixup.Thread;
+            }
+            else
+            {
+                displayThread = idleThread;
+            }
+
+            if (displayThread == 0 || kernelDtb == 0)
             {
                 result->Warnings.push_back(
-                    L"IdleThread unavailable; WinDbg may follow a user CurrentThread");
+                    L"no display thread for CPU0 CurrentThread");
                 break;
+            }
+
+            if (fixup.HeaderRip != 0 &&
+                (!fixup.HasKernelTrap || displayThread == idleThread))
+            {
+                std::wstring trapError;
+                if (SynthesizeIdleTrapFrame(
+                        file,
+                        device,
+                        symbols,
+                        ranges,
+                        kernelDtb,
+                        displayThread,
+                        fixup.HeaderRip,
+                        fixup.HeaderRsp,
+                        &trapError))
+                {
+                    result->TrapFrameSynthesized = true;
+                }
+                else if (displayThread != idleThread && idleThread != 0)
+                {
+                    result->Warnings.push_back(
+                        L"target trap synthesize failed, falling back to IdleThread: " +
+                        trapError);
+                    displayThread = idleThread;
+                    std::wstring idleTrapError;
+                    if (SynthesizeIdleTrapFrame(
+                            file,
+                            device,
+                            symbols,
+                            ranges,
+                            kernelDtb,
+                            idleThread,
+                            fixup.HeaderRip,
+                            fixup.HeaderRsp,
+                            &idleTrapError))
+                    {
+                        result->TrapFrameSynthesized = true;
+                    }
+                    else
+                    {
+                        result->Warnings.push_back(
+                            L"IdleThread trap frame synthesize failed: " + idleTrapError);
+                    }
+                }
+                else
+                {
+                    result->Warnings.push_back(
+                        L"display-thread trap frame synthesize failed: " + trapError);
+                }
             }
 
             uint32_t currentThreadOffset = kKprcbCurrentThreadFallback;
@@ -2473,7 +3239,7 @@ namespace
                 nextThreadOffset = nextThreadField.Offset;
             }
 
-            const uint64_t idleVa = idleThread;
+            const uint64_t displayVa = displayThread;
             const uint64_t zeroVa = 0;
             std::wstring patchError;
             if (!WriteDumpVirtualRange(
@@ -2482,12 +3248,12 @@ namespace
                     kernelDtb,
                     ranges,
                     prcb + currentThreadOffset,
-                    reinterpret_cast<const uint8_t*>(&idleVa),
-                    sizeof(idleVa),
+                    reinterpret_cast<const uint8_t*>(&displayVa),
+                    sizeof(displayVa),
                     &patchError,
-                    L"IdleThread"))
+                    L"CurrentThread"))
             {
-                result->Warnings.push_back(L"IdleThread CurrentThread patch failed: " + patchError);
+                result->Warnings.push_back(L"CurrentThread patch failed: " + patchError);
                 break;
             }
 
@@ -2506,29 +3272,29 @@ namespace
                 result->Warnings.push_back(L"NextThread clear failed: " + nextError);
             }
 
-            result->CurrentThread = idleThread;
+            result->CurrentThread = displayThread;
             result->CurrentProcessPatched = true;
 
             if (fixup.HeaderRip != 0)
             {
-                std::wstring trapError;
-                if (SynthesizeIdleTrapFrame(
+                std::wstring contextError;
+                if (WritePrcbProcessorContext(
                         file,
                         device,
                         symbols,
                         ranges,
                         kernelDtb,
-                        idleThread,
+                        prcb,
                         fixup.HeaderRip,
                         fixup.HeaderRsp,
-                        &trapError))
+                        &contextError))
                 {
-                    result->TrapFrameSynthesized = true;
+                    result->ProcessorStatePatched = true;
                 }
                 else
                 {
                     result->Warnings.push_back(
-                        L"IdleThread trap frame synthesize failed: " + trapError);
+                        L"KPRCB.ProcessorState patch failed: " + contextError);
                 }
             }
         } while (false);
@@ -4554,8 +5320,35 @@ bool DumpPhysicalMemoryToCrashDump(
         if (processFixup != nullptr)
         {
             localFixup = *processFixup;
-            localFixup.HeaderRip = result->ContextRip;
-            localFixup.HeaderRsp = result->ContextRsp;
+            if (localFixup.HasKernelTrap && localFixup.HeaderRip != 0)
+            {
+                result->ContextRip = localFixup.HeaderRip;
+                if (localFixup.HeaderRsp != 0)
+                {
+                    result->ContextRsp = localFixup.HeaderRsp;
+                }
+
+                if (info.ContextRecord.size() >= offsetof(CONTEXT, Rip) + sizeof(uint64_t))
+                {
+                    std::memcpy(
+                        info.ContextRecord.data() + offsetof(CONTEXT, Rip),
+                        &result->ContextRip,
+                        sizeof(result->ContextRip));
+                }
+                if (info.ContextRecord.size() >= offsetof(CONTEXT, Rsp) + sizeof(uint64_t) &&
+                    result->ContextRsp != 0)
+                {
+                    std::memcpy(
+                        info.ContextRecord.data() + offsetof(CONTEXT, Rsp),
+                        &result->ContextRsp,
+                        sizeof(result->ContextRsp));
+                }
+            }
+            else
+            {
+                localFixup.HeaderRip = result->ContextRip;
+                localFixup.HeaderRsp = result->ContextRsp;
+            }
             activeFixup = &localFixup;
         }
 
@@ -4809,6 +5602,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
     std::wstring* error)
 {
     bool ok = false;
+    HANDLE processHandle = nullptr;
 
     do
     {
@@ -4944,7 +5738,32 @@ bool DumpProcessVisibleMemoryToCrashDump(
         fixup.KernelDirectoryTableBase = plan.HeaderDtb;
         fixup.UserDirectoryTableBase = userDirectoryTableBase;
         fixup.Peb = peb;
-        fixup.Thread = FindFirstProcessThread(device, symbols, eprocess, &walkWarnings);
+        ReadFieldU64(
+            device,
+            symbols,
+            eprocess,
+            L"nt!_EPROCESS",
+            L"CreateTime",
+            nullptr,
+            &fixup.CreateTime);
+        uint64_t trapRip = 0;
+        uint64_t trapRsp = 0;
+        fixup.HasKernelTrap = FindProcessThreadKernelTrap(
+            device,
+            symbols,
+            eprocess,
+            &fixup.Thread,
+            &trapRip,
+            &trapRsp);
+        if (fixup.HasKernelTrap)
+        {
+            fixup.HeaderRip = trapRip;
+            fixup.HeaderRsp = trapRsp;
+        }
+        else if (fixup.Thread == 0)
+        {
+            fixup.Thread = FindFirstProcessThread(device, symbols, eprocess, &walkWarnings);
+        }
 
         uint64_t wow64Process = 0;
         if (ReadFieldU64(
@@ -4977,10 +5796,70 @@ bool DumpProcessVisibleMemoryToCrashDump(
         {
             AddTranslatedVirtualPage(device, pinDtb, eprocess + kPageSize, &ranges, nullptr, nullptr);
         }
+        EnableSeDebugPrivilege(nullptr);
+        processHandle = OpenTargetProcessReadHandle(processId);
+        if (processHandle == nullptr && processId != 0)
+        {
+            walkWarnings.push_back(
+                L"OpenProcess(VM_READ) failed; PEB.Ldr file-backed pages may stay unpaged (gle=" +
+                std::to_wstring(GetLastError()) + L")");
+        }
+
         AddTranslatedVirtualPage(device, pinDtb, fixup.Thread, &ranges, &walkWarnings, L"ETHREAD");
         if (fixup.Thread != 0)
         {
             AddTranslatedVirtualPage(device, pinDtb, fixup.Thread + kPageSize, &ranges, nullptr, nullptr);
+            const uint64_t threadStack = ReadCanonicalFieldU64(
+                device,
+                symbols,
+                fixup.Thread,
+                L"nt!_KTHREAD",
+                L"KernelStack");
+            if (threadStack != 0)
+            {
+                AddTranslatedVirtualPage(device, pinDtb, threadStack, &ranges, nullptr, nullptr);
+                AddTranslatedVirtualPage(
+                    device,
+                    pinDtb,
+                    threadStack - 0x200,
+                    &ranges,
+                    &walkWarnings,
+                    L"target thread stack");
+                AddTranslatedVirtualPage(
+                    device,
+                    pinDtb,
+                    threadStack - kPageSize,
+                    &ranges,
+                    nullptr,
+                    nullptr);
+            }
+
+            uint64_t trapFrame = 0;
+            if (ReadFieldU64(
+                    device,
+                    symbols,
+                    fixup.Thread,
+                    L"nt!_KTHREAD",
+                    L"TrapFrame",
+                    nullptr,
+                    &trapFrame) &&
+                IsKernelCanonicalVa(trapFrame))
+            {
+                AddTranslatedVirtualPage(
+                    device,
+                    pinDtb,
+                    trapFrame,
+                    &ranges,
+                    &walkWarnings,
+                    L"KTRAP_FRAME");
+                AddTranslatedVirtualPage(
+                    device,
+                    pinDtb,
+                    trapFrame + 0x180,
+                    &ranges,
+                    nullptr,
+                    nullptr);
+            }
         }
         AddTranslatedVirtualPage(device, userPinDtb, peb, &ranges, &walkWarnings, L"PEB");
         if (peb != 0)
@@ -4989,6 +5868,10 @@ bool DumpProcessVisibleMemoryToCrashDump(
             PinProcessLdrNamePages(
                 device,
                 symbols,
+                processHandle,
+                processId,
+                eprocess,
+                fixup.CreateTime,
                 userPinDtb,
                 peb,
                 &ranges,
@@ -5002,6 +5885,36 @@ bool DumpProcessVisibleMemoryToCrashDump(
             AddTranslatedVirtualPage(device, pinDtb, kpcr + 0x180, &ranges, nullptr, nullptr);
             const uint64_t prcb = ResolveKpcrPrcb(device, symbols, kpcr);
             AddTranslatedVirtualPage(device, pinDtb, prcb, &ranges, &walkWarnings, L"KPRCB");
+            uint64_t contextVa = 0;
+            uint64_t specialVa = 0;
+            if (ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, &specialVa))
+            {
+                AddTranslatedVirtualPage(
+                    device,
+                    pinDtb,
+                    contextVa,
+                    &ranges,
+                    &walkWarnings,
+                    L"ProcessorState.ContextFrame");
+                AddTranslatedVirtualPage(
+                    device,
+                    pinDtb,
+                    contextVa + (kDumpAmd64ContextBytes - 1),
+                    &ranges,
+                    nullptr,
+                    nullptr);
+                if (specialVa != 0)
+                {
+                    AddTranslatedVirtualPage(
+                        device,
+                        pinDtb,
+                        specialVa,
+                        &ranges,
+                        nullptr,
+                        nullptr);
+                }
+            }
+
             const uint64_t idleThread = ResolvePrcbIdleThread(device, symbols, prcb);
             AddTranslatedVirtualPage(device, pinDtb, idleThread, &ranges, &walkWarnings, L"IdleThread");
             if (idleThread != 0)
@@ -5092,6 +6005,7 @@ bool DumpProcessVisibleMemoryToCrashDump(
                    << L" user_dtb=0x" << MaskDirectoryTableBase(userDirectoryTableBase)
                    << L" thread=0x" << fixup.Thread
                    << std::dec
+                   << L" kernel_trap=" << (fixup.HasKernelTrap ? L"yes" : L"no")
                    << L" runs=" << ranges.size()
                    << L" pages=" << pageCount << L"\n";
 
@@ -5144,6 +6058,11 @@ bool DumpProcessVisibleMemoryToCrashDump(
 
         ok = true;
     } while (false);
+
+    if (processHandle != nullptr)
+    {
+        CloseHandle(processHandle);
+    }
 
     return ok;
 }

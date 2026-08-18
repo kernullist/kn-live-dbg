@@ -24181,9 +24181,11 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  notepad.exe after /user is an error, not an output path.\n";
     std::wcout << L"  The process-filtered file is a kernel complete dump (PAGE/DU64), not a\n";
     std::wcout << L"  user minidump (MDMP). WinDbg opens it as kd. The writer merges the KPTI\n";
-    std::wcout << L"  user+kernel page-table root, pins KDBG/EPROCESS/PEB, and forces CPU0\n";
-    std::wcout << L"  CurrentThread to IdleThread so the session stays amd64 kd. Switch to the\n";
-    std::wcout << L"  target with .process /p /r <eprocess> then !peb / lm u.\n";
+    std::wcout << L"  user+kernel page-table root, pins KDBG/EPROCESS/PEB/PEB.Ldr (faulting\n";
+    std::wcout << L"  file-backed ntdll pages in), overwrites KPRCB.ProcessorState, and points\n";
+    std::wcout << L"  CPU0 CurrentThread at a target thread with a kernel trap or a synthesized\n";
+    std::wcout << L"  kernel KTRAP_FRAME. IdleThread is the fallback so the session stays amd64\n";
+    std::wcout << L"  kd. Switch with .process /p /r <eprocess> then !peb / lm u if needed.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  dump-live .\\os-live.dmp\n";
@@ -24528,8 +24530,9 @@ static void HandleDumpLiveCommand(
                        << L" kdbg_plain=" << (dumpResult.KdbgPlain ? L"yes" : L"no")
                        << L" kpti_merged=" << (dumpResult.KptiRootMerged ? L"yes" : L"no")
                        << L" wow64=" << (dumpResult.Wow64Target ? L"yes" : L"no")
-                       << L" idle_thread=0x" << dumpResult.CurrentThread
-                       << L" current_idle=" << (dumpResult.CurrentProcessPatched ? L"yes" : L"no")
+                       << L" current_thread=0x" << dumpResult.CurrentThread
+                       << L" current_patched=" << (dumpResult.CurrentProcessPatched ? L"yes" : L"no")
+                       << L" processor_state=" << (dumpResult.ProcessorStatePatched ? L"yes" : L"no")
                        << L" trap_frame=" << (dumpResult.TrapFrameSynthesized ? L"yes" : L"no")
                        << L" ctx_rip=0x" << dumpResult.ContextRip
                        << L" ctx_rsp=0x" << dumpResult.ContextRsp
@@ -24542,7 +24545,7 @@ static void HandleDumpLiveCommand(
             PrintColoredText(path, KNDBG_COLOR_OK);
             std::wcout << L"\n";
             std::wcout << L"  windbg: kernel complete dump of this process, not a user MDMP. "
-                          L".process /p /r 0x"
+                          L"If the implicit process is still System: .process /p /r 0x"
                        << std::hex << target.Eprocess << std::dec
                        << L" then !peb / lm u\n";
             break;
