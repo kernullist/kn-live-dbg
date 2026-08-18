@@ -169,6 +169,9 @@ struct ProcessDumpWinDbgFixup
     uint64_t HeaderRip = 0;
     uint64_t HeaderRsp = 0;
     uint64_t CreateTime = 0;
+    uint32_t PrcbProcStateContextOffset = 0;
+    uint32_t PrcbContextOffset = 0;
+    uint32_t PrcbSize = 0;
     bool Wow64 = false;
     bool HasKernelTrap = false;
 };

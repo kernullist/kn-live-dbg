@@ -2316,9 +2316,19 @@ namespace
 
         uint64_t buffer = 0;
         uint32_t length = 0;
+        uint16_t nameLength = 0;
+        uint16_t nameMaximum = 0;
+        std::memcpy(&nameLength, raw.data(), sizeof(nameLength));
+        std::memcpy(&nameMaximum, raw.data() + 2, sizeof(nameMaximum));
         if (!ParseUserUnicodeString64(raw.data(), raw.size(), &buffer, &length))
         {
-            return;
+            std::memcpy(&buffer, raw.data() + 8, sizeof(buffer));
+            if (!IsUserModeVa(buffer))
+            {
+                return;
+            }
+
+            length = nameMaximum != 0 ? nameMaximum : 2;
         }
 
         FaultAndPinUserPage(
@@ -2341,6 +2351,19 @@ namespace
             alternateDtb,
             buffer + static_cast<uint64_t>(length) - 1,
             ranges);
+        if (nameMaximum > length)
+        {
+            FaultAndPinUserPage(
+                device,
+                processHandle,
+                processId,
+                eprocess,
+                createTime,
+                directoryTableBase,
+                alternateDtb,
+                buffer + static_cast<uint64_t>(nameMaximum) - 1,
+                ranges);
+        }
     }
 
     void PinProcessLdrNamePages(
@@ -2560,7 +2583,7 @@ namespace
             std::memcpy(&flink, headBytes.data(), sizeof(flink));
             uint32_t pinned = 0;
             uint64_t current = flink;
-            for (uint32_t index = 0; index < 256; ++index)
+            for (uint32_t index = 0; index < 512; ++index)
             {
                 if (current == 0 || current == listHead || !IsUserModeVa(current))
                 {
@@ -3087,9 +3110,76 @@ namespace
         return ok;
     }
 
+    bool ReadKdbgFieldU16(
+        const std::vector<uint8_t>& block,
+        SymbolEngine& symbols,
+        const wchar_t* fieldName,
+        uint16_t* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr || fieldName == nullptr)
+            {
+                break;
+            }
+
+            TypeFieldInfo field = {};
+            if (!symbols.FindField(L"nt!_KDDEBUGGER_DATA64", fieldName, &field, nullptr) &&
+                !symbols.FindField(L"_KDDEBUGGER_DATA64", fieldName, &field, nullptr))
+            {
+                break;
+            }
+
+            if (field.Offset + sizeof(uint16_t) > block.size())
+            {
+                break;
+            }
+
+            std::memcpy(value, block.data() + field.Offset, sizeof(*value));
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void FillKdbgPrcbOffsets(
+        const std::vector<uint8_t>& kdbg,
+        SymbolEngine& symbols,
+        ProcessDumpWinDbgFixup* fixup)
+    {
+        if (fixup == nullptr || kdbg.empty())
+        {
+            return;
+        }
+
+        uint16_t contextOffset = 0;
+        uint16_t pointerOffset = 0;
+        uint16_t prcbSize = 0;
+        if (ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbProcStateContext", &contextOffset) &&
+            contextOffset >= 0x40)
+        {
+            fixup->PrcbProcStateContextOffset = contextOffset;
+        }
+
+        if (ReadKdbgFieldU16(kdbg, symbols, L"OffsetPrcbContext", &pointerOffset) &&
+            pointerOffset >= 0x8)
+        {
+            fixup->PrcbContextOffset = pointerOffset;
+        }
+
+        if (ReadKdbgFieldU16(kdbg, symbols, L"SizePrcb", &prcbSize) &&
+            prcbSize >= 0x400)
+        {
+            fixup->PrcbSize = prcbSize;
+        }
+    }
+
     bool ResolvePrcbProcessorStateAddresses(
         SymbolEngine& symbols,
         uint64_t prcb,
+        uint32_t kdbgContextOffset,
         uint64_t* contextVa,
         uint64_t* specialVa)
     {
@@ -3113,7 +3203,17 @@ namespace
             TypeFieldInfo frameField = {};
             uint64_t frame = 0;
             uint64_t special = 0;
-            if (symbols.FindField(
+            // WinDbg 10 uses KDBG.OffsetPrcbProcStateContext, not the PDB
+            // field walk. Prefer that so the opening RIP write lands.
+            if (kdbgContextOffset >= 0x40 && kdbgContextOffset <= 0x40000)
+            {
+                frame = prcb + kdbgContextOffset;
+                if (kdbgContextOffset >= 0xF0)
+                {
+                    special = prcb + kdbgContextOffset - 0xF0;
+                }
+            }
+            else if (symbols.FindField(
                     L"nt!_KPRCB",
                     L"ProcessorState.ContextFrame",
                     &nestedField,
@@ -3203,6 +3303,41 @@ namespace
         return ok;
     }
 
+    bool WriteKernelDumpContext(
+        HANDLE file,
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t contextVa,
+        uint64_t rip,
+        uint64_t rsp,
+        std::wstring* error,
+        const wchar_t* what)
+    {
+        CONTEXT context = {};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+        context.MxCsr = 0x1F80;
+        context.SegCs = 0x10;
+        context.SegDs = 0x2B;
+        context.SegEs = 0x2B;
+        context.SegSs = 0x18;
+        context.SegFs = 0x53;
+        context.SegGs = 0x2B;
+        context.EFlags = 0x2;
+        context.Rip = rip;
+        context.Rsp = rsp;
+        return WriteDumpVirtualRangeAnyCr3(
+            file,
+            device,
+            directoryTableBase,
+            ranges,
+            contextVa,
+            reinterpret_cast<const uint8_t*>(&context),
+            kDumpAmd64ContextBytes,
+            error,
+            what);
+    }
+
     bool WritePrcbProcessorContext(
         HANDLE file,
         DeviceClient& device,
@@ -3210,6 +3345,8 @@ namespace
         const std::vector<PhysicalMemoryRange>& ranges,
         uint64_t directoryTableBase,
         uint64_t prcb,
+        uint32_t kdbgContextOffset,
+        uint32_t kdbgContextPointerOffset,
         uint64_t rip,
         uint64_t rsp,
         std::wstring* error)
@@ -3229,7 +3366,12 @@ namespace
 
             uint64_t contextVa = 0;
             uint64_t specialVa = 0;
-            if (!ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, &specialVa))
+            if (!ResolvePrcbProcessorStateAddresses(
+                    symbols,
+                    prcb,
+                    kdbgContextOffset,
+                    &contextVa,
+                    &specialVa))
             {
                 if (error != nullptr)
                 {
@@ -3238,31 +3380,58 @@ namespace
                 break;
             }
 
-            CONTEXT context = {};
-            context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
-            context.MxCsr = 0x1F80;
-            context.SegCs = 0x10;
-            context.SegDs = 0x2B;
-            context.SegEs = 0x2B;
-            context.SegSs = 0x18;
-            context.SegFs = 0x53;
-            context.SegGs = 0x2B;
-            context.EFlags = 0x2;
-            context.Rip = rip;
-            context.Rsp = rsp;
-
-            if (!WriteDumpVirtualRangeAnyCr3(
+            if (!WriteKernelDumpContext(
                     file,
                     device,
                     directoryTableBase,
                     ranges,
                     contextVa,
-                    reinterpret_cast<const uint8_t*>(&context),
-                    kDumpAmd64ContextBytes,
+                    rip,
+                    rsp,
                     error,
                     L"KPRCB.ProcessorState.ContextFrame"))
             {
                 break;
+            }
+
+            uint64_t pdbContextVa = 0;
+            uint64_t pdbSpecialVa = 0;
+            if (ResolvePrcbProcessorStateAddresses(symbols, prcb, 0, &pdbContextVa, &pdbSpecialVa) &&
+                pdbContextVa != 0 &&
+                pdbContextVa != contextVa)
+            {
+                std::wstring pdbError;
+                WriteKernelDumpContext(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    pdbContextVa,
+                    rip,
+                    rsp,
+                    &pdbError,
+                    L"KPRCB PDB ContextFrame");
+            }
+
+            if (kdbgContextPointerOffset >= 8 && kdbgContextPointerOffset <= 0x40000)
+            {
+                uint64_t pointed = 0;
+                if (ReadKernelU64(device, prcb + kdbgContextPointerOffset, &pointed) &&
+                    IsKernelCanonicalVa(pointed) &&
+                    pointed != contextVa)
+                {
+                    std::wstring pointerError;
+                    WriteKernelDumpContext(
+                        file,
+                        device,
+                        directoryTableBase,
+                        ranges,
+                        pointed,
+                        rip,
+                        rsp,
+                        &pointerError,
+                        L"KPRCB.Context");
+                }
             }
 
             if (specialVa != 0)
@@ -3294,6 +3463,7 @@ namespace
         const std::vector<PhysicalMemoryRange>& ranges,
         uint64_t directoryTableBase,
         uint64_t prcb,
+        uint32_t kdbgContextOffset,
         uint64_t replacementRip,
         std::vector<std::wstring>* warnings)
     {
@@ -3314,7 +3484,12 @@ namespace
             }
 
             uint64_t contextVa = 0;
-            if (!ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, nullptr) ||
+            if (!ResolvePrcbProcessorStateAddresses(
+                    symbols,
+                    prcb,
+                    kdbgContextOffset,
+                    &contextVa,
+                    nullptr) ||
                 contextVa == 0)
             {
                 break;
@@ -3556,6 +3731,17 @@ namespace
 
             result->CurrentThread = displayThread;
             result->CurrentProcessPatched = true;
+            if (fixup.PrcbProcStateContextOffset != 0)
+            {
+                std::wstringstream offsetStream;
+                offsetStream << L"KDBG OffsetPrcbProcStateContext=0x" << std::hex
+                             << fixup.PrcbProcStateContextOffset;
+                if (fixup.PrcbContextOffset != 0)
+                {
+                    offsetStream << L" OffsetPrcbContext=0x" << fixup.PrcbContextOffset;
+                }
+                result->Warnings.push_back(offsetStream.str());
+            }
 
             if (fixup.HeaderRip != 0)
             {
@@ -3567,6 +3753,8 @@ namespace
                         ranges,
                         kernelDtb,
                         prcb,
+                        fixup.PrcbProcStateContextOffset,
+                        fixup.PrcbContextOffset,
                         fixup.HeaderRip,
                         fixup.HeaderRsp,
                         &contextError))
@@ -3586,6 +3774,7 @@ namespace
                         ranges,
                         kernelDtb,
                         prcb,
+                        fixup.PrcbProcStateContextOffset,
                         fixup.HeaderRip,
                         &result->Warnings))
                 {
@@ -3609,6 +3798,8 @@ namespace
                             ranges,
                             kernelDtb,
                             blockPrcb,
+                            fixup.PrcbProcStateContextOffset,
+                            fixup.PrcbContextOffset,
                             fixup.HeaderRip,
                             fixup.HeaderRsp,
                             &blockError);
@@ -3619,6 +3810,7 @@ namespace
                             ranges,
                             kernelDtb,
                             blockPrcb,
+                            fixup.PrcbProcStateContextOffset,
                             fixup.HeaderRip,
                             &result->Warnings);
                     }
@@ -5647,6 +5839,10 @@ bool DumpPhysicalMemoryToCrashDump(
         if (processFixup != nullptr)
         {
             localFixup = *processFixup;
+            if (preparedKdbg.Ready)
+            {
+                FillKdbgPrcbOffsets(preparedKdbg.PlainBlock, symbols, &localFixup);
+            }
             if (localFixup.HasKernelTrap && localFixup.HeaderRip != 0)
             {
                 result->ContextRip = localFixup.HeaderRip;
@@ -6092,6 +6288,15 @@ bool DumpProcessVisibleMemoryToCrashDump(
             fixup.Thread = FindFirstProcessThread(device, symbols, eprocess, &walkWarnings);
         }
 
+        {
+            const uint64_t earlyKdbg = ResolveKdDebuggerDataBlock(device, symbols, &walkWarnings);
+            PreparedKdbg preparedOffsets = PreparePlainKdbg(device, symbols, earlyKdbg, &walkWarnings);
+            if (preparedOffsets.Ready)
+            {
+                FillKdbgPrcbOffsets(preparedOffsets.PlainBlock, symbols, &fixup);
+            }
+        }
+
         uint64_t wow64Process = 0;
         if (ReadFieldU64(
                 device,
@@ -6216,7 +6421,12 @@ bool DumpProcessVisibleMemoryToCrashDump(
 
             uint64_t contextVa = 0;
             uint64_t specialVa = 0;
-            ResolvePrcbProcessorStateAddresses(symbols, prcb, &contextVa, &specialVa);
+            ResolvePrcbProcessorStateAddresses(
+                symbols,
+                prcb,
+                fixup.PrcbProcStateContextOffset,
+                &contextVa,
+                &specialVa);
             uint64_t prcbPinEnd = prcb + kPageSize;
             TypeLayoutInfo prcbLayout = {};
             if (symbols.GetTypeLayout(L"nt!_KPRCB", &prcbLayout, nullptr) &&
@@ -6271,6 +6481,29 @@ bool DumpProcessVisibleMemoryToCrashDump(
                         device,
                         pinDtb,
                         specialVa,
+                        &ranges,
+                        nullptr,
+                        nullptr);
+                }
+            }
+
+            if (fixup.PrcbContextOffset >= 8 && fixup.PrcbContextOffset <= 0x40000)
+            {
+                uint64_t pointedContext = 0;
+                if (ReadKernelU64(device, prcb + fixup.PrcbContextOffset, &pointedContext) &&
+                    IsKernelCanonicalVa(pointedContext))
+                {
+                    AddTranslatedVirtualPageAnyCr3(
+                        device,
+                        pinDtb,
+                        pointedContext,
+                        &ranges,
+                        &walkWarnings,
+                        L"KPRCB.Context");
+                    AddTranslatedVirtualPageAnyCr3(
+                        device,
+                        pinDtb,
+                        pointedContext + (kDumpAmd64ContextBytes - 1),
                         &ranges,
                         nullptr,
                         nullptr);
