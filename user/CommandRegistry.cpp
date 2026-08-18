@@ -344,7 +344,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"dump-raw", L"dump-raw", L"memory", L"dump a kernel virtual range to file verbatim via the driver ReadMemory IOCTL", CommandSupport::Native),
         Make(L"dump-pe", L"dump-pe", L"memory", L"reconstruct an on-disk PE image from an in-memory loaded kernel PE by walking the section table", CommandSupport::Native),
         Make(L"dump-kernel", L"dump-kernel", L"memory", L"write a WinDbg-openable complete dump from live physical RAM runs", CommandSupport::Native),
-        Make(L"dump-live", L"dump-live", L"memory", L"ask Windows to write a live kernel dump via NtSystemDebugControl", CommandSupport::Native),
+        Make(L"dump-live", L"dump-live", L"memory", L"ask Windows to write a live kernel dump via NtSystemDebugControl; /user [pid|eprocess] dumps that process user AS", CommandSupport::Native),
         Make(L"pool-scan-pe", L"pool-scan-pe", L"kernel", L"scan big pool allocations for hidden / signature-wiped PE images, surfacing reflective-load and unpacker stages", CommandSupport::Native),
         Make(L"!payload", L"!payload", L"kernel", L"trace a non-image hook target through translation, big pool, PE probe, and disassembly; scan collects unbacked hook pointers first", CommandSupport::Native),
         Make(L"!mapper", L"!mapper", L"kernel", L"enumerate MmUnloadedDrivers, PiDDBCacheTable, and ci hash-bucket leftovers from unloaded mapper drivers", CommandSupport::Native),

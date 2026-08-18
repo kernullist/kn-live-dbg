@@ -150,6 +150,11 @@ struct DumpOsLiveResult
     bool IncludedUserPages = false;
     bool Compressed = false;
     bool IncludedHypervisorPages = false;
+    bool ProcessFiltered = false;
+    uint32_t ProcessId = 0;
+    uint64_t Eprocess = 0;
+    uint64_t DirectoryTableBase = 0;
+    uint32_t RangeCount = 0;
     std::vector<std::wstring> Warnings;
 };
 
@@ -161,11 +166,31 @@ bool BuildCompleteDumpHeader(
     std::wstring* error);
 
 // Streams a WinDbg-openable complete dump: 8 KB header + physical RAM runs.
+// rangesOverride, when non-null, replaces MmGetPhysicalMemoryRanges.
+// directoryTableBaseOverride, when non-zero, is stored as DirectoryTableBase
+// instead of CPU0 CR3. commentOverride replaces the default header comment.
 bool DumpPhysicalMemoryToCrashDump(
     DeviceClient& device,
     SymbolEngine& symbols,
     const std::wstring& path,
     uint64_t maxPayloadBytes,
+    bool abortOnReadFailure,
+    DumpKernelCrashResult* result,
+    std::wstring* error,
+    const std::vector<PhysicalMemoryRange>* rangesOverride = nullptr,
+    uint64_t directoryTableBaseOverride = 0,
+    const char* commentOverride = nullptr);
+
+// Walks the process DTB (user + kernel halves) and writes a complete dump of
+// resident pages so WinDbg can see that process's user address space.
+bool DumpProcessVisibleMemoryToCrashDump(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const std::wstring& path,
+    uint32_t processId,
+    uint64_t eprocess,
+    uint64_t directoryTableBase,
+    uint64_t userDirectoryTableBase,
     bool abortOnReadFailure,
     DumpKernelCrashResult* result,
     std::wstring* error);
@@ -184,3 +209,6 @@ bool DumpOsLiveControlSelfTest();
 
 // Round-trip check for the Win8+ KdCopyDataBlock decoder. Self-test only.
 bool DecodeKdbgSelfTest();
+
+// Coalesce/merge checks for process-filtered live dumps. Self-test only.
+bool DumpLiveProcessFilterSelfTest();

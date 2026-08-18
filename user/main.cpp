@@ -24091,29 +24091,38 @@ static void PrintDumpKernelHelp()
 static void PrintDumpLiveHelp()
 {
     std::wcout << L"dump-live command:\n";
-    std::wcout << L"  dump-live <path> [/user] [/compress] [/hv]\n";
+    std::wcout << L"  dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Asks Windows to write a live kernel dump through NtSystemDebugControl\n";
     std::wcout << L"  (SysDbgGetLiveKernelDump). This is the Task Manager / OS path, not a\n";
-    std::wcout << L"  KnLiveDbg physical walk. The driver is not required.\n";
+    std::wcout << L"  KnLiveDbg physical walk. The driver is not required unless /user names a\n";
+    std::wcout << L"  process. /user <pid|eprocess> walks that process DTB and writes a complete\n";
+    std::wcout << L"  dump of its resident kernel+user pages so WinDbg can see that user AS.\n";
     std::wcout << L"\n";
     std::wcout << L"arguments:\n";
-    std::wcout << L"  <path>      output .dmp path. Existing file is overwritten.\n";
-    std::wcout << L"  /user       include user-space pages (much larger).\n";
-    std::wcout << L"  /compress   request compressed pages when the OS supports it.\n";
-    std::wcout << L"  /hv         include hypervisor pages when the OS supports it.\n";
+    std::wcout << L"  <path>             output .dmp path. Existing file is overwritten.\n";
+    std::wcout << L"  /user              include every process user-space page (OS path, large).\n";
+    std::wcout << L"  /user <pid>        dump only that PID's visible resident pages (needs driver).\n";
+    std::wcout << L"  /user <eprocess>   same, keyed by nt!_EPROCESS address.\n";
+    std::wcout << L"  /compress          request compressed pages when the OS supports it.\n";
+    std::wcout << L"  /hv                include hypervisor pages when the OS supports it.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Needs elevation and SeDebugPrivilege. The file is opened write-through +\n";
-    std::wcout << L"  no-buffering so the OS dump stack can write it. Some builds or policies\n";
-    std::wcout << L"  reject live dumps with STATUS_NOT_IMPLEMENTED / ACCESS_DENIED /\n";
-    std::wcout << L"  PRIVILEGE_NOT_HELD. /user on older builds may return STATUS_DEBUGGER_INACTIVE\n";
-    std::wcout << L"  unless a kernel debugger is configured.\n";
+    std::wcout << L"  The unfiltered OS path needs elevation and SeDebugPrivilege. The file is\n";
+    std::wcout << L"  opened write-through + no-buffering so the OS dump stack can write it.\n";
+    std::wcout << L"  Some builds or policies reject live dumps with STATUS_NOT_IMPLEMENTED /\n";
+    std::wcout << L"  ACCESS_DENIED / PRIVILEGE_NOT_HELD. Bare /user on older builds may return\n";
+    std::wcout << L"  STATUS_DEBUGGER_INACTIVE unless a kernel debugger is configured.\n";
+    std::wcout << L"  /user <pid|eprocess> ignores /compress and /hv; it uses the complete-dump\n";
+    std::wcout << L"  writer. Only PID or _EPROCESS tokens are consumed after /user so a path\n";
+    std::wcout << L"  like dump.dmp is not stolen as a process name.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  dump-live .\\os-live.dmp\n";
     std::wcout << L"  dump-live C:\\Dumps\\os-live-user.dmp /user /compress\n";
+    std::wcout << L"  dump-live C:\\Dumps\\lsass-user.dmp /user 0n1234\n";
+    std::wcout << L"  dump-live C:\\Dumps\\target.dmp /user 0xffffa80234560000\n";
 }
 
 static void HandleDumpKernelCommand(
@@ -24262,7 +24271,20 @@ static void HandleDumpKernelCommand(
     } while (false);
 }
 
-static void HandleDumpLiveCommand(const std::vector<std::wstring>& args)
+static bool ResolveProcessTriageTarget(
+    const std::wstring& rawTarget,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    ProcessTriageTarget* target,
+    std::vector<std::wstring>* warnings,
+    std::wstring* error);
+
+static void HandleDumpLiveCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
 {
     do
     {
@@ -24274,12 +24296,13 @@ static void HandleDumpLiveCommand(const std::vector<std::wstring>& args)
 
         if (args.size() < 2)
         {
-            std::wcerr << L"usage: dump-live <path> [/user] [/compress] [/hv]\n";
+            std::wcerr << L"usage: dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]\n";
             PrintDumpLiveHelp();
             break;
         }
 
         std::wstring path;
+        std::wstring userTarget;
         bool includeUserPages = false;
         bool compress = false;
         bool includeHypervisorPages = false;
@@ -24290,6 +24313,24 @@ static void HandleDumpLiveCommand(const std::vector<std::wstring>& args)
             if (option == L"/user")
             {
                 includeUserPages = true;
+                if (index + 1 < args.size() &&
+                    !args[index + 1].empty() &&
+                    args[index + 1][0] != L'/')
+                {
+                    uint64_t ignoredPid = 0;
+                    uint64_t ignoredEprocess = 0;
+                    const ProcessSpecifierKind kind = ClassifyProcessSpecifier(
+                        args[index + 1],
+                        state.NumberBase,
+                        &ignoredPid,
+                        &ignoredEprocess);
+                    if (kind == ProcessSpecifierKind::Pid ||
+                        kind == ProcessSpecifierKind::Eprocess)
+                    {
+                        userTarget = args[index + 1];
+                        ++index;
+                    }
+                }
                 continue;
             }
             if (option == L"/compress")
@@ -24325,7 +24366,98 @@ static void HandleDumpLiveCommand(const std::vector<std::wstring>& args)
 
         if (path.empty())
         {
-            std::wcerr << L"usage: dump-live <path> [/user] [/compress] [/hv]\n";
+            std::wcerr << L"usage: dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]\n";
+            break;
+        }
+
+        if (!userTarget.empty())
+        {
+            if (!device.IsOpen())
+            {
+                std::wcerr << L"dump-live /user <pid|eprocess> requires the KnLiveDbg.sys driver\n";
+                break;
+            }
+
+            if (symbols.Modules().empty())
+            {
+                symbols.LoadKernelModules(nullptr);
+            }
+
+            if (compress || includeHypervisorPages)
+            {
+                std::wcerr << L"dump-live warning: /compress and /hv are ignored with /user <pid|eprocess>\n";
+            }
+
+            ProcessTriageTarget target = {};
+            std::vector<std::wstring> targetWarnings;
+            std::wstring targetError;
+            if (!ResolveProcessTriageTarget(
+                    userTarget,
+                    state,
+                    device,
+                    symbols,
+                    &target,
+                    &targetWarnings,
+                    &targetError))
+            {
+                std::wcerr << L"dump-live failed: " << targetError << L"\n";
+                break;
+            }
+
+            for (const std::wstring& warning : targetWarnings)
+            {
+                std::wcerr << L"dump-live warning: " << warning << L"\n";
+            }
+
+            const uint64_t dtb = target.DirectoryTableBase != 0
+                ? target.DirectoryTableBase
+                : target.UserDirectoryTableBase;
+            if (dtb == 0)
+            {
+                std::wcerr << L"dump-live failed: target process has no usable DTB\n";
+                break;
+            }
+
+            DumpKernelCrashResult dumpResult = {};
+            std::wstring dumpError;
+            if (!DumpProcessVisibleMemoryToCrashDump(
+                    device,
+                    symbols,
+                    path,
+                    target.ProcessId,
+                    target.Eprocess,
+                    target.DirectoryTableBase,
+                    target.UserDirectoryTableBase,
+                    false,
+                    &dumpResult,
+                    &dumpError))
+            {
+                std::wcerr << L"dump-live failed: " << dumpError << L"\n";
+                for (const std::wstring& warning : dumpResult.Warnings)
+                {
+                    std::wcerr << L"dump-live warning: " << warning << L"\n";
+                }
+                break;
+            }
+
+            for (const std::wstring& warning : dumpResult.Warnings)
+            {
+                std::wcerr << L"dump-live warning: " << warning << L"\n";
+            }
+
+            PrintColoredText(L"[dump-live]", KNDBG_COLOR_TITLE);
+            std::wcout << L" process_filter=yes pid=" << target.ProcessId
+                       << L" eprocess=0x" << std::hex << target.Eprocess
+                       << L" dtb=0x" << dumpResult.DirectoryTableBase
+                       << L" kdbg=0x" << dumpResult.KdDebuggerDataBlock
+                       << L" kdbg_plain=" << (dumpResult.KdbgPlain ? L"yes" : L"no")
+                       << std::dec
+                       << L" wrote=" << dumpResult.BytesWritten
+                       << L" runs=" << dumpResult.RangeCount
+                       << L" complete=" << (dumpResult.Complete ? L"yes" : L"no")
+                       << L" path=";
+            PrintColoredText(path, KNDBG_COLOR_OK);
+            std::wcout << L"\n";
             break;
         }
 
@@ -27635,8 +27767,13 @@ static int RunConsoleSurfaceSelfTest()
                 L"dump-kernel-kdbg-decoder-round-trip");
             CheckConsoleSurfaceSelfTest(
                 &context,
+                DumpLiveProcessFilterSelfTest(),
+                L"dump-live-process-run-coalesce");
+            CheckConsoleSurfaceSelfTest(
+                &context,
                 kernelHelp.find(L"DUMP_HEADER64") != std::wstring::npos &&
-                    liveHelp.find(L"NtSystemDebugControl") != std::wstring::npos,
+                    liveHelp.find(L"NtSystemDebugControl") != std::wstring::npos &&
+                    liveHelp.find(L"_EPROCESS") != std::wstring::npos,
                 L"dump-kernel-and-dump-live-help-routes");
             const std::wstring rootHelp = CaptureDetailedHelpOutput({L"help"}, 0);
             CheckConsoleSurfaceSelfTest(
@@ -44729,7 +44866,7 @@ static bool HandleCommand(
         }
         else if (command == L"dump-live")
         {
-            HandleDumpLiveCommand(args);
+            HandleDumpLiveCommand(args, state, device, symbols);
         }
         else if (command == L"pool-scan-pe")
         {
