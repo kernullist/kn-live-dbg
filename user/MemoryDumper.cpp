@@ -1836,6 +1836,26 @@ namespace
                 break;
             }
 
+            uint64_t remainingInRun = 0;
+            for (const PhysicalMemoryRange& range : ranges)
+            {
+                const uint64_t rangeEnd = RangeEnd(range.BaseAddress, range.ByteCount);
+                if (physicalAddress >= range.BaseAddress && physicalAddress < rangeEnd)
+                {
+                    remainingInRun = rangeEnd - physicalAddress;
+                    break;
+                }
+            }
+
+            if (remainingInRun < length)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"dump physical read crosses a run boundary";
+                }
+                break;
+            }
+
             LARGE_INTEGER position = {};
             position.QuadPart = static_cast<LONGLONG>(dumpOffset);
             if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN))
@@ -1987,6 +2007,7 @@ namespace
         const std::vector<PhysicalMemoryRange>& ranges,
         uint64_t contextVa,
         uint64_t replacementRip,
+        bool requireContextShape,
         std::vector<std::wstring>* warnings)
     {
         bool ok = false;
@@ -2001,6 +2022,13 @@ namespace
             uint64_t physical = 0;
             if (!TranslateToDumpPhysical(device, directoryTableBase, contextVa, &physical))
             {
+                if (warnings != nullptr)
+                {
+                    std::wstringstream stream;
+                    stream << L"dump-file CONTEXT VA 0x" << std::hex << contextVa
+                           << L" did not translate";
+                    warnings->push_back(stream.str());
+                }
                 break;
             }
 
@@ -2011,7 +2039,55 @@ namespace
                     contextVa + offsetof(CONTEXT, Rip),
                     &ripPa))
             {
+                const uint64_t pageOff = contextVa & (static_cast<uint64_t>(kPageSize) - 1ull);
+                if (pageOff + offsetof(CONTEXT, Rip) + sizeof(uint64_t) > kPageSize)
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(
+                            L"dump-file CONTEXT.Rip straddles a page and did not translate");
+                    }
+                    break;
+                }
+
                 ripPa = physical + offsetof(CONTEXT, Rip);
+            }
+
+            if (requireContextShape)
+            {
+                uint64_t flagsPa = 0;
+                if (!TranslateToDumpPhysical(
+                        device,
+                        directoryTableBase,
+                        contextVa + offsetof(CONTEXT, ContextFlags),
+                        &flagsPa))
+                {
+                    const uint64_t pageOff = contextVa & (static_cast<uint64_t>(kPageSize) - 1ull);
+                    if (pageOff + offsetof(CONTEXT, ContextFlags) + sizeof(uint32_t) > kPageSize)
+                    {
+                        break;
+                    }
+
+                    flagsPa = physical + offsetof(CONTEXT, ContextFlags);
+                }
+
+                uint32_t flags = 0;
+                if (!ReadDumpPhysicalBytes(
+                        file,
+                        ranges,
+                        flagsPa,
+                        sizeof(flags),
+                        &flags,
+                        nullptr) ||
+                    (flags & 0x100001ul) != 0x100001ul)
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(
+                            L"dump-file target is not an AMD64 CONTEXT; Rip left unchanged");
+                    }
+                    break;
+                }
             }
 
             uint64_t dumpRip = 0;
@@ -2024,6 +2100,10 @@ namespace
                     &dumpRip,
                     &readError))
             {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"dump-file CONTEXT.Rip read failed: " + readError);
+                }
                 break;
             }
 
@@ -3432,7 +3512,9 @@ namespace
                 kdbg.data() + kKdbgOffsetPrcbProcStateContext,
                 sizeof(contextOffset));
         }
-        if (contextOffset >= 0x40)
+        if (contextOffset >= 0x40 &&
+            contextOffset <= 0x20000 &&
+            (contextOffset % 16u) == 0)
         {
             fixup->PrcbProcStateContextOffset = contextOffset;
         }
@@ -3445,7 +3527,9 @@ namespace
                 kdbg.data() + kKdbgOffsetPrcbProcStateSpecialReg,
                 sizeof(specialOffset));
         }
-        if (specialOffset >= 0x40)
+        if (specialOffset >= 0x40 &&
+            specialOffset <= 0x20000 &&
+            (specialOffset % 16u) == 0)
         {
             fixup->PrcbProcStateSpecialRegOffset = specialOffset;
         }
@@ -3458,7 +3542,9 @@ namespace
                 kdbg.data() + kKdbgOffsetPrcbContext,
                 sizeof(pointerOffset));
         }
-        if (pointerOffset >= 0x8)
+        if (pointerOffset >= 0x8 &&
+            pointerOffset <= 0x20000 &&
+            (pointerOffset % 8u) == 0)
         {
             fixup->PrcbContextOffset = pointerOffset;
         }
@@ -4295,6 +4381,7 @@ namespace
                         ranges,
                         fileContextVa,
                         fixup.HeaderRip,
+                        false,
                         &result->Warnings))
                 {
                     result->ProcessorStatePatched = true;
@@ -4317,6 +4404,7 @@ namespace
                         ranges,
                         pdbFileContextVa,
                         fixup.HeaderRip,
+                        false,
                         &result->Warnings);
                 }
 
@@ -4329,6 +4417,7 @@ namespace
                         ranges,
                         fixup.SavedContext,
                         fixup.HeaderRip,
+                        true,
                         &result->Warnings);
                 }
             }
