@@ -1884,6 +1884,281 @@ namespace
         return ok;
     }
 
+    bool ReadVirtualThroughDtb(
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        uint64_t virtualAddress,
+        uint32_t length,
+        std::vector<uint8_t>* bytes)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (bytes == nullptr || length == 0 || directoryTableBase == 0)
+            {
+                break;
+            }
+
+            bytes->assign(length, 0);
+            uint32_t done = 0;
+            bool failed = false;
+            while (done < length)
+            {
+                PhysicalTranslationInfo translation = {};
+                if (!device.TranslateVirtual(
+                        MaskDirectoryTableBase(directoryTableBase),
+                        virtualAddress + done,
+                        length - done,
+                        &translation,
+                        nullptr) ||
+                    translation.TranslatedLength == 0 ||
+                    translation.PhysicalAddress == 0)
+                {
+                    failed = true;
+                    break;
+                }
+
+                uint32_t chunk = translation.TranslatedLength;
+                if (chunk > length - done)
+                {
+                    chunk = length - done;
+                }
+
+                std::vector<uint8_t> page;
+                if (!device.ReadPhysical(translation.PhysicalAddress, chunk, &page, nullptr) ||
+                    page.size() < chunk)
+                {
+                    failed = true;
+                    break;
+                }
+
+                std::memcpy(bytes->data() + done, page.data(), chunk);
+                done += chunk;
+            }
+
+            ok = !failed && done == length;
+        } while (false);
+
+        return ok;
+    }
+
+    bool IsUserModeVa(uint64_t address)
+    {
+        return address != 0 && !IsKernelCanonicalVa(address);
+    }
+
+    bool ParseUserUnicodeString64(
+        const uint8_t* raw,
+        size_t rawSize,
+        uint64_t* buffer,
+        uint32_t* byteLength)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (raw == nullptr || rawSize < 16 || buffer == nullptr || byteLength == nullptr)
+            {
+                break;
+            }
+
+            uint16_t length = 0;
+            uint16_t maximumLength = 0;
+            uint64_t pointer = 0;
+            std::memcpy(&length, raw, sizeof(length));
+            std::memcpy(&maximumLength, raw + 2, sizeof(maximumLength));
+            std::memcpy(&pointer, raw + 8, sizeof(pointer));
+            uint32_t bytes = length;
+            if (bytes == 0)
+            {
+                bytes = maximumLength;
+            }
+
+            if (!IsUserModeVa(pointer) || bytes == 0 || bytes > 0x10000)
+            {
+                break;
+            }
+
+            *buffer = pointer;
+            *byteLength = bytes;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void PinUserUnicodeStringPages(
+        DeviceClient& device,
+        uint64_t directoryTableBase,
+        uint64_t stringVa,
+        std::vector<PhysicalMemoryRange>* ranges)
+    {
+        if (stringVa == 0 || directoryTableBase == 0 || ranges == nullptr)
+        {
+            return;
+        }
+
+        AddTranslatedVirtualPage(device, directoryTableBase, stringVa, ranges, nullptr, nullptr);
+
+        std::vector<uint8_t> raw;
+        if (!ReadVirtualThroughDtb(device, directoryTableBase, stringVa, 16, &raw) ||
+            raw.size() < 16)
+        {
+            return;
+        }
+
+        uint64_t buffer = 0;
+        uint32_t length = 0;
+        if (!ParseUserUnicodeString64(raw.data(), raw.size(), &buffer, &length))
+        {
+            return;
+        }
+
+        AddTranslatedVirtualPage(device, directoryTableBase, buffer, ranges, nullptr, nullptr);
+        AddTranslatedVirtualPage(
+            device,
+            directoryTableBase,
+            buffer + static_cast<uint64_t>(length) - 1,
+            ranges,
+            nullptr,
+            nullptr);
+    }
+
+    void PinProcessLdrNamePages(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t userDtb,
+        uint64_t peb,
+        std::vector<PhysicalMemoryRange>* ranges,
+        std::vector<std::wstring>* warnings)
+    {
+        do
+        {
+            if (userDtb == 0 || peb == 0 || ranges == nullptr)
+            {
+                break;
+            }
+
+            TypeFieldInfo ldrField = {};
+            TypeFieldInfo listField = {};
+            TypeFieldInfo linksField = {};
+            TypeFieldInfo baseNameField = {};
+            TypeFieldInfo fullNameField = {};
+            if (!symbols.FindField(L"nt!_PEB", L"Ldr", &ldrField, nullptr) &&
+                !symbols.FindField(L"_PEB", L"Ldr", &ldrField, nullptr))
+            {
+                ldrField.Offset = 0x18;
+            }
+
+            if (!symbols.FindField(L"nt!_PEB_LDR_DATA", L"InLoadOrderModuleList", &listField, nullptr) &&
+                !symbols.FindField(L"_PEB_LDR_DATA", L"InLoadOrderModuleList", &listField, nullptr))
+            {
+                listField.Offset = 0x10;
+            }
+
+            if (!symbols.FindField(
+                    L"nt!_LDR_DATA_TABLE_ENTRY",
+                    L"InLoadOrderLinks",
+                    &linksField,
+                    nullptr) &&
+                !symbols.FindField(
+                    L"_LDR_DATA_TABLE_ENTRY",
+                    L"InLoadOrderLinks",
+                    &linksField,
+                    nullptr))
+            {
+                linksField.Offset = 0;
+            }
+
+            const bool haveBaseName =
+                symbols.FindField(L"nt!_LDR_DATA_TABLE_ENTRY", L"BaseDllName", &baseNameField, nullptr) ||
+                symbols.FindField(L"_LDR_DATA_TABLE_ENTRY", L"BaseDllName", &baseNameField, nullptr);
+            const bool haveFullName =
+                symbols.FindField(L"nt!_LDR_DATA_TABLE_ENTRY", L"FullDllName", &fullNameField, nullptr) ||
+                symbols.FindField(L"_LDR_DATA_TABLE_ENTRY", L"FullDllName", &fullNameField, nullptr);
+            if (!haveBaseName)
+            {
+                baseNameField.Offset = 0x58;
+            }
+
+            if (!haveFullName)
+            {
+                fullNameField.Offset = 0x48;
+            }
+
+            std::vector<uint8_t> pebBytes;
+            if (!ReadVirtualThroughDtb(device, userDtb, peb + ldrField.Offset, 8, &pebBytes))
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"could not read PEB.Ldr to pin module names");
+                }
+                break;
+            }
+
+            uint64_t ldr = 0;
+            std::memcpy(&ldr, pebBytes.data(), sizeof(ldr));
+            if (!IsUserModeVa(ldr))
+            {
+                break;
+            }
+
+            AddTranslatedVirtualPage(device, userDtb, ldr, ranges, nullptr, nullptr);
+            const uint64_t listHead = ldr + listField.Offset;
+            std::vector<uint8_t> headBytes;
+            if (!ReadVirtualThroughDtb(device, userDtb, listHead, 8, &headBytes))
+            {
+                break;
+            }
+
+            uint64_t flink = 0;
+            std::memcpy(&flink, headBytes.data(), sizeof(flink));
+            uint32_t pinned = 0;
+            uint64_t current = flink;
+            for (uint32_t index = 0; index < 256; ++index)
+            {
+                if (current == 0 || current == listHead || !IsUserModeVa(current))
+                {
+                    break;
+                }
+
+                if (current < linksField.Offset)
+                {
+                    break;
+                }
+
+                const uint64_t entry = current - linksField.Offset;
+                AddTranslatedVirtualPage(device, userDtb, entry, ranges, nullptr, nullptr);
+                AddTranslatedVirtualPage(device, userDtb, entry + 0x100, ranges, nullptr, nullptr);
+                PinUserUnicodeStringPages(device, userDtb, entry + baseNameField.Offset, ranges);
+                PinUserUnicodeStringPages(device, userDtb, entry + fullNameField.Offset, ranges);
+                ++pinned;
+
+                std::vector<uint8_t> nextBytes;
+                if (!ReadVirtualThroughDtb(device, userDtb, current, 8, &nextBytes))
+                {
+                    break;
+                }
+
+                uint64_t next = 0;
+                std::memcpy(&next, nextBytes.data(), sizeof(next));
+                if (next == current)
+                {
+                    break;
+                }
+
+                current = next;
+            }
+
+            if (warnings != nullptr && pinned > 0)
+            {
+                warnings->push_back(
+                    L"pinned PEB LDR names for " + std::to_wstring(pinned) + L" module(s)");
+            }
+        } while (false);
+    }
+
     bool ResolveLiveKpcr(
         DeviceClient& device,
         uint64_t* kpcr,
@@ -2857,6 +3132,14 @@ namespace
                 prcb,
                 L"nt!_KPRCB",
                 L"RspBase");
+        }
+
+        uint64_t idleLoop = 0;
+        std::wstring idleLoopError;
+        if (symbols.ResolveSymbol(L"nt!KiIdleLoop", &idleLoop, &idleLoopError) &&
+            IsKernelCanonicalVa(idleLoop))
+        {
+            context.Rip = idleLoop;
         }
 
         if (context.Rip == 0 && IsKernelCanonicalVa(lstar))
@@ -4703,6 +4986,13 @@ bool DumpProcessVisibleMemoryToCrashDump(
         if (peb != 0)
         {
             AddTranslatedVirtualPage(device, userPinDtb, peb + kPageSize, &ranges, nullptr, nullptr);
+            PinProcessLdrNamePages(
+                device,
+                symbols,
+                userPinDtb,
+                peb,
+                &ranges,
+                &walkWarnings);
         }
 
         uint64_t kpcr = 0;
@@ -5309,6 +5599,29 @@ bool DumpLiveProcessFilterSelfTest()
         uint16_t poked = 0;
         std::memcpy(&poked, pokeBlock.data() + 0x170, sizeof(poked));
         if (poked != 0x10)
+        {
+            break;
+        }
+
+        uint8_t unicodeBlob[16] = {};
+        const uint16_t nameBytes = 24;
+        const uint64_t nameBuffer = 0x00000080011be4e8ull;
+        std::memcpy(unicodeBlob, &nameBytes, sizeof(nameBytes));
+        std::memcpy(unicodeBlob + 8, &nameBuffer, sizeof(nameBuffer));
+        uint64_t parsedBuffer = 0;
+        uint32_t parsedLength = 0;
+        if (!ParseUserUnicodeString64(unicodeBlob, sizeof(unicodeBlob), &parsedBuffer, &parsedLength) ||
+            parsedBuffer != nameBuffer ||
+            parsedLength != 24)
+        {
+            break;
+        }
+
+        uint8_t kernelBlob[16] = {};
+        const uint64_t kernelBuffer = 0xfffff80012340000ull;
+        std::memcpy(kernelBlob + 8, &kernelBuffer, sizeof(kernelBuffer));
+        std::memcpy(kernelBlob, &nameBytes, sizeof(nameBytes));
+        if (ParseUserUnicodeString64(kernelBlob, sizeof(kernelBlob), &parsedBuffer, &parsedLength))
         {
             break;
         }
