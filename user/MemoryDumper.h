@@ -137,6 +137,9 @@ struct DumpKernelCrashResult
     uint64_t DirectoryTableBase = 0;
     uint64_t KdDebuggerDataBlock = 0;
     uint64_t CurrentThread = 0;
+    uint64_t ContextRip = 0;
+    uint64_t ContextRsp = 0;
+    uint32_t ContextFlags = 0;
     uint32_t RangeCount = 0;
     uint32_t ChunksRead = 0;
     uint32_t ChunksFailed = 0;
@@ -146,6 +149,7 @@ struct DumpKernelCrashResult
     bool KptiRootMerged = false;
     bool CurrentProcessPatched = false;
     bool Wow64Target = false;
+    bool TrapFrameSynthesized = false;
     std::vector<std::wstring> Warnings;
 };
 
@@ -161,6 +165,8 @@ struct ProcessDumpWinDbgFixup
     uint64_t UserDirectoryTableBase = 0;
     uint64_t Peb = 0;
     uint64_t Thread = 0;
+    uint64_t HeaderRip = 0;
+    uint64_t HeaderRsp = 0;
     bool Wow64 = false;
 };
 
@@ -191,9 +197,9 @@ bool BuildCompleteDumpHeader(
 // rangesOverride, when non-null, replaces MmGetPhysicalMemoryRanges.
 // directoryTableBaseOverride, when non-zero, is stored as DirectoryTableBase
 // instead of CPU0 CR3. commentOverride replaces the default header comment.
-// processFixup, when non-null, marks the dump as a filtered live dump and
-// merges the KPTI user/kernel page-table root. CPU0 CurrentThread is left
-// alone so dbgeng keeps an AMD64 kernel context.
+// processFixup, when non-null, marks the dump as a filtered live dump,
+// merges the KPTI user/kernel page-table root, and pins CPU0 CurrentThread
+// to IdleThread so dbgeng stays in AMD64 kernel context.
 bool DumpPhysicalMemoryToCrashDump(
     DeviceClient& device,
     SymbolEngine& symbols,

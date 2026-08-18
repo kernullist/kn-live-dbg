@@ -1199,6 +1199,8 @@ namespace
     constexpr uint32_t kKpcrSelfOffset = 0x18;
     constexpr uint32_t kKpcrCurrentPrcbOffset = 0x38;
     constexpr uint32_t kKprcbCurrentThreadFallback = 0x08;
+    constexpr uint32_t kKprcbNextThreadFallback = 0x10;
+    constexpr uint32_t kKprcbIdleThreadFallback = 0x18;
 
     bool IsKernelCanonicalVa(uint64_t address)
     {
@@ -1265,6 +1267,24 @@ namespace
         const wchar_t* fieldName,
         const uint32_t* fallbackOffset,
         uint64_t* value);
+    uint64_t ResolveKpcrPrcb(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t kpcr);
+    uint64_t ResolvePrcbIdleThread(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t prcb);
+    bool SynthesizeIdleTrapFrame(
+        HANDLE file,
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t directoryTableBase,
+        uint64_t idleThread,
+        uint64_t rip,
+        uint64_t rsp,
+        std::wstring* error);
 
     bool ModuleNameIsNt(const std::wstring& imageName)
     {
@@ -2101,8 +2121,6 @@ namespace
                 break;
             }
 
-            (void)symbols;
-
             const uint64_t kernelDtb = MaskDirectoryTableBase(fixup.KernelDirectoryTableBase);
             const uint64_t userDtb = MaskDirectoryTableBase(fixup.UserDirectoryTableBase);
             result->CurrentThread = fixup.Thread;
@@ -2143,11 +2161,101 @@ namespace
                 }
             }
 
-            // Do not retarget KPRCB.CurrentThread. A native x64 user thread
-            // still makes dbgeng drop the dump CONTEXT and switch to that
-            // thread's user record, which is how kd:x86 appeared on a
-            // non-WOW64 image. CPU0 keeps its live thread; the operator
-            // switches with .process /p /r.
+            // Force CPU0 onto IdleThread. Leaving a live user thread as
+            // CurrentThread makes dbgeng replace the dump CONTEXT with that
+            // thread's user record and switch the session to kd:x86 even
+            // when the image is native x64.
+            uint64_t kpcr = 0;
+            if (!ResolveLiveKpcr(device, &kpcr, nullptr, &result->Warnings) || kpcr == 0)
+            {
+                result->Warnings.push_back(
+                    L"could not resolve CPU0 KPCR to pin IdleThread");
+                break;
+            }
+
+            const uint64_t prcb = ResolveKpcrPrcb(device, symbols, kpcr);
+            const uint64_t idleThread = ResolvePrcbIdleThread(device, symbols, prcb);
+            if (idleThread == 0 || kernelDtb == 0)
+            {
+                result->Warnings.push_back(
+                    L"IdleThread unavailable; WinDbg may follow a user CurrentThread");
+                break;
+            }
+
+            uint32_t currentThreadOffset = kKprcbCurrentThreadFallback;
+            TypeFieldInfo currentThreadField = {};
+            if (symbols.FindField(L"nt!_KPRCB", L"CurrentThread", &currentThreadField, nullptr) &&
+                currentThreadField.Offset <= 0x4000)
+            {
+                currentThreadOffset = currentThreadField.Offset;
+            }
+
+            uint32_t nextThreadOffset = kKprcbNextThreadFallback;
+            TypeFieldInfo nextThreadField = {};
+            if (symbols.FindField(L"nt!_KPRCB", L"NextThread", &nextThreadField, nullptr) &&
+                nextThreadField.Offset <= 0x4000)
+            {
+                nextThreadOffset = nextThreadField.Offset;
+            }
+
+            const uint64_t idleVa = idleThread;
+            const uint64_t zeroVa = 0;
+            std::wstring patchError;
+            if (!WriteDumpVirtualRange(
+                    file,
+                    device,
+                    kernelDtb,
+                    ranges,
+                    prcb + currentThreadOffset,
+                    reinterpret_cast<const uint8_t*>(&idleVa),
+                    sizeof(idleVa),
+                    &patchError,
+                    L"IdleThread"))
+            {
+                result->Warnings.push_back(L"IdleThread CurrentThread patch failed: " + patchError);
+                break;
+            }
+
+            std::wstring nextError;
+            if (!WriteDumpVirtualRange(
+                    file,
+                    device,
+                    kernelDtb,
+                    ranges,
+                    prcb + nextThreadOffset,
+                    reinterpret_cast<const uint8_t*>(&zeroVa),
+                    sizeof(zeroVa),
+                    &nextError,
+                    L"NextThread"))
+            {
+                result->Warnings.push_back(L"NextThread clear failed: " + nextError);
+            }
+
+            result->CurrentThread = idleThread;
+            result->CurrentProcessPatched = true;
+
+            if (fixup.HeaderRip != 0)
+            {
+                std::wstring trapError;
+                if (SynthesizeIdleTrapFrame(
+                        file,
+                        device,
+                        symbols,
+                        ranges,
+                        kernelDtb,
+                        idleThread,
+                        fixup.HeaderRip,
+                        fixup.HeaderRsp,
+                        &trapError))
+                {
+                    result->TrapFrameSynthesized = true;
+                }
+                else
+                {
+                    result->Warnings.push_back(
+                        L"IdleThread trap frame synthesize failed: " + trapError);
+                }
+            }
         } while (false);
     }
 
@@ -2365,6 +2473,303 @@ namespace
         return 0;
     }
 
+    uint64_t ResolveKpcrPrcb(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t kpcr)
+    {
+        uint64_t prcb = 0;
+        if (kpcr == 0)
+        {
+            return 0;
+        }
+
+        if (!ReadFieldU64(
+                device,
+                symbols,
+                kpcr,
+                L"nt!_KPCR",
+                L"CurrentPrcb",
+                &kKpcrCurrentPrcbOffset,
+                &prcb) ||
+            !IsKernelCanonicalVa(prcb))
+        {
+            prcb = kpcr + 0x180;
+        }
+
+        return prcb;
+    }
+
+    uint64_t ResolvePrcbIdleThread(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t prcb)
+    {
+        uint64_t idle = 0;
+        if (prcb == 0)
+        {
+            return 0;
+        }
+
+        if (!ReadFieldU64(
+                device,
+                symbols,
+                prcb,
+                L"nt!_KPRCB",
+                L"IdleThread",
+                &kKprcbIdleThreadFallback,
+                &idle) ||
+            !IsKernelCanonicalVa(idle))
+        {
+            idle = 0;
+        }
+
+        return idle;
+    }
+
+    bool PokeDumpStructField(
+        std::vector<uint8_t>* block,
+        const TypeFieldInfo& field,
+        const void* value,
+        size_t valueSize)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (block == nullptr || value == nullptr || valueSize == 0)
+            {
+                break;
+            }
+
+            if (field.Offset + valueSize > block->size())
+            {
+                break;
+            }
+
+            std::memcpy(block->data() + field.Offset, value, valueSize);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool SynthesizeIdleTrapFrame(
+        HANDLE file,
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const std::vector<PhysicalMemoryRange>& ranges,
+        uint64_t directoryTableBase,
+        uint64_t idleThread,
+        uint64_t rip,
+        uint64_t rsp,
+        std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (idleThread == 0 || rip == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"idle trap frame needs IdleThread and a kernel RIP";
+                }
+                break;
+            }
+
+            TypeLayoutInfo frameLayout = {};
+            std::wstring layoutError;
+            if (!symbols.GetTypeLayout(L"nt!_KTRAP_FRAME", &frameLayout, &layoutError) ||
+                frameLayout.Size < 0x80 ||
+                frameLayout.Size > 0x400)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"nt!_KTRAP_FRAME layout unavailable: " + layoutError;
+                }
+                break;
+            }
+
+            TypeFieldInfo ripField = {};
+            TypeFieldInfo rspField = {};
+            TypeFieldInfo csField = {};
+            TypeFieldInfo ssField = {};
+            TypeFieldInfo flagsField = {};
+            TypeFieldInfo trapField = {};
+            for (const TypeFieldInfo& field : frameLayout.Fields)
+            {
+                if (_wcsicmp(field.Name.c_str(), L"Rip") == 0)
+                {
+                    ripField = field;
+                }
+                else if (_wcsicmp(field.Name.c_str(), L"Rsp") == 0 ||
+                         _wcsicmp(field.Name.c_str(), L"HardwareRsp") == 0)
+                {
+                    rspField = field;
+                }
+                else if (_wcsicmp(field.Name.c_str(), L"SegCs") == 0)
+                {
+                    csField = field;
+                }
+                else if (_wcsicmp(field.Name.c_str(), L"SegSs") == 0)
+                {
+                    ssField = field;
+                }
+                else if (_wcsicmp(field.Name.c_str(), L"EFlags") == 0)
+                {
+                    flagsField = field;
+                }
+            }
+
+            if (ripField.Name.empty())
+            {
+                symbols.FindField(L"nt!_KTRAP_FRAME", L"Rip", &ripField, nullptr);
+            }
+
+            if (rspField.Name.empty() &&
+                !symbols.FindField(L"nt!_KTRAP_FRAME", L"Rsp", &rspField, nullptr))
+            {
+                symbols.FindField(L"nt!_KTRAP_FRAME", L"HardwareRsp", &rspField, nullptr);
+            }
+
+            if (csField.Name.empty())
+            {
+                symbols.FindField(L"nt!_KTRAP_FRAME", L"SegCs", &csField, nullptr);
+            }
+
+            if (csField.Name.empty())
+            {
+                csField.Name = L"SegCs";
+                csField.Offset = 0x170;
+            }
+
+            if (flagsField.Name.empty())
+            {
+                flagsField.Name = L"EFlags";
+                flagsField.Offset = 0x178;
+            }
+
+            if (!symbols.FindField(L"nt!_KTHREAD", L"TrapFrame", &trapField, nullptr) ||
+                ripField.Name.empty() ||
+                rspField.Name.empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"TrapFrame/Rip/Rsp field offsets unavailable";
+                }
+                break;
+            }
+
+            uint64_t stack = ReadCanonicalFieldU64(
+                device,
+                symbols,
+                idleThread,
+                L"nt!_KTHREAD",
+                L"KernelStack");
+            if (stack == 0)
+            {
+                stack = ReadCanonicalFieldU64(
+                    device,
+                    symbols,
+                    idleThread,
+                    L"nt!_KTHREAD",
+                    L"InitialStack");
+            }
+
+            if (stack < frameLayout.Size + 0x40)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"IdleThread has no kernel stack for a trap frame";
+                }
+                break;
+            }
+
+            const uint64_t trapVa = (stack - frameLayout.Size - 0x20) & ~0xFull;
+            std::vector<uint8_t> frame(static_cast<size_t>(frameLayout.Size), 0);
+            const uint64_t frameRip = rip;
+            const uint64_t frameRsp = rsp != 0 ? rsp : stack;
+            const uint16_t kernelCs = 0x10;
+            const uint32_t eflags = 0x2;
+            if (!PokeDumpStructField(&frame, ripField, &frameRip, sizeof(frameRip)) ||
+                !PokeDumpStructField(&frame, rspField, &frameRsp, sizeof(frameRsp)))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"trap frame Rip/Rsp poke failed";
+                }
+                break;
+            }
+
+            const uint16_t kernelSs = 0x18;
+            if (!PokeDumpStructField(&frame, csField, &kernelCs, sizeof(kernelCs)))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"trap frame SegCs poke failed";
+                }
+                break;
+            }
+
+            PokeDumpStructField(&frame, flagsField, &eflags, sizeof(eflags));
+            if (!ssField.Name.empty())
+            {
+                PokeDumpStructField(&frame, ssField, &kernelSs, sizeof(kernelSs));
+            }
+
+            if (!WriteDumpVirtualRange(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    trapVa,
+                    frame.data(),
+                    static_cast<uint32_t>(frame.size()),
+                    error,
+                    L"KTRAP_FRAME"))
+            {
+                break;
+            }
+
+            if (!WriteDumpVirtualRange(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    idleThread + trapField.Offset,
+                    reinterpret_cast<const uint8_t*>(&trapVa),
+                    sizeof(trapVa),
+                    error,
+                    L"KTHREAD.TrapFrame"))
+            {
+                break;
+            }
+
+            TypeFieldInfo previousMode = {};
+            if (symbols.FindField(L"nt!_KTHREAD", L"PreviousMode", &previousMode, nullptr) &&
+                previousMode.Offset <= 0x4000)
+            {
+                const uint8_t kernelMode = 0;
+                std::wstring ignored;
+                WriteDumpVirtualRange(
+                    file,
+                    device,
+                    directoryTableBase,
+                    ranges,
+                    idleThread + previousMode.Offset,
+                    &kernelMode,
+                    sizeof(kernelMode),
+                    &ignored,
+                    L"KTHREAD.PreviousMode");
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     void CaptureLiveProcessorContext(
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -2387,6 +2792,10 @@ namespace
         // thread's user/WOW64 context (kd:x86, 32-bit _ETHREAD).
         context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
         context.MxCsr = 0x1F80;
+        context.FltSave.ControlWord = 0x027F;
+        context.FltSave.TagWord = 0xFF;
+        context.FltSave.MxCsr = 0x1F80;
+        context.FltSave.MxCsr_Mask = 0xFFFF;
         context.SegCs = 0x10;
         context.SegDs = 0x2B;
         context.SegEs = 0x2B;
@@ -2411,107 +2820,37 @@ namespace
         uint64_t kpcr = 0;
         ResolveLiveKpcr(device, &kpcr, &kernelGs, warnings);
 
-        uint64_t currentThread = 0;
+        uint64_t prcb = 0;
+        uint64_t idleThread = 0;
         if (kpcr != 0)
         {
-            uint64_t prcb = 0;
-            if (!ReadFieldU64(
-                    device,
-                    symbols,
-                    kpcr,
-                    L"nt!_KPCR",
-                    L"CurrentPrcb",
-                    &kKpcrCurrentPrcbOffset,
-                    &prcb) ||
-                !IsKernelCanonicalVa(prcb))
-            {
-                prcb = kpcr + 0x180;
-            }
-
-            if (!ReadFieldU64(
-                    device,
-                    symbols,
-                    prcb,
-                    L"nt!_KPRCB",
-                    L"CurrentThread",
-                    &kKprcbCurrentThreadFallback,
-                    &currentThread) ||
-                !IsKernelCanonicalVa(currentThread))
-            {
-                currentThread = 0;
-            }
+            prcb = ResolveKpcrPrcb(device, symbols, kpcr);
+            idleThread = ResolvePrcbIdleThread(device, symbols, prcb);
         }
 
-        // Header RIP/RSP must be kernel. A zero RIP makes dbgeng discard the
-        // AMD64 record and load the current thread's user context instead.
-        if (currentThread != 0)
+        // Header RIP/RSP come from IdleThread (always kernel). A live user
+        // trap frame here is how dbgeng ended up in kd:x86 on native x64.
+        if (idleThread != 0)
         {
-            uint64_t trapFrame = 0;
-            if (ReadFieldU64(
-                    device,
-                    symbols,
-                    currentThread,
-                    L"nt!_KTHREAD",
-                    L"TrapFrame",
-                    nullptr,
-                    &trapFrame) &&
-                IsKernelCanonicalVa(trapFrame))
-            {
-                uint64_t rip = 0;
-                uint64_t rsp = 0;
-                TypeFieldInfo ripField = {};
-                TypeFieldInfo rspField = {};
-                if (symbols.FindField(L"nt!_KTRAP_FRAME", L"Rip", &ripField, nullptr) &&
-                    symbols.FindField(L"nt!_KTRAP_FRAME", L"Rsp", &rspField, nullptr) &&
-                    ReadKernelU64(device, trapFrame + ripField.Offset, &rip) &&
-                    ReadKernelU64(device, trapFrame + rspField.Offset, &rsp) &&
-                    IsKernelCanonicalVa(rip))
-                {
-                    context.Rip = rip;
-                    if (IsKernelCanonicalVa(rsp))
-                    {
-                        context.Rsp = rsp;
-                    }
-                }
-            }
-
+            context.Rsp = ReadCanonicalFieldU64(
+                device,
+                symbols,
+                idleThread,
+                L"nt!_KTHREAD",
+                L"KernelStack");
             if (context.Rsp == 0)
             {
                 context.Rsp = ReadCanonicalFieldU64(
                     device,
                     symbols,
-                    currentThread,
-                    L"nt!_KTHREAD",
-                    L"KernelStack");
-            }
-
-            if (context.Rsp == 0)
-            {
-                context.Rsp = ReadCanonicalFieldU64(
-                    device,
-                    symbols,
-                    currentThread,
+                    idleThread,
                     L"nt!_KTHREAD",
                     L"InitialStack");
             }
         }
 
-        if (context.Rsp == 0 && kpcr != 0)
+        if (context.Rsp == 0 && prcb != 0)
         {
-            uint64_t prcb = 0;
-            if (!ReadFieldU64(
-                    device,
-                    symbols,
-                    kpcr,
-                    L"nt!_KPCR",
-                    L"CurrentPrcb",
-                    &kKpcrCurrentPrcbOffset,
-                    &prcb) ||
-                !IsKernelCanonicalVa(prcb))
-            {
-                prcb = kpcr + 0x180;
-            }
-
             context.Rsp = ReadCanonicalFieldU64(
                 device,
                 symbols,
@@ -3899,6 +4238,44 @@ bool DumpPhysicalMemoryToCrashDump(
             &result->Warnings,
             info.DirectoryTableBase);
 
+        if (info.ContextRecord.size() >= offsetof(CONTEXT, Rip) + sizeof(uint64_t))
+        {
+            std::memcpy(
+                &result->ContextRip,
+                info.ContextRecord.data() + offsetof(CONTEXT, Rip),
+                sizeof(result->ContextRip));
+            std::memcpy(
+                &result->ContextRsp,
+                info.ContextRecord.data() + offsetof(CONTEXT, Rsp),
+                sizeof(result->ContextRsp));
+            std::memcpy(
+                &result->ContextFlags,
+                info.ContextRecord.data() + offsetof(CONTEXT, ContextFlags),
+                sizeof(result->ContextFlags));
+        }
+
+        if (result->ContextRip == 0 && IsKernelCanonicalVa(info.KdDebuggerDataBlock))
+        {
+            result->ContextRip = info.KdDebuggerDataBlock;
+            if (info.ContextRecord.size() >= offsetof(CONTEXT, Rip) + sizeof(uint64_t))
+            {
+                std::memcpy(
+                    info.ContextRecord.data() + offsetof(CONTEXT, Rip),
+                    &result->ContextRip,
+                    sizeof(result->ContextRip));
+            }
+        }
+
+        ProcessDumpWinDbgFixup localFixup;
+        const ProcessDumpWinDbgFixup* activeFixup = processFixup;
+        if (processFixup != nullptr)
+        {
+            localFixup = *processFixup;
+            localFixup.HeaderRip = result->ContextRip;
+            localFixup.HeaderRsp = result->ContextRsp;
+            activeFixup = &localFixup;
+        }
+
         std::vector<uint8_t> header;
         std::wstring headerError;
         if (!BuildCompleteDumpHeader(ranges, info, &header, &headerError))
@@ -4113,14 +4490,14 @@ bool DumpPhysicalMemoryToCrashDump(
             }
         }
 
-        if (processFixup != nullptr)
+        if (activeFixup != nullptr)
         {
             ApplyProcessDumpWinDbgFixups(
                 file,
                 device,
                 symbols,
                 ranges,
-                *processFixup,
+                *activeFixup,
                 result);
         }
 
@@ -4333,6 +4710,44 @@ bool DumpProcessVisibleMemoryToCrashDump(
         {
             AddTranslatedVirtualPage(device, pinDtb, kpcr, &ranges, &walkWarnings, L"KPCR");
             AddTranslatedVirtualPage(device, pinDtb, kpcr + 0x180, &ranges, nullptr, nullptr);
+            const uint64_t prcb = ResolveKpcrPrcb(device, symbols, kpcr);
+            AddTranslatedVirtualPage(device, pinDtb, prcb, &ranges, &walkWarnings, L"KPRCB");
+            const uint64_t idleThread = ResolvePrcbIdleThread(device, symbols, prcb);
+            AddTranslatedVirtualPage(device, pinDtb, idleThread, &ranges, &walkWarnings, L"IdleThread");
+            if (idleThread != 0)
+            {
+                AddTranslatedVirtualPage(device, pinDtb, idleThread + kPageSize, &ranges, nullptr, nullptr);
+                const uint64_t idleStack = ReadCanonicalFieldU64(
+                    device,
+                    symbols,
+                    idleThread,
+                    L"nt!_KTHREAD",
+                    L"KernelStack");
+                if (idleStack != 0)
+                {
+                    AddTranslatedVirtualPage(
+                        device,
+                        pinDtb,
+                        idleStack,
+                        &ranges,
+                        nullptr,
+                        nullptr);
+                    AddTranslatedVirtualPage(
+                        device,
+                        pinDtb,
+                        idleStack - 0x200,
+                        &ranges,
+                        &walkWarnings,
+                        L"IdleThread stack");
+                    AddTranslatedVirtualPage(
+                        device,
+                        pinDtb,
+                        idleStack - kPageSize,
+                        &ranges,
+                        nullptr,
+                        nullptr);
+                }
+            }
         }
 
         uint64_t loadedModules = 0;
@@ -4877,6 +5292,23 @@ bool DumpLiveProcessFilterSelfTest()
         }
 
         if (!mergeOk)
+        {
+            break;
+        }
+
+        std::vector<uint8_t> pokeBlock(0x180, 0);
+        TypeFieldInfo pokeCs = {};
+        pokeCs.Name = L"SegCs";
+        pokeCs.Offset = 0x170;
+        const uint16_t pokeValue = 0x10;
+        if (!PokeDumpStructField(&pokeBlock, pokeCs, &pokeValue, sizeof(pokeValue)))
+        {
+            break;
+        }
+
+        uint16_t poked = 0;
+        std::memcpy(&poked, pokeBlock.data() + 0x170, sizeof(poked));
+        if (poked != 0x10)
         {
             break;
         }
