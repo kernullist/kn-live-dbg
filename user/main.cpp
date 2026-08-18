@@ -15608,10 +15608,16 @@ static void PrintMapperHelp()
     std::wcout << L"  /limit <n>   keep leftover/suspicious records first, then truncate.\n";
     std::wcout << L"  /json <path> write kn-live-dbg.mapper.v1 JSON.\n";
     std::wcout << L"\n";
-    std::wcout << L"  Missing symbols fail closed with an explicit coverage note. Names that\n";
-    std::wcout << L"  are not in the live module list print as STALE. Wiped names, a zero\n";
-    std::wcout << L"  TimeDateStamp, or an unloaded range that is still present+executable\n";
-    std::wcout << L"  print as SUSPICIOUS. !snapshot captures leftover-mapper only.\n";
+    std::wcout << L"  Missing symbols fail closed with an explicit coverage note. Unloaded\n";
+    std::wcout << L"  ranges reused by another live image print as REUSED; the same image\n";
+    std::wcout << L"  still mapped at that start prints as RELOAD (adjacent repeats coalesce\n";
+    std::wcout << L"  as xN). STILL-X is only for an unloaded range that is still\n";
+    std::wcout << L"  present+executable and not reused. CI/PiDDB names explained by\n";
+    std::wcout << L"  MmUnloadedDrivers or dump_* crash-dump leftovers are EXPECTED and\n";
+    std::wcout << L"  omitted from default output (kept in JSON). Other missing names print\n";
+    std::wcout << L"  as STALE. Wiped names or a zero TimeDateStamp print as SUSPICIOUS.\n";
+    std::wcout << L"  If PiDDB AVL does not validate, the walk falls back to PiDDBCacheList.\n";
+    std::wcout << L"  !snapshot captures leftover-mapper only.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !mapper\n";
@@ -16126,14 +16132,37 @@ static void HandleMapperCommand(
             std::wcerr << L"!mapper coverage: " << note << L"\n";
         }
 
+        uint32_t piddbLeftover = 0;
+        uint32_t hashLeftover = 0;
+        for (const MapperPiddbRecord& record : result.Piddb)
+        {
+            if (record.Suspicious || (!record.InLoadedModules && !record.Expected))
+            {
+                ++piddbLeftover;
+            }
+        }
+        for (const MapperHashRecord& record : result.HashEntries)
+        {
+            if (record.Suspicious || (!record.InLoadedModules && !record.Expected))
+            {
+                ++hashLeftover;
+            }
+        }
+
         PrintColoredText(L"mapper", KNDBG_COLOR_TITLE);
         std::wcout << L" suspicious=" << (result.AnySuspicious ? L"yes" : L"no")
                    << L" unloaded=" << result.Unloaded.size()
                    << L"(" << (result.UnloadedComplete ? L"complete" : L"partial") << L")"
                    << L" piddb=" << result.Piddb.size()
-                   << L"(" << (result.PiddbComplete ? L"complete" : L"partial") << L")"
+                   << L"(" << (result.PiddbComplete ? L"complete" : L"partial");
+        if (!result.PiddbWalkMode.empty())
+        {
+            std::wcout << L"/" << result.PiddbWalkMode;
+        }
+        std::wcout << L",leftover=" << piddbLeftover << L")"
                    << L" hash=" << result.HashEntries.size()
-                   << L"(" << (result.HashComplete ? L"complete" : L"partial") << L")\n";
+                   << L"(" << (result.HashComplete ? L"complete" : L"partial")
+                   << L",leftover=" << hashLeftover << L")\n";
 
         for (const MapperUnloadedRecord& record : result.Unloaded)
         {
@@ -16149,7 +16178,21 @@ static void HandleMapperCommand(
             }
             std::wcout << L" start=" << HexTextWidth(record.StartAddress, 16, true)
                        << L" end=" << HexTextWidth(record.EndAddress, 16, true);
-            if (record.StillExecutable)
+            if (record.RepeatCount > 1)
+            {
+                std::wcout << L" x" << record.RepeatCount;
+            }
+            if (record.SameImageReload)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"RELOAD", KNDBG_COLOR_WARN);
+            }
+            else if (record.RangeReused)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"REUSED", KNDBG_COLOR_WARN);
+            }
+            else if (record.StillExecutable)
             {
                 std::wcout << L" ";
                 PrintColoredText(L"STILL-X", KNDBG_COLOR_FAIL);
@@ -16169,7 +16212,7 @@ static void HandleMapperCommand(
         uint32_t piddbPrinted = 0;
         for (const MapperPiddbRecord& record : result.Piddb)
         {
-            if (record.InLoadedModules && !record.Suspicious)
+            if ((record.InLoadedModules || record.Expected) && !record.Suspicious)
             {
                 continue;
             }
@@ -16183,7 +16226,7 @@ static void HandleMapperCommand(
                        << L" stamp=0x" << std::hex << record.TimeDateStamp << std::dec
                        << L" loaded=" << (record.InLoadedModules ? L"yes" : L"no") << L" ";
             PrintColoredText(
-                record.Suspicious ? L"SUSPICIOUS" : L"STALE",
+                record.Suspicious ? L"SUSPICIOUS" : (record.Expected ? L"EXPECTED" : L"STALE"),
                 record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN);
             std::wcout << L"\n";
             if (!record.Notes.empty())
@@ -16196,7 +16239,7 @@ static void HandleMapperCommand(
         uint32_t hashPrinted = 0;
         for (const MapperHashRecord& record : result.HashEntries)
         {
-            if (record.InLoadedModules && !record.Suspicious)
+            if ((record.InLoadedModules || record.Expected) && !record.Suspicious)
             {
                 continue;
             }
@@ -16209,7 +16252,7 @@ static void HandleMapperCommand(
             std::wcout << L" " << record.DriverName
                        << L" loaded=" << (record.InLoadedModules ? L"yes" : L"no") << L" ";
             PrintColoredText(
-                record.Suspicious ? L"SUSPICIOUS" : L"STALE",
+                record.Suspicious ? L"SUSPICIOUS" : (record.Expected ? L"EXPECTED" : L"STALE"),
                 record.Suspicious ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN);
             std::wcout << L"\n";
             if (!record.Notes.empty())
