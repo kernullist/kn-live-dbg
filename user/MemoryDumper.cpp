@@ -1151,9 +1151,486 @@ namespace
     static_assert(16 + (kCrashDumpMaxPhysicalRuns * 16) <= 700,
         "42 runs must fit in DMP_PHYSICAL_MEMORY_BLOCK_SIZE_64");
 
+    constexpr uint32_t kKdbgOwnerTag = 0x4742444B; // 'KDBG'
+    constexpr uint32_t kKdbgHeaderTagOffset = 0x10;
+    constexpr uint32_t kKdbgHeaderSizeOffset = 0x14;
+    constexpr uint32_t kKdbgKernBaseOffset = 0x18;
+    constexpr uint32_t kSpecialCr0Offset = 0x00;
+    constexpr uint32_t kSpecialCr2Offset = 0x08;
+    constexpr uint32_t kSpecialCr3Offset = 0x10;
+    constexpr uint32_t kSpecialCr4Offset = 0x18;
+    constexpr uint32_t kSpecialIdtrOffset = 0x60;
+    constexpr uint32_t kSpecialCr8Offset = 0xA0;
+    constexpr uint32_t kSpecialGsBaseOffset = 0xA8;
+    constexpr uint32_t kSpecialGsSwapOffset = 0xB0;
+    constexpr uint32_t kSpecialStarOffset = 0xB8;
+    constexpr uint32_t kSpecialLstarOffset = 0xC0;
+    constexpr uint32_t kSpecialCstarOffset = 0xC8;
+    constexpr uint32_t kSpecialFmaskOffset = 0xD0;
+    constexpr uint32_t kSpecialFsBaseOffset = 0xE0;
+    constexpr uint32_t kSpecialRegistersBytes = 0xF0;
+    constexpr uint32_t kKpcrSelfOffset = 0x18;
+    constexpr uint32_t kKpcrCurrentPrcbOffset = 0x38;
+    constexpr uint32_t kKprcbCurrentThreadFallback = 0x08;
+
     bool IsKernelCanonicalVa(uint64_t address)
     {
         return address >= 0xff00000000000000ull;
+    }
+
+    bool ReadKernelBytes(
+        DeviceClient& device,
+        uint64_t address,
+        uint32_t length,
+        std::vector<uint8_t>* bytes)
+    {
+        std::wstring ignored;
+        return device.ReadMemory(address, length, bytes, &ignored) &&
+            bytes != nullptr &&
+            bytes->size() >= length;
+    }
+
+    bool ReadKernelU32(DeviceClient& device, uint64_t address, uint32_t* value)
+    {
+        std::vector<uint8_t> bytes;
+        if (value == nullptr || !ReadKernelBytes(device, address, sizeof(*value), &bytes))
+        {
+            return false;
+        }
+
+        std::memcpy(value, bytes.data(), sizeof(*value));
+        return true;
+    }
+
+    bool ReadKernelU64(DeviceClient& device, uint64_t address, uint64_t* value)
+    {
+        std::vector<uint8_t> bytes;
+        if (value == nullptr || !ReadKernelBytes(device, address, sizeof(*value), &bytes))
+        {
+            return false;
+        }
+
+        std::memcpy(value, bytes.data(), sizeof(*value));
+        return true;
+    }
+
+    void WriteU64Raw(std::vector<uint8_t>* buffer, size_t offset, uint64_t value)
+    {
+        if (buffer != nullptr && offset + sizeof(value) <= buffer->size())
+        {
+            std::memcpy(buffer->data() + offset, &value, sizeof(value));
+        }
+    }
+
+    bool ResolveOptionalSymbol(
+        SymbolEngine& symbols,
+        const wchar_t* name,
+        uint64_t* address,
+        std::vector<std::wstring>* warnings);
+
+    bool ModuleNameIsNt(const std::wstring& imageName)
+    {
+        return _wcsicmp(imageName.c_str(), L"ntoskrnl.exe") == 0 ||
+            _wcsicmp(imageName.c_str(), L"ntkrnlmp.exe") == 0 ||
+            _wcsicmp(imageName.c_str(), L"ntkrnlpa.exe") == 0 ||
+            _wcsicmp(imageName.c_str(), L"ntkrpamp.exe") == 0;
+    }
+
+    const KernelModuleInfo* FindNtModule(SymbolEngine& symbols)
+    {
+        const KernelModuleInfo* nt = nullptr;
+        for (const KernelModuleInfo& module : symbols.Modules())
+        {
+            if (ModuleNameIsNt(module.ImageName))
+            {
+                nt = &module;
+                break;
+            }
+        }
+
+        return nt;
+    }
+
+    bool KdbgLooksPlausible(DeviceClient& device, uint64_t address, uint64_t ntBase)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (!IsKernelCanonicalVa(address))
+            {
+                break;
+            }
+
+            uint32_t tag = 0;
+            uint32_t size = 0;
+            uint64_t kernBase = 0;
+            if (!ReadKernelU32(device, address + kKdbgHeaderTagOffset, &tag) ||
+                !ReadKernelU32(device, address + kKdbgHeaderSizeOffset, &size) ||
+                !ReadKernelU64(device, address + kKdbgKernBaseOffset, &kernBase))
+            {
+                break;
+            }
+
+            if (tag == kKdbgOwnerTag &&
+                size >= 0x200 &&
+                size <= 0x800)
+            {
+                ok = true;
+                break;
+            }
+
+            // Encoded KDBG still has to sit in readable kernel memory. Accept
+            // a symbol/list hit when the first 0x20 bytes can be read.
+            if (ntBase != 0 &&
+                IsKernelCanonicalVa(kernBase) &&
+                (kernBase == ntBase || tag != 0 || size != 0))
+            {
+                ok = true;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool ScanNtForUnencodedKdbg(
+        DeviceClient& device,
+        uint64_t ntBase,
+        uint32_t ntSize,
+        uint64_t* address)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (address == nullptr || ntBase == 0 || ntSize < 0x40)
+            {
+                break;
+            }
+
+            const uint32_t chunk = 0x10000;
+            uint32_t offset = 0;
+            while (offset + 0x20 < ntSize)
+            {
+                uint32_t want = chunk;
+                if (want > ntSize - offset)
+                {
+                    want = ntSize - offset;
+                }
+
+                std::vector<uint8_t> bytes;
+                if (!ReadKernelBytes(device, ntBase + offset, want, &bytes))
+                {
+                    offset += chunk;
+                    continue;
+                }
+
+                const size_t limit = bytes.size() >= 0x20 ? (bytes.size() - 0x20) : 0;
+                for (size_t index = 0; index + 4 <= bytes.size(); index += 8)
+                {
+                    if (index > limit)
+                    {
+                        break;
+                    }
+
+                    uint32_t tag = 0;
+                    std::memcpy(&tag, bytes.data() + index, sizeof(tag));
+                    if (tag != kKdbgOwnerTag)
+                    {
+                        continue;
+                    }
+
+                    if (index < kKdbgHeaderTagOffset)
+                    {
+                        continue;
+                    }
+
+                    const uint64_t candidate =
+                        ntBase + offset + index - kKdbgHeaderTagOffset;
+                    if (KdbgLooksPlausible(device, candidate, ntBase))
+                    {
+                        *address = candidate;
+                        ok = true;
+                        break;
+                    }
+                }
+
+                if (ok)
+                {
+                    break;
+                }
+
+                offset += chunk;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    uint64_t ResolveKdDebuggerDataBlock(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        std::vector<std::wstring>* warnings)
+    {
+        uint64_t kdBlock = 0;
+        const KernelModuleInfo* nt = FindNtModule(symbols);
+
+        uint64_t symbolBlock = 0;
+        if (ResolveOptionalSymbol(symbols, L"nt!KdDebuggerDataBlock", &symbolBlock, warnings) &&
+            KdbgLooksPlausible(device, symbolBlock, nt != nullptr ? nt->Base : 0))
+        {
+            kdBlock = symbolBlock;
+        }
+        else if (symbolBlock != 0 && IsKernelCanonicalVa(symbolBlock))
+        {
+            // Public PDBs often give the right VA even when the block is
+            // encoded and OwnerTag does not read back as 'KDBG'.
+            kdBlock = symbolBlock;
+        }
+
+        if (kdBlock == 0)
+        {
+            uint64_t listHead = 0;
+            ResolveOptionalSymbol(symbols, L"nt!KdpDebuggerDataListHead", &listHead, warnings);
+            uint64_t flink = 0;
+            if (listHead != 0 &&
+                ReadKernelU64(device, listHead, &flink) &&
+                IsKernelCanonicalVa(flink) &&
+                flink != listHead)
+            {
+                kdBlock = flink;
+            }
+        }
+
+        if (kdBlock == 0 && nt != nullptr)
+        {
+            uint64_t scanned = 0;
+            if (ScanNtForUnencodedKdbg(device, nt->Base, nt->Size, &scanned))
+            {
+                kdBlock = scanned;
+            }
+        }
+
+        if (kdBlock == 0 && warnings != nullptr)
+        {
+            warnings->push_back(
+                L"KdDebuggerDataBlock was not resolved; WinDbg will not have KDBG offsets");
+        }
+
+        return kdBlock;
+    }
+
+    bool ReadFieldU64(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t object,
+        const wchar_t* typeName,
+        const wchar_t* fieldName,
+        const uint32_t* fallbackOffset,
+        uint64_t* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr || object == 0)
+            {
+                break;
+            }
+
+            uint32_t offset = 0;
+            bool haveOffset = false;
+            TypeFieldInfo field = {};
+            std::wstring ignored;
+            if (symbols.FindField(typeName, fieldName, &field, &ignored) &&
+                field.Offset <= 0x4000)
+            {
+                offset = field.Offset;
+                haveOffset = true;
+            }
+            else if (fallbackOffset != nullptr)
+            {
+                offset = *fallbackOffset;
+                haveOffset = true;
+            }
+
+            if (haveOffset && ReadKernelU64(device, object + offset, value))
+            {
+                ok = true;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    void CaptureLiveProcessorContext(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const ControlRegisters& registers,
+        std::vector<uint8_t>* contextRecord,
+        std::vector<std::wstring>* warnings)
+    {
+        if (contextRecord == nullptr)
+        {
+            return;
+        }
+
+        contextRecord->assign(sizeof(CONTEXT) + kSpecialRegistersBytes, 0);
+
+        CONTEXT context = {};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+        context.MxCsr = 0x1F80;
+        context.SegCs = 0x10;
+        context.SegDs = 0x2B;
+        context.SegEs = 0x2B;
+        context.SegSs = 0x18;
+        context.SegFs = 0x53;
+        context.SegGs = 0x2B;
+        context.EFlags = 0x2;
+
+        uint64_t gsBase = 0;
+        uint64_t kernelGs = 0;
+        uint64_t fsBase = 0;
+        uint64_t star = 0;
+        uint64_t lstar = 0;
+        uint64_t cstar = 0;
+        uint64_t fmask = 0;
+        uint32_t ignoredCpu = 0;
+        std::wstring msrError;
+        if (!device.ReadMsr(KNDBG_MSR_IA32_GS_BASE, 0, &gsBase, &ignoredCpu, &msrError) &&
+            warnings != nullptr)
+        {
+            warnings->push_back(L"IA32_GS_BASE read failed: " + msrError);
+        }
+        device.ReadMsr(KNDBG_MSR_IA32_KERNEL_GS_BASE, 0, &kernelGs, &ignoredCpu, nullptr);
+        device.ReadMsr(KNDBG_MSR_IA32_FS_BASE, 0, &fsBase, &ignoredCpu, nullptr);
+        device.ReadMsr(KNDBG_MSR_IA32_STAR, 0, &star, &ignoredCpu, nullptr);
+        device.ReadMsr(KNDBG_MSR_IA32_LSTAR, 0, &lstar, &ignoredCpu, nullptr);
+        device.ReadMsr(KNDBG_MSR_IA32_CSTAR, 0, &cstar, &ignoredCpu, nullptr);
+        device.ReadMsr(KNDBG_MSR_IA32_FMASK, 0, &fmask, &ignoredCpu, nullptr);
+
+        uint64_t kpcr = 0;
+        if (IsKernelCanonicalVa(gsBase))
+        {
+            kpcr = gsBase;
+        }
+        else if (IsKernelCanonicalVa(kernelGs))
+        {
+            kpcr = kernelGs;
+        }
+
+        uint64_t self = 0;
+        if (kpcr != 0 &&
+            ReadKernelU64(device, kpcr + kKpcrSelfOffset, &self) &&
+            self != kpcr)
+        {
+            if (IsKernelCanonicalVa(kernelGs) &&
+                ReadKernelU64(device, kernelGs + kKpcrSelfOffset, &self) &&
+                self == kernelGs)
+            {
+                kpcr = kernelGs;
+            }
+            else
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"GS_BASE did not validate as KPCR.Self");
+                }
+                kpcr = 0;
+            }
+        }
+
+        uint64_t currentThread = 0;
+        if (kpcr != 0)
+        {
+            uint64_t prcb = 0;
+            if (!ReadFieldU64(
+                    device,
+                    symbols,
+                    kpcr,
+                    L"nt!_KPCR",
+                    L"CurrentPrcb",
+                    &kKpcrCurrentPrcbOffset,
+                    &prcb) ||
+                !IsKernelCanonicalVa(prcb))
+            {
+                prcb = kpcr + 0x180;
+            }
+
+            if (!ReadFieldU64(
+                    device,
+                    symbols,
+                    prcb,
+                    L"nt!_KPRCB",
+                    L"CurrentThread",
+                    &kKprcbCurrentThreadFallback,
+                    &currentThread) ||
+                !IsKernelCanonicalVa(currentThread))
+            {
+                currentThread = 0;
+            }
+        }
+
+        if (currentThread != 0)
+        {
+            uint64_t trapFrame = 0;
+            if (ReadFieldU64(
+                    device,
+                    symbols,
+                    currentThread,
+                    L"nt!_KTHREAD",
+                    L"TrapFrame",
+                    nullptr,
+                    &trapFrame) &&
+                IsKernelCanonicalVa(trapFrame))
+            {
+                uint64_t rip = 0;
+                uint64_t rsp = 0;
+                TypeFieldInfo ripField = {};
+                TypeFieldInfo rspField = {};
+                if (symbols.FindField(L"nt!_KTRAP_FRAME", L"Rip", &ripField, nullptr) &&
+                    symbols.FindField(L"nt!_KTRAP_FRAME", L"Rsp", &rspField, nullptr) &&
+                    ReadKernelU64(device, trapFrame + ripField.Offset, &rip) &&
+                    ReadKernelU64(device, trapFrame + rspField.Offset, &rsp))
+                {
+                    context.Rip = rip;
+                    context.Rsp = rsp;
+                }
+            }
+        }
+
+        std::memcpy(contextRecord->data(), &context, sizeof(context));
+
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr0Offset, registers.Cr0);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr2Offset, registers.Cr2);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr3Offset, registers.Cr3);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr4Offset, registers.Cr4);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCr8Offset, registers.Cr8);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialGsBaseOffset, kpcr != 0 ? kpcr : gsBase);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialGsSwapOffset, kernelGs);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialStarOffset, star);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialLstarOffset, lstar);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialCstarOffset, cstar);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialFmaskOffset, fmask);
+        WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialFsBaseOffset, fsBase);
+
+        IdtInfo idt = {};
+        if (device.ReadIdt(0, &idt, nullptr) && idt.Base != 0)
+        {
+            // KDESCRIPTOR: Pad[3], Limit, Base at +8.
+            const uint16_t limit = static_cast<uint16_t>(idt.Limit);
+            std::memcpy(
+                contextRecord->data() + sizeof(CONTEXT) + kSpecialIdtrOffset + 6,
+                &limit,
+                sizeof(limit));
+            WriteU64Raw(contextRecord, sizeof(CONTEXT) + kSpecialIdtrOffset + 8, idt.Base);
+        }
+
+        if (kpcr == 0 && warnings != nullptr)
+        {
+            warnings->push_back(
+                L"processor GsBase/KPCR was not captured; WinDbg may have no current thread");
+        }
     }
 
     uint64_t DecodeU64(const std::vector<uint8_t>& bytes)
@@ -1765,7 +2242,11 @@ bool BuildCompleteDumpHeader(
 
         dump.ProductType = info.ProductType;
         dump.SuiteMask = info.SuiteMask;
-        dump.Attributes.LiveDumpGeneratedDump = 1;
+        if (!info.ContextRecord.empty())
+        {
+            const size_t copied = (std::min)(info.ContextRecord.size(), sizeof(dump.ContextRecord));
+            std::memcpy(dump.ContextRecord, info.ContextRecord.data(), copied);
+        }
 
         header->resize(sizeof(dump));
         std::memcpy(header->data(), &dump, sizeof(dump));
@@ -1876,18 +2357,14 @@ bool DumpPhysicalMemoryToCrashDump(
             result->Warnings.push_back(L"CR3 read failed: " + crError);
         }
 
-        uint64_t kdBlock = 0;
         uint64_t pfnDatabase = 0;
         uint64_t loadedModules = 0;
         uint64_t activeProcesses = 0;
-        ResolveOptionalSymbol(symbols, L"nt!KdDebuggerDataBlock", &kdBlock, &result->Warnings);
+        info.KdDebuggerDataBlock =
+            ResolveKdDebuggerDataBlock(device, symbols, &result->Warnings);
         ResolveOptionalSymbol(symbols, L"nt!MmPfnDatabase", &pfnDatabase, &result->Warnings);
         ResolveOptionalSymbol(symbols, L"nt!PsLoadedModuleList", &loadedModules, &result->Warnings);
         ResolveOptionalSymbol(symbols, L"nt!PsActiveProcessHead", &activeProcesses, &result->Warnings);
-        if (kdBlock != 0)
-        {
-            info.KdDebuggerDataBlock = kdBlock;
-        }
         if (loadedModules != 0)
         {
             info.PsLoadedModuleList = loadedModules;
@@ -1905,6 +2382,16 @@ bool DumpPhysicalMemoryToCrashDump(
                     L"nt!MmPfnDatabase did not dereference to a kernel pointer");
             }
         }
+
+        result->DirectoryTableBase = info.DirectoryTableBase;
+        result->KdDebuggerDataBlock = info.KdDebuggerDataBlock;
+
+        CaptureLiveProcessorContext(
+            device,
+            symbols,
+            registers,
+            &info.ContextRecord,
+            &result->Warnings);
 
         std::vector<uint8_t> header;
         std::wstring headerError;

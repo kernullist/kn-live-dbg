@@ -24238,7 +24238,9 @@ static void HandleDumpKernelCommand(
 
         PrintColoredText(L"[dump-kernel]", KNDBG_COLOR_TITLE);
         std::wcout << L" header=0x" << std::hex << result.HeaderBytes
-                   << L" payload=0x" << result.PayloadBytes << std::dec
+                   << L" payload=0x" << result.PayloadBytes
+                   << L" dtb=0x" << result.DirectoryTableBase
+                   << L" kdbg=0x" << result.KdDebuggerDataBlock << std::dec
                    << L" kernel_bytes=" << result.BytesRead
                    << L" zero_bytes=" << result.BytesZeroFilled
                    << L" wrote=" << result.BytesWritten
@@ -27548,6 +27550,9 @@ static int RunConsoleSurfaceSelfTest()
             headerInfo.ProductType = 1;
             headerInfo.SuiteMask = 0x100;
             headerInfo.Comment = "kn-live-dbg header self-test";
+            headerInfo.ContextRecord.assign(0x40, 0);
+            const uint32_t contextFlags = 0x10000Bul;
+            std::memcpy(headerInfo.ContextRecord.data() + 0x30, &contextFlags, sizeof(contextFlags));
             std::vector<uint8_t> header;
             std::wstring headerError;
             const bool headerOk = BuildCompleteDumpHeader({run}, headerInfo, &header, &headerError);
@@ -27563,6 +27568,8 @@ static int RunConsoleSurfaceSelfTest()
             uint64_t numberOfPages = 0;
             uint64_t basePage = 0;
             uint64_t pageCount = 0;
+            uint32_t attributes = 0;
+            uint32_t storedContextFlags = 0;
             char comment[32] = {};
             if (header.size() >= kCrashDumpHeaderBytes)
             {
@@ -27579,6 +27586,8 @@ static int RunConsoleSurfaceSelfTest()
                 std::memcpy(comment, header.data() + 0xFB0, sizeof(comment) - 1);
                 std::memcpy(&productType, header.data() + 0x1040, sizeof(productType));
                 std::memcpy(&suiteMask, header.data() + 0x1044, sizeof(suiteMask));
+                std::memcpy(&attributes, header.data() + 0x1050, sizeof(attributes));
+                std::memcpy(&storedContextFlags, header.data() + 0x348 + 0x30, sizeof(storedContextFlags));
             }
             CheckConsoleSurfaceSelfTest(
                 &context,
@@ -27596,6 +27605,8 @@ static int RunConsoleSurfaceSelfTest()
                     required == kCrashDumpHeaderBytes + 0x2000ull &&
                     productType == 1 &&
                     suiteMask == 0x100 &&
+                    attributes == 0 &&
+                    storedContextFlags == 0x10000Bul &&
                     std::strncmp(comment, "kn-live-dbg header self-test", 27) == 0,
                 L"dump-kernel-header-is-complete-dump64");
             std::vector<PhysicalMemoryRange> tooMany(kCrashDumpMaxPhysicalRuns + 1);

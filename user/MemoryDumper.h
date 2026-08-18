@@ -121,6 +121,7 @@ struct DumpKernelHeaderInfo
     uint32_t ProductType = 1;
     uint32_t SuiteMask = 0;
     std::string Comment;
+    std::vector<uint8_t> ContextRecord;
 };
 
 struct DumpKernelCrashResult
@@ -130,6 +131,8 @@ struct DumpKernelCrashResult
     uint64_t BytesRead = 0;
     uint64_t BytesZeroFilled = 0;
     uint64_t BytesWritten = 0;
+    uint64_t DirectoryTableBase = 0;
+    uint64_t KdDebuggerDataBlock = 0;
     uint32_t RangeCount = 0;
     uint32_t ChunksRead = 0;
     uint32_t ChunksFailed = 0;
