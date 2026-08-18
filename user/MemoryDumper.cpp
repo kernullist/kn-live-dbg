@@ -3,7 +3,10 @@
 #include "../shared/KnLiveDbgIoctl.h"
 
 #include <Windows.h>
+#include <mindumpdef.h>
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -1115,38 +1118,38 @@ bool DumpKernelPeToFile(
 namespace
 {
     constexpr uint32_t kPageSize = 0x1000;
-    constexpr uint32_t kDumpSignature = 0x45474150u; // 'PAGE'
-    constexpr uint32_t kDumpValid64 = 0x34365544u;   // 'DU64'
-    constexpr uint32_t kDumpTypeFull = 1;
-    constexpr uint32_t kMachineAmd64 = 0x8664;
     constexpr uint32_t kBugCheckLiveSystemDump = 0x161;
-    constexpr uint32_t kPhysBlockOffset = 0x088;
-    constexpr uint32_t kDumpTypeOffset = 0xF94;
-    constexpr uint32_t kRequiredSpaceOffset = 0xF98;
-    constexpr uint32_t kSystemTimeOffset = 0xFA0;
-    constexpr uint32_t kCommentOffset = 0xFA8;
-    constexpr uint32_t kProductTypeOffset = 0x1038;
-    constexpr uint32_t kSuiteMaskOffset = 0x103C;
     constexpr uint32_t kSysDbgGetLiveKernelDump = 37;
     constexpr uint32_t kLiveDumpControlVersion1 = 1;
     constexpr uint32_t kLiveDumpControlVersion2 = 2;
     constexpr uint64_t kProgressStepBytes = 0x10000000ull; // 256 MB
 
-    void WriteU32At(std::vector<uint8_t>* header, size_t offset, uint32_t value)
-    {
-        if (header != nullptr && offset + sizeof(value) <= header->size())
-        {
-            std::memcpy(header->data() + offset, &value, sizeof(value));
-        }
-    }
-
-    void WriteU64At(std::vector<uint8_t>* header, size_t offset, uint64_t value)
-    {
-        if (header != nullptr && offset + sizeof(value) <= header->size())
-        {
-            std::memcpy(header->data() + offset, &value, sizeof(value));
-        }
-    }
+    static_assert(sizeof(DUMP_HEADER64) == kCrashDumpHeaderBytes,
+        "DUMP_HEADER64 must be the 8 KB complete-dump prefix");
+    static_assert(offsetof(DUMP_HEADER64, PhysicalMemoryBlock) == 0x088,
+        "PhysicalMemoryBlock offset");
+    static_assert(offsetof(DUMP_HEADER64, ContextRecord) == 0x348,
+        "ContextRecord offset");
+    static_assert(offsetof(DUMP_HEADER64, Exception) == 0xF00,
+        "Exception offset");
+    static_assert(offsetof(DUMP_HEADER64, DumpType) == 0xF98,
+        "DumpType must be 0xF98; 0xF94 is the pre-alignment slot WinDbg ignores");
+    static_assert(offsetof(DUMP_HEADER64, RequiredDumpSpace) == 0xFA0,
+        "RequiredDumpSpace offset");
+    static_assert(offsetof(DUMP_HEADER64, SystemTime) == 0xFA8,
+        "SystemTime offset");
+    static_assert(offsetof(DUMP_HEADER64, Comment) == 0xFB0,
+        "Comment offset");
+    static_assert(offsetof(DUMP_HEADER64, ProductType) == 0x1040,
+        "ProductType offset");
+    static_assert(offsetof(DUMP_HEADER64, SuiteMask) == 0x1044,
+        "SuiteMask offset");
+    static_assert(offsetof(PHYSICAL_MEMORY_DESCRIPTOR64, NumberOfPages) == 8,
+        "NumberOfPages is 8-byte aligned after NumberOfRuns");
+    static_assert(offsetof(PHYSICAL_MEMORY_DESCRIPTOR64, Run) == 16,
+        "first PHYSICAL_MEMORY_RUN64 starts at +16");
+    static_assert(16 + (kCrashDumpMaxPhysicalRuns * 16) <= 700,
+        "42 runs must fit in DMP_PHYSICAL_MEMORY_BLOCK_SIZE_64");
 
     bool IsKernelCanonicalVa(uint64_t address)
     {
@@ -1436,8 +1439,17 @@ namespace
         case 0xC000009Aul:
             name = L"STATUS_INSUFFICIENT_RESOURCES";
             break;
+        case 0xC0000004ul:
+            name = L"STATUS_INFO_LENGTH_MISMATCH";
+            break;
         case 0xC00000BBul:
             name = L"STATUS_NOT_SUPPORTED";
+            break;
+        case 0xC0000010ul:
+            name = L"STATUS_INVALID_DEVICE_REQUEST";
+            break;
+        case 0xC0000354ul:
+            name = L"STATUS_DEBUGGER_INACTIVE";
             break;
         default:
             break;
@@ -1446,6 +1458,7 @@ namespace
         return name;
     }
 
+    // SYSDBG_LIVEDUMP_CONTROL from phnt/ntexapi.h. Sizes are locked below.
     struct LiveDumpFlags
     {
         unsigned long UseDumpStorageStack : 1;
@@ -1483,6 +1496,58 @@ namespace
         void* SelectiveControl;
     };
 
+    struct LiveDumpSelectiveControl
+    {
+        unsigned long Version;
+        unsigned long Size;
+        unsigned long long Flags;
+        unsigned long long Reserved[4];
+    };
+
+    struct LiveDumpAttemptResult
+    {
+        long Status = static_cast<long>(0xC000000D);
+        unsigned long VersionUsed = 0;
+    };
+
+    static_assert(sizeof(LiveDumpFlags) == 4, "live-dump flags must be one ULONG");
+    static_assert(sizeof(LiveDumpAddPages) == 4, "live-dump add-pages must be one ULONG");
+    static_assert(sizeof(LiveDumpControlV1) == 64, "SYSDBG_LIVEDUMP_CONTROL V1 is 64 bytes on x64");
+    static_assert(sizeof(LiveDumpControlV2) == 72, "SYSDBG_LIVEDUMP_CONTROL V2 is 72 bytes on x64");
+    static_assert(sizeof(LiveDumpSelectiveControl) == 48, "SYSDBG_LIVEDUMP_SELECTIVE_CONTROL is 48 bytes");
+    static_assert(offsetof(LiveDumpControlV1, DumpFileHandle) == 40, "DumpFileHandle offset");
+    static_assert(offsetof(LiveDumpControlV1, Flags) == 56, "Flags offset");
+    static_assert(offsetof(LiveDumpControlV1, AddPagesControl) == 60, "AddPagesControl offset");
+    static_assert(offsetof(LiveDumpControlV2, SelectiveControl) == 64, "SelectiveControl offset");
+
+    bool IsLiveDumpVersionFallbackStatus(long status)
+    {
+        const unsigned long value = static_cast<unsigned long>(status);
+        return value == 0xC0000004ul ||
+            value == 0xC000000Dul ||
+            value == 0xC0000059ul ||
+            value == 0xC00000BBul;
+    }
+
+    bool IsLiveDumpIoFallbackStatus(long status)
+    {
+        const unsigned long value = static_cast<unsigned long>(status);
+        return value == 0xC0000002ul ||
+            value == 0xC0000004ul ||
+            value == 0xC000000Dul ||
+            value == 0xC0000010ul ||
+            value == 0xC000009Aul ||
+            value == 0xC00000BBul;
+    }
+
+    bool LiveDumpFileIsEmpty(HANDLE file)
+    {
+        LARGE_INTEGER size = {};
+        return file != INVALID_HANDLE_VALUE &&
+            GetFileSizeEx(file, &size) &&
+            size.QuadPart == 0;
+    }
+
     typedef long (WINAPI* NtSystemDebugControlFn)(
         unsigned long command,
         void* inputBuffer,
@@ -1490,6 +1555,82 @@ namespace
         void* outputBuffer,
         unsigned long outputLength,
         unsigned long* returnLength);
+
+    void ResetLiveDumpFile(HANDLE file)
+    {
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            LARGE_INTEGER zero = {};
+            SetFilePointerEx(file, zero, nullptr, FILE_BEGIN);
+            SetEndOfFile(file);
+        }
+    }
+
+    LiveDumpAttemptResult InvokeOsLiveDump(
+        NtSystemDebugControlFn ntSystemDebugControl,
+        HANDLE file,
+        bool useDumpStorageStack,
+        bool includeUserPages,
+        bool compress,
+        bool includeHypervisorPages)
+    {
+        LiveDumpAttemptResult attempt;
+
+        do
+        {
+            LiveDumpSelectiveControl selective = {};
+            selective.Version = 1;
+            selective.Size = static_cast<unsigned long>(sizeof(selective));
+
+            LiveDumpControlV2 control = {};
+            control.V1.BugCheckCode = kBugCheckLiveSystemDump;
+            control.V1.DumpFileHandle = file;
+            control.V1.Flags.UseDumpStorageStack = useDumpStorageStack ? 1u : 0u;
+            control.V1.Flags.CompressMemoryPagesData = compress ? 1u : 0u;
+            control.V1.Flags.IncludeUserSpaceMemoryPages = includeUserPages ? 1u : 0u;
+            control.V1.AddPagesControl.HypervisorPages = includeHypervisorPages ? 1u : 0u;
+            // Win11 probes this when Version==2. A null pointer is
+            // STATUS_INVALID_PARAMETER on some builds even if SelectiveDump=0.
+            control.SelectiveControl = &selective;
+            control.V1.Version = kLiveDumpControlVersion2;
+
+            attempt.Status = ntSystemDebugControl(
+                kSysDbgGetLiveKernelDump,
+                &control,
+                static_cast<unsigned long>(sizeof(control)),
+                nullptr,
+                0,
+                nullptr);
+            if (attempt.Status >= 0)
+            {
+                attempt.VersionUsed = kLiveDumpControlVersion2;
+                break;
+            }
+
+            if (!IsLiveDumpVersionFallbackStatus(attempt.Status) ||
+                !LiveDumpFileIsEmpty(file))
+            {
+                break;
+            }
+
+            ResetLiveDumpFile(file);
+            control.V1.Version = kLiveDumpControlVersion1;
+            control.SelectiveControl = nullptr;
+            attempt.Status = ntSystemDebugControl(
+                kSysDbgGetLiveKernelDump,
+                &control.V1,
+                static_cast<unsigned long>(sizeof(control.V1)),
+                nullptr,
+                0,
+                nullptr);
+            if (attempt.Status >= 0)
+            {
+                attempt.VersionUsed = kLiveDumpControlVersion1;
+            }
+        } while (false);
+
+        return attempt;
+    }
 }
 
 bool BuildCompleteDumpHeader(
@@ -1553,53 +1694,81 @@ bool BuildCompleteDumpHeader(
             break;
         }
 
-        header->assign(kCrashDumpHeaderBytes, 0);
-        WriteU32At(header, 0x000, kDumpSignature);
-        WriteU32At(header, 0x004, kDumpValid64);
-        WriteU32At(header, 0x008, info.MajorVersion);
-        WriteU32At(header, 0x00C, info.MinorVersion);
-        WriteU64At(header, 0x010, info.DirectoryTableBase);
-        WriteU64At(header, 0x018, info.PfnDataBase);
-        WriteU64At(header, 0x020, info.PsLoadedModuleList);
-        WriteU64At(header, 0x028, info.PsActiveProcessHead);
-        WriteU32At(header, 0x030, kMachineAmd64);
-        WriteU32At(header, 0x034, info.NumberProcessors == 0 ? 1u : info.NumberProcessors);
-        WriteU32At(header, 0x038, kBugCheckLiveSystemDump);
-        const char versionUser[] = "KnLiveDbg";
-        std::memcpy(header->data() + 0x060, versionUser, sizeof(versionUser) - 1);
-        WriteU64At(header, 0x080, info.KdDebuggerDataBlock);
-
-        WriteU32At(header, kPhysBlockOffset, static_cast<uint32_t>(ranges.size()));
-        WriteU64At(header, kPhysBlockOffset + 8, numberOfPages);
-        for (size_t index = 0; index < ranges.size(); ++index)
+        if (numberOfPages > (std::numeric_limits<uint64_t>::max)() / kPageSize)
         {
-            const size_t runOffset = kPhysBlockOffset + 16 + (index * 16);
-            WriteU64At(header, runOffset, ranges[index].BaseAddress / kPageSize);
-            WriteU64At(header, runOffset + 8, ranges[index].ByteCount / kPageSize);
+            if (error != nullptr)
+            {
+                *error = L"physical run page count overflows dump payload size";
+            }
+            break;
         }
 
         const uint64_t payloadBytes = numberOfPages * kPageSize;
-        WriteU32At(header, kDumpTypeOffset, kDumpTypeFull);
-        WriteU64At(header, kRequiredSpaceOffset, kCrashDumpHeaderBytes + payloadBytes);
+        if (payloadBytes > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()) -
+                kCrashDumpHeaderBytes)
+        {
+            if (error != nullptr)
+            {
+                *error = L"required dump size does not fit in DUMP_HEADER64.RequiredDumpSpace";
+            }
+            break;
+        }
+
+        // Build through DUMP_HEADER64 so field offsets match what dbgeng
+        // actually reads. A previous writer stored DumpType at 0xF94; WinDbg
+        // reads it at 0xF98 and then treats RequiredDumpSpace's low dword as
+        // an unknown dump type, so OpenDumpFile fails.
+        DUMP_HEADER64 dump = {};
+        dump.Signature = DUMP_SIGNATURE64;
+        dump.ValidDump = DUMP_VALID_DUMP64;
+        dump.MajorVersion = info.MajorVersion;
+        dump.MinorVersion = info.MinorVersion;
+        dump.DirectoryTableBase = info.DirectoryTableBase;
+        dump.PfnDataBase = info.PfnDataBase;
+        dump.PsLoadedModuleList = info.PsLoadedModuleList;
+        dump.PsActiveProcessHead = info.PsActiveProcessHead;
+        dump.MachineImageType = IMAGE_FILE_MACHINE_AMD64;
+        dump.NumberProcessors = info.NumberProcessors == 0 ? 1u : info.NumberProcessors;
+        dump.BugCheckCode = kBugCheckLiveSystemDump;
+        const char versionUser[] = "KnLiveDbg";
+        std::memcpy(dump.VersionUser, versionUser, sizeof(versionUser) - 1);
+        dump.KdDebuggerDataBlock = info.KdDebuggerDataBlock;
+
+        dump.PhysicalMemoryBlock.NumberOfRuns = static_cast<ULONG>(ranges.size());
+        dump.PhysicalMemoryBlock.NumberOfPages = numberOfPages;
+        PHYSICAL_MEMORY_RUN64* runs = reinterpret_cast<PHYSICAL_MEMORY_RUN64*>(
+            dump.PhysicalMemoryBlockBuffer +
+            FIELD_OFFSET(PHYSICAL_MEMORY_DESCRIPTOR64, Run));
+        for (size_t index = 0; index < ranges.size(); ++index)
+        {
+            runs[index].BasePage = ranges[index].BaseAddress / kPageSize;
+            runs[index].PageCount = ranges[index].ByteCount / kPageSize;
+        }
+
+        dump.DumpType = DUMP_TYPE_FULL;
+        dump.RequiredDumpSpace.QuadPart =
+            static_cast<LONGLONG>(kCrashDumpHeaderBytes + payloadBytes);
 
         FILETIME fileTime = {};
         GetSystemTimeAsFileTime(&fileTime);
-        ULARGE_INTEGER systemTime = {};
-        systemTime.LowPart = fileTime.dwLowDateTime;
-        systemTime.HighPart = fileTime.dwHighDateTime;
-        WriteU64At(header, kSystemTimeOffset, systemTime.QuadPart);
+        dump.SystemTime.LowPart = fileTime.dwLowDateTime;
+        dump.SystemTime.HighPart = static_cast<LONG>(fileTime.dwHighDateTime);
 
         std::string comment = info.Comment.empty()
             ? "KnLiveDbg live complete dump (inconsistent)"
             : info.Comment;
-        if (comment.size() > 127)
+        if (comment.size() >= sizeof(dump.Comment))
         {
-            comment.resize(127);
+            comment.resize(sizeof(dump.Comment) - 1);
         }
-        std::memcpy(header->data() + kCommentOffset, comment.data(), comment.size());
+        std::memcpy(dump.Comment, comment.data(), comment.size());
 
-        WriteU32At(header, kProductTypeOffset, info.ProductType);
-        WriteU32At(header, kSuiteMaskOffset, info.SuiteMask);
+        dump.ProductType = info.ProductType;
+        dump.SuiteMask = info.SuiteMask;
+        dump.Attributes.LiveDumpGeneratedDump = 1;
+
+        header->resize(sizeof(dump));
+        std::memcpy(header->data(), &dump, sizeof(dump));
         ok = true;
     } while (false);
 
@@ -1983,65 +2152,97 @@ bool DumpOsLiveKernel(
             break;
         }
 
+        // Task Manager / crashdmp write through the dump storage stack.
+        // That path requires a no-buffering, write-through handle. A cached
+        // FILE_ATTRIBUTE_NORMAL handle can return STATUS_INVALID_PARAMETER or
+        // leave a torn file that WinDbg rejects. Exclusive share stops a
+        // reader from observing a half-written image.
+        bool useDumpStorageStack = true;
         file = CreateFileW(
             path.c_str(),
             GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ,
+            0,
             nullptr,
             CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING,
             nullptr);
         if (file == INVALID_HANDLE_VALUE)
         {
-            if (error != nullptr)
-            {
-                *error = L"failed to create live-dump file (gle=" +
-                    std::to_wstring(GetLastError()) + L")";
-            }
-            break;
-        }
-
-        LiveDumpControlV2 control = {};
-        control.V1.BugCheckCode = kBugCheckLiveSystemDump;
-        control.V1.DumpFileHandle = file;
-        control.V1.Flags.CompressMemoryPagesData = compress ? 1u : 0u;
-        control.V1.Flags.IncludeUserSpaceMemoryPages = includeUserPages ? 1u : 0u;
-        control.V1.AddPagesControl.HypervisorPages = includeHypervisorPages ? 1u : 0u;
-
-        long status = static_cast<long>(0xC000000D);
-        unsigned long versionUsed = 0;
-
-        control.V1.Version = kLiveDumpControlVersion2;
-        status = ntSystemDebugControl(
-            kSysDbgGetLiveKernelDump,
-            &control,
-            sizeof(control),
-            nullptr,
-            0,
-            nullptr);
-        if (status >= 0)
-        {
-            versionUsed = kLiveDumpControlVersion2;
-        }
-        else
-        {
-            control.V1.Version = kLiveDumpControlVersion1;
-            status = ntSystemDebugControl(
-                kSysDbgGetLiveKernelDump,
-                &control.V1,
-                sizeof(control.V1),
-                nullptr,
+            file = CreateFileW(
+                path.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
                 0,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
                 nullptr);
-            if (status >= 0)
+            useDumpStorageStack = false;
+            if (file == INVALID_HANDLE_VALUE)
             {
-                versionUsed = kLiveDumpControlVersion1;
+                if (error != nullptr)
+                {
+                    *error = L"failed to create live-dump file (gle=" +
+                        std::to_wstring(GetLastError()) + L")";
+                }
+                break;
             }
+
+            result->Warnings.push_back(
+                L"opened without FILE_FLAG_NO_BUFFERING; dump storage stack disabled");
         }
 
-        result->Status = status;
-        result->ApiVersionUsed = versionUsed;
+        LiveDumpAttemptResult attempt = InvokeOsLiveDump(
+            ntSystemDebugControl,
+            file,
+            useDumpStorageStack,
+            includeUserPages,
+            compress,
+            includeHypervisorPages);
 
+        // Dump-stack + no-buffering is the Task Manager path, but it is not
+        // available on every volume. The old buffered handle still works
+        // there; retry only when the first attempt wrote nothing.
+        if (attempt.Status < 0 &&
+            useDumpStorageStack &&
+            LiveDumpFileIsEmpty(file) &&
+            IsLiveDumpIoFallbackStatus(attempt.Status))
+        {
+            CloseHandle(file);
+            file = INVALID_HANDLE_VALUE;
+            file = CreateFileW(
+                path.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"failed to reopen live-dump file without dump stack (gle=" +
+                        std::to_wstring(GetLastError()) + L")";
+                }
+                break;
+            }
+
+            result->Warnings.push_back(
+                L"dump storage stack rejected; retried without FILE_FLAG_NO_BUFFERING");
+            attempt = InvokeOsLiveDump(
+                ntSystemDebugControl,
+                file,
+                false,
+                includeUserPages,
+                compress,
+                includeHypervisorPages);
+        }
+
+        result->Status = attempt.Status;
+        result->ApiVersionUsed = attempt.VersionUsed;
+        const long status = attempt.Status;
+
+        FlushFileBuffers(file);
         LARGE_INTEGER fileSize = {};
         if (GetFileSizeEx(file, &fileSize) && fileSize.QuadPart > 0)
         {
@@ -2059,8 +2260,16 @@ bool DumpOsLiveKernel(
             {
                 stream << L" (" << name << L")";
             }
-            stream << L". This OS path needs elevation, SeDebugPrivilege, and a Windows "
-                   << L"build that allows live kernel dumps.";
+            if (static_cast<unsigned long>(status) == 0xC0000354ul && includeUserPages)
+            {
+                stream << L". /user on this build needs a configured kernel debugger "
+                       << L"(or Win11 22H2+ LivedumpProcessFiltering).";
+            }
+            else
+            {
+                stream << L". This OS path needs elevation, SeDebugPrivilege, and a Windows "
+                       << L"build that allows live kernel dumps.";
+            }
             if (error != nullptr)
             {
                 *error = stream.str();
@@ -2076,7 +2285,14 @@ bool DumpOsLiveKernel(
 
         if (result->BytesWritten == 0)
         {
-            result->Warnings.push_back(L"OS reported success but the dump file is empty");
+            if (error != nullptr)
+            {
+                *error = L"NtSystemDebugControl succeeded but the dump file is empty";
+            }
+            CloseHandle(file);
+            file = INVALID_HANDLE_VALUE;
+            DeleteFileW(path.c_str());
+            break;
         }
 
         ok = true;
@@ -2086,6 +2302,61 @@ bool DumpOsLiveKernel(
     {
         CloseHandle(file);
     }
+
+    return ok;
+}
+
+bool DumpOsLiveControlSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        unsigned long raw = 0;
+        LiveDumpFlags flags = {};
+        flags.UseDumpStorageStack = 1;
+        std::memcpy(&raw, &flags, sizeof(raw));
+        if (raw != 1ul)
+        {
+            break;
+        }
+
+        flags = {};
+        flags.CompressMemoryPagesData = 1;
+        std::memcpy(&raw, &flags, sizeof(raw));
+        if (raw != 2ul)
+        {
+            break;
+        }
+
+        flags = {};
+        flags.IncludeUserSpaceMemoryPages = 1;
+        std::memcpy(&raw, &flags, sizeof(raw));
+        if (raw != 4ul)
+        {
+            break;
+        }
+
+        flags = {};
+        flags.UseDumpStorageStack = 1;
+        flags.CompressMemoryPagesData = 1;
+        flags.IncludeUserSpaceMemoryPages = 1;
+        std::memcpy(&raw, &flags, sizeof(raw));
+        if (raw != 7ul)
+        {
+            break;
+        }
+
+        LiveDumpAddPages pages = {};
+        pages.HypervisorPages = 1;
+        std::memcpy(&raw, &pages, sizeof(raw));
+        if (raw != 1ul)
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
 
     return ok;
 }
