@@ -16369,12 +16369,12 @@ static void PrintMinifilterHelp()
     std::wcout << L"  Walks fltmgr!FltGlobals frames, FLT_FILTER.Operations, and the live\n";
     std::wcout << L"  FLT_INSTANCE.CallbackNodes that FltMgr actually dispatches (PDB layout).\n";
     std::wcout << L"  list/show/irp are read-only. disable/enable zero FLT_FILTER.Operations and\n";
-    std::wcout << L"  unlink each attached FLT_INSTANCE.CallbackNode from the volume list.\n";
-    std::wcout << L"  Live Pre/Post pointers are left intact; NULLing them makes FltMgr kCFG\n";
-    std::wcout << L"  bugcheck (FAST_FAIL_GUARD_ICALL_CHECK_FAILURE) on the next IRP. disable\n";
-    std::wcout << L"  saves list neighbors in this session so enable can splice the node back.\n";
+    std::wcout << L"  replace live FLT_INSTANCE.CallbackNode Pre/Post with a CFG-valid return-0\n";
+    std::wcout << L"  thunk from fltmgr/nt. Do not write NULL (kCFG 0x139/0xa) and do not unlink\n";
+    std::wcout << L"  CallbackLinks (corrupt list 0x139/0x3). disable saves the original pointers\n";
+    std::wcout << L"  in this session so enable can restore them.\n";
     std::wcout << L"  disable <name> all and disable-all walk every registered slot and sweep any\n";
-    std::wcout << L"  leftover linked nodes. enable-all restores every same-session backup.\n";
+    std::wcout << L"  leftover original callbacks. enable-all restores every same-session backup.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /pre /post /both  which callback to change (default both).\n";
