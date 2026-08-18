@@ -173,3 +173,6 @@ bool DumpOsLiveKernel(
     bool includeHypervisorPages,
     DumpOsLiveResult* result,
     std::wstring* error);
+
+// Compile/runtime ABI check for SYSDBG_LIVEDUMP_CONTROL V1/V2. Self-test only.
+bool DumpOsLiveControlSelfTest();

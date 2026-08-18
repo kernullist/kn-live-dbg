@@ -24105,8 +24105,11 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  /hv         include hypervisor pages when the OS supports it.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Needs elevation and SeDebugPrivilege. Some builds or policies reject live\n";
-    std::wcout << L"  dumps with STATUS_NOT_IMPLEMENTED / ACCESS_DENIED / PRIVILEGE_NOT_HELD.\n";
+    std::wcout << L"  Needs elevation and SeDebugPrivilege. The file is opened write-through +\n";
+    std::wcout << L"  no-buffering so the OS dump stack can write it. Some builds or policies\n";
+    std::wcout << L"  reject live dumps with STATUS_NOT_IMPLEMENTED / ACCESS_DENIED /\n";
+    std::wcout << L"  PRIVILEGE_NOT_HELD. /user on older builds may return STATUS_DEBUGGER_INACTIVE\n";
+    std::wcout << L"  unless a kernel debugger is configured.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  dump-live .\\os-live.dmp\n";
@@ -27482,6 +27485,7 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"dump-kernel"}, L"/strict", L"dump-kernel-strict-completion");
         CheckCompletionCandidate(&context, {L"dump-live"}, L"/user", L"dump-live-user-completion");
         CheckCompletionCandidate(&context, {L"dump-live"}, L"/compress", L"dump-live-compress-completion");
+        CheckCompletionCandidate(&context, {L"dump-live"}, L"/hv", L"dump-live-hv-completion");
         CheckCompletionCandidate(&context, {L"help", L"dump-kernel"}, L"/max", L"help-dump-kernel-option-completion");
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -27541,21 +27545,40 @@ static int RunConsoleSurfaceSelfTest()
             headerInfo.NumberProcessors = 2;
             headerInfo.MajorVersion = 15;
             headerInfo.MinorVersion = 26100;
+            headerInfo.ProductType = 1;
+            headerInfo.SuiteMask = 0x100;
+            headerInfo.Comment = "kn-live-dbg header self-test";
             std::vector<uint8_t> header;
             std::wstring headerError;
             const bool headerOk = BuildCompleteDumpHeader({run}, headerInfo, &header, &headerError);
             uint32_t signature = 0;
             uint32_t validDump = 0;
             uint32_t dumpType = 0;
+            uint32_t staleDumpType = 0;
             uint32_t runCount = 0;
+            uint32_t productType = 0;
+            uint32_t suiteMask = 0;
             uint64_t required = 0;
+            uint64_t directoryTableBase = 0;
+            uint64_t numberOfPages = 0;
+            uint64_t basePage = 0;
+            uint64_t pageCount = 0;
+            char comment[32] = {};
             if (header.size() >= kCrashDumpHeaderBytes)
             {
                 std::memcpy(&signature, header.data(), sizeof(signature));
                 std::memcpy(&validDump, header.data() + 4, sizeof(validDump));
-                std::memcpy(&dumpType, header.data() + 0xF94, sizeof(dumpType));
+                std::memcpy(&directoryTableBase, header.data() + 0x010, sizeof(directoryTableBase));
                 std::memcpy(&runCount, header.data() + 0x088, sizeof(runCount));
-                std::memcpy(&required, header.data() + 0xF98, sizeof(required));
+                std::memcpy(&numberOfPages, header.data() + 0x090, sizeof(numberOfPages));
+                std::memcpy(&basePage, header.data() + 0x098, sizeof(basePage));
+                std::memcpy(&pageCount, header.data() + 0x0A0, sizeof(pageCount));
+                std::memcpy(&staleDumpType, header.data() + 0xF94, sizeof(staleDumpType));
+                std::memcpy(&dumpType, header.data() + 0xF98, sizeof(dumpType));
+                std::memcpy(&required, header.data() + 0xFA0, sizeof(required));
+                std::memcpy(comment, header.data() + 0xFB0, sizeof(comment) - 1);
+                std::memcpy(&productType, header.data() + 0x1040, sizeof(productType));
+                std::memcpy(&suiteMask, header.data() + 0x1044, sizeof(suiteMask));
             }
             CheckConsoleSurfaceSelfTest(
                 &context,
@@ -27563,9 +27586,17 @@ static int RunConsoleSurfaceSelfTest()
                     header.size() == kCrashDumpHeaderBytes &&
                     signature == 0x45474150u &&
                     validDump == 0x34365544u &&
+                    directoryTableBase == 0x1aa000ull &&
                     dumpType == 1 &&
+                    staleDumpType == 0 &&
                     runCount == 1 &&
-                    required == kCrashDumpHeaderBytes + 0x2000ull,
+                    numberOfPages == 2 &&
+                    basePage == 1 &&
+                    pageCount == 2 &&
+                    required == kCrashDumpHeaderBytes + 0x2000ull &&
+                    productType == 1 &&
+                    suiteMask == 0x100 &&
+                    std::strncmp(comment, "kn-live-dbg header self-test", 27) == 0,
                 L"dump-kernel-header-is-complete-dump64");
             std::vector<PhysicalMemoryRange> tooMany(kCrashDumpMaxPhysicalRuns + 1);
             for (PhysicalMemoryRange& extra : tooMany)
@@ -27581,6 +27612,10 @@ static int RunConsoleSurfaceSelfTest()
         {
             const std::wstring kernelHelp = CaptureDetailedHelpOutput({L"help", L"dump-kernel"}, 1);
             const std::wstring liveHelp = CaptureDetailedHelpOutput({L"help", L"dump-live"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                DumpOsLiveControlSelfTest(),
+                L"dump-live-control-layout-is-sysdbg-v1-v2");
             CheckConsoleSurfaceSelfTest(
                 &context,
                 kernelHelp.find(L"DUMP_HEADER64") != std::wstring::npos &&
