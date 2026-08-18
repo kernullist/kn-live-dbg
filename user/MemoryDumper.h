@@ -173,6 +173,7 @@ struct ProcessDumpWinDbgFixup
     uint32_t PrcbProcStateSpecialRegOffset = 0;
     uint32_t PrcbContextOffset = 0;
     uint32_t PrcbSize = 0;
+    uint64_t SavedContext = 0;
     bool Wow64 = false;
     bool HasKernelTrap = false;
 };
