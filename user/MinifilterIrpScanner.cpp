@@ -189,11 +189,9 @@ namespace
             {
                 break;
             }
-            const std::wstring wanted = ToLowerCopy(LeftoverModuleBaseName(name));
             for (const KernelModuleInfo& module : symbols.Modules())
             {
-                const std::wstring image = ToLowerCopy(LeftoverModuleBaseName(module.ImageName));
-                if (image == wanted)
+                if (LeftoverNamesMatch(module.ImageName, name))
                 {
                     *base = module.Base;
                     *size = module.Size;
@@ -219,8 +217,9 @@ namespace
                 break;
             }
 
+            // LeftoverReadBytes caps at 8 KB. Headers fit; the CFG table does not.
             std::vector<uint8_t> headers;
-            if (!LeftoverReadBytes(device, moduleBase, 0x400, &headers, nullptr) ||
+            if (!LeftoverReadBytes(device, moduleBase, 0x1000, &headers, nullptr) ||
                 headers.size() < sizeof(IMAGE_DOS_HEADER))
             {
                 break;
@@ -228,15 +227,38 @@ namespace
 
             IMAGE_DOS_HEADER dos = {};
             memcpy(&dos, headers.data(), sizeof(dos));
-            if (dos.e_magic != IMAGE_DOS_SIGNATURE ||
-                dos.e_lfanew < 0 ||
-                static_cast<uint32_t>(dos.e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > headers.size())
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
             {
                 break;
             }
 
+            const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
+            if (ntOffset + sizeof(IMAGE_NT_HEADERS64) > headers.size())
+            {
+                uint64_t ntVa = 0;
+                if (!LeftoverTryAdd(moduleBase, ntOffset, &ntVa) ||
+                    !LeftoverReadBytes(device, ntVa, sizeof(IMAGE_NT_HEADERS64), &headers, nullptr) ||
+                    headers.size() < sizeof(IMAGE_NT_HEADERS64))
+                {
+                    break;
+                }
+            }
+
             IMAGE_NT_HEADERS64 nt = {};
-            memcpy(&nt, headers.data() + dos.e_lfanew, sizeof(nt));
+            if (ntOffset + sizeof(nt) <= headers.size() &&
+                headers.size() != sizeof(IMAGE_NT_HEADERS64))
+            {
+                memcpy(&nt, headers.data() + ntOffset, sizeof(nt));
+            }
+            else if (headers.size() >= sizeof(nt))
+            {
+                memcpy(&nt, headers.data(), sizeof(nt));
+            }
+            else
+            {
+                break;
+            }
+
             if (nt.Signature != IMAGE_NT_SIGNATURE ||
                 nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
                 nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
@@ -244,52 +266,56 @@ namespace
                 break;
             }
 
-            const IMAGE_DATA_DIRECTORY& dir =
+            const IMAGE_DATA_DIRECTORY dir =
                 nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
-            if (dir.VirtualAddress == 0 || dir.Size < 0x94)
+            const uint32_t cfgNeed = static_cast<uint32_t>(
+                FIELD_OFFSET(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags) + sizeof(DWORD));
+            if (dir.VirtualAddress == 0 || dir.Size < cfgNeed)
+            {
+                break;
+            }
+
+            uint64_t cfgVa = 0;
+            if (!LeftoverTryAdd(moduleBase, dir.VirtualAddress, &cfgVa))
             {
                 break;
             }
 
             std::vector<uint8_t> loadConfig;
-            if (!LeftoverReadBytes(
-                    device,
-                    moduleBase + dir.VirtualAddress,
-                    (std::min)(static_cast<uint32_t>(dir.Size), 0x100u),
-                    &loadConfig,
-                    nullptr) ||
-                loadConfig.size() < 0x94)
+            const uint32_t cfgRead = (std::min)(
+                static_cast<uint32_t>(dir.Size),
+                static_cast<uint32_t>(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64)));
+            if (!LeftoverReadBytes(device, cfgVa, cfgRead, &loadConfig, nullptr) ||
+                loadConfig.size() < cfgNeed)
             {
                 break;
             }
 
-            uint32_t cfgSize = 0;
-            memcpy(&cfgSize, loadConfig.data(), sizeof(cfgSize));
-            if (cfgSize < 0x94)
+            IMAGE_LOAD_CONFIG_DIRECTORY64 cfg = {};
+            memcpy(&cfg, loadConfig.data(), (std::min)(loadConfig.size(), sizeof(cfg)));
+            if (cfg.Size < cfgNeed)
             {
                 break;
             }
 
-            uint64_t tableVa = 0;
-            uint64_t tableCount = 0;
-            uint32_t guardFlags = 0;
-            memcpy(&tableVa, loadConfig.data() + 0x80, sizeof(tableVa));
-            memcpy(&tableCount, loadConfig.data() + 0x88, sizeof(tableCount));
-            memcpy(&guardFlags, loadConfig.data() + 0x90, sizeof(guardFlags));
+            uint64_t tableVa = cfg.GuardCFFunctionTable;
+            const uint64_t tableCount = cfg.GuardCFFunctionCount;
             if (tableVa >= moduleBase && tableVa < moduleBase + moduleSize)
             {
-                // already a VA
             }
             else if (tableVa < moduleSize)
             {
-                tableVa += moduleBase;
+                if (!LeftoverTryAdd(moduleBase, tableVa, &tableVa))
+                {
+                    break;
+                }
             }
             else
             {
                 break;
             }
 
-            const uint32_t extra = (guardFlags & IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK) >>
+            const uint32_t extra = (cfg.GuardFlags & IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK) >>
                 IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT;
             const uint32_t stride = 4u + extra;
             if (stride < 4 || stride > 20 || tableCount == 0 || tableCount > 100000)
@@ -297,47 +323,59 @@ namespace
                 break;
             }
 
-            const uint64_t tableBytes = tableCount * stride;
-            if (tableBytes > 2 * 1024 * 1024)
+            const uint32_t chunkBytes = 0x1000;
+            const uint64_t entriesPerChunk = chunkBytes / stride;
+            if (entriesPerChunk == 0)
             {
                 break;
             }
 
-            std::vector<uint8_t> table;
-            if (!LeftoverReadBytes(
-                    device,
-                    tableVa,
-                    static_cast<uint32_t>(tableBytes),
-                    &table,
-                    nullptr) ||
-                table.size() < tableBytes)
+            for (uint64_t index = 0; index < tableCount && !ok; )
             {
-                break;
-            }
-
-            for (uint64_t index = 0; index < tableCount; ++index)
-            {
-                uint32_t rva = 0;
-                memcpy(&rva, table.data() + (index * stride), sizeof(rva));
-                if (rva == 0 || static_cast<uint64_t>(rva) + 8 > moduleSize)
+                const uint64_t remaining = tableCount - index;
+                const uint32_t batch = static_cast<uint32_t>((std::min)(remaining, entriesPerChunk));
+                uint64_t chunkVa = 0;
+                if (!LeftoverTryAdd(tableVa, index * stride, &chunkVa))
                 {
-                    continue;
-                }
-
-                uint8_t code[8] = {};
-                std::vector<uint8_t> bytes;
-                if (!LeftoverReadBytes(device, moduleBase + rva, sizeof(code), &bytes, nullptr) ||
-                    bytes.size() < 3)
-                {
-                    continue;
-                }
-                memcpy(code, bytes.data(), (std::min)(bytes.size(), sizeof(code)));
-                if (BytesAreReturnZero(code, sizeof(code)))
-                {
-                    *thunk = moduleBase + rva;
-                    ok = true;
                     break;
                 }
+
+                std::vector<uint8_t> table;
+                if (!LeftoverReadBytes(device, chunkVa, batch * stride, &table, nullptr) ||
+                    table.size() < static_cast<size_t>(batch) * stride)
+                {
+                    break;
+                }
+
+                for (uint32_t entry = 0; entry < batch; ++entry)
+                {
+                    uint32_t rva = 0;
+                    memcpy(&rva, table.data() + (static_cast<size_t>(entry) * stride), sizeof(rva));
+                    if (rva == 0 || static_cast<uint64_t>(rva) + 8 > moduleSize)
+                    {
+                        continue;
+                    }
+
+                    uint64_t codeVa = 0;
+                    if (!LeftoverTryAdd(moduleBase, rva, &codeVa))
+                    {
+                        continue;
+                    }
+
+                    std::vector<uint8_t> bytes;
+                    if (!LeftoverReadBytes(device, codeVa, 8, &bytes, nullptr) || bytes.size() < 3)
+                    {
+                        continue;
+                    }
+                    if (BytesAreReturnZero(bytes.data(), bytes.size()))
+                    {
+                        *thunk = codeVa;
+                        ok = true;
+                        break;
+                    }
+                }
+
+                index += batch;
             }
         } while (false);
         return ok;
@@ -855,6 +893,17 @@ namespace
             slot->Entry = entry;
             slot->Pre = LeftoverIsKernelCanonical(pre) ? pre : 0;
             slot->Post = LeftoverIsKernelCanonical(post) ? post : 0;
+            if (g_FltNopThunk != 0)
+            {
+                if (slot->Pre == g_FltNopThunk)
+                {
+                    slot->Pre = 0;
+                }
+                if (slot->Post == g_FltNopThunk)
+                {
+                    slot->Post = 0;
+                }
+            }
             slot->PreActive = slot->Pre != 0;
             slot->PostActive = slot->Post != 0;
             slot->Disabled = !slot->PreActive && !slot->PostActive;
@@ -1597,6 +1646,21 @@ namespace
         {
             return;
         }
+        if (g_FltNopThunk != 0)
+        {
+            if (pre == g_FltNopThunk)
+            {
+                pre = 0;
+            }
+            if (post == g_FltNopThunk)
+            {
+                post = 0;
+            }
+        }
+        if (pre == 0 && post == 0)
+        {
+            return;
+        }
 
         LiveNodeBackup backup = {};
         backup.Filter = filter;
@@ -1679,11 +1743,13 @@ namespace
             if (action == MinifilterIrpAction::Disable)
             {
                 RememberLiveNode(filter, majorFunction, node, currentPre, currentPost);
-                if (touchPre)
+                // Leave original NULLs alone. FltMgr skips those at attach;
+                // replacing them with a thunk can change post registration.
+                if (touchPre && currentPre != 0)
                 {
                     newPre = nopThunk;
                 }
-                if (touchPost)
+                if (touchPost && currentPost != 0)
                 {
                     newPost = nopThunk;
                 }
@@ -2263,6 +2329,9 @@ bool MinifilterIrpScanner::Scan(MinifilterIrpScanResult* result, std::wstring* e
             }
         }
 
+        uint64_t ignoredThunk = 0;
+        EnsureFltNopThunk(device_, symbols_, &ignoredThunk, nullptr);
+
         MinifilterLayout layout = {};
         if (!BuildLayout(symbols_, &layout, error))
         {
@@ -2409,6 +2478,12 @@ bool MinifilterIrpScanner::SetIrp(
             break;
         }
 
+        uint64_t nopThunk = 0;
+        if (!EnsureFltNopThunk(device_, symbols_, &nopThunk, error))
+        {
+            break;
+        }
+
         MinifilterLayout layout = {};
         if (!BuildLayout(symbols_, &layout, error))
         {
@@ -2471,13 +2546,15 @@ bool MinifilterIrpScanner::SetIrp(
                     }
                 }
             }
-            if (touchPre)
+            // Never write NULL into a live-copied slot. New attaches copy
+            // Operations and FltMgr will kCFG-call a NULL Pre/Post.
+            if (touchPre && found->Pre != 0)
             {
-                newPre = 0;
+                newPre = nopThunk;
             }
-            if (touchPost)
+            if (touchPost && found->Post != 0)
             {
-                newPost = 0;
+                newPost = nopThunk;
             }
         }
         else
@@ -2511,12 +2588,6 @@ bool MinifilterIrpScanner::SetIrp(
 
         // Live CallbackNodes are what FltMgr dispatches. Replace Pre/Post with
         // a CFG-valid return-0 thunk. Never write NULL and never unlink lists.
-        uint64_t nopThunk = 0;
-        if (!EnsureFltNopThunk(device_, symbols_, &nopThunk, error))
-        {
-            break;
-        }
-
         std::wstring liveError;
         if (!PatchLiveCallbackNodes(
                 device_,
