@@ -23842,6 +23842,13 @@ static void HandlePoolScanPeCommand(
 
     do
     {
+        if (optionIndex == 1 &&
+            optionIndex < args.size() &&
+            ToLower(args[optionIndex]) == L"pe")
+        {
+            ++optionIndex;
+        }
+
         if (HasHelpToken(args, optionIndex))
         {
             PrintPoolScanPeHelp();
@@ -23892,7 +23899,7 @@ static void HandlePoolScanPeCommand(
 
             if (opt == L"/tag")
             {
-                if (i + 1 >= args.size())
+                if (i + 1 >= args.size() || IsSwitchLikeToken(args[i + 1]))
                 {
                     std::wcerr << L"!pool pe: /tag requires a value\n";
                     parseError = true;
@@ -23914,7 +23921,7 @@ static void HandlePoolScanPeCommand(
 
             if (opt == L"/min" || opt == L"/max" || opt == L"/limit")
             {
-                if (i + 1 >= args.size())
+                if (i + 1 >= args.size() || IsSwitchLikeToken(args[i + 1]))
                 {
                     std::wcerr << L"!pool pe: " << opt << L" requires a value\n";
                     parseError = true;
@@ -23948,7 +23955,7 @@ static void HandlePoolScanPeCommand(
 
             if (opt == L"/dump")
             {
-                if (i + 1 >= args.size())
+                if (i + 1 >= args.size() || IsSwitchLikeToken(args[i + 1]))
                 {
                     std::wcerr << L"!pool pe: /dump requires a directory\n";
                     parseError = true;
@@ -27224,6 +27231,8 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
 }
 
 static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* reason);
+static bool IsWriteLikeCommandLine(const std::wstring& line);
+static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason);
 static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge);
 static std::wstring BuildMcpClaudeCodeHttpServerJson(const std::wstring& url);
 static std::wstring BuildMcpCursorHttpJson(const std::wstring& url);
@@ -27932,6 +27941,9 @@ static int RunConsoleSurfaceSelfTest()
             AiCommandProposal peDump = {};
             peDump.Command = L"!pool pe /dump .\\poolpe-hits";
             peDump.Purpose = L"dump staged pool PE";
+            AiCommandProposal peDumpSwitch = {};
+            peDumpSwitch.Command = L"!pool pe /dump /suspicious";
+            peDumpSwitch.Purpose = L"should reject switch as dump directory";
             AiCommandProposal listDump = {};
             listDump.Command = L"!pool big /dump .\\poolpe-hits";
             listDump.Purpose = L"should reject dump on list scope";
@@ -27958,6 +27970,7 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 ValidateAiPlanCommand(peOk, &reason) &&
                     ValidateAiPlanCommand(peDump, &reason) &&
+                    !ValidateAiPlanCommand(peDumpSwitch, &reason) &&
                     !ValidateAiPlanCommand(listDump, &reason) &&
                     !ValidateAiPlanCommand(peWx, &reason) &&
                     !ValidateAiPlanCommand(oldCallbacks, &reason) &&
@@ -27966,6 +27979,15 @@ static int RunConsoleSurfaceSelfTest()
                     !ValidateAiPlanCommand(oldByovd, &reason) &&
                     ValidateAiPlanCommand(newByovd, &reason),
                 L"bang-unification-ai-plan-shape");
+            std::wstring blockReason;
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                IsWriteLikeCommandLine(L"!pool pe /dump .\\poolpe-hits") &&
+                    !IsWriteLikeCommandLine(L"!pool pe /suspicious") &&
+                    !IsWriteLikeCommandLine(L"!pool find /wx") &&
+                    IsBlockedAiRunCommand(L"!pool pe /dump .\\poolpe-hits", &blockReason) &&
+                    !IsBlockedAiRunCommand(L"!pool pe /suspicious", &blockReason),
+                L"pool-pe-dump-is-write-like");
         }
         CheckConsoleSurfaceSelfTest(&context, LeftoverCommonSelfTest(), L"leftover-common-self-test");
         CheckConsoleSurfaceSelfTest(&context, PayloadTracerSelfTest(), L"payload-tracer-self-test");
@@ -30040,6 +30062,19 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             if (IsMinifilterWriteAction(args[1]))
             {
                 writeLike = true;
+            }
+            break;
+        }
+
+        if (command == L"!pool")
+        {
+            for (size_t i = 1; i < args.size(); ++i)
+            {
+                if (ToLower(args[i]) == L"/dump")
+                {
+                    writeLike = true;
+                    break;
+                }
             }
             break;
         }
@@ -33695,7 +33730,7 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
 
     do
     {
-        if (key == L"callbacks" || key == L"callback-audit")
+        if (key == L"callbacks" || key == L"!callbacks" || key == L"callback-audit")
         {
             plan.Title = L"Callback surface audit";
             plan.Summary = L"Enumerate callback surfaces and module baseline for follow-up AI analysis.";
