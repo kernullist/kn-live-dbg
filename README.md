@@ -209,7 +209,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `!callbacks <Tab>` for callback scopes, `!callbacks object /module<Tab>` for the module option, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `!callbacks <Tab>` for callback scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -277,7 +277,7 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !vbs
 !ci [options|policy]
 !securekernel
-!etw [loggers|logger <index|name>|integrity]
+!etw [loggers|logger <index|name>|integrity|providers|ti-cross]
 !nmi [callbacks]
 !msrcheck
 !cr
@@ -285,11 +285,11 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !idt
 !fwtable [providers|provider <signature>]
 !fwtable providers /module <name>
-!module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]
+!module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/limit <n>] [/json <path>]
 !driver integrity [driver|all] [/limit <n>] [/json <path>]
 !byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
 !byovd fixture [status|load [sys-path]|unload|path]
-!pool [big|find|summary|pe] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx]
+!pool [big|find|tags|summary|pe] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx] [/tags]
 !pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
 !snapshot baseline [/all] [/name <label>]
 !snapshot save <path> [/all] [/name <label>]

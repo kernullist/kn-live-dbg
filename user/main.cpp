@@ -1775,7 +1775,8 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !hunt           whole-system user-mode anomaly hunt\n";
     std::wcout << L"  help !vad            VAD triage, injection scan, hidden PTEs, mapped-PE inventory\n";
     std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
-    std::wcout << L"  help !pool           big-pool allocation triage and W+X annotation\n";
+    std::wcout << L"  help !pool           big-pool triage, W+X annotation, and staged PE hunt\n";
+    std::wcout << L"  help !byovd          loaded BYOVD catalog scan and fixture\n";
     std::wcout << L"  help !timeline       time-ordered TI/snapshot/live evidence store\n";
     std::wcout << L"  help !address        canonicality, page-table walk, effective permissions, owner symbol\n";
     std::wcout << L"  help !hal            HAL dispatch table ownership\n";
@@ -3481,6 +3482,7 @@ static void AddHuntOptionCompletionCandidates(std::vector<std::wstring>* candida
         L"/quick",
         L"/deep",
         L"/summary",
+        L"/details",
         L"/limit",
         L"/json",
         L"help"
@@ -4295,6 +4297,58 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddAlpcScopeCompletionCandidates(&candidates);
                 }
+                else if (topic == L"!ti")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"start",
+                        L"stop",
+                        L"status",
+                        L"add",
+                        L"remove",
+                        L"watch",
+                        L"recent",
+                        L"stats",
+                        L"by",
+                        L"grep",
+                        L"save",
+                        L"clear"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"!byovd")
+                {
+                    if (argsBefore.size() >= 3 && ToLower(argsBefore[2]) == L"fixture")
+                    {
+                        static const wchar_t* values[] =
+                        {
+                            L"status",
+                            L"load",
+                            L"unload",
+                            L"path"
+                        };
+                        AddCompletionCandidates(&candidates, values);
+                    }
+                    else if (argsBefore.size() >= 3 && ToLower(argsBefore[2]) == L"update")
+                    {
+                        AddCompletionCandidate(&candidates, L"/force");
+                    }
+                    else
+                    {
+                        static const wchar_t* values[] =
+                        {
+                            L"scan",
+                            L"update",
+                            L"status",
+                            L"fixture",
+                            L"/no-update",
+                            L"/force-update",
+                            L"/exact",
+                            L"/yara"
+                        };
+                        AddCompletionCandidates(&candidates, values);
+                    }
+                }
                 else if (topic == L"!ci")
                 {
                     static const wchar_t* values[] =
@@ -4425,6 +4479,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                         L"/sections",
                         L"/wx",
                         L"/mismatch",
+                        L"/disk",
                         L"/limit",
                         L"/json"
                     };
@@ -4459,6 +4514,16 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                         };
                         AddCompletionCandidates(&candidates, values);
                     }
+                    else if (argsBefore.size() >= 3 &&
+                             (ToLower(argsBefore[2]) == L"tags" || ToLower(argsBefore[2]) == L"tag"))
+                    {
+                        static const wchar_t* values[] =
+                        {
+                            L"/tag",
+                            L"/limit"
+                        };
+                        AddCompletionCandidates(&candidates, values);
+                    }
                     else
                     {
                         static const wchar_t* values[] =
@@ -4471,6 +4536,28 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                         };
                         AddCompletionCandidates(&candidates, values);
                     }
+                }
+                else if (topic == L"log")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"enable",
+                        L"disable",
+                        L"status"
+                    };
+                    AddCompletionCandidates(&candidates, values);
+                }
+                else if (topic == L"mcp")
+                {
+                    static const wchar_t* values[] =
+                    {
+                        L"on",
+                        L"off",
+                        L"status",
+                        L"client-setup",
+                        L"endpoint"
+                    };
+                    AddCompletionCandidates(&candidates, values);
                 }
                 else if (topic == L"dump-raw")
                 {
@@ -4513,6 +4600,17 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddHelpCompletionCandidates(&candidates);
                 }
+            }
+        }
+        else if (command == L"!dml_proc" ||
+                 command == L"!msrcheck" ||
+                 command == L"!cr" ||
+                 command == L"!ssdt" ||
+                 command == L"!idt")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                AddCompletionCandidate(&candidates, L"help");
             }
         }
         else if (command == L"!callbacks")
@@ -4800,6 +4898,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"/sections",
                 L"/wx",
                 L"/mismatch",
+                L"/disk",
                 L"/limit",
                 L"/json",
                 L"help"
@@ -4832,6 +4931,19 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 };
                 AddCompletionCandidates(&candidates, values);
             }
+            else if (argsBefore.size() >= 2 && ToLower(argsBefore[1]) == L"update")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/force",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else if (argsBefore.size() >= 2 && ToLower(argsBefore[1]) == L"status")
+            {
+                AddCompletionCandidate(&candidates, L"help");
+            }
             else
             {
                 static const wchar_t* values[] =
@@ -4841,14 +4953,14 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"status",
                     L"fixture",
                     L"/no-update",
-                L"/force-update",
-                L"/exact",
-                L"/yara",
-                L"/yara-path",
-                L"/yara-timeout",
-                L"/verbose",
-                L"/summary",
-                L"/limit",
+                    L"/force-update",
+                    L"/exact",
+                    L"/yara",
+                    L"/yara-path",
+                    L"/yara-timeout",
+                    L"/verbose",
+                    L"/summary",
+                    L"/limit",
                     L"/json",
                     L"help"
                 };
@@ -4914,6 +5026,16 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 };
                 AddCompletionCandidates(&candidates, values);
             }
+            else if (ToLower(argsBefore[1]) == L"by")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"pid",
+                    L"task",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
             else
             {
                 static const wchar_t* values[] =
@@ -4923,8 +5045,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"/throttle",
                     L"/ring",
                     L"/log",
-                    L"pid",
-                    L"task"
+                    L"help"
                 };
                 AddCompletionCandidates(&candidates, values);
             }
@@ -4965,11 +5086,23 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 };
                 AddCompletionCandidates(&candidates, values);
             }
+            else if (ToLower(argsBefore[1]) == L"tags" || ToLower(argsBefore[1]) == L"tag")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/tag",
+                    L"/limit",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
             else
             {
                 static const wchar_t* values[] =
                 {
                     L"/tag",
+                    L"/tags",
+                    L"/with-tags",
                     L"/min",
                     L"/max",
                     L"/addr",
@@ -4978,7 +5111,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"/paged",
                     L"/any",
                     L"/annotate",
-                    L"/wx"
+                    L"/wx",
+                    L"help"
                 };
                 AddCompletionCandidates(&candidates, values);
             }
@@ -5214,20 +5348,42 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
 
             AddCompletionCandidates(&candidates, values);
         }
+        else if (command == L"u" || command == L"uf")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/process",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+        }
+        else if (command == L"query" ||
+                 command == L"kddetach" ||
+                 command == L"drvstatus" ||
+                 command == L"cls" ||
+                 command == L"home" ||
+                 command == L"dashboard" ||
+                 command == L"version" ||
+                 command == L"vertarget" ||
+                 command == L"vercommand" ||
+                 command == L"unload" ||
+                 command == L"kd" ||
+                 IsPhysicalDisplayCommand(command) ||
+                 IsPhysicalEnterCommand(command))
+        {
+            if (argsBefore.size() <= 1)
+            {
+                AddCompletionCandidate(&candidates, L"help");
+            }
+        }
         else if (IsDisplayCommand(command) || IsEnterCommand(command))
         {
             static const wchar_t* values[] =
             {
                 L"/process",
-                L"help"
-            };
-
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (IsPhysicalDisplayCommand(command) || IsPhysicalEnterCommand(command))
-        {
-            static const wchar_t* values[] =
-            {
                 L"help"
             };
 
@@ -24709,6 +24865,7 @@ static void PrintPoolHelp()
     std::wcout << L"           cheat allocations, BYOVD payloads, and unusual large NonPaged ranges.\n";
     std::wcout << L"  find     same data as 'big' but requires at least one filter (/tag, /addr, /min, or /max) and is geared\n";
     std::wcout << L"           toward targeted searches.\n";
+    std::wcout << L"  tags     per-tag usage via SystemPoolTagInformation (no VA).\n";
     std::wcout << L"  summary  print only the per-build totals and skip the per-entry listing.\n";
     std::wcout << L"  pe       staged pool PE hunt. Runs the dump-pe NT-header probe (intact or signature-wiped)\n";
     std::wcout << L"           on each kept big-pool entry's first 4 KB. Independent-page mapper images use !kpage /pe.\n";
@@ -27917,6 +28074,33 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/dump", L"pool-pe-dump-completion");
         CheckCompletionCandidate(&context, {L"help", L"!pool"}, L"pe", L"help-pool-pe-completion");
         CheckCompletionCandidate(&context, {L"help", L"!pool", L"pe"}, L"/suspicious", L"help-pool-pe-option-completion");
+        CheckCompletionCandidate(&context, {}, L"!dml_proc", L"dml-proc-root-completion");
+        CheckCompletionCandidate(&context, {L"!dml_proc"}, L"help", L"dml-proc-help-completion");
+        CheckCompletionCandidate(&context, {L"!msrcheck"}, L"help", L"msrcheck-help-completion");
+        CheckCompletionCandidate(&context, {L"!cr"}, L"help", L"cr-help-completion");
+        CheckCompletionCandidate(&context, {L"!ssdt"}, L"help", L"ssdt-help-completion");
+        CheckCompletionCandidate(&context, {L"!idt"}, L"help", L"idt-help-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !CompletionCandidateExists({L"!dml_proc", L"4"}, L"help") &&
+                !CompletionCandidateExists({L"!msrcheck", L"x"}, L"help") &&
+                !CompletionCandidateExists({L"!db", L"1000"}, L"help") &&
+                !CompletionCandidateExists({L"query", L"nt!PsLoadedModuleList"}, L"help") &&
+                !CompletionCandidateExists({L"u", L"nt!KiSystemCall64"}, L"/process"),
+            L"help-only-completion-stays-on-first-token");
+        CheckCompletionCandidate(&context, {L"!hunt"}, L"/details", L"hunt-details-completion");
+        CheckCompletionCandidate(&context, {L"!module"}, L"/disk", L"module-disk-completion");
+        CheckCompletionCandidate(&context, {L"!byovd", L"update"}, L"/force", L"byovd-update-force-completion");
+        CheckCompletionCandidate(&context, {L"!pool", L"big"}, L"/tags", L"pool-big-tags-completion");
+        CheckCompletionCandidate(&context, {L"!pool", L"tags"}, L"/tag", L"pool-tags-tag-completion");
+        CheckCompletionCandidate(&context, {L"u"}, L"/process", L"u-process-completion");
+        CheckCompletionCandidate(&context, {L"uf"}, L"/process", L"uf-process-completion");
+        CheckCompletionCandidate(&context, {L"query"}, L"help", L"query-help-completion");
+        CheckCompletionCandidate(&context, {L"!db"}, L"help", L"physical-db-help-completion");
+        CheckCompletionCandidate(&context, {L"!ti", L"by"}, L"pid", L"ti-by-pid-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!ti"}, L"start", L"help-ti-start-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!byovd"}, L"fixture", L"help-byovd-fixture-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!hunt"}, L"/details", L"help-hunt-details-completion");
         CheckConsoleSurfaceSelfTest(
             &context,
             !CompletionCandidateExists({}, L"callbacks") &&
@@ -28186,6 +28370,7 @@ static int RunConsoleSurfaceSelfTest()
                     rootHelp.find(L"!payload scan") != std::wstring::npos &&
                     rootHelp.find(L"!pool pe /suspicious") != std::wstring::npos &&
                     rootHelp.find(L"help !callbacks") != std::wstring::npos &&
+                    rootHelp.find(L"help !byovd") != std::wstring::npos &&
                     rootHelp.find(L"!byovd scan") != std::wstring::npos,
                 L"help-root-lists-leftover-commands");
             const std::wstring minifilterHelp = CaptureDetailedHelpOutput({L"help", L"!minifilter"}, 1);
