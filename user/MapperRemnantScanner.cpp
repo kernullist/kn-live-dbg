@@ -1,9 +1,10 @@
 #include "MapperRemnantScanner.h"
 
-#include "AddressInspector.h"
+#include "../shared/KnLiveDbgIoctl.h"
 #include "McpJson.h"
 
 #include <algorithm>
+#include <cstring>
 #include <set>
 #include <sstream>
 
@@ -63,48 +64,12 @@ namespace
         }
     }
 
-    AvlTableLayout ResolveAvlTableLayout(SymbolEngine& symbols)
+    AvlTableLayout ResolveAvlTableLayout()
     {
+        // Public PDB has this type, but a field miss still walks every
+        // kernel module through GetTypeLayout. The x64 slots are stable;
+        // LooksLikeAvlTable validates them against live pointers.
         AvlTableLayout layout;
-        TypeFieldInfo field = {};
-        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"BalancedRoot", &field, nullptr) &&
-            field.Offset <= 0x40)
-        {
-            layout.BalancedRoot = field.Offset;
-        }
-        if ((symbols.FindField(
-                 L"nt!_RTL_AVL_TABLE",
-                 L"NumberGenericTableElements",
-                 &field,
-                 nullptr) ||
-             symbols.FindField(
-                 L"nt!_RTL_AVL_TABLE",
-                 L"NumberOfElements",
-                 &field,
-                 nullptr)) &&
-            field.Offset <= 0x80)
-        {
-            layout.NumberGenericTableElements = field.Offset;
-        }
-        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"CompareRoutine", &field, nullptr) &&
-            field.Offset >= 0x20 &&
-            field.Offset <= 0x100)
-        {
-            layout.CompareRoutine = field.Offset;
-        }
-        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"AllocateRoutine", &field, nullptr) &&
-            field.Offset >= 0x20 &&
-            field.Offset <= 0x100)
-        {
-            layout.AllocateRoutine = field.Offset;
-        }
-        if (symbols.FindField(L"nt!_RTL_AVL_TABLE", L"FreeRoutine", &field, nullptr) &&
-            field.Offset >= 0x20 &&
-            field.Offset <= 0x100)
-        {
-            layout.FreeRoutine = field.Offset;
-        }
-
         SanitizeAvlTableLayout(&layout);
         return layout;
     }
@@ -218,6 +183,134 @@ namespace
         return ok;
     }
 
+    bool ReadAvlChildren(
+        DeviceClient& device,
+        uint64_t node,
+        uint64_t* left,
+        uint64_t* right)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (left == nullptr || right == nullptr)
+            {
+                break;
+            }
+            *left = 0;
+            *right = 0;
+
+            std::vector<uint8_t> links;
+            if (!LeftoverReadBytes(device, node, 0x18, &links, nullptr) ||
+                links.size() < 0x18)
+            {
+                break;
+            }
+            memcpy(left, links.data() + static_cast<size_t>(kAvlLeft), sizeof(uint64_t));
+            memcpy(right, links.data() + static_cast<size_t>(kAvlRight), sizeof(uint64_t));
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadBlobU16(const std::vector<uint8_t>& blob, uint32_t offset, uint16_t* value)
+    {
+        bool ok = false;
+        if (value != nullptr &&
+            static_cast<uint64_t>(offset) + sizeof(uint16_t) <= blob.size())
+        {
+            memcpy(value, blob.data() + offset, sizeof(uint16_t));
+            ok = true;
+        }
+
+        return ok;
+    }
+
+    bool ReadBlobU64(const std::vector<uint8_t>& blob, uint32_t offset, uint64_t* value)
+    {
+        bool ok = false;
+        if (value != nullptr &&
+            static_cast<uint64_t>(offset) + sizeof(uint64_t) <= blob.size())
+        {
+            memcpy(value, blob.data() + offset, sizeof(uint64_t));
+            ok = true;
+        }
+
+        return ok;
+    }
+
+    bool ProbeRangeStillExecutable(
+        DeviceClient& device,
+        uint64_t address,
+        bool* present,
+        bool* executable)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (present == nullptr || executable == nullptr)
+            {
+                break;
+            }
+            *present = false;
+            *executable = false;
+
+            PhysicalTranslationInfo info = {};
+            std::wstring translateError;
+            if (!device.TranslateVirtual(0, address, 1, &info, &translateError))
+            {
+                break;
+            }
+
+            const bool la57 = (info.Flags & KNDBG_TRANSLATE_FLAG_LA57_ACTIVE) != 0;
+            const uint64_t levels[5] = {
+                info.Pml5e,
+                info.Pml4e,
+                info.Pdpte,
+                info.Pde,
+                info.Pte
+            };
+            const size_t startIndex = la57 ? 0 : 1;
+            size_t walkCount = info.PagingLevels;
+            if (walkCount > 5)
+            {
+                walkCount = 5;
+            }
+
+            bool mapped = walkCount > 0;
+            bool nxClear = walkCount > 0;
+            for (size_t step = 0; step < walkCount; ++step)
+            {
+                const size_t levelIdx = startIndex + step;
+                if (levelIdx >= 5)
+                {
+                    break;
+                }
+                const uint64_t pte = levels[levelIdx];
+                if ((pte & 1ull) == 0)
+                {
+                    mapped = false;
+                }
+                if ((pte & (1ull << 63)) != 0)
+                {
+                    nxClear = false;
+                }
+                if ((levelIdx == 2 || levelIdx == 3) && (pte & (1ull << 7)) != 0)
+                {
+                    break;
+                }
+            }
+
+            *present = mapped;
+            *executable = mapped && nxClear;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     bool WalkAvlInOrder(
         DeviceClient& device,
         uint64_t tableAddr,
@@ -256,7 +349,12 @@ namespace
                 break;
             }
 
-            std::vector<uint64_t> stack;
+            struct AvlWalkFrame
+            {
+                uint64_t Node = 0;
+                uint64_t Right = 0;
+            };
+            std::vector<AvlWalkFrame> stack;
             std::set<uint64_t> visited;
             uint64_t current = root;
             uint32_t steps = 0;
@@ -282,43 +380,39 @@ namespace
                     if (stack.size() >= kMaxAvlNodes)
                     {
                         truncated = true;
-                        break;
-                    }
-                    stack.push_back(current);
-                    uint64_t leftField = 0;
-                    uint64_t left = 0;
-                    if (!LeftoverTryAdd(current, kAvlLeft, &leftField) ||
-                        !LeftoverReadU64(device, leftField, &left, nullptr))
-                    {
                         current = 0;
                         break;
                     }
+
+                    uint64_t left = 0;
+                    uint64_t right = 0;
+                    if (!ReadAvlChildren(device, current, &left, &right))
+                    {
+                        truncated = true;
+                        left = 0;
+                        right = 0;
+                    }
+                    AvlWalkFrame frame = {};
+                    frame.Node = current;
+                    frame.Right = right;
+                    stack.push_back(frame);
                     current = left;
                 }
 
-                if (truncated || stack.empty())
+                if (stack.empty())
                 {
                     break;
                 }
 
-                current = stack.back();
+                const AvlWalkFrame frame = stack.back();
                 stack.pop_back();
                 if (nodes->size() >= kMaxAvlNodes)
                 {
                     truncated = true;
                     break;
                 }
-                nodes->push_back(current);
-
-                uint64_t rightField = 0;
-                uint64_t right = 0;
-                if (!LeftoverTryAdd(current, kAvlRight, &rightField) ||
-                    !LeftoverReadU64(device, rightField, &right, nullptr))
-                {
-                    current = 0;
-                    continue;
-                }
-                current = right;
+                nodes->push_back(frame.Node);
+                current = frame.Right;
             }
 
             *complete = !truncated;
@@ -328,9 +422,59 @@ namespace
         return ok;
     }
 
+    uint16_t EffectiveUnicodeMaximum(uint16_t length, uint16_t maximumLength)
+    {
+        return (maximumLength == 0) ? length : maximumLength;
+    }
+
+    bool ReadUnicodeFromFields(
+        DeviceClient& device,
+        uint16_t length,
+        uint16_t maximumLength,
+        uint64_t buffer,
+        std::wstring* name)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (name == nullptr)
+            {
+                break;
+            }
+            name->clear();
+            const uint16_t effectiveMax = EffectiveUnicodeMaximum(length, maximumLength);
+            if (!LeftoverLooksLikeUnicodeString(length, effectiveMax, buffer))
+            {
+                break;
+            }
+            if (length == 0)
+            {
+                ok = true;
+                break;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!LeftoverReadBytes(device, buffer, length, &bytes, nullptr) ||
+                bytes.size() != length)
+            {
+                break;
+            }
+            name->assign(
+                reinterpret_cast<const wchar_t*>(bytes.data()),
+                bytes.size() / sizeof(wchar_t));
+            while (!name->empty() && (name->back() == L'\0' || name->back() < 0x20))
+            {
+                name->pop_back();
+            }
+            ok = !name->empty();
+        } while (false);
+
+        return ok;
+    }
+
     bool ProbeUnicodeAt(
         DeviceClient& device,
-        SymbolEngine& symbols,
         uint64_t address,
         std::wstring* name)
     {
@@ -344,34 +488,20 @@ namespace
             }
             name->clear();
 
+            std::vector<uint8_t> header;
+            if (!LeftoverReadBytes(device, address, 16, &header, nullptr) ||
+                header.size() < 16)
+            {
+                break;
+            }
+
             uint16_t length = 0;
             uint16_t maximumLength = 0;
-            uint64_t maxAddr = 0;
             uint64_t buffer = 0;
-            uint64_t bufferAddr = 0;
-            if (!LeftoverReadU16(device, address, &length, nullptr) ||
-                !LeftoverTryAdd(address, 2, &maxAddr) ||
-                !LeftoverReadU16(device, maxAddr, &maximumLength, nullptr) ||
-                !LeftoverTryAdd(address, 8, &bufferAddr) ||
-                !LeftoverReadU64(device, bufferAddr, &buffer, nullptr))
-            {
-                break;
-            }
-            if (!LeftoverLooksLikeUnicodeString(length, maximumLength, buffer))
-            {
-                break;
-            }
-            if (length == 0)
-            {
-                ok = true;
-                break;
-            }
-            if (!LeftoverReadUnicodeString(device, symbols, address, name, nullptr) ||
-                name->empty())
-            {
-                break;
-            }
-            ok = true;
+            memcpy(&length, header.data(), sizeof(length));
+            memcpy(&maximumLength, header.data() + 2, sizeof(maximumLength));
+            memcpy(&buffer, header.data() + 8, sizeof(buffer));
+            ok = ReadUnicodeFromFields(device, length, maximumLength, buffer, name);
         } while (false);
 
         return ok;
@@ -379,7 +509,6 @@ namespace
 
     bool ProbePiddbDriverName(
         DeviceClient& device,
-        SymbolEngine& symbols,
         uint64_t node,
         bool listEntry,
         uint32_t preferredNameOffset,
@@ -427,7 +556,7 @@ namespace
                     {
                         continue;
                     }
-                    if (!ProbeUnicodeAt(device, symbols, nameAddr, &name) ||
+                    if (!ProbeUnicodeAt(device, nameAddr, &name) ||
                         name.empty() ||
                         !LeftoverLooksLikeDriverName(name))
                     {
@@ -601,53 +730,14 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
             break;
         }
 
-        uint32_t nameOffset = 0;
-        uint32_t startOffset = 0x10;
-        uint32_t endOffset = 0x18;
-        uint32_t timeOffset = 0x20;
-        uint32_t entrySize = 0x28;
-        TypeLayoutInfo layout = {};
-        const wchar_t* unloadedTypes[] = {
-            L"nt!_MM_UNLOADED_DRIVER",
-            L"_MM_UNLOADED_DRIVER",
-            L"nt!_UNLOADED_DRIVERS",
-            L"_UNLOADED_DRIVERS"
-        };
-        bool layoutFromPdb = false;
-        for (const wchar_t* typeName : unloadedTypes)
-        {
-            TypeFieldInfo nameField = {};
-            TypeFieldInfo startField = {};
-            if (!symbols_.GetTypeLayout(typeName, &layout, nullptr) ||
-                layout.Size < 0x28 ||
-                layout.Size > 0x80 ||
-                !symbols_.FindField(typeName, L"Name", &nameField, nullptr) ||
-                !symbols_.FindField(typeName, L"StartAddress", &startField, nullptr))
-            {
-                continue;
-            }
-
-            entrySize = static_cast<uint32_t>(layout.Size);
-            nameOffset = nameField.Offset;
-            startOffset = startField.Offset;
-            TypeFieldInfo field = {};
-            if (symbols_.FindField(typeName, L"EndAddress", &field, nullptr))
-            {
-                endOffset = field.Offset;
-            }
-            if (symbols_.FindField(typeName, L"CurrentTime", &field, nullptr) ||
-                symbols_.FindField(typeName, L"UnloadTime", &field, nullptr))
-            {
-                timeOffset = field.Offset;
-            }
-            layoutFromPdb = true;
-            break;
-        }
-        if (!layoutFromPdb)
-        {
-            result->CoverageNotes.push_back(
-                L"nt!_MM_UNLOADED_DRIVER not in PDB; using x64 UNICODE_STRING+range layout 0x28");
-        }
+        // Public PDBs omit _MM_UNLOADED_DRIVER. The x64 slot is UNICODE_STRING
+        // + Start/End + CurrentTime (0x28). Do not GetTypeLayout-miss here:
+        // a missing type walks every kernel module and loads PDBs.
+        const uint32_t nameOffset = 0;
+        const uint32_t startOffset = 0x10;
+        const uint32_t endOffset = 0x18;
+        const uint32_t timeOffset = 0x20;
+        const uint32_t entrySize = 0x28;
 
         if (array == 0)
         {
@@ -688,7 +778,22 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
 
         result->UnloadedSlotCount = kDefaultUnloadedSlots;
         bool walkedAll = true;
-        for (uint32_t index = 0; index < kDefaultUnloadedSlots && index < kMaxUnloadedSlots; ++index)
+        const uint32_t blobBytes = kDefaultUnloadedSlots * entrySize;
+        std::vector<uint8_t> blob;
+        std::wstring blobError;
+        const bool usedBulk =
+            LeftoverReadBytes(device_, array, blobBytes, &blob, &blobError) &&
+            blob.size() == blobBytes;
+        if (!usedBulk)
+        {
+            result->Warnings.push_back(
+                L"MmUnloadedDrivers bulk read failed; falling back to per-slot");
+        }
+
+        uint32_t readableSlots = 0;
+        for (uint32_t index = 0;
+             index < kDefaultUnloadedSlots && index < kMaxUnloadedSlots;
+             ++index)
         {
             uint64_t entry = 0;
             if (!LeftoverTryAdd(array, static_cast<uint64_t>(index) * entrySize, &entry))
@@ -698,30 +803,46 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                 break;
             }
 
+            uint32_t slot = 0;
+            const std::vector<uint8_t>* view = &blob;
+            std::vector<uint8_t> slotBlob;
+            if (usedBulk)
+            {
+                slot = index * entrySize;
+            }
+            else if (LeftoverReadBytes(device_, entry, entrySize, &slotBlob, nullptr) &&
+                     slotBlob.size() == entrySize)
+            {
+                view = &slotBlob;
+                ++readableSlots;
+            }
+            else
+            {
+                continue;
+            }
+
             uint64_t start = 0;
             uint64_t end = 0;
             uint64_t time = 0;
-            uint64_t startAddr = 0;
-            uint64_t endAddr = 0;
-            uint64_t timeAddr = 0;
-            uint64_t nameAddr = 0;
-            if (!LeftoverTryAdd(entry, startOffset, &startAddr) ||
-                !LeftoverTryAdd(entry, endOffset, &endAddr) ||
-                !LeftoverTryAdd(entry, timeOffset, &timeAddr) ||
-                !LeftoverTryAdd(entry, nameOffset, &nameAddr))
+            uint16_t nameLength = 0;
+            uint16_t nameMaximum = 0;
+            uint64_t nameBuffer = 0;
+            if (!ReadBlobU64(*view, slot + startOffset, &start) ||
+                !ReadBlobU64(*view, slot + endOffset, &end) ||
+                !ReadBlobU64(*view, slot + timeOffset, &time) ||
+                !ReadBlobU16(*view, slot + nameOffset, &nameLength) ||
+                !ReadBlobU16(*view, slot + nameOffset + 2, &nameMaximum) ||
+                !ReadBlobU64(*view, slot + nameOffset + 8, &nameBuffer))
             {
                 continue;
             }
-            LeftoverReadU64(device_, startAddr, &start, nullptr);
-            LeftoverReadU64(device_, endAddr, &end, nullptr);
-            LeftoverReadU64(device_, timeAddr, &time, nullptr);
+            if (start == 0 && end == 0 && nameLength == 0)
+            {
+                continue;
+            }
 
             std::wstring name;
-            ProbeUnicodeAt(device_, symbols_, nameAddr, &name);
-            if (start == 0 && end == 0 && name.empty())
-            {
-                continue;
-            }
+            ReadUnicodeFromFields(device_, nameLength, nameMaximum, nameBuffer, &name);
 
             MapperUnloadedRecord record = {};
             record.Index = index;
@@ -742,6 +863,8 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                 if (owner != nullptr)
                 {
                     record.OverlapsLoadedModule = true;
+                    record.StillPresent = true;
+                    record.StillExecutable = true;
                     if (!name.empty() && LeftoverNamesMatch(owner->Name, name))
                     {
                         record.SameImageReload = true;
@@ -757,17 +880,21 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                             L"range reused by " + owner->Name);
                     }
                 }
-
-                AddressInspectResult inspect = {};
-                std::wstring inspectError;
-                if (InspectAddress(device_, symbols_, start, &inspect, &inspectError, 0))
+                else
                 {
-                    record.StillPresent = inspect.EffectivePresent;
-                    record.StillExecutable = inspect.EffectivePresent && inspect.EffectiveExecutable;
-                    if (record.StillExecutable && !record.OverlapsLoadedModule)
+                    bool present = false;
+                    bool executable = false;
+                    if (ProbeRangeStillExecutable(device_, start, &present, &executable))
                     {
-                        record.Suspicious = true;
-                        LeftoverAppendNote(&record.Notes, L"unloaded range is still present+executable");
+                        record.StillPresent = present;
+                        record.StillExecutable = executable;
+                        if (executable)
+                        {
+                            record.Suspicious = true;
+                            LeftoverAppendNote(
+                                &record.Notes,
+                                L"unloaded range is still present+executable");
+                        }
                     }
                 }
             }
@@ -783,6 +910,11 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                 result->AnySuspicious = true;
             }
             result->Unloaded.push_back(record);
+        }
+
+        if (!usedBulk && readableSlots == 0)
+        {
+            walkedAll = false;
         }
 
         CoalesceUnloadedRecords(&result->Unloaded);
@@ -812,7 +944,7 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
         }
 
         result->PiDDBCacheTable = table;
-        const AvlTableLayout avlLayout = ResolveAvlTableLayout(symbols_);
+        const AvlTableLayout avlLayout = ResolveAvlTableLayout();
         std::vector<uint64_t> nodes;
         bool complete = false;
         bool usedAvl = false;
@@ -822,7 +954,7 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
             {
                 result->Warnings.push_back(L"PiDDB AVL walk failed");
             }
-            else
+            else if (complete || !nodes.empty())
             {
                 usedAvl = true;
                 result->PiddbWalkMode = L"avl";
@@ -905,30 +1037,6 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
         const bool listEntries = (result->PiddbWalkMode == L"list");
 
         uint32_t nameOffset = 0x10;
-        const std::wstring typeNames[] = {
-            L"nt!_DDBCACHE_ENTRY",
-            L"nt!_PIDDB_CACHE_ENTRY",
-            L"nt!_PiDDBCacheEntry"
-        };
-        bool layoutFromPdb = false;
-        for (const std::wstring& typeName : typeNames)
-        {
-            TypeFieldInfo field = {};
-            if (symbols_.FindField(typeName, L"DriverName", &field, nullptr) &&
-                field.Offset != 0 &&
-                field.Offset <= 0x40)
-            {
-                nameOffset = field.Offset;
-                layoutFromPdb = true;
-                break;
-            }
-        }
-        if (!layoutFromPdb && !nodes.empty())
-        {
-            result->Warnings.push_back(
-                L"PiDDB cache entry type was not in the PDB; using LIST_ENTRY+UNICODE_STRING fallback");
-        }
-
         uint32_t index = 0;
         for (uint64_t node : nodes)
         {
@@ -937,7 +1045,6 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
             std::wstring name;
             if (!ProbePiddbDriverName(
                     device_,
-                    symbols_,
                     node,
                     listEntries,
                     nameOffset,
@@ -988,6 +1095,12 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
                 }
             }
             result->Piddb.push_back(record);
+        }
+
+        if (!nodes.empty() && result->Piddb.empty())
+        {
+            result->Warnings.push_back(
+                L"PiDDB nodes were walked but no driver names parsed");
         }
 
         ok = true;
@@ -1126,7 +1239,7 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
                 {
                     continue;
                 }
-                if (ProbeUnicodeAt(device_, symbols_, nameAddr, &name) &&
+                if (ProbeUnicodeAt(device_, nameAddr, &name) &&
                     !name.empty() &&
                     LeftoverLooksLikeDriverName(name))
                 {
@@ -1491,6 +1604,40 @@ bool MapperRemnantSelfTest()
         if (badRoutines.CompareRoutine != 0x48 ||
             badRoutines.AllocateRoutine != 0x50 ||
             badRoutines.FreeRoutine != 0x58)
+        {
+            ok = false;
+            break;
+        }
+
+        if (EffectiveUnicodeMaximum(8, 0) != 8 ||
+            EffectiveUnicodeMaximum(8, 16) != 16 ||
+            LeftoverLooksLikeUnicodeString(8, 0, 0xFFFFF80000001000ull) ||
+            !LeftoverLooksLikeUnicodeString(
+                8,
+                EffectiveUnicodeMaximum(8, 0),
+                0xFFFFF80000001000ull))
+        {
+            ok = false;
+            break;
+        }
+
+        std::vector<uint8_t> blob(24, 0);
+        blob[0] = 8;
+        blob[8] = 0x00;
+        blob[9] = 0x10;
+        blob[10] = 0x00;
+        blob[11] = 0x00;
+        blob[12] = 0x00;
+        blob[13] = 0x80;
+        blob[14] = 0xFF;
+        blob[15] = 0xFF;
+        uint16_t nameLength = 0;
+        uint64_t nameBuffer = 0;
+        if (!ReadBlobU16(blob, 0, &nameLength) ||
+            nameLength != 8 ||
+            !ReadBlobU64(blob, 8, &nameBuffer) ||
+            nameBuffer != 0xFFFF800000001000ull ||
+            ReadBlobU64(blob, 17, &nameBuffer))
         {
             ok = false;
             break;
