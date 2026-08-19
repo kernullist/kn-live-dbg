@@ -1790,9 +1790,9 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
     std::wcout << L"  help dump-kernel     WinDbg complete dump from live physical RAM runs\n";
     std::wcout << L"  help dump-live       OS live kernel dump via NtSystemDebugControl\n";
-    std::wcout << L"  help !payload        unbacked hook-target trace (translate/pool/PE/disasm)\n";
-    std::wcout << L"  help !mapper         MmUnloadedDrivers / PiDDB / ci hash-bucket leftovers\n";
-    std::wcout << L"  help !kpage          executable kernel pages outside loaded modules\n";
+    std::wcout << L"  help !payload        hook-to-body layer (unbacked pointer trace)\n";
+    std::wcout << L"  help !mapper         bookkeeping-remnant layer (unload / PiDDB / ci hash)\n";
+    std::wcout << L"  help !kpage          orphan-page layer (executable VA outside modules)\n";
     std::wcout << L"  help !minifilter     list minifilters and enable/disable IRP handlers\n";
     std::wcout << L"  --cloak              relaunch from a random EXE/service/device session\n";
     std::wcout << L"  ai help              AI question, config, plan, explain, run, and write commands\n";
@@ -1813,8 +1813,10 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  quiet-surface !hal | !hive | !token <pid> | !dpc | !timer | !etw providers | !etw ti-cross\n";
     std::wcout << L"  cpu-state     !msrcheck (SYSCALL MSR / LSTAR hook) | !cr (CR0.WP / SMEP / SMAP)\n";
     std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
-    std::wcout << L"  hunting       !hunt | !pool find /wx | pool-scan-pe /suspicious | !byovd scan\n";
-    std::wcout << L"                !payload scan | !mapper | !kpage | !kpage /deep\n";
+    std::wcout << L"  hunting       !byovd scan (loaded BYOVD) | !mapper (bookkeeping remnants)\n";
+    std::wcout << L"                !kpage /pe (orphan pages) | !payload scan (hook-to-body)\n";
+    std::wcout << L"                pool-scan-pe /suspicious (staged pool PE) | !kpage /deep\n";
+    std::wcout << L"                !hunt | !pool find /wx\n";
     std::wcout << L"                !minifilter | !minifilter show <name> | !minifilter disable <name> all\n";
     std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
@@ -8519,6 +8521,10 @@ static void PrintSnapshotHelp()
     std::wcout << L"  session baseline in memory plus JSON and Markdown files under .kn-live-dbg.\n";
     std::wcout << L"  Baseline captures process inventory; VAD DKOM hidden-PTE scans run during\n";
     std::wcout << L"  !diff baseline for processes newly present since the baseline.\n";
+    std::wcout << L"  leftover-mapper is the bookkeeping-remnant layer only (!mapper). A clean\n";
+    std::wcout << L"  leftover-mapper diff does not prove the payload is gone; run !kpage /pe\n";
+    std::wcout << L"  and !payload scan for orphan pages and hook-to-body. !kpage is not a\n";
+    std::wcout << L"  snapshot domain.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !snapshot baseline /name clean-boot\n";
@@ -15568,8 +15574,13 @@ static void PrintPayloadHelp()
     std::wcout << L"  !payload <address|symbol> [/disasm <n>] [/json <path>]\n";
     std::wcout << L"  !payload scan [/limit <n>] [/disasm <n>] [/json <path>]\n";
     std::wcout << L"\n";
-    std::wcout << L"  Trace one hook target, or sweep scanned hook surfaces for pointers that\n";
-    std::wcout << L"  sit outside every loaded kernel module and trace each unique address.\n";
+    std::wcout << L"  Layer: hook-to-body. Follows function pointers that sit outside every\n";
+    std::wcout << L"  loaded kernel module. This is how a cleaned kdmapper-style payload stays\n";
+    std::wcout << L"  live: callbacks/SSDT/IDT/NMI/HAL/MSR/ETW/WFP/DPC/dispatch still jump to\n";
+    std::wcout << L"  independent pages after the original driver image is gone. !mapper will\n";
+    std::wcout << L"  not see that image. A quiet !payload scan means no scanned hook surface\n";
+    std::wcout << L"  pointed off-module; it does not prove those pages are unused.\n";
+    std::wcout << L"\n";
     std::wcout << L"  Each trace walks page tables, looks up SystemBigPoolInformation, probes\n";
     std::wcout << L"  for an intact or signature-wiped PE header, and disassembles the first\n";
     std::wcout << L"  instructions. No new driver IOCTL is used.\n";
@@ -15598,11 +15609,20 @@ static void PrintMapperHelp()
     std::wcout << L"  !piddb       alias for !mapper piddb\n";
     std::wcout << L"  !cihash      alias for !mapper cihash\n";
     std::wcout << L"\n";
-    std::wcout << L"  Walks mapper leftovers after a driver image has disappeared:\n";
+    std::wcout << L"  Layer: bookkeeping remnants. Walks the three kernel ledgers a real\n";
+    std::wcout << L"  NtLoadDriver / IopLoadDriver path writes, then a mapper often forgets\n";
+    std::wcout << L"  or only half-wipes:\n";
     std::wcout << L"    unloaded  nt!MmUnloadedDrivers circular log\n";
     std::wcout << L"    piddb     nt!PiDDBCacheTable AVL cache\n";
     std::wcout << L"    cihash    ci!g_KernelHashBucketList (or nearby ci symbols)\n";
     std::wcout << L"    all       every surface (default)\n";
+    std::wcout << L"\n";
+    std::wcout << L"  This layer sees the signed BYOVD/exploit driver after it was loaded for\n";
+    std::wcout << L"  real. The manually mapped payload was never in these lists, so a cleaned\n";
+    std::wcout << L"  kdmapper run is expected to print leftover=0. leftover=0 means the\n";
+    std::wcout << L"  ledgers look clean, not that no payload is mapped. Pair with !byovd\n";
+    std::wcout << L"  (still-loaded vulnerable image), !kpage /pe (orphan pages), and\n";
+    std::wcout << L"  !payload scan (hooks that still point at those pages).\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /limit <n>   keep leftover/suspicious records first, then truncate.\n";
@@ -15630,10 +15650,15 @@ static void PrintKpageHelp()
     std::wcout << L"!kpage command:\n";
     std::wcout << L"  !kpage [/deep] [/wx] [/pe] [/session|/nosession] [/limit <n>] [/json <path>]\n";
     std::wcout << L"\n";
-    std::wcout << L"  Walks the kernel half of the live CR3 page tables and reports executable\n";
-    std::wcout << L"  leaves that do not overlap any SystemModuleInformation range. Adjacent\n";
-    std::wcout << L"  pages with the same permissions are coalesced. Page-table self-map windows\n";
-    std::wcout << L"  are skipped. Session-space hits are kept at low risk unless W+X or PE.\n";
+    std::wcout << L"  Layer: orphan executable pages. Walks the kernel half of the live CR3\n";
+    std::wcout << L"  page tables and reports executable leaves that do not overlap any\n";
+    std::wcout << L"  SystemModuleInformation range. This is the layer that can still see a\n";
+    std::wcout << L"  kdmapper payload after PiDDB / MmUnloadedDrivers / ci hash were wiped:\n";
+    std::wcout << L"  the image lives on independent pages that were never a loaded module.\n";
+    std::wcout << L"  Use /pe to keep PE-like regions and /wx for W+X. A silent !kpage does\n";
+    std::wcout << L"  not replace !payload scan: hooks can hide inside a live module via PTE\n";
+    std::wcout << L"  remap. Adjacent same-permission pages are coalesced. Page-table self-map\n";
+    std::wcout << L"  windows are skipped. Session-space hits stay low-risk unless W+X or PE.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /deep         also walk nt!MmPfnDatabase (expensive; not default).\n";
@@ -19022,10 +19047,13 @@ static void PrintByovdHelp()
     std::wcout << L"  byovd fixture [status|load [sys-path]|unload|path]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
-    std::wcout << L"  Scans currently loaded kernel modules against a local BYOVD intelligence\n";
-    std::wcout << L"  catalog built from the Microsoft vulnerable driver blocklist and LOLDrivers\n";
-    std::wcout << L"  hash/YARA feeds. The scan updates the local catalog automatically when it is\n";
-    std::wcout << L"  missing or older than 24 hours, then hashes each module image on disk.\n";
+    std::wcout << L"  Layer: loaded BYOVD. Scans currently loaded kernel modules against a local\n";
+    std::wcout << L"  BYOVD intelligence catalog built from the Microsoft vulnerable driver\n";
+    std::wcout << L"  blocklist and LOLDrivers hash/YARA feeds. Catch the signed exploit driver\n";
+    std::wcout << L"  while it is still mapped. After kdmapper unloads and wipes PiDDB / unload\n";
+    std::wcout << L"  log / ci hash, this layer goes quiet and !mapper leftover=0 is expected.\n";
+    std::wcout << L"  The scan updates the local catalog automatically when it is missing or\n";
+    std::wcout << L"  older than 24 hours, then hashes each module image on disk.\n";
     std::wcout << L"\n";
     std::wcout << L"match confidence:\n";
     std::wcout << L"  HIGH    exact MD5/SHA1/SHA256 catalog match.\n";
@@ -23679,13 +23707,16 @@ static void PrintPoolScanPeHelp()
     std::wcout << L"               [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
-    std::wcout << L"  Enumerates big pool allocations via NtQuerySystemInformation\n";
-    std::wcout << L"  (SystemBigPoolInformation=0x42) and runs the same PE header detection used\n";
-    std::wcout << L"  by dump-pe on each entry's first 4 KB. The detector accepts both intact and\n";
-    std::wcout << L"  signature-wiped PE headers, so reflectively-loaded modules, unpacker stages,\n";
-    std::wcout << L"  and stomped driver replacements that zero MZ/PE to evade scanners are still\n";
-    std::wcout << L"  surfaced. Each hit prints the pool tag, address/size, suspicion markers\n";
-    std::wcout << L"  (which signatures were stripped), and PE metadata.\n";
+    std::wcout << L"  Layer: staged pool PE. Enumerates big pool allocations via\n";
+    std::wcout << L"  NtQuerySystemInformation (SystemBigPoolInformation=0x42) and runs the same\n";
+    std::wcout << L"  PE header detection used by dump-pe on each entry's first 4 KB. This is\n";
+    std::wcout << L"  the pool-backed staging path; independent-page kdmapper images that never\n";
+    std::wcout << L"  used ExAllocatePool show up on !kpage /pe instead. The detector accepts\n";
+    std::wcout << L"  both intact and signature-wiped PE headers, so reflectively-loaded\n";
+    std::wcout << L"  modules, unpacker stages, and stomped driver replacements that zero MZ/PE\n";
+    std::wcout << L"  to evade scanners are still surfaced. Each hit prints the pool tag,\n";
+    std::wcout << L"  address/size, suspicion markers (which signatures were stripped), and PE\n";
+    std::wcout << L"  metadata.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /tag <ABCD>        only scan entries with the given 4-char pool tag.\n";
@@ -27978,8 +28009,11 @@ static int RunConsoleSurfaceSelfTest()
             CheckConsoleSurfaceSelfTest(
                 &context,
                 payloadHelp.find(L"!payload scan") != std::wstring::npos &&
+                    payloadHelp.find(L"Layer: hook-to-body") != std::wstring::npos &&
                     mapperHelp.find(L"MmUnloadedDrivers") != std::wstring::npos &&
-                    kpageHelp.find(L"/deep") != std::wstring::npos,
+                    mapperHelp.find(L"Layer: bookkeeping remnants") != std::wstring::npos &&
+                    kpageHelp.find(L"/deep") != std::wstring::npos &&
+                    kpageHelp.find(L"Layer: orphan executable pages") != std::wstring::npos,
                 L"leftover-help-routes");
             CheckConsoleSurfaceSelfTest(
                 &context,
@@ -38946,10 +38980,10 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- etw.ti_cross: correlate active Threat-Intelligence subscription reception with silence/drop signals. Args: {}.\n";
     stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
     stream << L"- minifilter.list: list filesystem minifilters and IRP registrations. Optional filter/name string selects one filter.\n";
-    stream << L"- payload.inspect: trace one kernel address through translation, big pool, PE, and disassembly. Args: address/va/symbol.\n";
-    stream << L"- payload.scan: collect unbacked hook pointers and trace them. Args: optional limit.\n";
-    stream << L"- mapper.list: walk MmUnloadedDrivers, PiDDB, and ci hash leftovers. Args: optional scope all|unloaded|piddb|cihash, limit.\n";
-    stream << L"- kpage.list: find executable kernel pages outside loaded modules. Args: optional deep/wx/pe booleans and limit. Do not set deep unless asked.\n";
+    stream << L"- payload.inspect: hook-to-body layer; trace one kernel address through translation, big pool, PE, and disassembly. Args: address/va/symbol.\n";
+    stream << L"- payload.scan: hook-to-body layer; collect unbacked hook pointers and trace them. A quiet scan does not prove independent pages are unused. Args: optional limit.\n";
+    stream << L"- mapper.list: bookkeeping-remnant layer; walk MmUnloadedDrivers, PiDDB, and ci hash leftovers. leftover=0 means the ledgers look clean, not that no mapper payload is mapped. Args: optional scope all|unloaded|piddb|cihash, limit.\n";
+    stream << L"- kpage.list: orphan-page layer; find executable kernel pages outside loaded modules. This is the layer that can still see a wiped kdmapper payload. Args: optional deep/wx/pe booleans and limit. Do not set deep unless asked.\n";
     stream << L"- hal.scan: check HalDispatchTable ownership. Args: {}.\n";
     stream << L"- hive.list: walk registry hive GetCellRoutine ownership. Args: {}.\n";
     stream << L"- token.inspect: inspect process token privileges (pid optional, default 4). Args: optional pid.\n";
@@ -38973,9 +39007,9 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- cr.scan: check control registers for CR0.WP=0, SMEP/SMAP disablement, and per-CPU divergence. Args: {}.\n";
     stream << L"- msr.check: check SYSCALL MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) for hooked entry pointers and per-CPU divergence. Args: {}.\n";
     stream << L"- vbs.scan: report VBS/HVCI, Code Integrity options, hypervisor, Secure Kernel modules, and trustlets. Args: {}.\n";
-    stream << L"- byovd.scan: scan loaded kernel modules against the local BYOVD/LOLDrivers catalog (no network). Args: {}.\n";
+    stream << L"- byovd.scan: loaded-BYOVD layer; scan currently loaded kernel modules against the local BYOVD/LOLDrivers catalog (no network). Catch the signed exploit driver before it is unloaded. Args: {}.\n";
     stream << L"- byovd.status: show local BYOVD catalog age, source counts, and YARA rule availability. Args: {}.\n";
-    stream << L"- pool.scan_pe: hunt PE images (intact or signature-wiped) staged in kernel big pool. Args: optional tag, limit strings; optional boolean suspicious.\n";
+    stream << L"- pool.scan_pe: staged-pool-PE layer; hunt PE images (intact or signature-wiped) in kernel big pool. Independent-page mapper images are kpage.list, not this tool. Args: optional tag, limit strings; optional boolean suspicious.\n";
     stream << L"- hunt.run: whole-system user-mode anomaly hunt. Args: optional mode string quick or deep.\n";
     stream << L"- snapshot.capture: capture a same-boot evidence baseline. Args: optional name string.\n";
     stream << L"- snapshot.show: show the current baseline or a snapshot JSON file. Args: optional source/path string, optional booleans domains, warnings.\n";
@@ -39003,8 +39037,9 @@ static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
     stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
     stream << L"- For inline ETW hook questions, use etw.integrity.\n";
     stream << L"- For NMI callback questions, use nmi.list.\n";
-    stream << L"- For unbacked hook targets or leftover pool/independent-page code, use payload.inspect or payload.scan.\n";
-    stream << L"- For unloaded-driver / mapper remnants, use mapper.list.\n";
+    stream << L"- Mapper-family detection is layered. loaded BYOVD: byovd.scan. bookkeeping remnants: mapper.list. orphan pages: kpage.list. hook-to-body: payload.scan / payload.inspect. staged pool PE: pool.scan_pe. Do not treat mapper.list leftover=0 as proof the payload is gone.\n";
+    stream << L"- For unbacked hook targets or leftover independent-page code, use payload.inspect or payload.scan.\n";
+    stream << L"- For unloaded-driver / mapper bookkeeping remnants, use mapper.list.\n";
     stream << L"- For executable kernel pages outside modules, use kpage.list. Use deep=true only when the operator asks for a PFN walk.\n";
     stream << L"- For firmware table provider, SystemRegisterFirmwareTableInformationHandler, or firmware-table cheat-channel questions, use fwtable.list.\n";
     stream << L"- For W+X pool or suspicious big pool allocation questions, use pool.find with wx=true or explicit filters.\n";

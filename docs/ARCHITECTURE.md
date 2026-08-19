@@ -239,14 +239,30 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 
 ## Leftover Payload Flow
 
+kdmapper-style attacks are two objects: a signed exploit driver that was
+really loaded (`NtLoadDriver` / `IopLoadDriver`), and a payload copied into
+independent kernel pages that was never a loaded module. No single command
+covers both. Operators must not treat `!mapper leftover=0` as "no mapper".
+
+Detection layers (run in this order when the goal is mapper-family coverage):
+
+| Layer | Command | What it can see | What a quiet result means |
+|---|---|---|---|
+| Loaded BYOVD | `byovd` / `!byovd` | The signed exploit driver while it is still in the module list | Image already unloaded, or never matched the catalog |
+| Bookkeeping remnants | `!mapper` | Incomplete cleanup of `MmUnloadedDrivers`, `PiDDBCacheTable`, `g_KernelHashBucketList` for a driver that was loaded for real | Ledgers look clean. Stock kdmapper wipe is expected to look like this |
+| Orphan executable pages | `!kpage` (`/pe`, `/wx`) | Executable leaves outside `SystemModuleInformation`, including independent-page payloads | No such leaves in the walked tables. PTE-remap into a live module still hides here |
+| Hook-to-body | `!payload` / `!payload scan` | Hook pointers (callbacks, SSDT, IDT, NMI, HAL, MSR, ETW, WFP, DPC, dispatch, firmware tables) that land outside every loaded module | No scanned hook surface pointed off-module. Does not prove orphan pages are unused |
+| Staged pool PE | `pool-scan-pe` | Intact or signature-wiped PE headers in big pool | Payload was not pool-backed, or the header is gone |
+| Temporal bookkeeping | `!snapshot` domain `leftover-mapper` | Same-boot add/drop of `!mapper` records | Snapshot never runs `!kpage` or `!payload scan` |
+
 1. These scanners stay in user mode and reuse `ReadMemory`, `TranslateVirtual`, `ReadPhysical`, `ReadControlRegisters`, and `GetPhysicalMemoryRanges`. The driver ABI does not change.
 2. `!payload <addr>` (`PayloadTracer`) inspects one kernel VA: module containment from `SystemModuleInformation`, `InspectAddress` page-walk permissions, one `SystemBigPoolInformation` snapshot, a PE-header probe at the pool base or page-aligned VA (intact or signature-wiped), and a bounded Zydis disassembly. Classification is evidence, not proof.
 3. `!payload scan` first collects function pointers that sit outside every loaded module from the existing hook scanners (callbacks, SSDT, IDT, NMI, HAL, SYSCALL MSRs, ETW, WFP callouts, DPC/timer, driver dispatch, firmware table handlers). A failed surface is a coverage warning. Unique addresses are then traced with the same path as `!payload <addr>`, capped by `/limit` (default 16, max 128).
-4. `!mapper` (`MapperRemnantScanner`) walks `nt!MmUnloadedDrivers` (PDB `_MM_UNLOADED_DRIVER` or a guarded 0x28 x64 fallback), `nt!PiDDBCacheTable` as an `RTL_AVL_TABLE` whose root parent must point back at the table, and `ci!g_KernelHashBucketList` (or nearby ci symbols) as either a `LIST_ENTRY` head or a singly-linked chain. Missing symbols fail closed. Names that are not in the live module list, wiped names with a non-zero range, or an unloaded range that is still present+executable are flagged.
+4. `!mapper` (`MapperRemnantScanner`) walks `nt!MmUnloadedDrivers` with the stable x64 `0x28` slot (public PDBs omit `_MM_UNLOADED_DRIVER`; a missing-type `GetTypeLayout` would load every kernel PDB). `nt!PiDDBCacheTable` is validated as an `RTL_AVL_TABLE` using x64 routine slots `0x48/0x50/0x58`; a failed header falls back to `nt!PiDDBCacheList`. `ci!g_KernelHashBucketList` (or nearby ci symbols) is either a `LIST_ENTRY` head or a singly-linked chain. Missing symbols fail closed. Overlap with a live image is `REUSED` or `RELOAD`, not `STILL-X`. Names explained by the unload log or `dump_*` are `EXPECTED` and omitted from default output. Wiped names with a non-zero range, a zero `TimeDateStamp`, or an unloaded range that is still present+executable and not reused are `SUSPICIOUS`. The mapped payload itself is not in these lists.
 5. `!kpage` (`OrphanKernelPageScanner`) walks the kernel half of the live CR3 page tables, coalesces adjacent executable leaves that do not overlap any loaded module, and skips the `MmPteBase` self-map window. Session-space hits stay low-risk unless they are W+X or PE-like. `/wx` and `/pe` filter after classification.
 6. `!kpage /deep` additionally walks `nt!MmPfnDatabase` using the PDB `_MMPFN` layout and `PteAddress`, decodes the VA as `(PteAddress - MmPteBase) << 9`, and keeps ActiveAndValid executable kernel pages the page-table walk did not emit. The PFN pass is capped and is not part of `!snapshot`.
 7. Snapshots store `leftover-mapper` only. `!kpage` and `!payload scan` stay operator commands: a kernel page-table walk is too expensive for every baseline, and hook surfaces are already captured in their own domains.
-8. MCP/AI tools are `payload.inspect`, `payload.scan`, `mapper.list`, and `kpage.list`. `kpage.list` must not set `deep=true` unless the operator asks for a PFN walk.
+8. MCP/AI tools are `byovd.scan`, `mapper.list`, `kpage.list`, `payload.inspect`, `payload.scan`, and `pool.scan_pe`. `kpage.list` must not set `deep=true` unless the operator asks for a PFN walk. Planner text must not treat a clean `mapper.list` as payload absence.
 
 ## Minifilter IRP Control Flow
 

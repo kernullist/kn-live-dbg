@@ -15,9 +15,11 @@ Completed core slices:
 3. Module integrity scanning.
 4. Driver dispatch integrity.
 5. Live complete dump (`dump-kernel`) and OS live dump (`dump-live`).
-6. Leftover payload detectors: `!payload` hook-to-body trace, `!mapper`
-   (`MmUnloadedDrivers` / PiDDB / ci hash), `!kpage` orphan executable
-   kernel pages, and optional `!kpage /deep` PFN walk.
+6. Leftover payload detectors, as separate layers: `byovd` (loaded BYOVD),
+   `!mapper` (bookkeeping remnants: `MmUnloadedDrivers` / PiDDB / ci hash),
+   `!kpage` (orphan executable pages; optional `/deep` PFN walk),
+   `!payload` (hook-to-body), and `pool-scan-pe` (staged pool PE). A clean
+   `!mapper` is ledger-clean, not payload-absent.
 7. Minifilter IRP control: `!minifilter` list/show plus session-backed
    enable/disable of one filter IRP, or every registered slot
    (`disable-all` / `irp=all`).
