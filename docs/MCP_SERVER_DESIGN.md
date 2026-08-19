@@ -14,7 +14,7 @@ The core principles carry over directly from the philosophy of the existing `doc
 
 ### 1.1 Purpose
 
-1. Let external LLMs invoke read-only detection features such as `callbacks`, `!wfp`, `!alpc`, `!vbs`, `!etw`, `!nmi`, `!ssdt`, `!idt`, `!cr`, `!msrcheck`, `!pool`, `!address`, `byovd`, `!ti`, `module/driver integrity`, and VAD/thread hunting in a structured form.
+1. Let external LLMs invoke read-only detection features such as `!callbacks`, `!wfp`, `!alpc`, `!vbs`, `!etw`, `!nmi`, `!ssdt`, `!idt`, `!cr`, `!msrcheck`, `!pool`, `!address`, `!byovd`, `!ti`, `module/driver integrity`, and VAD/thread hunting in a structured form.
 2. Because this exposes an **elevated (Administrator/SYSTEM)** tool capable of kernel memory read/write to an LLM, minimize the attack surface and audit every action. Writes / kernel mutations are fully blocked in v1.
 3. Reuse existing assets (capability catalog, guard functions, `Build*Json`, `ScopedWideStreamCapture`) as much as possible to reduce new code and risk.
 
@@ -170,7 +170,7 @@ Rules (invariants):
 
 ### 4.3 Backpressure / Cancellation / Lifetime
 
-- **One in-flight**: the engine runs only one job at a time. A long scan (UserModeHunter, pool-scan-pe, full callbacks) blocks all other MCP requests and the operator for that duration -- this is **intentional backpressure**, not to be masked by a false cancellation promise.
+- **One in-flight**: the engine runs only one job at a time. A long scan (UserModeHunter, !pool pe, full callbacks) blocks all other MCP requests and the operator for that duration -- this is **intentional backpressure**, not to be masked by a false cancellation promise.
 - **Bounded waiting queue (e.g., MCP 8)**: when full, respond with `isError:true` ("engine busy") (§7.3 -- not a JSON-RPC -32xxx).
 - **Operator priority**: pop CONSOLE jobs from the queue before MCP jobs. However, an in-flight job cannot be preempted, so this does not guarantee "the operator always runs immediately" (stated honestly).
 - **Cancellation (honest model)**: a cancellation notification removes **only jobs still in the queue**. A dispatched scan runs to completion -- because scanners have no stop token (C9) and `DeviceIoControl` is synchronous. We do not promise "mid-flight cancellation." To keep scans short, enforce `limit`/`count` arguments.
@@ -559,8 +559,8 @@ Added kernel anti-cheat detections not in the initial catalog (the 18 tools used
 | `cr.scan` | `!cr` | `BuildCrJson` (`.cr.v1`) | CR0.WP/SMEP/SMAP |
 | `msr.check` | `!msrcheck` | `BuildMsrJson` (`.msr.v1`) | SYSCALL MSR hooks |
 | `vbs.scan` | `!vbs` | `BuildVbsJson` (`.vbs.v1`) | VBS/HVCI/CI/SecureKernel/trustlet (a single tool covering !ci/!securekernel) |
-| `byovd.scan` | `byovd scan /no-update` | `BuildByovdScanJson` (existing) | `/no-update` forced (blocks network/subprocess) |
-| `pool.scan_pe` | `pool-scan-pe` | `BuildPoolPeJson` (`.pool-pe.v1`) | args tag/limit/suspicious; `/dump` not exposed |
+| `byovd.scan` | `!byovd scan /no-update` | `BuildByovdScanJson` (existing) | `/no-update` forced (blocks network/subprocess) |
+| `pool.scan_pe` | `!pool pe` | `BuildPoolPeJson` (`.pool-pe.v1`) | args tag/limit/suspicious; `/dump` not exposed |
 | `payload.inspect` | `!payload` | `BuildPayloadTraceJson` (`.payload.v1`) | hook-to-body; args address/va/symbol |
 | `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | hook-to-body; args limit |
 | `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | bookkeeping remnants; leftover=0 is ledger-clean; args scope/limit |

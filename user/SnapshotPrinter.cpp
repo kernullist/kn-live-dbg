@@ -27,7 +27,7 @@ namespace
         {
             if (SnapshotRecordHasTag(record, L"pool-pe"))
             {
-                follow = L"pool-scan-pe /tag " + EvidenceValue(record, L"tag") + L" /dump .\\poolpe-hits";
+                follow = L"!pool pe /tag " + EvidenceValue(record, L"tag") + L" /dump .\\poolpe-hits";
             }
             else if (SnapshotRecordHasTag(record, L"wx"))
             {
@@ -55,11 +55,11 @@ namespace
         }
         else if (record.Domain == L"callbacks")
         {
-            follow = L"callbacks all " + EvidenceValue(record, L"function_module");
+            follow = L"!callbacks all " + EvidenceValue(record, L"function_module");
         }
         else if (record.Domain == L"byovd")
         {
-            follow = L"byovd scan /no-update";
+            follow = L"!byovd scan /no-update";
         }
         else if (record.Domain == L"etw")
         {

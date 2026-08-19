@@ -77,13 +77,13 @@ struct PeHeaderProbe
 // Non-mutating PE header probe over an arbitrary byte buffer. Returns true if
 // a plausible IMAGE_NT_HEADERS instance is located (intact or recovered from
 // wiped MZ/PE signatures), with the metadata and anomaly flags populated in
-// PeHeaderProbe. Used by pool-scan-pe to flag PE images stashed in pool
+// PeHeaderProbe. Used by !pool pe to flag PE images stashed in pool
 // memory, including malware-style header-stripped variants.
 bool ProbeForPeHeader(const uint8_t* buffer, size_t length, PeHeaderProbe* result);
 
 // Page-start leftover probe. Uses DOS.e_lfanew only (no interior 4-byte NT
 // scan). For kernel leftover pages a random FILE_HEADER in the page is not a
-// mapped image. dump-pe / pool-scan-pe keep the looser ProbeForPeHeader.
+// mapped image. dump-pe / !pool pe keep the looser ProbeForPeHeader.
 bool ProbeForPageStartPeHeader(const uint8_t* buffer, size_t length, PeHeaderProbe* result);
 
 // Dumps [address, address+length) verbatim to <path>. On read failure the

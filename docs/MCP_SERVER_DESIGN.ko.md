@@ -14,7 +14,7 @@
 
 ### 1.1 목적
 
-1. 외부 LLM이 `callbacks`, `!wfp`, `!alpc`, `!vbs`, `!etw`, `!nmi`, `!ssdt`, `!idt`, `!cr`, `!msrcheck`, `!pool`, `!address`, `byovd`, `!ti`, `module/driver integrity`, VAD/thread 헌트 등 읽기 전용 탐지 기능을 구조화된 형태로 호출하게 한다.
+1. 외부 LLM이 `!callbacks`, `!wfp`, `!alpc`, `!vbs`, `!etw`, `!nmi`, `!ssdt`, `!idt`, `!cr`, `!msrcheck`, `!pool`, `!address`, `!byovd`, `!ti`, `module/driver integrity`, VAD/thread 헌트 등 읽기 전용 탐지 기능을 구조화된 형태로 호출하게 한다.
 2. 커널 메모리 read/write가 가능한 **elevated(관리자/SYSTEM)** 도구를 LLM에 노출하는 만큼, 공격 표면을 최소화하고 모든 행위를 감사한다. write/커널 변형은 v1에서 전면 차단한다.
 3. 기존 자산(capability 카탈로그, 가드 함수, `Build*Json`, `ScopedWideStreamCapture`)을 최대한 재사용해 신규 코드와 위험을 줄인다.
 
@@ -170,7 +170,7 @@ while (!g_StopRequested)
 
 ### 4.3 백프레셔 · 취소 · 수명
 
-- **인플라이트 1개**: 엔진은 한 번에 job 하나만 실행. 긴 스캔(UserModeHunter, pool-scan-pe, full callbacks)은 그 시간 동안 다른 모든 MCP 요청과 operator를 막는다 — 이는 **의도된 백프레셔**이며, 잘못된 취소 약속으로 가리지 않는다.
+- **인플라이트 1개**: 엔진은 한 번에 job 하나만 실행. 긴 스캔(UserModeHunter, !pool pe, full callbacks)은 그 시간 동안 다른 모든 MCP 요청과 operator를 막는다 — 이는 **의도된 백프레셔**이며, 잘못된 취소 약속으로 가리지 않는다.
 - **대기 큐 bounded(예: MCP 8)**: 가득 차면 `isError:true`("engine busy")로 응답(§7.3 — JSON-RPC -32xxx 아님).
 - **operator 우선순위**: 큐에서 CONSOLE job을 MCP job보다 먼저 꺼낸다. 단, 인플라이트 job은 선점 불가하므로 "operator가 항상 즉시 실행"을 보장하진 않는다(정직하게 명시).
 - **취소(정직한 모델)**: cancellation notification은 **큐에 남아있는 job만** 제거한다. 디스패치된 스캔은 끝까지 실행된다 — 스캐너에 stop token이 없고(C9) `DeviceIoControl`이 동기이기 때문. "중도 취소"를 약속하지 않는다. 스캔을 짧게 유지하려면 `limit`/`count` 인자를 강제한다.
@@ -558,8 +558,8 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 | `cr.scan` | `!cr` | `BuildCrJson`(`.cr.v1`) | CR0.WP/SMEP/SMAP |
 | `msr.check` | `!msrcheck` | `BuildMsrJson`(`.msr.v1`) | SYSCALL MSR 후크 |
 | `vbs.scan` | `!vbs` | `BuildVbsJson`(`.vbs.v1`) | VBS/HVCI/CI/SecureKernel/trustlet (단일 툴로 !ci/!securekernel 포함) |
-| `byovd.scan` | `byovd scan /no-update` | `BuildByovdScanJson`(기존) | `/no-update` 강제(네트워크/subprocess 차단) |
-| `pool.scan_pe` | `pool-scan-pe` | `BuildPoolPeJson`(`.pool-pe.v1`) | args tag/limit/suspicious; `/dump` 미노출 |
+| `byovd.scan` | `!byovd scan /no-update` | `BuildByovdScanJson`(기존) | `/no-update` 강제(네트워크/subprocess 차단) |
+| `pool.scan_pe` | `!pool pe` | `BuildPoolPeJson`(`.pool-pe.v1`) | args tag/limit/suspicious; `/dump` 미노출 |
 | `payload.inspect` | `!payload` | `BuildPayloadTraceJson` (`.payload.v1`) | 훅-투-바디; args address/va/symbol |
 | `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | 훅-투-바디; args limit |
 | `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | 장부 잔흔; leftover=0은 장부 클린; args scope/limit |

@@ -207,7 +207,7 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
     *result = PoolPeHunterResult{};
     result->BigPoolAddressViewOnly = true;
     result->Diagnostics.push_back(
-        L"pool-scan-pe address view is big-pool only (PoolBigPageTable); small-pool PE images are not enumerated by VA");
+        L"!pool pe address view is big-pool only (PoolBigPageTable); small-pool PE images are not enumerated by VA");
 
     bool ok = false;
     void* buffer = nullptr;

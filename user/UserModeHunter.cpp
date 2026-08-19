@@ -22149,7 +22149,7 @@ namespace
                 {
                     L"!driver integrity " + record.Name + L" /limit 80",
                     L"!ssdt",
-                    L"callbacks all"
+                    L"!callbacks all"
                 };
 
                 AddSystemFinding(
