@@ -65,13 +65,13 @@ kn-live-dbg/
 25. Detects InfinityHook-style ETW logger tampering with `!etw` and walks the registered NMI handler chain with `!nmi` — reading `nt!EtwpDebuggerData`'s 64 `WMI_LOGGER_CONTEXT*` slots for logger name and GetCpuClock annotation, walking `nt!KiNmiCallbackListHead` through the `KNMI_HANDLER_CALLBACK` singly-linked list, and flagging any callback or GetCpuClock target outside the loaded kernel modules.
 26. Enumerates registered firmware table providers with `!fwtable` -- passively walking `nt!ExpFirmwareTableProviderListHead`, decoding `SYSTEM_FIRMWARE_TABLE_HANDLER`-style provider nodes, annotating ProviderSignature, handler module/symbol, and DriverObject owner/name/start/size, and flagging custom signatures, duplicate signatures, corrupt links, non-image handlers, unresolved DriverObject module ownership, and handler/DriverObject owner mismatches without invoking firmware handlers.
 27. Checks live module and driver-object integrity with `!module integrity` and `!driver integrity` -- reading live PE headers/sections for loaded modules, validating PE/section invariants with reason codes, flagging static/effective W+X evidence or live SizeOfImage drift, walking `\Driver` objects through Object Manager metadata, and annotating `DRIVER_OBJECT.MajorFunction[]` dispatch targets with module/symbol ownership.
-28. Scans loaded kernel modules for BYOVD risk with `byovd` / `!byovd` -- maintaining a local catalog from the Microsoft vulnerable driver blocklist plus LOLDrivers hash/YARA feeds, auto-refreshing it when older than 24 hours, hashing loaded module images on disk, optionally running LOLDrivers YARA rules through an operator-supplied `yara64.exe` / `yara.exe`, and reporting exact hash/YARA matches as `HIGH` confidence plus Microsoft file-name/version blocklist hints as `MEDIUM` confidence. A benign no-op fixture driver (`amdryzenmasterdriver.sys`) can be loaded with `byovd fixture load` to exercise the Microsoft name/version positive-control path without shipping an actual vulnerable driver.
+28. Scans loaded kernel modules for BYOVD risk with `!byovd` -- maintaining a local catalog from the Microsoft vulnerable driver blocklist plus LOLDrivers hash/YARA feeds, auto-refreshing it when older than 24 hours, hashing loaded module images on disk, optionally running LOLDrivers YARA rules through an operator-supplied `yara64.exe` / `yara.exe`, and reporting exact hash/YARA matches as `HIGH` confidence plus Microsoft file-name/version blocklist hints as `MEDIUM` confidence. A benign no-op fixture driver (`amdryzenmasterdriver.sys`) can be loaded with `!byovd fixture load` to exercise the Microsoft name/version positive-control path without shipping an actual vulnerable driver.
 29. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), W+X page attributes (`/wx`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
 30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, reporting added/escalated records plus coverage-gated callback removal and `_EPROCESS.Protection` changes, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first.
 31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, writes a WinDbg-openable complete dump with `dump-kernel <path>` (8 KB `DUMP_HEADER64` plus streamed physical RAM runs from `MmGetPhysicalMemoryRanges`), and asks Windows for an OS live kernel dump with `dump-live <path>` via `NtSystemDebugControl(SysDbgGetLiveKernelDump)`, or writes a WinDbg kernel complete dump of one process with `dump-live <path> /user <pid|eprocess>`. `dump-pe` parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
-32. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
+32. Hunts PE images stashed in big pool with `!pool pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
 33. Lists filesystem minifilters and can disable or restore one IRP pre/post handler, or every registered slot, with `!minifilter`. The walk uses `fltmgr!FltGlobals` and PDB `_FLT_OPERATION_REGISTRATION` offsets. `disable` writes NULL through the existing write IOCTL after saving the original pointers in this session; `enable` puts them back. `disable <name> all` and `disable-all` walk every slot. Inbox filters warn. No new driver IOCTL.
-34. Traces leftover mapper payloads after the original driver image is gone, as separate layers. `byovd` is loaded BYOVD. `!mapper` is bookkeeping remnants (`MmUnloadedDrivers` / PiDDB / ci hash); `leftover=0` is ledger-clean, not payload-absent. `!kpage` is orphan executable pages; `!kpage /deep` adds a capped PFN-database pass. `!payload` / `!payload scan` is hook-to-body. `pool-scan-pe` is staged pool PE. None of these add driver IOCTLs.
+34. Traces leftover mapper payloads after the original driver image is gone, as separate layers. `!byovd` is loaded BYOVD. `!mapper` is bookkeeping remnants (`MmUnloadedDrivers` / PiDDB / ci hash); `leftover=0` is ledger-clean, not payload-absent. `!kpage` is orphan executable pages; `!kpage /deep` adds a capped PFN-database pass. `!payload` / `!payload scan` is hook-to-body. `!pool pe` is staged pool PE. None of these add driver IOCTLs.
 34. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
 34. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
 35. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
@@ -209,7 +209,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `callbacks <Tab>` for callback scopes, `callbacks object /module<Tab>` for the module option, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. Examples include `!callbacks <Tab>` for callback scopes, `!callbacks object /module<Tab>` for the module option, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -223,8 +223,8 @@ help all
 help <command>
 <command> help
 ai help <subcommand>
-help callbacks
-callbacks <scope> help
+help !callbacks
+!callbacks <scope> help
 ai <subcommand> help
 home
 dashboard
@@ -258,8 +258,8 @@ u <address|symbol> [instruction-count]
 uf <address|symbol> [max-instructions]
 dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
-callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
-callbacks [scope] /module <module>
+!callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
+!callbacks [scope] /module <module>
 !dml_proc [pid|name]
 !hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
@@ -287,10 +287,10 @@ callbacks [scope] /module <module>
 !fwtable providers /module <name>
 !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]
 !driver integrity [driver|all] [/limit <n>] [/json <path>]
-byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
 !byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
-byovd fixture [status|load [sys-path]|unload|path]
-!pool [big|find|summary] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx]
+!byovd fixture [status|load [sys-path]|unload|path]
+!pool [big|find|summary|pe] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx]
+!pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
 !snapshot baseline [/all] [/name <label>]
 !snapshot save <path> [/all] [/name <label>]
 !snapshot show [baseline|<path>] [/domains] [/warnings]
@@ -300,7 +300,6 @@ dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
 dump-kernel <path> [/max <bytes>] [/strict]
 dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]
-pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
 !payload <address|symbol> [/disasm <n>] [/json <path>]
 !payload scan [/limit <n>] [/disasm <n>] [/json <path>]
 !mapper [all|unloaded|piddb|cihash] [/limit <n>] [/json <path>]
@@ -367,12 +366,12 @@ knkd> !eb <physical-address>
 knkd> !eq <physical-address> <value>
 knkd> dt nt!_EPROCESS
 knkd> dt -r1 nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
-knkd> callbacks all
-knkd> callbacks object
-knkd> callbacks imageload
-knkd> callbacks minifilter
-knkd> callbacks all WdFilter.sys
-knkd> callbacks /module WdFilter.sys
+knkd> !callbacks all
+knkd> !callbacks object
+knkd> !callbacks imageload
+knkd> !callbacks minifilter
+knkd> !callbacks all WdFilter.sys
+knkd> !callbacks /module WdFilter.sys
 knkd> !dml_proc
 knkd> !dml_proc 4
 knkd> !dml_proc lsass
@@ -416,8 +415,8 @@ knkd> !diff baseline /domain pool /limit 20
 knkd> dump-raw nt!KiSystemServiceUser 0x200 .\kiSystemServiceUser.bin
 knkd> dump-pe nt .\ntoskrnl-live.exe
 knkd> dump-pe Wdf01000 .\wdf01000-live.sys
-knkd> pool-scan-pe
-knkd> pool-scan-pe /suspicious /dump .\poolpe-hits
+knkd> !pool pe
+knkd> !pool pe /suspicious /dump .\poolpe-hits
 knkd> !payload scan
 knkd> !payload fffffc0000123456
 knkd> !mapper
@@ -449,7 +448,7 @@ knkd> ai config provider openai-codex-cli
 knkd> ai config test
 knkd> ai a.exe eprocess
 knkd> ai pid 1234 dtb
-knkd> ai callbacks all WdFilter.sys
+knkd> ai !callbacks all WdFilter.sys
 knkd> ai check VBS status
 knkd> ai !ci options
 knkd> ai show
@@ -497,7 +496,7 @@ ai a.exe eprocess
 ai a.exe process eprocess info
 ai pid 1234 dtb
 ai WdFilter.sys object callbacks
-ai callbacks all WdFilter.sys
+ai !callbacks all WdFilter.sys
 ai dt nt!_EPROCESS <address> UniqueProcessId ActiveProcessLinks
 ai uf nt!PspCreateProcessNotifyRoutine 128
 ai check VBS status
@@ -535,7 +534,7 @@ Supported keys:
 8. If no Codex auth file is configured, Kn Live Dbg checks `%USERPROFILE%\.kernforge\codex_auth.json` and `%USERPROFILE%\.codex\auth.json`.
 9. `KNLIVEDBG_CODEX_CLI_PATH` overrides the `codex` executable used by `openai-codex-cli`.
 
-Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
+Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze !callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
 
 For `ai <question>`, the provider sees the operator prompt plus a capability catalog, not live memory contents. The catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `minifilter.list`, `payload.inspect`, `payload.scan`, `mapper.list`, `kpage.list`, `fwtable.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, and `driver.integrity`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback/WFP/ALPC prompts route through their native scanners with validated scope/filter args. Firmware table provider prompts route through the passive `!fwtable` scanner and never invoke firmware handlers. Requests that ask to list, show, recommend, or suggest commands route to the planner first, so command-advice prompts do not run native scanners immediately. Process memory prompts route through `!vad` or `!threads`, including VAD DKOM prompts that set `hiddenpte=true` and run `!vad <target> /hiddenpte`. Integrity prompts such as `ai any inline ETW hook?`, `ai list NMI callbacks`, `ai list firmware table providers`, `ai show W+X pool allocations`, `ai why is nt!Foo suspicious?`, `ai decode this WNF state name 0x41c64e6da3bc0075`, `ai list live WNF instances`, `ai query recent TI WriteVM events`, `ai inspect module text integrity with headers and sections`, `ai find W+X kernel modules`, and `ai check driver dispatch integrity` route through the corresponding local read-only tool. Exact read-only commands after `ai`, such as `ai callbacks all WdFilter.sys`, `ai dt nt!_EPROCESS <address>`, `ai uf nt!Foo`, `ai !ci options`, `ai !vbs`, or `ai !fwtable providers`, are treated as evidence commands: Kn Live Dbg runs the command, captures stdout/stderr, and asks the selected model to explain the evidence. If neither a local capability nor an evidence command fits but the request looks investigative, `ai <question>` automatically builds a validated `kn-live-dbg.ai-plan.v2` command plan and leaves execution to `ai run`. `module.integrity` accepts validated `target`/`module`/`name`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, and `mismatch` args before the local executor builds the native command. The capability parser rejects unknown tools, unknown fields, unsafe characters, invalid scalars, write-like actions, raw `kd`, nested `ai`, session mutation, unload/shutdown, and command chaining before any native handler is called. The compatibility local process resolver remains as a fallback when the provider is disabled or the tool planner cannot produce a usable local plan.
 
@@ -558,7 +557,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!payload`, `!mapper`, `!kpage`, `!minifilter`, `!fwtable`, `!module`, `!driver`, `!pool`, `!snapshot`, `!diff`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, `pool-scan-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `!callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!payload`, `!mapper`, `!kpage`, `!minifilter`, `!fwtable`, `!module`, `!driver`, `!pool`, `!snapshot`, `!diff`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 
@@ -918,8 +917,8 @@ BYOVD path is offline/reproducible and high-signal: it reuses the local catalog,
 never runs the updater script from inside `!hunt`, and suppresses name/version
 hints that require signer context. Weak ESET driver names are also suppressed in
 the loaded-module name-only sweep unless hash, Gentlemen-staged service, or
-integrity evidence supplies stronger context. Run `byovd update` explicitly
-when fresh driver intelligence is needed, or `byovd scan` when broader hinting
+integrity evidence supplies stronger context. Run `!byovd update` explicitly
+when fresh driver intelligence is needed, or `!byovd scan` when broader hinting
 is desired.
 The SCM scan is also read-only and surfaces installed or running driver services
 whose service name or configured binary path matches a strong EDR-killer driver
@@ -1128,18 +1127,18 @@ The elevated positive-control gate exercises every VAD filter plus both new mode
 
 ## Kernel Callback Scanner
 
-`callbacks` walks live kernel callback lists using kernel PDB type layouts and the native memory reader:
+`!callbacks` walks live kernel callback lists using kernel PDB type layouts and the native memory reader:
 
 ```text
-callbacks all
-callbacks object
-callbacks registry
-callbacks process
-callbacks thread
-callbacks imageload
-callbacks minifilter
-callbacks object WdFilter.sys
-callbacks minifilter UnionFS
+!callbacks all
+!callbacks object
+!callbacks registry
+!callbacks process
+!callbacks thread
+!callbacks imageload
+!callbacks minifilter
+!callbacks object WdFilter.sys
+!callbacks minifilter UnionFS
 ```
 
 The scanner currently covers:
@@ -1151,7 +1150,7 @@ The scanner currently covers:
 5. Image load callbacks by enumerating and validating load-image notify routine table candidates such as `PspLoadImageNotifyRoutine`, then decoding callback routine blocks with the same stable x64 fallback.
 6. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
 
-Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Image-load output uses `function` for the `PLOAD_IMAGE_NOTIFY_ROUTINE` owner and reports the decoded notify block plus raw encoded slot value. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `callbacks object WdFilter.sys` or `callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
+Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Image-load output uses `function` for the `PLOAD_IMAGE_NOTIFY_ROUTINE` owner and reports the decoded notify block plus raw encoded slot value. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `!callbacks object WdFilter.sys` or `!callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
 
 ## Windows Filtering Platform
 
@@ -1391,7 +1390,7 @@ The diff is intentionally biased toward new or defense-relevant state changes:
 5. `!diff baseline` scans VAD DKOM hidden-PTE evidence for every process that is new since the baseline and still alive at diff time.
 6. Low-risk child records implied by a newly added parent, such as a new driver's routine dispatch entries, are folded by default and counted as `hiddenChildren`; add `/details` to expand them.
 
-The `/all` option is accepted for explicitness; the current native baseline captures the full implemented domain set by default: modules, drivers, callbacks, Filter Manager minifilter attachments and volumes, ETW, NMI, cpu-state (SYSCALL MSRs / control registers / SSDT / IDT), firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, BYOVD, process inventory, and a separate `process-security` record for each readable `_EPROCESS.Protection` byte. Minifilter attachment capture uses read-only `FilterVolumeFind*` and `FilterVolumeInstanceFind*` calls; `--self-test minifilter-attachments-query` exposes the live enumeration contract and fails visibly when the token lacks the required access. BYOVD catalog auto-update is allowed for `!snapshot baseline` and `!snapshot save`, but `!diff baseline` reuses the local catalog in no-update mode and emits a warning if the catalog fingerprint differs between snapshots. YARA is not run by the snapshot path unless the standalone `byovd scan /yara` command is used.
+The `/all` option is accepted for explicitness; the current native baseline captures the full implemented domain set by default: modules, drivers, callbacks, Filter Manager minifilter attachments and volumes, ETW, NMI, cpu-state (SYSCALL MSRs / control registers / SSDT / IDT), firmware-table providers, pool, pool-PE, WFP, ALPC, WNF, VBS/CI, BYOVD, process inventory, and a separate `process-security` record for each readable `_EPROCESS.Protection` byte. Minifilter attachment capture uses read-only `FilterVolumeFind*` and `FilterVolumeInstanceFind*` calls; `--self-test minifilter-attachments-query` exposes the live enumeration contract and fails visibly when the token lacks the required access. BYOVD catalog auto-update is allowed for `!snapshot baseline` and `!snapshot save`, but `!diff baseline` reuses the local catalog in no-update mode and emits a warning if the catalog fingerprint differs between snapshots. YARA is not run by the snapshot path unless the standalone `!byovd scan /yara` command is used.
 
 Typical clean-baseline flow:
 
@@ -1527,17 +1526,15 @@ knkd> !driver integrity all /json .\driver-integrity.json
 
 ## BYOVD Intelligence Scan
 
-`byovd` (also accepted as `!byovd`) scans the currently loaded kernel module list against a local BYOVD catalog. The catalog is generated by `tools\update-byovd-intel.ps1` from the Microsoft vulnerable driver blocklist ZIP/XML plus LOLDrivers hash and YARA feeds. `byovd scan` automatically refreshes the local catalog under `<exe-dir>\data\byovd` when it is missing or older than 24 hours; use `/no-update` to force offline/reproducible mode or `/force-update` to refresh before scanning.
+`!byovd` scans the currently loaded kernel module list against a local BYOVD catalog. The catalog is generated by `tools\update-byovd-intel.ps1` from the Microsoft vulnerable driver blocklist ZIP/XML plus LOLDrivers hash and YARA feeds. `!byovd scan` automatically refreshes the local catalog under `<exe-dir>\data\byovd` when it is missing or older than 24 hours; use `/no-update` to force offline/reproducible mode or `/force-update` to refresh before scanning.
 
 ```text
-byovd [scan] [/no-update] [/force-update] [/exact] [/verbose] [/summary]
-             [/limit <n>] [/json <path>]
 !byovd [scan] [/no-update] [/force-update] [/exact] [/verbose] [/summary]
               [/limit <n>] [/json <path>]
-byovd scan /yara [/yara-path <exe>] [/yara-timeout <seconds>]
-byovd update [/force]
-byovd status
-byovd fixture [status|load [sys-path]|unload|path]
+!byovd scan /yara [/yara-path <exe>] [/yara-timeout <seconds>]
+!byovd update [/force]
+!byovd status
+!byovd fixture [status|load [sys-path]|unload|path]
 ```
 
 The scanner hashes each loaded module image on disk with MD5/SHA1/SHA256. Exact hash matches against Microsoft or LOLDrivers entries are reported as `HIGH` confidence. Microsoft file-attribute rules are also matched by file name plus PE file version and reported as `MEDIUM` confidence. The scanner reads PE version-info vendor metadata and suppresses third-party file-attribute hints against Microsoft-owned OS binaries, but full WDAC signer/certificate constraints are not yet enforced in this slice. `/exact` suppresses those name/version hints when the operator wants hash-only evidence.
@@ -1545,43 +1542,43 @@ The scanner hashes each loaded module image on disk with MD5/SHA1/SHA256. Exact 
 `/yara` additionally runs the downloaded LOLDrivers YARA files under `<exe-dir>\data\byovd\yara` against each loaded module image on disk. YARA execution uses an external `yara64.exe` / `yara.exe`, but release packages intentionally do not include YARA binaries. Install YARA separately, put it on `PATH`, or use `/yara-path <exe>` to pin a specific binary. KnLiveDbg also searches the EXE directory, `tools\`, development parent `tools\` directories, and the current working directory's `tools\` for operator-supplied binaries. `/yara-timeout <seconds>` caps each driver/rule invocation; the default is 30 seconds and accepted range is 1..600 seconds. YARA hits are emitted as `HIGH` confidence with `source=loldrivers_yara` and `match_type=yara`. JSON output uses `kn-live-dbg.byovd-scan.v1` and includes `summary.yara_*`, `yara.executable`, and `yara.rule_files`.
 `summary.yara_scans` counts attempted YARA process invocations, while `summary.yara_failures` and `summary.yara_timeouts` split out failed or timed-out attempts.
 
-`byovd fixture load` installs and starts the bundled no-op fixture driver `amdryzenmasterdriver.sys`. The driver creates no device, exposes no IOCTLs, and only sets `DriverUnload`; its file name and fixed PE version `1.0.0.0` are intentionally chosen to satisfy a Microsoft vulnerable-driver file-attribute rule so the scanner should report a `MEDIUM` signer-unverified hit. This fixture is for testing the name/version path only. `HIGH` exact-hash testing should use a test-only local catalog entry for a benign sample hash, not a real vulnerable driver binary.
+`!byovd fixture load` installs and starts the bundled no-op fixture driver `amdryzenmasterdriver.sys`. The driver creates no device, exposes no IOCTLs, and only sets `DriverUnload`; its file name and fixed PE version `1.0.0.0` are intentionally chosen to satisfy a Microsoft vulnerable-driver file-attribute rule so the scanner should report a `MEDIUM` signer-unverified hit. This fixture is for testing the name/version path only. `HIGH` exact-hash testing should use a test-only local catalog entry for a benign sample hash, not a real vulnerable driver binary.
 
 Positive-control flow:
 
 ```text
-knkd> byovd update
-knkd> byovd fixture load
-knkd> byovd scan /no-update /verbose
+knkd> !byovd update
+knkd> !byovd fixture load
+knkd> !byovd scan /no-update /verbose
 ...
 [byovd.hit] image=amdryzenmasterdriver.sys ... version=1.0.0.0 ...
   [byovd.match] confidence=MEDIUM source=microsoft_blocklist category=microsoft_file_attribute type=file_version name=amdryzenmasterdriver.sys versionRange=0.0.0.0..1.5.0.0
-knkd> byovd fixture unload
+knkd> !byovd fixture unload
 ```
 
-If the fixture fails to load before the scan, treat that as a platform policy result first: HVCI, Secure Boot, test-signing state, and the Windows vulnerable-driver blocklist can prevent a driver that intentionally matches a Microsoft blocklist rule from loading. In that case the scanner has no loaded module to report; use a test VM with the intended code-integrity policy, or validate the catalog/status path with `byovd status` and updater tests.
+If the fixture fails to load before the scan, treat that as a platform policy result first: HVCI, Secure Boot, test-signing state, and the Windows vulnerable-driver blocklist can prevent a driver that intentionally matches a Microsoft blocklist rule from loading. In that case the scanner has no loaded module to report; use a test VM with the intended code-integrity policy, or validate the catalog/status path with `!byovd status` and updater tests.
 
 Examples:
 
 ```text
-knkd> byovd
-knkd> byovd scan /exact
-knkd> byovd scan /yara
-knkd> byovd scan /yara /yara-path C:\Tools\YARA\yara64.exe /yara-timeout 15
-knkd> byovd scan /force-update /json .\byovd-scan.json
-knkd> byovd update
-knkd> byovd status
-knkd> byovd fixture load
-knkd> byovd scan
-knkd> byovd fixture unload
+knkd> !byovd
+knkd> !byovd scan /exact
+knkd> !byovd scan /yara
+knkd> !byovd scan /yara /yara-path C:\Tools\YARA\yara64.exe /yara-timeout 15
+knkd> !byovd scan /force-update /json .\byovd-scan.json
+knkd> !byovd update
+knkd> !byovd status
+knkd> !byovd fixture load
+knkd> !byovd scan
+knkd> !byovd fixture unload
 ```
 
 ## Big Pool PE Hunting
 
-`pool-scan-pe` combines the big pool enumerator with the `dump-pe` plausibility-gated PE header detector to surface hidden / reflectively-loaded modules camped in `nt!PoolBigPageTable` allocations. The detector accepts both intact and signature-wiped PE headers, so the common malware pattern of zeroing `MZ` / `PE\0\0` / `e_lfanew` to evade scanners no longer hides the payload.
+`!pool pe` combines the big pool enumerator with the `dump-pe` plausibility-gated PE header detector to surface hidden / reflectively-loaded modules camped in `nt!PoolBigPageTable` allocations. The detector accepts both intact and signature-wiped PE headers, so the common malware pattern of zeroing `MZ` / `PE\0\0` / `e_lfanew` to evade scanners no longer hides the payload.
 
 ```text
-pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]
+!pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]
              [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
 ```
 
@@ -1615,11 +1612,11 @@ look clean, not that the payload is gone.
 
 | Layer | Command | Role |
 |---|---|---|
-| Loaded BYOVD | `byovd` / `!byovd` | Catch the signed exploit driver while it is still mapped |
+| Loaded BYOVD | `!byovd` | Catch the signed exploit driver while it is still mapped |
 | Bookkeeping remnants | `!mapper` | Incomplete PiDDB / `MmUnloadedDrivers` / ci-hash wipe |
 | Orphan executable pages | `!kpage /pe` | Independent-page payload after the ledgers were cleaned |
 | Hook-to-body | `!payload scan` | Callbacks/SSDT/IDT/... that still jump to those pages |
-| Staged pool PE | `pool-scan-pe` | Pool-backed PE (intact or MZ/PE wiped). Not independent pages |
+| Staged pool PE | `!pool pe` | Pool-backed PE (intact or MZ/PE wiped). Not independent pages |
 | Temporal bookkeeping | `!snapshot` `leftover-mapper` | Same-boot add/drop of `!mapper` records only |
 
 These commands follow that leftover without widening the driver:
@@ -1633,7 +1630,7 @@ These commands follow that leftover without widening the driver:
 
 1. `!payload <addr>` translates the VA, looks it up in `SystemBigPoolInformation`,
    probes for an intact or signature-wiped PE header, and disassembles the first
-   instructions. Use this on a `<non-image>` hook pointer from `callbacks`,
+   instructions. Use this on a `<non-image>` hook pointer from `!callbacks`,
    `!ssdt`, `!idt`, `!nmi`, `!wfp`, or `!driver integrity`.
 2. `!payload scan` collects those unbacked hook pointers first, then traces each
    unique address. A failed hook surface is a coverage warning, not a clean miss.
@@ -1655,11 +1652,11 @@ These commands follow that leftover without widening the driver:
    `!snapshot` stores `leftover-mapper` only; it does not run `!kpage`.
 
 ```text
-knkd> byovd scan
+knkd> !byovd scan
 knkd> !mapper
 knkd> !kpage /wx /pe
 knkd> !payload scan
-knkd> pool-scan-pe /suspicious
+knkd> !pool pe /suspicious
 knkd> !kpage /deep /nosession
 ```
 
@@ -2010,7 +2007,7 @@ knkd> !ti grep ProtectionMask=0x40    # PAGE_EXECUTE_READWRITE (RWX)
 knkd> !ti save .\wx-trace.jsonl
 ```
 
-This recipe explicitly skips `!ti watch` -- the silent ring fills in the background while you keep the TUI free for `!pool` / `pool-scan-pe` to chase the resulting allocation in big pool.
+This recipe explicitly skips `!ti watch` -- the silent ring fills in the background while you keep the TUI free for `!pool` / `!pool pe` to chase the resulting allocation in big pool.
 
 #### 15) Cleanup at session end
 

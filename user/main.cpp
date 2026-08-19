@@ -1771,7 +1771,7 @@ static void PrintHelp(bool includeDbgEng)
 
     PrintColoredText(L"high-value topics", KNDBG_COLOR_ACCENT);
     std::wcout << L"\n";
-    std::wcout << L"  help callbacks       callback scanners and module filters\n";
+    std::wcout << L"  help !callbacks      callback scanners and module filters\n";
     std::wcout << L"  help !hunt           whole-system user-mode anomaly hunt\n";
     std::wcout << L"  help !vad            VAD triage, injection scan, hidden PTEs, mapped-PE inventory\n";
     std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
@@ -1806,7 +1806,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  memory        dq nt!PsLoadedModuleList 8 | db /process <pid> <user-address> 80\n";
     std::wcout << L"  memory        procctx <pid> | vtop /process <pid> <user-address> | pdb <pa> 80\n";
     std::wcout << L"  types/code    dt nt!_EPROCESS <address> | u nt!KiSystemCall64 8 | uf nt!KiSystemCall64 512\n";
-    std::wcout << L"  callbacks     callbacks all | callbacks imageload | callbacks process WdFilter.sys\n";
+    std::wcout << L"  callbacks     !callbacks all | !callbacks imageload | !callbacks process WdFilter.sys\n";
     std::wcout << L"  process       !hunt /deep /summary | !vad scan <pid> | !vad modules <pid> | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
@@ -1815,14 +1815,14 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"                !ssdt (syscall table hooks) | !idt (interrupt handler hooks)\n";
     std::wcout << L"  hunting       !byovd scan (loaded BYOVD) | !mapper (bookkeeping remnants)\n";
     std::wcout << L"                !kpage /pe (orphan pages) | !payload scan (hook-to-body)\n";
-    std::wcout << L"                pool-scan-pe /suspicious (staged pool PE) | !kpage /deep\n";
+    std::wcout << L"                !pool pe /suspicious (staged pool PE) | !kpage /deep\n";
     std::wcout << L"                !hunt | !pool find /wx\n";
     std::wcout << L"                !minifilter | !minifilter show <name> | !minifilter disable <name> all\n";
     std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
     std::wcout << L"  timeline      !timeline | !timeline dashboard | !timeline help advanced\n";
-    std::wcout << L"  ai            ai a.exe eprocess | ai explain callbacks all | ai plan check VBS status\n";
+    std::wcout << L"  ai            ai a.exe eprocess | ai explain !callbacks all | ai plan check VBS status\n";
     std::wcout << L"\n";
 
     CommandRegistry::PrintSummary(includeDbgEng);
@@ -1837,10 +1837,10 @@ static void PrintHelp(bool includeDbgEng)
 
 static void PrintCallbacksHelp()
 {
-    std::wcout << L"callbacks command:\n";
-    std::wcout << L"  callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
-    std::wcout << L"  callbacks [scope] /module <module>\n";
-    std::wcout << L"  callbacks <scope> help\n";
+    std::wcout << L"!callbacks command:\n";
+    std::wcout << L"  !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
+    std::wcout << L"  !callbacks [scope] /module <module>\n";
+    std::wcout << L"  !callbacks <scope> help\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
     std::wcout << L"  all          object-manager, registry, process, thread, image-load, and minifilter callbacks\n";
@@ -1858,15 +1858,15 @@ static void PrintCallbacksHelp()
     std::wcout << L"  Some private callback item layouts are absent from public PDBs; fallback notes are printed per record.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
-    std::wcout << L"  callbacks all\n";
-    std::wcout << L"  callbacks object\n";
-    std::wcout << L"  callbacks registry\n";
-    std::wcout << L"  callbacks process\n";
-    std::wcout << L"  callbacks thread\n";
-    std::wcout << L"  callbacks imageload\n";
-    std::wcout << L"  callbacks minifilter\n";
-    std::wcout << L"  callbacks object WdFilter.sys\n";
-    std::wcout << L"  callbacks minifilter UnionFS\n";
+    std::wcout << L"  !callbacks all\n";
+    std::wcout << L"  !callbacks object\n";
+    std::wcout << L"  !callbacks registry\n";
+    std::wcout << L"  !callbacks process\n";
+    std::wcout << L"  !callbacks thread\n";
+    std::wcout << L"  !callbacks imageload\n";
+    std::wcout << L"  !callbacks minifilter\n";
+    std::wcout << L"  !callbacks object WdFilter.sys\n";
+    std::wcout << L"  !callbacks minifilter UnionFS\n";
 }
 
 static std::wstring NormalizeCallbackHelpScope(const std::wstring& value)
@@ -1887,9 +1887,9 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
     }
     else if (scope == L"object")
     {
-        std::wcout << L"callbacks object:\n";
-        std::wcout << L"  callbacks object [module]\n";
-        std::wcout << L"  callbacks object /module <module>\n";
+        std::wcout << L"!callbacks object:\n";
+        std::wcout << L"  !callbacks object [module]\n";
+        std::wcout << L"  !callbacks object /module <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Object-manager pre/post filters from each _OBJECT_TYPE.CallbackList.\n";
@@ -1902,9 +1902,9 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
     }
     else if (scope == L"registry")
     {
-        std::wcout << L"callbacks registry:\n";
-        std::wcout << L"  callbacks registry [module]\n";
-        std::wcout << L"  callbacks registry /module <module>\n";
+        std::wcout << L"!callbacks registry:\n";
+        std::wcout << L"  !callbacks registry [module]\n";
+        std::wcout << L"  !callbacks registry /module <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Registry callbacks from CmpCallbackListHead-style callback-list candidates.\n";
@@ -1916,9 +1916,9 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
     }
     else if (scope == L"process")
     {
-        std::wcout << L"callbacks process:\n";
-        std::wcout << L"  callbacks process [module]\n";
-        std::wcout << L"  callbacks process /module <module>\n";
+        std::wcout << L"!callbacks process:\n";
+        std::wcout << L"  !callbacks process [module]\n";
+        std::wcout << L"  !callbacks process /module <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Process creation notification blocks from PspCreateProcessNotifyRoutine candidates.\n";
@@ -1930,9 +1930,9 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
     }
     else if (scope == L"thread")
     {
-        std::wcout << L"callbacks thread:\n";
-        std::wcout << L"  callbacks thread [module]\n";
-        std::wcout << L"  callbacks thread /module <module>\n";
+        std::wcout << L"!callbacks thread:\n";
+        std::wcout << L"  !callbacks thread [module]\n";
+        std::wcout << L"  !callbacks thread /module <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Thread creation notification blocks from PspCreateThreadNotifyRoutine candidates.\n";
@@ -1943,9 +1943,9 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
     }
     else if (scope == L"imageload")
     {
-        std::wcout << L"callbacks imageload:\n";
-        std::wcout << L"  callbacks imageload [module]\n";
-        std::wcout << L"  callbacks imageload /module <module>\n";
+        std::wcout << L"!callbacks imageload:\n";
+        std::wcout << L"  !callbacks imageload [module]\n";
+        std::wcout << L"  !callbacks imageload /module <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Image load notification blocks from PspLoadImageNotifyRoutine candidates.\n";
@@ -1957,9 +1957,9 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
     }
     else if (scope == L"minifilter")
     {
-        std::wcout << L"callbacks minifilter:\n";
-        std::wcout << L"  callbacks minifilter [module]\n";
-        std::wcout << L"  callbacks minifilter /module <module>\n";
+        std::wcout << L"!callbacks minifilter:\n";
+        std::wcout << L"  !callbacks minifilter [module]\n";
+        std::wcout << L"  !callbacks minifilter /module <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Minifilter filters and operation callbacks discovered from fltmgr!FltGlobals.\n";
@@ -2139,6 +2139,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!diff" ||
         command == L"!wfp" ||
         command == L"!alpc" ||
+        command == L"!callbacks" ||
         command == L"!byovd" ||
         command == L"!vbs" ||
         command == L"!ci" ||
@@ -3124,9 +3125,6 @@ static bool IsNativeOwnedCommand(const std::wstring& command)
             command == L"dump-pe" ||
             command == L"dump-kernel" ||
             command == L"dump-live" ||
-            command == L"pool-scan-pe" ||
-            command == L"byovd" ||
-            command == L"callbacks" ||
             command == L"probe" ||
             command == L"procctx" ||
             command == L"ai" ||
@@ -3323,10 +3321,25 @@ static bool IsPoolScopeName(const std::wstring& value)
         lowered == L"find" ||
         lowered == L"tags" ||
         lowered == L"tag" ||
-        lowered == L"summary";
+        lowered == L"summary" ||
+        lowered == L"pe";
 }
 
-static bool IsPoolOption(const std::wstring& value)
+static bool IsPoolPeOption(const std::wstring& value)
+{
+    std::wstring lowered = ToLower(value);
+    return lowered == L"/tag" ||
+        lowered == L"/min" ||
+        lowered == L"/max" ||
+        lowered == L"/limit" ||
+        lowered == L"/paged" ||
+        lowered == L"/nonpaged" ||
+        lowered == L"/any" ||
+        lowered == L"/suspicious" ||
+        lowered == L"/dump";
+}
+
+static bool IsPoolListOption(const std::wstring& value)
 {
     std::wstring lowered = ToLower(value);
     return lowered == L"/tag" ||
@@ -3401,7 +3414,7 @@ static void AddHelpCompletionCandidates(std::vector<std::wstring>* candidates)
     static const wchar_t* values[] =
     {
         L"all",
-        L"callbacks"
+        L"!callbacks"
     };
 
     AddCompletionCandidates(candidates, values);
@@ -3845,7 +3858,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
 {
     static const wchar_t* values[] =
     {
-        L"callbacks",
+        L"!callbacks",
         L"dt",
         L"dtx",
         L"u",
@@ -4032,7 +4045,7 @@ static void AddAiCompletionCandidates(
             {
                 AddAiEvidenceCommandCompletionCandidates(candidates);
             }
-            else if (ToLower(argsBefore[2]) == L"callbacks")
+            else if (ToLower(argsBefore[2]) == L"!callbacks")
             {
                 if (argsBefore.size() == 3)
                 {
@@ -4050,7 +4063,7 @@ static void AddAiCompletionCandidates(
             {
                 AddAiEvidenceCommandCompletionCandidates(candidates);
             }
-            else if (ToLower(argsBefore[2]) == L"callbacks")
+            else if (ToLower(argsBefore[2]) == L"!callbacks")
             {
                 if (argsBefore.size() == 3)
                 {
@@ -4204,7 +4217,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     AddAiActionCompletionCandidates(&candidates);
                 }
-                else if (topic == L"callbacks")
+                else if (topic == L"!callbacks")
                 {
                     AddCallbackScopeCompletionCandidates(&candidates);
                 }
@@ -4430,29 +4443,34 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 }
                 else if (topic == L"!pool")
                 {
-                    static const wchar_t* values[] =
+                    if (argsBefore.size() >= 3 && ToLower(argsBefore[2]) == L"pe")
                     {
-                        L"big",
-                        L"find",
-                        L"summary"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"pool-scan-pe")
-                {
-                    static const wchar_t* values[] =
+                        static const wchar_t* values[] =
+                        {
+                            L"/tag",
+                            L"/min",
+                            L"/max",
+                            L"/limit",
+                            L"/nonpaged",
+                            L"/paged",
+                            L"/any",
+                            L"/suspicious",
+                            L"/dump"
+                        };
+                        AddCompletionCandidates(&candidates, values);
+                    }
+                    else
                     {
-                        L"/tag",
-                        L"/min",
-                        L"/max",
-                        L"/limit",
-                        L"/nonpaged",
-                        L"/paged",
-                        L"/any",
-                        L"/suspicious",
-                        L"/dump"
-                    };
-                    AddCompletionCandidates(&candidates, values);
+                        static const wchar_t* values[] =
+                        {
+                            L"big",
+                            L"find",
+                            L"tags",
+                            L"summary",
+                            L"pe"
+                        };
+                        AddCompletionCandidates(&candidates, values);
+                    }
                 }
                 else if (topic == L"dump-raw")
                 {
@@ -4497,7 +4515,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 }
             }
         }
-        else if (command == L"callbacks")
+        else if (command == L"!callbacks")
         {
             if (argsBefore.size() <= 1)
             {
@@ -4800,7 +4818,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             };
             AddCompletionCandidates(&candidates, values);
         }
-        else if (command == L"byovd" || command == L"!byovd")
+        else if (command == L"!byovd")
         {
             if (argsBefore.size() >= 2 && ToLower(argsBefore[1]) == L"fixture")
             {
@@ -4836,23 +4854,6 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 };
                 AddCompletionCandidates(&candidates, values);
             }
-        }
-        else if (command == L"pool-scan-pe")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/tag",
-                L"/min",
-                L"/max",
-                L"/limit",
-                L"/nonpaged",
-                L"/paged",
-                L"/any",
-                L"/suspicious",
-                L"/dump",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
         }
         else if (command == L"dump-raw")
         {
@@ -4940,7 +4941,26 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 {
                     L"big",
                     L"find",
+                    L"tags",
                     L"summary",
+                    L"pe",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else if (ToLower(argsBefore[1]) == L"pe")
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/tag",
+                    L"/min",
+                    L"/max",
+                    L"/limit",
+                    L"/nonpaged",
+                    L"/paged",
+                    L"/any",
+                    L"/suspicious",
+                    L"/dump",
                     L"help"
                 };
                 AddCompletionCandidates(&candidates, values);
@@ -12809,7 +12829,7 @@ static void PrintStartupTui(
     PrintTuiLine(L"  help all      include DbgEng-routed WinDbg commands", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  drvstatus     inspect service/session/write gate state", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  probe load    load positive-control VA/PA and fwtable provider", KNDBG_COLOR_TEXT);
-    PrintTuiLine(L"  callbacks all enumerate callback surfaces including minifilters", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  !callbacks all enumerate callback surfaces including minifilters", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  ai status     inspect provider, model, policy, and credentials", KNDBG_COLOR_TEXT);
     PrintTuiBlank();
     PrintTuiLine(L"Examples", KNDBG_COLOR_TITLE);
@@ -13238,7 +13258,7 @@ static void HandleCallbacksCommand(
             else if (IsDeprecatedCallbackModuleOption(args[index]) ||
                      IsDeprecatedCallbackScopeAlias(args[index]))
             {
-                std::wcerr << L"usage: callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
+                std::wcerr << L"usage: !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
                 PrintCallbacksHelp();
                 break;
             }
@@ -13254,13 +13274,13 @@ static void HandleCallbacksCommand(
                 {
                     if (index + 1 >= args.size())
                     {
-                        std::wcerr << L"usage: callbacks [scope] /module <module>\n";
+                        std::wcerr << L"usage: !callbacks [scope] /module <module>\n";
                         break;
                     }
 
                     if (!moduleFilter.empty())
                     {
-                        std::wcerr << L"usage: callbacks [scope] [module]\n";
+                        std::wcerr << L"usage: !callbacks [scope] [module]\n";
                         break;
                     }
 
@@ -13272,7 +13292,7 @@ static void HandleCallbacksCommand(
                 if (IsDeprecatedCallbackModuleOption(args[index]) ||
                     IsDeprecatedCallbackScopeAlias(args[index]))
                 {
-                    std::wcerr << L"usage: callbacks [scope] [module]\n";
+                    std::wcerr << L"usage: !callbacks [scope] [module]\n";
                     break;
                 }
 
@@ -13283,7 +13303,7 @@ static void HandleCallbacksCommand(
                     continue;
                 }
 
-                std::wcerr << L"usage: callbacks [scope] [module]\n";
+                std::wcerr << L"usage: !callbacks [scope] [module]\n";
                 break;
             }
 
@@ -15662,7 +15682,7 @@ static void PrintKpageHelp()
     std::wcout << L"  remap. Adjacent same-permission pages are coalesced. Page-table self-map\n";
     std::wcout << L"  windows are skipped. Session-space hits stay low-risk unless W+X or PE.\n";
     std::wcout << L"  /pe uses a page-start PE probe (DOS e_lfanew only). Interior NT-header\n";
-    std::wcout << L"  scans are for pool-scan-pe, not leftover pages.\n";
+    std::wcout << L"  scans are for !pool pe, not leftover pages.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /deep         also walk nt!MmPfnDatabase (expensive; not default).\n";
@@ -19042,14 +19062,14 @@ static std::wstring GetDefaultByovdFixturePath()
 
 static void PrintByovdHelp()
 {
-    std::wcout << L"byovd command:\n";
-    std::wcout << L"  byovd [scan] [/no-update] [/force-update] [/exact] [/yara]\n";
+    std::wcout << L"!byovd command:\n";
+    std::wcout << L"  !byovd [scan] [/no-update] [/force-update] [/exact] [/yara]\n";
     std::wcout << L"               [/yara-path <exe>] [/yara-timeout <seconds>]\n";
     std::wcout << L"               [/verbose] [/summary]\n";
     std::wcout << L"               [/limit <n>] [/json <path>]\n";
-    std::wcout << L"  byovd update [/force]\n";
-    std::wcout << L"  byovd status\n";
-    std::wcout << L"  byovd fixture [status|load [sys-path]|unload|path]\n";
+    std::wcout << L"  !byovd update [/force]\n";
+    std::wcout << L"  !byovd status\n";
+    std::wcout << L"  !byovd fixture [status|load [sys-path]|unload|path]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Layer: loaded BYOVD. Scans currently loaded kernel modules against a local\n";
@@ -19086,20 +19106,20 @@ static void PrintByovdHelp()
     std::wcout << L"  vulnerable-driver blocklist state before debugging the scanner.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
-    std::wcout << L"  byovd\n";
-    std::wcout << L"  byovd scan /exact\n";
-    std::wcout << L"  byovd scan /yara\n";
-    std::wcout << L"  byovd scan /force-update /json .\\byovd-scan.json\n";
-    std::wcout << L"  byovd update\n";
-    std::wcout << L"  byovd status\n";
-    std::wcout << L"  byovd fixture load\n";
-    std::wcout << L"  byovd scan\n";
-    std::wcout << L"  byovd fixture unload\n";
+    std::wcout << L"  !byovd\n";
+    std::wcout << L"  !byovd scan /exact\n";
+    std::wcout << L"  !byovd scan /yara\n";
+    std::wcout << L"  !byovd scan /force-update /json .\\byovd-scan.json\n";
+    std::wcout << L"  !byovd update\n";
+    std::wcout << L"  !byovd status\n";
+    std::wcout << L"  !byovd fixture load\n";
+    std::wcout << L"  !byovd scan\n";
+    std::wcout << L"  !byovd fixture unload\n";
 }
 
 static void PrintByovdFixtureStatus(const DriverStatus& status)
 {
-    std::wcout << L"byovd fixture service: " << (status.Installed ? L"installed" : L"not installed");
+    std::wcout << L"!byovd fixture service: " << (status.Installed ? L"installed" : L"not installed");
     if (!status.StateText.empty())
     {
         std::wcout << L" state=" << status.StateText;
@@ -19132,7 +19152,7 @@ static void HandleByovdFixtureCommand(
         {
             if (args.size() > index + 1)
             {
-                std::wcerr << L"byovd fixture " << action
+                std::wcerr << L"!byovd fixture " << action
                            << L": unexpected argument \"" << args[index + 1] << L"\"\n";
                 argumentError = true;
                 break;
@@ -19144,7 +19164,7 @@ static void HandleByovdFixtureCommand(
             DriverStatus status = {};
             if (!fixtureService.Query(&status, &error))
             {
-                std::wcerr << L"byovd fixture status failed: " << error << L"\n";
+                std::wcerr << L"!byovd fixture status failed: " << error << L"\n";
                 break;
             }
 
@@ -19165,19 +19185,19 @@ static void HandleByovdFixtureCommand(
 
             if (!LoadDriverServiceWithUx(fixtureService, L"BYOVD fixture driver load", driverPath, &error))
             {
-                std::wcerr << L"byovd fixture load failed: " << error << L"\n";
+                std::wcerr << L"!byovd fixture load failed: " << error << L"\n";
                 break;
             }
 
-            std::wcout << L"byovd fixture loaded: " << driverPath << L"\n";
-            std::wcout << L"run: byovd scan\n";
+            std::wcout << L"!byovd fixture loaded: " << driverPath << L"\n";
+            std::wcout << L"run: !byovd scan\n";
         }
         else if (action == L"unload")
         {
             DriverUnloadResult unloadResult = {};
             if (!UnloadDriverServiceWithUx(fixtureService, L"BYOVD fixture driver unload", &unloadResult, &error))
             {
-                std::wcerr << L"byovd fixture unload failed: " << error << L"\n";
+                std::wcerr << L"!byovd fixture unload failed: " << error << L"\n";
                 break;
             }
 
@@ -19185,13 +19205,13 @@ static void HandleByovdFixtureCommand(
         }
         else
         {
-            std::wcerr << L"usage: byovd fixture [status|load [sys-path]|unload|path]\n";
+            std::wcerr << L"usage: !byovd fixture [status|load [sys-path]|unload|path]\n";
         }
     } while (false);
 
     if (argumentError)
     {
-        std::wcerr << L"usage: byovd fixture [status|load [sys-path]|unload|path]\n";
+        std::wcerr << L"usage: !byovd fixture [status|load [sys-path]|unload|path]\n";
     }
 }
 
@@ -19366,7 +19386,7 @@ static void HandleByovdCommand(
             ByovdCatalogStatus status = {};
             if (!scanner.QueryCatalogStatus(&status, &error))
             {
-                std::wcerr << L"byovd status failed: " << error << L"\n";
+                std::wcerr << L"!byovd status failed: " << error << L"\n";
                 break;
             }
 
@@ -19401,7 +19421,7 @@ static void HandleByovdCommand(
                     break;
                 }
 
-                std::wcerr << L"byovd update: unrecognised option \"" << args[index] << L"\"\n";
+                std::wcerr << L"!byovd update: unrecognised option \"" << args[index] << L"\"\n";
                 parseError = true;
                 break;
             }
@@ -23707,9 +23727,9 @@ static void HandleAddressCommand(
 
 static void PrintPoolScanPeHelp()
 {
-    std::wcout << L"pool-scan-pe command:\n";
-    std::wcout << L"  pool-scan-pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]\n";
-    std::wcout << L"               [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]\n";
+    std::wcout << L"!pool pe command:\n";
+    std::wcout << L"  !pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]\n";
+    std::wcout << L"           [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Layer: staged pool PE. Enumerates big pool allocations via\n";
@@ -23742,10 +23762,10 @@ static void PrintPoolScanPeHelp()
     std::wcout << L"  paged-out big pool allocations are recovered automatically.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
-    std::wcout << L"  pool-scan-pe\n";
-    std::wcout << L"  pool-scan-pe /suspicious\n";
-    std::wcout << L"  pool-scan-pe /tag Cdat /dump .\\poolpe-hits\n";
-    std::wcout << L"  pool-scan-pe /min 0x4000 /suspicious /dump .\\poolpe-hits\n";
+    std::wcout << L"  !pool pe\n";
+    std::wcout << L"  !pool pe /suspicious\n";
+    std::wcout << L"  !pool pe /tag Cdat /dump .\\poolpe-hits\n";
+    std::wcout << L"  !pool pe /min 0x4000 /suspicious /dump .\\poolpe-hits\n";
 }
 
 static void PrintPoolPeHit(const PoolPeHit& hit)
@@ -23815,13 +23835,14 @@ static void HandlePoolScanPeCommand(
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
-    std::wstring* structuredJsonOut = nullptr)
+    std::wstring* structuredJsonOut = nullptr,
+    size_t optionIndex = 1)
 {
     (void)symbols;
 
     do
     {
-        if (HasHelpToken(args, 1))
+        if (HasHelpToken(args, optionIndex))
         {
             PrintPoolScanPeHelp();
             break;
@@ -23829,7 +23850,7 @@ static void HandlePoolScanPeCommand(
 
         if (!device.IsOpen())
         {
-            std::wcerr << L"pool-scan-pe requires the KnLiveDbg.sys driver device to be open\n";
+            std::wcerr << L"!pool pe requires the KnLiveDbg.sys driver device to be open\n";
             break;
         }
 
@@ -23839,7 +23860,7 @@ static void HandlePoolScanPeCommand(
         options.MinSize = 0x1000;
 
         bool parseError = false;
-        size_t i = 1;
+        size_t i = optionIndex;
         while (i < args.size())
         {
             std::wstring opt = ToLower(args[i]);
@@ -23873,14 +23894,14 @@ static void HandlePoolScanPeCommand(
             {
                 if (i + 1 >= args.size())
                 {
-                    std::wcerr << L"pool-scan-pe: /tag requires a value\n";
+                    std::wcerr << L"!pool pe: /tag requires a value\n";
                     parseError = true;
                     break;
                 }
                 uint32_t tag = 0;
                 if (!ParsePoolTagText(args[i + 1], &tag))
                 {
-                    std::wcerr << L"pool-scan-pe: invalid tag \"" << args[i + 1] << L"\"\n";
+                    std::wcerr << L"!pool pe: invalid tag \"" << args[i + 1] << L"\"\n";
                     parseError = true;
                     break;
                 }
@@ -23895,14 +23916,14 @@ static void HandlePoolScanPeCommand(
             {
                 if (i + 1 >= args.size())
                 {
-                    std::wcerr << L"pool-scan-pe: " << opt << L" requires a value\n";
+                    std::wcerr << L"!pool pe: " << opt << L" requires a value\n";
                     parseError = true;
                     break;
                 }
                 uint64_t value = 0;
                 if (!ParseUnsigned(args[i + 1], state.NumberBase, &value))
                 {
-                    std::wcerr << L"pool-scan-pe: failed to parse \"" << args[i + 1] << L"\" for " << opt << L"\n";
+                    std::wcerr << L"!pool pe: failed to parse \"" << args[i + 1] << L"\" for " << opt << L"\n";
                     parseError = true;
                     break;
                 }
@@ -23929,7 +23950,7 @@ static void HandlePoolScanPeCommand(
             {
                 if (i + 1 >= args.size())
                 {
-                    std::wcerr << L"pool-scan-pe: /dump requires a directory\n";
+                    std::wcerr << L"!pool pe: /dump requires a directory\n";
                     parseError = true;
                     break;
                 }
@@ -23939,7 +23960,7 @@ static void HandlePoolScanPeCommand(
                 continue;
             }
 
-            std::wcerr << L"pool-scan-pe: unrecognised argument \"" << args[i] << L"\"\n";
+            std::wcerr << L"!pool pe: unrecognised argument \"" << args[i] << L"\"\n";
             PrintPoolScanPeHelp();
             parseError = true;
             break;
@@ -23955,10 +23976,10 @@ static void HandlePoolScanPeCommand(
         std::wstring error;
         if (!hunter.Scan(options, &result, &error))
         {
-            std::wcerr << L"pool-scan-pe failed: " << error << L"\n";
+            std::wcerr << L"!pool pe failed: " << error << L"\n";
             for (const std::wstring& warning : result.Warnings)
             {
-                std::wcerr << L"pool-scan-pe warning: " << warning << L"\n";
+                std::wcerr << L"!pool pe warning: " << warning << L"\n";
             }
             break;
         }
@@ -23970,11 +23991,11 @@ static void HandlePoolScanPeCommand(
 
         for (const std::wstring& warning : result.Warnings)
         {
-            std::wcerr << L"pool-scan-pe warning: " << warning << L"\n";
+            std::wcerr << L"!pool pe warning: " << warning << L"\n";
         }
         for (const std::wstring& diag : result.Diagnostics)
         {
-            std::wcout << L"pool-scan-pe diag: " << diag << L"\n";
+            std::wcout << L"!pool pe diag: " << diag << L"\n";
         }
 
         for (const PoolPeHit& hit : result.Hits)
@@ -24672,6 +24693,8 @@ static void PrintPoolHelp()
     std::wcout << L"  !pool find /tag <TAG> [options]\n";
     std::wcout << L"  !pool tags [/tag <TAG>] [/limit <n>]\n";
     std::wcout << L"  !pool summary\n";
+    std::wcout << L"  !pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>]\n";
+    std::wcout << L"           [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
     std::wcout << L"  big      enumerate big pool allocations via NtQuerySystemInformation(SystemBigPoolInformation=0x42).\n";
@@ -24680,6 +24703,8 @@ static void PrintPoolHelp()
     std::wcout << L"  find     same data as 'big' but requires at least one filter (/tag, /addr, /min, or /max) and is geared\n";
     std::wcout << L"           toward targeted searches.\n";
     std::wcout << L"  summary  print only the per-build totals and skip the per-entry listing.\n";
+    std::wcout << L"  pe       staged pool PE hunt. Runs the dump-pe NT-header probe (intact or signature-wiped)\n";
+    std::wcout << L"           on each kept big-pool entry's first 4 KB. Independent-page mapper images use !kpage /pe.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /tag <ABCD>     filter by 4-char ASCII tag (e.g. Wmem, MmCa, Cdat). Up to 4 characters; pad with spaces.\n";
@@ -24693,6 +24718,8 @@ static void PrintPoolHelp()
     std::wcout << L"  /annotate       walk PTE for each kept NonPaged entry to mark R/W/X and large-page state.\n";
     std::wcout << L"                  Slower (issues one QueryAddress+TranslateVirtual IOCTL per entry).\n";
     std::wcout << L"  /wx             implies /annotate and keeps only effective W+X NonPaged entries.\n";
+    std::wcout << L"  /suspicious     pe only: keep hits whose MZ/PE/e_lfanew were wiped.\n";
+    std::wcout << L"  /dump <dir>     pe only: dump each detected PE via dump-pe logic to poolpe_<tag>_<address>.bin.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Requires SeDebugPrivilege; run elevated. The scanner attempts to enable it automatically.\n";
@@ -24709,6 +24736,8 @@ static void PrintPoolHelp()
     std::wcout << L"  !pool find /min 0x10000 /annotate\n";
     std::wcout << L"  !pool find /addr 0xffffae8000123000\n";
     std::wcout << L"  !pool summary\n";
+    std::wcout << L"  !pool pe /suspicious\n";
+    std::wcout << L"  !pool pe /tag Cdat /dump .\\poolpe-hits\n";
 }
 
 static void PrintBigPoolRecord(const BigPoolEntryRecord& entry, bool annotateRequested)
@@ -24770,12 +24799,6 @@ static void HandlePoolCommand(
 {
     do
     {
-        if (HasHelpToken(args, 1))
-        {
-            PrintPoolHelp();
-            break;
-        }
-
         PoolScanner::Options options = {};
         options.Target = PoolScanner::Scope::Big;
         options.Paged = PoolScanner::PagedFilter::NonPagedOnly;
@@ -24783,6 +24806,23 @@ static void HandlePoolCommand(
         std::wstring error;
 
         size_t index = 1;
+        if (index < args.size() && ToLower(args[index]) == L"pe")
+        {
+            HandlePoolScanPeCommand(
+                args,
+                state,
+                device,
+                symbols,
+                structuredJsonOut,
+                index + 1);
+            break;
+        }
+
+        if (HasHelpToken(args, 1))
+        {
+            PrintPoolHelp();
+            break;
+        }
         if (index < args.size() && IsPoolScopeName(args[index]))
         {
             std::wstring scope = ToLower(args[index]);
@@ -26612,7 +26652,7 @@ static void PrintAiHelp()
     std::wcout << L"  ai a.exe eprocess\n";
     std::wcout << L"  ai WdFilter.sys object callbacks\n";
     std::wcout << L"  ai pid 1234 dtb\n";
-    std::wcout << L"  ai callbacks all WdFilter.sys\n";
+    std::wcout << L"  ai !callbacks all WdFilter.sys\n";
     std::wcout << L"  ai uf nt!PspCreateProcessNotifyRoutine 128\n";
     std::wcout << L"  ai check VBS status\n";
     std::wcout << L"  ai !ci options\n";
@@ -26717,8 +26757,8 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     {
         std::wcout << L"ai analyze:\n";
         std::wcout << L"  ai analyze <read-only-command...>\n";
-        std::wcout << L"  ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
-        std::wcout << L"  ai analyze callbacks [scope] /module <module>\n";
+        std::wcout << L"  ai analyze !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
+        std::wcout << L"  ai analyze !callbacks [scope] /module <module>\n";
         std::wcout << L"  Runs a read-only evidence command and asks AI for an analysis report.\n";
         std::wcout << L"  Callback analysis remains available for compatibility.\n";
     }
@@ -26726,7 +26766,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     {
         std::wcout << L"ai explain:\n";
         std::wcout << L"  ai explain <read-only-command...>\n";
-        std::wcout << L"  ai explain callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
+        std::wcout << L"  ai explain !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
         std::wcout << L"  ai explain dt <dt-args...>\n";
         std::wcout << L"  ai explain dtx <dtx-args...>\n";
         std::wcout << L"  ai explain <u|uf> <address|symbol> [instruction-count]\n";
@@ -26881,7 +26921,7 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintHelp(false);
         }
-        else if (command == L"callbacks")
+        else if (command == L"!callbacks")
         {
             PrintCallbacksHelpFromArgs(args, detailIndex);
         }
@@ -26945,7 +26985,7 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintAlpcHelp();
         }
-        else if (command == L"byovd" || command == L"!byovd")
+        else if (command == L"!byovd")
         {
             PrintByovdHelp();
         }
@@ -27042,7 +27082,14 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         }
         else if (command == L"!pool")
         {
-            PrintPoolHelp();
+            if (detailIndex < args.size() && ToLower(args[detailIndex]) == L"pe")
+            {
+                PrintPoolScanPeHelp();
+            }
+            else
+            {
+                PrintPoolHelp();
+            }
         }
         else if (command == L"dump-raw")
         {
@@ -27059,10 +27106,6 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"dump-live")
         {
             PrintDumpLiveHelp();
-        }
-        else if (command == L"pool-scan-pe")
-        {
-            PrintPoolScanPeHelp();
         }
         else if (command == L"!address")
         {
@@ -27180,6 +27223,7 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
     return handled;
 }
 
+static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* reason);
 static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge);
 static std::wstring BuildMcpClaudeCodeHttpServerJson(const std::wstring& url);
 static std::wstring BuildMcpCursorHttpJson(const std::wstring& url);
@@ -27844,6 +27888,85 @@ static int RunConsoleSurfaceSelfTest()
                 IsNativeOwnedCommand(L"!kpage") &&
                 IsNativeOwnedCommand(L"!unloaded"),
             L"leftover-commands-are-native-owned");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IsNativeOwnedCommand(L"!callbacks") &&
+                IsNativeOwnedCommand(L"!byovd") &&
+                IsNativeOwnedCommand(L"!pool") &&
+                !IsNativeOwnedCommand(L"callbacks") &&
+                !IsNativeOwnedCommand(L"byovd") &&
+                !IsNativeOwnedCommand(L"pool-scan-pe") &&
+                IsPoolScopeName(L"pe"),
+            L"bang-unification-commands-are-native-owned");
+        CheckCompletionCandidate(&context, {}, L"!callbacks", L"callbacks-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!byovd", L"byovd-root-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!callbacks", L"help-callbacks-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!byovd", L"help-byovd-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks"}, L"all", L"callbacks-all-completion");
+        CheckCompletionCandidate(&context, {L"!pool"}, L"pe", L"pool-pe-scope-completion");
+        CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/suspicious", L"pool-pe-suspicious-completion");
+        CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/dump", L"pool-pe-dump-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!pool"}, L"pe", L"help-pool-pe-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!pool", L"pe"}, L"/suspicious", L"help-pool-pe-option-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !CompletionCandidateExists({}, L"callbacks") &&
+                !CompletionCandidateExists({}, L"byovd") &&
+                !CompletionCandidateExists({}, L"pool-scan-pe"),
+            L"legacy-command-aliases-are-not-completed");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IsPoolPeOption(L"/suspicious") &&
+                IsPoolPeOption(L"/dump") &&
+                !IsPoolPeOption(L"/wx") &&
+                !IsPoolPeOption(L"/addr") &&
+                IsPoolListOption(L"/wx") &&
+                IsPoolListOption(L"/addr") &&
+                !IsPoolListOption(L"/suspicious") &&
+                !IsPoolListOption(L"/dump"),
+            L"pool-pe-options-are-not-list-options");
+        {
+            AiCommandProposal peOk = {};
+            peOk.Command = L"!pool pe /suspicious";
+            peOk.Purpose = L"hunt wiped pool PE";
+            AiCommandProposal peDump = {};
+            peDump.Command = L"!pool pe /dump .\\poolpe-hits";
+            peDump.Purpose = L"dump staged pool PE";
+            AiCommandProposal listDump = {};
+            listDump.Command = L"!pool big /dump .\\poolpe-hits";
+            listDump.Purpose = L"should reject dump on list scope";
+            AiCommandProposal peWx = {};
+            peWx.Command = L"!pool pe /wx";
+            peWx.Purpose = L"should reject list option on pe";
+            AiCommandProposal oldCallbacks = {};
+            oldCallbacks.Command = L"callbacks all";
+            oldCallbacks.Purpose = L"should reject removed alias";
+            AiCommandProposal newCallbacks = {};
+            newCallbacks.Command = L"!callbacks all";
+            newCallbacks.Purpose = L"list callback surfaces";
+            AiCommandProposal oldPe = {};
+            oldPe.Command = L"pool-scan-pe /suspicious";
+            oldPe.Purpose = L"should reject removed alias";
+            AiCommandProposal oldByovd = {};
+            oldByovd.Command = L"byovd scan";
+            oldByovd.Purpose = L"should reject removed alias";
+            AiCommandProposal newByovd = {};
+            newByovd.Command = L"!byovd scan /no-update";
+            newByovd.Purpose = L"scan loaded BYOVD modules";
+            std::wstring reason;
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                ValidateAiPlanCommand(peOk, &reason) &&
+                    ValidateAiPlanCommand(peDump, &reason) &&
+                    !ValidateAiPlanCommand(listDump, &reason) &&
+                    !ValidateAiPlanCommand(peWx, &reason) &&
+                    !ValidateAiPlanCommand(oldCallbacks, &reason) &&
+                    ValidateAiPlanCommand(newCallbacks, &reason) &&
+                    !ValidateAiPlanCommand(oldPe, &reason) &&
+                    !ValidateAiPlanCommand(oldByovd, &reason) &&
+                    ValidateAiPlanCommand(newByovd, &reason),
+                L"bang-unification-ai-plan-shape");
+        }
         CheckConsoleSurfaceSelfTest(&context, LeftoverCommonSelfTest(), L"leftover-common-self-test");
         CheckConsoleSurfaceSelfTest(&context, PayloadTracerSelfTest(), L"payload-tracer-self-test");
         CheckConsoleSurfaceSelfTest(&context, MapperRemnantSelfTest(), L"mapper-remnant-self-test");
@@ -28018,14 +28141,30 @@ static int RunConsoleSurfaceSelfTest()
                     mapperHelp.find(L"MmUnloadedDrivers") != std::wstring::npos &&
                     mapperHelp.find(L"Layer: bookkeeping remnants") != std::wstring::npos &&
                     kpageHelp.find(L"/deep") != std::wstring::npos &&
-                    kpageHelp.find(L"Layer: orphan executable pages") != std::wstring::npos,
+                    kpageHelp.find(L"Layer: orphan executable pages") != std::wstring::npos &&
+                    kpageHelp.find(L"!pool pe") != std::wstring::npos,
                 L"leftover-help-routes");
+            const std::wstring callbacksHelp = CaptureDetailedHelpOutput({L"help", L"!callbacks"}, 1);
+            const std::wstring byovdHelp = CaptureDetailedHelpOutput({L"help", L"!byovd"}, 1);
+            const std::wstring poolHelp = CaptureDetailedHelpOutput({L"help", L"!pool"}, 1);
+            const std::wstring poolPeHelp = CaptureDetailedHelpOutput({L"help", L"!pool", L"pe"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                callbacksHelp.find(L"!callbacks all") != std::wstring::npos &&
+                    byovdHelp.find(L"!byovd scan") != std::wstring::npos &&
+                    poolHelp.find(L"!pool pe") != std::wstring::npos &&
+                    poolPeHelp.find(L"!pool pe /suspicious") != std::wstring::npos &&
+                    poolPeHelp.find(L"pool-scan-pe") == std::wstring::npos,
+                L"bang-unification-help-routes");
             CheckConsoleSurfaceSelfTest(
                 &context,
                 rootHelp.find(L"help !payload") != std::wstring::npos &&
                     rootHelp.find(L"help !mapper") != std::wstring::npos &&
                     rootHelp.find(L"help !kpage") != std::wstring::npos &&
-                    rootHelp.find(L"!payload scan") != std::wstring::npos,
+                    rootHelp.find(L"!payload scan") != std::wstring::npos &&
+                    rootHelp.find(L"!pool pe /suspicious") != std::wstring::npos &&
+                    rootHelp.find(L"help !callbacks") != std::wstring::npos &&
+                    rootHelp.find(L"!byovd scan") != std::wstring::npos,
                 L"help-root-lists-leftover-commands");
             const std::wstring minifilterHelp = CaptureDetailedHelpOutput({L"help", L"!minifilter"}, 1);
             CheckConsoleSurfaceSelfTest(
@@ -29964,7 +30103,7 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             break;
         }
 
-        if ((command == L"byovd" || command == L"!byovd") &&
+        if ((command == L"!byovd") &&
             args.size() >= 3 &&
             ToLower(args[1]) == L"fixture")
         {
@@ -30201,7 +30340,7 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
             break;
         }
 
-        if (command == L"callbacks")
+        if (command == L"!callbacks")
         {
             commandClass = L"callbacks";
             break;
@@ -31112,7 +31251,7 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
-        else if (command == L"callbacks")
+        else if (command == L"!callbacks")
         {
             if (!ValidateCallbackCommandArgumentShape(args, reason))
             {
@@ -31579,18 +31718,23 @@ static bool ValidateAiPlanArgumentShape(
         {
             size_t i = 1;
             bool shapeOk = true;
+            bool peScope = false;
             if (i < args.size() && IsPoolScopeName(args[i]))
             {
+                peScope = ToLower(args[i]) == L"pe";
                 ++i;
             }
             while (i < args.size())
             {
                 std::wstring option = ToLower(args[i]);
-                if (!IsPoolOption(option))
+                const bool optionOk = peScope ? IsPoolPeOption(option) : IsPoolListOption(option);
+                if (!optionOk)
                 {
                     if (reason != nullptr)
                     {
-                        *reason = L"!pool argument must be a scope name or /option";
+                        *reason = peScope
+                            ? L"!pool pe argument must be a pe hunt option"
+                            : L"!pool argument must be a scope name or /option";
                     }
                     shapeOk = false;
                     break;
@@ -31600,7 +31744,8 @@ static bool ValidateAiPlanArgumentShape(
                     option == L"/min" ||
                     option == L"/max" ||
                     option == L"/addr" ||
-                    option == L"/limit")
+                    option == L"/limit" ||
+                    option == L"/dump")
                 {
                     if (i + 1 >= args.size() || IsSwitchLikeToken(args[i + 1]))
                     {
@@ -33231,7 +33376,7 @@ static AiEvidenceAnalysisMetadata BuildAiEvidenceAnalysisMetadata(
     if (!commandArgs.empty())
     {
         std::wstring topic = ToLower(NormalizeInputCommand(commandArgs[0]));
-        if (topic == L"callbacks")
+        if (topic == L"!callbacks")
         {
             metadata.EventName = defaultEventName + L"_callbacks";
             metadata.Title = L"Analyze this KnLiveDbg kernel callback scan.";
@@ -33262,7 +33407,7 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
 
     do
     {
-        if (normalized == L"callbacks" ||
+        if (normalized == L"!callbacks" ||
             normalized == L"dt" ||
             normalized == L"dtx" ||
             normalized == L"u" ||
@@ -33554,21 +33699,21 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
         {
             plan.Title = L"Callback surface audit";
             plan.Summary = L"Enumerate callback surfaces and module baseline for follow-up AI analysis.";
-            add(L"callbacks all", L"enumerate object, registry, process, thread, image-load, and minifilter callbacks");
+            add(L"!callbacks all", L"enumerate object, registry, process, thread, image-load, and minifilter callbacks");
             add(L"lm", L"capture loaded module baseline");
         }
         else if (key == L"minifilter")
         {
             plan.Title = L"Minifilter chain review";
             plan.Summary = L"Enumerate minifilter callbacks and baseline fltmgr symbols.";
-            add(L"callbacks minifilter", L"enumerate registered minifilter callbacks");
+            add(L"!callbacks minifilter", L"enumerate registered minifilter callbacks");
             add(L"x fltmgr!*Flt*", L"list FltMgr symbols useful for manual follow-up");
         }
         else if (key == L"object" || key == L"object-callbacks")
         {
             plan.Title = L"Object callback integrity review";
             plan.Summary = L"Enumerate object-manager callback lists discovered from object type objects.";
-            add(L"callbacks object", L"enumerate object-manager filters by object type");
+            add(L"!callbacks object", L"enumerate object-manager filters by object type");
             add(L"dt nt!_OBJECT_TYPE", L"show object type layout for offset verification");
         }
         else if (key == L"address")
@@ -33596,14 +33741,14 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
             {
                 plan.Summary = L"Capture module list and callback registrations; pass a module name for symbol enumeration.";
                 add(L"lm", L"list loaded kernel modules");
-                add(L"callbacks all", L"find callback surfaces owned by loaded modules");
+                add(L"!callbacks all", L"find callback surfaces owned by loaded modules");
             }
             else
             {
                 plan.Summary = L"Capture module, symbols, and callback registrations for a suspected driver.";
                 add(L"lm " + argument, L"show matching loaded module");
                 add(L"x " + argument + L"!*", L"list public symbols for the suspected module");
-                add(L"callbacks all " + argument, L"find callback surfaces owned by the module");
+                add(L"!callbacks all " + argument, L"find callback surfaces owned by the module");
             }
         }
         else
@@ -39896,7 +40041,7 @@ static bool ExecuteAiCapabilityCallbacksList(
         }
 
         std::vector<std::wstring> args;
-        args.push_back(L"callbacks");
+        args.push_back(L"!callbacks");
         args.push_back(scope);
         if (!module.empty())
         {
@@ -43048,7 +43193,7 @@ static bool ExecuteAiCapabilityByovdScan(
         // the network or runs a subprocess; it scans loaded modules against
         // the existing local catalog only.
         std::vector<std::wstring> args;
-        args.push_back(L"byovd");
+        args.push_back(L"!byovd");
         args.push_back(L"scan");
         args.push_back(L"/no-update");
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
@@ -43077,7 +43222,7 @@ static bool ExecuteAiCapabilityByovdStatus(
         (void)structuredJsonOut;
 
         std::vector<std::wstring> args;
-        args.push_back(L"byovd");
+        args.push_back(L"!byovd");
         args.push_back(L"status");
 
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
@@ -43112,7 +43257,8 @@ static bool ExecuteAiCapabilityPoolScanPe(
         }
 
         std::vector<std::wstring> args;
-        args.push_back(L"pool-scan-pe");
+        args.push_back(L"!pool");
+        args.push_back(L"pe");
 
         std::wstring tag;
         if (ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"tag"}, &tag))
@@ -43149,7 +43295,7 @@ static bool ExecuteAiCapabilityPoolScanPe(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": pool.scan_pe\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandlePoolScanPeCommand(args, state, device, symbols, structuredJsonOut);
+        HandlePoolCommand(args, state, device, symbols, structuredJsonOut);
         ok = true;
     } while (false);
 
@@ -44325,7 +44471,7 @@ static void HandleAiCommand(
                 break;
             }
 
-            if (ToLower(args[2]) != L"callbacks")
+            if (ToLower(args[2]) != L"!callbacks")
             {
                 HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
                 break;
@@ -44344,7 +44490,7 @@ static void HandleAiCommand(
                 else if (IsDeprecatedCallbackScopeAlias(args[3]) ||
                          IsDeprecatedCallbackModuleOption(args[3]))
                 {
-                    std::wcerr << L"usage: ai analyze callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
+                    std::wcerr << L"usage: ai analyze !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
                     break;
                 }
 
@@ -44354,13 +44500,13 @@ static void HandleAiCommand(
                     {
                         if (index + 1 >= args.size())
                         {
-                            std::wcerr << L"usage: ai analyze callbacks [scope] /module <module>\n";
+                            std::wcerr << L"usage: ai analyze !callbacks [scope] /module <module>\n";
                             break;
                         }
 
                         if (!moduleFilter.empty())
                         {
-                            std::wcerr << L"usage: ai analyze callbacks [scope] [module]\n";
+                            std::wcerr << L"usage: ai analyze !callbacks [scope] [module]\n";
                             break;
                         }
 
@@ -44372,7 +44518,7 @@ static void HandleAiCommand(
                     if (IsDeprecatedCallbackModuleOption(args[index]) ||
                         IsDeprecatedCallbackScopeAlias(args[index]))
                     {
-                        std::wcerr << L"usage: ai analyze callbacks [scope] [module]\n";
+                        std::wcerr << L"usage: ai analyze !callbacks [scope] [module]\n";
                         break;
                     }
 
@@ -44383,7 +44529,7 @@ static void HandleAiCommand(
                         continue;
                     }
 
-                    std::wcerr << L"usage: ai analyze callbacks [scope] [module]\n";
+                    std::wcerr << L"usage: ai analyze !callbacks [scope] [module]\n";
                     break;
                 }
 
@@ -44393,7 +44539,7 @@ static void HandleAiCommand(
                 }
             }
 
-            std::wstring evidenceCommand = L"callbacks " + scope;
+            std::wstring evidenceCommand = L"!callbacks " + scope;
             if (!moduleFilter.empty())
             {
                 evidenceCommand += L" " + moduleFilter;
@@ -45076,7 +45222,7 @@ static bool HandleCommand(
         {
             HandleDriverIntegrityCommand(args, state, device, symbols);
         }
-        else if (command == L"byovd" || command == L"!byovd")
+        else if (command == L"!byovd")
         {
             HandleByovdCommand(args, state, symbols);
         }
@@ -45099,10 +45245,6 @@ static bool HandleCommand(
         else if (command == L"dump-live")
         {
             HandleDumpLiveCommand(args, state, device, symbols);
-        }
-        else if (command == L"pool-scan-pe")
-        {
-            HandlePoolScanPeCommand(args, state, device, symbols);
         }
         else if (command == L"!address")
         {
@@ -45140,7 +45282,7 @@ static bool HandleCommand(
         {
             HandleDtCommand(args, state, device, symbols);
         }
-        else if (command == L"callbacks")
+        else if (command == L"!callbacks")
         {
             HandleCallbacksCommand(args, device, symbols);
         }

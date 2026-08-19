@@ -120,11 +120,11 @@ bodies or a flood of `SUSPICIOUS` rows are not.
 These are separate detection layers. A quiet result on one layer is not a
 clean bill on the others:
 
-- `byovd` = loaded BYOVD (signed exploit driver still mapped)
+- `!byovd` = loaded BYOVD (signed exploit driver still mapped)
 - `!mapper` = bookkeeping remnants (PiDDB / unload log / ci hash)
 - `!kpage` = orphan executable pages (independent-page payload)
 - `!payload scan` = hook-to-body (off-module function pointers)
-- `pool-scan-pe` = staged pool PE
+- `!pool pe` = staged pool PE
 - `!snapshot` `leftover-mapper` = temporal bookkeeping only; it does not
   run `!kpage` or `!payload scan`
 

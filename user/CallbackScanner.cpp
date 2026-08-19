@@ -3006,7 +3006,7 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
         {
             if (error != nullptr)
             {
-                *error = L"usage: callbacks [all|object|registry|process|thread|imageload|minifilter]";
+                *error = L"usage: !callbacks [all|object|registry|process|thread|imageload|minifilter]";
             }
             break;
         }

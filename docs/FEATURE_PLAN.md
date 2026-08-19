@@ -15,10 +15,10 @@ Completed core slices:
 3. Module integrity scanning.
 4. Driver dispatch integrity.
 5. Live complete dump (`dump-kernel`) and OS live dump (`dump-live`).
-6. Leftover payload detectors, as separate layers: `byovd` (loaded BYOVD),
+6. Leftover payload detectors, as separate layers: `!byovd` (loaded BYOVD),
    `!mapper` (bookkeeping remnants: `MmUnloadedDrivers` / PiDDB / ci hash),
    `!kpage` (orphan executable pages; optional `/deep` PFN walk),
-   `!payload` (hook-to-body), and `pool-scan-pe` (staged pool PE). A clean
+   `!payload` (hook-to-body), and `!pool pe` (staged pool PE). A clean
    `!mapper` is ledger-clean, not payload-absent.
 7. Minifilter IRP control: `!minifilter` list/show plus session-backed
    enable/disable of one filter IRP, or every registered slot
@@ -389,12 +389,12 @@ Operational value:
 
 1. Detect live driver patching, stomped sections, hidden inline hooks, and
    disk/live divergence.
-2. Pair with `pool-scan-pe` for hidden images and `!driver integrity` for
+2. Pair with `!pool pe` for hidden images and `!driver integrity` for
    dispatch pointer checks.
 
 ## 8. BYOVD Intelligence Scanner
 
-Status: implemented as `byovd [scan|update|status]` and `!byovd`.
+Status: implemented as `!byovd [scan|update|status]`.
 `tools\update-byovd-intel.ps1` builds a local catalog from the Microsoft
 vulnerable driver blocklist plus LOLDrivers hash/YARA feeds. `scan` refreshes
 the catalog automatically when it is older than 24 hours, unless `/no-update`
@@ -420,8 +420,8 @@ Implemented behavior:
    confidence with `source=loldrivers_yara`. Release packages intentionally do
    not include YARA binaries; operators provide them separately.
 7. Provides a benign no-op positive-control fixture driver named
-   `amdryzenmasterdriver.sys` with fixed PE version `1.0.0.0`. `byovd fixture
-   load` installs it through SCM so `byovd scan` can verify the Microsoft
+   `amdryzenmasterdriver.sys` with fixed PE version `1.0.0.0`. `!byovd fixture
+   load` installs it through SCM so `!byovd scan` can verify the Microsoft
    file-name/version `MEDIUM` hit path without using a real vulnerable driver.
    On systems where HVCI or the Windows vulnerable-driver blocklist blocks the
    fixture at load time, the scanner is not expected to report it because it
