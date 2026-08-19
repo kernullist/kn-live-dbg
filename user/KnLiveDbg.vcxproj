@@ -110,6 +110,7 @@
     <ClCompile Include="CloudFileScanner.cpp" />
     <ClCompile Include="CloakSession.cpp" />
     <ClCompile Include="CommandRegistry.cpp" />
+    <ClCompile Include="CompletionHints.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
     <ClCompile Include="DeviceClient.cpp" />
     <ClCompile Include="DriverService.cpp" />
@@ -173,6 +174,7 @@
     <ClInclude Include="CloudFileScanner.h" />
     <ClInclude Include="CloakSession.h" />
     <ClInclude Include="CommandRegistry.h" />
+    <ClInclude Include="CompletionHints.h" />
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />
     <ClInclude Include="DriverService.h" />

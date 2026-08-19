@@ -43,6 +43,9 @@
     <ClCompile Include="CommandRegistry.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="CompletionHints.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="McpServer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -199,6 +202,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CommandRegistry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CompletionHints.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="McpServer.h">

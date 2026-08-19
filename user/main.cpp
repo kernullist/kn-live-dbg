@@ -6,6 +6,7 @@
 #include "CallbackScanner.h"
 #include "CloudFileScanner.h"
 #include "CommandRegistry.h"
+#include "CompletionHints.h"
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
 #include "DriverService.h"
@@ -4214,392 +4215,12 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             }
             else
             {
-                std::wstring topic = CompletionCanonicalCommand(argsBefore[1]);
-                if (topic == L"ai")
-                {
-                    AddAiActionCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!callbacks")
-                {
-                    AddCallbackScopeCompletionCandidates(&candidates);
-                }
-                else if (topic == L"backend")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"auto",
-                        L"native",
-                        L"dbgeng"
-                    };
-
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"kdinit")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"/local",
-                        L"/remote"
-                    };
-
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"probe")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"status",
-                        L"load",
-                        L"info",
-                        L"reset",
-                        L"unload"
-                    };
-
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"procctx")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"status",
-                        L"clear"
-                    };
-
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"write")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"on",
-                        L"off"
-                    };
-
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!wfp")
-                {
-                    AddWfpScopeCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!hunt")
-                {
-                    AddHuntOptionCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!vad")
-                {
-                    AddVadOptionCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!threads")
-                {
-                    AddThreadsOptionCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!alpc")
-                {
-                    AddAlpcScopeCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!ti")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"start",
-                        L"stop",
-                        L"status",
-                        L"add",
-                        L"remove",
-                        L"watch",
-                        L"recent",
-                        L"stats",
-                        L"by",
-                        L"grep",
-                        L"save",
-                        L"clear"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!byovd")
-                {
-                    if (argsBefore.size() >= 3 && ToLower(argsBefore[2]) == L"fixture")
-                    {
-                        static const wchar_t* values[] =
-                        {
-                            L"status",
-                            L"load",
-                            L"unload",
-                            L"path"
-                        };
-                        AddCompletionCandidates(&candidates, values);
-                    }
-                    else if (argsBefore.size() >= 3 && ToLower(argsBefore[2]) == L"update")
-                    {
-                        AddCompletionCandidate(&candidates, L"/force");
-                    }
-                    else
-                    {
-                        static const wchar_t* values[] =
-                        {
-                            L"scan",
-                            L"update",
-                            L"status",
-                            L"fixture",
-                            L"/no-update",
-                            L"/force-update",
-                            L"/exact",
-                            L"/yara"
-                        };
-                        AddCompletionCandidates(&candidates, values);
-                    }
-                }
-                else if (topic == L"!ci")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"options",
-                        L"policy"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!etw")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"loggers",
-                        L"logger",
-                        L"integrity",
-                        L"providers",
-                        L"ti-cross"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!hal")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"dispatch",
-                        L"private"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!hive")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"list",
-                        L"cells"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!token")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"/all",
-                        L"/limit",
-                        L"/system"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!dpc" || topic == L"!timer" || topic == L"!workitem")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"/verbose",
-                        L"/limit"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!nmi")
-                {
-                    AddCompletionCandidate(&candidates, L"callbacks");
-                }
-                else if (topic == L"!payload")
-                {
-                    static const wchar_t* values[] = { L"scan", L"/limit", L"/disasm", L"/json" };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!mapper" || topic == L"!unloaded" || topic == L"!piddb" || topic == L"!cihash")
-                {
-                    static const wchar_t* values[] = { L"all", L"unloaded", L"piddb", L"cihash", L"/limit", L"/json" };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!kpage")
-                {
-                    static const wchar_t* values[] = { L"/deep", L"/wx", L"/pe", L"/session", L"/nosession", L"/limit", L"/json" };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!minifilter" || topic == L"!fltmgr")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"list",
-                        L"show",
-                        L"irp",
-                        L"disable",
-                        L"enable",
-                        L"disable-all",
-                        L"enable-all",
-                        L"all",
-                        L"/pre",
-                        L"/post",
-                        L"/both",
-                        L"/json"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!fwtable")
-                {
-                    AddFirmwareTableCompletionCandidates(&candidates, false);
-                }
-                else if (topic == L"!snapshot")
-                {
-                    AddSnapshotCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!timeline")
-                {
-                    std::vector<std::wstring> helpArgs;
-                    helpArgs.push_back(L"!timeline");
-                    for (size_t index = 2; index < argsBefore.size(); ++index)
-                    {
-                        helpArgs.push_back(argsBefore[index]);
-                    }
-                    AddTimelineCompletionCandidates(&candidates, helpArgs);
-                }
-                else if (topic == L"!diff")
-                {
-                    AddDiffCompletionCandidates(&candidates);
-                }
-                else if (topic == L"!module")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"integrity",
-                        L"all",
-                        L"/summary",
-                        L"/verbose",
-                        L"/headers",
-                        L"/sections",
-                        L"/wx",
-                        L"/mismatch",
-                        L"/disk",
-                        L"/limit",
-                        L"/json"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!driver")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"integrity",
-                        L"all",
-                        L"/limit",
-                        L"/json"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!pool")
-                {
-                    if (argsBefore.size() >= 3 && ToLower(argsBefore[2]) == L"pe")
-                    {
-                        static const wchar_t* values[] =
-                        {
-                            L"/tag",
-                            L"/min",
-                            L"/max",
-                            L"/limit",
-                            L"/nonpaged",
-                            L"/paged",
-                            L"/any",
-                            L"/suspicious",
-                            L"/dump"
-                        };
-                        AddCompletionCandidates(&candidates, values);
-                    }
-                    else if (argsBefore.size() >= 3 &&
-                             (ToLower(argsBefore[2]) == L"tags" || ToLower(argsBefore[2]) == L"tag"))
-                    {
-                        static const wchar_t* values[] =
-                        {
-                            L"/tag",
-                            L"/limit"
-                        };
-                        AddCompletionCandidates(&candidates, values);
-                    }
-                    else
-                    {
-                        static const wchar_t* values[] =
-                        {
-                            L"big",
-                            L"find",
-                            L"tags",
-                            L"summary",
-                            L"pe"
-                        };
-                        AddCompletionCandidates(&candidates, values);
-                    }
-                }
-                else if (topic == L"log")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"enable",
-                        L"disable",
-                        L"status"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"mcp")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"on",
-                        L"off",
-                        L"status",
-                        L"client-setup",
-                        L"endpoint"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"dump-raw")
-                {
-                    AddCompletionCandidate(&candidates, L"/zerofill");
-                }
-                else if (topic == L"dump-kernel")
-                {
-                    static const wchar_t* values[] = { L"/max", L"/strict" };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"dump-live")
-                {
-                    static const wchar_t* values[] = { L"/user", L"/compress", L"/hv" };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"set-ppl-antimalware")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"on",
-                        L"off",
-                        L"status"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else if (topic == L"!wnf")
-                {
-                    static const wchar_t* values[] =
-                    {
-                        L"decode",
-                        L"instances",
-                        L"instance",
-                        L"data",
-                        L"candidates",
-                        L"lists"
-                    };
-                    AddCompletionCandidates(&candidates, values);
-                }
-                else
-                {
-                    AddHelpCompletionCandidates(&candidates);
-                }
+                // Reuse the topic command's own completer. A second hand-maintained
+                // help-path table drifted (wrong tokens, missing nested scopes) and
+                // made annotated Tab headers describe a different command than the
+                // names printed underneath.
+                std::vector<std::wstring> topicArgs(argsBefore.begin() + 1, argsBefore.end());
+                candidates = BuildInteractiveCompletionCandidates(topicArgs);
             }
         }
         else if (command == L"!dml_proc" ||
@@ -5486,35 +5107,37 @@ static std::wstring LongestCommonCompletionPrefix(const std::vector<std::wstring
     return prefix;
 }
 
-static void PrintCompletionMatches(const std::vector<std::wstring>& matches)
+static std::vector<std::wstring> CompletionListingArgs(const std::vector<std::wstring>& argsBefore)
+{
+    std::vector<std::wstring> args = argsBefore;
+    if (args.size() >= 2 && IsHelpToken(args[0]))
+    {
+        args.erase(args.begin());
+    }
+
+    return args;
+}
+
+static std::wstring FormatCompletionListing(
+    const std::vector<std::wstring>& matches,
+    const std::vector<std::wstring>& argsBefore)
+{
+    const std::vector<std::wstring> hintArgs = CompletionListingArgs(argsBefore);
+    std::wstring command;
+    if (!hintArgs.empty())
+    {
+        command = CompletionCanonicalCommand(hintArgs[0]);
+    }
+
+    return BuildCompletionListing(matches, command, hintArgs);
+}
+
+static void PrintCompletionMatches(
+    const std::vector<std::wstring>& matches,
+    const std::vector<std::wstring>& argsBefore)
 {
     std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
-    const size_t columnWidth = 18;
-    size_t column = 0;
-
-    std::wcout << L"\n";
-    for (const std::wstring& match : matches)
-    {
-        std::wcout << L"  " << match;
-        size_t used = match.size() + 2;
-        while (used < columnWidth)
-        {
-            std::wcout << L" ";
-            ++used;
-        }
-
-        ++column;
-        if (column == 4)
-        {
-            std::wcout << L"\n";
-            column = 0;
-        }
-    }
-
-    if (column != 0)
-    {
-        std::wcout << L"\n";
-    }
+    std::wcout << FormatCompletionListing(matches, argsBefore);
 }
 
 struct InteractiveRenderState
@@ -6137,7 +5760,7 @@ static bool ApplyInteractiveTabCompletion(std::wstring* line, size_t* cursor, bo
             replacement = LongestCommonCompletionPrefix(matches);
             if (replacement.size() <= context.Prefix.size())
             {
-                PrintCompletionMatches(matches);
+                PrintCompletionMatches(matches, context.ArgsBefore);
                 if (listed != nullptr)
                 {
                     *listed = true;
@@ -27468,6 +27091,158 @@ static std::wstring CaptureDetailedHelpOutput(
     return output;
 }
 
+static std::wstring CaptureCompletionListing(
+    const std::vector<std::wstring>& argsBefore,
+    const std::wstring& prefix)
+{
+    std::vector<std::wstring> candidates = BuildInteractiveCompletionCandidates(argsBefore);
+    std::vector<std::wstring> matches = FilterCompletionCandidates(candidates, prefix);
+    return FormatCompletionListing(matches, argsBefore);
+}
+
+static std::wstring FirstCommandMissingCompletionGuide()
+{
+    std::wstring missing;
+    for (const CommandInfo& info : CommandRegistry::Commands())
+    {
+        if (info.Support == CommandSupport::DbgEng || info.Name == nullptr)
+        {
+            continue;
+        }
+
+        CompletionCommandGuide guide = {};
+        if (!FindCompletionCommandGuide(info.Name, {}, &guide) ||
+            guide.Summary == nullptr ||
+            guide.Summary[0] == L'\0')
+        {
+            missing = info.Name;
+            break;
+        }
+    }
+
+    return missing;
+}
+
+static std::wstring FirstTokenMissingCompletionHint()
+{
+    std::wstring missing;
+    const std::vector<std::vector<std::wstring>> contexts =
+    {
+        {},
+        {L"help"},
+        {L"!pool"},
+        {L"!pool", L"pe"},
+        {L"!pool", L"big"},
+        {L"!pool", L"tags"},
+        {L"!callbacks"},
+        {L"!byovd"},
+        {L"!byovd", L"fixture"},
+        {L"!byovd", L"update"},
+        {L"!ti"},
+        {L"!ti", L"by"},
+        {L"!ti", L"start"},
+        {L"!timeline"},
+        {L"!timeline", L"ingest"},
+        {L"!timeline", L"ingest", L"ti"},
+        {L"!timeline", L"live"},
+        {L"!timeline", L"query"},
+        {L"!minifilter"},
+        {L"!minifilter", L"disable"},
+        {L"!mapper"},
+        {L"!payload"},
+        {L"!kpage"},
+        {L"!hunt"},
+        {L"!vad"},
+        {L"!wfp"},
+        {L"!wfp", L"callouts"},
+        {L"!wfp", L"filters"},
+        {L"!alpc"},
+        {L"!etw"},
+        {L"!etw", L"providers"},
+        {L"!hal"},
+        {L"!hive"},
+        {L"!token"},
+        {L"!fwtable"},
+        {L"!fwtable", L"provider"},
+        {L"!fwtable", L"providers"},
+        {L"!module"},
+        {L"!driver"},
+        {L"!ci"},
+        {L"!nmi"},
+        {L"!wnf"},
+        {L"!snapshot"},
+        {L"!diff"},
+        {L"!threads"},
+        {L"!dpc"},
+        {L"ai"},
+        {L"ai", L"config"},
+        {L"ai", L"config", L"provider"},
+        {L"ai", L"config", L"policy"},
+        {L"ai", L"config", L"effort"},
+        {L"ai", L"playbook"},
+        {L"ai", L"playbook", L"callbacks"},
+        {L"ai", L"explain"},
+        {L"ai", L"explain", L"!callbacks"},
+        {L"ai", L"analyze", L"!callbacks"},
+        {L"!ti", L"watch"},
+        {L"!ti", L"recent"},
+        {L"help", L"!ti", L"by"},
+        {L"help", L"!dml_proc"},
+        {L"help", L"!minifilter", L"disable"},
+        {L"ai", L"annotate"},
+        {L"ai", L"run"},
+        {L"ai", L"write"},
+        {L"ai", L"transcript"},
+        {L"mcp"},
+        {L"mcp", L"on"},
+        {L"mcp", L"client-setup"},
+        {L"probe"},
+        {L"backend"},
+        {L"kdinit"},
+        {L"log"},
+        {L"write"},
+        {L"procctx"},
+        {L"vtop"},
+        {L"dt"},
+        {L"u"},
+        {L"dump-kernel"},
+        {L"dump-live"},
+        {L"help", L"!pool"},
+        {L"help", L"!byovd"},
+        {L"help", L"!ti"}
+    };
+
+    for (const std::vector<std::wstring>& argsBefore : contexts)
+    {
+        std::vector<std::wstring> candidates = BuildInteractiveCompletionCandidates(argsBefore);
+        const std::vector<std::wstring> hintArgs = CompletionListingArgs(argsBefore);
+        std::wstring command;
+        if (!hintArgs.empty())
+        {
+            command = CompletionCanonicalCommand(hintArgs[0]);
+        }
+
+        for (const std::wstring& token : candidates)
+        {
+            CompletionHint hint = {};
+            if (!FindCompletionTokenHint(command, hintArgs, token, &hint) ||
+                hint.Summary == nullptr ||
+                hint.Summary[0] == L'\0')
+            {
+                missing = command.empty() ? token : (command + L" " + token);
+                break;
+            }
+        }
+
+        if (!missing.empty())
+        {
+            break;
+        }
+    }
+
+    return missing;
+}
+
 static int RunConsoleSurfaceSelfTest()
 {
     int exitCode = 1;
@@ -28040,7 +27815,15 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"!minifilter", L"disable"}, L"all", L"minifilter-all-irp-completion");
         CheckCompletionCandidate(&context, {L"!fltmgr"}, L"disable-all", L"fltmgr-disable-all-completion");
         CheckCompletionCandidate(&context, {L"help", L"!minifilter"}, L"disable-all", L"help-minifilter-disable-all-completion");
-        CheckCompletionCandidate(&context, {L"help", L"!minifilter"}, L"all", L"help-minifilter-all-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!minifilter", L"disable"}, L"all", L"help-minifilter-all-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !CompletionCandidateExists({L"help", L"!minifilter"}, L"all") &&
+                !CompletionCandidateExists({L"help", L"!dml_proc"}, L"!pool") &&
+                CompletionCandidateExists({L"help", L"!dml_proc"}, L"help") &&
+                CompletionCandidateExists({L"help", L"!ti", L"by"}, L"pid") &&
+                CompletionCandidateExists({L"!ti", L"watch"}, L"/pid"),
+            L"help-prefix-reuses-native-completion-scopes");
         CheckConsoleSurfaceSelfTest(
             &context,
             IsNativeOwnedCommand(L"!minifilter") &&
@@ -28107,6 +27890,155 @@ static int RunConsoleSurfaceSelfTest()
                 !CompletionCandidateExists({}, L"byovd") &&
                 !CompletionCandidateExists({}, L"pool-scan-pe"),
             L"legacy-command-aliases-are-not-completed");
+        {
+            const std::wstring missingGuide = FirstCommandMissingCompletionGuide();
+            if (!missingGuide.empty())
+            {
+                std::wcerr << L"[console.selftest] missing completion guide: "
+                           << missingGuide << L"\n";
+            }
+
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                missingGuide.empty(),
+                L"completion-guide-covers-native-and-alias-commands");
+
+            const std::wstring missingHint = FirstTokenMissingCompletionHint();
+            if (!missingHint.empty())
+            {
+                std::wcerr << L"[console.selftest] missing completion hint: "
+                           << missingHint << L"\n";
+            }
+
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                missingHint.empty(),
+                L"completion-hints-cover-subcommand-tokens");
+
+            const std::wstring poolList = CaptureCompletionListing({L"!pool"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                poolList.find(L"usage:") != std::wstring::npos &&
+                    poolList.find(L"!pool [big|find|tags|summary|pe]") != std::wstring::npos &&
+                    poolList.find(L"big-pool") != std::wstring::npos &&
+                    poolList.find(L"pe") != std::wstring::npos &&
+                    poolList.find(L"signature-wiped") != std::wstring::npos &&
+                    poolList.find(L"!pool big") != std::wstring::npos,
+                L"completion-listing-pool-shows-usage-and-subcommand-text");
+
+            const std::wstring poolFromHelp = CaptureCompletionListing({L"help", L"!pool"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                poolFromHelp.find(L"usage:") != std::wstring::npos &&
+                    poolFromHelp.find(L"signature-wiped") != std::wstring::npos,
+                L"completion-listing-help-pool-strips-help-prefix");
+
+            const std::wstring poolPe = CaptureCompletionListing({L"!pool", L"pe"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                poolPe.find(L"!pool pe") != std::wstring::npos &&
+                    poolPe.find(L"/dump") != std::wstring::npos &&
+                    poolPe.find(L"write-like") != std::wstring::npos,
+                L"completion-listing-pool-pe-options");
+
+            const std::wstring callbacks = CaptureCompletionListing({L"!callbacks"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                callbacks.find(L"usage:") != std::wstring::npos &&
+                    callbacks.find(L"object") != std::wstring::npos &&
+                    callbacks.find(L"CallbackList") != std::wstring::npos &&
+                    callbacks.find(L"minifilter") != std::wstring::npos,
+                L"completion-listing-callbacks-scopes");
+
+            const std::wstring byovd = CaptureCompletionListing({L"!byovd"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                byovd.find(L"usage:") != std::wstring::npos &&
+                    byovd.find(L"fixture") != std::wstring::npos &&
+                    byovd.find(L"catalog") != std::wstring::npos,
+                L"completion-listing-byovd-actions");
+
+            const std::wstring mapper = CaptureCompletionListing({L"!mapper"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                mapper.find(L"usage:") != std::wstring::npos &&
+                    mapper.find(L"unloaded") != std::wstring::npos &&
+                    mapper.find(L"PiDDB") != std::wstring::npos,
+                L"completion-listing-mapper-scopes");
+
+            const std::wstring timeline = CaptureCompletionListing({L"!timeline"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                timeline.find(L"usage:") != std::wstring::npos &&
+                    timeline.find(L"dashboard") != std::wstring::npos &&
+                    timeline.find(L"\n  live") == std::wstring::npos &&
+                    !CompletionCandidateExists({L"!timeline"}, L"live"),
+                L"completion-listing-timeline-simple-surface");
+
+            const std::wstring aiList = CaptureCompletionListing({L"ai"}, L"");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                aiList.find(L"usage:") != std::wstring::npos &&
+                    aiList.find(L"playbook") != std::wstring::npos &&
+                    aiList.find(L"config") != std::wstring::npos,
+                L"completion-listing-ai-actions");
+
+            const std::wstring rootBang = CaptureCompletionListing({}, L"!p");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                rootBang.find(L"!pool") != std::wstring::npos &&
+                    rootBang.find(L"!payload") != std::wstring::npos &&
+                    (rootBang.find(L"big-pool") != std::wstring::npos ||
+                     rootBang.find(L"hook-to-body") != std::wstring::npos),
+                L"completion-listing-root-prefix-includes-summaries");
+
+            CompletionHint dbHint = {};
+            CompletionHint dqHint = {};
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                FindCompletionTokenHint(L"", {}, L"db", &dbHint) &&
+                    FindCompletionTokenHint(L"", {}, L"dq", &dqHint) &&
+                    dbHint.Summary != nullptr &&
+                    dqHint.Summary != nullptr &&
+                    std::wstring(dbHint.Summary).find(L"byte") != std::wstring::npos &&
+                    std::wstring(dqHint.Summary).find(L"qword") != std::wstring::npos &&
+                    std::wstring(dbHint.Summary) != std::wstring(dqHint.Summary),
+                L"completion-listing-display-family-keeps-per-command-summaries");
+
+            CompletionHint nestedAll = {};
+            CompletionHint nestedObject = {};
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                FindCompletionTokenHint(
+                    L"ai",
+                    {L"ai", L"explain", L"!callbacks"},
+                    L"object",
+                    &nestedObject) &&
+                    nestedObject.Summary != nullptr &&
+                    std::wstring(nestedObject.Summary).find(L"CallbackList") != std::wstring::npos &&
+                    FindCompletionTokenHint(
+                        L"ai",
+                        {L"ai", L"explain", L"!callbacks"},
+                        L"all",
+                        &nestedAll) &&
+                    nestedAll.Summary != nullptr &&
+                    std::wstring(nestedAll.Summary).find(L"include every supported surface") ==
+                        std::wstring::npos &&
+                    std::wstring(nestedAll.Summary).find(L"minifilter") != std::wstring::npos,
+                L"completion-hints-nested-ai-explain-callbacks");
+
+            CompletionHint tiWatchPid = {};
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                FindCompletionTokenHint(
+                    L"!ti",
+                    {L"!ti", L"watch"},
+                    L"/pid",
+                    &tiWatchPid) &&
+                    tiWatchPid.Summary != nullptr &&
+                    std::wstring(tiWatchPid.Summary).find(L"PID") != std::wstring::npos,
+                L"completion-hints-ti-watch-pid-option");
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             IsPoolPeOption(L"/suspicious") &&
