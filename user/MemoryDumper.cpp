@@ -628,6 +628,53 @@ bool ProbeForPeHeader(const uint8_t* buffer, size_t length, PeHeaderProbe* resul
     return true;
 }
 
+bool ProbeForPageStartPeHeader(const uint8_t* buffer, size_t length, PeHeaderProbe* result)
+{
+    if (result == nullptr)
+    {
+        return false;
+    }
+
+    *result = PeHeaderProbe{};
+    if (buffer == nullptr || length < sizeof(IMAGE_DOS_HEADER))
+    {
+        return false;
+    }
+
+    const uint32_t scanEnd = (length < 0x1000)
+        ? static_cast<uint32_t>(length)
+        : 0x1000;
+
+    IMAGE_DOS_HEADER dos = {};
+    std::memcpy(&dos, buffer, sizeof(dos));
+    LONG declared = dos.e_lfanew;
+    if (declared < 0x40 || static_cast<uint32_t>(declared) + 26 > scanEnd)
+    {
+        return false;
+    }
+    if (!IsPlausibleNtHeader(buffer, scanEnd, static_cast<uint32_t>(declared)))
+    {
+        return false;
+    }
+
+    IMAGE_FILE_HEADER fileHeader = {};
+    std::memcpy(&fileHeader, buffer + declared + 4, sizeof(fileHeader));
+    if (fileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 &&
+        fileHeader.Machine != IMAGE_FILE_MACHINE_I386)
+    {
+        return false;
+    }
+
+    result->IsPe = true;
+    result->MzWiped = (dos.e_magic != IMAGE_DOS_SIGNATURE);
+    result->ELfanewMismatch = false;
+    uint32_t sig = 0;
+    std::memcpy(&sig, buffer + declared, sizeof(sig));
+    result->PeSignatureWiped = (sig != IMAGE_NT_SIGNATURE);
+    PopulateProbeFromNt(buffer, scanEnd, static_cast<uint32_t>(declared), result);
+    return true;
+}
+
 bool DumpKernelRangeToFile(
     DeviceClient& device,
     uint64_t address,
