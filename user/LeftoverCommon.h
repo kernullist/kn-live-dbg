@@ -47,6 +47,13 @@ bool LeftoverIsLikelyUserAddress(uint64_t address);
 uint64_t LeftoverSignExtendVa(uint64_t address, bool la57);
 bool LeftoverIsSessionSpace(uint64_t address);
 bool LeftoverIsPageTableSelfMap(uint64_t address, uint64_t pteBase, bool la57);
+bool LeftoverProbePagePermissions(
+    DeviceClient& device,
+    uint64_t address,
+    bool* present,
+    bool* writable,
+    bool* executable,
+    uint64_t* physicalAddress);
 uint64_t LeftoverDecodeVaFromPteAddress(uint64_t pteAddress, uint64_t pteBase, bool la57);
 
 bool LeftoverReadBytes(

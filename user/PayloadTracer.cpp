@@ -40,6 +40,25 @@ namespace
         pointers->push_back(item);
     }
 
+    bool KeepPayloadScanRecord(const PayloadTraceRecord& record)
+    {
+        bool keep = false;
+        if (record.Risk == L"high")
+        {
+            keep = true;
+        }
+        else if (record.PeProbed && record.Pe.IsPe)
+        {
+            keep = true;
+        }
+        else if (record.Inspect.EffectiveExecutable)
+        {
+            keep = true;
+        }
+
+        return keep;
+    }
+
 }
 
 std::wstring ClassifyPayloadRecord(const PayloadTraceRecord& record)
@@ -80,6 +99,11 @@ std::wstring ClassifyPayloadRecord(const PayloadTraceRecord& record)
             classification = L"session";
             break;
         }
+        if (!record.Inspect.EffectiveExecutable)
+        {
+            classification = L"nonexec_kernel_pointer";
+            break;
+        }
         classification = L"independent_or_untracked";
     } while (false);
 
@@ -116,15 +140,20 @@ std::wstring RiskForPayloadRecord(const PayloadTraceRecord& record)
             risk = L"high";
             break;
         }
-        if (record.Classification == L"big_pool" ||
-            record.Classification == L"independent_or_untracked")
+        if (record.Classification == L"independent_or_untracked" ||
+            record.Classification == L"big_pool")
         {
-            risk = L"high";
+            risk = record.Inspect.EffectiveExecutable ? L"high" : L"medium";
             break;
         }
         if (record.Classification == L"session")
         {
             risk = L"medium";
+            break;
+        }
+        if (record.Classification == L"nonexec_kernel_pointer")
+        {
+            risk = L"low";
             break;
         }
     } while (false);
@@ -153,7 +182,7 @@ void ProbePeAt(
         }
 
         PeHeaderProbe probe = {};
-        if (!ProbeForPeHeader(bytes.data(), bytes.size(), &probe) || !probe.IsPe)
+        if (!ProbeForPageStartPeHeader(bytes.data(), bytes.size(), &probe) || !probe.IsPe)
         {
             break;
         }
@@ -230,29 +259,45 @@ bool PayloadTracer::TraceAddress(
         {
             record->InLoadedModule = true;
             record->ModuleName = module->Name;
-        }
-
-        std::wstring nearest;
-        uint64_t displacement = 0;
-        std::wstring ignored;
-        if (symbols_.FindNearestSymbol(address, &nearest, &displacement, &ignored) &&
-            !nearest.empty())
-        {
-            std::wstringstream stream;
-            stream << nearest;
-            if (displacement != 0)
+            std::wstring nearest;
+            uint64_t displacement = 0;
+            std::wstring ignored;
+            if (symbols_.FindNearestSymbol(address, &nearest, &displacement, &ignored) &&
+                !nearest.empty())
             {
-                stream << L"+0x" << std::hex << displacement;
+                std::wstringstream stream;
+                stream << nearest;
+                if (displacement != 0)
+                {
+                    stream << L"+0x" << std::hex << displacement;
+                }
+                record->SymbolName = stream.str();
             }
-            record->SymbolName = stream.str();
         }
 
-        std::wstring inspectError;
-        if (!InspectAddress(device_, symbols_, address, &record->Inspect, &inspectError, 0))
+        bool present = false;
+        bool writable = false;
+        bool executable = false;
+        uint64_t physical = 0;
+        if (LeftoverProbePagePermissions(
+                device_,
+                address,
+                &present,
+                &writable,
+                &executable,
+                &physical))
         {
-            LeftoverAppendNote(
-                &record->Notes,
-                inspectError.empty() ? L"address inspect failed" : inspectError);
+            record->Inspect.TranslationAttempted = true;
+            record->Inspect.TranslationSucceeded = true;
+            record->Inspect.EffectivePresent = present;
+            record->Inspect.EffectiveWritable = writable;
+            record->Inspect.EffectiveExecutable = executable;
+            record->Inspect.PhysicalAddress = physical;
+        }
+        else
+        {
+            record->Inspect.TranslationAttempted = true;
+            LeftoverAppendNote(&record->Notes, L"page-table translate failed");
         }
 
         const LeftoverBigPoolEntry* pool = LeftoverFindBigPool(pool_, address);
@@ -273,10 +318,6 @@ bool PayloadTracer::TraceAddress(
         {
             ProbePeAt(device_, address & ~0xFFFull, record);
         }
-        if (!record->PeProbed)
-        {
-            ProbePeAt(device_, address, record);
-        }
 
         uint32_t instructionCount = options.DisasmInstructions;
         if (instructionCount == 0)
@@ -288,9 +329,14 @@ bool PayloadTracer::TraceAddress(
             instructionCount = kMaxDisasmInstructions;
         }
 
+        const bool skipDisasm = options.ScanHooks && !record->Inspect.EffectiveExecutable;
         std::vector<uint8_t> code;
         std::wstring readError;
-        if (device_.ReadMemory(address, kMaxDisasmBytes, &code, &readError) &&
+        if (skipDisasm)
+        {
+            LeftoverAppendNote(&record->Notes, L"skipped disasm; pointer is not executable");
+        }
+        else if (device_.ReadMemory(address, kMaxDisasmBytes, &code, &readError) &&
             !code.empty())
         {
             std::wstring disasmError;
@@ -681,7 +727,7 @@ void PayloadTracer::TracePrepared(
             result->Incomplete = true;
             result->Warnings.push_back(
                 L"payload scan truncated after " + std::to_wstring(limit) +
-                L" unique unbacked pointer(s); " +
+                L" kept unbacked pointer(s); " +
                 std::to_wstring(unique.size()) + L" unique address(es) observed");
             break;
         }
@@ -692,6 +738,11 @@ void PayloadTracer::TracePrepared(
         {
             result->Warnings.push_back(
                 L"trace " + LeftoverFormatHex(item.first, 16) + L" failed: " + error);
+            continue;
+        }
+        if (!KeepPayloadScanRecord(record))
+        {
+            ++result->FilteredLowRisk;
             continue;
         }
         result->Records.push_back(record);
@@ -755,6 +806,7 @@ std::wstring BuildPayloadTraceJson(const PayloadTraceResult& result)
     out += L",\"hookPointersSeen\":" + std::to_wstring(result.HookPointersSeen);
     out += L",\"uniqueUnbacked\":" + std::to_wstring(result.UniqueUnbacked);
     out += L",\"traced\":" + std::to_wstring(result.Traced);
+    out += L",\"filteredLowRisk\":" + std::to_wstring(result.FilteredLowRisk);
     out += L",\"hookSweepComplete\":";
     out += result.HookSweepComplete ? L"true" : L"false";
     out += L",\"incomplete\":";
@@ -862,6 +914,29 @@ bool PayloadTracerSelfTest()
         record.InLoadedModule = true;
         record.Classification = ClassifyPayloadRecord(record);
         if (record.Classification != L"inside_module" || RiskForPayloadRecord(record) != L"low")
+        {
+            ok = false;
+            break;
+        }
+
+        record = PayloadTraceRecord{};
+        record.Address = 0xFFFF9886C6359900ull;
+        record.Inspect.TranslationSucceeded = true;
+        record.Inspect.EffectivePresent = true;
+        record.Inspect.EffectiveWritable = true;
+        record.Inspect.EffectiveExecutable = false;
+        record.Classification = ClassifyPayloadRecord(record);
+        if (record.Classification != L"nonexec_kernel_pointer" ||
+            RiskForPayloadRecord(record) != L"low")
+        {
+            ok = false;
+            break;
+        }
+
+        record.Inspect.EffectiveExecutable = true;
+        record.Classification = ClassifyPayloadRecord(record);
+        if (record.Classification != L"independent_or_untracked" ||
+            RiskForPayloadRecord(record) != L"high")
         {
             ok = false;
             break;

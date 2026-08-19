@@ -55,6 +55,7 @@ struct PayloadTraceResult
     uint64_t HookPointersSeen = 0;
     uint64_t UniqueUnbacked = 0;
     uint64_t Traced = 0;
+    uint64_t FilteredLowRisk = 0;
     bool HookSweepComplete = false;
     bool Incomplete = false;
     bool BigPoolQueried = false;

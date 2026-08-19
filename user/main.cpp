@@ -15594,6 +15594,8 @@ static void PrintPayloadHelp()
     std::wcout << L"  scan collects unbacked pointers from callbacks, SSDT, IDT, NMI, HAL,\n";
     std::wcout << L"  SYSCALL MSRs, ETW, WFP callouts, DPC/timer, driver dispatch, and firmware\n";
     std::wcout << L"  table handlers. A failed surface is a coverage warning, not a clean miss.\n";
+    std::wcout << L"  scan drops present but non-executable off-module pointers (registry\n";
+    std::wcout << L"  cookies/list links). Those are not hook bodies. Count them as filtered.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !payload fffffc0000123456\n";
@@ -15659,6 +15661,8 @@ static void PrintKpageHelp()
     std::wcout << L"  not replace !payload scan: hooks can hide inside a live module via PTE\n";
     std::wcout << L"  remap. Adjacent same-permission pages are coalesced. Page-table self-map\n";
     std::wcout << L"  windows are skipped. Session-space hits stay low-risk unless W+X or PE.\n";
+    std::wcout << L"  /pe uses a page-start PE probe (DOS e_lfanew only). Interior NT-header\n";
+    std::wcout << L"  scans are for pool-scan-pe, not leftover pages.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /deep         also walk nt!MmPfnDatabase (expensive; not default).\n";
@@ -16033,6 +16037,7 @@ static void HandlePayloadCommand(
             std::wcout << L" scan hooks=" << result.HookPointersSeen
                        << L" unique=" << result.UniqueUnbacked
                        << L" traced=" << result.Traced
+                       << L" filtered=" << result.FilteredLowRisk
                        << L" complete=" << (result.HookSweepComplete ? L"yes" : L"no");
             if (result.Incomplete)
             {

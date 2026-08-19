@@ -1,5 +1,7 @@
 #include "LeftoverCommon.h"
 
+#include "../shared/KnLiveDbgIoctl.h"
+
 #include <Windows.h>
 #include <algorithm>
 #include <cstring>
@@ -190,6 +192,108 @@ uint64_t LeftoverSignExtendVa(uint64_t address, bool la57)
 bool LeftoverIsSessionSpace(uint64_t address)
 {
     return address >= kLeftoverSessionSpaceMin && address < kLeftoverSessionSpaceEnd;
+}
+
+bool LeftoverProbePagePermissions(
+    DeviceClient& device,
+    uint64_t address,
+    bool* present,
+    bool* writable,
+    bool* executable,
+    uint64_t* physicalAddress)
+{
+    bool ok = false;
+
+    do
+    {
+        if (present != nullptr)
+        {
+            *present = false;
+        }
+        if (writable != nullptr)
+        {
+            *writable = false;
+        }
+        if (executable != nullptr)
+        {
+            *executable = false;
+        }
+        if (physicalAddress != nullptr)
+        {
+            *physicalAddress = 0;
+        }
+
+        PhysicalTranslationInfo info = {};
+        std::wstring translateError;
+        if (!device.TranslateVirtual(0, address, 1, &info, &translateError))
+        {
+            break;
+        }
+
+        const bool la57 = (info.Flags & KNDBG_TRANSLATE_FLAG_LA57_ACTIVE) != 0;
+        const uint64_t levels[5] = {
+            info.Pml5e,
+            info.Pml4e,
+            info.Pdpte,
+            info.Pde,
+            info.Pte
+        };
+        const size_t startIndex = la57 ? 0 : 1;
+        size_t walkCount = info.PagingLevels;
+        if (walkCount > 5)
+        {
+            walkCount = 5;
+        }
+
+        bool mapped = walkCount > 0;
+        bool writeOk = walkCount > 0;
+        bool nxClear = walkCount > 0;
+        for (size_t step = 0; step < walkCount; ++step)
+        {
+            const size_t levelIdx = startIndex + step;
+            if (levelIdx >= 5)
+            {
+                break;
+            }
+            const uint64_t pte = levels[levelIdx];
+            if ((pte & 1ull) == 0)
+            {
+                mapped = false;
+            }
+            if ((pte & (1ull << 1)) == 0)
+            {
+                writeOk = false;
+            }
+            if ((pte & (1ull << 63)) != 0)
+            {
+                nxClear = false;
+            }
+            if ((levelIdx == 2 || levelIdx == 3) && (pte & (1ull << 7)) != 0)
+            {
+                break;
+            }
+        }
+
+        if (present != nullptr)
+        {
+            *present = mapped;
+        }
+        if (writable != nullptr)
+        {
+            *writable = mapped && writeOk;
+        }
+        if (executable != nullptr)
+        {
+            *executable = mapped && nxClear;
+        }
+        if (physicalAddress != nullptr)
+        {
+            *physicalAddress = info.PhysicalAddress;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
 }
 
 bool LeftoverIsPageTableSelfMap(uint64_t address, uint64_t pteBase, bool la57)

@@ -650,7 +650,7 @@ void OrphanKernelPageScanner::FinalizeRegions(
         if (device_.ReadMemory(probeAt, 0x1000, &head, &ignored) && head.size() >= 0x40)
         {
             PeHeaderProbe probe = {};
-            if (ProbeForPeHeader(head.data(), head.size(), &probe) && probe.IsPe)
+            if (ProbeForPageStartPeHeader(head.data(), head.size(), &probe) && probe.IsPe)
             {
                 region.HasPe = true;
                 region.Pe = probe;
@@ -891,6 +891,33 @@ bool OrphanKernelPageSelfTest()
         region.HasPe = true;
         region.Classification = ClassifyRegion(region);
         if (region.Classification != L"unbacked_pe" || RiskForRegion(region) != L"high")
+        {
+            ok = false;
+            break;
+        }
+
+        uint8_t emptyPage[0x80] = {};
+        PeHeaderProbe probe = {};
+        if (ProbeForPageStartPeHeader(emptyPage, sizeof(emptyPage), &probe) && probe.IsPe)
+        {
+            ok = false;
+            break;
+        }
+
+        uint8_t interiorOnly[0x200] = {};
+        const uint32_t peSig = 0x00004550;
+        memcpy(interiorOnly + 0x80, &peSig, sizeof(peSig));
+        uint16_t machine = 0x8664;
+        memcpy(interiorOnly + 0x84, &machine, sizeof(machine));
+        uint16_t sections = 3;
+        memcpy(interiorOnly + 0x86, &sections, sizeof(sections));
+        uint16_t optional = 0x00F0;
+        memcpy(interiorOnly + 0x94, &optional, sizeof(optional));
+        uint16_t magic = 0x020B;
+        memcpy(interiorOnly + 0x98, &magic, sizeof(magic));
+        PeHeaderProbe interior = {};
+        if (ProbeForPageStartPeHeader(interiorOnly, sizeof(interiorOnly), &interior) &&
+            interior.IsPe)
         {
             ok = false;
             break;
