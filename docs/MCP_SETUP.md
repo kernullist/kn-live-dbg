@@ -510,10 +510,10 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `etw.integrity` | ETW logger/GetCpuClock integrity (InfinityHook) | (none) |
 | `nmi.list` | Enumerate registered NMI callbacks | `scope` |
 | `minifilter.list` | List filesystem minifilters and IRP registrations | `filter`, `name` |
-| `payload.inspect` | Trace one kernel address (page walk, big pool, PE, disasm) | `address`, `va`, `symbol` |
-| `payload.scan` | Sweep unbacked hook pointers and trace each unique target | `limit` |
-| `mapper.list` | Walk MmUnloadedDrivers, PiDDB, and ci hash leftovers | `scope`, `limit` |
-| `kpage.list` | Find executable kernel pages outside loaded modules | `deep`, `wx`, `pe`, `limit` |
+| `payload.inspect` | Hook-to-body: trace one kernel address (page walk, big pool, PE, disasm) | `address`, `va`, `symbol` |
+| `payload.scan` | Hook-to-body: sweep unbacked hook pointers and trace each unique target | `limit` |
+| `mapper.list` | Bookkeeping remnants: MmUnloadedDrivers / PiDDB / ci hash. leftover=0 is ledger-clean, not payload-absent | `scope`, `limit` |
+| `kpage.list` | Orphan pages: executable kernel VA outside loaded modules (wiped kdmapper payload layer) | `deep`, `wx`, `pe`, `limit` |
 | `fwtable.list` | Enumerate firmware-table providers | `scope`, `module`, `provider`, `signature` |
 | `pool.find` | Enumerate kernel big pool allocations (tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
 | `address.inspect` | Inspect a virtual address (page-table walk/permissions/owning module) | `address`, `va`, `symbol` |
@@ -674,12 +674,18 @@ pointing outside the kernel image and attach which module each target belongs to
 
 ### 9.3b Leftover mapper / unbacked kernel code
 
+Mapper-family coverage is layered. `mapper.list` leftover=0 means the ledgers
+look clean (expected after stock kdmapper wipe), not that the payload is gone.
+
 ```
 The original cheat driver is gone. Find leftover functional code in nonpaged
 pool or independent pages, plus MmUnloadedDrivers / PiDDB / ci hash remnants.
 Do not run a PFN walk unless I ask.
 ```
--> `payload.scan` + `mapper.list` + `kpage.list`, then `payload.inspect` on each unbacked address. Set `kpage.list` `deep=true` only when the operator asks.
+-> bookkeeping: `mapper.list`; orphan pages: `kpage.list`; hook-to-body:
+`payload.scan` then `payload.inspect` on each unbacked address; staged pool PE:
+`pool.scan_pe`. Loaded BYOVD while still mapped is `byovd.scan`. Set
+`kpage.list` `deep=true` only when the operator asks.
 
 ### 9.4 Callback target verification (down to the code)
 

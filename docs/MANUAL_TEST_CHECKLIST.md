@@ -117,9 +117,23 @@ On a clean machine these commands must not invent a live mapper. Coverage
 warnings for unresolved private symbols are acceptable; fabricated hook
 bodies or a flood of `SUSPICIOUS` rows are not.
 
+These are separate detection layers. A quiet result on one layer is not a
+clean bill on the others:
+
+- `byovd` = loaded BYOVD (signed exploit driver still mapped)
+- `!mapper` = bookkeeping remnants (PiDDB / unload log / ci hash)
+- `!kpage` = orphan executable pages (independent-page payload)
+- `!payload scan` = hook-to-body (off-module function pointers)
+- `pool-scan-pe` = staged pool PE
+- `!snapshot` `leftover-mapper` = temporal bookkeeping only; it does not
+  run `!kpage` or `!payload scan`
+
+`help !mapper` / `help !payload` / `help !kpage` must name those layers.
+`leftover=0` on a clean box is expected and is not "no mapper".
+
 ### `!payload` / `!payload scan`
-- `help !payload` shows `scan`, `/limit`, `/disasm`, `/json`, and the example
-  `!payload scan`.
+- `help !payload` shows `scan`, `/limit`, `/disasm`, `/json`, `Layer: hook-to-body`,
+  and the example `!payload scan`.
 - `!payload nt!KiSystemCall64` classifies `inside_module` / risk `low`.
 - `!payload scan` may take a while. Expect `unique=0 traced=0` on a clean box,
   or only coverage warnings from an incomplete hook surface. No high-risk
@@ -128,16 +142,22 @@ bodies or a flood of `SUSPICIOUS` rows are not.
   `help !payload`.
 
 ### `!mapper` / `!unloaded` / `!piddb` / `!cihash`
-- `help !mapper` mentions `MmUnloadedDrivers`, `PiDDBCacheTable`, and
-  `ci!g_KernelHashBucketList`.
-- `!mapper` on a clean box may list historical `STALE` names from legitimate
-  unloads. That is telemetry, not a finding. `SUSPICIOUS` requires a wiped
-  name, TimeDateStamp 0, or an unloaded range that is still present+executable.
+- `help !mapper` mentions `MmUnloadedDrivers`, `PiDDBCacheTable`,
+  `ci!g_KernelHashBucketList`, and `Layer: bookkeeping remnants`.
+- `!mapper` on a clean box may list historical unload rows (`REUSED` /
+  `RELOAD` / `xN`). Boot leftovers explained by the unload log or `dump_*`
+  are `EXPECTED` and omitted from default output. `STALE` is a name that is
+  still leftover after that filter. `SUSPICIOUS` requires a wiped name,
+  TimeDateStamp 0, or an unloaded range that is still present+executable
+  and not reused.
+- `piddb=.../avl` or `/list` with `leftover=0` and `hash=... leftover=0` is
+  the clean-host shape. Do not treat that as mapper-payload absence.
 - `!snapshot show baseline /domains` includes `leftover-mapper` after a full
   baseline. It must not include a leftover-pages/`!kpage` domain.
 
 ### `!kpage`
-- `help !kpage` shows `/deep`, `/wx`, `/pe`, `/session`, `/nosession`.
+- `help !kpage` shows `/deep`, `/wx`, `/pe`, `/session`, `/nosession`, and
+  `Layer: orphan executable pages`.
 - Bare `!kpage` may emit session-space `low` rows. High-risk requires `W+X`
   or a PE header outside every loaded module.
 - Do not treat `/deep` as the default; run it once and confirm it is slower

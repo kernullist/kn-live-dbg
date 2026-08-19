@@ -221,9 +221,10 @@ The command now behaves like a small tool-using agent and intent router. The ope
 - "list NMI callbacks" or "check NMI handler chain" -> `nmi.list`
 - "show W+X pool allocations" -> `pool.find` with `wx=true`
 - "pool tag Wmem larger than 0x10000" -> `pool.find` with `tag=Wmem` and `min=0x10000`
-- "find leftover unbacked kernel hook targets" -> `payload.scan`
-- "scan unloaded mapper remnants" or "show MmUnloadedDrivers and PiDDB leftovers" -> `mapper.list`
-- "find executable kernel pages outside loaded modules" -> `kpage.list` without `deep`
+- "find leftover unbacked kernel hook targets" -> `payload.scan` (hook-to-body layer)
+- "scan unloaded mapper remnants" or "show MmUnloadedDrivers and PiDDB leftovers" -> `mapper.list` (bookkeeping remnants; leftover=0 is not payload absence)
+- "find executable kernel pages outside loaded modules" -> `kpage.list` without `deep` (orphan-page layer)
+- "kdmapper / manual-map after the driver is gone" -> `mapper.list` then `kpage.list` then `payload.scan`; do not stop at a clean mapper.list
 - "list filesystem minifilters" -> `minifilter.list`
 - "show IRP handlers for filter UnionFS" -> `minifilter.list` with `filter=UnionFS`
 - Disable/enable of minifilter IRP handlers is not on the AI planner. Use the

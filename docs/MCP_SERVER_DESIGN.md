@@ -561,10 +561,10 @@ Added kernel anti-cheat detections not in the initial catalog (the 18 tools used
 | `vbs.scan` | `!vbs` | `BuildVbsJson` (`.vbs.v1`) | VBS/HVCI/CI/SecureKernel/trustlet (a single tool covering !ci/!securekernel) |
 | `byovd.scan` | `byovd scan /no-update` | `BuildByovdScanJson` (existing) | `/no-update` forced (blocks network/subprocess) |
 | `pool.scan_pe` | `pool-scan-pe` | `BuildPoolPeJson` (`.pool-pe.v1`) | args tag/limit/suspicious; `/dump` not exposed |
-| `payload.inspect` | `!payload` | `BuildPayloadTraceJson` (`.payload.v1`) | args address/va/symbol |
-| `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | args limit |
-| `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | args scope/limit |
-| `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | args deep/wx/pe/limit; deep is not default |
+| `payload.inspect` | `!payload` | `BuildPayloadTraceJson` (`.payload.v1`) | hook-to-body; args address/va/symbol |
+| `payload.scan` | `!payload scan` | `BuildPayloadTraceJson` (`.payload.v1`) | hook-to-body; args limit |
+| `mapper.list` | `!mapper` | `BuildMapperJson` (`.mapper.v1`) | bookkeeping remnants; leftover=0 is ledger-clean; args scope/limit |
+| `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | orphan pages; args deep/wx/pe/limit; deep is not default |
 | `minifilter.list` | `!minifilter` | `BuildMinifilterIrpJson` (`.minifilter.v1`) | args filter/name |
 | `minifilter.set_irp` | `!minifilter disable/enable` | `BuildMinifilterIrpChangeJson` (`.minifilter-irp.v1`) or `BuildMinifilterIrpBatchJson` (`.minifilter-irp-batch.v1`) | WRITE; action enable/disable; `irp=all` batches |
 | `hunt.run` | `!hunt` | `BuildHuntJson` (existing) | args mode (quick/deep); `/summary` forced |

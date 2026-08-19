@@ -71,7 +71,7 @@ kn-live-dbg/
 31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, writes a WinDbg-openable complete dump with `dump-kernel <path>` (8 KB `DUMP_HEADER64` plus streamed physical RAM runs from `MmGetPhysicalMemoryRanges`), and asks Windows for an OS live kernel dump with `dump-live <path>` via `NtSystemDebugControl(SysDbgGetLiveKernelDump)`, or writes a WinDbg kernel complete dump of one process with `dump-live <path> /user <pid|eprocess>`. `dump-pe` parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
 32. Hunts PE images stashed in big pool with `pool-scan-pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
 33. Lists filesystem minifilters and can disable or restore one IRP pre/post handler, or every registered slot, with `!minifilter`. The walk uses `fltmgr!FltGlobals` and PDB `_FLT_OPERATION_REGISTRATION` offsets. `disable` writes NULL through the existing write IOCTL after saving the original pointers in this session; `enable` puts them back. `disable <name> all` and `disable-all` walk every slot. Inbox filters warn. No new driver IOCTL.
-34. Traces leftover mapper payloads after the original driver image is gone. `!payload <addr>` follows one hook target through page-table translation, big-pool membership, PE-header probe, and disassembly. `!payload scan` collects unbacked pointers from the hook scanners first. `!mapper` walks `MmUnloadedDrivers`, `PiDDBCacheTable`, and the ci hash-bucket list. `!kpage` reports executable kernel pages outside loaded modules; `!kpage /deep` adds a capped PFN-database pass. None of these add driver IOCTLs.
+34. Traces leftover mapper payloads after the original driver image is gone, as separate layers. `byovd` is loaded BYOVD. `!mapper` is bookkeeping remnants (`MmUnloadedDrivers` / PiDDB / ci hash); `leftover=0` is ledger-clean, not payload-absent. `!kpage` is orphan executable pages; `!kpage /deep` adds a capped PFN-database pass. `!payload` / `!payload scan` is hook-to-body. `pool-scan-pe` is staged pool PE. None of these add driver IOCTLs.
 34. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
 34. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
 35. Subscribes to the Microsoft-Windows-Threat-Intelligence ETW provider with `!ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]` -- creates an own ETW session (StartTraceW + EnableTraceEx2 + ProcessTrace), decodes payloads via TDH with a raw-hex fallback, captures every event into a 1M-event in-memory ring AND a JSONL log file (rotated 100MB x 10), and surfaces only watch-matched events to the TUI (throttled to 50/s). Lazy image-name matching catches processes that aren't running yet at subscribe time; first match auto-promotes the PID to the hot path. Subcommands cover live tail (`!ti watch`), ring stats and histograms (`!ti stats`), per-PID/per-task filtering (`!ti by pid` / `!ti by task`), substring grep (`!ti grep`), and forensic export (`!ti save`). KnLiveDbg.exe events are excluded by default to prevent self-feedback.
@@ -1607,9 +1607,22 @@ Notes:
 
 ## Leftover mapper payloads
 
-Game-cheat mappers often copy working code into nonpaged pool or independent
-pages, then unload the original driver. These commands follow that leftover
-without widening the driver:
+A kdmapper-style run is two objects. The signed exploit driver is loaded for
+real, then usually unloaded and wiped from kernel ledgers. The payload is
+copied into independent pages and was never a loaded module. `!mapper` only
+sees ledger leftovers from the first object. `leftover=0` means the ledgers
+look clean, not that the payload is gone.
+
+| Layer | Command | Role |
+|---|---|---|
+| Loaded BYOVD | `byovd` / `!byovd` | Catch the signed exploit driver while it is still mapped |
+| Bookkeeping remnants | `!mapper` | Incomplete PiDDB / `MmUnloadedDrivers` / ci-hash wipe |
+| Orphan executable pages | `!kpage /pe` | Independent-page payload after the ledgers were cleaned |
+| Hook-to-body | `!payload scan` | Callbacks/SSDT/IDT/... that still jump to those pages |
+| Staged pool PE | `pool-scan-pe` | Pool-backed PE (intact or MZ/PE wiped). Not independent pages |
+| Temporal bookkeeping | `!snapshot` `leftover-mapper` | Same-boot add/drop of `!mapper` records only |
+
+These commands follow that leftover without widening the driver:
 
 ```text
 !payload <address|symbol> [/disasm <n>] [/json <path>]
@@ -1624,21 +1637,29 @@ without widening the driver:
    `!ssdt`, `!idt`, `!nmi`, `!wfp`, or `!driver integrity`.
 2. `!payload scan` collects those unbacked hook pointers first, then traces each
    unique address. A failed hook surface is a coverage warning, not a clean miss.
-   Default `/limit` is 16 unique addresses.
+   Default `/limit` is 16 unique addresses. A quiet scan does not prove orphan
+   pages are unused.
 3. `!mapper` walks `nt!MmUnloadedDrivers`, `nt!PiDDBCacheTable`, and
-   `ci!g_KernelHashBucketList`. Names missing from the live module list are
-   `STALE`. Wiped names, a zero TimeDateStamp, or an unloaded range that is still
-   present+executable are `SUSPICIOUS`. `!unloaded` / `!piddb` / `!cihash` are
-   aliases. Missing symbols fail closed.
+   `ci!g_KernelHashBucketList`. This is the bookkeeping-remnant layer for a
+   driver that was actually loaded. Range overlap with a live image is `REUSED`
+   or `RELOAD`, not `STILL-X`. Names explained by the unload log or `dump_*`
+   are `EXPECTED` and omitted from default output. Other missing names are
+   `STALE`. Wiped names, a zero TimeDateStamp, or an unloaded range that is
+   still present+executable and not reused are `SUSPICIOUS`. `!unloaded` /
+   `!piddb` / `!cihash` are aliases. Missing symbols fail closed. Stock
+   kdmapper ledger wipe is expected to print `leftover=0`.
 4. `!kpage` walks the kernel half of the live CR3 page tables and reports
-   executable leaves outside every loaded module. `/deep` adds a capped
-   `MmPfnDatabase` pass and is not the default. `!snapshot` stores
-   `leftover-mapper` only; it does not run `!kpage`.
+   executable leaves outside every loaded module. This is the orphan-page
+   layer that can still see a wiped kdmapper payload. `/pe` keeps PE-like
+   regions. `/deep` adds a capped `MmPfnDatabase` pass and is not the default.
+   `!snapshot` stores `leftover-mapper` only; it does not run `!kpage`.
 
 ```text
-knkd> !payload scan
+knkd> byovd scan
 knkd> !mapper
 knkd> !kpage /wx /pe
+knkd> !payload scan
+knkd> pool-scan-pe /suspicious
 knkd> !kpage /deep /nosession
 ```
 

@@ -509,10 +509,10 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `etw.integrity` | ETW logger/GetCpuClock 무결성(InfinityHook) | (없음) |
 | `nmi.list` | 등록된 NMI 콜백 열거 | `scope` |
 | `minifilter.list` | 파일시스템 미니필터와 IRP 등록 열거 | `filter`, `name` |
-| `payload.inspect` | 커널 주소 하나 추적(페이지워크/big pool/PE/디스어셈) | `address`, `va`, `symbol` |
-| `payload.scan` | 모듈 밖 훅 포인터를 모아 각각 추적 | `limit` |
-| `mapper.list` | MmUnloadedDrivers / PiDDB / ci hash 잔흔 | `scope`, `limit` |
-| `kpage.list` | 로드 모듈 밖 실행 가능 커널 페이지 | `deep`, `wx`, `pe`, `limit` |
+| `payload.inspect` | 훅-투-바디: 커널 주소 하나 추적(페이지워크/big pool/PE/디스어셈) | `address`, `va`, `symbol` |
+| `payload.scan` | 훅-투-바디: 모듈 밖 훅 포인터를 모아 각각 추적 | `limit` |
+| `mapper.list` | 장부 잔흔: MmUnloadedDrivers / PiDDB / ci hash. leftover=0은 장부가 깨끗한 것이지 페이로드 부재가 아님 | `scope`, `limit` |
+| `kpage.list` | 고아 페이지: 로드 모듈 밖 실행 가능 커널 VA (장부 wipe 이후 kdmapper 페이로드 층) | `deep`, `wx`, `pe`, `limit` |
 | `fwtable.list` | 펌웨어 테이블 provider 열거 | `scope`, `module`, `provider`, `signature` |
 | `pool.find` | 커널 big pool 할당 열거(tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
 | `address.inspect` | 가상주소 검사(페이지테이블 워크/권한/소유 모듈) | `address`, `va`, `symbol` |
@@ -716,12 +716,16 @@ code.disasm 로 엔트리 바이트까지 확인.
 
 ### 9.8b 언로드된 매퍼 / 잔존 커널 코드
 
+매퍼 계열은 레이어가 나뉜다. `mapper.list` leftover=0은 장부가 깨끗하다는 뜻이고
+(공개 kdmapper wipe 이후 정상), 페이로드가 없다는 뜻이 아니다.
+
 ```
 최초 드라이버는 사라졌다. 논페이지드 풀이나 독립 페이지에 남은 실행 코드와
 MmUnloadedDrivers / PiDDB / ci hash 잔흔을 찾아줘. PFN 전수는 내가 말하기 전에는 하지 마.
 ```
-→ `payload.scan` + `mapper.list` + `kpage.list`, 모듈 밖 주소는 `payload.inspect`.
-`kpage.list`의 `deep=true`는 운영자가 요청할 때만.
+→ 장부 잔흔: `mapper.list`. 고아 페이지: `kpage.list`. 훅-투-바디: `payload.scan`
+후 모듈 밖 주소는 `payload.inspect`. 풀 스테이징 PE: `pool.scan_pe`. 아직 로드된
+취약 드라이버는 `byovd.scan`. `kpage.list`의 `deep=true`는 운영자가 요청할 때만.
 
 ### 9.9 물리 메모리 / VA 별칭 (후킹된 매핑 우회)
 
