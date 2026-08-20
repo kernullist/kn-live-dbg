@@ -23,6 +23,12 @@ Completed core slices:
 7. Minifilter IRP control: `!minifilter` list/show plus session-backed
    enable/disable of one filter IRP, or every registered slot
    (`disable-all` / `irp=all`).
+8. Evidence timeline (`!timeline`) with TI ingest, kernel live
+   process/image/thread callbacks, dashboard, and MCP
+   query/export/reconcile.
+9. Default/deep `!hunt` collectors for Policy-based QoS, Bind Filter
+   mappings, CloudFiles placeholders, and Filter Manager attachments,
+   plus the corresponding E2E fixtures.
 
 Remaining priority order:
 

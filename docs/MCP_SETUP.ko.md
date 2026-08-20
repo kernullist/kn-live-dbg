@@ -493,7 +493,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 ## 6. 제공 기능 카탈로그
 
-### 6.1 읽기 툴 (46종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
+### 6.1 읽기 툴 (58종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
 
 | 툴 | 설명 | 주요 인자 (별도 표기 외 모두 선택) |
 |-----|------|----------------------|
@@ -507,12 +507,19 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `vad.list` | VAD 열거(W+X/private/hidden-PTE/DKOM 체크) | `pid`, `image`, `eprocess`, `exec`, `private`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
 | `threads.list` | 스레드/시작주소/APC/스택 증거 | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
 | `etw.integrity` | ETW logger/GetCpuClock 무결성(InfinityHook) | (없음) |
+| `etw.providers` | ETW provider 등록/enable-callback 소유의 휴리스틱·부분 진단 | (없음) |
+| `etw.ti_cross` | 활성 TI 구독 수신과 침묵/드롭 신호를 교차 대조 | (없음) |
 | `nmi.list` | 등록된 NMI 콜백 열거 | `scope` |
 | `minifilter.list` | 파일시스템 미니필터와 IRP 등록 열거 | `filter`, `name` |
 | `payload.inspect` | 훅-투-바디: 커널 주소 하나 추적(페이지워크/big pool/PE/디스어셈) | `address`, `va`, `symbol` |
 | `payload.scan` | 훅-투-바디: 모듈 밖 훅 포인터를 모아 각각 추적 | `limit` |
 | `mapper.list` | 장부 잔흔: MmUnloadedDrivers / PiDDB / ci hash. leftover=0은 장부가 깨끗한 것이지 페이로드 부재가 아님 | `scope`, `limit` |
 | `kpage.list` | 고아 페이지: 로드 모듈 밖 실행 가능 커널 VA (장부 wipe 이후 kdmapper 페이로드 층) | `deep`, `wx`, `pe`, `limit` |
+| `hal.scan` | HalDispatchTable / HalPrivateDispatchTable 함수 포인터 소유 | (없음) |
+| `hive.list` | 레지스트리 하이브 GetCellRoutine 소유와 리스트 링크 검증 | (없음) |
+| `token.inspect` | 프로세스 토큰 privilege Present/Enabled 마스크 | `pid`, `image`, `eprocess`, `limit` |
+| `dpc.list` | 샘플 DPC deferred 루틴 열거, 이미지 밖 콜백은 high risk | (없음) |
+| `timer.list` | 커널 타이머 DPC 루틴 열거, 이미지 밖 콜백은 high risk | (없음) |
 | `fwtable.list` | 펌웨어 테이블 provider 열거 | `scope`, `module`, `provider`, `signature` |
 | `pool.find` | 커널 big pool 할당 열거(tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
 | `address.inspect` | 가상주소 검사(페이지테이블 워크/권한/소유 모듈) | `address`, `va`, `symbol` |
