@@ -795,16 +795,18 @@ namespace
         { L"preview", L"ai preview <prompt>", L"compatibility: print the request locally" },
         { L"ask", L"ai ask <prompt>", L"compatibility: send a free-form request" },
         { L"plan", L"ai plan <prompt>", L"build a validated command plan" },
+        { L"go", L"ai go", L"run a pending expensive local-tool plan" },
+        { L"no", L"ai no", L"cancel a pending expensive local-tool plan" },
         { L"run", L"ai run <index|all>", L"execute planned read-only commands" },
         { L"write", L"ai write <index> [confirm]", L"preview or confirm a write-like plan step" },
         { L"explain", L"ai explain <read-only-command...>", L"run a command and explain the output" },
         { L"analyze", L"ai analyze <read-only-command...>", L"run a command and write an analysis report" },
         { L"annotate", L"ai annotate <u|uf> <addr>", L"annotate native disassembly" },
         { L"diagnose", L"ai diagnose <note>", L"diagnose a symbol/backend/type failure" },
-        { L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver>", L"load a repeatable read-only plan" },
+        { L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver|hidden|...>", L"load a repeatable read-only plan" },
         { L"transcript", L"ai transcript <path>", L"capture command stdout/stderr as JSONL" },
         { L"audit", L"ai audit <path>", L"record write-like command decisions" },
-        { L"show", L"ai show", L"print the loaded plan" },
+        { L"show", L"ai show [plan|pending|evidence]", L"print the loaded plan, pending tools, or last evidence" },
         { L"report", L"ai report <path>", L"write a Markdown session report" },
     };
 
@@ -829,7 +831,21 @@ namespace
         { L"object", L"ai playbook object [run|dry-run]", L"object-manager callback review plan" },
         { L"address", L"ai playbook address <va> [run|dry-run]", L"one-address provenance plan" },
         { L"driver", L"ai playbook driver [module] [run|dry-run]", L"suspect-driver surface map" },
+        { L"hidden", L"ai playbook hidden [run|dry-run]", L"hidden process cross-view plan" },
+        { L"handles", L"ai playbook handles [run|dry-run]", L"process handle VM/DUP triage plan" },
+        { L"leftover", L"ai playbook leftover [run|dry-run]", L"mapper leftover plus orphan pages" },
+        { L"integrity", L"ai playbook integrity [run|dry-run]", L"module and driver integrity plan" },
+        { L"vbs", L"ai playbook vbs [run|dry-run]", L"VBS/HVCI posture plan" },
+        { L"dma", L"ai playbook dma [run|dry-run]", L"DMA and hypervisor posture plan" },
         { L"help", nullptr, L"show playbook usage" },
+    };
+
+    const CompletionHint kAiShowTokens[] =
+    {
+        { L"plan", L"ai show plan", L"print the loaded command plan" },
+        { L"pending", L"ai show pending", L"print the pending expensive tool plan" },
+        { L"evidence", L"ai show evidence", L"print the last captured tool or evidence output" },
+        { L"help", nullptr, L"show ai show usage" },
     };
 
     const CompletionHint kHelpOnlyTokens[] =
@@ -885,6 +901,20 @@ namespace
         { L"!pool", L"ai explain|analyze !pool", L"big-pool triage" },
         { L"!address", L"ai explain|analyze !address <va>", L"page-walk and owner" },
         { L"!wnf", L"ai explain|analyze !wnf", L"WNF state names" },
+        { L"!handles", L"ai explain|analyze !handles", L"process handle VM/DUP triage" },
+        { L"!hiddenproc", L"ai explain|analyze !hiddenproc", L"hidden process cross-view" },
+        { L"!wdfilter", L"ai explain|analyze !wdfilter", L"WdFilter RuntimeDriver leftovers" },
+        { L"!inputstack", L"ai explain|analyze !inputstack", L"kbd/mou attached-device stacks" },
+        { L"!dma", L"ai explain|analyze !dma", L"IOMMU and Kernel DMA Protection" },
+        { L"!hv", L"ai explain|analyze !hv", L"hypervisor presence" },
+        { L"!drvobj", L"ai explain|analyze !drvobj", L"DRIVER_OBJECT and device chain" },
+        { L"!devstack", L"ai explain|analyze !devstack", L"DEVICE_OBJECT attached stack" },
+        { L"!payload", L"ai explain|analyze !payload", L"hook-to-body leftover trace" },
+        { L"!mapper", L"ai explain|analyze !mapper", L"unloaded-driver bookkeeping remnants" },
+        { L"!kpage", L"ai explain|analyze !kpage", L"orphan executable kernel pages" },
+        { L"!minifilter", L"ai explain|analyze !minifilter", L"minifilter IRP registrations" },
+        { L"!byovd", L"ai explain|analyze !byovd", L"loaded BYOVD catalog scan" },
+        { L"dump-analyze", L"ai explain|analyze dump-analyze <path>", L"offline dump header and PML4/PML5 walk" },
         { L"help", nullptr, L"show ai explain/analyze usage" },
     };
 
@@ -1363,13 +1393,15 @@ namespace
 
     const CompletionScopeTable kAiScopes[] =
     {
-        SCOPE(L"", L"ai <question> | ai <subcommand> ...", L"intent router, planner, and evidence analysis", kAiRootTokens),
+        SCOPE(L"", L"ai <goal> | ai <subcommand> ...", L"intent router: local tools, playbooks, and evidence analysis", kAiRootTokens),
         SCOPE(L"config", L"ai config [status|provider|policy|model|test|...]", L"provider setup", kAiConfigTokens),
         SCOPE(L"config-provider", L"ai config provider <name|off>", L"select the AI provider", kAiProviderNameTokens),
         SCOPE(L"config-policy", L"ai config policy <allow-remote|local-only|status>", L"allow or block HTTP providers", kAiPolicyTokens),
         SCOPE(L"config-effort", L"ai config effort <minimal|low|medium|high|xhigh>", L"reasoning effort", kAiEffortTokens),
-        SCOPE(L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver>", L"repeatable read-only plans", kAiPlaybookTokens),
+        SCOPE(L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver|hidden|...>", L"repeatable read-only plans", kAiPlaybookTokens),
         SCOPE(L"playbook-run", L"ai playbook <name> [run|dry-run]", L"execute or preview a playbook", kAiPlaybookRunTokens),
+        SCOPE(L"show", L"ai show [plan|pending|evidence]", L"loaded plan, pending tools, or last evidence", kAiShowTokens),
+        SCOPE(L"leaf", L"ai <subcommand> [help]", L"subcommand help", kHelpOnlyTokens),
         SCOPE(L"evidence", L"ai explain|analyze <read-only-command...>", L"run a command and explain or analyze the output", kAiEvidenceTokens),
         SCOPE(L"annotate", L"ai annotate <u|uf> <addr|symbol>", L"annotate native disassembly", kAiAnnotateTokens),
         SCOPE(L"write", L"ai write <index> [confirm]", L"preview or confirm a write-like plan step", kAiWriteTokens),
@@ -1894,6 +1926,25 @@ namespace
             else if (first == L"run")
             {
                 scope = L"run";
+            }
+            else if (first == L"show")
+            {
+                scope = L"show";
+            }
+            else if (first == L"go" ||
+                     first == L"no" ||
+                     first == L"status" ||
+                     first == L"report" ||
+                     first == L"diagnose" ||
+                     first == L"auth" ||
+                     first == L"preview" ||
+                     first == L"ask" ||
+                     first == L"plan" ||
+                     first == L"model" ||
+                     first == L"base-url" ||
+                     first == L"providers")
+            {
+                scope = L"leaf";
             }
             else if (first == L"transcript")
             {

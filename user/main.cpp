@@ -1,4 +1,5 @@
 #include "AddressInspector.h"
+#include "AiCapabilityCatalog.h"
 #include "AiProvider.h"
 #include "AlpcScanner.h"
 #include "BindFilterScanner.h"
@@ -690,6 +691,16 @@ struct AiPlanState
     uint32_t TranscriptRotationIndex;
     std::wstring WriteAuditPath;
     bool WriteAuditEnabled;
+    uint32_t LastPid = 0;
+    std::wstring LastImage;
+    std::wstring LastAddress;
+    std::wstring LastDumpPath;
+    std::wstring LastEvidenceTitle;
+    std::wstring LastEvidenceOutput;
+    bool HasPendingCapabilityPlan = false;
+    std::wstring PendingCapabilityJson;
+    std::wstring PendingQuery;
+    bool PendingVerbose = false;
 };
 
 struct CommandExecutionResult
@@ -720,6 +731,16 @@ static void PreserveAiSessionSettings(AiPlanState& target, const AiPlanState& so
     target.TranscriptRotationIndex = source.TranscriptRotationIndex;
     target.WriteAuditPath = source.WriteAuditPath;
     target.WriteAuditEnabled = source.WriteAuditEnabled;
+    target.LastPid = source.LastPid;
+    target.LastImage = source.LastImage;
+    target.LastAddress = source.LastAddress;
+    target.LastDumpPath = source.LastDumpPath;
+    target.LastEvidenceTitle = source.LastEvidenceTitle;
+    target.LastEvidenceOutput = source.LastEvidenceOutput;
+    target.HasPendingCapabilityPlan = source.HasPendingCapabilityPlan;
+    target.PendingCapabilityJson = source.PendingCapabilityJson;
+    target.PendingQuery = source.PendingQuery;
+    target.PendingVerbose = source.PendingVerbose;
 }
 
 static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text, std::wstring* error);
@@ -1812,7 +1833,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !kpage          orphan-page layer (executable VA outside modules)\n";
     std::wcout << L"  help !minifilter     list minifilters and enable/disable IRP handlers\n";
     std::wcout << L"  --cloak              relaunch from a random EXE/service/device session\n";
-    std::wcout << L"  ai help              AI question, config, plan, explain, run, and write commands\n";
+    std::wcout << L"  ai help              AI goals, local tools, playbooks, go/no, explain, run, and write\n";
     std::wcout << L"\n";
 
     PrintColoredText(L"example workflows", KNDBG_COLOR_ACCENT);
@@ -3850,6 +3871,8 @@ static void AddFirmwareTableCommandCompletionCandidates(
     } while (false);
 }
 
+static bool IsAiEvidenceNestedAction(const std::wstring& action);
+
 static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidates)
 {
     static const wchar_t* values[] =
@@ -3867,6 +3890,8 @@ static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidate
         L"preview",
         L"ask",
         L"plan",
+        L"go",
+        L"no",
         L"run",
         L"write",
         L"explain",
@@ -3925,6 +3950,20 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!pool",
         L"!address",
         L"!wnf",
+        L"!handles",
+        L"!hiddenproc",
+        L"!wdfilter",
+        L"!inputstack",
+        L"!dma",
+        L"!hv",
+        L"!drvobj",
+        L"!devstack",
+        L"!payload",
+        L"!mapper",
+        L"!kpage",
+        L"!minifilter",
+        L"!byovd",
+        L"dump-analyze",
         L"help"
     };
 
@@ -4057,7 +4096,11 @@ static void AddAiCompletionCandidates(
         }
         else if (action == L"write")
         {
-            if (argsBefore.size() >= 3)
+            if (argsBefore.size() == 2)
+            {
+                AddCompletionCandidate(candidates, L"help");
+            }
+            else
             {
                 static const wchar_t* values[] =
                 {
@@ -4067,6 +4110,21 @@ static void AddAiCompletionCandidates(
 
                 AddCompletionCandidates(candidates, values);
             }
+        }
+        else if (action == L"status" ||
+                 action == L"go" ||
+                 action == L"no" ||
+                 action == L"report" ||
+                 action == L"diagnose" ||
+                 action == L"auth" ||
+                 action == L"preview" ||
+                 action == L"ask" ||
+                 action == L"plan" ||
+                 action == L"providers" ||
+                 action == L"model" ||
+                 action == L"base-url")
+        {
+            AddCompletionCandidate(candidates, L"help");
         }
         else if (action == L"analyze")
         {
@@ -4126,6 +4184,12 @@ static void AddAiCompletionCandidates(
                     L"object",
                     L"address",
                     L"driver",
+                    L"hidden",
+                    L"handles",
+                    L"leftover",
+                    L"integrity",
+                    L"vbs",
+                    L"dma",
                     L"help"
                 };
 
@@ -4142,6 +4206,18 @@ static void AddAiCompletionCandidates(
 
                 AddCompletionCandidates(candidates, values);
             }
+        }
+        else if (action == L"show")
+        {
+            static const wchar_t* values[] =
+            {
+                L"plan",
+                L"pending",
+                L"evidence",
+                L"help"
+            };
+
+            AddCompletionCandidates(candidates, values);
         }
         else if (action == L"transcript")
         {
@@ -4840,6 +4916,17 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         else if (command == L"ai")
         {
             AddAiCompletionCandidates(argsBefore, &candidates);
+            if (argsBefore.size() >= 3 &&
+                IsAiEvidenceNestedAction(ToLower(argsBefore[1])))
+            {
+                std::vector<std::wstring> nested(argsBefore.begin() + 2, argsBefore.end());
+                const std::vector<std::wstring> nestedCandidates =
+                    BuildInteractiveCompletionCandidates(nested);
+                for (const std::wstring& token : nestedCandidates)
+                {
+                    AddCompletionCandidate(&candidates, token.c_str());
+                }
+            }
         }
         else if (command == L"backend")
         {
@@ -27719,40 +27806,49 @@ static void PrintQueryHelp()
 static void PrintAiHelp()
 {
     std::wcout << L"ai command:\n";
-    std::wcout << L"  ai <question>\n";
+    std::wcout << L"  ai <goal> [/verbose]\n";
     std::wcout << L"  ai <subcommand> [args...]\n";
     std::wcout << L"\n";
     std::wcout << L"primary subcommands:\n";
     std::wcout << L"  status       show provider, model, credential, and policy state\n";
     std::wcout << L"  config       configure provider, policy, model, base URL, effort, or auth\n";
+    std::wcout << L"  go           run a pending expensive local-tool plan\n";
+    std::wcout << L"  no           cancel a pending expensive local-tool plan\n";
+    std::wcout << L"  show         show the loaded command plan, pending tools, or last evidence\n";
     std::wcout << L"  plan         explicitly ask AI to produce executable command proposals\n";
     std::wcout << L"  run          execute planned read-only commands\n";
     std::wcout << L"  write        preview or confirm a planned write-like command\n";
     std::wcout << L"  explain      explicitly run a read-only command and ask AI to explain the output\n";
     std::wcout << L"  analyze      explicitly run a read-only command and ask AI for an analysis report\n";
-    std::wcout << L"  show         show the loaded AI plan\n";
     std::wcout << L"  report       write a session report\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  ai a.exe pid\n";
     std::wcout << L"  ai a.exe eprocess\n";
     std::wcout << L"  ai WdFilter.sys object callbacks\n";
+    std::wcout << L"  ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4 \xCC3E\xC544\xC918\n";
+    std::wcout << L"  ai \xCF5C\xBC31 \xC804\xC218\xC870\xC0AC\n";
     std::wcout << L"  ai pid 1234 dtb\n";
     std::wcout << L"  ai !callbacks all WdFilter.sys\n";
     std::wcout << L"  ai uf nt!PspCreateProcessNotifyRoutine 128\n";
     std::wcout << L"  ai check VBS status\n";
     std::wcout << L"  ai !ci options\n";
+    std::wcout << L"  ai go\n";
+    std::wcout << L"  ai show evidence\n";
     std::wcout << L"  ai explain !module integrity all /summary\n";
     std::wcout << L"  ai analyze !wnf candidates\n";
     std::wcout << L"  ai config provider openrouter\n";
     std::wcout << L"  ai config test\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Prefer ai <goal>. It auto-routes local tools, read-only evidence analysis, or command planning.\n";
+    std::wcout << L"  Prefer ai <goal>. Local process queries and playbooks run first; the model only picks tools.\n";
     std::wcout << L"  Exact read-only commands such as callbacks, dt, u, !ci, or !vbs are treated as evidence to explain.\n";
-    std::wcout << L"  ai plan and ai explain still work as explicit overrides when you want that mode.\n";
+    std::wcout << L"  Cheap tools run after a short preview. hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
+    std::wcout << L"  After tools run, AI explains the captured output. Conceptual why/what questions stay advisory.\n";
+    std::wcout << L"  ai plan remains an explicit command-proposal override. Default ai <goal> no longer auto-builds that plan.\n";
     std::wcout << L"  API-key providers load .env only from the EXE directory.\n";
     std::wcout << L"  ai run executes read-only validated plan commands; write-like commands require ai write confirm.\n";
+    std::wcout << L"  ai <subcommand> help and ai help <subcommand> print that subcommand's usage.\n";
     std::wcout << L"  Legacy detailed commands still work; use ai help <topic> when needed.\n";
 }
 
@@ -27874,14 +27970,30 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     else if (name == L"playbook")
     {
         std::wcout << L"ai playbook:\n";
-        std::wcout << L"  ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]\n";
+        std::wcout << L"  ai playbook <callbacks|minifilter|object|address|driver|hidden|handles|leftover|integrity|vbs|dma> [argument] [run|dry-run]\n";
         std::wcout << L"  Generates investigation commands; run executes read-only plan items immediately.\n";
+        std::wcout << L"  Natural-language goals such as ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4 also run the matching local-tool playbook immediately.\n";
     }
     else if (name == L"show")
     {
         std::wcout << L"ai show:\n";
         std::wcout << L"  ai show\n";
-        std::wcout << L"  Show the current parsed AI command plan.\n";
+        std::wcout << L"  ai show plan\n";
+        std::wcout << L"  ai show pending\n";
+        std::wcout << L"  ai show evidence\n";
+        std::wcout << L"  Show the current command plan, a pending expensive tool plan, or the last captured tool output.\n";
+    }
+    else if (name == L"go")
+    {
+        std::wcout << L"ai go:\n";
+        std::wcout << L"  ai go\n";
+        std::wcout << L"  Run the pending expensive local-tool plan previewed by ai <goal>.\n";
+    }
+    else if (name == L"no")
+    {
+        std::wcout << L"ai no:\n";
+        std::wcout << L"  ai no\n";
+        std::wcout << L"  Cancel the pending expensive local-tool plan without running it.\n";
     }
     else if (name == L"run")
     {
@@ -27952,6 +28064,11 @@ static bool IsAiPromptPayloadAction(const std::wstring& action)
     return action == L"ask" || action == L"preview" || action == L"plan" || action == L"diagnose";
 }
 
+static bool IsAiEvidenceNestedAction(const std::wstring& action)
+{
+    return action == L"explain" || action == L"analyze" || action == L"annotate";
+}
+
 static bool IsAiSubcommandHelpRequest(const std::vector<std::wstring>& args, const std::wstring& action)
 {
     bool help = false;
@@ -27963,7 +28080,7 @@ static bool IsAiSubcommandHelpRequest(const std::vector<std::wstring>& args, con
             break;
         }
 
-        if (IsAiPromptPayloadAction(action))
+        if (IsAiPromptPayloadAction(action) || IsAiEvidenceNestedAction(action))
         {
             help = args.size() == 3 && IsHelpToken(args[2]);
             break;
@@ -27980,6 +28097,39 @@ static bool IsAiSubcommandHelpRequest(const std::vector<std::wstring>& args, con
     } while (false);
 
     return help;
+}
+
+static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size_t commandIndex);
+
+static bool TryPrintAiNestedCommandHelp(const std::vector<std::wstring>& args)
+{
+    bool handled = false;
+
+    do
+    {
+        if (args.size() < 4 || !IsAiEvidenceNestedAction(ToLower(args[1])))
+        {
+            break;
+        }
+
+        bool nestedHelp = false;
+        for (size_t index = 3; index < args.size(); ++index)
+        {
+            if (IsHelpToken(args[index]))
+            {
+                nestedHelp = true;
+                break;
+            }
+        }
+        if (!nestedHelp)
+        {
+            break;
+        }
+
+        handled = PrintDetailedCommandHelp(args, 2);
+    } while (false);
+
+    return handled;
 }
 
 static void HandleMcpCommand(const std::vector<std::wstring>& args);
@@ -28510,7 +28660,13 @@ static std::wstring FirstTokenMissingCompletionHint()
         {L"ai", L"playbook", L"callbacks"},
         {L"ai", L"explain"},
         {L"ai", L"explain", L"!callbacks"},
+        {L"ai", L"explain", L"!hiddenproc"},
+        {L"ai", L"explain", L"!vad"},
         {L"ai", L"analyze", L"!callbacks"},
+        {L"ai", L"go"},
+        {L"ai", L"no"},
+        {L"ai", L"status"},
+        {L"ai", L"show"},
         {L"!ti", L"watch"},
         {L"!ti", L"recent"},
         {L"help", L"!ti", L"by"},
@@ -29398,8 +29554,54 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 aiList.find(L"usage:") != std::wstring::npos &&
                     aiList.find(L"playbook") != std::wstring::npos &&
-                    aiList.find(L"config") != std::wstring::npos,
+                    aiList.find(L"config") != std::wstring::npos &&
+                    aiList.find(L"go") != std::wstring::npos &&
+                    aiList.find(L"no") != std::wstring::npos,
                 L"completion-listing-ai-actions");
+            CheckCompletionCandidate(&context, {L"ai"}, L"go", L"ai-go-completion");
+            CheckCompletionCandidate(&context, {L"ai"}, L"no", L"ai-no-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"show"}, L"evidence", L"ai-show-evidence-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"playbook"}, L"hidden", L"ai-playbook-hidden-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"go"}, L"help", L"ai-go-help-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"status"}, L"help", L"ai-status-help-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"plan"}, L"help", L"ai-plan-help-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"explain", L"!vad"}, L"scan", L"ai-explain-vad-nested-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"explain", L"!hiddenproc"}, L"help", L"ai-explain-hiddenproc-help-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"analyze", L"!handles"}, L"/suspicious", L"ai-analyze-handles-nested-completion");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                AiCapabilityCatalogSelfTest(),
+                L"ai-capability-catalog-self-test");
+            {
+                const std::wstring aiHelp = CaptureDetailedHelpOutput({L"help", L"ai"}, 1);
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    aiHelp.find(L"ai go") != std::wstring::npos &&
+                        aiHelp.find(L"ai show evidence") != std::wstring::npos &&
+                        aiHelp.find(L"ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4") != std::wstring::npos &&
+                        aiHelp.find(L"no longer auto-builds") != std::wstring::npos,
+                    L"ai-help-covers-go-evidence-and-local-first");
+                const std::wstring goHelp = CaptureDetailedHelpOutput({L"help", L"ai", L"go"}, 1);
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    goHelp.find(L"ai go") != std::wstring::npos &&
+                        goHelp.find(L"pending expensive") != std::wstring::npos,
+                    L"ai-go-subcommand-help");
+                const std::wstring suffixGoHelp = CaptureDetailedHelpOutput({L"ai", L"go", L"help"}, 0);
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    suffixGoHelp.find(L"ai go") != std::wstring::npos &&
+                        suffixGoHelp.find(L"pending expensive") != std::wstring::npos,
+                    L"ai-go-suffix-help");
+                const std::wstring nestedVadHelp = CaptureDetailedHelpOutput(
+                    {L"ai", L"explain", L"!vad", L"help"},
+                    2);
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    nestedVadHelp.find(L"!vad") != std::wstring::npos &&
+                        nestedVadHelp.find(L"mappedpe") != std::wstring::npos,
+                    L"ai-explain-nested-command-help");
+            }
 
             const std::wstring rootBang = CaptureCompletionListing({}, L"!p");
             CheckConsoleSurfaceSelfTest(
@@ -33886,7 +34088,30 @@ static std::wstring BuildAiSessionReport(
     {
         stream << L" `" << plan.WriteAuditPath << L"`";
     }
-    stream << L"\n\n";
+    stream << L"\n";
+    stream << L"- last process: ";
+    if (plan.LastPid != 0 || !plan.LastImage.empty())
+    {
+        if (plan.LastPid != 0)
+        {
+            stream << L"pid=" << plan.LastPid;
+        }
+        if (!plan.LastImage.empty())
+        {
+            if (plan.LastPid != 0)
+            {
+                stream << L" ";
+            }
+            stream << L"image=" << plan.LastImage;
+        }
+    }
+    else
+    {
+        stream << L"(none)";
+    }
+    stream << L"\n";
+    stream << L"- last address: " << (plan.LastAddress.empty() ? L"(none)" : plan.LastAddress) << L"\n";
+    stream << L"- pending expensive tools: " << (plan.HasPendingCapabilityPlan ? L"yes" : L"no") << L"\n\n";
 
     stream << L"## Current AI Plan\n\n";
     if (plan.Commands.empty())
@@ -34965,6 +35190,9 @@ static void HandleAiEvidenceAnalysis(
             break;
         }
 
+        aiState.LastEvidenceTitle = commandLine;
+        aiState.LastEvidenceOutput = TruncateForAiPrompt(result.Output, 80000);
+
         AiCompletionRequest request = {};
         request.System = BuildAiSystemPrompt(state, symbols);
         request.Prompt = BuildAiEvidencePrompt(title, instructions, commandLine, result);
@@ -35052,7 +35280,27 @@ static bool IsAiEvidenceCommandName(const std::wstring& command)
             normalized == L"!driver" ||
             normalized == L"!pool" ||
             normalized == L"!address" ||
-            normalized == L"!wnf")
+            normalized == L"!wnf" ||
+            normalized == L"!handles" ||
+            normalized == L"!hiddenproc" ||
+            normalized == L"!wdfilter" ||
+            normalized == L"!inputstack" ||
+            normalized == L"!dma" ||
+            normalized == L"!hv" ||
+            normalized == L"!drvobj" ||
+            normalized == L"!devstack" ||
+            normalized == L"!payload" ||
+            normalized == L"!mapper" ||
+            normalized == L"!kpage" ||
+            normalized == L"!minifilter" ||
+            normalized == L"!token" ||
+            normalized == L"!hal" ||
+            normalized == L"!hive" ||
+            normalized == L"!dpc" ||
+            normalized == L"!timer" ||
+            normalized == L"!byovd" ||
+            normalized == L"!snapshot" ||
+            normalized == L"dump-analyze")
         {
             evidenceCommand = true;
             break;
@@ -35133,100 +35381,6 @@ static bool ContainsAnyNoCase(const std::wstring& text, const std::vector<std::w
     return found;
 }
 
-static bool StartsWithAnyNoCase(const std::wstring& text, const std::vector<std::wstring>& prefixes)
-{
-    bool found = false;
-    std::wstring lowered = TrimWhitespace(ToLower(text));
-
-    for (const std::wstring& prefix : prefixes)
-    {
-        if (prefix.empty())
-        {
-            continue;
-        }
-
-        if (lowered == prefix ||
-            (lowered.size() > prefix.size() &&
-             lowered.rfind(prefix + L" ", 0) == 0))
-        {
-            found = true;
-            break;
-        }
-    }
-
-    return found;
-}
-
-static bool ShouldAutoPlanAiQuery(const std::wstring& query)
-{
-    static const std::vector<std::wstring> conceptualPrefixes =
-    {
-        L"what is",
-        L"what are",
-        L"why",
-        L"how do",
-        L"how does",
-        L"how can",
-        L"explain",
-        L"describe"
-    };
-    static const std::vector<std::wstring> planActionSignals =
-    {
-        L"check",
-        L"show",
-        L"list",
-        L"inspect",
-        L"find",
-        L"dump",
-        L"translate",
-        L"decode",
-        L"disassemble",
-        L"enumerate",
-        L"scan",
-        L"triage",
-        L"audit",
-        L"verify",
-        L"status",
-        L"options",
-        L"integrity"
-    };
-    static const std::vector<std::wstring> planInvestigationPhrases =
-    {
-        L"vbs",
-        L"hvci",
-        L"cioptions",
-        L"ci options",
-        L"securekernel",
-        L"secure kernel",
-        L"trustlet",
-        L"kernel callback",
-        L"module integrity",
-        L"driver integrity",
-        L"pool scan",
-        L"pool tag",
-        L"address inspect",
-        L"symbol lookup"
-    };
-    bool shouldPlan = false;
-
-    do
-    {
-        if (StartsWithAnyNoCase(query, conceptualPrefixes))
-        {
-            break;
-        }
-
-        if (ContainsAnyNoCase(query, planActionSignals) ||
-            ContainsAnyNoCase(query, planInvestigationPhrases))
-        {
-            shouldPlan = true;
-            break;
-        }
-    } while (false);
-
-    return shouldPlan;
-}
-
 static bool IsAiCommandRecommendationQuery(const std::wstring& query)
 {
     static const std::vector<std::wstring> commandPhrases =
@@ -35239,7 +35393,11 @@ static bool IsAiCommandRecommendationQuery(const std::wstring& query)
         L"command to",
         L"commands for",
         L"recommend commands",
-        L"suggest commands"
+        L"suggest commands",
+        L"\xBA85\xB839 \xCD94\xCC9C",
+        L"\xBA85\xB839\xC5B4 \xC54C\xB824",
+        L"\xC5B4\xB5A4 \xBA85\xB839",
+        L"\xBB34\xC2A8 \xBA85\xB839"
     };
 
     return ContainsAnyNoCase(query, commandPhrases);
@@ -35275,6 +35433,10 @@ static void HandleAiPlanRequest(
 
         AiPlanState parsed = {};
         PreserveAiSessionSettings(parsed, aiState);
+        parsed.HasPendingCapabilityPlan = false;
+        parsed.PendingCapabilityJson.clear();
+        parsed.PendingQuery.clear();
+        parsed.PendingVerbose = false;
         if (!ParseAiPlanResponse(response.Text, &parsed, &error))
         {
             aiState.RawResponse = response.Text;
@@ -35367,11 +35529,50 @@ static AiPlanState BuildPlaybookPlan(const std::wstring& name, const std::wstrin
                 add(L"!callbacks all " + argument, L"find callback surfaces owned by the module");
             }
         }
+        else if (key == L"hidden" || key == L"hiddenproc" || key == L"hidden-process")
+        {
+            plan.Title = L"Hidden process cross-view";
+            plan.Summary = L"Compare ActiveProcessLinks, SPI, Toolhelp, and handle owners.";
+            add(L"!hiddenproc", L"cross-view hidden process scan");
+        }
+        else if (key == L"handles" || key == L"handle-table")
+        {
+            plan.Title = L"Process handle VM/DUP triage";
+            plan.Summary = L"Enumerate process handles and flag cross-process VM/DUP access.";
+            add(L"!handles", L"process handle table triage");
+        }
+        else if (key == L"leftover" || key == L"mapper")
+        {
+            plan.Title = L"Mapper leftover layers";
+            plan.Summary = L"Check bookkeeping remnants, then orphan executable kernel pages.";
+            add(L"!mapper all", L"MmUnloadedDrivers / PiDDB / ci hash leftovers");
+            add(L"!kpage", L"executable kernel pages outside loaded modules");
+        }
+        else if (key == L"integrity")
+        {
+            plan.Title = L"Module and driver integrity";
+            plan.Summary = L"Scan loaded-module PE integrity and DRIVER_OBJECT dispatch targets.";
+            add(L"!module integrity all /summary", L"module PE/section integrity summary");
+            add(L"!driver integrity all", L"DRIVER_OBJECT dispatch integrity");
+        }
+        else if (key == L"vbs")
+        {
+            plan.Title = L"VBS/HVCI posture";
+            plan.Summary = L"Report VBS, HVCI, CI options, hypervisor, and Secure Kernel state.";
+            add(L"!vbs", L"virtualization-based security posture");
+        }
+        else if (key == L"dma")
+        {
+            plan.Title = L"DMA and hypervisor posture";
+            plan.Summary = L"Report IOMMU/Kernel DMA Protection and hypervisor presence.";
+            add(L"!dma", L"IOMMU firmware and Kernel DMA Protection");
+            add(L"!hv", L"hypervisor presence without FEATURE_CONTROL");
+        }
         else
         {
             if (error != nullptr)
             {
-                *error = L"unknown playbook. supported: callbacks, minifilter, object, address, driver";
+                *error = L"unknown playbook. supported: callbacks, minifilter, object, address, driver, hidden, handles, leftover, integrity, vbs, dma";
             }
             break;
         }
@@ -35476,7 +35677,7 @@ static void HandleAiPlaybookCommand(
     {
         if (args.size() < 3)
         {
-            std::wcerr << L"usage: ai playbook <callbacks|minifilter|object|address|driver> [argument] [run|dry-run]\n";
+            std::wcerr << L"usage: ai playbook <callbacks|minifilter|object|address|driver|hidden|handles|leftover|integrity|vbs|dma> [argument] [run|dry-run]\n";
             break;
         }
 
@@ -35509,6 +35710,10 @@ static void HandleAiPlaybookCommand(
         }
 
         PreserveAiSessionSettings(plan, aiState);
+        plan.HasPendingCapabilityPlan = false;
+        plan.PendingCapabilityJson.clear();
+        plan.PendingQuery.clear();
+        plan.PendingVerbose = false;
         aiState = plan;
         WriteAiTranscriptEvent(aiState, L"ai_playbook", L"playbook loaded", args[2]);
         PrintAiPlan(aiState);
@@ -39677,11 +39882,54 @@ static void PrintAiProcessNextCommands(const DmlProcessRecord& record)
     std::wcout << L"  vtop /process " << std::dec << record.ProcessId << L" <user-va>\n";
 }
 
+static bool AiQueryHasNonProcessInvestigation(const std::wstring& query)
+{
+    static const std::vector<std::wstring> needles =
+    {
+        L"vad",
+        L"thread",
+        L"callback",
+        L"handle",
+        L"hunt",
+        L"payload",
+        L"mapper",
+        L"kpage",
+        L"integrity",
+        L"ssdt",
+        L"idt",
+        L"wfp",
+        L"alpc",
+        L"minifilter",
+        L"hidden",
+        L"token",
+        L"pool",
+        L"wnf",
+        L"etw",
+        L"nmi",
+        L"module",
+        L"driver",
+        L"dma",
+        L"snapshot",
+        L"vbs",
+        L"hvci",
+        L"byovd",
+        L"hypervisor",
+        L"\xCF5C\xBC31",
+        L"\xD578\xB4E4",
+        L"\xC228\xC740",
+        L"\xC740\xB2C9",
+        L"\xBB34\xACB0\xC131"
+    };
+
+    return ContainsAnyNoCase(query, needles);
+}
+
 static bool TryHandleAiProcessQuery(
     const std::wstring& query,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    AiPlanState* aiState)
 {
     bool handled = false;
 
@@ -39689,6 +39937,10 @@ static bool TryHandleAiProcessQuery(
     {
         AiProcessIntent intent = ParseAiProcessIntent(query, state);
         if (!intent.IsProcessQuery)
+        {
+            break;
+        }
+        if (AiQueryHasNonProcessInvestigation(query) || FindAiPlaybook(query) != nullptr)
         {
             break;
         }
@@ -39765,10 +40017,19 @@ static bool TryHandleAiProcessQuery(
             std::wcout << L": ";
             PrintAiProcessAnswerLine(matches[0], intent);
             PrintAiProcessNextCommands(matches[0]);
+            if (aiState != nullptr)
+            {
+                aiState->LastPid = static_cast<uint32_t>(matches[0].ProcessId);
+                aiState->LastImage = matches[0].ImageName;
+            }
         }
         else
         {
             std::wcout << L"answer: multiple matches; use pid or eprocess to narrow the query\n";
+            if (aiState != nullptr && !intent.ImageName.empty())
+            {
+                aiState->LastImage = intent.ImageName;
+            }
         }
     } while (false);
 
@@ -39779,13 +40040,14 @@ static bool TryHandleAiLocalQuery(
     const std::wstring& query,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    AiPlanState* aiState)
 {
     bool handled = false;
 
     do
     {
-        if (TryHandleAiProcessQuery(query, state, device, symbols))
+        if (TryHandleAiProcessQuery(query, state, device, symbols, aiState))
         {
             handled = true;
             break;
@@ -39799,7 +40061,8 @@ enum class AiCapabilityQueryResult
 {
     NotAttempted,
     Handled,
-    Failed
+    Failed,
+    Deferred
 };
 
 struct AiCapabilityStep
@@ -40312,87 +40575,23 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
 {
     bool supported = false;
 
-    if (tool == L"process.find" ||
-        tool == L"process.describe" ||
-        tool == L"type.describe" ||
-        tool == L"callbacks.list" ||
-        tool == L"wfp.list" ||
-        tool == L"wfp.kernel_callouts" ||
-        tool == L"alpc.list" ||
-        tool == L"vad.list" ||
-        tool == L"threads.list" ||
-        tool == L"etw.integrity" ||
-        tool == L"etw.providers" ||
-        tool == L"etw.ti_cross" ||
-        tool == L"nmi.list" ||
-        tool == L"minifilter.list" ||
-        tool == L"payload.inspect" ||
-        tool == L"payload.scan" ||
-        tool == L"mapper.list" ||
-        tool == L"kpage.list" ||
-        tool == L"hal.scan" ||
-        tool == L"hive.list" ||
-        tool == L"token.inspect" ||
-        tool == L"dpc.list" ||
-        tool == L"timer.list" ||
-        tool == L"fwtable.list" ||
-        // firmwaretable.list is an internal AI-planner alias only; it is NOT an
-        // MCP tool name (kTools advertises just fwtable.list, and FindTool only
-        // matches kTools), so MCP clients cannot reach it. Same intent as the
-        // assistant.answer planner verb being excluded from kTools.
-        tool == L"firmwaretable.list" ||
-        tool == L"pool.find" ||
-        tool == L"address.inspect" ||
-        tool == L"wnf.decode" ||
-        tool == L"wnf.list" ||
-        tool == L"ti.query" ||
-        tool == L"timeline.status" ||
-        tool == L"timeline.query" ||
-        tool == L"timeline.export" ||
-        tool == L"timeline.reconcile" ||
-        tool == L"graph.query" ||
-        tool == L"module.integrity" ||
-        tool == L"driver.integrity" ||
-        tool == L"driver.object" ||
-        tool == L"device.stack" ||
-        tool == L"handles.list" ||
-        tool == L"hiddenproc.list" ||
-        tool == L"wdfilter.list" ||
-        tool == L"inputstack.list" ||
-        tool == L"dma.posture" ||
-        tool == L"hv.posture" ||
-        tool == L"dump.analyze" ||
-        tool == L"ssdt.scan" ||
-        tool == L"idt.scan" ||
-        tool == L"cr.scan" ||
-        tool == L"msr.check" ||
-        tool == L"vbs.scan" ||
-        tool == L"byovd.scan" ||
-        tool == L"byovd.status" ||
-        tool == L"pool.scan_pe" ||
-        tool == L"hunt.run" ||
-        tool == L"snapshot.capture" ||
-        tool == L"snapshot.show" ||
-        tool == L"snapshot.diff" ||
-        tool == L"memory.read_virtual" ||
-        tool == L"memory.read_physical" ||
-        tool == L"memory.search" ||
-        tool == L"memory.translate" ||
-        tool == L"memory.probe" ||
-        tool == L"memory.read_pointers" ||
-        tool == L"memory.compare" ||
-        // code.disasm is intentionally NOT here: it has no ExecuteAiCapabilityPlan
-        // branch (it needs the DbgEng handle, which that path does not carry) and
-        // is handled MCP-only inline in DispatchMcpRequest. Listing it here would
-        // let an NL-planner plan reach the dispatch chain and fail with an empty
-        // error. Its ValidateAiCapabilityToolArgKeys branch stays (the inline
-        // DispatchMcpRequest path reuses it).
-        tool == L"symbol.search" ||
-        tool == L"ti.subscribe" ||
-        tool == L"assistant.answer")
+    do
     {
-        supported = true;
-    }
+        if (IsAiCapabilityCatalogTool(tool))
+        {
+            supported = true;
+            break;
+        }
+
+        // firmwaretable.list is an internal alias of fwtable.list. ti.subscribe
+        // is MCP/lifecycle and is not advertised in the shared planner catalog.
+        // code.disasm stays excluded: ExecuteAiCapabilityPlan has no DbgEng handle.
+        if (tool == L"firmwaretable.list" || tool == L"ti.subscribe")
+        {
+            supported = true;
+            break;
+        }
+    } while (false);
 
     return supported;
 }
@@ -40752,119 +40951,6 @@ static bool ParseAiCapabilityPlanResponse(
     } while (false);
 
     return ok;
-}
-
-static std::wstring BuildAiCapabilityPlannerPrompt(const std::wstring& query)
-{
-    std::wstringstream stream;
-
-    stream << L"You are the KnLiveDbg tool router. Choose local read-only tools for the operator request.\n";
-    stream << L"Return only one JSON object, with no Markdown fences and no prose before or after it.\n";
-    stream << L"Schema:\n";
-    stream << L"{\"schema\":\"kn-live-dbg.ai-capability-plan.v1\",\"summary\":\"short summary\",\"steps\":[";
-    stream << L"{\"tool\":\"process.find|process.describe|type.describe|callbacks.list|wfp.list|wfp.kernel_callouts|alpc.list|vad.list|threads.list|etw.integrity|etw.providers|etw.ti_cross|nmi.list|minifilter.list|payload.inspect|payload.scan|mapper.list|kpage.list|hal.scan|hive.list|token.inspect|dpc.list|timer.list|fwtable.list|pool.find|address.inspect|wnf.decode|wnf.list|ti.query|timeline.status|timeline.query|timeline.export|timeline.reconcile|graph.query|module.integrity|driver.integrity|ssdt.scan|idt.scan|cr.scan|msr.check|vbs.scan|byovd.scan|byovd.status|pool.scan_pe|hunt.run|snapshot.capture|snapshot.show|snapshot.diff|memory.read_virtual|memory.read_physical|memory.search|memory.translate|memory.probe|memory.read_pointers|memory.compare|symbol.search|assistant.answer\",\"args\":{}}";
-    stream << L"]}\n";
-    stream << L"Available tools:\n";
-    stream << L"- process.find: find live processes. Args are strings: image, pid, eprocess. Returns process records.\n";
-    stream << L"- process.describe: print process fields. Args: source like \"$0\" or image/pid/eprocess, fields array. Supported fields: pid,image,eprocess,dtb,userdtb,peb,ppid,threads,all.\n";
-    stream << L"- type.describe: dump a structure with dt. Args: source like \"$0\" or address/eprocess, type string, fields array of type field names. For process source, use each record EPROCESS address.\n";
-    stream << L"- callbacks.list: list kernel callbacks. Args: scope string and optional module string. Supported scopes: all,object,registry,process,thread,imageload,minifilter.\n";
-    stream << L"- wfp.list: list Windows Filtering Platform objects via fwpuclnt.dll. Args: scope (providers,sublayers,callouts,filters,layers; defaults to callouts), optional module (callouts/filters provider name or GUID), optional layer (filters only).\n";
-    stream << L"- wfp.kernel_callouts: resolve kernel-mode WFP classify/notify/flowDelete pointers from netio.sys. Args: {}.\n";
-    stream << L"- alpc.list: list ALPC ports discovered via Object Manager directory walk and CommunicationInfo links. Args: scope (ports,connections; defaults to ports), optional name substring, optional pid filter as decimal string.\n";
-    stream << L"- vad.list: list target VADs, scan injected/hidden executable regions, or inventory all observable loaded/mapped PEs. Args: image, pid, eprocess, or source; optional mode string list|scan|modules; optional booleans exec, private, wx, pe, hiddenpte, dkom, summary; optional limit string.\n";
-    stream << L"- threads.list: list target process threads. Args: image, pid, eprocess, or source; optional booleans apc, stacks; optional limit string.\n";
-    stream << L"- etw.integrity: check inline ETW GetCpuClock targets and suspicious callback redirects. Args: {}.\n";
-    stream << L"- etw.providers: heuristic ETW provider registration surface and enable-callback ownership. Args: {}.\n";
-    stream << L"- etw.ti_cross: correlate active Threat-Intelligence subscription reception with silence/drop signals. Args: {}.\n";
-    stream << L"- nmi.list: list registered NMI callbacks. Args: optional scope string \"callbacks\".\n";
-    stream << L"- minifilter.list: list filesystem minifilters and IRP registrations. Optional filter/name string selects one filter.\n";
-    stream << L"- payload.inspect: hook-to-body layer; trace one kernel address through translation, big pool, PE, and disassembly. Args: address/va/symbol.\n";
-    stream << L"- payload.scan: hook-to-body layer; collect unbacked hook pointers and trace them. A quiet scan does not prove independent pages are unused. Args: optional limit.\n";
-    stream << L"- mapper.list: bookkeeping-remnant layer; walk MmUnloadedDrivers, PiDDB, and ci hash leftovers. leftover=0 means the ledgers look clean, not that no mapper payload is mapped. Args: optional scope all|unloaded|piddb|cihash, limit.\n";
-    stream << L"- kpage.list: orphan-page layer; find executable kernel pages outside loaded modules. This is the layer that can still see a wiped kdmapper payload. Args: optional deep/wx/pe booleans and limit. Do not set deep unless asked.\n";
-    stream << L"- hal.scan: check HalDispatchTable ownership. Args: {}.\n";
-    stream << L"- hive.list: walk registry hive GetCellRoutine ownership. Args: {}.\n";
-    stream << L"- token.inspect: inspect process token privileges (pid optional, default 4). Args: optional pid.\n";
-    stream << L"- dpc.list: enumerate sampled DPC routines. Args: {}.\n";
-    stream << L"- timer.list: enumerate timer DPC routines. Args: {}.\n";
-    stream << L"- fwtable.list: list registered firmware table providers from nt!ExpFirmwareTableProviderListHead without invoking handlers. Args: optional scope providers|provider, optional module string, optional provider/signature string.\n";
-    stream << L"- pool.find: find big pool entries. Args: optional tag, min, max, addr/address, limit strings; optional paged string any|nonpaged|paged; optional booleans annotate, wx. Use wx=true for W+X pool.\n";
-    stream << L"- address.inspect: inspect one virtual address or symbol. Args: address, va, or symbol string.\n";
-    stream << L"- wnf.decode: decode one WNF state-name hash. Args: hash, state, or state_name string.\n";
-    stream << L"- wnf.list: list live WNF data. Args: optional scope string instances, candidates, or lists; defaults to instances.\n";
-    stream << L"- ti.query: query the Threat Intelligence ring. Args: action recent|stats|by|grep; optional count, pid, task, pattern strings.\n";
-    stream << L"- timeline.status: report the in-memory evidence timeline status. Args: {}.\n";
-    stream << L"- timeline.query: query events already ingested into the timeline. Args: optional source, domain, pid, limit, order strings. order is newest or oldest.\n";
-    stream << L"- timeline.export: return ingested timeline events as JSONL text without writing to disk. Args: optional source, domain, pid, limit, order strings.\n";
-    stream << L"- timeline.reconcile: compare ingested timeline events with a snapshot baseline or JSON file. Args: optional path or snapshot string, plus source, domain, pid, limit strings.\n";
-    stream << L"- graph.query: derive a process/image/domain/source graph from ingested timeline events. Args: optional source, domain, image, pid, limit, order strings.\n";
-    stream << L"- module.integrity: inspect loaded module PE headers, sections, and runtime page permissions. Args: optional module/name/target string, optional limit string, optional booleans summary, verbose, headers, sections, wx, mismatch.\n";
-    stream << L"- driver.integrity: inspect DRIVER_OBJECT dispatch targets. Args: optional driver/name/target string and optional limit string.\n";
-    stream << L"- ssdt.scan: detect SSDT and win32k shadow-SSDT syscall hooks (routines outside the expected kernel image). Args: {}.\n";
-    stream << L"- idt.scan: detect IDT interrupt-gate hooks and per-CPU handler divergence. Args: {}.\n";
-    stream << L"- cr.scan: check control registers for CR0.WP=0, SMEP/SMAP disablement, and per-CPU divergence. Args: {}.\n";
-    stream << L"- msr.check: check SYSCALL MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) for hooked entry pointers and per-CPU divergence. Args: {}.\n";
-    stream << L"- vbs.scan: report VBS/HVCI, Code Integrity options, hypervisor, Secure Kernel modules, and trustlets. Args: {}.\n";
-    stream << L"- byovd.scan: loaded-BYOVD layer; scan currently loaded kernel modules against the local BYOVD/LOLDrivers catalog (no network). Catch the signed exploit driver before it is unloaded. Args: {}.\n";
-    stream << L"- byovd.status: show local BYOVD catalog age, source counts, and YARA rule availability. Args: {}.\n";
-    stream << L"- pool.scan_pe: staged-pool-PE layer; hunt PE images (intact or signature-wiped) in kernel big pool. Independent-page mapper images are kpage.list, not this tool. Args: optional tag, limit strings; optional boolean suspicious.\n";
-    stream << L"- hunt.run: whole-system user-mode anomaly hunt. Args: optional mode string quick or deep.\n";
-    stream << L"- snapshot.capture: capture a same-boot evidence baseline. Args: optional name string.\n";
-    stream << L"- snapshot.show: show the current baseline or a snapshot JSON file. Args: optional source/path string, optional booleans domains, warnings.\n";
-    stream << L"- snapshot.diff: diff the session baseline against a fresh live capture (or two snapshot files). Args: optional old, new, domain, risk, limit.\n";
-    stream << L"- memory.read_virtual: read bytes at a virtual address. Args: address|va|symbol, optional width (1|2|4|8), count, process.\n";
-    stream << L"- memory.read_physical: read bytes at a physical address. Args: physical_address, optional width (1|2|4|8), count.\n";
-    stream << L"- memory.search: search a virtual range for an integer value. Args: address, length, value, optional width (1|2|4|8).\n";
-    stream << L"- memory.translate: translate a virtual address to physical (vtop). Args: address|va|symbol, optional process/pid or cr3, length.\n";
-    stream << L"- memory.probe: test whether an address is readable/writable. Args: address|va|symbol, optional length.\n";
-    stream << L"- memory.read_pointers: dump a pointer table with each slot resolved to its nearest symbol. Args: address|va|symbol, optional width (4|8), count.\n";
-    stream << L"- memory.compare: compare two virtual ranges and report mismatch offsets. Args: address1, address2, length.\n";
-    stream << L"- symbol.search: enumerate symbols by wildcard. Args: mask (e.g. nt!Etw*), optional limit.\n";
-    stream << L"- assistant.answer: use this when none of the local tools fit the request. Args: {}.\n";
-    stream << L"Rules:\n";
-    stream << L"- Use only these tools. Do not emit debugger commands.\n";
-    stream << L"- All scalar args must be JSON strings. Use fields as an array of strings. Do not invent fields.\n";
-    stream << L"- Never emit raw kd commands, nested ai commands, writes, unload/shutdown, session mutation, command chaining, or multiline content.\n";
-    stream << L"- For image-name process questions, first use process.find with image, then describe or type.describe source \"$0\".\n";
-    stream << L"- For PID/EPROCESS/DTB/PEB answers, prefer process.describe.\n";
-    stream << L"- For full _EPROCESS layout at the found process, use type.describe with type \"nt!_EPROCESS\" and source \"$0\".\n";
-    stream << L"- For callback requests such as object callbacks for WdFilter.sys, use callbacks.list with scope \"object\" and module \"WdFilter.sys\".\n";
-    stream << L"- For WFP questions such as callouts owned by tcpip or filters in the ALE auth connect layer, use wfp.list with the appropriate scope and module/layer. For kernel callout function pointers, use wfp.kernel_callouts.\n";
-    stream << L"- For ALPC questions such as listing named ports or pairing csrss/lsass connections, use alpc.list with scope ports or connections and optional name/pid filters.\n";
-    stream << L"- For injected or hidden executable process memory, use vad.list mode=scan. For every observable loaded/mapped PE, use mode=modules. Use mode=list plus filters for individual VAD views.\n";
-    stream << L"- For suspicious thread starts, stack bounds, or APC evidence, use threads.list directly.\n";
-    stream << L"- For inline ETW hook questions, use etw.integrity.\n";
-    stream << L"- For NMI callback questions, use nmi.list.\n";
-    stream << L"- Mapper-family detection is layered. loaded BYOVD: byovd.scan. bookkeeping remnants: mapper.list. orphan pages: kpage.list. hook-to-body: payload.scan / payload.inspect. staged pool PE: pool.scan_pe. Do not treat mapper.list leftover=0 as proof the payload is gone.\n";
-    stream << L"- For unbacked hook targets or leftover independent-page code, use payload.inspect or payload.scan.\n";
-    stream << L"- For unloaded-driver / mapper bookkeeping remnants, use mapper.list.\n";
-    stream << L"- For executable kernel pages outside modules, use kpage.list. Use deep=true only when the operator asks for a PFN walk.\n";
-    stream << L"- For firmware table provider, SystemRegisterFirmwareTableInformationHandler, or firmware-table cheat-channel questions, use fwtable.list.\n";
-    stream << L"- For W+X pool or suspicious big pool allocation questions, use pool.find with wx=true or explicit filters.\n";
-    stream << L"- For address suspicion or page permission questions, use address.inspect.\n";
-    stream << L"- For WNF decode questions, use wnf.decode; for live WNF instance/list questions, use wnf.list.\n";
-    stream << L"- For recent Microsoft-Windows-Threat-Intelligence events, use ti.query with recent/stats/by/grep.\n";
-    stream << L"- For time-ordered evidence already ingested into !timeline, use timeline.status, timeline.query, timeline.export, timeline.reconcile, or graph.query.\n";
-    stream << L"- For driver dispatch integrity questions, use driver.integrity.\n";
-    stream << L"- For module text or executable section integrity questions, use module.integrity. Use wx=true for W+X-only module triage, headers=true for PE header evidence, and sections=true for full section-table evidence.\n";
-    stream << L"- Keep the plan read-only and no more than three steps unless the request needs more.\n";
-    stream << L"Examples:\n";
-    stream << L"- \"any inline ETW hook?\" => etw.integrity {}\n";
-    stream << L"- \"list NMI callbacks\" => nmi.list {\"scope\":\"callbacks\"}\n";
-    stream << L"- \"list firmware table providers\" => fwtable.list {\"scope\":\"providers\"}\n";
-    stream << L"- \"show custom firmware handler ACPI\" => fwtable.list {\"scope\":\"provider\",\"provider\":\"ACPI\"}\n";
-    stream << L"- \"show W+X pool allocations\" => pool.find {\"wx\":\"true\",\"limit\":\"50\"}\n";
-    stream << L"- \"why is this address suspicious?\" => address.inspect {\"address\":\"<address>\"}\n";
-    stream << L"- \"decode this WNF state name\" => wnf.decode {\"hash\":\"<hash>\"}\n";
-    stream << L"- \"show live WNF instances\" => wnf.list {\"scope\":\"instances\"}\n";
-    stream << L"- \"query recent TI WriteVM events\" => ti.query {\"action\":\"grep\",\"pattern\":\"WriteVM\"}\n";
-    stream << L"- \"check driver dispatch integrity\" => driver.integrity {\"target\":\"all\"}\n";
-    stream << L"- \"inspect module text integrity\" => module.integrity {\"target\":\"all\",\"headers\":\"true\",\"sections\":\"true\"}\n";
-    stream << L"Operator request:\n";
-    stream << query << L"\n";
-
-    return stream.str();
 }
 
 static bool IsAiCapabilityAssistantAnswerPlan(const AiCapabilityPlan& plan)
@@ -45604,8 +45690,556 @@ static bool ExecuteAiCapabilityPlan(
     return ok;
 }
 
+static std::wstring SerializeAiCapabilityPlan(const AiCapabilityPlan& plan)
+{
+    std::wstringstream stream;
+    stream << L"{\"schema\":\"" << EscapeJsonText(plan.Schema.empty() ? L"kn-live-dbg.ai-capability-plan.v1" : plan.Schema)
+           << L"\",\"summary\":\"" << EscapeJsonText(plan.Summary) << L"\",\"steps\":[";
+    for (size_t i = 0; i < plan.Steps.size(); ++i)
+    {
+        if (i != 0)
+        {
+            stream << L",";
+        }
+        const std::wstring args = plan.Steps[i].ArgsJson.empty() ? L"{}" : plan.Steps[i].ArgsJson;
+        stream << L"{\"tool\":\"" << EscapeJsonText(plan.Steps[i].Tool) << L"\",\"args\":" << args << L"}";
+    }
+    stream << L"]}";
+    return stream.str();
+}
+
+static std::wstring BuildAiSessionHints(const AiPlanState& aiState)
+{
+    std::wstringstream stream;
+    if (aiState.LastPid != 0)
+    {
+        stream << L"last_pid=" << aiState.LastPid << L"\n";
+    }
+    if (!aiState.LastImage.empty())
+    {
+        stream << L"last_image=" << aiState.LastImage << L"\n";
+    }
+    if (!aiState.LastAddress.empty())
+    {
+        stream << L"last_address=" << aiState.LastAddress << L"\n";
+    }
+    if (!aiState.LastDumpPath.empty())
+    {
+        stream << L"last_dump=" << aiState.LastDumpPath << L"\n";
+    }
+    return stream.str();
+}
+
+static std::wstring ExtractAiGoalAddress(const std::wstring& query)
+{
+    std::wstring address;
+    std::vector<std::wstring> tokens = Split(query);
+    for (const std::wstring& token : tokens)
+    {
+        std::wstring trimmed = TrimWhitespace(token);
+        if (trimmed.size() >= 5 &&
+            (trimmed[0] == L'0') &&
+            (trimmed[1] == L'x' || trimmed[1] == L'X'))
+        {
+            address = trimmed;
+            break;
+        }
+        if (!trimmed.empty() &&
+            trimmed[0] != L'!' &&
+            trimmed.find(L'!') != std::wstring::npos)
+        {
+            address = trimmed;
+            break;
+        }
+    }
+    return address;
+}
+
+static bool AiQueryHasInvestigationAction(const std::wstring& query)
+{
+    static const std::vector<std::wstring> needles =
+    {
+        L"check",
+        L"show",
+        L"list",
+        L"find",
+        L"scan",
+        L"inspect",
+        L"enumerate",
+        L"audit",
+        L"dump",
+        L"\xCC3E\xC544",
+        L"\xC870\xC0AC",
+        L"\xC804\xC218",
+        L"\xBCF4\xC5EC",
+        L"\xB098\xC5F4"
+    };
+    return ContainsAnyNoCase(query, needles);
+}
+
+static bool IsAiCapabilityPlanExpensive(const AiCapabilityPlan& plan)
+{
+    bool expensive = false;
+    for (const AiCapabilityStep& step : plan.Steps)
+    {
+        const AiCapabilityCost cost = GetAiCapabilityToolCost(step.Tool);
+        if (cost == AiCapabilityCost::Expensive)
+        {
+            expensive = true;
+            break;
+        }
+        if (cost == AiCapabilityCost::ExpensiveIfDeep)
+        {
+            bool deep = false;
+            ExtractAiCapabilityBooleanArg(step.ArgsJson, L"deep", &deep, nullptr);
+            if (deep)
+            {
+                expensive = true;
+                break;
+            }
+        }
+    }
+    return expensive;
+}
+
+static void PrintAiCapabilityPlanPreview(const AiCapabilityPlan& plan, bool expensive)
+{
+    PrintColoredText(L"ai tools", KNDBG_COLOR_TITLE);
+    std::wcout << L": " << (plan.Summary.empty() ? L"(no summary)" : plan.Summary) << L"\n";
+    for (size_t i = 0; i < plan.Steps.size(); ++i)
+    {
+        const AiCapabilityStep& step = plan.Steps[i];
+        const AiCapabilityToolDef* def = FindAiCapabilityTool(step.Tool);
+        std::wcout << L"  [" << (i + 1) << L"] " << step.Tool;
+        if (!step.ArgsJson.empty() && step.ArgsJson != L"{}")
+        {
+            std::wcout << L" " << step.ArgsJson;
+        }
+        if (def != nullptr && def->RanCommand != nullptr && def->RanCommand[0] != L'\0')
+        {
+            std::wcout << L"  -> " << def->RanCommand;
+        }
+        std::wcout << L"\n";
+    }
+    std::wcout << L"cost: " << (expensive ? L"expensive" : L"cheap") << L"\n";
+}
+
+static void RememberAiEvidence(
+    AiPlanState& aiState,
+    const std::wstring& title,
+    const std::wstring& output)
+{
+    aiState.LastEvidenceTitle = title;
+    aiState.LastEvidenceOutput = TruncateForAiPrompt(output, 80000);
+}
+
+static void UpdateAiSessionFromCapabilityPlan(AiPlanState& aiState, const AiCapabilityPlan& plan)
+{
+    for (const AiCapabilityStep& step : plan.Steps)
+    {
+        std::wstring pidText;
+        std::wstring image;
+        std::wstring address;
+        std::wstring path;
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pid"}, &pidText);
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"image", L"process"}, &image);
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"symbol"}, &address);
+        ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"path", L"file"}, &path);
+        if (!pidText.empty())
+        {
+            uint64_t pid = 0;
+            if (ParseUnsigned(pidText, 0, &pid) && pid <= 0xffffffffull)
+            {
+                aiState.LastPid = static_cast<uint32_t>(pid);
+            }
+        }
+        if (!image.empty())
+        {
+            aiState.LastImage = image;
+        }
+        if (!address.empty())
+        {
+            aiState.LastAddress = address;
+        }
+        if (!path.empty())
+        {
+            aiState.LastDumpPath = path;
+        }
+    }
+}
+
+static void ClearPendingAiCapability(AiPlanState& aiState)
+{
+    aiState.HasPendingCapabilityPlan = false;
+    aiState.PendingCapabilityJson.clear();
+    aiState.PendingQuery.clear();
+    aiState.PendingVerbose = false;
+}
+
+static void StorePendingAiCapability(
+    AiPlanState& aiState,
+    const AiCapabilityPlan& plan,
+    const std::wstring& query,
+    bool verbose)
+{
+    aiState.HasPendingCapabilityPlan = true;
+    aiState.PendingCapabilityJson = SerializeAiCapabilityPlan(plan);
+    aiState.PendingQuery = query;
+    aiState.PendingVerbose = verbose;
+}
+
+static void ExplainAiCapturedTools(
+    const std::wstring& query,
+    const std::wstring& summary,
+    const std::wstring& stdoutText,
+    const std::wstring& stderrText,
+    DebuggerState& state,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    RememberAiEvidence(aiState, summary.empty() ? query : summary, stdoutText);
+    if (ToLower(ai.ProviderName()) == L"off")
+    {
+        std::wcout << L"ai note: provider is off; raw tool output is above. type ai config provider to enable explanations.\n";
+        return;
+    }
+
+    CommandExecutionResult result = {};
+    result.KeepRunning = true;
+    result.Output = stdoutText;
+    result.Error = stderrText;
+
+    AiCompletionRequest request = {};
+    request.System = BuildAiSystemPrompt(state, symbols);
+    request.Prompt = BuildAiEvidencePrompt(
+        L"Explain this KnLiveDbg local tool output for the operator.",
+        L"The operator may not know the underlying command names. Explain important findings, anomalies, uncertainty, and concrete follow-up commands. Preserve raw addresses and values. Reply in the operator's language (Korean or English).",
+        query + (summary.empty() ? L"" : (L" [" + summary + L"]")),
+        result);
+    CompleteAndPrintAiRequest(L"ai_tool_explain", request, ai, aiState);
+}
+
+static bool ExecuteAiCapabilityPlanWithCapture(
+    const AiCapabilityPlan& plan,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* stdoutText,
+    std::wstring* stderrText,
+    std::wstring* error)
+{
+    bool ok = false;
+    std::wstring captured;
+    std::wstring capturedErr;
+    {
+        ScopedWideStreamCapture capture(&captured, &capturedErr);
+        ok = ExecuteAiCapabilityPlan(plan, state, device, symbols, error);
+    }
+    if (stdoutText != nullptr)
+    {
+        *stdoutText = captured;
+    }
+    if (stderrText != nullptr)
+    {
+        *stderrText = capturedErr;
+    }
+    return ok;
+}
+
+static AiCapabilityQueryResult RunOrDeferAiCapabilityPlan(
+    const AiCapabilityPlan& plan,
+    const std::wstring& query,
+    bool verbose,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    AiCapabilityQueryResult result = AiCapabilityQueryResult::Failed;
+    const bool expensive = IsAiCapabilityPlanExpensive(plan);
+    PrintAiCapabilityPlanPreview(plan, expensive);
+
+    do
+    {
+        if (expensive)
+        {
+            StorePendingAiCapability(aiState, plan, query, verbose);
+            std::wcout << L"this plan is expensive. type `ai go` to run it, or `ai no` to cancel.\n";
+            WriteAiTranscriptEvent(aiState, L"ai_tool_plan_pending", L"expensive plan waiting for ai go", query);
+            result = AiCapabilityQueryResult::Deferred;
+            break;
+        }
+
+        if (verbose)
+        {
+            std::wcout << L"ai verbose: executing " << plan.Steps.size() << L" local tool(s)\n";
+        }
+
+        std::wstring captured;
+        std::wstring capturedErr;
+        std::wstring error;
+        if (!ExecuteAiCapabilityPlanWithCapture(
+                plan,
+                state,
+                device,
+                symbols,
+                &captured,
+                &capturedErr,
+                &error))
+        {
+            std::wcerr << L"ai tool execution failed: " << error << L"\n";
+            WriteAiTranscriptEvent(aiState, L"ai_tool_execution_failed", error, L"");
+            break;
+        }
+
+        UpdateAiSessionFromCapabilityPlan(aiState, plan);
+        WriteAiTranscriptEvent(aiState, L"ai_tool_plan", L"capability plan executed", L"");
+        ExplainAiCapturedTools(
+            query,
+            plan.Summary,
+            captured,
+            capturedErr,
+            state,
+            symbols,
+            ai,
+            aiState);
+        result = AiCapabilityQueryResult::Handled;
+    } while (false);
+
+    return result;
+}
+
+static bool TryBuildCatalogPlaybookPlan(
+    const AiPlaybookDef* playbook,
+    const std::wstring& query,
+    const AiPlanState& aiState,
+    AiCapabilityPlan* plan,
+    std::wstring* error)
+{
+    bool ok = false;
+    do
+    {
+        if (playbook == nullptr || plan == nullptr)
+        {
+            break;
+        }
+
+        std::wstring address = ExtractAiGoalAddress(query);
+        if (address.empty())
+        {
+            address = aiState.LastAddress;
+        }
+        if (playbook->NeedsAddress && address.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"this playbook needs an address. inspect one VA first, or include 0x... / module!symbol in the goal.";
+            }
+            break;
+        }
+
+        AiCapabilityPlan parsed = {};
+        parsed.Schema = L"kn-live-dbg.ai-capability-plan.v1";
+        parsed.Summary = playbook->Summary != nullptr ? playbook->Summary : L"";
+        for (size_t i = 0; i < playbook->StepCount; ++i)
+        {
+            AiCapabilityStep step = {};
+            step.Tool = playbook->Steps[i].Tool != nullptr ? playbook->Steps[i].Tool : L"";
+            const std::wstring rawArgs = playbook->Steps[i].ArgsJson != nullptr ? playbook->Steps[i].ArgsJson : L"{}";
+            step.ArgsJson = SubstituteAiPlaybookPlaceholders(rawArgs, address);
+            if (playbook->NeedsAddress &&
+                step.ArgsJson.find(L"$address") != std::wstring::npos)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"this playbook needs an address. inspect one VA first, or include 0x... / module!symbol in the goal.";
+                }
+                parsed.Steps.clear();
+                break;
+            }
+            if (!IsSupportedAiCapabilityTool(step.Tool))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"playbook referenced unsupported tool: " + step.Tool;
+                }
+                parsed.Steps.clear();
+                break;
+            }
+            if (!ValidateAiCapabilityToolArgKeys(step.Tool, step.ArgsJson, error))
+            {
+                parsed.Steps.clear();
+                break;
+            }
+            parsed.Steps.push_back(step);
+        }
+        if (parsed.Steps.empty())
+        {
+            break;
+        }
+
+        *plan = parsed;
+        ok = true;
+    } while (false);
+    return ok;
+}
+
+static void HandleAiPendingGo(
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        if (!aiState.HasPendingCapabilityPlan || aiState.PendingCapabilityJson.empty())
+        {
+            std::wcerr << L"no pending expensive AI tool plan. type an ai <goal> first.\n";
+            break;
+        }
+
+        AiCapabilityPlan plan = {};
+        std::wstring error;
+        if (!ParseAiCapabilityPlanResponse(aiState.PendingCapabilityJson, &plan, &error))
+        {
+            std::wcerr << L"pending AI tool plan is invalid: " << error << L"\n";
+            break;
+        }
+
+        const std::wstring query = aiState.PendingQuery;
+        const bool verbose = aiState.PendingVerbose;
+        ClearPendingAiCapability(aiState);
+        WriteAiTranscriptEvent(aiState, L"ai_tool_plan_go", L"operator confirmed expensive plan", query);
+        if (verbose)
+        {
+            std::wcout << L"ai verbose: executing " << plan.Steps.size() << L" local tool(s)\n";
+        }
+
+        std::wstring captured;
+        std::wstring capturedErr;
+        if (!ExecuteAiCapabilityPlanWithCapture(
+                plan,
+                state,
+                device,
+                symbols,
+                &captured,
+                &capturedErr,
+                &error))
+        {
+            std::wcerr << L"ai tool execution failed: " << error << L"\n";
+            WriteAiTranscriptEvent(aiState, L"ai_tool_execution_failed", error, L"");
+            break;
+        }
+
+        UpdateAiSessionFromCapabilityPlan(aiState, plan);
+        ExplainAiCapturedTools(
+            query,
+            plan.Summary,
+            captured,
+            capturedErr,
+            state,
+            symbols,
+            ai,
+            aiState);
+    } while (false);
+}
+
+static void HandleAiPendingNo(AiPlanState& aiState)
+{
+    do
+    {
+        if (!aiState.HasPendingCapabilityPlan)
+        {
+            std::wcerr << L"no pending AI tool plan to cancel.\n";
+            break;
+        }
+
+        WriteAiTranscriptEvent(aiState, L"ai_tool_plan_no", L"operator cancelled expensive plan", aiState.PendingQuery);
+        ClearPendingAiCapability(aiState);
+        std::wcout << L"pending expensive AI tool plan cancelled.\n";
+    } while (false);
+}
+
+static void PrintAiSessionShow(const AiPlanState& aiState, const std::wstring& what)
+{
+    do
+    {
+        if (what == L"evidence")
+        {
+            if (aiState.LastEvidenceOutput.empty())
+            {
+                std::wcout << L"no captured AI evidence in this session.\n";
+                break;
+            }
+            std::wcout << L"last AI evidence";
+            if (!aiState.LastEvidenceTitle.empty())
+            {
+                std::wcout << L": " << aiState.LastEvidenceTitle;
+            }
+            std::wcout << L"\n";
+            std::wcout << aiState.LastEvidenceOutput;
+            if (!aiState.LastEvidenceOutput.empty() && aiState.LastEvidenceOutput.back() != L'\n')
+            {
+                std::wcout << L"\n";
+            }
+            break;
+        }
+
+        if (what == L"pending" || what == L"tools")
+        {
+            if (!aiState.HasPendingCapabilityPlan)
+            {
+                std::wcout << L"no pending expensive AI tool plan.\n";
+                break;
+            }
+            std::wcout << L"pending AI tool plan for: " << aiState.PendingQuery << L"\n";
+            std::wcout << aiState.PendingCapabilityJson << L"\n";
+            std::wcout << L"type `ai go` to run it, or `ai no` to cancel.\n";
+            break;
+        }
+
+        if (aiState.HasPendingCapabilityPlan)
+        {
+            std::wcout << L"pending expensive AI tool plan for: " << aiState.PendingQuery << L"\n";
+            std::wcout << L"  json=" << aiState.PendingCapabilityJson << L"\n";
+            std::wcout << L"  type `ai go` to run it, or `ai no` to cancel.\n";
+        }
+        if (!aiState.LastEvidenceTitle.empty())
+        {
+            std::wcout << L"last evidence: " << aiState.LastEvidenceTitle
+                       << L"  (type ai show evidence)\n";
+        }
+        if (aiState.LastPid != 0 || !aiState.LastImage.empty() || !aiState.LastAddress.empty())
+        {
+            std::wcout << L"session:";
+            if (aiState.LastPid != 0)
+            {
+                std::wcout << L" pid=" << aiState.LastPid;
+            }
+            if (!aiState.LastImage.empty())
+            {
+                std::wcout << L" image=" << aiState.LastImage;
+            }
+            if (!aiState.LastAddress.empty())
+            {
+                std::wcout << L" address=" << aiState.LastAddress;
+            }
+            if (!aiState.LastDumpPath.empty())
+            {
+                std::wcout << L" dump=" << aiState.LastDumpPath;
+            }
+            std::wcout << L"\n";
+        }
+        PrintAiPlan(aiState);
+    } while (false);
+}
+
 static AiCapabilityQueryResult TryHandleAiCapabilityQuery(
     const std::wstring& query,
+    bool verbose,
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols,
@@ -45623,7 +46257,7 @@ static AiCapabilityQueryResult TryHandleAiCapabilityQuery(
 
         AiCompletionRequest request = {};
         request.System = BuildAiSystemPrompt(state, symbols);
-        request.Prompt = BuildAiCapabilityPlannerPrompt(query);
+        request.Prompt = BuildAiCapabilityPlannerPrompt(query, BuildAiSessionHints(aiState));
 
         std::wcout << L"ai tool planner: provider=" << ai.ProviderName()
                    << L" model=" << ai.Settings().Model
@@ -45656,15 +46290,15 @@ static AiCapabilityQueryResult TryHandleAiCapabilityQuery(
         }
 
         WriteAiTranscriptEvent(aiState, L"ai_tool_plan", L"capability plan accepted", L"");
-        if (!ExecuteAiCapabilityPlan(plan, state, device, symbols, &error))
-        {
-            std::wcerr << L"ai tool execution failed: " << error << L"\n";
-            WriteAiTranscriptEvent(aiState, L"ai_tool_execution_failed", error, L"");
-            result = AiCapabilityQueryResult::Failed;
-            break;
-        }
-
-        result = AiCapabilityQueryResult::Handled;
+        result = RunOrDeferAiCapabilityPlan(
+            plan,
+            query,
+            verbose,
+            state,
+            device,
+            symbols,
+            ai,
+            aiState);
     } while (false);
 
     return result;
@@ -45875,6 +46509,20 @@ static void HandleAiFreeFormCommand(
             break;
         }
 
+        bool verbose = false;
+        StripAiGoalOptions(&query, &verbose);
+        query = ApplyAiSessionContext(
+            query,
+            aiState.LastPid,
+            aiState.LastImage,
+            aiState.LastAddress,
+            aiState.LastDumpPath);
+        if (TrimWhitespace(query).empty())
+        {
+            PrintAiHelp();
+            break;
+        }
+
         if (IsAiCommandRecommendationQuery(query))
         {
             std::wcout << L"ai auto: command recommendation request; building command plan\n";
@@ -45889,39 +46537,84 @@ static void HandleAiFreeFormCommand(
             break;
         }
 
+        const AiPlaybookDef* playbook = FindAiPlaybook(query);
+        const bool conceptual = IsAiConceptualQuery(query);
+        if (playbook != nullptr &&
+            (!conceptual || playbook->NeedsAddress || AiQueryHasInvestigationAction(query)))
+        {
+            AiCapabilityPlan plan = {};
+            std::wstring playbookError;
+            if (!TryBuildCatalogPlaybookPlan(playbook, query, aiState, &plan, &playbookError))
+            {
+                std::wcerr << L"ai playbook " << playbook->Name << L" failed: " << playbookError << L"\n";
+                break;
+            }
+
+            std::wcout << L"ai auto: playbook " << playbook->Name << L"\n";
+            RunOrDeferAiCapabilityPlan(
+                plan,
+                query,
+                verbose,
+                state,
+                device,
+                symbols,
+                ai,
+                aiState);
+            break;
+        }
+
+        std::wstring localOut;
+        std::wstring localErr;
+        bool localHandled = false;
+        {
+            ScopedWideStreamCapture capture(&localOut, &localErr);
+            localHandled = TryHandleAiLocalQuery(query, state, device, symbols, &aiState);
+        }
+        if (localHandled)
+        {
+            ExplainAiCapturedTools(
+                query,
+                L"local process query",
+                localOut,
+                localErr,
+                state,
+                symbols,
+                ai,
+                aiState);
+            break;
+        }
+
+        if (conceptual)
+        {
+            AiCompletionRequest request = {};
+            request.System = BuildAiSystemPrompt(state, symbols);
+            request.Prompt = query;
+            std::wcout << L"ai request: provider=" << ai.ProviderName()
+                       << L" model=" << ai.Settings().Model
+                       << L" credential=" << ai.CredentialStatus() << L"\n";
+            CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
+            break;
+        }
+
         AiCapabilityQueryResult capabilityResult = TryHandleAiCapabilityQuery(
             query,
+            verbose,
             state,
             device,
             symbols,
             ai,
             aiState);
-        if (capabilityResult == AiCapabilityQueryResult::Handled)
+        if (capabilityResult == AiCapabilityQueryResult::Handled ||
+            capabilityResult == AiCapabilityQueryResult::Deferred ||
+            capabilityResult == AiCapabilityQueryResult::Failed)
         {
             break;
         }
 
-        if (TryHandleAiLocalQuery(query, state, device, symbols))
+        if (ToLower(ai.ProviderName()) == L"off")
         {
-            break;
-        }
-
-        if (capabilityResult == AiCapabilityQueryResult::Failed)
-        {
-            break;
-        }
-
-        if (ShouldAutoPlanAiQuery(query))
-        {
-            std::wcout << L"ai auto: no direct local tool matched; building command plan\n";
-            HandleAiPlanRequest(
-                query,
-                L"ai_auto_plan",
-                L"ai auto-plan request",
-                state,
-                symbols,
-                ai,
-                aiState);
+            std::wcout << L"ai provider is off. Local playbooks still run for known goals such as hidden processes or callbacks.\n";
+            std::wcout << L"type ai config provider <name> to enable tool planning and explanations.\n";
             break;
         }
 
@@ -46048,15 +46741,34 @@ static void HandleAiCommand(
         {
             std::wcout << ai.AuthHelpText();
         }
+        else if (action == L"go")
+        {
+            HandleAiPendingGo(state, device, symbols, ai, aiState);
+        }
+        else if (action == L"no")
+        {
+            HandleAiPendingNo(aiState);
+        }
         else if (action == L"show")
         {
             if (args.size() == 2)
             {
-                PrintAiPlan(aiState);
+                PrintAiSessionShow(aiState, L"");
             }
             else
             {
-                HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
+                const std::wstring what = ToLower(args[2]);
+                if (what == L"evidence" ||
+                    what == L"pending" ||
+                    what == L"tools" ||
+                    what == L"plan")
+                {
+                    PrintAiSessionShow(aiState, what);
+                }
+                else
+                {
+                    HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
+                }
             }
         }
         else if (action == L"write")
@@ -46211,6 +46923,11 @@ static void HandleAiCommand(
                 break;
             }
 
+            if (TryPrintAiNestedCommandHelp(args))
+            {
+                break;
+            }
+
             if (ToLower(args[2]) != L"!callbacks")
             {
                 HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
@@ -46306,6 +47023,11 @@ static void HandleAiCommand(
                 break;
             }
 
+            if (TryPrintAiNestedCommandHelp(args))
+            {
+                break;
+            }
+
             std::wstring commandLine = JoinArgs(args, 2);
             AiEvidenceAnalysisMetadata metadata = BuildAiEvidenceAnalysisMetadata(commandLine, L"ai_explain");
 
@@ -46324,6 +47046,11 @@ static void HandleAiCommand(
         }
         else if (action == L"annotate")
         {
+            if (TryPrintAiNestedCommandHelp(args))
+            {
+                break;
+            }
+
             if (args.size() < 4 || (ToLower(args[2]) != L"u" && ToLower(args[2]) != L"uf"))
             {
                 std::wcerr << L"usage: ai annotate <u|uf> <address|symbol> [instruction-count]\n";

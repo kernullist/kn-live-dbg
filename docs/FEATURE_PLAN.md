@@ -299,12 +299,17 @@ Operational value:
 Expose more existing native scanners through the strict read-only AI tool
 router.
 
-Status: implemented. The strict `kn-live-dbg.ai-capability-plan.v1` router now
-accepts the expanded read-only catalog, rejects unknown tools and per-tool
-unknown args, and dispatches every selected tool through validated local native
-handlers instead of raw debugger command generation.
+Status: implemented. `user/AiCapabilityCatalog.cpp` is the shared tool table
+for the in-process `ai <goal>` planner (MCP keeps its own `kTools` projection
+of the same names). The strict `kn-live-dbg.ai-capability-plan.v1` router
+rejects unknown tools and per-tool unknown args, and dispatches every selected
+tool through validated local native handlers instead of raw debugger command
+generation. Default `ai <goal>` is local-first: playbooks and process field
+queries run before any model call; cheap tools preview, execute, then get an
+LLM explanation; expensive tools wait for `ai go`. The v2 command planner is
+explicit (`ai plan`) and is no longer the default fallback.
 
-Implemented tools:
+Implemented tools include the original catalog plus P0-P2 scanners:
 
 ```text
 etw.integrity
@@ -318,6 +323,15 @@ module.integrity
 vad.list
 threads.list
 driver.integrity
+driver.object
+device.stack
+handles.list
+hiddenproc.list
+wdfilter.list
+inputstack.list
+dma.posture
+hv.posture
+dump.analyze
 ```
 
 Implementation notes:
@@ -325,10 +339,19 @@ Implementation notes:
 1. Keep the catalog explicit and small enough to validate by hand.
 2. Reject unknown tools, unknown fields, write-like actions, raw `kd`, nested
    `ai`, session mutation, unload/shutdown, and command chaining.
-3. Return local tool evidence first, then optionally ask the provider to
-   explain the evidence.
-4. Prefer structured local execution over natural-language keyword rules.
+3. Return local tool evidence first, then ask the provider to explain the
+   captured output.
+4. Prefer structured local execution and named playbooks over natural-language
+   keyword rules. Generic playbooks do not fire when the goal already names a
+   `.sys`/`.exe`/`.dll`/`.drv` file, so prompts such as
+   `ai WdFilter.sys object callbacks` stay on the tool planner instead of the
+   unfiltered callbacks playbook.
 5. Use `assistant.answer` only when no local read-only tool fits.
+6. Confirm `hunt.run`, `payload.scan`, `snapshot.capture`, and `kpage.list`
+   with `deep=true` before execution.
+7. Every `ai` subcommand supports `ai help <sub>` / `ai <sub> help` and Tab
+   completion. `ai explain|analyze|annotate <cmd> help` prints that command's
+   native help, and Tab after those verbs reuses the native completer.
 
 Operational value:
 

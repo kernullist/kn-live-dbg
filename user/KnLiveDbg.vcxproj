@@ -102,6 +102,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AddressInspector.cpp" />
+    <ClCompile Include="AiCapabilityCatalog.cpp" />
     <ClCompile Include="AiProvider.cpp" />
     <ClCompile Include="AlpcScanner.cpp" />
     <ClCompile Include="BindFilterScanner.cpp" />
@@ -173,6 +174,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AddressInspector.h" />
+    <ClInclude Include="AiCapabilityCatalog.h" />
     <ClInclude Include="AiProvider.h" />
     <ClInclude Include="AlpcScanner.h" />
     <ClInclude Include="BindFilterScanner.h" />

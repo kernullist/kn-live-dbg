@@ -19,6 +19,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AiCapabilityCatalog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="AiProvider.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -201,6 +204,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AiCapabilityCatalog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="AiProvider.h">
       <Filter>Header Files</Filter>
     </ClInclude>
