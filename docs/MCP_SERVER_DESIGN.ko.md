@@ -600,7 +600,7 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 
 ### 11.1.5 현재 카탈로그 (2026-08)
 
-실제 소스는 `user/McpServer.cpp`의 `kTools` 테이블이다. 운영자용 표는 `MCP_SETUP.ko.md` §6. 작성 시점 기준 **읽기 툴 58종**, **쓰기 툴 11종**. Phase 2 quiet surface로 `etw.providers`, `etw.ti_cross`, `hal.scan`, `hive.list`, `token.inspect`, `dpc.list`, `timer.list`가 추가됐다. Lab write 모드의 `process.set_protection`은 임의 대상 PID를 받으며, 초기 v0의 self-only 매핑은 과거 기록이다.
+실제 소스는 `user/McpServer.cpp`의 `kTools` 테이블이다. 운영자용 표는 `MCP_SETUP.ko.md` §6. 작성 시점 기준 **읽기 툴 67종**, **쓰기 툴 11종**. Phase 2 quiet surface로 `etw.providers`, `etw.ti_cross`, `hal.scan`, `hive.list`, `token.inspect`, `dpc.list`, `timer.list`가 추가됐다. Lab write 모드의 `process.set_protection`은 임의 대상 PID를 받으며, 초기 v0의 self-only 매핑은 과거 기록이다.
 
 ## 12. 설계 핵심 7줄 요약
 

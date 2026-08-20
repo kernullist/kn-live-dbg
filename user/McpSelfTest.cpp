@@ -337,6 +337,10 @@ int RunMcpToolCatalogSelfTest()
             {L"address", L"va", L"symbol"});
         CheckReadOnlyTool(&context, L"payload.scan", {L"limit"});
         CheckReadOnlyTool(&context, L"mapper.list", {L"scope", L"limit"});
+        CheckReadOnlyTool(&context, L"hiddenproc.list", {});
+        CheckReadOnlyTool(&context, L"handles.list", {L"pid", L"target", L"limit"});
+        CheckReadOnlyTool(&context, L"hv.posture", {});
+        CheckReadOnlyTool(&context, L"dma.posture", {});
         CheckReadOnlyTool(
             &context,
             L"kpage.list",

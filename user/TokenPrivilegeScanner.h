@@ -38,6 +38,16 @@ struct TokenPrivilegeRecord
     bool IdentityResolved = false;
     bool CoverageIncomplete = false;
     std::wstring PrivilegeFingerprint;
+    uint32_t TokenType = 0;
+    uint32_t ImpersonationLevel = 0;
+    uint32_t SessionId = 0;
+    uint32_t IntegrityLevel = 0;
+    uint64_t TokenId = 0;
+    uint64_t AuthenticationId = 0;
+    bool TokenObjectFieldsResolved = false;
+    bool PrimaryToken = false;
+    bool IntegrityResolved = false;
+    std::wstring IntegrityText;
 };
 
 struct TokenPrivilegeScanResult

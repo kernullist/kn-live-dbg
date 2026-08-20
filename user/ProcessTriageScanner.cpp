@@ -5,6 +5,7 @@
 #include <Psapi.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <functional>
@@ -2183,6 +2184,10 @@ namespace
         TypeFieldInfo NoChange = {};
         TypeFieldInfo Large = {};
         TypeFieldInfo Subsection = {};
+        TypeFieldInfo ControlArea = {};
+        TypeFieldInfo FilePointer = {};
+        TypeFieldInfo FileName = {};
+        TypeFieldInfo MappedViews = {};
         bool HasRtlRoot = false;
         bool HasVadNode = false;
         bool HasStartingVpnHigh = false;
@@ -2193,6 +2198,10 @@ namespace
         bool HasNoChange = false;
         bool HasLarge = false;
         bool HasSubsection = false;
+        bool HasControlArea = false;
+        bool HasFilePointer = false;
+        bool HasFileName = false;
+        bool HasMappedViews = false;
         std::vector<std::wstring> Warnings;
     };
 
@@ -2257,6 +2266,15 @@ namespace
                 FindFieldRecursive(symbols, {L"nt!_MMVAD_SHORT", L"_MMVAD_SHORT", L"nt!_MMVAD", L"_MMVAD"}, L"LargePages", &layout->Large, nullptr);
             layout->HasSubsection =
                 FindFieldRecursive(symbols, {L"nt!_MMVAD", L"_MMVAD"}, L"Subsection", &layout->Subsection, nullptr);
+            layout->HasControlArea =
+                FindFieldRecursive(symbols, {L"nt!_SUBSECTION", L"_SUBSECTION"}, L"ControlArea", &layout->ControlArea, nullptr);
+            layout->HasFilePointer =
+                FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"FilePointer", &layout->FilePointer, nullptr);
+            layout->HasFileName =
+                FindFieldRecursive(symbols, {L"nt!_FILE_OBJECT", L"_FILE_OBJECT"}, L"FileName", &layout->FileName, nullptr);
+            layout->HasMappedViews =
+                FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"NumberOfMappedViews", &layout->MappedViews, nullptr) ||
+                FindFieldRecursive(symbols, {L"nt!_CONTROL_AREA", L"_CONTROL_AREA"}, L"NumberOfUserReferences", &layout->MappedViews, nullptr);
 
             ok = true;
         } while (false);
@@ -2586,7 +2604,91 @@ namespace
                 {
                     record->Subsection = subsection;
                     record->HasSubsection = subsection != 0;
+                    if (record->HasSubsection &&
+                        layout.HasControlArea &&
+                        subsection != 0)
+                    {
+                        uint64_t controlArea = 0;
+                        if (ReadFieldInteger(
+                                device,
+                                subsection,
+                                layout.ControlArea,
+                                sizeof(uint64_t),
+                                &controlArea,
+                                nullptr) &&
+                            controlArea != 0 &&
+                            controlArea >= 0xffff800000000000ull)
+                        {
+                            record->ControlArea = controlArea;
+                            record->HasControlArea = true;
+                            if (layout.HasMappedViews)
+                            {
+                                uint64_t views = 0;
+                                if (ReadFieldInteger(
+                                        device,
+                                        controlArea,
+                                        layout.MappedViews,
+                                        sizeof(uint32_t),
+                                        &views,
+                                        nullptr))
+                                {
+                                    record->MappedViews = static_cast<uint32_t>(views);
+                                }
+                            }
+                            if (layout.HasFilePointer)
+                            {
+                                uint64_t fileRaw = 0;
+                                if (ReadFieldInteger(
+                                        device,
+                                        controlArea,
+                                        layout.FilePointer,
+                                        sizeof(uint64_t),
+                                        &fileRaw,
+                                        nullptr))
+                                {
+                                    const uint64_t fileObject = fileRaw & ~0xFull;
+                                    record->FileObject = fileObject;
+                                    if (fileObject >= 0xffff800000000000ull && layout.HasFileName)
+                                    {
+                                        uint64_t nameAddress = 0;
+                                        if (TryAdd(fileObject, layout.FileName.Offset, &nameAddress))
+                                        {
+                                            std::vector<uint8_t> header;
+                                            if (device.ReadMemory(nameAddress, 16, &header, nullptr) &&
+                                                header.size() >= 16)
+                                            {
+                                                uint16_t length = 0;
+                                                uint64_t buffer = 0;
+                                                memcpy(&length, header.data(), sizeof(length));
+                                                memcpy(&buffer, header.data() + 8, sizeof(buffer));
+                                                if (length > 0 && length <= 2048 && buffer != 0)
+                                                {
+                                                    std::vector<uint8_t> nameBytes;
+                                                    if (device.ReadMemory(buffer, length, &nameBytes, nullptr) &&
+                                                        nameBytes.size() >= 2)
+                                                    {
+                                                        record->SectionFileName.assign(
+                                                            reinterpret_cast<const wchar_t*>(nameBytes.data()),
+                                                            nameBytes.size() / sizeof(wchar_t));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+
+            if (!record->SectionFileName.empty())
+            {
+                if (!record->Notes.empty())
+                {
+                    record->Notes += L"; ";
+                }
+                record->Notes += L"section=" + record->SectionFileName;
             }
 
             ok = true;

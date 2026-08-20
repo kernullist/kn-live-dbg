@@ -347,6 +347,8 @@ namespace
         { L"/verbose", nullptr, L"also print clean modules and hash failures" },
         { L"/summary", nullptr, L"aggregate counts only" },
         { L"/limit", L"/limit <n>", L"cap printed records" },
+        { L"/sign", nullptr, L"include Authenticode verification (default)" },
+        { L"/no-sign", nullptr, L"skip Authenticode verification" },
         { L"/json", L"/json <path>", L"write kn-live-dbg.byovd-scan.v1" },
         { L"help", nullptr, L"show !byovd usage" },
     };
@@ -448,6 +450,8 @@ namespace
         { L"/wx", nullptr, L"keep W+X section or page evidence" },
         { L"/mismatch", nullptr, L"keep header/size/section anomalies" },
         { L"/disk", nullptr, L"compare live executable pages to the on-disk PE" },
+        { L"/iat", nullptr, L"walk the live IAT and flag thunks outside expected modules" },
+        { L"/prologue", nullptr, L"disassemble AddressOfEntryPoint for trampoline / trap heads" },
         { L"/limit", L"/limit <n>", L"cap printed modules" },
         { L"/json", L"/json <path>", L"write kn-live-dbg.module-integrity.v1" },
         { L"help", nullptr, L"show !module usage" },
@@ -455,11 +459,76 @@ namespace
 
     const CompletionHint kDriverTokens[] =
     {
+        { L"list", L"!driver list [driver|all]", L"enumerate \\Driver objects" },
+        { L"object", L"!driver object <name|address>", L"inspect one DRIVER_OBJECT and its devices" },
         { L"integrity", L"!driver integrity [driver|all]", L"walk \\Driver and annotate MajorFunction[]" },
         { L"all", L"!driver integrity all", L"scan every driver object" },
+        { L"/dispatch", nullptr, L"print MajorFunction[] with !drvobj" },
+        { L"/devices", nullptr, L"walk DEVICE_OBJECT.NextDevice and attached stacks" },
         { L"/limit", L"/limit <n>", L"cap printed drivers" },
         { L"/json", L"/json <path>", L"write kn-live-dbg.driver-integrity.v1" },
         { L"help", nullptr, L"show !driver usage" },
+    };
+
+    const CompletionHint kDrvobjTokens[] =
+    {
+        { L"/dispatch", nullptr, L"print MajorFunction[]" },
+        { L"/devices", nullptr, L"walk NextDevice and attached stacks" },
+        { L"/json", L"/json <path>", L"write kn-live-dbg.drvobj.v1" },
+        { L"help", nullptr, L"show !drvobj usage" },
+    };
+
+    const CompletionHint kDevstackTokens[] =
+    {
+        { L"/json", L"/json <path>", L"write kn-live-dbg.device-stack.v1" },
+        { L"help", nullptr, L"show !devstack usage" },
+    };
+
+    const CompletionHint kHandlesTokens[] =
+    {
+        { L"/target", L"/target <pid>", L"keep process handles that point at that PID" },
+        { L"/process", nullptr, L"keep process-type handles only (default)" },
+        { L"/all", nullptr, L"include non-process handles" },
+        { L"/suspicious", nullptr, L"keep non-system VM/DUP cross-process handles" },
+        { L"/limit", L"/limit <n>", L"cap printed handles" },
+        { L"/json", L"/json <path>", L"write kn-live-dbg.handle-table.v1" },
+        { L"help", nullptr, L"show !handles usage" },
+    };
+
+    const CompletionHint kHiddenProcTokens[] =
+    {
+        { L"/json", L"/json <path>", L"write kn-live-dbg.hidden-process.v1" },
+        { L"help", nullptr, L"show !hiddenproc usage" },
+    };
+
+    const CompletionHint kWdFilterTokens[] =
+    {
+        { L"/json", L"/json <path>", L"write kn-live-dbg.wdfilter-runtime.v1" },
+        { L"help", nullptr, L"show !wdfilter usage" },
+    };
+
+    const CompletionHint kInputStackTokens[] =
+    {
+        { L"/json", L"/json <path>", L"write kn-live-dbg.input-stack.v1" },
+        { L"help", nullptr, L"show !inputstack usage" },
+    };
+
+    const CompletionHint kDmaTokens[] =
+    {
+        { L"/json", L"/json <path>", L"write kn-live-dbg.dma-posture.v1" },
+        { L"help", nullptr, L"show !dma usage" },
+    };
+
+    const CompletionHint kHvTokens[] =
+    {
+        { L"/json", L"/json <path>", L"write kn-live-dbg.hv-posture.v1" },
+        { L"help", nullptr, L"show !hv usage" },
+    };
+
+    const CompletionHint kDumpAnalyzeTokens[] =
+    {
+        { L"/json", L"/json <path>", L"write kn-live-dbg.dump-analyze.v1" },
+        { L"help", nullptr, L"show dump-analyze usage" },
     };
 
     const CompletionHint kPoolRootTokens[] =
@@ -1180,7 +1249,55 @@ namespace
 
     const CompletionScopeTable kDriverScopes[] =
     {
-        SCOPE(L"", L"!driver integrity [driver|all] [options]", L"DRIVER_OBJECT dispatch integrity", kDriverTokens),
+        SCOPE(L"", L"!driver [list|object|integrity] [options]", L"DRIVER_OBJECT list, object, and dispatch integrity", kDriverTokens),
+        SCOPE(L"list", L"!driver list [driver|all] [options]", L"enumerate \\Driver objects", kDriverTokens),
+        SCOPE(L"object", L"!driver object <name|address> [options]", L"inspect one DRIVER_OBJECT", kDrvobjTokens),
+        SCOPE(L"integrity", L"!driver integrity [driver|all] [options]", L"DRIVER_OBJECT dispatch integrity", kDriverTokens),
+    };
+
+    const CompletionScopeTable kDrvobjScopes[] =
+    {
+        SCOPE(L"", L"!drvobj <name|address> [/dispatch] [/devices] [/json]", L"inspect one DRIVER_OBJECT", kDrvobjTokens),
+    };
+
+    const CompletionScopeTable kDevstackScopes[] =
+    {
+        SCOPE(L"", L"!devstack <device-address> [/json]", L"walk a DEVICE_OBJECT stack", kDevstackTokens),
+    };
+
+    const CompletionScopeTable kHandlesScopes[] =
+    {
+        SCOPE(L"", L"!handles [pid] [/target pid] [/process|/all] [/suspicious] [/limit] [/json]", L"process handle table triage", kHandlesTokens),
+    };
+
+    const CompletionScopeTable kHiddenProcScopes[] =
+    {
+        SCOPE(L"", L"!hiddenproc [/json]", L"cross-view hidden process", kHiddenProcTokens),
+    };
+
+    const CompletionScopeTable kWdFilterScopes[] =
+    {
+        SCOPE(L"", L"!wdfilter [/json]", L"WdFilter RuntimeDriver leftovers", kWdFilterTokens),
+    };
+
+    const CompletionScopeTable kInputStackScopes[] =
+    {
+        SCOPE(L"", L"!inputstack [/json]", L"keyboard/mouse device stacks", kInputStackTokens),
+    };
+
+    const CompletionScopeTable kDmaScopes[] =
+    {
+        SCOPE(L"", L"!dma [/json]", L"IOMMU / Kernel DMA Protection posture", kDmaTokens),
+    };
+
+    const CompletionScopeTable kHvScopes[] =
+    {
+        SCOPE(L"", L"!hv [/json]", L"hypervisor presence posture", kHvTokens),
+    };
+
+    const CompletionScopeTable kDumpAnalyzeScopes[] =
+    {
+        SCOPE(L"", L"dump-analyze <path> [/json]", L"parse DUMP_HEADER64 and walk modules (PML4 or LA57 PML5)", kDumpAnalyzeTokens),
     };
 
     const CompletionScopeTable kPoolScopes[] =
@@ -1512,6 +1629,7 @@ namespace
         CMD(L"dump-pe", kDumpPeScopes),
         CMD(L"dump-kernel", kDumpKernelScopes),
         CMD(L"dump-live", kDumpLiveScopes),
+        CMD(L"dump-analyze", kDumpAnalyzeScopes),
         CMD(L"u", kUnassembleScopes),
         CMD(L"uf", kUnassembleScopes),
         CMD(L"!callbacks", kCallbackScopes),
@@ -1542,6 +1660,14 @@ namespace
         CMD(L"!fwtable", kFwtableScopes),
         CMD(L"!module", kModuleScopes),
         CMD(L"!driver", kDriverScopes),
+        CMD(L"!drvobj", kDrvobjScopes),
+        CMD(L"!devstack", kDevstackScopes),
+        CMD(L"!handles", kHandlesScopes),
+        CMD(L"!hiddenproc", kHiddenProcScopes),
+        CMD(L"!wdfilter", kWdFilterScopes),
+        CMD(L"!inputstack", kInputStackScopes),
+        CMD(L"!dma", kDmaScopes),
+        CMD(L"!hv", kHvScopes),
         CMD(L"!pool", kPoolScopes),
         CMD(L"!address", kAddressScopes),
         CMD(L"!payload", kPayloadScopes),

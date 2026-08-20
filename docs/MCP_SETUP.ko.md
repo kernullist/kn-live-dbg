@@ -493,7 +493,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 ## 6. 제공 기능 카탈로그
 
-### 6.1 읽기 툴 (58종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
+### 6.1 읽기 툴 (67종, `--allow-write` 불필요 — 단 `ti.subscribe` start/stop 제외)
 
 | 툴 | 설명 | 주요 인자 (별도 표기 외 모두 선택) |
 |-----|------|----------------------|
@@ -533,6 +533,15 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `graph.query` | 수집된 timeline 이벤트에서 process/image/domain/source 그래프 파생 | `source`, `domain`, `image`, `pid`, `limit`, `order` |
 | `module.integrity` | 로드 모듈 PE/섹션 무결성 + W+X | `module`, `target`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch` |
 | `driver.integrity` | `DRIVER_OBJECT` 디스패치 테이블 무결성 | `driver`, `target`, `limit` |
+| `driver.object` | `DRIVER_OBJECT` 하나와 device/attached 스택 | `driver`, `name`, `target`, `address` |
+| `device.stack` | `DEVICE_OBJECT` AttachedDevice/AttachedTo 스택 워크 | `address`, `va`, `device` |
+| `handles.list` | 프로세스 핸들 + 비시스템 VM/DUP 교차 프로세스 의심 | `pid`, `target`, `limit` |
+| `hiddenproc.list` | ActiveProcessLinks x SPI x Toolhelp x 핸들 owner | (없음) |
+| `wdfilter.list` | WdFilter RuntimeDriver leftover | (없음) |
+| `inputstack.list` | 키보드/마우스 class attached-device 스택 | (없음) |
+| `dma.posture` | IOMMU 펌웨어 + Kernel DMA Protection + removable PCI | (없음) |
+| `hv.posture` | CPUID/CR4.VMXE/timing 하이퍼바이저 존재(FEATURE_CONTROL 없음) | (없음) |
+| `dump.analyze` | dump-kernel DUMP_HEADER64, run, 로드 모듈 파싱 (4-level 또는 LA57 5-level VA 워크) | `path`, `file` |
 | `ssdt.scan` | SSDT/shadow-SSDT 시스템콜 훅 탐지 | (없음) |
 | `idt.scan` | IDT 인터럽트 게이트 훅/CPU별 divergence | (없음) |
 | `cr.scan` | 컨트롤 레지스터 검사(CR0.WP/SMEP/SMAP/CPU별) | (없음) |

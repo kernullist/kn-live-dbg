@@ -494,7 +494,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 
 ## 6. Capability Catalog
 
-### 6.1 Read tools (58, no `--allow-write` needed — except `ti.subscribe` start/stop)
+### 6.1 Read tools (67, no `--allow-write` needed — except `ti.subscribe` start/stop)
 
 | Tool | Description | Key args (all optional unless noted otherwise) |
 |-----|------|----------------------|
@@ -532,8 +532,17 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `timeline.export` | Return ingested timeline events as JSONL text without writing to disk | `source`, `domain`, `pid`, `limit`, `order` |
 | `timeline.reconcile` | Compare ingested timeline evidence with a snapshot baseline or JSON file | `path`, `snapshot`, `source`, `domain`, `pid`, `limit` |
 | `graph.query` | Derive a process/image/domain/source graph from ingested timeline events | `source`, `domain`, `image`, `pid`, `limit`, `order` |
-| `module.integrity` | Loaded-module PE/section integrity + W+X | `module`, `target`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch` |
+| `module.integrity` | Loaded-module PE/section integrity + W+X + IAT/prologue | `module`, `target`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch`, `disk`, `iat`, `prologue` |
 | `driver.integrity` | `DRIVER_OBJECT` dispatch-table integrity | `driver`, `target`, `limit` |
+| `driver.object` | One `DRIVER_OBJECT` plus device/attached stacks | `driver`, `name`, `target`, `address` |
+| `device.stack` | Walk a `DEVICE_OBJECT` AttachedDevice/AttachedTo stack | `address`, `va`, `device` |
+| `handles.list` | Process handles with VM/DUP cross-process suspicion | `pid`, `target`, `limit` |
+| `hiddenproc.list` | ActiveProcessLinks x SPI x Toolhelp x handle owners | (none) |
+| `wdfilter.list` | WdFilter RuntimeDriver leftovers | (none) |
+| `inputstack.list` | Keyboard/mouse class attached-device stacks | (none) |
+| `dma.posture` | IOMMU firmware + Kernel DMA Protection + removable PCI | (none) |
+| `hv.posture` | CPUID/CR4.VMXE/timing hypervisor presence (no FEATURE_CONTROL) | (none) |
+| `dump.analyze` | Parse dump-kernel DUMP_HEADER64, runs, and loaded modules (4-level or LA57 5-level VA walk) | `path`, `file` |
 | `ssdt.scan` | Detect SSDT/shadow-SSDT syscall hooks | (none) |
 | `idt.scan` | IDT interrupt-gate hooks/per-CPU divergence | (none) |
 | `cr.scan` | Inspect control registers (CR0.WP/SMEP/SMAP/per-CPU) | (none) |

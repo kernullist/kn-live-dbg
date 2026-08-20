@@ -87,6 +87,11 @@ struct ProcessVadRecord
     bool LargePage = false;
     bool HasSubsection = false;
     uint64_t Subsection = 0;
+    bool HasControlArea = false;
+    uint64_t ControlArea = 0;
+    uint64_t FileObject = 0;
+    uint32_t MappedViews = 0;
+    std::wstring SectionFileName;
     bool PeProbeAttempted = false;
     bool PeProbeReadSucceeded = false;
     bool PeHeaderFound = false;

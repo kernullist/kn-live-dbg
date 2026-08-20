@@ -70,7 +70,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Psapi.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Crypt32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Psapi.lib;SetupAPI.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;Wintrust.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -94,7 +94,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(DebuggingToolsLibDir);$(DiaSdkLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Advapi32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Psapi.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Crypt32.lib;Dbghelp.lib;Dbgeng.lib;diaguids.lib;FltLib.lib;Ole32.lib;OleAut32.lib;Psapi.lib;SetupAPI.lib;Shell32.lib;Winhttp.lib;Httpapi.lib;Version.lib;Wintrust.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -117,7 +117,13 @@
     <ClCompile Include="EtwScanner.cpp" />
     <ClCompile Include="FirmwareTableScanner.cpp" />
     <ClCompile Include="HalDispatchScanner.cpp" />
+    <ClCompile Include="HandleTableScanner.cpp" />
+    <ClCompile Include="HiddenProcessScanner.cpp" />
     <ClCompile Include="HiveScanner.cpp" />
+    <ClCompile Include="HvPostureScanner.cpp" />
+    <ClCompile Include="DumpAnalyzer.cpp" />
+    <ClCompile Include="DmaPostureScanner.cpp" />
+    <ClCompile Include="InputStackScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
     <ClCompile Include="LeftoverCommon.cpp" />
     <ClCompile Include="MapperRemnantScanner.cpp" />
@@ -154,6 +160,7 @@
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
     <ClCompile Include="VbsScanner.cpp" />
+    <ClCompile Include="WdFilterRuntimeScanner.cpp" />
     <ClCompile Include="WfpScanner.cpp" />
     <ClCompile Include="WfpCalloutScanner.cpp" />
     <ClCompile Include="WnfScanner.cpp" />
@@ -181,7 +188,13 @@
     <ClInclude Include="EtwScanner.h" />
     <ClInclude Include="FirmwareTableScanner.h" />
     <ClInclude Include="HalDispatchScanner.h" />
+    <ClInclude Include="HandleTableScanner.h" />
+    <ClInclude Include="HiddenProcessScanner.h" />
     <ClInclude Include="HiveScanner.h" />
+    <ClInclude Include="HvPostureScanner.h" />
+    <ClInclude Include="DumpAnalyzer.h" />
+    <ClInclude Include="DmaPostureScanner.h" />
+    <ClInclude Include="InputStackScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />
     <ClInclude Include="LayoutResolver.h" />
     <ClInclude Include="LeftoverCommon.h" />
@@ -219,6 +232,7 @@
     <ClInclude Include="SnapshotPrinter.h" />
     <ClInclude Include="SymbolEngine.h" />
     <ClInclude Include="VbsScanner.h" />
+    <ClInclude Include="WdFilterRuntimeScanner.h" />
     <ClInclude Include="WfpScanner.h" />
     <ClInclude Include="WfpCalloutScanner.h" />
     <ClInclude Include="WnfScanner.h" />

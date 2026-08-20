@@ -68,7 +68,7 @@ kn-live-dbg/
 28. Scans loaded kernel modules for BYOVD risk with `!byovd` -- maintaining a local catalog from the Microsoft vulnerable driver blocklist plus LOLDrivers hash/YARA feeds, auto-refreshing it when older than 24 hours, hashing loaded module images on disk, optionally running LOLDrivers YARA rules through an operator-supplied `yara64.exe` / `yara.exe`, and reporting exact hash/YARA matches as `HIGH` confidence plus Microsoft file-name/version blocklist hints as `MEDIUM` confidence. A benign no-op fixture driver (`amdryzenmasterdriver.sys`) can be loaded with `!byovd fixture load` to exercise the Microsoft name/version positive-control path without shipping an actual vulnerable driver.
 29. Enumerates the kernel big pool with `!pool big` / `!pool find` / `!pool summary` -- snapshotting `nt!PoolBigPageTable` through `NtQuerySystemInformation(SystemBigPoolInformation=0x42)`, filtering by 4-character tag (`/tag`), size band (`/min`/`/max`), containing virtual address (`/addr`), W+X page attributes (`/wx`), or paged/non-paged class, and optionally walking the PML5/PML4/PDPT/PD/PT hierarchy via the driver's `TranslateVirtual` IOCTL with `/annotate` to surface effective R/W/X permissions and `[W+X]` non-paged allocations as BYOVD/payload-staging signals.
 30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, reporting added/escalated records plus coverage-gated callback removal and `_EPROCESS.Protection` changes, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first.
-31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, writes a WinDbg-openable complete dump with `dump-kernel <path>` (8 KB `DUMP_HEADER64` plus streamed physical RAM runs from `MmGetPhysicalMemoryRanges`), and asks Windows for an OS live kernel dump with `dump-live <path>` via `NtSystemDebugControl(SysDbgGetLiveKernelDump)`, or writes a WinDbg kernel complete dump of one process with `dump-live <path> /user <pid|eprocess>`. `dump-pe` parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
+31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, writes a WinDbg-openable complete dump with `dump-kernel <path>` (8 KB `DUMP_HEADER64` plus streamed physical RAM runs from `MmGetPhysicalMemoryRanges`), and asks Windows for an OS live kernel dump with `dump-live <path>` via `NtSystemDebugControl(SysDbgGetLiveKernelDump)`, or writes a WinDbg kernel complete dump of one process with `dump-live <path> /user <pid|eprocess>`. `dump-analyze <path>` is offline: it parses that `DUMP_HEADER64`, lists physical runs, and walks `PsLoadedModuleList` through 4-level or LA57 5-level paging. `dump-pe` parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images.
 32. Hunts PE images stashed in big pool with `!pool pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
 33. Lists filesystem minifilters and can disable or restore one IRP pre/post handler, or every registered slot, with `!minifilter`. The walk uses `fltmgr!FltGlobals` and PDB `_FLT_OPERATION_REGISTRATION` offsets. `disable` writes NULL through the existing write IOCTL after saving the original pointers in this session; `enable` puts them back. `disable <name> all` and `disable-all` walk every slot. Inbox filters warn. No new driver IOCTL.
 34. Traces leftover mapper payloads after the original driver image is gone, as separate layers. `!byovd` is loaded BYOVD. `!mapper` is bookkeeping remnants (`MmUnloadedDrivers` / PiDDB / ci hash); `leftover=0` is ledger-clean, not payload-absent. `!kpage` is orphan executable pages; `!kpage /deep` adds a capped PFN-database pass. `!payload` / `!payload scan` is hook-to-body. `!pool pe` is staged pool PE. None of these add driver IOCTLs.
@@ -86,7 +86,8 @@ kn-live-dbg/
 46. Enumerates active global Bind Filter mappings on every mounted local fixed/removable/RAM volume during default/deep `!hunt` by dynamically calling the system `bindfltapi!BfGetMappings` interface. Drive-letter and mounted-folder-only volumes are discovered through the volume GUID/mount-path APIs; a partial volume walk leaves global coverage incomplete. Root-relative mapping paths are anchored to the specific enumerated volume, preventing a mapping on another volume from correlating with the Windows volume. Exact mapping records are promoted only when they intersect a known security-product path, `amsi.dll`/event-log artifacts, an authoritative Windows/Program Files-to-user path boundary, its inverse, a Windows system-image redirect, or a same-volume two-way mapping pair. Global Process-Binding is promoted separately only when a running process exposes the mapping source through an exact API/PEB/module path match while both the `_EPROCESS.SectionObject` and main-image VAD independently resolve to the same mapped target. Missing either backing view sets an explicit correlation-coverage-incomplete state instead of producing clean proof. Buffer offsets, lengths, counts, structural regions, returned size, exact success statuses, and growth are fail-closed and size-bounded. `KnLiveDbgBindFixture.exe` is constrained to two fixed mappings under one direct `%TEMP%\KnLiveDbgBindFixture-<GUID>` child and cannot target Windows or installed-product paths; cleanup can remove those exact mappings even if fixture files were lost, and only `S_OK` or an already-missing mapping is accepted as complete. `tools\run-qos-bind-e2e.ps1` verifies redirected content and image hashes, keeps the copied benign backing process alive for one hunt, and independently validates exact mapping, PID, two-backing-view, policy, rate, and counter evidence before exact cleanup. JSON distinguishes global enumeration and Process-Binding correlation completeness from the remaining unsupported silo-scoped mapping query; a clean global result is not presented as Silo-Binding coverage.
 47. Detects current-state CloudFiles False File Immutability evidence during default/deep `!hunt`. For each resolved SEC_IMAGE VAD backing, an attribute-only handle dynamically queries bounded `CF_PLACEHOLDER_STANDARD_INFO` metadata without requesting file data. The scanner recognizes the complete `IO_REPARSE_TAG_CLOUD` family when the tag is visible and records a bounded `FSCTL_GET_REPARSE_POINT` cross-view. Some current `cldflt` builds mask the tag from both views; successful `CfGetPlaceholderInfo` is therefore also an authoritative placeholder identity signal, with the fallback and failed FSCTL error preserved as evidence. A PP/PPL mapping or a placeholder correlated with an already-normalized deep executable live-versus-disk mismatch is high risk/high confidence; positive `ModifiedDataSize` on a mapped placeholder is medium risk/high confidence. An in-sync, unmodified, non-PP/PPL placeholder is a negative control. Missing CloudFiles metadata suppresses the derived claim; unresolved process protection cannot establish clean or PP/PPL evidence and is exposed as incomplete correlation, while independent modified-data or deep-mismatch evidence remains eligible. Every metadata-complete observation is retained in the additive `cloudfiles_images` JSON array with exact PID, module/VAD identity, raw state, protection correlation, decision, and reasons, including clean observations. This is current-state provenance detection, not a claim that rehydration history or file-generation history is reconstructed.
 48. Captures Filter Manager volume and instance attachment state in every `!snapshot` through the documented `FltLib` enumeration APIs. Each bounded, strictly parsed record preserves filter, instance, altitude, volume, frame, filesystem, supported-feature, and raw attachment flags, including `FLTFL_IASIM_DETACHED_VOLUME`; failed or partial enumeration leaves explicit incomplete coverage instead of a clean result. Same-boot `!diff` promotes a stable attachment's attached-to-detached transition. It also reports a missing attachment only when attachment and callback coverage are complete, the same volume remains enumerated, and the same minifilter remains registered in the independent kernel callback view. A clean attachment for the same filter, volume, and altitude suppresses the removal signal even when the instance name changes; when altitude is unavailable, the instance name is the fallback discriminator. A different-altitude decoy attachment no longer masks removal. Static detached state, cross-boot comparison, filter unload, volume removal, and incomplete coverage remain non-findings. Imported snapshot JSON must keep attachment/volume/detached counters, coverage state, record tags, and evidence mutually consistent before removal logic can use it. The bundled no-op minifilter fixture and `tools\run-minifilter-detach-e2e.ps1` exercise the supported attach/detach/reattach path and independently validate the raw snapshots plus positive and recovery diffs. This closes the documented Filter Manager view of ABYSSWORKER-style detach behavior; it does not claim full arbitrary device-stack topology or causal attribution.
-49. Quiet kernel surfaces (Phase 2): `!hal` checks PDB-described HalDispatchTable pointer fields; `!hive` walks PDB-described registry hive GetCellRoutine ownership with list-link validation; `!token` inspects process privilege Present/Enabled masks and propagates incomplete coverage into `!hunt`; `!etw providers` emits unclassified heuristic diagnostics while `!etw ti-cross` treats silence alone as inconclusive; `!dpc` / `!timer` require PDB-bounded deferred-execution layouts, and `!workitem` explicitly remains incomplete. Snapshot domains include `hal`, `hive`, `dpc-timer`, and token fingerprints under `process-security`.
+49. Quiet kernel surfaces (Phase 2): `!hal` checks PDB-described HalDispatchTable pointer fields; `!hive` walks PDB-described registry hive GetCellRoutine ownership with list-link validation; `!token` inspects process privilege Present/Enabled masks plus TokenType/SessionId/integrity SID and propagates incomplete coverage into `!hunt`; `!etw providers` emits unclassified heuristic diagnostics while `!etw ti-cross` treats silence alone as inconclusive; `!dpc` / `!timer` require PDB-bounded deferred-execution layouts, and `!workitem` explicitly remains incomplete. Snapshot domains include `hal`, `hive`, `dpc-timer`, and token fingerprints under `process-security`.
+50. P0-P2 investigation scanners (no driver ABI change): `!drvobj` / `!devstack` walk DRIVER_OBJECT device stacks; `!module integrity` adds `/disk` `/iat` `/prologue`; `!handles` triages VM/DUP cross-process handles; `!hiddenproc` cross-views ActiveProcessLinks vs SPI vs Toolhelp vs handle owners; `!wdfilter` lists WdFilter RuntimeDriver leftovers; `!inputstack` flags unknown kbd/mou attached drivers; `!vad` annotates ControlArea/FILE_OBJECT section names; `!dma` reports IOMMU firmware and Kernel DMA Protection; `!hv` reports hypervisor presence without `IA32_FEATURE_CONTROL`; `dump-analyze` walks dump DTB with PML4 or PML5; `!byovd` Authenticode is on by default (`/no-sign` skips it).
 
 ## Design Notes
 
@@ -257,6 +258,8 @@ kd <windbg-command>
 kddetach
 version
 drvstatus
+mcp [on [port]|off|status|client-setup|endpoint]
+log [enable|disable|status]
 probe [status|load [sys-path]|info|reset|unload]
 .sympath [path]
 .sympath+ <path>
@@ -305,11 +308,25 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !cr
 !ssdt
 !idt
+!hal [dispatch|private]
+!hive [list|cells]
+!token <pid|image|eprocess> | !token /all [/limit <n>] [/system]
+!dpc [/verbose] [/limit <n>]
+!timer [/verbose] [/limit <n>]
+!workitem [/verbose] [/limit <n>]
 !fwtable [providers|provider <signature>]
 !fwtable providers /module <name>
-!module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/limit <n>] [/json <path>]
-!driver integrity [driver|all] [/limit <n>] [/json <path>]
-!byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
+!module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/iat] [/prologue] [/limit <n>] [/json <path>]
+!driver [list|object|integrity] [driver|all] [/dispatch] [/devices] [/limit <n>] [/json <path>]
+!drvobj <name|address> [/dispatch] [/devices] [/json <path>]
+!devstack <device-object-address> [/json <path>]
+!handles [pid] [/target <pid>] [/process|/all] [/suspicious] [/limit <n>] [/json <path>]
+!hiddenproc [/json <path>]
+!wdfilter [/json <path>]
+!inputstack [/json <path>]
+!dma [/json <path>]
+!hv [/json <path>]
+!byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/sign|/no-sign] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
 !byovd fixture [status|load [sys-path]|unload|path]
 !pool [big|find|tags|summary|pe] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx] [/tags]
 !pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
@@ -321,6 +338,7 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
 dump-kernel <path> [/max <bytes>] [/strict]
+dump-analyze <path> [/json <path>]
 dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]
 !payload <address|symbol> [/disasm <n>] [/json <path>]
 !payload scan [/limit <n>] [/disasm <n>] [/json <path>]
@@ -1453,6 +1471,7 @@ Two file-emitting commands turn live kernel memory into on-disk artefacts for of
 dump-raw <address> <length> <path> [/zerofill]
 dump-pe <address> <path>
 dump-kernel <path> [/max <bytes>] [/strict]
+dump-analyze <path> [/json <path>]
 dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]
 ```
 
@@ -1487,7 +1506,11 @@ dump-pe nt .\ntoskrnl-live.exe
 dump-pe Wdf01000 .\wdf01000-live.sys
 dump-kernel .\live-complete.dmp
 dump-live .\os-live.dmp
+dump-analyze .\live-complete.dmp
+dump-analyze .\live-complete.dmp /json .\dump-analyze.json
 ```
+
+`dump-analyze` is offline and does not need KnLiveDbg.sys. It parses the 8 KB `DUMP_HEADER64`, lists physical runs, and walks `PsLoadedModuleList` through the dump DTB. VA translation is 4-level (PML4) or 5-level (PML5/LA57): CR4.LA57 is read from `ContextRecord` when `KdSecondaryVersion=2`, then confirmed by probing the module-list page tables. Using a 5-level walk on a 4-level dump (or the reverse) would mis-index CR3, so the probe is required. Output includes `paging=`, `la57=`, and `cr4=`.
 
 Caveats:
 
@@ -1529,7 +1552,15 @@ Symbolic forms (`nt!XXX`, `module+0xNN`, hex/decimal values, address expressions
 ```text
 !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections]
                   [/wx] [/mismatch] [/limit <n>] [/json <path>]
-!driver integrity [driver|all] [/limit <n>] [/json <path>]
+!driver [list|object|integrity] [driver|all] [/dispatch] [/devices] [/limit <n>] [/json <path>]
+!drvobj <name|address> [/dispatch] [/devices] [/json <path>]
+!devstack <device-object-address> [/json <path>]
+!handles [pid] [/target <pid>] [/process|/all] [/suspicious] [/limit <n>] [/json <path>]
+!hiddenproc [/json <path>]
+!wdfilter [/json <path>]
+!inputstack [/json <path>]
+!dma [/json <path>]
+!hv [/json <path>]
 ```
 
 `!module integrity` reads loaded kernel module PE headers from live memory, validates PE signatures, optional-header bounds, `SizeOfImage`, `SizeOfHeaders`, alignments, data directories, and section ranges, then page-walks executable/`.text` section first/last pages to flag static or effective W+X evidence. Live-vs-disk comparison masks loader-owned mutable bytes, including supported Dynamic Value Relocation Table Function Override fixups, while malformed or unsupported fixup metadata fails closed. Console output stays compact by default; `/summary` suppresses records, `/verbose` shows every reported module and section, `/headers` prints PE header evidence, `/sections` prints all sections, `/wx` filters to W+X evidence, and `/mismatch` filters to size/header/section mismatch evidence. JSON output uses the stable `kn-live-dbg.module-integrity.v1` schema with summary counts, warnings, module reason codes, section reason codes, page-probe state, and notes for baseline diffing. `!driver integrity` walks `\Driver`, decodes `_DRIVER_OBJECT` fields from PDB/DIA metadata, annotates `MajorFunction[]` handlers with module/symbol ownership, and flags only dispatch pointers outside every loaded module; cross-module handlers inside a loaded image are retained as delegation telemetry.

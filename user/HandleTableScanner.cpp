@@ -1,0 +1,551 @@
+#include "HandleTableScanner.h"
+
+#include "LayoutResolver.h"
+#include "McpJson.h"
+
+#include <Windows.h>
+
+#include <algorithm>
+#include <cstring>
+#include <cwctype>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace
+{
+    constexpr uint64_t kKernelSpaceMin = 0xffff800000000000ull;
+    constexpr ULONG kSystemExtendedHandleInformation = 64;
+    constexpr uint32_t kMaxHandleBytes = 64u * 1024u * 1024u;
+    constexpr uint32_t kMaxProcesses = 8192;
+    constexpr ULONG kProcessVmRead = 0x0010;
+    constexpr ULONG kProcessVmWrite = 0x0020;
+    constexpr ULONG kProcessVmOperation = 0x0008;
+    constexpr ULONG kProcessDupHandle = 0x0040;
+
+    typedef LONG NTSTATUS_LOCAL;
+    typedef NTSTATUS_LOCAL (NTAPI* PfnNtQuerySystemInformation)(
+        ULONG SystemInformationClass,
+        PVOID SystemInformation,
+        ULONG SystemInformationLength,
+        PULONG ReturnLength);
+
+    struct SystemHandleTableEntryEx
+    {
+        PVOID Object;
+        ULONG_PTR UniqueProcessId;
+        ULONG_PTR HandleValue;
+        ULONG GrantedAccess;
+        USHORT CreatorBackTraceIndex;
+        USHORT ObjectTypeIndex;
+        ULONG HandleAttributes;
+        ULONG Reserved;
+    };
+
+    struct SystemHandleInformationEx
+    {
+        ULONG_PTR NumberOfHandles;
+        ULONG_PTR Reserved;
+        SystemHandleTableEntryEx Handles[1];
+    };
+
+    struct ProcessIdentity
+    {
+        uint32_t Pid = 0;
+        uint64_t Eprocess = 0;
+        std::wstring Image;
+    };
+
+    bool IsKernelAddress(uint64_t value)
+    {
+        return value >= kKernelSpaceMin;
+    }
+
+    bool ReadU64(DeviceClient& device, uint64_t address, uint64_t* value)
+    {
+        std::vector<uint8_t> bytes;
+        if (!device.ReadMemory(address, sizeof(uint64_t), &bytes, nullptr) ||
+            bytes.size() != sizeof(uint64_t))
+        {
+            return false;
+        }
+
+        memcpy(value, bytes.data(), sizeof(uint64_t));
+        return true;
+    }
+
+    std::wstring ToLowerCopy(const std::wstring& value)
+    {
+        std::wstring lowered = value;
+        for (wchar_t& ch : lowered)
+        {
+            ch = static_cast<wchar_t>(std::towlower(ch));
+        }
+
+        return lowered;
+    }
+
+    std::wstring JsonHex(uint64_t value)
+    {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+
+    std::wstring AccessTextFromMask(uint32_t access)
+    {
+        std::wstring text;
+        if ((access & kProcessVmRead) != 0)
+        {
+            text += L"VM_READ";
+        }
+        if ((access & kProcessVmWrite) != 0)
+        {
+            if (!text.empty())
+            {
+                text += L"|";
+            }
+            text += L"VM_WRITE";
+        }
+        if ((access & kProcessVmOperation) != 0)
+        {
+            if (!text.empty())
+            {
+                text += L"|";
+            }
+            text += L"VM_OPERATION";
+        }
+        if ((access & kProcessDupHandle) != 0)
+        {
+            if (!text.empty())
+            {
+                text += L"|";
+            }
+            text += L"DUP_HANDLE";
+        }
+        if (text.empty())
+        {
+            wchar_t buffer[16];
+            swprintf_s(buffer, L"0x%08x", access);
+            text = buffer;
+        }
+
+        return text;
+    }
+
+    bool IsSystemOwnerImage(const std::wstring& image, uint32_t pid)
+    {
+        if (pid == 0 || pid == 4)
+        {
+            return true;
+        }
+
+        const std::wstring lowered = ToLowerCopy(image);
+        return lowered == L"system" ||
+            lowered == L"csrss.exe" ||
+            lowered == L"smss.exe" ||
+            lowered == L"lsass.exe" ||
+            lowered == L"services.exe" ||
+            lowered == L"svchost.exe" ||
+            lowered == L"wininit.exe";
+    }
+
+    bool EnumerateKernelProcesses(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        std::vector<ProcessIdentity>* processes,
+        std::vector<std::wstring>* warnings)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (processes == nullptr)
+            {
+                break;
+            }
+
+            processes->clear();
+            TypeFieldInfo linksField = {};
+            TypeFieldInfo pidField = {};
+            TypeFieldInfo imageField = {};
+            std::wstring ignored;
+            if (!symbols.FindField(L"nt!_EPROCESS", L"ActiveProcessLinks", &linksField, &ignored) ||
+                !symbols.FindField(L"nt!_EPROCESS", L"UniqueProcessId", &pidField, &ignored))
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"EPROCESS ActiveProcessLinks/UniqueProcessId not in PDB");
+                }
+                break;
+            }
+
+            symbols.FindField(L"nt!_EPROCESS", L"ImageFileName", &imageField, &ignored);
+
+            uint64_t listHead = 0;
+            if (!symbols.ResolveSymbol(L"nt!PsActiveProcessHead", &listHead, &ignored) ||
+                listHead == 0)
+            {
+                if (warnings != nullptr)
+                {
+                    warnings->push_back(L"nt!PsActiveProcessHead was not resolved");
+                }
+                break;
+            }
+
+            uint64_t flink = 0;
+            if (!ReadU64(device, listHead, &flink))
+            {
+                break;
+            }
+
+            uint32_t walked = 0;
+            uint64_t current = flink;
+            while (current != 0 &&
+                current != listHead &&
+                IsKernelAddress(current) &&
+                walked < kMaxProcesses)
+            {
+                ++walked;
+                uint64_t eprocess = current - linksField.Offset;
+                uint64_t pidValue = 0;
+                if (!ReadU64(device, eprocess + pidField.Offset, &pidValue))
+                {
+                    break;
+                }
+
+                ProcessIdentity identity = {};
+                identity.Pid = static_cast<uint32_t>(pidValue);
+                identity.Eprocess = eprocess;
+                if (imageField.Offset != 0 && imageField.Length >= 1)
+                {
+                    std::vector<uint8_t> nameBytes;
+                    uint32_t nameLen = static_cast<uint32_t>(imageField.Length);
+                    if (nameLen > 16)
+                    {
+                        nameLen = 16;
+                    }
+                    if (device.ReadMemory(eprocess + imageField.Offset, nameLen, &nameBytes, nullptr) &&
+                        !nameBytes.empty())
+                    {
+                        std::string ascii(
+                            reinterpret_cast<const char*>(nameBytes.data()),
+                            strnlen(reinterpret_cast<const char*>(nameBytes.data()), nameBytes.size()));
+                        identity.Image = mcpjson::Utf8ToWide(ascii);
+                    }
+                }
+
+                processes->push_back(identity);
+
+                uint64_t next = 0;
+                if (!ReadU64(device, current, &next) || next == current)
+                {
+                    break;
+                }
+                current = next;
+            }
+
+            ok = !processes->empty();
+        } while (false);
+
+        return ok;
+    }
+}
+
+HandleTableScanner::HandleTableScanner(DeviceClient& device, SymbolEngine& symbols) :
+    device_(device),
+    symbols_(symbols)
+{
+}
+
+bool HandleTableScanner::Scan(
+    const HandleTableScanOptions& options,
+    HandleTableScanResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid handle-table result output";
+            }
+            break;
+        }
+
+        *result = HandleTableScanResult{};
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"ntdll.dll is not loaded";
+            }
+            break;
+        }
+
+        auto query = reinterpret_cast<PfnNtQuerySystemInformation>(
+            GetProcAddress(ntdll, "NtQuerySystemInformation"));
+        if (query == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"NtQuerySystemInformation is unavailable";
+            }
+            break;
+        }
+
+        std::vector<ProcessIdentity> processes;
+        EnumerateKernelProcesses(device_, symbols_, &processes, &result->Warnings);
+        std::unordered_map<uint64_t, ProcessIdentity> byEprocess;
+        std::unordered_map<uint32_t, ProcessIdentity> byPid;
+        for (const ProcessIdentity& process : processes)
+        {
+            byEprocess[process.Eprocess] = process;
+            byPid[process.Pid] = process;
+        }
+
+        ULONG needed = 0;
+        size_t cap = 0x100000;
+        std::vector<uint8_t> buffer(cap);
+        NTSTATUS_LOCAL status = query(
+            kSystemExtendedHandleInformation,
+            buffer.data(),
+            static_cast<ULONG>(buffer.size()),
+            &needed);
+        while (status < 0 && cap < kMaxHandleBytes)
+        {
+            if (needed > cap && needed <= kMaxHandleBytes)
+            {
+                cap = static_cast<size_t>(needed) + 0x10000;
+            }
+            else
+            {
+                cap *= 2;
+            }
+            if (cap > kMaxHandleBytes)
+            {
+                cap = kMaxHandleBytes;
+            }
+            buffer.resize(cap);
+            status = query(
+                kSystemExtendedHandleInformation,
+                buffer.data(),
+                static_cast<ULONG>(buffer.size()),
+                &needed);
+        }
+
+        if (status < 0)
+        {
+            if (error != nullptr)
+            {
+                wchar_t message[64];
+                swprintf_s(message, L"NtQuerySystemInformation failed: 0x%08x", static_cast<unsigned int>(status));
+                *error = message;
+            }
+            break;
+        }
+
+        if (buffer.size() < sizeof(ULONG_PTR) * 2)
+        {
+            if (error != nullptr)
+            {
+                *error = L"handle snapshot is truncated";
+            }
+            break;
+        }
+
+        const SystemHandleInformationEx* table =
+            reinterpret_cast<const SystemHandleInformationEx*>(buffer.data());
+        const size_t headerBytes = offsetof(SystemHandleInformationEx, Handles);
+        const uint64_t count = static_cast<uint64_t>(table->NumberOfHandles);
+        const uint64_t maxCount = (buffer.size() - headerBytes) / sizeof(SystemHandleTableEntryEx);
+        const uint64_t useCount = count < maxCount ? count : maxCount;
+        if (count > maxCount)
+        {
+            result->Warnings.push_back(L"handle snapshot was truncated by buffer size");
+        }
+
+        result->HandlesEnumerated = useCount;
+        result->CoverageComplete = count <= maxCount && status >= 0;
+        std::unordered_set<uint32_t> owners;
+        bool storeCapWarned = false;
+
+        for (uint64_t index = 0; index < useCount; ++index)
+        {
+            const SystemHandleTableEntryEx& entry = table->Handles[index];
+            HandleTableRecord record = {};
+            record.OwnerPid = static_cast<uint32_t>(entry.UniqueProcessId);
+            record.HandleValue = static_cast<uint32_t>(entry.HandleValue);
+            record.GrantedAccess = entry.GrantedAccess;
+            record.ObjectTypeIndex = entry.ObjectTypeIndex;
+            record.HandleAttributes = entry.HandleAttributes;
+            record.Object = reinterpret_cast<uint64_t>(entry.Object);
+            record.AccessText = AccessTextFromMask(record.GrantedAccess);
+            record.VmRead = (record.GrantedAccess & kProcessVmRead) != 0;
+            record.VmWrite = (record.GrantedAccess & kProcessVmWrite) != 0;
+            record.VmOperation = (record.GrantedAccess & kProcessVmOperation) != 0;
+            record.DupHandle = (record.GrantedAccess & kProcessDupHandle) != 0;
+
+            auto ownerIt = byPid.find(record.OwnerPid);
+            if (ownerIt != byPid.end())
+            {
+                record.OwnerImage = ownerIt->second.Image;
+            }
+
+            auto objectIt = byEprocess.find(record.Object);
+            if (objectIt != byEprocess.end())
+            {
+                record.PointsToProcess = true;
+                record.TypeName = L"Process";
+                record.TargetPid = objectIt->second.Pid;
+                record.TargetEprocess = objectIt->second.Eprocess;
+                record.TargetImage = objectIt->second.Image;
+                ++result->ProcessHandles;
+            }
+
+            if (options.HasOwnerPid && record.OwnerPid != options.OwnerPid)
+            {
+                continue;
+            }
+            if (options.HasTargetPid)
+            {
+                if (!record.PointsToProcess || record.TargetPid != options.TargetPid)
+                {
+                    continue;
+                }
+            }
+            if (options.ProcessHandlesOnly && !record.PointsToProcess)
+            {
+                continue;
+            }
+
+            if (record.PointsToProcess &&
+                record.OwnerPid != record.TargetPid &&
+                (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle) &&
+                !IsSystemOwnerImage(record.OwnerImage, record.OwnerPid))
+            {
+                record.Suspicious = true;
+                record.Notes = L"non-system process holds VM/DUP access to another process";
+            }
+
+            if (options.SuspiciousOnly && !record.Suspicious)
+            {
+                continue;
+            }
+
+            ++result->MatchingHandles;
+            if (record.Suspicious)
+            {
+                ++result->SuspiciousHandles;
+            }
+            owners.insert(record.OwnerPid);
+            if (!options.CollectRecords)
+            {
+                continue;
+            }
+            if (options.Limit != 0 && result->Records.size() >= options.Limit)
+            {
+                result->Truncated = true;
+                continue;
+            }
+            if (options.Limit == 0 && result->Records.size() >= 100000)
+            {
+                result->Truncated = true;
+                if (!storeCapWarned)
+                {
+                    result->Warnings.push_back(L"handle record store hit the 100000 safety cap");
+                    storeCapWarned = true;
+                }
+                continue;
+            }
+
+            result->Records.push_back(record);
+        }
+
+        result->OwnerPids.assign(owners.begin(), owners.end());
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+std::wstring BuildHandleTableJson(const HandleTableScanResult& result)
+{
+    std::wstringstream json;
+    json << L"{\"schema\":\"kn-live-dbg.handle-table.v1\"";
+    json << L",\"handles_enumerated\":" << result.HandlesEnumerated;
+    json << L",\"matching\":" << result.MatchingHandles;
+    json << L",\"process_handles\":" << result.ProcessHandles;
+    json << L",\"suspicious\":" << result.SuspiciousHandles;
+    json << L",\"truncated\":" << (result.Truncated ? L"true" : L"false");
+    json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
+    json << L",\"records\":[";
+    bool first = true;
+    for (const HandleTableRecord& record : result.Records)
+    {
+        if (!first)
+        {
+            json << L",";
+        }
+        first = false;
+        json << L"{\"owner_pid\":" << record.OwnerPid;
+        json << L",\"owner_image\":\"" << mcpjson::Escape(record.OwnerImage) << L"\"";
+        json << L",\"handle\":" << record.HandleValue;
+        json << L",\"access\":\"" << mcpjson::Escape(record.AccessText) << L"\"";
+        json << L",\"object\":\"" << JsonHex(record.Object) << L"\"";
+        json << L",\"type\":\"" << mcpjson::Escape(record.TypeName) << L"\"";
+        json << L",\"target_pid\":" << record.TargetPid;
+        json << L",\"target_image\":\"" << mcpjson::Escape(record.TargetImage) << L"\"";
+        json << L",\"vm_read\":" << (record.VmRead ? L"true" : L"false");
+        json << L",\"vm_write\":" << (record.VmWrite ? L"true" : L"false");
+        json << L",\"suspicious\":" << (record.Suspicious ? L"true" : L"false");
+        json << L",\"notes\":\"" << mcpjson::Escape(record.Notes) << L"\"}";
+    }
+    json << L"],\"warnings\":[";
+    first = true;
+    for (const std::wstring& warning : result.Warnings)
+    {
+        if (!first)
+        {
+            json << L",";
+        }
+        first = false;
+        json << L"\"" << mcpjson::Escape(warning) << L"\"";
+    }
+    json << L"]}";
+    return json.str();
+}
+
+bool HandleTableAccessMaskSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        if (AccessTextFromMask(kProcessVmRead) != L"VM_READ")
+        {
+            break;
+        }
+        if (AccessTextFromMask(kProcessVmRead | kProcessVmWrite).find(L"VM_WRITE") == std::wstring::npos)
+        {
+            break;
+        }
+        if (!IsSystemOwnerImage(L"csrss.exe", 500))
+        {
+            break;
+        }
+        if (IsSystemOwnerImage(L"cheat.exe", 1234))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}

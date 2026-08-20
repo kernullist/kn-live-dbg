@@ -32,6 +32,83 @@ namespace
         return true;
     }
 
+    bool ReadU32(DeviceClient& device, uint64_t address, uint32_t* value)
+    {
+        std::vector<uint8_t> bytes;
+        if (!device.ReadMemory(address, sizeof(uint32_t), &bytes, nullptr) ||
+            bytes.size() != sizeof(uint32_t))
+        {
+            return false;
+        }
+        memcpy(value, bytes.data(), sizeof(uint32_t));
+        return true;
+    }
+
+    std::wstring IntegrityLevelText(uint32_t rid)
+    {
+        std::wstring text;
+        switch (rid)
+        {
+        case 0x0000:
+            text = L"Untrusted";
+            break;
+        case 0x1000:
+            text = L"Low";
+            break;
+        case 0x2000:
+            text = L"Medium";
+            break;
+        case 0x3000:
+            text = L"High";
+            break;
+        case 0x4000:
+            text = L"System";
+            break;
+        case 0x5000:
+            text = L"ProtectedProcess";
+            break;
+        default:
+            text = L"Unknown";
+            break;
+        }
+        return text;
+    }
+
+    bool ReadSidRid(DeviceClient& device, uint64_t sid, uint32_t* rid)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (rid == nullptr || sid == 0)
+            {
+                break;
+            }
+            std::vector<uint8_t> bytes;
+            if (!device.ReadMemory(sid, 12, &bytes, nullptr) || bytes.size() < 12)
+            {
+                break;
+            }
+            const uint8_t subCount = bytes[1];
+            if (subCount == 0 || subCount > 15)
+            {
+                break;
+            }
+            const uint32_t sidSize = 8u + (static_cast<uint32_t>(subCount) * 4u);
+            std::vector<uint8_t> full;
+            if (!device.ReadMemory(sid, sidSize, &full, nullptr) || full.size() < sidSize)
+            {
+                break;
+            }
+            uint32_t value = 0;
+            memcpy(&value, full.data() + 8 + (static_cast<size_t>(subCount - 1) * 4), sizeof(value));
+            *rid = value;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     bool ReadBytes(DeviceClient& device, uint64_t address, uint32_t length, std::vector<uint8_t>* bytes)
     {
         if (bytes == nullptr)
@@ -382,6 +459,14 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
         ResolvedFieldOffset linksField = ResolveFieldOffset(symbols_, L"nt!_EPROCESS", L"ActiveProcessLinks", 0x448);
         ResolvedFieldOffset imageField = ResolveFieldOffset(symbols_, L"nt!_EPROCESS", L"ImageFileName", 0x5a8);
         ResolvedFieldOffset privilegesField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"Privileges", 0x40);
+        ResolvedFieldOffset tokenTypeField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"TokenType", 0x50);
+        ResolvedFieldOffset impersonationField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"ImpersonationLevel", 0x54);
+        ResolvedFieldOffset sessionField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"SessionId", 0x58);
+        ResolvedFieldOffset tokenIdField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"TokenId", 0x10);
+        ResolvedFieldOffset authIdField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"AuthenticationId", 0x18);
+        ResolvedFieldOffset integrityIndexField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"IntegrityLevelIndex", 0x0c8);
+        ResolvedFieldOffset userAndGroupsField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"UserAndGroups", 0x90);
+        ResolvedFieldOffset userAndGroupCountField = ResolveFieldOffset(symbols_, L"nt!_TOKEN", L"UserAndGroupCount", 0x7c);
 
         // _SEP_TOKEN_PRIVILEGES layout: Present, Enabled, EnabledByDefault (3x ULONG64)
         ResolvedFieldOffset presentField = ResolveFieldOffset(symbols_, L"nt!_SEP_TOKEN_PRIVILEGES", L"Present", 0x00);
@@ -660,6 +745,76 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             }
             record.TokenResolved = true;
 
+            uint32_t tokenType = 0;
+            uint32_t impersonation = 0;
+            uint32_t sessionId = 0;
+            uint64_t tokenId = 0;
+            uint64_t authId = 0;
+            if (!tokenTypeField.FromPdb)
+            {
+                record.Notes.push_back(L"TOKEN identity fields were not in PDB; object-field triage skipped");
+            }
+            else if (ReadU32(device_, record.TokenObject + tokenTypeField.Offset, &tokenType) &&
+                ReadU32(device_, record.TokenObject + impersonationField.Offset, &impersonation) &&
+                ReadU32(device_, record.TokenObject + sessionField.Offset, &sessionId) &&
+                ReadU64(device_, record.TokenObject + tokenIdField.Offset, &tokenId) &&
+                ReadU64(device_, record.TokenObject + authIdField.Offset, &authId))
+            {
+                record.TokenObjectFieldsResolved = true;
+                record.TokenType = tokenType;
+                record.ImpersonationLevel = impersonation;
+                record.SessionId = sessionId;
+                record.TokenId = tokenId;
+                record.AuthenticationId = authId;
+                record.PrimaryToken = tokenType == 1;
+                if (tokenType != 1 && tokenType != 0)
+                {
+                    record.Suspicious = true;
+                    record.Notes.push_back(L"process token TokenType is not TokenPrimary");
+                }
+            }
+            else
+            {
+                record.CoverageIncomplete = true;
+                record.Notes.push_back(L"TOKEN object identity fields were unreadable");
+            }
+
+            uint32_t integrityIndex = 0;
+            uint32_t groupCount = 0;
+            uint64_t groups = 0;
+            if (integrityIndexField.FromPdb &&
+                userAndGroupsField.FromPdb &&
+                userAndGroupCountField.FromPdb &&
+                ReadU32(device_, record.TokenObject + integrityIndexField.Offset, &integrityIndex) &&
+                ReadU32(device_, record.TokenObject + userAndGroupCountField.Offset, &groupCount) &&
+                ReadU64(device_, record.TokenObject + userAndGroupsField.Offset, &groups) &&
+                groups != 0 &&
+                IsKernelAddress(groups) &&
+                integrityIndex < groupCount &&
+                groupCount < 256)
+            {
+                constexpr uint64_t kSidAndAttributesSize = 16;
+                uint64_t sidPtrAddress = groups + (static_cast<uint64_t>(integrityIndex) * kSidAndAttributesSize);
+                uint64_t sid = 0;
+                uint32_t rid = 0;
+                if (ReadU64(device_, sidPtrAddress, &sid) &&
+                    ReadSidRid(device_, sid, &rid))
+                {
+                    record.IntegrityResolved = true;
+                    record.IntegrityLevel = rid;
+                    record.IntegrityText = IntegrityLevelText(rid);
+                    if (integrityIndexField.FromPdb &&
+                        userAndGroupsField.FromPdb &&
+                        rid == 0x4000 &&
+                        record.IdentityResolved &&
+                        !record.SystemProfile)
+                    {
+                        record.Suspicious = true;
+                        record.Notes.push_back(L"non-system process token has System integrity");
+                    }
+                }
+            }
+
             uint64_t privBase = record.TokenObject + privilegesField.Offset;
             uint64_t present = 0;
             uint64_t enabled = 0;
@@ -835,6 +990,14 @@ std::wstring BuildTokenPrivilegeJson(const TokenPrivilegeScanResult& result)
         out += L",\"eprocess\":" + mcpjson::Quote(JsonHex(record.Eprocess));
         out += L",\"image\":" + mcpjson::Quote(record.ImageName);
         out += L",\"token\":" + mcpjson::Quote(JsonHex(record.TokenObject));
+        out += L",\"tokenType\":" + std::to_wstring(record.TokenType);
+        out += L",\"primaryToken\":";
+        out += record.PrimaryToken ? L"true" : L"false";
+        out += L",\"sessionId\":" + std::to_wstring(record.SessionId);
+        out += L",\"integrityLevel\":" + std::to_wstring(record.IntegrityLevel);
+        out += L",\"integrityText\":" + mcpjson::Quote(record.IntegrityText);
+        out += L",\"tokenObjectFieldsResolved\":";
+        out += record.TokenObjectFieldsResolved ? L"true" : L"false";
         out += L",\"present\":" + mcpjson::Quote(JsonHex(record.PresentMask));
         out += L",\"enabled\":" + mcpjson::Quote(JsonHex(record.EnabledMask));
         out += L",\"enabledByDefault\":" + mcpjson::Quote(JsonHex(record.EnabledByDefaultMask));
