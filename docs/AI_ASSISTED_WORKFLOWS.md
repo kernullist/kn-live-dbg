@@ -16,12 +16,12 @@ This document captures the implemented AI assistance surface in Kn Live Dbg plus
 
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory, but the visible surface is now smaller:
 
-1. `ai <question>` is the default operator entrypoint. It first recognizes exact read-only evidence commands such as `!callbacks`, `dt`, `dtx`, `u`, `uf`, `!ci`, or `!vbs` and runs them through evidence analysis. Requests that ask to list, show, recommend, or suggest commands are treated as planning requests before local capability execution. Otherwise it asks the selected provider to choose from a small read-only capability catalog, then validates and executes the selected local tools in C++. If no direct local tool fits but the request looks investigative, it automatically builds a validated command plan and leaves execution to `ai run`; conceptual `what`/`how`/`why` questions remain advisory instead of being forced into planning. The catalog exposes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, `driver.integrity`, and `assistant.answer`.
+1. `ai <goal>` is the default operator entrypoint. Routing is local-first: exact read-only evidence commands such as `!callbacks`, `dt`, `!hiddenproc`, or `dump-analyze` run and are explained; command-recommendation requests still build a `kn-live-dbg.ai-plan.v2` command plan; known playbooks (callbacks, hidden processes, handles, leftover mapper layers, integrity, VBS, DMA, one-address inspect) and local process field queries run immediately; conceptual `what`/`why` questions stay advisory. Remaining goals ask the selected provider to pick tools from the shared `AiCapabilityCatalog` (`kn-live-dbg.ai-capability-plan.v1`). Cheap tools preview and run, then the model explains the captured output. `hunt.run`, `payload.scan`, `snapshot.capture`, and `kpage.list` with `deep=true` wait for `ai go` / `ai no`. Default `ai <goal>` no longer auto-builds a v2 command plan; use `ai plan` when you want command proposals. Korean and English goals are both accepted. The catalog includes the P0-P2 scanners (`hiddenproc.list`, `handles.list`, `driver.object`, `dump.analyze`, and the rest) plus `assistant.answer`.
 2. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
 3. `ai config ...` groups provider setup and smoke checks under one visible subcommand. It supports `status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`.
 4. `ai plan <prompt>` remains an explicit override that asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
 5. `ai explain <read-only-command...>` remains an explicit override for evidence analysis. The same path is also reached implicitly when the operator types `ai !callbacks ...`, `ai dt ...`, `ai uf ...`, `ai !ci options`, or another recognized read-only evidence command.
-6. `ai show` prints the most recent parsed or playbook command plan.
+6. `ai show` prints session hints, a pending expensive tool plan, and the loaded command plan. `ai show evidence` reprints the last captured tool or evidence output. `ai go` / `ai no` confirm or cancel a pending expensive tool plan.
 7. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
 8. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
 9. `ai report <path>` exports a Markdown report with session context, provider status, transcript settings, write-audit path, the parsed plan, and the raw AI plan response.
@@ -45,7 +45,7 @@ The main `ai help` output stays focused on the primary workflow. Detailed compat
 
 ## Operator Command Examples
 
-Default rule: prefer `ai <goal>` during normal use. Exact read-only command lines after `ai` are treated as evidence to run and explain, investigative requests can become a validated plan, and conceptual `what`/`how`/`why` questions stay advisory.
+Default rule: prefer `ai <goal>` during normal use. Exact read-only command lines after `ai` are treated as evidence to run and explain. Known playbooks and process field queries run locally first. Cheap selected tools run after a preview and are explained. Expensive tools wait for `ai go`. Conceptual `what`/`why` questions stay advisory. Use `ai plan` only when you want a stored command proposal.
 
 Provider and session setup:
 
@@ -70,6 +70,11 @@ ai pid 1234 peb
 ai show parent process for pid 1234
 ai find process named game.exe
 ai describe eprocess 0xffffc10212345080
+ai 숨은 프로세스 찾아줘
+ai 콜백 전수조사
+ai go
+ai no
+ai show evidence
 ```
 
 Structure, symbol, and disassembly evidence:
@@ -200,7 +205,7 @@ ai report .\reports\session-ai.md
 
 Implemented entrypoint: `ai <question>`.
 
-The command now behaves like a small tool-using agent and intent router. The operator can usually type `ai <goal>` without deciding between `plan` and `explain`. Exact read-only commands are executed as evidence and explained; local capability matches run through the strict tool catalog; unsupported investigative requests fall through to a validated command plan. The model receives the operator request and the capability catalog, returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. The catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, dispatches callback/WFP/ALPC requests to native scanners, and routes VAD/thread triage through the read-only process scanner:
+The command now behaves like a small tool-using agent and intent router. The operator can usually type `ai <goal>` without knowing command names. Exact read-only commands are executed as evidence and explained. Known Korean/English playbooks and local process field queries run without a model round-trip. Generic playbooks are skipped when the goal already names a `.sys`/`.exe`/`.dll`/`.drv` file, so a prompt such as `WdFilter.sys object callbacks` stays on the tool planner with a module filter instead of running an unfiltered callback dump. Otherwise the model receives the operator request plus the shared capability catalog (not live memory), returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. After the tools finish, the model explains the captured output. Expensive tools preview and wait for `ai go`. Every AI subcommand supports `ai help <sub>` / `ai <sub> help` and Tab completion; `ai explain !vad <tab>` reuses `!vad` completion, and `ai explain !vad help` prints `!vad` help. The catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, dispatches callback/WFP/ALPC/hidden-process/handle/DMA requests to native scanners, and routes VAD/thread triage through the read-only process scanner:
 
 - "a.exe pid" -> matching PID records from the live process list
 - "a.exe eprocess" -> matching `_EPROCESS` addresses
@@ -238,13 +243,15 @@ The command now behaves like a small tool-using agent and intent router. The ope
 - "find W+X kernel modules" -> `module.integrity` with `target=all`, `wx=true`, and `verbose=true`
 - "summarize live module integrity mismatches" -> `module.integrity` with `target=all`, `summary=true`, and `mismatch=true`
 - "check driver dispatch integrity" -> `driver.integrity` with `target=all`
-- "is HVCI on?" or "VBS status" -> automatic command plan for read-only native commands such as `!vbs`
-- "decode CiOptions" -> exact evidence command with `ai !ci options` or automatic command plan from the natural-language request
-- "list IUM trustlets" -> automatic command plan for `!securekernel`
+- "is HVCI on?" or "VBS status" or "가상화 기반 보안" -> playbook `vbs.scan` (`!vbs`)
+- "숨은 프로세스 찾아줘" / "find hidden processes" -> playbook `hiddenproc.list` (`!hiddenproc`)
+- "콜백 전수조사" -> playbook `callbacks.list`
+- "decode CiOptions" -> exact evidence command with `ai !ci options`
 - "!callbacks all WdFilter.sys" -> implicit evidence analysis, equivalent to `ai explain !callbacks all WdFilter.sys`
 - "dt nt!_EPROCESS <address>" -> implicit evidence analysis for structure output
 - "uf nt!PspCreateProcessNotifyRoutine 128" -> implicit evidence analysis for disassembly output
-- "what is HVCI?" -> advisory answer, not automatic command planning
+- "what is HVCI?" -> advisory answer, not tool execution
+- whole-system `hunt.run` / `kpage.list` with `deep=true` -> preview, then `ai go` or `ai no`
 
 The model-backed planner remains available through `ai plan <prompt>` when the operator wants to force plan creation:
 
