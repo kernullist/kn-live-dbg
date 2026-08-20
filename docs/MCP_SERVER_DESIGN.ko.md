@@ -598,6 +598,10 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 
 - 라이브 검증 항목: `mcp on` → `claude mcp add --transport http` 연결 → `tools/list`/`resources/list` + `callbacks.list`/`ssdt.scan`/`kn://modules/kernel` 등 왕복 → `--allow-write`로 `memory.write_virtual` backup/verify 경로(테스트 VM, 스냅샷 후).
 
+### 11.1.5 현재 카탈로그 (2026-08)
+
+실제 소스는 `user/McpServer.cpp`의 `kTools` 테이블이다. 운영자용 표는 `MCP_SETUP.ko.md` §6. 작성 시점 기준 **읽기 툴 58종**, **쓰기 툴 11종**. Phase 2 quiet surface로 `etw.providers`, `etw.ti_cross`, `hal.scan`, `hive.list`, `token.inspect`, `dpc.list`, `timer.list`가 추가됐다. Lab write 모드의 `process.set_protection`은 임의 대상 PID를 받으며, 초기 v0의 self-only 매핑은 과거 기록이다.
+
 ## 12. 설계 핵심 7줄 요약
 
 1. **인프로세스 loopback Streamable HTTP**(stdio 아님), 기본 OFF, `mcp on`으로 활성화.

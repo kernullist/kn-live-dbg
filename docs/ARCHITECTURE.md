@@ -57,9 +57,13 @@ Current calls:
 13. `IOCTL_KNDBG_READ_MSR`
 14. `IOCTL_KNDBG_READ_CONTROL_REGISTERS`
 15. `IOCTL_KNDBG_READ_IDT`
-16. `IOCTL_KNDBG_GET_PHYSICAL_RANGES`
+16. `IOCTL_KNDBG_TIMELINE_CONTROL`
+17. `IOCTL_KNDBG_TIMELINE_STATUS`
+18. `IOCTL_KNDBG_TIMELINE_DRAIN`
+19. `IOCTL_KNDBG_READ_PROCESS_VIRTUAL`
+20. `IOCTL_KNDBG_GET_PHYSICAL_RANGES`
 
-All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size. ABI version 5 adds `IOCTL_KNDBG_FLUSH_VIRTUAL` plus explicit translation metadata for paging level and page-table entry physical addresses. ABI version 7 makes MDL-backed virtual reads opt-in through `KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK`; the driver additionally requires canonical system range and resident-page preflight before `MmProbeAndLockPages`, so broad scanners keep failed pointer probes on the safer `MmCopyMemory` path. ABI version 8 adds the read-only `IOCTL_KNDBG_READ_MSR` primitive, which permits only a fixed architectural MSR whitelist (`IA32_EFER`/`STAR`/`LSTAR`/`CSTAR`/`FMASK`/`FS_BASE`/`GS_BASE`/`KERNEL_GS_BASE`) and pins thread affinity to a caller-selected processor so per-CPU MSR divergence is observable; no write-mode gate is required because the call is read-only. ABI version 9 adds the read-only `IOCTL_KNDBG_READ_CONTROL_REGISTERS` primitive, which returns CR0/CR2/CR3/CR4/CR8 read on a caller-selected processor under the same affinity-pinned pattern. ABI version 10 adds the read-only `IOCTL_KNDBG_READ_IDT` primitive, which returns the IDTR (base + limit) read via `__sidt` on a caller-selected processor. ABI version 15 adds the read-only `IOCTL_KNDBG_GET_PHYSICAL_RANGES` primitive, which copies `MmGetPhysicalMemoryRanges()` into a bounded `{Base,Size}[]` so user mode can stream a complete dump without mapping MMIO holes.
+All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size. Current `KNDBG_ABI_VERSION` is 15. ABI version 5 adds `IOCTL_KNDBG_FLUSH_VIRTUAL` plus explicit translation metadata for paging level and page-table entry physical addresses. ABI version 7 makes MDL-backed virtual reads opt-in through `KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK`; the driver additionally requires canonical system range and resident-page preflight before `MmProbeAndLockPages`, so broad scanners keep failed pointer probes on the safer `MmCopyMemory` path. ABI version 8 adds the read-only `IOCTL_KNDBG_READ_MSR` primitive, which permits only a fixed architectural MSR whitelist (`IA32_EFER`/`STAR`/`LSTAR`/`CSTAR`/`FMASK`/`FS_BASE`/`GS_BASE`/`KERNEL_GS_BASE`) and pins thread affinity to a caller-selected processor so per-CPU MSR divergence is observable; no write-mode gate is required because the call is read-only. ABI version 9 adds the read-only `IOCTL_KNDBG_READ_CONTROL_REGISTERS` primitive, which returns CR0/CR2/CR3/CR4/CR8 read on a caller-selected processor under the same affinity-pinned pattern. ABI version 10 adds the read-only `IOCTL_KNDBG_READ_IDT` primitive, which returns the IDTR (base + limit) read via `__sidt` on a caller-selected processor. Later ABI versions add the bounded kernel live-callback ring (`IOCTL_KNDBG_TIMELINE_CONTROL` / `STATUS` / `DRAIN`) used by `!timeline live`, `IOCTL_KNDBG_READ_PROCESS_VIRTUAL` for DTB-qualified process virtual reads, and ABI version 15 `IOCTL_KNDBG_GET_PHYSICAL_RANGES`, which copies `MmGetPhysicalMemoryRanges()` into a bounded `{Base,Size}[]` so user mode can stream a complete dump without mapping MMIO holes.
 
 ## Physical Memory Flow
 
@@ -349,11 +353,11 @@ Human-readable native command output uses scoped console attributes for high-sig
 
 ## Build and Release Flow
 
-1. `tools\build.ps1` is the authoritative scripted build path for PE-stamped artifacts.
-2. It reads `.build\version-state.json`, falls back to the existing output PE version, and otherwise starts from `0.0.0`.
+1. `tools\build.ps1` is the authoritative scripted build path for PE-stamped artifacts. Driver projects require Visual Studio 2022 17.11+ with the Windows Driver Kit individual component and WDK 10.0.26100.6584; WDK 10.0.28000 is the VS 2026 kit and does not register `WindowsKernelModeDriver10.0` on VS 2022.
+2. It takes the highest current PE version from `.build\version-state.json`, the existing output PE, or an exact `vX.Y.Z` Git tag reachable from `HEAD`. With none of those, it starts from `0.0.0`.
 3. Normal builds do not increment the version; `-BumpVersion` increments the patch component by one and saves the new version state after a successful build.
 4. The first bumped build is therefore `0.0.1`.
-5. The script discovers MSBuild and the DIA SDK from installed Visual Studio instances, writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, and `KnLiveDbgProbe.sys` before the WDK TestSign step.
+5. The script discovers MSBuild and the DIA SDK from installed Visual Studio instances, writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, `KnLiveDbgProbe.sys`, `KnLiveDbgMiniFilterFixture.sys`, and `KnLiveDbgBindFixture.exe` before the WDK TestSign step. The BYOVD metadata fixture keeps its intentional fixed `1.0.0.0`.
 6. After a successful build, the script verifies the stamped PE versions, verifies driver signatures, and stages Debugging Tools runtime DLLs beside the EXE.
 7. `tools\release.ps1` runs a version-bumped build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory. `-NoVersionBump` keeps the current version for ad hoc packages.
 8. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, README/runtime manifest metadata, and `kn-live-dbg-version.json`.

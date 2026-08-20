@@ -19,7 +19,7 @@ before the feature is trusted.
    .\KnLiveDbg.exe
    ```
 3. Confirm startup reaches the `knkd>` prompt with the driver loaded, the device
-   open, ABI verified (version 10), and `nt` kernel symbols resolved (the
+   open, ABI verified (version 15), and `nt` kernel symbols resolved (the
    dashboard shows symbol state; if `symType=0 (SymNone)`, fix the symbol path
    before running symbol-dependent checks).
 

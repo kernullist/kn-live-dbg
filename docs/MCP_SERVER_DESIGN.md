@@ -599,6 +599,10 @@ Side fix: found a bug where the `resources/read` listener handled only `session/
 
 - Live verification items: `mcp on` -> `claude mcp add --transport http` connect -> `tools/list`/`resources/list` + round trips of `callbacks.list`/`ssdt.scan`/`kn://modules/kernel` etc. -> the `memory.write_virtual` backup/verify path via `--allow-write` (test VM, after a snapshot).
 
+### 11.1.5 Current catalog (2026-08)
+
+The live `kTools` table in `user/McpServer.cpp` is the source of truth. Operator-facing tables live in `MCP_SETUP.md` §6. As of this writing that table exposes **58 read tools** and **11 write tools**. Phase 2 quiet surfaces added `etw.providers`, `etw.ti_cross`, `hal.scan`, `hive.list`, `token.inspect`, `dpc.list`, and `timer.list`. Lab write mode `process.set_protection` now accepts an arbitrary target PID; the earlier v0 self-only mapping is historical.
+
 ## 12. Design Core 7-line Summary
 
 1. **In-process loopback Streamable HTTP** (not stdio), OFF by default, activated via `mcp on`.

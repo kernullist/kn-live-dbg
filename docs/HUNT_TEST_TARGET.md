@@ -7,7 +7,13 @@ does not bypass system protections.
 
 ## Build
 
-The target is part of `kn-live-dbg.sln`:
+The target is part of `kn-live-dbg.sln`. Prefer the repo build helper so DIA/DbgEng include paths and WDK TestSign stay consistent:
+
+```powershell
+.\tools\build.ps1 -Configuration Release
+```
+
+Direct MSBuild also works after the VS 2022 / WDK 10.0.26100 toolchain is installed:
 
 ```powershell
 msbuild kn-live-dbg.sln /p:Configuration=Release /p:Platform=x64

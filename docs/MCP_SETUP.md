@@ -494,7 +494,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 
 ## 6. Capability Catalog
 
-### 6.1 Read tools (46, no `--allow-write` needed — except `ti.subscribe` start/stop)
+### 6.1 Read tools (58, no `--allow-write` needed — except `ti.subscribe` start/stop)
 
 | Tool | Description | Key args (all optional unless noted otherwise) |
 |-----|------|----------------------|
@@ -508,12 +508,19 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `vad.list` | Enumerate VADs (W+X/private/hidden-PTE/DKOM checks) | `pid`, `image`, `eprocess`, `exec`, `private`, `wx`, `pe`, `hiddenpte`, `dkom`, `summary`, `limit` |
 | `threads.list` | Thread/start-address/APC/stack evidence | `pid`, `image`, `eprocess`, `apc`, `stacks`, `limit` |
 | `etw.integrity` | ETW logger/GetCpuClock integrity (InfinityHook) | (none) |
+| `etw.providers` | Heuristic/partial ETW provider registration and enable-callback ownership | (none) |
+| `etw.ti_cross` | Correlate active TI subscription reception with silence/drop signals | (none) |
 | `nmi.list` | Enumerate registered NMI callbacks | `scope` |
 | `minifilter.list` | List filesystem minifilters and IRP registrations | `filter`, `name` |
 | `payload.inspect` | Hook-to-body: trace one kernel address (page walk, big pool, PE, disasm) | `address`, `va`, `symbol` |
 | `payload.scan` | Hook-to-body: sweep unbacked hook pointers and trace each unique target | `limit` |
 | `mapper.list` | Bookkeeping remnants: MmUnloadedDrivers / PiDDB / ci hash. leftover=0 is ledger-clean, not payload-absent | `scope`, `limit` |
 | `kpage.list` | Orphan pages: executable kernel VA outside loaded modules (wiped kdmapper payload layer) | `deep`, `wx`, `pe`, `limit` |
+| `hal.scan` | HalDispatchTable / HalPrivateDispatchTable function-pointer ownership | (none) |
+| `hive.list` | Registry hive GetCellRoutine ownership with validated list links | (none) |
+| `token.inspect` | Process token privilege Present/Enabled masks | `pid`, `image`, `eprocess`, `limit` |
+| `dpc.list` | Sampled DPC deferred routines; non-image callbacks are high risk | (none) |
+| `timer.list` | Kernel timer DPC routines; non-image callbacks are high risk | (none) |
 | `fwtable.list` | Enumerate firmware-table providers | `scope`, `module`, `provider`, `signature` |
 | `pool.find` | Enumerate kernel big pool allocations (tag/size/addr/W+X) | `tag`, `min`, `max`, `addr`, `limit`, `paged`, `annotate`, `wx` |
 | `address.inspect` | Inspect a virtual address (page-table walk/permissions/owning module) | `address`, `va`, `symbol` |
