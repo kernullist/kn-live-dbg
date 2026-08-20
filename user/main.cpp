@@ -13,7 +13,13 @@
 #include "EtwScanner.h"
 #include "FirmwareTableScanner.h"
 #include "HalDispatchScanner.h"
+#include "HandleTableScanner.h"
+#include "HiddenProcessScanner.h"
 #include "HiveScanner.h"
+#include "HvPostureScanner.h"
+#include "DumpAnalyzer.h"
+#include "DmaPostureScanner.h"
+#include "InputStackScanner.h"
 #include "IntegrityScanner.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
@@ -49,6 +55,7 @@
 #include "SymbolEngine.h"
 #include "UserModeHunter.h"
 #include "VbsScanner.h"
+#include "WdFilterRuntimeScanner.h"
 #include "WfpScanner.h"
 #include "WfpCalloutScanner.h"
 #include "WnfScanner.h"
@@ -1782,7 +1789,10 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !address        canonicality, page-table walk, effective permissions, owner symbol\n";
     std::wcout << L"  help !hal            HAL dispatch table ownership\n";
     std::wcout << L"  help !hive           registry hive GetCellRoutine ownership\n";
-    std::wcout << L"  help !token          process token privilege Present/Enabled triage\n";
+    std::wcout << L"  help !token          process token privilege and object-field triage\n";
+    std::wcout << L"  help !drvobj         DRIVER_OBJECT and device-stack inspection\n";
+    std::wcout << L"  help !handles        process handle table vs VM/DUP access\n";
+    std::wcout << L"  help !hiddenproc     ActiveProcessLinks x SPI x Toolhelp x handle owners\n";
     std::wcout << L"  help !dpc            sampled DPC deferred routines\n";
     std::wcout << L"  help !timer          kernel timer DPC routines\n";
     std::wcout << L"  help !workitem       best-effort work-item coverage\n";
@@ -1792,6 +1802,11 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help vtop            VA to PA translation and page-table details\n";
     std::wcout << L"  help dump-kernel     WinDbg complete dump from live physical RAM runs\n";
     std::wcout << L"  help dump-live       OS live kernel dump via NtSystemDebugControl\n";
+    std::wcout << L"  help dump-analyze    offline DUMP_HEADER64 parse and PML4/PML5 module walk\n";
+    std::wcout << L"  help !wdfilter       WdFilter RuntimeDriver leftovers after a mapper unload\n";
+    std::wcout << L"  help !inputstack     keyboard/mouse class attached-device stacks\n";
+    std::wcout << L"  help !dma            IOMMU firmware and Kernel DMA Protection posture\n";
+    std::wcout << L"  help !hv             hypervisor presence without FEATURE_CONTROL\n";
     std::wcout << L"  help !payload        hook-to-body layer (unbacked pointer trace)\n";
     std::wcout << L"  help !mapper         bookkeeping-remnant layer (unload / PiDDB / ci hash)\n";
     std::wcout << L"  help !kpage          orphan-page layer (executable VA outside modules)\n";
@@ -1820,7 +1835,9 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"                !pool pe /suspicious (staged pool PE) | !kpage /deep\n";
     std::wcout << L"                !hunt | !pool find /wx\n";
     std::wcout << L"                !minifilter | !minifilter show <name> | !minifilter disable <name> all\n";
-    std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path>\n";
+    std::wcout << L"  triage        !drvobj kbdclass | !handles /suspicious | !hiddenproc | !wdfilter\n";
+    std::wcout << L"                !inputstack | !dma | !hv | dump-analyze .\\live.dmp\n";
+    std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path> | dump-analyze <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
     std::wcout << L"  timeline      !timeline | !timeline dashboard | !timeline help advanced\n";
@@ -2169,6 +2186,14 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!fwtable" ||
         command == L"!module" ||
         command == L"!driver" ||
+        command == L"!drvobj" ||
+        command == L"!devstack" ||
+        command == L"!handles" ||
+        command == L"!hiddenproc" ||
+        command == L"!wdfilter" ||
+        command == L"!inputstack" ||
+        command == L"!dma" ||
+        command == L"!hv" ||
         command == L"!pool" ||
         command == L"!wnf" ||
         command == L"!address" ||
@@ -3127,6 +3152,7 @@ static bool IsNativeOwnedCommand(const std::wstring& command)
             command == L"dump-pe" ||
             command == L"dump-kernel" ||
             command == L"dump-live" ||
+            command == L"dump-analyze" ||
             command == L"probe" ||
             command == L"procctx" ||
             command == L"ai" ||
@@ -4520,6 +4546,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"/wx",
                 L"/mismatch",
                 L"/disk",
+                L"/iat",
+                L"/prologue",
                 L"/limit",
                 L"/json",
                 L"help"
@@ -4530,8 +4558,41 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         {
             static const wchar_t* values[] =
             {
+                L"list",
+                L"object",
                 L"integrity",
                 L"all",
+                L"/dispatch",
+                L"/devices",
+                L"/limit",
+                L"/json",
+                L"help"
+            };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!drvobj")
+        {
+            static const wchar_t* values[] = { L"/dispatch", L"/devices", L"/json", L"help" };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!devstack" ||
+            command == L"!hiddenproc" ||
+            command == L"!wdfilter" ||
+            command == L"!inputstack" ||
+            command == L"!dma" ||
+            command == L"!hv")
+        {
+            static const wchar_t* values[] = { L"/json", L"help" };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!handles")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/target",
+                L"/process",
+                L"/all",
+                L"/suspicious",
                 L"/limit",
                 L"/json",
                 L"help"
@@ -4576,6 +4637,8 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"/no-update",
                     L"/force-update",
                     L"/exact",
+                    L"/sign",
+                    L"/no-sign",
                     L"/yara",
                     L"/yara-path",
                     L"/yara-timeout",
@@ -4608,6 +4671,11 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         else if (command == L"dump-live")
         {
             static const wchar_t* values[] = { L"/user", L"/compress", L"/hv", L"help" };
+            AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"dump-analyze")
+        {
+            static const wchar_t* values[] = { L"/json", L"help" };
             AddCompletionCandidates(&candidates, values);
         }
         else if (command == L"!address")
@@ -17579,6 +17647,7 @@ static void PrintTokenHelp()
     std::wcout << L"  !token /all [/limit <n>] [/system]\n";
     std::wcout << L"\n";
     std::wcout << L"reads _EPROCESS.Token -> _SEP_TOKEN_PRIVILEGES and reports high-risk enabled privileges.\n";
+    std::wcout << L"Also reads TokenType, SessionId, and the integrity-level SID from the TOKEN object.\n";
     std::wcout << L"system-profile images are suppressed by default; /system includes them in suspicion.\n";
 }
 
@@ -18751,7 +18820,7 @@ static void PrintModuleIntegrityHelp()
 {
     std::wcout << L"!module command:\n";
     std::wcout << L"  !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections]\n";
-    std::wcout << L"                    [/wx] [/mismatch] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"                    [/wx] [/mismatch] [/disk] [/iat] [/prologue] [/limit <n>] [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Verifies loaded kernel module PE headers and executable sections from live\n";
@@ -18768,6 +18837,10 @@ static void PrintModuleIntegrityHelp()
     std::wcout << L"  /mismatch     report only modules with header, size, or section anomalies.\n";
     std::wcout << L"  /disk         compare live executable pages against on-disk PE raw data (additive;\n";
     std::wcout << L"                applies basereloc deltas to disk pages when the image is relocated).\n";
+    std::wcout << L"  /iat          walk IMAGE_DIRECTORY_ENTRY_IMPORT and flag live IAT thunks whose\n";
+    std::wcout << L"                targets sit outside loaded modules or unexpected owners.\n";
+    std::wcout << L"  /prologue     disassemble AddressOfEntryPoint and flag JMP/INT3 trampoline heads\n";
+    std::wcout << L"                whose targets leave the owning module.\n";
     std::wcout << L"  /limit <n>    cap reported records while still scanning matching modules.\n";
     std::wcout << L"  /json <path>  write structured kn-live-dbg.module-integrity.v1 JSON.\n";
     std::wcout << L"\n";
@@ -18778,28 +18851,37 @@ static void PrintModuleIntegrityHelp()
     std::wcout << L"  !module integrity all /wx\n";
     std::wcout << L"  !module integrity WdFilter /headers /sections\n";
     std::wcout << L"  !module integrity all /json .\\module-integrity.json\n";
+    std::wcout << L"  !module integrity ntoskrnl /iat /prologue /disk\n";
 }
 
 static void PrintDriverIntegrityHelp()
 {
     std::wcout << L"!driver command:\n";
+    std::wcout << L"  !driver list [driver|all] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !driver object <name|address> [/dispatch] [/devices] [/json <path>]\n";
     std::wcout << L"  !driver integrity [driver|all] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !drvobj <name|address> [/dispatch] [/devices] [/json <path>]\n";
+    std::wcout << L"  !devstack <device-object-address> [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Walks the Object Manager \\Driver directory, reads _DRIVER_OBJECT entries,\n";
     std::wcout << L"  annotates MajorFunction dispatch pointers, and flags handlers outside loaded\n";
-    std::wcout << L"  modules or routed into another non-kernel module. ntoskrnl stubs are treated\n";
-    std::wcout << L"  as normal because unused dispatch slots commonly point to nt!IopInvalidDeviceRequest.\n";
+    std::wcout << L"  modules. !drvobj / !driver object walks DEVICE_OBJECT.NextDevice and the\n";
+    std::wcout << L"  AttachedDevice / AttachedTo stack. ntoskrnl stubs are treated as normal\n";
+    std::wcout << L"  because unused dispatch slots commonly point to nt!IopInvalidDeviceRequest.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  [driver|all]  driver object name/path substring filter. Defaults to all.\n";
+    std::wcout << L"  /dispatch     print MajorFunction[] with !drvobj / !driver object.\n";
+    std::wcout << L"  /devices      walk NextDevice and attached stacks (default for !drvobj).\n";
     std::wcout << L"  /limit <n>    stop after <n> matching drivers.\n";
-    std::wcout << L"  /json <path>  write structured kn-live-dbg.driver-integrity.v1 JSON.\n";
+    std::wcout << L"  /json <path>  write structured JSON.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
+    std::wcout << L"  !driver list\n";
     std::wcout << L"  !driver integrity WdFilter\n";
-    std::wcout << L"  !driver integrity all /limit 25\n";
-    std::wcout << L"  !driver integrity all /json .\\driver-integrity.json\n";
+    std::wcout << L"  !drvobj kbdclass /devices\n";
+    std::wcout << L"  !devstack ffffce8f12340000\n";
 }
 
 static bool ParseIntegrityLimitOption(
@@ -18842,7 +18924,7 @@ static std::wstring GetDefaultByovdFixturePath()
 static void PrintByovdHelp()
 {
     std::wcout << L"!byovd command:\n";
-    std::wcout << L"  !byovd [scan] [/no-update] [/force-update] [/exact] [/yara]\n";
+    std::wcout << L"  !byovd [scan] [/no-update] [/force-update] [/exact] [/sign|/no-sign] [/yara]\n";
     std::wcout << L"               [/yara-path <exe>] [/yara-timeout <seconds>]\n";
     std::wcout << L"               [/verbose] [/summary]\n";
     std::wcout << L"               [/limit <n>] [/json <path>]\n";
@@ -18869,6 +18951,8 @@ static void PrintByovdHelp()
     std::wcout << L"  /no-update     skip stale-catalog auto update for this scan.\n";
     std::wcout << L"  /force-update  update before scanning even when the catalog is fresh.\n";
     std::wcout << L"  /exact         suppress name/version hints; /yara still adds YARA hits.\n";
+    std::wcout << L"  /sign          Authenticode/WDAC catalog posture (default).\n";
+    std::wcout << L"  /no-sign       skip Authenticode verification.\n";
     std::wcout << L"  /yara          run LOLDrivers YARA rules through external yara64.exe/yara.exe.\n";
     std::wcout << L"                 YARA binaries are operator-supplied and not bundled.\n";
     std::wcout << L"  /yara-path     use a specific YARA executable path.\n";
@@ -18887,6 +18971,7 @@ static void PrintByovdHelp()
     std::wcout << L"examples:\n";
     std::wcout << L"  !byovd\n";
     std::wcout << L"  !byovd scan /exact\n";
+    std::wcout << L"  !byovd scan /no-sign\n";
     std::wcout << L"  !byovd scan /yara\n";
     std::wcout << L"  !byovd scan /force-update /json .\\byovd-scan.json\n";
     std::wcout << L"  !byovd update\n";
@@ -19249,6 +19334,18 @@ static void HandleByovdCommand(
             if (opt == L"/exact")
             {
                 options.ExactOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/sign")
+            {
+                options.CheckAuthenticode = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/no-sign")
+            {
+                options.CheckAuthenticode = false;
                 ++index;
                 continue;
             }
@@ -19693,7 +19790,7 @@ static void HandleModuleIntegrityCommand(
 
         if (args.size() < 2 || ToLower(args[1]) != L"integrity")
         {
-            std::wcerr << L"usage: !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/limit <n>] [/json <path>]\n";
+            std::wcerr << L"usage: !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/iat] [/prologue] [/limit <n>] [/json <path>]\n";
             PrintModuleIntegrityHelp();
             break;
         }
@@ -19752,6 +19849,18 @@ static void HandleModuleIntegrityCommand(
             if (opt == L"/disk")
             {
                 options.CompareDiskPages = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/iat")
+            {
+                options.ScanIat = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/prologue")
+            {
+                options.ScanPrologue = true;
                 ++index;
                 continue;
             }
@@ -19854,9 +19963,18 @@ static void HandleModuleIntegrityCommand(
                    << L" suspicious=" << result.SuspiciousModules
                    << L" wx=" << result.WxModules
                    << L" mismatch=" << result.MismatchModules
+                   << L" iat=" << result.IatModules
+                   << L" prologue=" << result.PrologueModules
                    << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
     } while (false);
 }
+
+static void HandleDrvobjCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut);
 
 static void HandleDriverIntegrityCommand(
     const std::vector<std::wstring>& args,
@@ -19873,9 +19991,132 @@ static void HandleDriverIntegrityCommand(
             break;
         }
 
-        if (args.size() < 2 || ToLower(args[1]) != L"integrity")
+        if (args.size() < 2)
         {
-            std::wcerr << L"usage: !driver integrity [driver|all] [/limit <n>] [/json <path>]\n";
+            std::wcerr << L"usage: !driver [list|object|integrity] ...\n";
+            PrintDriverIntegrityHelp();
+            break;
+        }
+
+        const std::wstring sub = ToLower(args[1]);
+        if (sub == L"list")
+        {
+            if (!device.IsOpen())
+            {
+                std::wcerr << L"!driver list requires the KnLiveDbg.sys driver device to be open\n";
+                break;
+            }
+            DriverIntegrityOptions options = {};
+            std::wstring jsonPath;
+            std::wstring error;
+            bool parseError = false;
+            size_t index = 2;
+            while (index < args.size())
+            {
+                std::wstring opt = ToLower(args[index]);
+                if (opt == L"/limit")
+                {
+                    if (index + 1 >= args.size())
+                    {
+                        std::wcerr << L"!driver list: /limit requires a value\n";
+                        parseError = true;
+                        break;
+                    }
+                    if (!ParseIntegrityLimitOption(args[index + 1], state.NumberBase, &options.Limit, &error))
+                    {
+                        std::wcerr << L"!driver list: " << error << L"\n";
+                        parseError = true;
+                        break;
+                    }
+                    index += 2;
+                    continue;
+                }
+                if (opt == L"/json")
+                {
+                    if (index + 1 >= args.size())
+                    {
+                        std::wcerr << L"!driver list: /json requires a path\n";
+                        parseError = true;
+                        break;
+                    }
+                    jsonPath = args[index + 1];
+                    index += 2;
+                    continue;
+                }
+                if (IsSwitchLikeToken(args[index]))
+                {
+                    std::wcerr << L"!driver list: unrecognised option \"" << args[index] << L"\"\n";
+                    parseError = true;
+                    break;
+                }
+                if (!options.DriverFilter.empty())
+                {
+                    std::wcerr << L"!driver list: unexpected extra target \"" << args[index] << L"\"\n";
+                    parseError = true;
+                    break;
+                }
+                options.DriverFilter = args[index];
+                ++index;
+            }
+            if (parseError)
+            {
+                break;
+            }
+            IntegrityScanner scanner(device, symbols);
+            DriverIntegrityResult result = {};
+            if (!scanner.ScanDrivers(options, &result, &error))
+            {
+                std::wcerr << L"!driver list failed: " << error << L"\n";
+                break;
+            }
+            if (structuredJsonOut != nullptr)
+            {
+                *structuredJsonOut = BuildDriverIntegrityJson(result);
+            }
+            if (!jsonPath.empty())
+            {
+                std::wstring writeError;
+                if (WriteUtf8TextFile(jsonPath, BuildDriverIntegrityJson(result), &writeError))
+                {
+                    std::wcout << L"!driver list json=" << jsonPath << L"\n";
+                }
+                else
+                {
+                    std::wcerr << L"!driver list json failed: " << writeError << L"\n";
+                }
+            }
+            for (const DriverIntegrityRecord& record : result.Records)
+            {
+                PrintColoredText(
+                    record.Suspicious ? L"[driver.list.suspicious]" : L"[driver.list]",
+                    record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+                std::wcout << L" " << record.Name
+                           << L" object=" << std::hex << record.DriverObject
+                           << L" start=" << record.DriverStart
+                           << L" size=" << std::dec << record.DriverSize
+                           << L" device=" << std::hex << record.DeviceObject
+                           << L" module=" << record.OwningModule << std::dec << L"\n";
+            }
+            PrintColoredText(L"[driver.list.summary]", KNDBG_COLOR_TITLE);
+            std::wcout << L" scanned=" << result.DriversScanned
+                       << L" matching=" << result.MatchingDrivers
+                       << L" suspicious=" << result.SuspiciousDrivers << L"\n";
+            break;
+        }
+        if (sub == L"object")
+        {
+            std::vector<std::wstring> drvobjArgs;
+            drvobjArgs.push_back(L"!drvobj");
+            for (size_t i = 2; i < args.size(); ++i)
+            {
+                drvobjArgs.push_back(args[i]);
+            }
+            HandleDrvobjCommand(drvobjArgs, state, device, symbols, structuredJsonOut);
+            break;
+        }
+        if (sub != L"integrity")
+        {
+            std::wcerr << L"usage: !driver [list|object|integrity] ...\n";
             PrintDriverIntegrityHelp();
             break;
         }
@@ -19991,6 +20232,1063 @@ static void HandleDriverIntegrityCommand(
                    << L" matching=" << result.MatchingDrivers
                    << L" suspicious=" << result.SuspiciousDrivers
                    << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
+    } while (false);
+}
+
+static void HandleDrvobjCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut)
+{
+    do
+    {
+        if (HasHelpToken(args, 1) || args.size() < 2)
+        {
+            PrintDriverIntegrityHelp();
+            break;
+        }
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!drvobj requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring filter;
+        std::wstring jsonPath;
+        bool includeDispatch = false;
+        bool includeDevices = true;
+        bool parseError = false;
+        size_t index = 1;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/dispatch")
+            {
+                includeDispatch = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/devices")
+            {
+                includeDevices = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!drvobj: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"!drvobj: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            if (!filter.empty())
+            {
+                std::wcerr << L"!drvobj: unexpected extra target \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            filter = args[index];
+            ++index;
+        }
+        if (parseError || filter.empty())
+        {
+            if (filter.empty() && !parseError)
+            {
+                std::wcerr << L"usage: !drvobj <name|address> [/dispatch] [/devices] [/json <path>]\n";
+            }
+            break;
+        }
+
+        IntegrityScanner scanner(device, symbols);
+        DriverObjectInspectResult result = {};
+        std::wstring error;
+        if (!scanner.InspectDriverObject(filter, includeDispatch, includeDevices, &result, &error))
+        {
+            std::wcerr << L"!drvobj failed: " << error << L"\n";
+            for (const std::wstring& warning : result.Warnings)
+            {
+                std::wcerr << L"!drvobj warning: " << warning << L"\n";
+            }
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!drvobj warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildDriverObjectJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildDriverObjectJson(result), &writeError))
+            {
+                std::wcout << L"!drvobj json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!drvobj json failed: " << writeError << L"\n";
+            }
+        }
+        (void)state;
+        for (const DriverIntegrityRecord& record : result.Drivers)
+        {
+            PrintDriverIntegrityRecord(record, includeDispatch);
+            std::wcout << L"  device_object=" << std::hex << record.DeviceObject
+                       << L" fastio=" << record.FastIoDispatch
+                       << L" unload=" << record.DriverUnload << std::dec << L"\n";
+        }
+        for (const DeviceObjectRecord& deviceRecord : result.Devices)
+        {
+            PrintColoredText(
+                deviceRecord.Suspicious ? L"[drvobj.device.suspicious]" : L"[drvobj.device]",
+                deviceRecord.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+            std::wcout << L" " << deviceRecord.DeviceName
+                       << L" device=" << std::hex << deviceRecord.DeviceObject
+                       << L" driver=" << deviceRecord.DriverName
+                       << L" next=" << deviceRecord.NextDevice
+                       << L" attached=" << deviceRecord.AttachedDevice << std::dec << L"\n";
+        }
+        for (const DeviceStackResult& stack : result.Stacks)
+        {
+            PrintColoredText(L"[drvobj.stack]", KNDBG_COLOR_TITLE);
+            std::wcout << L" start=" << std::hex << stack.StartDevice
+                       << L" top=" << stack.TopDevice
+                       << L" depth=" << std::dec << stack.Stack.size() << L"\n";
+            for (size_t i = 0; i < stack.Stack.size(); ++i)
+            {
+                const DeviceObjectRecord& deviceRecord = stack.Stack[i];
+                std::wcout << L"  [" << i << L"] " << deviceRecord.DriverName
+                           << L" " << std::hex << deviceRecord.DeviceObject << std::dec << L"\n";
+            }
+        }
+    } while (false);
+}
+
+static void HandleDevstackCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1) || args.size() < 2)
+        {
+            PrintDriverIntegrityHelp();
+            break;
+        }
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!devstack requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring jsonPath;
+        std::wstring target;
+        bool parseError = false;
+        size_t index = 1;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!devstack: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"!devstack: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            if (!target.empty())
+            {
+                std::wcerr << L"!devstack: unexpected extra target \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            target = args[index];
+            ++index;
+        }
+        if (parseError || target.empty())
+        {
+            if (target.empty() && !parseError)
+            {
+                std::wcerr << L"usage: !devstack <device-object-address> [/json <path>]\n";
+            }
+            break;
+        }
+
+        uint64_t address = 0;
+        if (!ParseUnsigned(target, state.NumberBase, &address) || address < 0xffff800000000000ull)
+        {
+            std::wcerr << L"!devstack: target must be a kernel DEVICE_OBJECT address\n";
+            break;
+        }
+
+        IntegrityScanner scanner(device, symbols);
+        DeviceStackResult result = {};
+        std::wstring error;
+        if (!scanner.InspectDeviceStack(address, &result, &error))
+        {
+            std::wcerr << L"!devstack failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!devstack warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildDeviceStackJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildDeviceStackJson(result), &writeError))
+            {
+                std::wcout << L"!devstack json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!devstack json failed: " << writeError << L"\n";
+            }
+        }
+        PrintColoredText(L"[devstack]", KNDBG_COLOR_TITLE);
+        std::wcout << L" start=" << std::hex << result.StartDevice
+                   << L" top=" << result.TopDevice
+                   << L" depth=" << std::dec << result.Stack.size()
+                   << L" cycle=" << (result.CycleDetected ? L"yes" : L"no") << L"\n";
+        for (size_t i = 0; i < result.Stack.size(); ++i)
+        {
+            const DeviceObjectRecord& deviceRecord = result.Stack[i];
+            PrintColoredText(
+                deviceRecord.Suspicious ? L"[devstack.suspicious]" : L"[devstack.device]",
+                deviceRecord.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+            std::wcout << L" [" << i << L"] " << deviceRecord.DriverName
+                       << L" " << deviceRecord.DeviceName
+                       << L" device=" << std::hex << deviceRecord.DeviceObject
+                       << std::dec << L"\n";
+        }
+    } while (false);
+}
+
+static void PrintHandlesHelp()
+{
+    std::wcout << L"!handles command:\n";
+    std::wcout << L"  !handles [pid] [/target <pid>] [/process|/all] [/suspicious] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"enumerates SystemExtendedHandleInformation and matches process-type handles to\n";
+    std::wcout << L"live EPROCESS addresses. Owner/target pids are decimal unless prefixed with 0x.\n";
+    std::wcout << L"Non-system owners with VM_READ/WRITE/OPERATION or DUP_HANDLE on another process\n";
+    std::wcout << L"are marked suspicious.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  [pid]          keep handles owned by that PID (decimal, or 0x/0n prefixed).\n";
+    std::wcout << L"  /target <pid>  keep process handles that point at that PID.\n";
+    std::wcout << L"  /process       process-type handles only (default).\n";
+    std::wcout << L"  /all           include non-process handles (default /limit 1000).\n";
+    std::wcout << L"  /suspicious    keep non-system VM/DUP cross-process handles.\n";
+    std::wcout << L"  /limit <n>     cap printed handles.\n";
+    std::wcout << L"  /json <path>   write kn-live-dbg.handle-table.v1.\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  !handles\n";
+    std::wcout << L"  !handles 1234 /suspicious\n";
+    std::wcout << L"  !handles /target 4 /json .\\handles.json\n";
+}
+
+static void HandleHandlesCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintHandlesHelp();
+            break;
+        }
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!handles requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        HandleTableScanOptions options = {};
+        options.ProcessHandlesOnly = true;
+        std::wstring jsonPath;
+        std::wstring error;
+        bool parseError = false;
+        size_t index = 1;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/target")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!handles: /target requires a pid\n";
+                    parseError = true;
+                    break;
+                }
+                uint64_t pidValue = 0;
+                uint64_t eprocess = 0;
+                const ProcessSpecifierKind kind = ClassifyProcessSpecifier(
+                    args[index + 1],
+                    0,
+                    &pidValue,
+                    &eprocess);
+                if (kind != ProcessSpecifierKind::Pid || pidValue > 0xffffffffull)
+                {
+                    std::wcerr << L"!handles: /target must be a pid (decimal, or 0x/0n prefixed)\n";
+                    parseError = true;
+                    break;
+                }
+                options.HasTargetPid = true;
+                options.TargetPid = static_cast<uint32_t>(pidValue);
+                index += 2;
+                continue;
+            }
+            if (opt == L"/process")
+            {
+                options.ProcessHandlesOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/all")
+            {
+                options.ProcessHandlesOnly = false;
+                ++index;
+                continue;
+            }
+            if (opt == L"/suspicious")
+            {
+                options.SuspiciousOnly = true;
+                ++index;
+                continue;
+            }
+            if (opt == L"/limit")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!handles: /limit requires a value\n";
+                    parseError = true;
+                    break;
+                }
+                uint32_t limit = 0;
+                if (!ParseIntegrityLimitOption(args[index + 1], state.NumberBase, &limit, &error))
+                {
+                    std::wcerr << L"!handles: " << error << L"\n";
+                    parseError = true;
+                    break;
+                }
+                options.Limit = limit;
+                index += 2;
+                continue;
+            }
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!handles: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"!handles: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            if (options.HasOwnerPid)
+            {
+                std::wcerr << L"!handles: unexpected extra target \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            uint64_t pidValue = 0;
+            uint64_t eprocess = 0;
+            const ProcessSpecifierKind kind = ClassifyProcessSpecifier(
+                args[index],
+                0,
+                &pidValue,
+                &eprocess);
+            if (kind != ProcessSpecifierKind::Pid || pidValue > 0xffffffffull)
+            {
+                std::wcerr << L"!handles: owner must be a pid (decimal, or 0x/0n prefixed)\n";
+                parseError = true;
+                break;
+            }
+            options.HasOwnerPid = true;
+            options.OwnerPid = static_cast<uint32_t>(pidValue);
+            ++index;
+        }
+        if (parseError)
+        {
+            break;
+        }
+        if (!options.ProcessHandlesOnly && options.Limit == 0)
+        {
+            options.Limit = 1000;
+        }
+
+        HandleTableScanner scanner(device, symbols);
+        HandleTableScanResult result = {};
+        if (!scanner.Scan(options, &result, &error))
+        {
+            std::wcerr << L"!handles failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!handles warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildHandleTableJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildHandleTableJson(result), &writeError))
+            {
+                std::wcout << L"!handles json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!handles json failed: " << writeError << L"\n";
+            }
+        }
+        for (const HandleTableRecord& record : result.Records)
+        {
+            PrintColoredText(
+                record.Suspicious ? L"[handles.suspicious]" : L"[handles]",
+                record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+            std::wcout << L" pid=" << record.OwnerPid
+                       << L" " << record.OwnerImage
+                       << L" handle=0x" << std::hex << record.HandleValue
+                       << L" access=" << record.AccessText
+                       << L" target=" << std::dec << record.TargetPid
+                       << L" " << record.TargetImage;
+            if (!record.Notes.empty())
+            {
+                std::wcout << L" " << record.Notes;
+            }
+            std::wcout << L"\n";
+        }
+        PrintColoredText(L"[handles.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" enumerated=" << result.HandlesEnumerated
+                   << L" matching=" << result.MatchingHandles
+                   << L" process=" << result.ProcessHandles
+                   << L" suspicious=" << result.SuspiciousHandles
+                   << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
+    } while (false);
+}
+
+static void PrintHiddenProcHelp()
+{
+    std::wcout << L"!hiddenproc command:\n";
+    std::wcout << L"  !hiddenproc [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"cross-views ActiveProcessLinks, SystemProcessInformation, Toolhelp, and handle\n";
+    std::wcout << L"owners. Processes in the kernel list but missing from user views, or the reverse,\n";
+    std::wcout << L"are marked suspicious. Full PspCidTable coverage stays on !hunt /deep.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /json <path>  write kn-live-dbg.hidden-process.v1.\n";
+}
+
+static void HandleHiddenProcCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintHiddenProcHelp();
+            break;
+        }
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!hiddenproc requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+
+        std::wstring jsonPath;
+        bool parseError = false;
+        size_t index = 1;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!hiddenproc: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            std::wcerr << L"!hiddenproc: unrecognised option \"" << args[index] << L"\"\n";
+            parseError = true;
+            break;
+        }
+        if (parseError)
+        {
+            break;
+        }
+
+        HiddenProcessScanner scanner(device, symbols);
+        HiddenProcessScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!hiddenproc failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!hiddenproc warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildHiddenProcessJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildHiddenProcessJson(result), &writeError))
+            {
+                std::wcout << L"!hiddenproc json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!hiddenproc json failed: " << writeError << L"\n";
+            }
+        }
+        for (const HiddenProcessRecord& record : result.Records)
+        {
+            PrintColoredText(
+                record.Suspicious ? L"[hiddenproc.suspicious]" : L"[hiddenproc]",
+                record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+            std::wcout << L" pid=" << record.ProcessId
+                       << L" " << record.ImageName
+                       << L" kernel=" << (record.InKernelList ? L"y" : L"n")
+                       << L" spi=" << (record.InSystemProcessInfo ? L"y" : L"n")
+                       << L" toolhelp=" << (record.InToolhelp ? L"y" : L"n")
+                       << L" handles=" << (record.InHandleOwners ? L"y" : L"n");
+            if (!record.Notes.empty())
+            {
+                std::wcout << L" " << record.Notes;
+            }
+            std::wcout << L"\n";
+        }
+        PrintColoredText(L"[hiddenproc.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" kernel=" << result.KernelListCount
+                   << L" spi=" << result.SystemProcessInfoCount
+                   << L" toolhelp=" << result.ToolhelpCount
+                   << L" handle_owners=" << result.HandleOwnerCount
+                   << L" suspicious=" << result.SuspiciousCount
+                   << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete") << L"\n";
+    } while (false);
+}
+
+static void PrintWdFilterHelp()
+{
+    std::wcout << L"!wdfilter command:\n";
+    std::wcout << L"  !wdfilter [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"enumerates WdFilter RuntimeDriver array/list leftovers. Names that are no longer\n";
+    std::wcout << L"in the loaded module list are mapper leftovers, not proof of a live payload.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /json <path>  write kn-live-dbg.wdfilter-runtime.v1.\n";
+}
+
+static void HandleWdFilterCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintWdFilterHelp();
+            break;
+        }
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!wdfilter requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        std::wstring jsonPath;
+        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        {
+            jsonPath = args[2];
+        }
+        else if (args.size() > 1)
+        {
+            std::wcerr << L"usage: !wdfilter [/json <path>]\n";
+            break;
+        }
+
+        WdFilterRuntimeScanner scanner(device, symbols);
+        WdFilterRuntimeScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!wdfilter failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!wdfilter warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildWdFilterRuntimeJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildWdFilterRuntimeJson(result), &writeError))
+            {
+                std::wcout << L"!wdfilter json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!wdfilter json failed: " << writeError << L"\n";
+            }
+        }
+        for (const WdFilterRuntimeRecord& record : result.Records)
+        {
+            PrintColoredText(
+                record.Suspicious ? L"[wdfilter.suspicious]" : L"[wdfilter]",
+                record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+            std::wcout << L" " << record.DriverName
+                       << L" loaded=" << (record.InLoadedModules ? L"y" : L"n");
+            if (!record.Notes.empty())
+            {
+                std::wcout << L" " << record.Notes;
+            }
+            std::wcout << L"\n";
+        }
+        PrintColoredText(L"[wdfilter.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" resolved=" << (result.Resolved ? L"y" : L"n")
+                   << L" mode=" << result.WalkMode
+                   << L" records=" << result.Records.size()
+                   << L" suspicious=" << result.SuspiciousCount << L"\n";
+    } while (false);
+}
+
+static void PrintInputStackHelp()
+{
+    std::wcout << L"!inputstack command:\n";
+    std::wcout << L"  !inputstack [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"walks kbdclass/mouclass/kbdhid/mouhid/i8042prt device stacks and flags attached\n";
+    std::wcout << L"drivers that are not known input-class images.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /json <path>  write kn-live-dbg.input-stack.v1.\n";
+}
+
+static void HandleInputStackCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintInputStackHelp();
+            break;
+        }
+        if (!device.IsOpen())
+        {
+            std::wcerr << L"!inputstack requires the KnLiveDbg.sys driver device to be open\n";
+            break;
+        }
+        std::wstring jsonPath;
+        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        {
+            jsonPath = args[2];
+        }
+        else if (args.size() > 1)
+        {
+            std::wcerr << L"usage: !inputstack [/json <path>]\n";
+            break;
+        }
+
+        InputStackScanner scanner(device, symbols);
+        InputStackScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!inputstack failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!inputstack warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildInputStackJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildInputStackJson(result), &writeError))
+            {
+                std::wcout << L"!inputstack json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!inputstack json failed: " << writeError << L"\n";
+            }
+        }
+        for (const InputStackRecord& record : result.Records)
+        {
+            PrintColoredText(
+                record.Suspicious ? L"[inputstack.suspicious]" : L"[inputstack]",
+                record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+            std::wcout << L" " << record.Role
+                       << L" filter=" << record.DriverFilter
+                       << L" found=" << (record.Driver.Found ? L"y" : L"n")
+                       << L" devices=" << record.Driver.Devices.size();
+            if (!record.Notes.empty())
+            {
+                std::wcout << L" " << record.Notes;
+            }
+            std::wcout << L"\n";
+        }
+        PrintColoredText(L"[inputstack.summary]", KNDBG_COLOR_TITLE);
+        std::wcout << L" suspicious=" << result.SuspiciousStacks
+                   << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete") << L"\n";
+    } while (false);
+}
+
+static void PrintDmaHelp()
+{
+    std::wcout << L"!dma command:\n";
+    std::wcout << L"  !dma [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"reports IOMMU firmware posture (ACPI DMAR/IVRS), Kernel DMA Protection registry\n";
+    std::wcout << L"state, and removable PCI bus classes. This is evidence, not an FPGA DMA test.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /json <path>  write kn-live-dbg.dma-posture.v1.\n";
+}
+
+static void HandleDmaCommand(
+    const std::vector<std::wstring>& args,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintDmaHelp();
+            break;
+        }
+        std::wstring jsonPath;
+        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        {
+            jsonPath = args[2];
+        }
+        else if (args.size() > 1)
+        {
+            std::wcerr << L"usage: !dma [/json <path>]\n";
+            break;
+        }
+
+        DmaPostureScanner scanner;
+        DmaPostureScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!dma failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!dma warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildDmaPostureJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildDmaPostureJson(result), &writeError))
+            {
+                std::wcout << L"!dma json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!dma json failed: " << writeError << L"\n";
+            }
+        }
+        PrintColoredText(L"[dma]", KNDBG_COLOR_TITLE);
+        std::wcout << L" dmar=" << (result.DmarPresent ? L"y" : L"n")
+                   << L" ivrs=" << (result.IvrsPresent ? L"y" : L"n")
+                   << L" iommu=" << (result.IommuFirmwarePresent ? L"y" : L"n")
+                   << L" kdma=" << (result.KernelDmaProtectionEnabled ? L"on" : L"off/unknown")
+                   << L" removable_pci=" << result.RemovableBusCount << L"\n";
+        for (const DmaPciDeviceRecord& deviceRecord : result.PciDevices)
+        {
+            std::wcout << L"  pci " << deviceRecord.Description
+                       << L" " << deviceRecord.HardwareId << L"\n";
+        }
+    } while (false);
+}
+
+static void PrintHvHelp()
+{
+    std::wcout << L"!hv command:\n";
+    std::wcout << L"  !hv [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"reports hypervisor presence from CPUID.1.ECX[31], VMX/SVM feature bits, CR4.VMXE\n";
+    std::wcout << L"when the driver is open, and a CPUID vs NOP timing sample. IA32_FEATURE_CONTROL\n";
+    std::wcout << L"is never read (AMD #GP).\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /json <path>  write kn-live-dbg.hv-posture.v1.\n";
+}
+
+static void HandleHvCommand(
+    const std::vector<std::wstring>& args,
+    DeviceClient& device,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintHvHelp();
+            break;
+        }
+        std::wstring jsonPath;
+        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        {
+            jsonPath = args[2];
+        }
+        else if (args.size() > 1)
+        {
+            std::wcerr << L"usage: !hv [/json <path>]\n";
+            break;
+        }
+
+        HvPostureScanner scanner(device.IsOpen() ? &device : nullptr);
+        HvPostureScanResult result = {};
+        std::wstring error;
+        if (!scanner.Scan(&result, &error))
+        {
+            std::wcerr << L"!hv failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"!hv warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildHvPostureJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildHvPostureJson(result), &writeError))
+            {
+                std::wcout << L"!hv json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"!hv json failed: " << writeError << L"\n";
+            }
+        }
+        PrintColoredText(L"[hv]", KNDBG_COLOR_TITLE);
+        std::wcout << L" cpuid_hv=" << (result.CpuidHypervisorPresent ? L"y" : L"n")
+                   << L" vendor=" << result.VendorSignature
+                   << L" vmx=" << (result.VmxSupported ? L"y" : L"n")
+                   << L" svm=" << (result.SvmSupported ? L"y" : L"n")
+                   << L" cr4.vmxe=" << (result.Cr4Vmxe ? L"y" : L"n")
+                   << L" cpuid_ticks=" << result.CpuidMedianTicks
+                   << L" nop_ticks=" << result.NopMedianTicks << L"\n";
+        if (!result.Notes.empty())
+        {
+            std::wcout << L"  " << result.Notes << L"\n";
+        }
+    } while (false);
+}
+
+static void PrintDumpAnalyzeHelp()
+{
+    std::wcout << L"dump-analyze command:\n";
+    std::wcout << L"  dump-analyze <path> [/json <path>]\n";
+    std::wcout << L"\n";
+    std::wcout << L"parses a dump-kernel DUMP_HEADER64 prefix, lists physical memory runs, and walks\n";
+    std::wcout << L"PsLoadedModuleList through the dump DTB. Offline; does not need KnLiveDbg.sys.\n";
+    std::wcout << L"\n";
+    std::wcout << L"paging:\n";
+    std::wcout << L"  VA translation is 4-level (PML4) or 5-level (PML5/LA57). CR4.LA57 is read from\n";
+    std::wcout << L"  ContextRecord when KdSecondaryVersion=2 and KSPECIAL_REGISTERS.Cr3 matches the\n";
+    std::wcout << L"  header DirectoryTableBase, then confirmed by probing the module-list page tables.\n";
+    std::wcout << L"  A 5-level walk is not applied to a 4-level CR3. Non-AMD64 dumps skip VA translation.\n";
+    std::wcout << L"  Summary prints paging=, la57=, cr4=, and cr4_valid=.\n";
+    std::wcout << L"\n";
+    std::wcout << L"options:\n";
+    std::wcout << L"  /json <path>  write kn-live-dbg.dump-analyze.v1 (includes paging_levels and la57_active).\n";
+    std::wcout << L"\n";
+    std::wcout << L"examples:\n";
+    std::wcout << L"  dump-analyze .\\live-complete.dmp\n";
+    std::wcout << L"  dump-analyze .\\live-complete.dmp /json .\\dump-analyze.json\n";
+}
+
+static void HandleDumpAnalyzeCommand(
+    const std::vector<std::wstring>& args,
+    SymbolEngine& symbols,
+    std::wstring* structuredJsonOut = nullptr)
+{
+    do
+    {
+        if (HasHelpToken(args, 1) || args.size() < 2)
+        {
+            PrintDumpAnalyzeHelp();
+            break;
+        }
+
+        std::wstring path;
+        std::wstring jsonPath;
+        bool parseError = false;
+        size_t index = 1;
+        while (index < args.size())
+        {
+            std::wstring opt = ToLower(args[index]);
+            if (opt == L"/json")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"dump-analyze: /json requires a path\n";
+                    parseError = true;
+                    break;
+                }
+                jsonPath = args[index + 1];
+                index += 2;
+                continue;
+            }
+            if (IsSwitchLikeToken(args[index]))
+            {
+                std::wcerr << L"dump-analyze: unrecognised option \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            if (!path.empty())
+            {
+                std::wcerr << L"dump-analyze: unexpected extra path \"" << args[index] << L"\"\n";
+                parseError = true;
+                break;
+            }
+            path = args[index];
+            ++index;
+        }
+        if (parseError || path.empty())
+        {
+            if (path.empty() && !parseError)
+            {
+                PrintDumpAnalyzeHelp();
+            }
+            break;
+        }
+
+        DumpAnalyzer analyzer(&symbols);
+        DumpAnalyzeResult result = {};
+        std::wstring error;
+        if (!analyzer.Analyze(path, &result, &error))
+        {
+            std::wcerr << L"dump-analyze failed: " << error << L"\n";
+            break;
+        }
+        for (const std::wstring& warning : result.Warnings)
+        {
+            std::wcerr << L"dump-analyze warning: " << warning << L"\n";
+        }
+        if (structuredJsonOut != nullptr)
+        {
+            *structuredJsonOut = BuildDumpAnalyzeJson(result);
+        }
+        if (!jsonPath.empty())
+        {
+            std::wstring writeError;
+            if (WriteUtf8TextFile(jsonPath, BuildDumpAnalyzeJson(result), &writeError))
+            {
+                std::wcout << L"dump-analyze json=" << jsonPath << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"dump-analyze json failed: " << writeError << L"\n";
+            }
+        }
+        PrintColoredText(L"[dump-analyze]", KNDBG_COLOR_TITLE);
+        std::wcout << L" sig=" << result.Signature << L"/" << result.ValidDump
+                   << L" dtb=0x" << std::hex << result.DirectoryTableBase
+                   << L" cr4=0x" << result.Cr4
+                   << L" paging=" << std::dec << result.PagingLevels
+                   << L" la57=" << (result.La57Active ? L"1" : L"0")
+                   << L" cr4_valid=" << (result.Cr4Valid ? L"1" : L"0")
+                   << L" bugcheck=0x" << std::hex << result.BugCheckCode
+                   << L" runs=" << std::dec << result.Runs.size()
+                   << L" pages=" << result.NumberOfPages
+                   << L" modules=" << result.Modules.size() << L"\n";
+        for (const DumpLoadedModuleRecord& module : result.Modules)
+        {
+            std::wcout << L"  " << module.BaseName
+                       << L" base=0x" << std::hex << module.DllBase
+                       << L" size=0x" << module.SizeOfImage << std::dec << L"\n";
+        }
     } while (false);
 }
 
@@ -26041,6 +27339,7 @@ static void PrintVadHelp()
     std::wcout << L"  /json path write stable JSON output\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
+    std::wcout << L"  Mapped VADs resolve _SUBSECTION.ControlArea -> FILE_OBJECT and annotate section= when the backing name is readable.\n";
     std::wcout << L"  The target can be a decimal PID, image name, or kernel EPROCESS address.\n";
     std::wcout << L"  Compatibility aliases /scan, /modules, and /mappedpe are accepted after a legacy target.\n";
     std::wcout << L"  Layouts are resolved from nt PDBs at runtime; drift or protected targets may produce partial warnings.\n";
@@ -26863,9 +28162,33 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintModuleIntegrityHelp();
         }
-        else if (command == L"!driver")
+        else if (command == L"!driver" || command == L"!drvobj" || command == L"!devstack")
         {
             PrintDriverIntegrityHelp();
+        }
+        else if (command == L"!handles")
+        {
+            PrintHandlesHelp();
+        }
+        else if (command == L"!hiddenproc")
+        {
+            PrintHiddenProcHelp();
+        }
+        else if (command == L"!wdfilter")
+        {
+            PrintWdFilterHelp();
+        }
+        else if (command == L"!inputstack")
+        {
+            PrintInputStackHelp();
+        }
+        else if (command == L"!dma")
+        {
+            PrintDmaHelp();
+        }
+        else if (command == L"!hv")
+        {
+            PrintHvHelp();
         }
         else if (command == L"!pool")
         {
@@ -26893,6 +28216,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"dump-live")
         {
             PrintDumpLiveHelp();
+        }
+        else if (command == L"dump-analyze")
+        {
+            PrintDumpAnalyzeHelp();
         }
         else if (command == L"!address")
         {
@@ -27207,6 +28534,15 @@ static std::wstring FirstTokenMissingCompletionHint()
         {L"u"},
         {L"dump-kernel"},
         {L"dump-live"},
+        {L"dump-analyze"},
+        {L"!handles"},
+        {L"!drvobj"},
+        {L"!devstack"},
+        {L"!hiddenproc"},
+        {L"!wdfilter"},
+        {L"!inputstack"},
+        {L"!dma"},
+        {L"!hv"},
         {L"help", L"!pool"},
         {L"help", L"!byovd"},
         {L"help", L"!ti"}
@@ -27721,6 +29057,17 @@ static int RunConsoleSurfaceSelfTest()
                 !ParseDmlProcessPidFilter(L"0x1234", &parsedNumber) &&
                 !ParseDmlProcessPidFilter(L"ffffa80212345678", &parsedNumber),
             L"token-pid-filter-is-decimal-only");
+        {
+            uint64_t handlePid = 0;
+            uint64_t handleEprocess = 0;
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                ClassifyProcessSpecifier(L"1234", 0, &handlePid, &handleEprocess) == ProcessSpecifierKind::Pid &&
+                    handlePid == 1234 &&
+                    ClassifyProcessSpecifier(L"0x4", 0, &handlePid, &handleEprocess) == ProcessSpecifierKind::Pid &&
+                    handlePid == 4,
+                L"handles-pid-is-decimal-first");
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             ParseUnsigned(L"0xffff800000001000", 16, &parsedNumber) &&
@@ -27771,6 +29118,8 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {}, L"dump-live", L"dump-live-root-completion");
         CheckCompletionCandidate(&context, {L"help"}, L"dump-kernel", L"help-dump-kernel-completion");
         CheckCompletionCandidate(&context, {L"help"}, L"dump-live", L"help-dump-live-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"dump-analyze", L"help-dump-analyze-completion");
+        CheckCompletionCandidate(&context, {L"dump-analyze"}, L"/json", L"dump-analyze-json-completion");
         CheckCompletionCandidate(&context, {L"dump-kernel"}, L"/max", L"dump-kernel-max-completion");
         CheckCompletionCandidate(&context, {L"dump-kernel"}, L"/strict", L"dump-kernel-strict-completion");
         CheckCompletionCandidate(&context, {L"dump-live"}, L"/user", L"dump-live-user-completion");
@@ -27787,8 +29136,53 @@ static int RunConsoleSurfaceSelfTest()
         CheckConsoleSurfaceSelfTest(
             &context,
             IsNativeOwnedCommand(L"dump-kernel") &&
-                IsNativeOwnedCommand(L"dump-live"),
+                IsNativeOwnedCommand(L"dump-live") &&
+                IsNativeOwnedCommand(L"dump-analyze"),
             L"dump-kernel-and-dump-live-are-native-owned");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HandleTableAccessMaskSelfTest(),
+            L"handle-table-access-mask");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HiddenProcessViewSelfTest(),
+            L"hidden-process-view-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IntegrityIatOwnerSelfTest(),
+            L"module-iat-owner-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IntegrityProloguePatternSelfTest(),
+            L"module-prologue-address-filter");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            DeviceStackWalkSelfTest(),
+            L"device-stack-cycle-guard");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            InputStackKnownDriverSelfTest(),
+            L"input-stack-known-driver");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            WdFilterRuntimeNameSelfTest(),
+            L"wdfilter-runtime-name");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            DmaAcpiSignatureSelfTest(),
+            L"dma-acpi-signature");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HvCpuidMaskSelfTest(),
+            L"hv-cpuid-mask");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            DumpHeaderSignatureSelfTest(),
+            L"dump-header-signature");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            DumpPagingWalkSelfTest(),
+            L"dump-paging-walk");
         CheckCompletionCandidate(&context, {}, L"!payload", L"payload-root-completion");
         CheckCompletionCandidate(&context, {}, L"!mapper", L"mapper-root-completion");
         CheckCompletionCandidate(&context, {}, L"!kpage", L"kpage-root-completion");
@@ -27826,7 +29220,15 @@ static int RunConsoleSurfaceSelfTest()
             L"help-prefix-reuses-native-completion-scopes");
         CheckConsoleSurfaceSelfTest(
             &context,
-            IsNativeOwnedCommand(L"!minifilter") &&
+            IsNativeOwnedCommand(L"!drvobj") &&
+                IsNativeOwnedCommand(L"!devstack") &&
+                IsNativeOwnedCommand(L"!handles") &&
+                IsNativeOwnedCommand(L"!hiddenproc") &&
+                IsNativeOwnedCommand(L"!wdfilter") &&
+                IsNativeOwnedCommand(L"!inputstack") &&
+                IsNativeOwnedCommand(L"!dma") &&
+                IsNativeOwnedCommand(L"!hv") &&
+                IsNativeOwnedCommand(L"!minifilter") &&
                 IsNativeOwnedCommand(L"!fltmgr") &&
                 MinifilterIrpScannerSelfTest(),
             L"minifilter-command-native-and-self-test");
@@ -27873,6 +29275,22 @@ static int RunConsoleSurfaceSelfTest()
             L"help-only-completion-stays-on-first-token");
         CheckCompletionCandidate(&context, {L"!hunt"}, L"/details", L"hunt-details-completion");
         CheckCompletionCandidate(&context, {L"!module"}, L"/disk", L"module-disk-completion");
+        CheckCompletionCandidate(&context, {L"!module"}, L"/iat", L"module-iat-completion");
+        CheckCompletionCandidate(&context, {L"!module"}, L"/prologue", L"module-prologue-completion");
+        CheckCompletionCandidate(&context, {}, L"!drvobj", L"drvobj-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!devstack", L"devstack-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!handles", L"handles-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!hiddenproc", L"hiddenproc-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!wdfilter", L"wdfilter-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!inputstack", L"inputstack-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!dma", L"dma-root-completion");
+        CheckCompletionCandidate(&context, {}, L"!hv", L"hv-root-completion");
+        CheckCompletionCandidate(&context, {}, L"dump-analyze", L"dump-analyze-root-completion");
+        CheckCompletionCandidate(&context, {L"!driver"}, L"list", L"driver-list-completion");
+        CheckCompletionCandidate(&context, {L"!driver"}, L"object", L"driver-object-completion");
+        CheckCompletionCandidate(&context, {L"!handles"}, L"/suspicious", L"handles-suspicious-completion");
+        CheckCompletionCandidate(&context, {L"!byovd"}, L"/no-sign", L"byovd-no-sign-completion");
+        CheckCompletionCandidate(&context, {L"help"}, L"!hiddenproc", L"help-hiddenproc-completion");
         CheckCompletionCandidate(&context, {L"!byovd", L"update"}, L"/force", L"byovd-update-force-completion");
         CheckCompletionCandidate(&context, {L"!pool", L"big"}, L"/tags", L"pool-big-tags-completion");
         CheckCompletionCandidate(&context, {L"!pool", L"tags"}, L"/tag", L"pool-tags-tag-completion");
@@ -28267,8 +29685,21 @@ static int RunConsoleSurfaceSelfTest()
             CheckConsoleSurfaceSelfTest(
                 &context,
                 rootHelp.find(L"help dump-kernel") != std::wstring::npos &&
-                    rootHelp.find(L"help dump-live") != std::wstring::npos,
+                    rootHelp.find(L"help dump-live") != std::wstring::npos &&
+                    rootHelp.find(L"help dump-analyze") != std::wstring::npos &&
+                    rootHelp.find(L"help !wdfilter") != std::wstring::npos &&
+                    rootHelp.find(L"help !dma") != std::wstring::npos,
                 L"help-root-lists-dump-kernel-and-dump-live");
+            const std::wstring dumpAnalyzeHelp = CaptureDetailedHelpOutput({L"help", L"dump-analyze"}, 1);
+            const std::wstring byovdHelp = CaptureDetailedHelpOutput({L"help", L"!byovd"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                dumpAnalyzeHelp.find(L"PML5") != std::wstring::npos &&
+                    dumpAnalyzeHelp.find(L"LA57") != std::wstring::npos &&
+                    dumpAnalyzeHelp.find(L"/json") != std::wstring::npos &&
+                    byovdHelp.find(L"/no-sign") != std::wstring::npos &&
+                    byovdHelp.find(L"/sign") != std::wstring::npos,
+                L"dump-analyze-and-byovd-help-cover-new-options");
             const std::wstring payloadHelp = CaptureDetailedHelpOutput({L"help", L"!payload"}, 1);
             const std::wstring mapperHelp = CaptureDetailedHelpOutput({L"help", L"!mapper"}, 1);
             const std::wstring kpageHelp = CaptureDetailedHelpOutput({L"help", L"!kpage"}, 1);
@@ -28283,7 +29714,6 @@ static int RunConsoleSurfaceSelfTest()
                     kpageHelp.find(L"!pool pe") != std::wstring::npos,
                 L"leftover-help-routes");
             const std::wstring callbacksHelp = CaptureDetailedHelpOutput({L"help", L"!callbacks"}, 1);
-            const std::wstring byovdHelp = CaptureDetailedHelpOutput({L"help", L"!byovd"}, 1);
             const std::wstring poolHelp = CaptureDetailedHelpOutput({L"help", L"!pool"}, 1);
             const std::wstring poolPeHelp = CaptureDetailedHelpOutput({L"help", L"!pool", L"pe"}, 1);
             CheckConsoleSurfaceSelfTest(
@@ -30454,9 +31884,23 @@ static std::wstring ClassifyCommandLine(const std::wstring& line, bool writeLike
                 break;
             }
 
-            if (command == L"!module" || command == L"!driver")
+            if (command == L"!module" || command == L"!driver" ||
+                command == L"!drvobj" || command == L"!devstack")
             {
                 commandClass = L"integrity";
+                break;
+            }
+
+            if (command == L"!handles" || command == L"!hiddenproc")
+            {
+                commandClass = L"process";
+                break;
+            }
+
+            if (command == L"!wdfilter" || command == L"!inputstack" ||
+                command == L"!dma" || command == L"!hv")
+            {
+                commandClass = L"posture";
                 break;
             }
 
@@ -31791,13 +33235,33 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
-        else if (command == L"!module" || command == L"!driver")
+        else if (command == L"!module")
         {
             if (args.size() < 2 || ToLower(args[1]) != L"integrity")
             {
                 if (reason != nullptr)
                 {
                     *reason = command + L" scope must be integrity";
+                }
+                break;
+            }
+        }
+        else if (command == L"!driver")
+        {
+            if (args.size() < 2)
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!driver scope must be list, object, or integrity";
+                }
+                break;
+            }
+            std::wstring scope = ToLower(args[1]);
+            if (scope != L"list" && scope != L"object" && scope != L"integrity" && !IsHelpToken(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"!driver scope must be list, object, or integrity";
                 }
                 break;
             }
@@ -38889,6 +40353,15 @@ static bool IsSupportedAiCapabilityTool(const std::wstring& tool)
         tool == L"graph.query" ||
         tool == L"module.integrity" ||
         tool == L"driver.integrity" ||
+        tool == L"driver.object" ||
+        tool == L"device.stack" ||
+        tool == L"handles.list" ||
+        tool == L"hiddenproc.list" ||
+        tool == L"wdfilter.list" ||
+        tool == L"inputstack.list" ||
+        tool == L"dma.posture" ||
+        tool == L"hv.posture" ||
+        tool == L"dump.analyze" ||
         tool == L"ssdt.scan" ||
         tool == L"idt.scan" ||
         tool == L"cr.scan" ||
@@ -39054,11 +40527,35 @@ static bool ValidateAiCapabilityToolArgKeys(
     }
     else if (tool == L"module.integrity")
     {
-        allowed = {L"module", L"name", L"target", L"limit", L"summary", L"verbose", L"headers", L"sections", L"wx", L"mismatch"};
+        allowed = {L"module", L"name", L"target", L"limit", L"summary", L"verbose", L"headers", L"sections", L"wx", L"mismatch", L"disk", L"iat", L"prologue"};
     }
     else if (tool == L"driver.integrity")
     {
         allowed = {L"driver", L"name", L"target", L"limit"};
+    }
+    else if (tool == L"driver.object")
+    {
+        allowed = {L"driver", L"name", L"target", L"address"};
+    }
+    else if (tool == L"device.stack")
+    {
+        allowed = {L"address", L"va", L"device"};
+    }
+    else if (tool == L"handles.list")
+    {
+        allowed = {L"pid", L"target", L"limit"};
+    }
+    else if (tool == L"hiddenproc.list" ||
+             tool == L"wdfilter.list" ||
+             tool == L"inputstack.list" ||
+             tool == L"dma.posture" ||
+             tool == L"hv.posture")
+    {
+        allowed = {};
+    }
+    else if (tool == L"dump.analyze")
+    {
+        allowed = {L"path", L"file"};
     }
     else if (tool == L"ssdt.scan" ||
              tool == L"idt.scan" ||
@@ -43009,12 +44506,18 @@ static bool ExecuteAiCapabilityModuleIntegrity(
         bool sections = false;
         bool wx = false;
         bool mismatch = false;
+        bool disk = false;
+        bool iat = false;
+        bool prologue = false;
         if (!ExtractAiCapabilityBooleanArg(step.ArgsJson, L"summary", &summaryOnly, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"verbose", &verbose, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"headers", &headers, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"sections", &sections, error) ||
             !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"wx", &wx, error) ||
-            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"mismatch", &mismatch, error))
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"mismatch", &mismatch, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"disk", &disk, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"iat", &iat, error) ||
+            !ExtractAiCapabilityBooleanArg(step.ArgsJson, L"prologue", &prologue, error))
         {
             break;
         }
@@ -43041,6 +44544,18 @@ static bool ExecuteAiCapabilityModuleIntegrity(
         if (mismatch)
         {
             args.push_back(L"/mismatch");
+        }
+        if (disk)
+        {
+            args.push_back(L"/disk");
+        }
+        if (iat)
+        {
+            args.push_back(L"/iat");
+        }
+        if (prologue)
+        {
+            args.push_back(L"/prologue");
         }
 
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
@@ -43909,6 +45424,79 @@ static bool ExecuteAiCapabilityPlan(
             else if (step.Tool == L"driver.integrity")
             {
                 stepOk = ExecuteAiCapabilityDriverIntegrity(step, state, device, symbols, error, structuredJsonOut);
+            }
+            else if (step.Tool == L"driver.object")
+            {
+                std::wstring target;
+                ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"driver", L"name", L"target", L"address"}, &target);
+                std::vector<std::wstring> drvArgs = {L"!drvobj"};
+                if (!target.empty())
+                {
+                    drvArgs.push_back(target);
+                }
+                HandleDrvobjCommand(drvArgs, state, device, symbols, structuredJsonOut);
+                stepOk = true;
+            }
+            else if (step.Tool == L"device.stack")
+            {
+                std::wstring address;
+                ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"address", L"va", L"device"}, &address);
+                std::vector<std::wstring> stackArgs = {L"!devstack"};
+                if (!address.empty())
+                {
+                    stackArgs.push_back(address);
+                }
+                HandleDevstackCommand(stackArgs, state, device, symbols, structuredJsonOut);
+                stepOk = true;
+            }
+            else if (step.Tool == L"handles.list")
+            {
+                std::vector<std::wstring> handleArgs = {L"!handles"};
+                std::wstring pid;
+                ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"pid"}, &pid);
+                if (!pid.empty())
+                {
+                    handleArgs.push_back(pid);
+                }
+                HandleHandlesCommand(handleArgs, state, device, symbols, structuredJsonOut);
+                stepOk = true;
+            }
+            else if (step.Tool == L"hiddenproc.list")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step, device, symbols, L"hiddenproc.list", {L"!hiddenproc"}, error, structuredJsonOut, HandleHiddenProcCommand);
+            }
+            else if (step.Tool == L"wdfilter.list")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step, device, symbols, L"wdfilter.list", {L"!wdfilter"}, error, structuredJsonOut, HandleWdFilterCommand);
+            }
+            else if (step.Tool == L"inputstack.list")
+            {
+                stepOk = ExecuteAiCapabilitySimpleBang(
+                    step, device, symbols, L"inputstack.list", {L"!inputstack"}, error, structuredJsonOut, HandleInputStackCommand);
+            }
+            else if (step.Tool == L"dma.posture")
+            {
+                HandleDmaCommand({L"!dma"}, structuredJsonOut);
+                stepOk = structuredJsonOut == nullptr || !structuredJsonOut->empty();
+            }
+            else if (step.Tool == L"hv.posture")
+            {
+                HandleHvCommand({L"!hv"}, device, structuredJsonOut);
+                stepOk = structuredJsonOut == nullptr || !structuredJsonOut->empty();
+            }
+            else if (step.Tool == L"dump.analyze")
+            {
+                std::wstring path;
+                ExtractAiCapabilityScalarAlias(step.ArgsJson, {L"path", L"file"}, &path);
+                std::vector<std::wstring> dumpArgs = {L"dump-analyze"};
+                if (!path.empty())
+                {
+                    dumpArgs.push_back(path);
+                }
+                HandleDumpAnalyzeCommand(dumpArgs, symbols, structuredJsonOut);
+                stepOk = structuredJsonOut == nullptr || !structuredJsonOut->empty();
             }
             else if (step.Tool == L"ssdt.scan")
             {
@@ -45374,6 +46962,38 @@ static bool HandleCommand(
         {
             HandleDriverIntegrityCommand(args, state, device, symbols);
         }
+        else if (command == L"!drvobj")
+        {
+            HandleDrvobjCommand(args, state, device, symbols, nullptr);
+        }
+        else if (command == L"!devstack")
+        {
+            HandleDevstackCommand(args, state, device, symbols);
+        }
+        else if (command == L"!handles")
+        {
+            HandleHandlesCommand(args, state, device, symbols);
+        }
+        else if (command == L"!hiddenproc")
+        {
+            HandleHiddenProcCommand(args, device, symbols);
+        }
+        else if (command == L"!wdfilter")
+        {
+            HandleWdFilterCommand(args, device, symbols);
+        }
+        else if (command == L"!inputstack")
+        {
+            HandleInputStackCommand(args, device, symbols);
+        }
+        else if (command == L"!dma")
+        {
+            HandleDmaCommand(args);
+        }
+        else if (command == L"!hv")
+        {
+            HandleHvCommand(args, device);
+        }
         else if (command == L"!byovd")
         {
             HandleByovdCommand(args, state, symbols);
@@ -45397,6 +47017,10 @@ static bool HandleCommand(
         else if (command == L"dump-live")
         {
             HandleDumpLiveCommand(args, state, device, symbols);
+        }
+        else if (command == L"dump-analyze")
+        {
+            HandleDumpAnalyzeCommand(args, symbols);
         }
         else if (command == L"!address")
         {

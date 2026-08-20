@@ -2,6 +2,8 @@
 
 #include <Windows.h>
 #include <wincrypt.h>
+#include <WinTrust.h>
+#include <Softpub.h>
 
 #include <algorithm>
 #include <array>
@@ -106,6 +108,154 @@ namespace
     {
         DWORD attr = GetFileAttributesW(path.c_str());
         return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    void QueryEmbeddedSigner(const std::wstring& path, std::wstring* signer)
+    {
+        HCERTSTORE store = nullptr;
+        HCRYPTMSG msg = nullptr;
+
+        do
+        {
+            if (signer == nullptr)
+            {
+                break;
+            }
+            signer->clear();
+            DWORD encoding = 0;
+            DWORD contentType = 0;
+            DWORD formatType = 0;
+            if (!CryptQueryObject(
+                    CERT_QUERY_OBJECT_FILE,
+                    path.c_str(),
+                    CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                    CERT_QUERY_FORMAT_FLAG_BINARY,
+                    0,
+                    &encoding,
+                    &contentType,
+                    &formatType,
+                    &store,
+                    &msg,
+                    nullptr) ||
+                store == nullptr)
+            {
+                break;
+            }
+
+            PCCERT_CONTEXT cert = CertEnumCertificatesInStore(store, nullptr);
+            if (cert == nullptr)
+            {
+                break;
+            }
+            wchar_t name[256] = {};
+            if (CertGetNameStringW(
+                    cert,
+                    CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                    0,
+                    nullptr,
+                    name,
+                    256) > 1)
+            {
+                *signer = name;
+            }
+            CertFreeCertificateContext(cert);
+        } while (false);
+
+        if (msg != nullptr)
+        {
+            CryptMsgClose(msg);
+        }
+        if (store != nullptr)
+        {
+            CertCloseStore(store, 0);
+        }
+    }
+
+    void VerifyAuthenticode(
+        const std::wstring& path,
+        bool* signedOk,
+        bool* trusted,
+        std::wstring* signer,
+        std::wstring* errorText)
+    {
+        do
+        {
+            if (signedOk != nullptr)
+            {
+                *signedOk = false;
+            }
+            if (trusted != nullptr)
+            {
+                *trusted = false;
+            }
+            if (signer != nullptr)
+            {
+                signer->clear();
+            }
+            if (errorText != nullptr)
+            {
+                errorText->clear();
+            }
+            if (path.empty() || !FileExists(path))
+            {
+                if (errorText != nullptr)
+                {
+                    *errorText = L"disk image was not found";
+                }
+                break;
+            }
+
+            WINTRUST_FILE_INFO fileInfo = {};
+            fileInfo.cbStruct = sizeof(fileInfo);
+            fileInfo.pcwszFilePath = path.c_str();
+
+            GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+            WINTRUST_DATA data = {};
+            data.cbStruct = sizeof(data);
+            data.dwUIChoice = WTD_UI_NONE;
+            data.fdwRevocationChecks = WTD_REVOKE_NONE;
+            data.dwUnionChoice = WTD_CHOICE_FILE;
+            data.pFile = &fileInfo;
+            data.dwStateAction = WTD_STATEACTION_VERIFY;
+            data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE;
+
+            const LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+            data.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+
+            QueryEmbeddedSigner(path, signer);
+            if (status == 0)
+            {
+                if (signedOk != nullptr)
+                {
+                    *signedOk = true;
+                }
+                if (trusted != nullptr)
+                {
+                    *trusted = true;
+                }
+            }
+            else if (status == TRUST_E_NOSIGNATURE)
+            {
+                if (errorText != nullptr)
+                {
+                    *errorText = L"no Authenticode signature";
+                }
+            }
+            else
+            {
+                if (signedOk != nullptr)
+                {
+                    *signedOk = signer != nullptr && !signer->empty();
+                }
+                if (errorText != nullptr)
+                {
+                    wchar_t buffer[64];
+                    swprintf_s(buffer, L"WinVerifyTrust 0x%08x", static_cast<unsigned int>(status));
+                    *errorText = buffer;
+                }
+            }
+        } while (false);
     }
 
     bool DirectoryExists(const std::wstring& path)
@@ -1897,6 +2047,33 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
                 ++result->FileReadFailures;
             }
 
+            if (options.CheckAuthenticode)
+            {
+                record.AuthenticodeAttempted = true;
+                VerifyAuthenticode(
+                    record.DiskPath,
+                    &record.AuthenticodeSigned,
+                    &record.AuthenticodeTrusted,
+                    &record.AuthenticodeSigner,
+                    &record.AuthenticodeError);
+                if (record.AuthenticodeSigned)
+                {
+                    ++result->AuthenticodeSigned;
+                }
+                else
+                {
+                    ++result->AuthenticodeUnsigned;
+                }
+                if (record.AuthenticodeTrusted)
+                {
+                    ++result->AuthenticodeTrusted;
+                }
+                if (!record.AuthenticodeError.empty() && !record.AuthenticodeSigned)
+                {
+                    ++result->AuthenticodeFailures;
+                }
+            }
+
             if (!options.ExactOnly)
             {
                 FileVersionMetadata versionMetadata = {};
@@ -2013,6 +2190,10 @@ std::wstring BuildByovdScanJson(const ByovdScanResult& result)
     stream << L"\"yara_matches\":" << result.YaraMatches << L",";
     stream << L"\"yara_failures\":" << result.YaraFailures << L",";
     stream << L"\"yara_timeouts\":" << result.YaraTimeouts << L",";
+    stream << L"\"authenticode_signed\":" << result.AuthenticodeSigned << L",";
+    stream << L"\"authenticode_unsigned\":" << result.AuthenticodeUnsigned << L",";
+    stream << L"\"authenticode_trusted\":" << result.AuthenticodeTrusted << L",";
+    stream << L"\"authenticode_failures\":" << result.AuthenticodeFailures << L",";
     stream << L"\"catalog_updated\":" << (result.CatalogUpdated ? L"true" : L"false") << L",";
     stream << L"\"catalog_update_attempted\":" << (result.CatalogUpdateAttempted ? L"true" : L"false") << L",";
     stream << L"\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},";
@@ -2067,6 +2248,11 @@ std::wstring BuildByovdScanJson(const ByovdScanResult& result)
         stream << L"\"yara_error\":\"" << JsonEscape(record.YaraError) << L"\",";
         stream << L"\"yara_scanned\":" << (record.YaraScanned ? L"true" : L"false") << L",";
         stream << L"\"yara_timed_out\":" << (record.YaraTimedOut ? L"true" : L"false") << L",";
+        stream << L"\"authenticode_attempted\":" << (record.AuthenticodeAttempted ? L"true" : L"false") << L",";
+        stream << L"\"authenticode_signed\":" << (record.AuthenticodeSigned ? L"true" : L"false") << L",";
+        stream << L"\"authenticode_trusted\":" << (record.AuthenticodeTrusted ? L"true" : L"false") << L",";
+        stream << L"\"authenticode_signer\":\"" << JsonEscape(record.AuthenticodeSigner) << L"\",";
+        stream << L"\"authenticode_error\":\"" << JsonEscape(record.AuthenticodeError) << L"\",";
         stream << L"\"matches\":[";
         for (size_t m = 0; m < record.Matches.size(); ++m)
         {

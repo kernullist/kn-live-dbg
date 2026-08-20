@@ -3,8 +3,10 @@
 #include "../shared/KnLiveDbgIoctl.h"
 
 #include <Windows.h>
+#include <Zydis.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <iomanip>
@@ -1805,6 +1807,911 @@ namespace
 
         return ok;
     }
+
+    constexpr uint64_t kImageOrdinalFlag64 = 0x8000000000000000ull;
+    constexpr uint32_t kMaxIatDescriptors = 64;
+    constexpr uint32_t kMaxIatThunksPerDescriptor = 256;
+    constexpr uint32_t kMaxDeviceChain = 32;
+    constexpr uint32_t kPrologueBytes = 64;
+    constexpr uint32_t kPrologueInstructions = 8;
+
+    std::wstring StemImageName(const std::wstring& value)
+    {
+        std::wstring name = ToLowerCopy(value);
+        size_t slash = name.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+        {
+            name = name.substr(slash + 1);
+        }
+        size_t dot = name.find_last_of(L'.');
+        if (dot != std::wstring::npos)
+        {
+            name = name.substr(0, dot);
+        }
+        return name;
+    }
+
+    bool IsExpectedImportOwner(const std::wstring& importDll, const std::wstring& targetModule)
+    {
+        bool expected = false;
+
+        do
+        {
+            if (targetModule.empty())
+            {
+                break;
+            }
+
+            const std::wstring importStem = StemImageName(importDll);
+            const std::wstring targetStem = StemImageName(targetModule);
+            if (!importStem.empty() && importStem == targetStem)
+            {
+                expected = true;
+                break;
+            }
+
+            // Kernel import forwarding lands in these images on a clean host.
+            expected =
+                targetStem == L"ntoskrnl" ||
+                targetStem == L"ntkrnlmp" ||
+                targetStem == L"ntkrnlpa" ||
+                targetStem == L"hal" ||
+                targetStem == L"halmacpi" ||
+                targetStem == L"wdf01000" ||
+                targetStem == L"wdfldr" ||
+                targetStem == L"fltmgr" ||
+                targetStem == L"ci" ||
+                targetStem == L"cng" ||
+                targetStem == L"ksecdd" ||
+                targetStem == L"netio" ||
+                targetStem == L"ndis" ||
+                targetStem == L"fwpkclnt" ||
+                targetStem == L"tcpip" ||
+                targetStem == L"storport" ||
+                targetStem == L"scsiport" ||
+                targetStem == L"classpnp" ||
+                targetStem == L"hidclass" ||
+                targetStem == L"hidparse" ||
+                targetStem == L"wmilib" ||
+                targetStem == L"wpprecorder" ||
+                targetStem == L"msrpc" ||
+                targetStem == L"kdcom" ||
+                targetStem == L"bootvid" ||
+                targetStem == L"pci" ||
+                targetStem == L"acpi" ||
+                targetStem == L"nt";
+        } while (false);
+
+        return expected;
+    }
+
+    bool PushUniqueAddress(
+        std::vector<uint64_t>* visited,
+        uint64_t value,
+        uint32_t maxCount,
+        bool* cycle)
+    {
+        bool added = false;
+
+        do
+        {
+            if (visited == nullptr || value == 0)
+            {
+                break;
+            }
+
+            for (uint64_t existing : *visited)
+            {
+                if (existing == value)
+                {
+                    if (cycle != nullptr)
+                    {
+                        *cycle = true;
+                    }
+                    break;
+                }
+            }
+            if (cycle != nullptr && *cycle)
+            {
+                break;
+            }
+            if (visited->size() >= maxCount)
+            {
+                break;
+            }
+
+            visited->push_back(value);
+            added = true;
+        } while (false);
+
+        return added;
+    }
+
+    bool ReadAsciiZ(
+        DeviceClient& device,
+        uint64_t address,
+        uint32_t maxBytes,
+        std::wstring* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr || address == 0 || maxBytes == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!ReadKernelBytes(device, address, maxBytes, &bytes, nullptr))
+            {
+                break;
+            }
+
+            std::wstring text;
+            for (uint8_t ch : bytes)
+            {
+                if (ch == 0)
+                {
+                    break;
+                }
+                if (ch < 0x20 || ch > 0x7e)
+                {
+                    text.push_back(L'?');
+                }
+                else
+                {
+                    text.push_back(static_cast<wchar_t>(ch));
+                }
+            }
+            *value = text;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void ScanModuleIat(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const KernelModuleInfo& module,
+        uint32_t importRva,
+        uint32_t importSize,
+        uint32_t sizeOfImage,
+        ModuleIntegrityRecord* record)
+    {
+        do
+        {
+            if (record == nullptr || importRva == 0 || importSize < sizeof(IMAGE_IMPORT_DESCRIPTOR))
+            {
+                break;
+            }
+            uint64_t importEnd = 0;
+            if (sizeOfImage != 0 &&
+                (importRva >= sizeOfImage ||
+                 !TryAdd(importRva, sizeof(IMAGE_IMPORT_DESCRIPTOR), &importEnd) ||
+                 importEnd > sizeOfImage))
+            {
+                AddRecordReason(record, L"iat_directory_outside_image", L"import directory RVA is outside SizeOfImage");
+                record->MismatchEvidence = true;
+                break;
+            }
+
+            uint64_t directoryAddress = 0;
+            if (!TryAdd(module.Base, importRva, &directoryAddress))
+            {
+                break;
+            }
+
+            uint32_t descriptorCount = importSize / static_cast<uint32_t>(sizeof(IMAGE_IMPORT_DESCRIPTOR));
+            if (descriptorCount > kMaxIatDescriptors)
+            {
+                descriptorCount = kMaxIatDescriptors;
+            }
+
+            for (uint32_t descriptorIndex = 0; descriptorIndex < descriptorCount; ++descriptorIndex)
+            {
+                uint64_t descriptorAddress = 0;
+                if (!TryAdd(
+                        directoryAddress,
+                        static_cast<uint64_t>(descriptorIndex) * sizeof(IMAGE_IMPORT_DESCRIPTOR),
+                        &descriptorAddress))
+                {
+                    break;
+                }
+
+                std::vector<uint8_t> descriptorBytes;
+                if (!ReadKernelBytes(
+                        device,
+                        descriptorAddress,
+                        static_cast<uint32_t>(sizeof(IMAGE_IMPORT_DESCRIPTOR)),
+                        &descriptorBytes,
+                        nullptr))
+                {
+                    AddRecordReason(record, L"iat_descriptor_unreadable", L"import descriptor read failed");
+                    record->IatEvidence = true;
+                    record->Suspicious = true;
+                    break;
+                }
+
+                IMAGE_IMPORT_DESCRIPTOR descriptor = {};
+                memcpy(&descriptor, descriptorBytes.data(), sizeof(descriptor));
+                if (descriptor.Name == 0 &&
+                    descriptor.FirstThunk == 0 &&
+                    descriptor.OriginalFirstThunk == 0)
+                {
+                    break;
+                }
+
+                std::wstring importDll;
+                uint64_t nameAddress = 0;
+                if (descriptor.Name != 0 &&
+                    TryAdd(module.Base, descriptor.Name, &nameAddress))
+                {
+                    ReadAsciiZ(device, nameAddress, 64, &importDll);
+                }
+
+                const uint32_t iatRva = descriptor.FirstThunk;
+                const uint32_t iltRva = descriptor.OriginalFirstThunk;
+                if (iatRva == 0)
+                {
+                    continue;
+                }
+
+                for (uint32_t thunkIndex = 0; thunkIndex < kMaxIatThunksPerDescriptor; ++thunkIndex)
+                {
+                    uint64_t thunkAddress = 0;
+                    uint64_t target = 0;
+                    if (!TryAdd(module.Base, iatRva, &thunkAddress) ||
+                        !TryAdd(thunkAddress, static_cast<uint64_t>(thunkIndex) * sizeof(uint64_t), &thunkAddress) ||
+                        !ReadKernelInteger(device, thunkAddress, sizeof(uint64_t), &target, nullptr))
+                    {
+                        break;
+                    }
+                    if (target == 0)
+                    {
+                        break;
+                    }
+                    if (thunkIndex + 1 == kMaxIatThunksPerDescriptor)
+                    {
+                        AddRecordReason(
+                            record,
+                            L"iat_thunk_cap",
+                            L"IAT thunk walk hit the per-descriptor safety cap");
+                    }
+
+                    ModuleIatRecord entry = {};
+                    entry.ImportDll = importDll;
+                    entry.ThunkAddress = thunkAddress;
+                    entry.Target = target;
+
+                    if (iltRva != 0)
+                    {
+                        uint64_t iltSlot = 0;
+                        uint64_t iltValue = 0;
+                        if (TryAdd(module.Base, iltRva, &iltSlot) &&
+                            TryAdd(iltSlot, static_cast<uint64_t>(thunkIndex) * sizeof(uint64_t), &iltSlot) &&
+                            ReadKernelInteger(device, iltSlot, sizeof(uint64_t), &iltValue, nullptr) &&
+                            iltValue != 0)
+                        {
+                            if ((iltValue & kImageOrdinalFlag64) != 0)
+                            {
+                                entry.ByOrdinal = true;
+                                entry.Ordinal = static_cast<uint32_t>(iltValue & 0xffffu);
+                            }
+                            else
+                            {
+                                uint64_t hintName = 0;
+                                if (TryAdd(module.Base, static_cast<uint32_t>(iltValue), &hintName))
+                                {
+                                    uint64_t nameField = 0;
+                                    if (TryAdd(hintName, 2, &nameField))
+                                    {
+                                        ReadAsciiZ(device, nameField, 96, &entry.FunctionName);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    AnnotatePointer(symbols, target, &entry.TargetModule, &entry.TargetSymbol);
+                    const KernelModuleInfo* owner = FindModuleForAddress(symbols.Modules(), target);
+                    if (owner == nullptr)
+                    {
+                        entry.Suspicious = true;
+                        entry.Notes = L"IAT thunk target is outside loaded kernel modules";
+                    }
+                    else if (!IsExpectedImportOwner(importDll, owner->ImageName))
+                    {
+                        entry.Suspicious = true;
+                        entry.Notes = L"IAT thunk target module does not match the imported DLL";
+                    }
+
+                    if (entry.Suspicious)
+                    {
+                        record->IatEvidence = true;
+                        record->Suspicious = true;
+                        AddUnique(&record->ReasonCodes, L"iat_hook");
+                        if (record->IatEntries.size() < 64)
+                        {
+                            record->IatEntries.push_back(entry);
+                        }
+                    }
+                    else if (record->IatEntries.size() < 8)
+                    {
+                        record->IatEntries.push_back(entry);
+                    }
+                }
+            }
+        } while (false);
+    }
+
+    bool RelativeBranchTarget(
+        const ZydisDisassembledInstruction& inst,
+        uint64_t address,
+        uint64_t* target)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (target == nullptr || inst.info.operand_count < 1)
+            {
+                break;
+            }
+            if (inst.operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE ||
+                !inst.operands[0].imm.is_relative)
+            {
+                break;
+            }
+
+            *target = address + inst.info.length + static_cast<uint64_t>(inst.operands[0].imm.value.s);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void ScanModulePrologue(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const KernelModuleInfo& module,
+        uint32_t entryRva,
+        uint32_t sizeOfImage,
+        ModuleIntegrityRecord* record)
+    {
+        do
+        {
+            if (record == nullptr || entryRva == 0)
+            {
+                break;
+            }
+            if (sizeOfImage != 0 && entryRva >= sizeOfImage)
+            {
+                AddRecordReason(record, L"entry_point_outside_image", L"AddressOfEntryPoint is outside SizeOfImage");
+                record->MismatchEvidence = true;
+                break;
+            }
+
+            uint64_t entryAddress = 0;
+            if (!TryAdd(module.Base, entryRva, &entryAddress))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!ReadKernelBytes(device, entryAddress, kPrologueBytes, &bytes, nullptr))
+            {
+                AddRecordReason(record, L"prologue_unreadable", L"AddressOfEntryPoint bytes were unreadable");
+                record->PrologueEvidence = true;
+                record->Suspicious = true;
+                break;
+            }
+
+            std::vector<ZydisDisassembledInstruction> decoded;
+            size_t offset = 0;
+            uint64_t pc = entryAddress;
+            for (uint32_t i = 0; i < kPrologueInstructions && offset < bytes.size(); ++i)
+            {
+                ZydisDisassembledInstruction inst = {};
+                ZyanStatus status = ZydisDisassembleIntel(
+                    ZYDIS_MACHINE_MODE_LONG_64,
+                    pc,
+                    bytes.data() + offset,
+                    bytes.size() - offset,
+                    &inst);
+                if (!ZYAN_SUCCESS(status) ||
+                    inst.info.length == 0 ||
+                    inst.info.length > 15 ||
+                    offset + inst.info.length > bytes.size())
+                {
+                    break;
+                }
+                decoded.push_back(inst);
+                offset += inst.info.length;
+                pc += inst.info.length;
+            }
+
+            if (decoded.empty())
+            {
+                break;
+            }
+
+            const KernelModuleInfo* owner = FindModuleForAddress(symbols.Modules(), entryAddress);
+            auto targetOutsideOwner = [&](uint64_t target) -> bool
+            {
+                if (owner == nullptr)
+                {
+                    return FindModuleForAddress(symbols.Modules(), target) == nullptr;
+                }
+                uint64_t end = 0;
+                return !TryAdd(owner->Base, owner->Size, &end) ||
+                    target < owner->Base ||
+                    target >= end;
+            };
+
+            const ZydisDisassembledInstruction& first = decoded[0];
+            if (first.info.mnemonic == ZYDIS_MNEMONIC_JMP)
+            {
+                ModulePrologueFinding finding = {};
+                finding.Address = entryAddress;
+                finding.Mnemonic = L"jmp";
+                uint64_t target = 0;
+                if (RelativeBranchTarget(first, entryAddress, &target))
+                {
+                    finding.HasTarget = true;
+                    finding.Target = target;
+                    AnnotatePointer(symbols, target, &finding.TargetModule, nullptr);
+                    if (targetOutsideOwner(target))
+                    {
+                        finding.Suspicious = true;
+                        finding.Reason = L"entry point JMP target is outside the owning module";
+                    }
+                    else
+                    {
+                        finding.Reason = L"entry point starts with JMP inside the owning module";
+                    }
+                }
+                else
+                {
+                    finding.Suspicious = true;
+                    finding.Reason = L"entry point starts with an indirect JMP trampoline";
+                }
+                if (finding.Suspicious)
+                {
+                    record->PrologueEvidence = true;
+                    record->Suspicious = true;
+                    AddUnique(&record->ReasonCodes, L"prologue_trampoline");
+                }
+                record->PrologueFindings.push_back(finding);
+            }
+            else if (first.info.mnemonic == ZYDIS_MNEMONIC_INT3 ||
+                     first.info.mnemonic == ZYDIS_MNEMONIC_UD2)
+            {
+                ModulePrologueFinding finding = {};
+                finding.Address = entryAddress;
+                finding.Mnemonic = first.info.mnemonic == ZYDIS_MNEMONIC_INT3 ? L"int3" : L"ud2";
+                finding.Suspicious = true;
+                finding.Reason = L"entry point replaced with a debug-trap instruction";
+                record->PrologueEvidence = true;
+                record->Suspicious = true;
+                AddUnique(&record->ReasonCodes, L"prologue_trap");
+                record->PrologueFindings.push_back(finding);
+            }
+
+            if (decoded.size() >= 2)
+            {
+                const ZydisDisassembledInstruction& a = decoded[0];
+                const ZydisDisassembledInstruction& b = decoded[1];
+                const bool movImm64 =
+                    a.info.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                    a.info.length == 10 &&
+                    a.info.operand_count >= 2 &&
+                    a.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    a.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+                const bool jmpReg =
+                    b.info.mnemonic == ZYDIS_MNEMONIC_JMP &&
+                    b.info.operand_count >= 1 &&
+                    b.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER;
+                if (movImm64 && jmpReg &&
+                    a.operands[0].reg.value == b.operands[0].reg.value)
+                {
+                    ModulePrologueFinding finding = {};
+                    finding.Address = entryAddress;
+                    finding.Mnemonic = L"mov-imm64+jmp-reg";
+                    finding.HasTarget = true;
+                    finding.Target = a.operands[1].imm.value.u;
+                    AnnotatePointer(symbols, finding.Target, &finding.TargetModule, nullptr);
+                    finding.Suspicious = targetOutsideOwner(finding.Target);
+                    finding.Reason = finding.Suspicious
+                        ? L"entry point matches mov-imm64+jmp-reg trampoline outside the owning module"
+                        : L"entry point matches mov-imm64+jmp-reg inside the owning module";
+                    if (finding.Suspicious)
+                    {
+                        record->PrologueEvidence = true;
+                        record->Suspicious = true;
+                        AddUnique(&record->ReasonCodes, L"prologue_trampoline");
+                    }
+                    record->PrologueFindings.push_back(finding);
+                }
+
+                const bool pushImm =
+                    a.info.mnemonic == ZYDIS_MNEMONIC_PUSH &&
+                    a.info.operand_count >= 1 &&
+                    a.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+                const bool retInst = b.info.mnemonic == ZYDIS_MNEMONIC_RET;
+                if (pushImm && retInst)
+                {
+                    ModulePrologueFinding finding = {};
+                    finding.Address = entryAddress;
+                    finding.Mnemonic = L"push-imm+ret";
+                    finding.HasTarget = true;
+                    finding.Target = a.operands[0].imm.is_signed
+                        ? static_cast<uint64_t>(static_cast<int64_t>(a.operands[0].imm.value.s))
+                        : a.operands[0].imm.value.u;
+                    AnnotatePointer(symbols, finding.Target, &finding.TargetModule, nullptr);
+                    finding.Suspicious = true;
+                    finding.Reason = L"entry point matches push-imm+ret trampoline";
+                    record->PrologueEvidence = true;
+                    record->Suspicious = true;
+                    AddUnique(&record->ReasonCodes, L"prologue_trampoline");
+                    record->PrologueFindings.push_back(finding);
+                }
+            }
+        } while (false);
+    }
+
+    struct DeviceObjectLayout
+    {
+        TypeFieldInfo DriverObject = {};
+        TypeFieldInfo NextDevice = {};
+        TypeFieldInfo AttachedDevice = {};
+        TypeFieldInfo DeviceExtension = {};
+        TypeFieldInfo DeviceObjectExtension = {};
+        TypeFieldInfo DeviceType = {};
+        TypeFieldInfo Characteristics = {};
+        TypeFieldInfo Flags = {};
+        TypeFieldInfo StackSize = {};
+        TypeFieldInfo DriverName = {};
+        TypeFieldInfo AttachedTo = {};
+        bool HasAttachedTo = false;
+        bool HasDriverName = false;
+    };
+
+    bool ResolveDeviceObjectLayout(SymbolEngine& symbols, DeviceObjectLayout* layout, std::wstring* error)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (layout == nullptr)
+            {
+                break;
+            }
+
+            *layout = DeviceObjectLayout{};
+            if (!FindField(symbols, L"nt!_DEVICE_OBJECT", {L"DriverObject"}, &layout->DriverObject) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"NextDevice"}, &layout->NextDevice) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"AttachedDevice"}, &layout->AttachedDevice) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"DeviceExtension"}, &layout->DeviceExtension) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"DeviceObjectExtension"}, &layout->DeviceObjectExtension) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"DeviceType"}, &layout->DeviceType) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"Characteristics"}, &layout->Characteristics) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"Flags"}, &layout->Flags) ||
+                !FindField(symbols, L"nt!_DEVICE_OBJECT", {L"StackSize"}, &layout->StackSize))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"_DEVICE_OBJECT field layout was not resolved";
+                }
+                break;
+            }
+
+            layout->HasDriverName =
+                FindField(symbols, L"nt!_DRIVER_OBJECT", {L"DriverName"}, &layout->DriverName);
+            layout->HasAttachedTo =
+                FindField(symbols, L"nt!_DEVOBJ_EXTENSION", {L"AttachedTo"}, &layout->AttachedTo);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadDeviceObjectRecord(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const DeviceObjectLayout& layout,
+        uint64_t deviceObject,
+        DeviceObjectRecord* record)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (record == nullptr || deviceObject == 0 || !IsKernelAddress(deviceObject))
+            {
+                break;
+            }
+
+            *record = DeviceObjectRecord{};
+            record->DeviceObject = deviceObject;
+            ReadFieldInteger(device, deviceObject, layout.DriverObject, sizeof(uint64_t), &record->DriverObject, nullptr);
+            ReadFieldInteger(device, deviceObject, layout.NextDevice, sizeof(uint64_t), &record->NextDevice, nullptr);
+            ReadFieldInteger(device, deviceObject, layout.AttachedDevice, sizeof(uint64_t), &record->AttachedDevice, nullptr);
+            ReadFieldInteger(device, deviceObject, layout.DeviceExtension, sizeof(uint64_t), &record->DeviceExtension, nullptr);
+            ReadFieldInteger(
+                device,
+                deviceObject,
+                layout.DeviceObjectExtension,
+                sizeof(uint64_t),
+                &record->DeviceObjectExtension,
+                nullptr);
+
+            uint64_t value = 0;
+            if (ReadFieldInteger(device, deviceObject, layout.DeviceType, sizeof(uint32_t), &value, nullptr))
+            {
+                record->DeviceType = static_cast<uint32_t>(value);
+            }
+            if (ReadFieldInteger(device, deviceObject, layout.Characteristics, sizeof(uint32_t), &value, nullptr))
+            {
+                record->Characteristics = static_cast<uint32_t>(value);
+            }
+            if (ReadFieldInteger(device, deviceObject, layout.Flags, sizeof(uint32_t), &value, nullptr))
+            {
+                record->Flags = static_cast<uint32_t>(value);
+            }
+            if (ReadFieldInteger(device, deviceObject, layout.StackSize, sizeof(uint8_t), &value, nullptr))
+            {
+                record->StackSize = static_cast<int32_t>(static_cast<int8_t>(value));
+            }
+
+            if (layout.HasAttachedTo &&
+                record->DeviceObjectExtension != 0 &&
+                IsKernelAddress(record->DeviceObjectExtension))
+            {
+                ReadFieldInteger(
+                    device,
+                    record->DeviceObjectExtension,
+                    layout.AttachedTo,
+                    sizeof(uint64_t),
+                    &record->AttachedTo,
+                    nullptr);
+            }
+
+            if (record->DriverObject != 0 && IsKernelAddress(record->DriverObject))
+            {
+                ObjectWalkContext ctx(device, symbols);
+                if (layout.HasDriverName)
+                {
+                    uint64_t nameAddress = 0;
+                    if (TryAdd(record->DriverObject, layout.DriverName.Offset, &nameAddress))
+                    {
+                        ctx.ReadUnicodeStringAt(nameAddress, &record->DriverName);
+                    }
+                }
+
+                uint64_t driverStart = 0;
+                TypeFieldInfo startField = {};
+                if (FindField(symbols, L"nt!_DRIVER_OBJECT", {L"DriverStart"}, &startField) &&
+                    ReadFieldInteger(device, record->DriverObject, startField, sizeof(uint64_t), &driverStart, nullptr) &&
+                    driverStart != 0)
+                {
+                    const KernelModuleInfo* owner = FindModuleForAddress(symbols.Modules(), driverStart);
+                    if (owner != nullptr)
+                    {
+                        record->DriverModule = owner->ImageName;
+                    }
+                    else
+                    {
+                        record->Suspicious = true;
+                        record->Notes = L"owning DRIVER_OBJECT.DriverStart is outside loaded modules";
+                    }
+                }
+            }
+
+            ObjectHeaderLayout headerLayout = {};
+            ObjectWalkContext ctx(device, symbols);
+            if (ResolveObjectHeaderLayout(ctx, &headerLayout))
+            {
+                uint64_t header = 0;
+                if (ComputeObjectHeader(headerLayout, deviceObject, &header))
+                {
+                    ReadObjectName(ctx, headerLayout, header, &record->DeviceName);
+                }
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool WalkDeviceStackInternal(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const DeviceObjectLayout& layout,
+        uint64_t startDevice,
+        DeviceStackResult* result)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            *result = DeviceStackResult{};
+            result->StartDevice = startDevice;
+            if (startDevice == 0 || !IsKernelAddress(startDevice))
+            {
+                result->Warnings.push_back(L"device object address is not kernel-canonical");
+                break;
+            }
+
+            std::vector<uint64_t> upward;
+            bool cycle = false;
+            uint64_t current = startDevice;
+            while (current != 0 &&
+                IsKernelAddress(current) &&
+                PushUniqueAddress(&upward, current, kMaxDeviceChain, &cycle))
+            {
+                DeviceObjectRecord record = {};
+                if (!ReadDeviceObjectRecord(device, symbols, layout, current, &record))
+                {
+                    result->Warnings.push_back(L"failed to read a device object on the attached-device walk");
+                    break;
+                }
+                current = record.AttachedDevice;
+            }
+            if (cycle)
+            {
+                result->CycleDetected = true;
+                result->Warnings.push_back(L"AttachedDevice walk hit a cycle");
+            }
+
+            std::vector<uint64_t> downward;
+            cycle = false;
+            current = startDevice;
+            if (layout.HasAttachedTo)
+            {
+                while (current != 0 &&
+                    IsKernelAddress(current) &&
+                    PushUniqueAddress(&downward, current, kMaxDeviceChain, &cycle))
+                {
+                    DeviceObjectRecord record = {};
+                    if (!ReadDeviceObjectRecord(device, symbols, layout, current, &record))
+                    {
+                        result->Warnings.push_back(L"failed to read a device object on the AttachedTo walk");
+                        break;
+                    }
+                    current = record.AttachedTo;
+                }
+                if (cycle)
+                {
+                    result->CycleDetected = true;
+                    result->Warnings.push_back(L"AttachedTo walk hit a cycle");
+                }
+            }
+            else
+            {
+                result->Warnings.push_back(L"_DEVOBJ_EXTENSION.AttachedTo was not resolved; lower stack is incomplete");
+            }
+
+            std::vector<uint64_t> ordered;
+            if (!upward.empty())
+            {
+                for (size_t i = upward.size(); i > 0; --i)
+                {
+                    ordered.push_back(upward[i - 1]);
+                }
+            }
+            if (downward.size() > 1)
+            {
+                for (size_t i = 1; i < downward.size(); ++i)
+                {
+                    bool exists = false;
+                    for (uint64_t existing : ordered)
+                    {
+                        if (existing == downward[i])
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists)
+                    {
+                        ordered.push_back(downward[i]);
+                    }
+                }
+            }
+
+            if (!ordered.empty())
+            {
+                result->TopDevice = ordered.front();
+            }
+
+            std::vector<uint64_t> seen;
+            for (uint64_t deviceAddress : ordered)
+            {
+                bool localCycle = false;
+                if (!PushUniqueAddress(&seen, deviceAddress, kMaxDeviceChain, &localCycle))
+                {
+                    if (localCycle)
+                    {
+                        result->CycleDetected = true;
+                    }
+                    continue;
+                }
+
+                DeviceObjectRecord record = {};
+                if (ReadDeviceObjectRecord(device, symbols, layout, deviceAddress, &record))
+                {
+                    result->Stack.push_back(record);
+                }
+            }
+
+            result->CoverageComplete =
+                !result->Stack.empty() &&
+                layout.HasAttachedTo &&
+                !result->CycleDetected;
+            ok = !result->Stack.empty();
+        } while (false);
+
+        return ok;
+    }
+
+    bool ParseKernelAddressFilter(const std::wstring& filter, uint64_t* address)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (address == nullptr || filter.empty())
+            {
+                break;
+            }
+
+            std::wstring text = filter;
+            if (text.size() >= 2 && text[0] == L'0' && (text[1] == L'x' || text[1] == L'X'))
+            {
+                text = text.substr(2);
+            }
+            if (text.find(L'`') != std::wstring::npos)
+            {
+                std::wstring compact;
+                for (wchar_t ch : text)
+                {
+                    if (ch != L'`')
+                    {
+                        compact.push_back(ch);
+                    }
+                }
+                text.swap(compact);
+            }
+            if (text.empty())
+            {
+                break;
+            }
+
+            wchar_t* end = nullptr;
+            unsigned long long parsed = wcstoull(text.c_str(), &end, 16);
+            if (end == text.c_str() || (end != nullptr && *end != L'\0'))
+            {
+                break;
+            }
+            if (parsed < kKernelSpaceMin)
+            {
+                break;
+            }
+
+            *address = static_cast<uint64_t>(parsed);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
 }
 
 IntegrityScanner::IntegrityScanner(DeviceClient& device, SymbolEngine& symbols) :
@@ -1851,6 +2758,8 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
             record.ImagePath = module.ImagePath;
             record.Base = module.Base;
             record.Size = module.Size;
+            uint32_t importRva = 0;
+            uint32_t importSize = 0;
 
             std::vector<uint8_t> headerBytes;
             std::wstring readError;
@@ -1958,7 +2867,15 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                 record.FileAlignment = optional->FileAlignment;
                                 record.NumberOfRvaAndSizes = optional->NumberOfRvaAndSizes;
                                 record.PreferredImageBase = optional->ImageBase;
+                                record.AddressOfEntryPoint = optional->AddressOfEntryPoint;
                                 record.OptionalHeaderOk = optional->Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+                                if (optional->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT)
+                                {
+                                    importRva =
+                                        optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                                    importSize =
+                                        optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+                                }
                                 if (optional->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
                                 {
                                     baserelocRva =
@@ -2668,6 +3585,28 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                 }
             }
 
+            if (options.ScanIat)
+            {
+                ScanModuleIat(
+                    device_,
+                    symbols_,
+                    module,
+                    importRva,
+                    importSize,
+                    record.SizeOfImage,
+                    &record);
+            }
+            if (options.ScanPrologue)
+            {
+                ScanModulePrologue(
+                    device_,
+                    symbols_,
+                    module,
+                    record.AddressOfEntryPoint,
+                    record.SizeOfImage,
+                    &record);
+            }
+
             if (record.MismatchEvidence)
             {
                 AddUnique(&record.ReasonCodes, L"module_mismatch");
@@ -2675,6 +3614,14 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
             if (record.WxEvidence)
             {
                 AddUnique(&record.ReasonCodes, L"module_wx");
+            }
+            if (record.IatEvidence)
+            {
+                AddUnique(&record.ReasonCodes, L"iat_hook");
+            }
+            if (record.PrologueEvidence)
+            {
+                AddUnique(&record.ReasonCodes, L"prologue_trampoline");
             }
             if (record.Suspicious)
             {
@@ -2687,6 +3634,14 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
             if (record.MismatchEvidence)
             {
                 ++result->MismatchModules;
+            }
+            if (record.IatEvidence)
+            {
+                ++result->IatModules;
+            }
+            if (record.PrologueEvidence)
+            {
+                ++result->PrologueModules;
             }
 
             const bool passesWx = !options.WxOnly || record.WxEvidence;
@@ -2884,6 +3839,226 @@ bool IntegrityScanner::ScanDrivers(const DriverIntegrityOptions& options, Driver
     return ok;
 }
 
+bool IntegrityScanner::InspectDeviceStack(
+    uint64_t deviceObject,
+    DeviceStackResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid device-stack result output";
+            }
+            break;
+        }
+
+        *result = DeviceStackResult{};
+        if (symbols_.Modules().empty())
+        {
+            if (!symbols_.LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        DeviceObjectLayout layout = {};
+        if (!ResolveDeviceObjectLayout(symbols_, &layout, error))
+        {
+            break;
+        }
+        if (!layout.HasAttachedTo)
+        {
+            result->Warnings.push_back(L"_DEVOBJ_EXTENSION.AttachedTo was not resolved");
+        }
+
+        if (!WalkDeviceStackInternal(device_, symbols_, layout, deviceObject, result))
+        {
+            if (error != nullptr && result->Warnings.empty())
+            {
+                *error = L"device stack walk failed";
+            }
+            else if (error != nullptr && !result->Warnings.empty())
+            {
+                *error = result->Warnings.front();
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool IntegrityScanner::InspectDriverObject(
+    const std::wstring& filter,
+    bool includeDispatch,
+    bool includeDevices,
+    DriverObjectInspectResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+    (void)includeDispatch;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid driver-object result output";
+            }
+            break;
+        }
+
+        *result = DriverObjectInspectResult{};
+        if (symbols_.Modules().empty())
+        {
+            if (!symbols_.LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        uint64_t address = 0;
+        const bool addressFilter = ParseKernelAddressFilter(filter, &address);
+
+        if (addressFilter)
+        {
+            TypeFieldInfo driverStart = {};
+            TypeFieldInfo driverSize = {};
+            TypeFieldInfo driverSection = {};
+            TypeFieldInfo deviceObject = {};
+            TypeFieldInfo fastIoDispatch = {};
+            TypeFieldInfo driverUnload = {};
+            TypeFieldInfo majorFunction = {};
+            if (!FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DriverStart"}, &driverStart) ||
+                !FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DriverSize"}, &driverSize) ||
+                !FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DriverSection"}, &driverSection) ||
+                !FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DeviceObject"}, &deviceObject) ||
+                !FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"FastIoDispatch"}, &fastIoDispatch) ||
+                !FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DriverUnload"}, &driverUnload) ||
+                !FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"MajorFunction"}, &majorFunction))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"_DRIVER_OBJECT field layout was not resolved";
+                }
+                break;
+            }
+
+            DirectoryObjectRecord object = {};
+            object.Body = address;
+            object.Path = L"\\Driver";
+            TypeFieldInfo driverName = {};
+            if (FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DriverName"}, &driverName))
+            {
+                ObjectWalkContext ctx(device_, symbols_);
+                uint64_t nameAddress = 0;
+                if (TryAdd(address, driverName.Offset, &nameAddress))
+                {
+                    ctx.ReadUnicodeStringAt(nameAddress, &object.Name);
+                }
+            }
+            if (object.Name.empty())
+            {
+                object.Name = Hex(address, 16);
+            }
+
+            DriverIntegrityRecord record = {};
+            if (ReadDriverRecord(
+                    device_,
+                    symbols_,
+                    object,
+                    driverStart,
+                    driverSize,
+                    driverSection,
+                    deviceObject,
+                    fastIoDispatch,
+                    driverUnload,
+                    majorFunction,
+                    &record))
+            {
+                result->Drivers.push_back(record);
+            }
+        }
+        else
+        {
+            DriverIntegrityOptions options = {};
+            options.DriverFilter = filter;
+            DriverIntegrityResult drivers = {};
+            if (!ScanDrivers(options, &drivers, error))
+            {
+                result->Warnings = drivers.Warnings;
+                break;
+            }
+            result->Warnings = drivers.Warnings;
+            result->Drivers = drivers.Records;
+        }
+
+        result->Found = !result->Drivers.empty();
+        if (!result->Found)
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver object was not found";
+            }
+            break;
+        }
+
+        if (includeDevices)
+        {
+            DeviceObjectLayout layout = {};
+            std::wstring layoutError;
+            if (!ResolveDeviceObjectLayout(symbols_, &layout, &layoutError))
+            {
+                result->Warnings.push_back(layoutError);
+            }
+            else
+            {
+                for (const DriverIntegrityRecord& driver : result->Drivers)
+                {
+                    std::vector<uint64_t> visited;
+                    bool cycle = false;
+                    uint64_t current = driver.DeviceObject;
+                    while (current != 0 &&
+                        IsKernelAddress(current) &&
+                        PushUniqueAddress(&visited, current, kMaxDeviceChain, &cycle))
+                    {
+                        DeviceObjectRecord device = {};
+                        if (!ReadDeviceObjectRecord(device_, symbols_, layout, current, &device))
+                        {
+                            result->Warnings.push_back(L"failed to read a DEVICE_OBJECT on the NextDevice chain");
+                            break;
+                        }
+                        result->Devices.push_back(device);
+
+                        DeviceStackResult stack = {};
+                        if (WalkDeviceStackInternal(device_, symbols_, layout, current, &stack))
+                        {
+                            result->Stacks.push_back(stack);
+                        }
+                        current = device.NextDevice;
+                    }
+                    if (cycle)
+                    {
+                        result->Warnings.push_back(L"DRIVER_OBJECT.NextDevice walk hit a cycle");
+                    }
+                }
+            }
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
 {
     std::wstringstream json;
@@ -2909,6 +4084,8 @@ std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
          << L",\"suspicious_modules\":" << result.SuspiciousModules
          << L",\"wx_modules\":" << result.WxModules
          << L",\"mismatch_modules\":" << result.MismatchModules
+         << L",\"iat_modules\":" << result.IatModules
+         << L",\"prologue_modules\":" << result.PrologueModules
          << L",\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},\n";
     json << L"  \"warnings\":";
     writeStringArray(result.Warnings);
@@ -2941,7 +4118,10 @@ std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
              << L",\"suspicious\":" << (record.Suspicious ? L"true" : L"false")
              << L",\"wx_evidence\":" << (record.WxEvidence ? L"true" : L"false")
              << L",\"mismatch_evidence\":" << (record.MismatchEvidence ? L"true" : L"false")
-             << L",\"reason_codes\":";
+             << L",\"iat_evidence\":" << (record.IatEvidence ? L"true" : L"false")
+             << L",\"prologue_evidence\":" << (record.PrologueEvidence ? L"true" : L"false")
+             << L",\"entry_point_rva\":\"" << Hex(record.AddressOfEntryPoint)
+             << L"\",\"reason_codes\":";
         writeStringArray(record.ReasonCodes);
         json << L",\"info_codes\":";
         writeStringArray(record.InfoCodes);
@@ -2990,6 +4170,42 @@ std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
                  << L"\",\"reason_codes\":";
             writeStringArray(section.ReasonCodes);
             json << L",\"notes\":\"" << JsonEscape(section.Notes) << L"\"}";
+        }
+        json << L"],\"iat\":[";
+        for (size_t t = 0; t < record.IatEntries.size(); ++t)
+        {
+            const ModuleIatRecord& iat = record.IatEntries[t];
+            if (t != 0)
+            {
+                json << L",";
+            }
+            json << L"{\"dll\":\"" << JsonEscape(iat.ImportDll)
+                 << L"\",\"function\":\"" << JsonEscape(iat.FunctionName)
+                 << L"\",\"ordinal\":" << iat.Ordinal
+                 << L",\"thunk\":\"" << Hex(iat.ThunkAddress, 16)
+                 << L"\",\"target\":\"" << Hex(iat.Target, 16)
+                 << L"\",\"target_module\":\"" << JsonEscape(iat.TargetModule)
+                 << L"\",\"target_symbol\":\"" << JsonEscape(iat.TargetSymbol)
+                 << L"\",\"by_ordinal\":" << (iat.ByOrdinal ? L"true" : L"false")
+                 << L",\"suspicious\":" << (iat.Suspicious ? L"true" : L"false")
+                 << L",\"notes\":\"" << JsonEscape(iat.Notes) << L"\"}";
+        }
+        json << L"],\"prologue\":[";
+        for (size_t p = 0; p < record.PrologueFindings.size(); ++p)
+        {
+            const ModulePrologueFinding& finding = record.PrologueFindings[p];
+            if (p != 0)
+            {
+                json << L",";
+            }
+            json << L"{\"address\":\"" << Hex(finding.Address, 16)
+                 << L"\",\"mnemonic\":\"" << JsonEscape(finding.Mnemonic)
+                 << L"\",\"reason\":\"" << JsonEscape(finding.Reason)
+                 << L"\",\"target\":\"" << Hex(finding.Target, 16)
+                 << L"\",\"target_module\":\"" << JsonEscape(finding.TargetModule)
+                 << L"\",\"has_target\":" << (finding.HasTarget ? L"true" : L"false")
+                 << L",\"suspicious\":" << (finding.Suspicious ? L"true" : L"false")
+                 << L"}";
         }
         json << L"]}";
         if (i + 1 != result.Records.size())
@@ -3051,4 +4267,180 @@ std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result)
     json << L"  ]\n";
     json << L"}\n";
     return json.str();
+}
+
+std::wstring BuildDeviceStackJson(const DeviceStackResult& result)
+{
+    std::wstringstream json;
+    json << L"{\n";
+    json << L"  \"schema\":\"kn-live-dbg.device-stack.v1\",\n";
+    json << L"  \"start\":\"" << Hex(result.StartDevice, 16) << L"\",\n";
+    json << L"  \"top\":\"" << Hex(result.TopDevice, 16) << L"\",\n";
+    json << L"  \"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false") << L",\n";
+    json << L"  \"cycle_detected\":" << (result.CycleDetected ? L"true" : L"false") << L",\n";
+    json << L"  \"warnings\":[";
+    for (size_t i = 0; i < result.Warnings.size(); ++i)
+    {
+        if (i != 0)
+        {
+            json << L",";
+        }
+        json << L"\"" << JsonEscape(result.Warnings[i]) << L"\"";
+    }
+    json << L"],\n  \"stack\":[";
+    for (size_t i = 0; i < result.Stack.size(); ++i)
+    {
+        const DeviceObjectRecord& device = result.Stack[i];
+        if (i != 0)
+        {
+            json << L",";
+        }
+        json << L"{\"device\":\"" << Hex(device.DeviceObject, 16)
+             << L"\",\"driver\":\"" << Hex(device.DriverObject, 16)
+             << L"\",\"driver_name\":\"" << JsonEscape(device.DriverName)
+             << L"\",\"driver_module\":\"" << JsonEscape(device.DriverModule)
+             << L"\",\"device_name\":\"" << JsonEscape(device.DeviceName)
+             << L"\",\"next\":\"" << Hex(device.NextDevice, 16)
+             << L"\",\"attached\":\"" << Hex(device.AttachedDevice, 16)
+             << L"\",\"attached_to\":\"" << Hex(device.AttachedTo, 16)
+             << L"\",\"device_type\":" << device.DeviceType
+             << L",\"suspicious\":" << (device.Suspicious ? L"true" : L"false")
+             << L",\"notes\":\"" << JsonEscape(device.Notes) << L"\"}";
+    }
+    json << L"]\n}\n";
+    return json.str();
+}
+
+std::wstring BuildDriverObjectJson(const DriverObjectInspectResult& result)
+{
+    std::wstringstream json;
+    json << L"{\n";
+    json << L"  \"schema\":\"kn-live-dbg.drvobj.v1\",\n";
+    json << L"  \"found\":" << (result.Found ? L"true" : L"false") << L",\n";
+    json << L"  \"warnings\":[";
+    for (size_t i = 0; i < result.Warnings.size(); ++i)
+    {
+        if (i != 0)
+        {
+            json << L",";
+        }
+        json << L"\"" << JsonEscape(result.Warnings[i]) << L"\"";
+    }
+    json << L"],\n";
+    DriverIntegrityResult drivers = {};
+    drivers.Records = result.Drivers;
+    drivers.MatchingDrivers = result.Drivers.size();
+    json << L"  \"drivers\":";
+    json << BuildDriverIntegrityJson(drivers);
+    json << L",\n  \"devices\":[";
+    for (size_t i = 0; i < result.Devices.size(); ++i)
+    {
+        const DeviceObjectRecord& device = result.Devices[i];
+        if (i != 0)
+        {
+            json << L",";
+        }
+        json << L"{\"device\":\"" << Hex(device.DeviceObject, 16)
+             << L"\",\"driver_name\":\"" << JsonEscape(device.DriverName)
+             << L"\",\"device_name\":\"" << JsonEscape(device.DeviceName)
+             << L"\",\"next\":\"" << Hex(device.NextDevice, 16)
+             << L"\",\"attached\":\"" << Hex(device.AttachedDevice, 16)
+             << L"\",\"suspicious\":" << (device.Suspicious ? L"true" : L"false") << L"}";
+    }
+    json << L"],\n  \"stacks\":[";
+    for (size_t i = 0; i < result.Stacks.size(); ++i)
+    {
+        if (i != 0)
+        {
+            json << L",";
+        }
+        json << BuildDeviceStackJson(result.Stacks[i]);
+    }
+    json << L"]\n}\n";
+    return json.str();
+}
+
+bool IntegrityIatOwnerSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        if (!IsExpectedImportOwner(L"ntoskrnl.exe", L"ntoskrnl.exe"))
+        {
+            break;
+        }
+        if (!IsExpectedImportOwner(L"HAL.dll", L"hal.dll"))
+        {
+            break;
+        }
+        if (IsExpectedImportOwner(L"ntoskrnl.exe", L"cheat.sys"))
+        {
+            break;
+        }
+        if (IsExpectedImportOwner(L"fltmgr.sys", L""))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool IntegrityProloguePatternSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        uint64_t parsed = 0;
+        if (!ParseKernelAddressFilter(L"0xfffff80012340000", &parsed) ||
+            parsed != 0xfffff80012340000ull)
+        {
+            break;
+        }
+        if (ParseKernelAddressFilter(L"ntoskrnl", &parsed))
+        {
+            break;
+        }
+        if (ParseKernelAddressFilter(L"0x1234", &parsed))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DeviceStackWalkSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        std::vector<uint64_t> visited;
+        bool cycle = false;
+        if (!PushUniqueAddress(&visited, 0xfffffa8012340000ull, 4, &cycle) || cycle)
+        {
+            break;
+        }
+        if (PushUniqueAddress(&visited, 0xfffffa8012340000ull, 4, &cycle) || !cycle)
+        {
+            break;
+        }
+        cycle = false;
+        if (!PushUniqueAddress(&visited, 0xfffffa8012341000ull, 4, &cycle))
+        {
+            break;
+        }
+        if (visited.size() != 2)
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
 }

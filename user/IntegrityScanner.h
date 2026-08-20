@@ -56,6 +56,31 @@ struct ModuleIntegritySectionRecord
     std::vector<std::wstring> ReasonCodes;
 };
 
+struct ModuleIatRecord
+{
+    std::wstring ImportDll;
+    std::wstring FunctionName;
+    uint32_t Ordinal = 0;
+    uint64_t ThunkAddress = 0;
+    uint64_t Target = 0;
+    std::wstring TargetModule;
+    std::wstring TargetSymbol;
+    bool ByOrdinal = false;
+    bool Suspicious = false;
+    std::wstring Notes;
+};
+
+struct ModulePrologueFinding
+{
+    uint64_t Address = 0;
+    std::wstring Mnemonic;
+    std::wstring Reason;
+    uint64_t Target = 0;
+    std::wstring TargetModule;
+    bool HasTarget = false;
+    bool Suspicious = false;
+};
+
 struct ModuleIntegrityRecord
 {
     std::wstring ImageName;
@@ -67,6 +92,7 @@ struct ModuleIntegrityRecord
     uint32_t SectionAlignment = 0;
     uint32_t FileAlignment = 0;
     uint32_t NumberOfRvaAndSizes = 0;
+    uint32_t AddressOfEntryPoint = 0;
     uint64_t PreferredImageBase = 0;
     uint16_t Machine = 0;
     uint16_t OptionalHeaderMagic = 0;
@@ -81,10 +107,14 @@ struct ModuleIntegrityRecord
     bool Suspicious = false;
     bool WxEvidence = false;
     bool MismatchEvidence = false;
+    bool IatEvidence = false;
+    bool PrologueEvidence = false;
     std::wstring Notes;
     std::vector<std::wstring> ReasonCodes;
     std::vector<std::wstring> InfoCodes;
     std::vector<ModuleIntegritySectionRecord> Sections;
+    std::vector<ModuleIatRecord> IatEntries;
+    std::vector<ModulePrologueFinding> PrologueFindings;
 };
 
 struct ModuleIntegrityOptions
@@ -101,6 +131,11 @@ struct ModuleIntegrityOptions
     // Additive: never disables existing W+X / header checks.
     bool CompareDiskPages = false;
     uint32_t DiskPagesPerSection = 2; // first + one interior sample by default
+    // Walk IMAGE_DIRECTORY_ENTRY_IMPORT and flag IAT thunks whose live
+    // targets sit outside loaded modules or unexpected owners.
+    bool ScanIat = false;
+    // Disassemble AddressOfEntryPoint and flag trampoline / debug-trap heads.
+    bool ScanPrologue = false;
 };
 
 struct ModuleIntegrityResult
@@ -113,6 +148,8 @@ struct ModuleIntegrityResult
     uint64_t SuspiciousModules = 0;
     uint64_t WxModules = 0;
     uint64_t MismatchModules = 0;
+    uint64_t IatModules = 0;
+    uint64_t PrologueModules = 0;
     bool Truncated = false;
 };
 
@@ -165,6 +202,45 @@ struct DriverIntegrityResult
     bool Truncated = false;
 };
 
+struct DeviceObjectRecord
+{
+    uint64_t DeviceObject = 0;
+    uint64_t DriverObject = 0;
+    uint64_t NextDevice = 0;
+    uint64_t AttachedDevice = 0;
+    uint64_t AttachedTo = 0;
+    uint64_t DeviceExtension = 0;
+    uint64_t DeviceObjectExtension = 0;
+    uint32_t DeviceType = 0;
+    uint32_t Characteristics = 0;
+    uint32_t Flags = 0;
+    int32_t StackSize = 0;
+    std::wstring DriverName;
+    std::wstring DriverModule;
+    std::wstring DeviceName;
+    std::wstring Notes;
+    bool Suspicious = false;
+};
+
+struct DeviceStackResult
+{
+    uint64_t StartDevice = 0;
+    uint64_t TopDevice = 0;
+    std::vector<DeviceObjectRecord> Stack;
+    std::vector<std::wstring> Warnings;
+    bool CoverageComplete = false;
+    bool CycleDetected = false;
+};
+
+struct DriverObjectInspectResult
+{
+    std::vector<DriverIntegrityRecord> Drivers;
+    std::vector<DeviceObjectRecord> Devices;
+    std::vector<DeviceStackResult> Stacks;
+    std::vector<std::wstring> Warnings;
+    bool Found = false;
+};
+
 class IntegrityScanner
 {
 public:
@@ -172,6 +248,13 @@ public:
 
     bool ScanModules(const ModuleIntegrityOptions& options, ModuleIntegrityResult* result, std::wstring* error);
     bool ScanDrivers(const DriverIntegrityOptions& options, DriverIntegrityResult* result, std::wstring* error);
+    bool InspectDriverObject(
+        const std::wstring& filter,
+        bool includeDispatch,
+        bool includeDevices,
+        DriverObjectInspectResult* result,
+        std::wstring* error);
+    bool InspectDeviceStack(uint64_t deviceObject, DeviceStackResult* result, std::wstring* error);
 
 private:
     DeviceClient& device_;
@@ -180,3 +263,8 @@ private:
 
 std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result);
 std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result);
+std::wstring BuildDriverObjectJson(const DriverObjectInspectResult& result);
+std::wstring BuildDeviceStackJson(const DeviceStackResult& result);
+bool IntegrityIatOwnerSelfTest();
+bool IntegrityProloguePatternSelfTest();
+bool DeviceStackWalkSelfTest();

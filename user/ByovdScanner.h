@@ -46,6 +46,11 @@ struct ByovdModuleRecord
     bool VersionRead = false;
     bool YaraScanned = false;
     bool YaraTimedOut = false;
+    bool AuthenticodeAttempted = false;
+    bool AuthenticodeSigned = false;
+    bool AuthenticodeTrusted = false;
+    std::wstring AuthenticodeSigner;
+    std::wstring AuthenticodeError;
     std::vector<ByovdMatch> Matches;
 };
 
@@ -55,6 +60,7 @@ struct ByovdScanOptions
     bool ForceUpdate = false;
     bool ExactOnly = false;
     bool EnableYara = false;
+    bool CheckAuthenticode = true;
     bool Verbose = false;
     bool SummaryOnly = false;
     uint32_t Limit = 0;
@@ -77,6 +83,10 @@ struct ByovdScanResult
     uint64_t YaraMatches = 0;
     uint64_t YaraFailures = 0;
     uint64_t YaraTimeouts = 0;
+    uint64_t AuthenticodeSigned = 0;
+    uint64_t AuthenticodeUnsigned = 0;
+    uint64_t AuthenticodeTrusted = 0;
+    uint64_t AuthenticodeFailures = 0;
     bool CatalogUpdated = false;
     bool CatalogUpdateAttempted = false;
     bool Truncated = false;

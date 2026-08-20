@@ -71,8 +71,12 @@ namespace
     const McpToolArg kArgsWnfDecode[] = { {L"hash", L"string", false}, {L"state", L"string", false}, {L"state_name", L"string", false} };
     const McpToolArg kArgsWnfList[] = { {L"scope", L"string", false} };
     const McpToolArg kArgsTi[] = { {L"action", L"string", false}, {L"count", L"string", false}, {L"pid", L"string", false}, {L"task", L"string", false}, {L"pattern", L"string", false} };
-    const McpToolArg kArgsModuleIntegrity[] = { {L"module", L"string", false}, {L"target", L"string", false}, {L"limit", L"string", false}, {L"summary", L"boolean", false}, {L"verbose", L"boolean", false}, {L"headers", L"boolean", false}, {L"sections", L"boolean", false}, {L"wx", L"boolean", false}, {L"mismatch", L"boolean", false} };
+    const McpToolArg kArgsModuleIntegrity[] = { {L"module", L"string", false}, {L"target", L"string", false}, {L"limit", L"string", false}, {L"summary", L"boolean", false}, {L"verbose", L"boolean", false}, {L"headers", L"boolean", false}, {L"sections", L"boolean", false}, {L"wx", L"boolean", false}, {L"mismatch", L"boolean", false}, {L"disk", L"boolean", false}, {L"iat", L"boolean", false}, {L"prologue", L"boolean", false} };
     const McpToolArg kArgsDriverIntegrity[] = { {L"driver", L"string", false}, {L"target", L"string", false}, {L"limit", L"string", false} };
+    const McpToolArg kArgsDriverObject[] = { {L"driver", L"string", false}, {L"name", L"string", false}, {L"target", L"string", false}, {L"address", L"string", false} };
+    const McpToolArg kArgsDeviceStack[] = { {L"address", L"string", false}, {L"va", L"string", false}, {L"device", L"string", false} };
+    const McpToolArg kArgsHandles[] = { {L"pid", L"string", false}, {L"target", L"string", false}, {L"limit", L"string", false} };
+    const McpToolArg kArgsDumpAnalyze[] = { {L"path", L"string", false}, {L"file", L"string", false} };
 
     // Write tools: lab-mode only, registered when --allow-write. Engine routes
     // each through the existing write-safety pipeline (preflight read, backup,
@@ -152,6 +156,15 @@ namespace
         { L"ti.query", L"Query the Threat-Intelligence ETW ring (recent/stats/by/grep).", true, MCP_ARG_TABLE(kArgsTi) },
         { L"module.integrity", L"Check loaded-module PE/section integrity and W+X evidence.", true, MCP_ARG_TABLE(kArgsModuleIntegrity) },
         { L"driver.integrity", L"Check DRIVER_OBJECT dispatch-table integrity.", true, MCP_ARG_TABLE(kArgsDriverIntegrity) },
+        { L"driver.object", L"Inspect one DRIVER_OBJECT and its DEVICE_OBJECT / attached-device chain.", true, MCP_ARG_TABLE(kArgsDriverObject) },
+        { L"device.stack", L"Walk a DEVICE_OBJECT AttachedDevice/AttachedTo stack.", true, MCP_ARG_TABLE(kArgsDeviceStack) },
+        { L"handles.list", L"Enumerate process handles and flag non-system VM/DUP access to another process.", true, MCP_ARG_TABLE(kArgsHandles) },
+        { L"hiddenproc.list", L"Cross-view hidden processes: ActiveProcessLinks vs SPI vs Toolhelp vs handle owners.", true, nullptr, 0 },
+        { L"wdfilter.list", L"Walk WdFilter RuntimeDriver leftovers that survive after a mapper unloads.", true, nullptr, 0 },
+        { L"inputstack.list", L"Walk keyboard/mouse class device stacks and flag unknown attached drivers.", true, nullptr, 0 },
+        { L"dma.posture", L"Report IOMMU firmware tables, Kernel DMA Protection, and removable PCI bus posture.", true, nullptr, 0 },
+        { L"hv.posture", L"Report hypervisor presence from CPUID, CR4.VMXE, and CPUID timing without FEATURE_CONTROL.", true, nullptr, 0 },
+        { L"dump.analyze", L"Parse a dump-kernel DUMP_HEADER64, physical runs, and loaded modules (4-level or LA57 5-level VA walk).", true, MCP_ARG_TABLE(kArgsDumpAnalyze) },
 
         { L"ssdt.scan", L"Detect SSDT / shadow-SSDT syscall hooks (routines outside the expected kernel image).", true, nullptr, 0 },
         { L"idt.scan", L"Detect IDT interrupt-gate hooks and per-CPU handler divergence.", true, nullptr, 0 },

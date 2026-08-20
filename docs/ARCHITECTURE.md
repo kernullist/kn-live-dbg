@@ -77,7 +77,19 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 8. Virtual and physical display commands perform sparse reads for dump output. Readable bytes are printed normally, while unreadable bytes keep the requested layout and are shown as `??` or `0x????...` for wider units.
 9. `phys`, `pdb`, `pdw`, `pdd`, `pdq`, `!db`, `!dw`, `!dd`, and `!dq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
 10. `peb`, `pew`, `ped`, `peq`, `!eb`, `!ew`, `!ed`, and `!eq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; address-only form prompts with the current physical value before writing, and write mode starts enabled and can be disabled with `write off`.
-11. `dump-kernel <path>` asks the driver for RAM runs, writes a WinDbg `DUMP_HEADER64`, then streams each run through `IOCTL_KNDBG_READ_PHYSICAL`. Failed pages are zero-filled unless `/strict` is set. `dump-live <path>` does not use the driver; it calls `NtSystemDebugControl(SysDbgGetLiveKernelDump)`. `dump-live /user <pid|eprocess>` walks that process DTB through the driver and writes a filtered complete dump, merging the KPTI user/kernel page-table root and retargeting CPU0 `CurrentThread` so WinDbg's default process is the target.
+11. `dump-kernel <path>` asks the driver for RAM runs, writes a WinDbg `DUMP_HEADER64`, then streams each run through `IOCTL_KNDBG_READ_PHYSICAL`. Failed pages are zero-filled unless `/strict` is set. `dump-live <path>` does not use the driver; it calls `NtSystemDebugControl(SysDbgGetLiveKernelDump)`. `dump-live /user <pid|eprocess>` walks that process DTB through the driver and writes a filtered complete dump, merging the KPTI user/kernel page-table root and retargeting CPU0 `CurrentThread` so WinDbg's default process is the target. `dump-analyze <path>` is offline: it parses the 8 KB header, lists physical runs, and walks `PsLoadedModuleList` through the dump DTB. Paging depth is CR4.LA57 from `ContextRecord` (when `KdSecondaryVersion=2` and `KSPECIAL_REGISTERS.Cr3` matches `DirectoryTableBase`) plus a 4-level/5-level probe of the module-list Flink/Blink, so LA57 dumps walk PML5. Non-AMD64 dumps skip VA translation. No extra IOCTL.
+
+## P0-P2 Investigation Surface Flow
+
+1. `!drvobj` / `!driver object` and `!devstack` walk `_DRIVER_OBJECT` device lists and `DEVICE_OBJECT.AttachedDevice` / `AttachedTo` stacks in user mode. `!driver list|integrity` enumerates `\Driver`.
+2. `!module integrity /disk /iat /prologue` compares live executable pages to disk, walks the live IAT, and disassembles `AddressOfEntryPoint` for trampoline heads.
+3. `!handles` uses `SystemExtendedHandleInformation` and flags non-system VM/DUP access to another process. Owner/target PIDs are decimal-first.
+4. `!hiddenproc` cross-views `ActiveProcessLinks`, `SystemProcessInformation`, Toolhelp, and handle owners. Full `PspCidTable` remains on `!hunt /deep`.
+5. `!wdfilter` walks WdFilter RuntimeDriver leftovers. `!inputstack` walks kbd/mou class attached stacks.
+6. `!vad` resolves `_SUBSECTION.ControlArea` and backing `FILE_OBJECT` names into VAD notes when PDB fields are available.
+7. `!dma` reports ACPI DMAR/IVRS, Kernel DMA Protection, and removable PCI buses. `!hv` reports CPUID hypervisor presence, CR4.VMXE, and CPUID timing; it does not read `IA32_FEATURE_CONTROL`.
+8. `!byovd` Authenticode verification is on by default; `/no-sign` skips it.
+9. `dump-analyze` is the offline dump DTB walker described in Physical Memory Flow item 11.
 
 ## Native Process Listing Flow
 

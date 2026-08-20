@@ -32,11 +32,35 @@ Completed core slices:
 
 Remaining priority order:
 
-1. Richer driver object, `!drvobj`, and device-stack inspection.
-2. WNF stabilization.
-3. Positive-control probe expansion.
-4. Module integrity hardening (disk/live hash, IAT, prologue trampoline).
-5. BYOVD signer/certificate validation.
+1. WNF stabilization.
+2. Positive-control probe expansion.
+
+## P0-P2 Investigation Surface (2026-08-20)
+
+Status: implemented (read-only user-mode scanners; no driver ABI change).
+IA32_FEATURE_CONTROL is not sampled (AMD #GP). Full PspCidTable remains on
+`!hunt /deep`.
+
+P0:
+
+1. `!driver list|object|integrity`, `!drvobj`, `!devstack`.
+2. `!module integrity /disk /iat /prologue`.
+3. `!handles` process-handle VM/DUP triage.
+
+P1:
+
+1. `!token` TokenType / SessionId / integrity-level SID.
+2. `!hiddenproc` ActiveProcessLinks x SPI x Toolhelp x handle owners.
+3. `!wdfilter` RuntimeDriver leftovers.
+4. `!inputstack` kbd/mou class attached stacks.
+5. `!vad` ControlArea / FILE_OBJECT section owner.
+
+P2:
+
+1. `!dma` DMAR/IVRS, Kernel DMA Protection, removable PCI buses.
+2. `!hv` CPUID hypervisor bit, VMX/SVM, CR4.VMXE, CPUID timing.
+3. `dump-analyze` DUMP_HEADER64 + physical runs + PsLoadedModuleList + 4/5-level (LA57) VA walk. Help, Tab completion, README, architecture, and WinDbg coverage include PML4/PML5 detection.
+4. `!byovd` Authenticode (`/sign` default, `/no-sign` to skip).
 
 ## Phase 2 Quiet Surfaces (2026-08-11)
 
@@ -121,10 +145,12 @@ Operational value:
 
 Add native `!driver`, `!drvobj`, and `!devstack` commands.
 
-Status: initial dispatch-integrity slice is implemented as
-`!driver integrity [driver|all] [/limit <n>] [/json <path>]` and exposed to
-the AI router as `driver.integrity`. Remaining work is the richer `list`,
-`object`, `!drvobj`, and `!devstack` surface.
+Status: implemented. `!driver list|object|integrity`, `!drvobj`, and
+`!devstack` walk `\Driver`, decode `_DRIVER_OBJECT` through PDB-resolved
+fields, and walk `DEVICE_OBJECT.NextDevice` plus AttachedDevice/AttachedTo
+with cycle guards. JSON schemas: `kn-live-dbg.driver-integrity.v1`,
+`kn-live-dbg.drvobj.v1`, `kn-live-dbg.device-stack.v1`. MCP tools:
+`driver.integrity`, `driver.object`, `device.stack`.
 
 Target shape:
 
