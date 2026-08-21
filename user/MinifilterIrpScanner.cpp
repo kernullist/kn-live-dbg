@@ -67,6 +67,7 @@ namespace
         const MinifilterLayout& layout,
         const std::vector<uint64_t>& instances);
     void InferCallbackNodeArray(SymbolEngine& symbols, MinifilterLayout* layout);
+    bool IsNopThunk(uint64_t address);
 
     struct IrpBackupKey
     {
@@ -102,7 +103,9 @@ namespace
     std::mutex g_BackupLock;
     std::map<IrpBackupKey, IrpBackupValue> g_Backups;
     std::map<uint64_t, LiveNodeBackup> g_NodeBackups;
-    uint64_t g_FltNopThunk = 0;
+    uint64_t g_FltPreNopThunk = 0;
+    uint64_t g_FltPostNopThunk = 0;
+    uint64_t g_FltLegacyPostNopThunk = 0;
 
     uint32_t CountNodeBackupsForFilter(uint64_t filter)
     {
@@ -192,7 +195,7 @@ namespace
                 index += 2;
                 continue;
             }
-            if (bytes[index] == 0x90 || bytes[index] == 0xcc)
+            if (bytes[index] == 0x90)
             {
                 ++index;
                 continue;
@@ -202,42 +205,237 @@ namespace
         return index;
     }
 
-    bool BytesAreReturnZero(const uint8_t* bytes, size_t length)
+    bool BytesAreReturnImmediate(const uint8_t* bytes, size_t length, uint32_t value)
     {
         bool match = false;
-        if (bytes != nullptr && length >= 3)
+        do
         {
-            const size_t prefix = SkipIcallPrefixes(bytes, length);
-            if (prefix < length)
+            if (bytes == nullptr || length < 3 || (value != 0 && value != 1))
             {
-                const uint8_t* body = bytes + prefix;
-                const size_t remaining = length - prefix;
+                break;
+            }
+
+            const size_t prefix = SkipIcallPrefixes(bytes, length);
+            if (prefix >= length)
+            {
+                break;
+            }
+
+            const uint8_t* body = bytes + prefix;
+            const size_t remaining = length - prefix;
+            if (value == 0)
+            {
                 if (remaining >= 3 &&
                     ((body[0] == 0x33 && body[1] == 0xc0 && body[2] == 0xc3) ||
                      (body[0] == 0x31 && body[1] == 0xc0 && body[2] == 0xc3)))
                 {
                     match = true;
+                    break;
                 }
-                else if (remaining >= 4 &&
-                         body[0] == 0x48 &&
-                         (body[1] == 0x33 || body[1] == 0x31) &&
-                         body[2] == 0xc0 &&
-                         body[3] == 0xc3)
+                if (remaining >= 4 &&
+                    body[0] == 0x48 &&
+                    (body[1] == 0x33 || body[1] == 0x31) &&
+                    body[2] == 0xc0 &&
+                    body[3] == 0xc3)
                 {
                     match = true;
+                    break;
                 }
-                else if (remaining >= 6 &&
-                         body[0] == 0xb8 &&
-                         body[1] == 0x00 &&
-                         body[2] == 0x00 &&
-                         body[3] == 0x00 &&
-                         body[4] == 0x00 &&
-                         body[5] == 0xc3)
+                if (remaining >= 6 &&
+                    body[0] == 0xb8 &&
+                    body[1] == 0x00 &&
+                    body[2] == 0x00 &&
+                    body[3] == 0x00 &&
+                    body[4] == 0x00 &&
+                    body[5] == 0xc3)
                 {
                     match = true;
+                    break;
                 }
+                break;
             }
-        }
+
+            // FLT_PREOP_SUCCESS_NO_CALLBACK == 1
+            if (remaining >= 6 &&
+                body[0] == 0xb8 &&
+                body[1] == 0x01 &&
+                body[2] == 0x00 &&
+                body[3] == 0x00 &&
+                body[4] == 0x00 &&
+                body[5] == 0xc3)
+            {
+                match = true;
+                break;
+            }
+            if (remaining >= 5 &&
+                (body[0] == 0x33 || body[0] == 0x31) &&
+                body[1] == 0xc0 &&
+                body[2] == 0xff &&
+                body[3] == 0xc0 &&
+                body[4] == 0xc3)
+            {
+                match = true;
+                break;
+            }
+            if (remaining >= 4 &&
+                body[0] == 0x6a &&
+                body[1] == 0x01 &&
+                body[2] == 0x58 &&
+                body[3] == 0xc3)
+            {
+                match = true;
+                break;
+            }
+            if (remaining >= 6 &&
+                body[0] == 0x48 &&
+                (body[1] == 0x33 || body[1] == 0x31) &&
+                body[2] == 0xc0 &&
+                body[3] == 0xff &&
+                body[4] == 0xc0 &&
+                body[5] == 0xc3)
+            {
+                match = true;
+                break;
+            }
+            if (remaining >= 11 &&
+                body[0] == 0x48 &&
+                body[1] == 0xb8 &&
+                body[2] == 0x01 &&
+                body[3] == 0x00 &&
+                body[4] == 0x00 &&
+                body[5] == 0x00 &&
+                body[6] == 0x00 &&
+                body[7] == 0x00 &&
+                body[8] == 0x00 &&
+                body[9] == 0x00 &&
+                body[10] == 0xc3)
+            {
+                match = true;
+                break;
+            }
+        } while (false);
+        return match;
+    }
+
+    bool BytesAreReturnZero(const uint8_t* bytes, size_t length)
+    {
+        return BytesAreReturnImmediate(bytes, length, 0);
+    }
+
+    bool BytesAreReturnOne(const uint8_t* bytes, size_t length)
+    {
+        return BytesAreReturnImmediate(bytes, length, 1);
+    }
+
+    bool DecodeRelJmpTarget(
+        const uint8_t* bytes,
+        size_t length,
+        uint64_t ip,
+        uint64_t* target)
+    {
+        bool ok = false;
+        do
+        {
+            if (bytes == nullptr || target == nullptr)
+            {
+                break;
+            }
+            if (length >= 5 && bytes[0] == 0xe9)
+            {
+                int32_t relative = 0;
+                memcpy(&relative, bytes + 1, sizeof(relative));
+                *target = ip + 5ull + static_cast<uint64_t>(static_cast<int64_t>(relative));
+                ok = LeftoverIsKernelCanonical(*target);
+                break;
+            }
+            if (length >= 2 && bytes[0] == 0xeb)
+            {
+                const int8_t relative = static_cast<int8_t>(bytes[1]);
+                *target = ip + 2ull + static_cast<uint64_t>(static_cast<int64_t>(relative));
+                ok = LeftoverIsKernelCanonical(*target);
+                break;
+            }
+        } while (false);
+        return ok;
+    }
+
+    bool ReadThunkCode(
+        DeviceClient& device,
+        uint64_t address,
+        std::vector<uint8_t>* bytes)
+    {
+        bool ok = false;
+        do
+        {
+            if (bytes == nullptr ||
+                address == 0 ||
+                !LeftoverIsKernelCanonical(address))
+            {
+                break;
+            }
+            if (!device.ReadMemory(
+                    address,
+                    32,
+                    bytes,
+                    nullptr,
+                    KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK) ||
+                bytes->size() < 3)
+            {
+                break;
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool CodeLooksLikeReturnValue(
+        const uint8_t* bytes,
+        size_t length,
+        uint64_t address,
+        uint32_t value,
+        DeviceClient* device)
+    {
+        bool match = false;
+        do
+        {
+            if (bytes == nullptr ||
+                length < 2 ||
+                (value != 0 && value != 1))
+            {
+                break;
+            }
+            if (BytesAreReturnImmediate(bytes, length, value))
+            {
+                match = true;
+                break;
+            }
+
+            const size_t prefix = SkipIcallPrefixes(bytes, length);
+            if (prefix >= length)
+            {
+                break;
+            }
+            uint64_t target = 0;
+            if (!DecodeRelJmpTarget(
+                    bytes + prefix,
+                    length - prefix,
+                    address + prefix,
+                    &target))
+            {
+                break;
+            }
+            if (device == nullptr)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> targetBytes;
+            if (!ReadThunkCode(*device, target, &targetBytes))
+            {
+                break;
+            }
+            match = BytesAreReturnImmediate(targetBytes.data(), targetBytes.size(), value);
+        } while (false);
         return match;
     }
 
@@ -523,12 +721,13 @@ namespace
     bool FindDriverNopExport(
         DeviceClient& device,
         SymbolEngine& symbols,
+        const char* exportName,
         uint64_t* address)
     {
         bool ok = false;
         do
         {
-            if (address == nullptr)
+            if (address == nullptr || exportName == nullptr || exportName[0] == 0)
             {
                 break;
             }
@@ -544,7 +743,7 @@ namespace
                         device,
                         module.Base,
                         module.Size,
-                        "KnDbgMinifilterCallbackNop",
+                        exportName,
                         address))
                 {
                     ok = true;
@@ -555,16 +754,21 @@ namespace
         return ok;
     }
 
-    bool FindGuardCfReturnZero(
+    bool FindGuardCfReturnImmediate(
         DeviceClient& device,
         uint64_t moduleBase,
         uint64_t moduleSize,
+        uint32_t value,
+        uint64_t exclude,
         uint64_t* thunk)
     {
         bool ok = false;
         do
         {
-            if (thunk == nullptr || moduleBase == 0 || moduleSize < 0x400)
+            if (thunk == nullptr ||
+                moduleBase == 0 ||
+                moduleSize < 0x400 ||
+                (value != 0 && value != 1))
             {
                 break;
             }
@@ -667,7 +871,8 @@ namespace
                     }
 
                     uint64_t codeVa = 0;
-                    if (!LeftoverTryAdd(moduleBase, rva, &codeVa))
+                    if (!LeftoverTryAdd(moduleBase, rva, &codeVa) ||
+                        codeVa == exclude)
                     {
                         continue;
                     }
@@ -683,7 +888,7 @@ namespace
                     {
                         continue;
                     }
-                    if (BytesAreReturnZero(bytes.data(), bytes.size()))
+                    if (BytesAreReturnImmediate(bytes.data(), bytes.size(), value))
                     {
                         *thunk = codeVa;
                         ok = true;
@@ -697,81 +902,393 @@ namespace
         return ok;
     }
 
-    bool EnsureFltNopThunk(
+    bool ResolveDriverSymbolThunk(
+        SymbolEngine& symbols,
+        const wchar_t* symbolName,
+        uint64_t* address)
+    {
+        bool ok = false;
+        do
+        {
+            if (address == nullptr || symbolName == nullptr)
+            {
+                break;
+            }
+
+            uint64_t symbol = 0;
+            std::wstring resolveError;
+            if (!symbols.ResolveSymbol(symbolName, &symbol, &resolveError) ||
+                !LeftoverIsKernelCanonical(symbol))
+            {
+                break;
+            }
+
+            bool owned = false;
+            for (const KernelModuleInfo& module : symbols.Modules())
+            {
+                uint64_t end = 0;
+                if (!LeftoverTryAdd(module.Base, module.Size, &end))
+                {
+                    continue;
+                }
+                if (symbol >= module.Base && symbol < end)
+                {
+                    owned = true;
+                    break;
+                }
+            }
+            if (!owned)
+            {
+                break;
+            }
+
+            *address = symbol;
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool TryFindExportOrSymbolThunk(
         DeviceClient& device,
         SymbolEngine& symbols,
-        uint64_t* thunk,
+        const char* exportName,
+        const wchar_t* symbolName,
+        uint64_t* address)
+    {
+        bool ok = false;
+        do
+        {
+            if (address == nullptr)
+            {
+                break;
+            }
+            *address = 0;
+            if (FindDriverNopExport(device, symbols, exportName, address) &&
+                LeftoverIsKernelCanonical(*address))
+            {
+                ok = true;
+                break;
+            }
+            *address = 0;
+            if (ResolveDriverSymbolThunk(symbols, symbolName, address))
+            {
+                ok = true;
+                break;
+            }
+            *address = 0;
+        } while (false);
+        return ok;
+    }
+
+    bool TryFindCfgGadgetThunk(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint32_t value,
+        uint64_t exclude,
+        uint64_t* address)
+    {
+        bool ok = false;
+        do
+        {
+            if (address == nullptr)
+            {
+                break;
+            }
+            if (*address != 0)
+            {
+                ok = true;
+                break;
+            }
+
+            const wchar_t* modules[] = { L"KnLiveDbg.sys", L"fltmgr.sys", L"ntoskrnl.exe" };
+            for (const wchar_t* name : modules)
+            {
+                uint64_t base = 0;
+                uint64_t size = 0;
+                uint64_t found = 0;
+                if (!FindModuleRange(symbols, name, &base, &size))
+                {
+                    continue;
+                }
+                if (FindGuardCfReturnImmediate(device, base, size, value, exclude, &found) &&
+                    LeftoverIsKernelCanonical(found) &&
+                    found != exclude)
+                {
+                    *address = found;
+                    ok = true;
+                    break;
+                }
+            }
+        } while (false);
+        return ok;
+    }
+
+    bool IsNopThunk(uint64_t address)
+    {
+        return address != 0 &&
+            ((g_FltPreNopThunk != 0 && address == g_FltPreNopThunk) ||
+             (g_FltPostNopThunk != 0 && address == g_FltPostNopThunk) ||
+             (g_FltLegacyPostNopThunk != 0 && address == g_FltLegacyPostNopThunk));
+    }
+
+    bool TryFindNamedExportOnModule(
+        DeviceClient& device,
+        uint64_t moduleBase,
+        uint64_t moduleSize,
+        const char* exportName,
+        uint64_t* address)
+    {
+        bool ok = false;
+        do
+        {
+            if (address == nullptr)
+            {
+                break;
+            }
+            uint64_t found = 0;
+            if (!FindPeExportByName(device, moduleBase, moduleSize, exportName, &found) ||
+                !LeftoverIsKernelCanonical(found) ||
+                found < moduleBase)
+            {
+                break;
+            }
+            uint64_t end = 0;
+            if (!LeftoverTryAdd(moduleBase, moduleSize, &end) || found >= end)
+            {
+                break;
+            }
+            *address = found;
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool ScanModulesForThunkExports(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t* pre,
+        uint64_t* post,
+        uint64_t* legacy)
+    {
+        bool ok = false;
+        do
+        {
+            if (pre == nullptr || post == nullptr || legacy == nullptr)
+            {
+                break;
+            }
+            *pre = 0;
+            *post = 0;
+            *legacy = 0;
+
+            uint64_t fallbackPost = 0;
+            uint64_t fallbackLegacy = 0;
+            const size_t moduleCount = symbols.Modules().size();
+            for (int pass = 0; pass < 2 && !ok; ++pass)
+            {
+                for (size_t index = 0; index < moduleCount; ++index)
+                {
+                    const KernelModuleInfo& module = symbols.Modules()[index];
+                    const bool nameHit =
+                        ModuleLooksLikeKnLiveDbg(module.ImageName) ||
+                        LeftoverNamesMatch(module.ImageName, L"KnLiveDbg.sys");
+                    if (pass == 0 && !nameHit)
+                    {
+                        continue;
+                    }
+                    if (pass == 1 && nameHit)
+                    {
+                        continue;
+                    }
+
+                    uint64_t foundPre = 0;
+                    uint64_t foundPost = 0;
+                    uint64_t foundLegacy = 0;
+                    TryFindNamedExportOnModule(
+                        device,
+                        module.Base,
+                        module.Size,
+                        "KnDbgMinifilterPreCallbackNop",
+                        &foundPre);
+                    TryFindNamedExportOnModule(
+                        device,
+                        module.Base,
+                        module.Size,
+                        "KnDbgMinifilterPostCallbackNop",
+                        &foundPost);
+                    TryFindNamedExportOnModule(
+                        device,
+                        module.Base,
+                        module.Size,
+                        "KnDbgMinifilterCallbackNop",
+                        &foundLegacy);
+                    if (foundPost == 0)
+                    {
+                        foundPost = foundLegacy;
+                    }
+                    if (foundPre != 0 && foundPost != 0 && foundPre != foundPost)
+                    {
+                        *pre = foundPre;
+                        *post = foundPost;
+                        *legacy = foundLegacy;
+                        ok = true;
+                        break;
+                    }
+                    if (fallbackPost == 0 && foundPost != 0)
+                    {
+                        fallbackPost = foundPost;
+                        fallbackLegacy = foundLegacy;
+                    }
+                }
+            }
+            if (!ok && fallbackPost != 0)
+            {
+                *post = fallbackPost;
+                *legacy = fallbackLegacy;
+                ok = true;
+            }
+        } while (false);
+        return ok;
+    }
+
+    bool EnsureFltNopThunks(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t* preThunk,
+        uint64_t* postThunk,
         std::wstring* error)
     {
         bool ok = false;
         do
         {
-            if (thunk == nullptr)
+            if (preThunk == nullptr || postThunk == nullptr)
             {
                 break;
             }
-            if (g_FltNopThunk != 0)
+            if (g_FltPreNopThunk != 0 &&
+                g_FltPostNopThunk != 0 &&
+                g_FltPreNopThunk != g_FltPostNopThunk)
             {
-                *thunk = g_FltNopThunk;
+                *preThunk = g_FltPreNopThunk;
+                *postThunk = g_FltPostNopThunk;
                 ok = true;
                 break;
             }
 
-            uint64_t found = 0;
-            uint64_t base = 0;
-            uint64_t size = 0;
-
-            // Prefer our exported nop. Do not require xor-eax-eax-ret bytes;
-            // /O2+/GS may add a frame. The function is written to return 0.
-            if (!FindDriverNopExport(device, symbols, &found))
+            uint64_t pre = 0;
+            uint64_t post = 0;
+            uint64_t legacy = 0;
+            // Prefer PE exports on any loaded image. Cloak renames KnLiveDbg.sys,
+            // so do not require the original file name.
+            ScanModulesForThunkExports(device, symbols, &pre, &post, &legacy);
+            if (pre == 0)
             {
-                found = 0;
+                TryFindExportOrSymbolThunk(
+                    device,
+                    symbols,
+                    "KnDbgMinifilterPreCallbackNop",
+                    L"KnLiveDbg!KnDbgMinifilterPreCallbackNop",
+                    &pre);
             }
-            if (found == 0)
+            if (post == 0)
             {
-                uint64_t symbol = 0;
-                std::wstring resolveError;
-                if (symbols.ResolveSymbol(
-                        L"KnLiveDbg!KnDbgMinifilterCallbackNop",
-                        &symbol,
-                        &resolveError) &&
-                    LeftoverIsKernelCanonical(symbol))
+                TryFindExportOrSymbolThunk(
+                    device,
+                    symbols,
+                    "KnDbgMinifilterPostCallbackNop",
+                    L"KnLiveDbg!KnDbgMinifilterPostCallbackNop",
+                    &post);
+            }
+            if (post == 0)
+            {
+                TryFindExportOrSymbolThunk(
+                    device,
+                    symbols,
+                    "KnDbgMinifilterCallbackNop",
+                    L"KnLiveDbg!KnDbgMinifilterCallbackNop",
+                    &post);
+                if (legacy == 0)
                 {
-                    uint64_t driverBase = 0;
-                    uint64_t driverSize = 0;
-                    if (FindModuleRange(symbols, L"KnLiveDbg.sys", &driverBase, &driverSize) &&
-                        symbol >= driverBase &&
-                        symbol < driverBase + driverSize)
-                    {
-                        found = symbol;
-                    }
+                    legacy = post;
                 }
             }
-            if (found == 0 && FindModuleRange(symbols, L"KnLiveDbg.sys", &base, &size))
-            {
-                FindGuardCfReturnZero(device, base, size, &found);
-            }
-            if (found == 0 && FindModuleRange(symbols, L"fltmgr.sys", &base, &size))
-            {
-                FindGuardCfReturnZero(device, base, size, &found);
-            }
-            if (found == 0 && FindModuleRange(symbols, L"ntoskrnl.exe", &base, &size))
-            {
-                FindGuardCfReturnZero(device, base, size, &found);
-            }
-            if (found == 0)
+
+            TryFindCfgGadgetThunk(device, symbols, 1, post, &pre);
+            TryFindCfgGadgetThunk(device, symbols, 0, pre, &post);
+
+            if (pre == 0 || post == 0 || pre == post)
             {
                 if (error != nullptr)
                 {
-                    *error = L"no CFG-valid return-0 thunk in KnLiveDbg/fltmgr/nt "
-                             L"(CET targets start with endbr64; rebuild KnLiveDbg.sys "
-                             L"for KnDbgMinifilterCallbackNop). Refusing NULL/unlink.";
+                    *error = L"no distinct CFG-valid Pre(return 1)/Post(return 0) thunks "
+                             L"in KnLiveDbg/fltmgr/nt (CET targets start with endbr64; "
+                             L"rebuild KnLiveDbg.sys for KnDbgMinifilterPreCallbackNop / "
+                             L"KnDbgMinifilterPostCallbackNop). Refusing NULL/unlink and "
+                             L"refusing a shared return-0 Pre (FastIO drain).";
                 }
                 break;
             }
 
-            g_FltNopThunk = found;
-            *thunk = found;
+            std::vector<uint8_t> preBytes;
+            std::vector<uint8_t> postBytes;
+            if (!ReadThunkCode(device, pre, &preBytes) ||
+                !ReadThunkCode(device, post, &postBytes))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"failed to read resolved Pre/Post thunk bytes; "
+                             L"refusing unverified callback replacement";
+                }
+                break;
+            }
+            {
+                const size_t prefix = SkipIcallPrefixes(preBytes.data(), preBytes.size());
+                uint64_t jmpTarget = 0;
+                if (prefix < preBytes.size() &&
+                    DecodeRelJmpTarget(
+                        preBytes.data() + prefix,
+                        preBytes.size() - prefix,
+                        pre + prefix,
+                        &jmpTarget))
+                {
+                    std::vector<uint8_t> jmpBytes;
+                    if (!ReadThunkCode(device, jmpTarget, &jmpBytes))
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = L"Pre thunk is a jump to unreadable code; "
+                                     L"refusing unverified callback replacement";
+                        }
+                        break;
+                    }
+                }
+            }
+            // Named exports may have a frame. Still refuse a Pre that is
+            // return-0 or a JMP to return-0 (legacy CallbackNop alias).
+            if (CodeLooksLikeReturnValue(preBytes.data(), preBytes.size(), pre, 0, &device))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"resolved Pre thunk returns 0 "
+                             L"(FLT_PREOP_SUCCESS_WITH_CALLBACK); refusing FastIO drain";
+                }
+                break;
+            }
+            if (CodeLooksLikeReturnValue(postBytes.data(), postBytes.size(), post, 1, &device))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"resolved Post thunk returns 1 "
+                             L"(FLT_POSTOP_MORE_PROCESSING_REQUIRED); refusing I/O hang";
+                }
+                break;
+            }
+
+            g_FltPreNopThunk = pre;
+            g_FltPostNopThunk = post;
+            g_FltLegacyPostNopThunk = (legacy != 0 && legacy != pre) ? legacy : 0;
+            *preThunk = pre;
+            *postThunk = post;
             ok = true;
         } while (false);
         return ok;
@@ -1236,16 +1753,13 @@ namespace
             slot->Entry = entry;
             slot->Pre = LeftoverIsKernelCanonical(pre) ? pre : 0;
             slot->Post = LeftoverIsKernelCanonical(post) ? post : 0;
-            if (g_FltNopThunk != 0)
+            if (IsNopThunk(slot->Pre))
             {
-                if (slot->Pre == g_FltNopThunk)
-                {
-                    slot->Pre = 0;
-                }
-                if (slot->Post == g_FltNopThunk)
-                {
-                    slot->Post = 0;
-                }
+                slot->Pre = 0;
+            }
+            if (IsNopThunk(slot->Post))
+            {
+                slot->Post = 0;
             }
             slot->PreActive = slot->Pre != 0;
             slot->PostActive = slot->Post != 0;
@@ -1948,9 +2462,9 @@ namespace
         }
     }
 
-    bool IsOriginalCallback(uint64_t address, uint64_t nopThunk)
+    bool IsOriginalCallback(uint64_t address)
     {
-        return address != 0 && address != nopThunk && LeftoverIsKernelCanonical(address);
+        return address != 0 && !IsNopThunk(address) && LeftoverIsKernelCanonical(address);
     }
 
     uint32_t CountLiveCallbackNodes(
@@ -1968,8 +2482,7 @@ namespace
                 uint64_t pre = 0;
                 uint64_t post = 0;
                 if (ReadCallbackNodePointers(device, layout, node, &pre, &post, nullptr) &&
-                    (IsOriginalCallback(pre, g_FltNopThunk) ||
-                     IsOriginalCallback(post, g_FltNopThunk)))
+                    (IsOriginalCallback(pre) || IsOriginalCallback(post)))
                 {
                     ++live;
                 }
@@ -1989,16 +2502,13 @@ namespace
         {
             return;
         }
-        if (g_FltNopThunk != 0)
+        if (IsNopThunk(pre))
         {
-            if (pre == g_FltNopThunk)
-            {
-                pre = 0;
-            }
-            if (post == g_FltNopThunk)
-            {
-                post = 0;
-            }
+            pre = 0;
+        }
+        if (IsNopThunk(post))
+        {
+            post = 0;
         }
         if (pre == 0 && post == 0)
         {
@@ -2044,7 +2554,8 @@ namespace
         uint64_t node,
         MinifilterIrpAction action,
         MinifilterIrpWhich which,
-        uint64_t nopThunk,
+        uint64_t preThunk,
+        uint64_t postThunk,
         uint32_t* changed,
         uint32_t* failed,
         std::wstring* error)
@@ -2056,12 +2567,17 @@ namespace
             {
                 break;
             }
-            if (action == MinifilterIrpAction::Disable && nopThunk == 0)
+            const bool touchPre = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Pre);
+            const bool touchPost = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
+            if (action == MinifilterIrpAction::Disable &&
+                ((touchPre && preThunk == 0) ||
+                 (touchPost && postThunk == 0) ||
+                 (touchPre && touchPost && preThunk == postThunk)))
             {
                 ++(*failed);
                 if (error != nullptr && error->empty())
                 {
-                    *error = L"missing CFG-valid nop thunk";
+                    *error = L"missing distinct CFG-valid Pre/Post nop thunks";
                 }
                 break;
             }
@@ -2078,8 +2594,6 @@ namespace
                 break;
             }
 
-            const bool touchPre = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Pre);
-            const bool touchPost = (which == MinifilterIrpWhich::Both || which == MinifilterIrpWhich::Post);
             uint64_t newPre = currentPre;
             uint64_t newPost = currentPost;
 
@@ -2088,13 +2602,15 @@ namespace
                 RememberLiveNode(filter, majorFunction, node, currentPre, currentPost);
                 // Leave original NULLs alone. FltMgr skips those at attach;
                 // replacing them with a thunk can change post registration.
+                // Pre must return 1 (NO_CALLBACK). Post must return 0
+                // (FINISHED_PROCESSING). Same gadget cannot satisfy both.
                 if (touchPre && currentPre != 0)
                 {
-                    newPre = nopThunk;
+                    newPre = preThunk;
                 }
                 if (touchPost && currentPost != 0)
                 {
-                    newPost = nopThunk;
+                    newPost = postThunk;
                 }
             }
             else
@@ -2115,18 +2631,20 @@ namespace
                     ok = true;
                     break;
                 }
-                if (touchPre)
+                // Never restore a NULL pointer. A 0 backup means this side was
+                // already a nop/NULL; writing NULL is a kCFG 0x139/0x1e.
+                if (touchPre && backup.Pre != 0)
                 {
                     newPre = backup.Pre;
                 }
-                if (touchPost)
+                if (touchPost && backup.Post != 0)
                 {
                     newPost = backup.Post;
                 }
             }
 
             bool wrote = false;
-            if (touchPre && newPre != currentPre)
+            if (touchPre && newPre != 0 && newPre != currentPre)
             {
                 std::wstring writeError;
                 if (!WritePointer(device, preAddr, newPre, &writeError))
@@ -2140,7 +2658,7 @@ namespace
                 }
                 wrote = true;
             }
-            if (touchPost && newPost != currentPost)
+            if (touchPost && newPost != 0 && newPost != currentPost)
             {
                 std::wstring writeError;
                 if (!WritePointer(device, postAddr, newPost, &writeError))
@@ -2172,7 +2690,8 @@ namespace
         uint64_t matchPost,
         MinifilterIrpAction action,
         MinifilterIrpWhich which,
-        uint64_t nopThunk,
+        uint64_t preThunk,
+        uint64_t postThunk,
         uint32_t* changed,
         uint32_t* failed,
         std::wstring* error)
@@ -2209,7 +2728,8 @@ namespace
                             indexed,
                             action,
                             which,
-                            nopThunk,
+                            preThunk,
+                            postThunk,
                             changed,
                             failed,
                             error);
@@ -2247,7 +2767,8 @@ namespace
                             node,
                             action,
                             which,
-                            nopThunk,
+                            preThunk,
+                            postThunk,
                             changed,
                             failed,
                             error);
@@ -2282,8 +2803,7 @@ namespace
                 uint64_t pre = 0;
                 uint64_t post = 0;
                 if (ReadCallbackNodePointers(device, layout, indexed, &pre, &post, nullptr) &&
-                    (IsOriginalCallback(pre, g_FltNopThunk) ||
-                     IsOriginalCallback(post, g_FltNopThunk)))
+                    (IsOriginalCallback(pre) || IsOriginalCallback(post)))
                 {
                     live = true;
                     break;
@@ -2310,8 +2830,7 @@ namespace
                 const bool postMatch = (matchPost == 0) || (post == matchPost);
                 if (preMatch &&
                     postMatch &&
-                    (IsOriginalCallback(pre, g_FltNopThunk) ||
-                     IsOriginalCallback(post, g_FltNopThunk)))
+                    (IsOriginalCallback(pre) || IsOriginalCallback(post)))
                 {
                     live = true;
                     break;
@@ -2332,7 +2851,8 @@ namespace
         uint64_t filter,
         MinifilterIrpAction action,
         MinifilterIrpWhich which,
-        uint64_t nopThunk,
+        uint64_t preThunk,
+        uint64_t postThunk,
         uint32_t* changed,
         uint32_t* failed,
         std::wstring* error)
@@ -2359,8 +2879,8 @@ namespace
                         continue;
                     }
                     if (action == MinifilterIrpAction::Disable &&
-                        !IsOriginalCallback(pre, nopThunk) &&
-                        !IsOriginalCallback(post, nopThunk))
+                        !IsOriginalCallback(pre) &&
+                        !IsOriginalCallback(post))
                     {
                         continue;
                     }
@@ -2372,7 +2892,8 @@ namespace
                         node,
                         action,
                         which,
-                        nopThunk,
+                        preThunk,
+                        postThunk,
                         changed,
                         failed,
                         error);
@@ -2672,8 +3193,9 @@ bool MinifilterIrpScanner::Scan(MinifilterIrpScanResult* result, std::wstring* e
             }
         }
 
-        uint64_t ignoredThunk = 0;
-        EnsureFltNopThunk(device_, symbols_, &ignoredThunk, nullptr);
+        uint64_t ignoredPreThunk = 0;
+        uint64_t ignoredPostThunk = 0;
+        EnsureFltNopThunks(device_, symbols_, &ignoredPreThunk, &ignoredPostThunk, nullptr);
 
         MinifilterLayout layout = {};
         if (!BuildLayout(symbols_, &layout, error))
@@ -2821,8 +3343,9 @@ bool MinifilterIrpScanner::SetIrp(
             break;
         }
 
-        uint64_t nopThunk = 0;
-        if (!EnsureFltNopThunk(device_, symbols_, &nopThunk, error))
+        uint64_t preThunk = 0;
+        uint64_t postThunk = 0;
+        if (!EnsureFltNopThunks(device_, symbols_, &preThunk, &postThunk, error))
         {
             break;
         }
@@ -2891,13 +3414,15 @@ bool MinifilterIrpScanner::SetIrp(
             }
             // Never write NULL into a live-copied slot. New attaches copy
             // Operations and FltMgr will kCFG-call a NULL Pre/Post.
+            // Pre thunk returns 1 (NO_CALLBACK). Post thunk returns 0
+            // (FINISHED_PROCESSING). Do not share one return-0 gadget.
             if (touchPre && found->Pre != 0)
             {
-                newPre = nopThunk;
+                newPre = preThunk;
             }
             if (touchPost && found->Post != 0)
             {
-                newPost = nopThunk;
+                newPost = postThunk;
             }
         }
         else
@@ -2918,19 +3443,20 @@ bool MinifilterIrpScanner::SetIrp(
             if (haveOperationsBackup)
             {
                 change->UsedBackup = true;
-                if (touchPre)
+                if (touchPre && value.Pre != 0)
                 {
                     newPre = value.Pre;
                 }
-                if (touchPost)
+                if (touchPost && value.Post != 0)
                 {
                     newPost = value.Post;
                 }
             }
         }
 
-        // Live CallbackNodes are what FltMgr dispatches. Replace Pre/Post with
-        // a CFG-valid return-0 thunk. Never write NULL and never unlink lists.
+        // Live CallbackNodes are what FltMgr dispatches. Replace Pre with a
+        // return-1 thunk and Post with a return-0 thunk. Never write NULL
+        // and never unlink lists.
         std::wstring liveError;
         if (!PatchLiveCallbackNodes(
                 device_,
@@ -2941,7 +3467,8 @@ bool MinifilterIrpScanner::SetIrp(
                 found->Post,
                 action,
                 which,
-                nopThunk,
+                preThunk,
+                postThunk,
                 &change->LiveNodesChanged,
                 &change->LiveNodesFailed,
                 &liveError))
@@ -3012,7 +3539,7 @@ bool MinifilterIrpScanner::SetIrp(
             break;
         }
 
-        if (touchPre && newPre != found->Pre)
+        if (touchPre && newPre != 0 && newPre != found->Pre)
         {
             if (!WritePointer(device_, preAddr, newPre, error))
             {
@@ -3020,7 +3547,7 @@ bool MinifilterIrpScanner::SetIrp(
             }
             change->PreChanged = true;
         }
-        if (touchPost && newPost != found->Post)
+        if (touchPost && newPost != 0 && newPost != found->Post)
         {
             if (!WritePointer(device_, postAddr, newPost, error))
             {
@@ -3173,10 +3700,11 @@ bool MinifilterIrpScanner::SetAllIrps(
 
         MinifilterLayout layout = {};
         std::wstring layoutError;
-        uint64_t nopThunk = 0;
+        uint64_t preThunk = 0;
+        uint64_t postThunk = 0;
         if (BuildLayout(symbols_, &layout, &layoutError) &&
             layout.HasLiveCallbackLayout &&
-            EnsureFltNopThunk(device_, symbols_, &nopThunk, &layoutError))
+            EnsureFltNopThunks(device_, symbols_, &preThunk, &postThunk, &layoutError))
         {
             uint32_t swept = 0;
             uint32_t sweepFailed = 0;
@@ -3187,7 +3715,8 @@ bool MinifilterIrpScanner::SetAllIrps(
                     filter.Filter,
                     action,
                     which,
-                    nopThunk,
+                    preThunk,
+                    postThunk,
                     &swept,
                     &sweepFailed,
                     &sweepError))
@@ -3422,10 +3951,26 @@ bool MinifilterIrpScannerSelfTest()
             const uint8_t xorRaxRet[] = { 0x48, 0x33, 0xc0, 0xc3 };
             const uint8_t endbrXorRet[] = { 0xf3, 0x0f, 0x1e, 0xfa, 0x33, 0xc0, 0xc3 };
             const uint8_t notNop[] = { 0x48, 0x89, 0x5c, 0x24 };
+            const uint8_t movEaxOneRet[] = { 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 };
+            const uint8_t xorIncRet[] = { 0x33, 0xc0, 0xff, 0xc0, 0xc3 };
+            const uint8_t endbrMovOneRet[] = { 0xf3, 0x0f, 0x1e, 0xfa, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 };
+            const uint8_t int3XorRet[] = { 0xcc, 0x33, 0xc0, 0xc3 };
+            const uint8_t jmpRel32[] = { 0xe9, 0x00, 0x00, 0x00, 0x00 };
+            uint64_t jmpTarget = 0;
             if (!BytesAreReturnZero(xorRet, sizeof(xorRet)) ||
                 !BytesAreReturnZero(xorRaxRet, sizeof(xorRaxRet)) ||
                 !BytesAreReturnZero(endbrXorRet, sizeof(endbrXorRet)) ||
-                BytesAreReturnZero(notNop, sizeof(notNop)))
+                BytesAreReturnZero(notNop, sizeof(notNop)) ||
+                BytesAreReturnZero(movEaxOneRet, sizeof(movEaxOneRet)) ||
+                BytesAreReturnZero(int3XorRet, sizeof(int3XorRet)) ||
+                BytesAreReturnOne(xorRet, sizeof(xorRet)) ||
+                !BytesAreReturnOne(movEaxOneRet, sizeof(movEaxOneRet)) ||
+                !BytesAreReturnOne(xorIncRet, sizeof(xorIncRet)) ||
+                !BytesAreReturnOne(endbrMovOneRet, sizeof(endbrMovOneRet)) ||
+                BytesAreReturnOne(notNop, sizeof(notNop)) ||
+                BytesAreReturnOne(int3XorRet, sizeof(int3XorRet)) ||
+                !DecodeRelJmpTarget(jmpRel32, sizeof(jmpRel32), 0xfffff80000000000ull, &jmpTarget) ||
+                jmpTarget != 0xfffff80000000005ull)
             {
                 ok = false;
                 break;

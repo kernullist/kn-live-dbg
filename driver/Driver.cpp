@@ -74,8 +74,51 @@ static ULONG g_KnDbgTimelineCount = 0;
 static ULONGLONG g_KnDbgTimelineDropped = 0;
 static ULONGLONG g_KnDbgTimelineNextSequence = 1;
 
-// CFG-valid minifilter Pre/Post stand-in. Returns 0 so Pre is
-// FLT_PREOP_SUCCESS_NO_CALLBACK and Post is FLT_POSTOP_FINISHED_PROCESSING.
+// CFG-valid minifilter Pre stand-in.
+// Must return 1 (FLT_PREOP_SUCCESS_NO_CALLBACK). Return 0 is
+// FLT_PREOP_SUCCESS_WITH_CALLBACK and drains FastIO to IRP.
+// Keep these as C exports so /guard:cf emits GFIDS entries. Kernel MSVC
+// has no _mm_endbr64 intrinsic; CET/IBT landing pads stay a known gap.
+extern "C"
+__declspec(dllexport)
+__declspec(noinline)
+ULONG_PTR
+NTAPI
+KnDbgMinifilterPreCallbackNop(
+    PVOID Unused1,
+    PVOID Unused2,
+    PVOID Unused3,
+    PVOID Unused4)
+{
+    UNREFERENCED_PARAMETER(Unused1);
+    UNREFERENCED_PARAMETER(Unused2);
+    UNREFERENCED_PARAMETER(Unused3);
+    UNREFERENCED_PARAMETER(Unused4);
+    return 1;
+}
+
+// CFG-valid minifilter Post stand-in.
+// Must return 0 (FLT_POSTOP_FINISHED_PROCESSING). Return 1 is
+// FLT_POSTOP_MORE_PROCESSING_REQUIRED and hangs the I/O.
+extern "C"
+__declspec(dllexport)
+__declspec(noinline)
+ULONG_PTR
+NTAPI
+KnDbgMinifilterPostCallbackNop(
+    PVOID Unused1,
+    PVOID Unused2,
+    PVOID Unused3,
+    PVOID Unused4)
+{
+    UNREFERENCED_PARAMETER(Unused1);
+    UNREFERENCED_PARAMETER(Unused2);
+    UNREFERENCED_PARAMETER(Unused3);
+    UNREFERENCED_PARAMETER(Unused4);
+    return 0;
+}
+
+// Legacy alias with the Post contract (return 0). Do not use for Pre.
 extern "C"
 __declspec(dllexport)
 __declspec(noinline)
@@ -87,11 +130,7 @@ KnDbgMinifilterCallbackNop(
     PVOID Unused3,
     PVOID Unused4)
 {
-    UNREFERENCED_PARAMETER(Unused1);
-    UNREFERENCED_PARAMETER(Unused2);
-    UNREFERENCED_PARAMETER(Unused3);
-    UNREFERENCED_PARAMETER(Unused4);
-    return 0;
+    return KnDbgMinifilterPostCallbackNop(Unused1, Unused2, Unused3, Unused4);
 }
 
 static bool KnDbgIsLa57Active();
@@ -2697,7 +2736,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     do
     {
-        // Keep the nop export live so /guard:cf emits a GFIDS entry.
+        // Keep the nop exports live so /guard:cf emits GFIDS entries.
+        if (KnDbgMinifilterPreCallbackNop(nullptr, nullptr, nullptr, nullptr) != 1)
+        {
+            status = STATUS_UNSUCCESSFUL;
+            break;
+        }
+        if (KnDbgMinifilterPostCallbackNop(nullptr, nullptr, nullptr, nullptr) != 0)
+        {
+            status = STATUS_UNSUCCESSFUL;
+            break;
+        }
         if (KnDbgMinifilterCallbackNop(nullptr, nullptr, nullptr, nullptr) != 0)
         {
             status = STATUS_UNSUCCESSFUL;

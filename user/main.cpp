@@ -16395,11 +16395,13 @@ static void PrintMinifilterHelp()
     std::wcout << L"\n";
     std::wcout << L"  Walks fltmgr!FltGlobals frames, FLT_FILTER.Operations, and the live\n";
     std::wcout << L"  FLT_INSTANCE.CallbackNodes that FltMgr actually dispatches (PDB layout).\n";
-    std::wcout << L"  list/show/irp are read-only. disable/enable zero FLT_FILTER.Operations and\n";
-    std::wcout << L"  replace live FLT_INSTANCE.CallbackNode Pre/Post with a CFG-valid return-0\n";
-    std::wcout << L"  thunk from fltmgr/nt. Do not write NULL (kCFG 0x139/0xa) and do not unlink\n";
-    std::wcout << L"  CallbackLinks (corrupt list 0x139/0x3). disable saves the original pointers\n";
-    std::wcout << L"  in this session so enable can restore them.\n";
+    std::wcout << L"  list/show/irp are read-only. disable/enable write FLT_FILTER.Operations and\n";
+    std::wcout << L"  replace live FLT_INSTANCE.CallbackNode Pre/Post with distinct CFG-valid\n";
+    std::wcout << L"  thunks: Pre returns FLT_PREOP_SUCCESS_NO_CALLBACK (1), Post returns\n";
+    std::wcout << L"  FLT_POSTOP_FINISHED_PROCESSING (0). A shared return-0 Pre is\n";
+    std::wcout << L"  FLT_PREOP_SUCCESS_WITH_CALLBACK and drains FastIO to IRP. Do not write NULL\n";
+    std::wcout << L"  (kCFG 0x139/0xa) and do not unlink CallbackLinks (corrupt list 0x139/0x3).\n";
+    std::wcout << L"  disable saves the original pointers in this session so enable can restore them.\n";
     std::wcout << L"  disable <name> all and disable-all walk every registered slot and sweep any\n";
     std::wcout << L"  leftover original callbacks. enable-all restores every same-session backup.\n";
     std::wcout << L"\n";
@@ -29947,6 +29949,8 @@ static int RunConsoleSurfaceSelfTest()
                     minifilterHelp.find(L"disable UnionFS all") != std::wstring::npos &&
                     minifilterHelp.find(L"disable-all UnionFS") != std::wstring::npos &&
                     minifilterHelp.find(L"CallbackNodes") != std::wstring::npos &&
+                    minifilterHelp.find(L"FLT_PREOP_SUCCESS_NO_CALLBACK") != std::wstring::npos &&
+                    minifilterHelp.find(L"FLT_POSTOP_FINISHED_PROCESSING") != std::wstring::npos &&
                     minifilterHelp.find(L"minifilter-irp-batch.v1") != std::wstring::npos &&
                     rootHelp.find(L"help !minifilter") != std::wstring::npos &&
                     rootHelp.find(L"disable <name> all") != std::wstring::npos,
