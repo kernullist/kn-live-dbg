@@ -279,6 +279,7 @@ v1 tools (18) and argument schemas (= the existing whitelist, `additionalPropert
 | `process.describe` | source, pid, eprocess, fields | `_EPROCESS` fields |
 | `type.describe` | source, address, type, fields | `dt` structure |
 | `callbacks.list` | scope, module | `CallbackScanner` |
+| `callbacks.set` | action, module, scope | `KernelCallbackScanner::SetModuleCallbacks` (WRITE) |
 | `wfp.list` | scope, module, provider, layer | `WfpScanner` (+ kernel callout pointers) |
 | `alpc.list` | scope, name, pid | `AlpcScanner` |
 | `vad.list` | source, image, pid, eprocess, exec, private, wx, pe, hiddenpte, dkom, summary, limit | `ProcessTriageScanner::ScanVad` |
@@ -567,6 +568,7 @@ Added kernel anti-cheat detections not in the initial catalog (the 18 tools used
 | `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | orphan pages; args deep/wx/pe/limit; deep is not default |
 | `minifilter.list` | `!minifilter` | `BuildMinifilterIrpJson` (`.minifilter.v1`) | args filter/name |
 | `minifilter.set_irp` | `!minifilter disable/enable` | `BuildMinifilterIrpChangeJson` (`.minifilter-irp.v1`) or `BuildMinifilterIrpBatchJson` (`.minifilter-irp-batch.v1`) | WRITE; action enable/disable; `irp=all` batches |
+| `callbacks.set` | `!callbacks disable/enable` | `BuildCallbackSetJson` (`.callbacks-set.v1`) | WRITE; action enable/disable/enable-all/disable-all; module required; scope required except *-all |
 | `hunt.run` | `!hunt` | `BuildHuntJson` (existing) | args mode (quick/deep); `/summary` forced |
 | `snapshot.capture` | `!snapshot baseline` | `BuildSnapshotJson` (existing) | args name; baseline file write (not a kernel write -> allowed in read-only mode) |
 

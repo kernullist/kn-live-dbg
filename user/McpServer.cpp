@@ -51,6 +51,12 @@ namespace
     const McpToolArg kArgsProcessDescribe[] = { {L"source", L"string", false}, {L"pid", L"string", false}, {L"eprocess", L"string", false}, {L"fields", L"array", false} };
     const McpToolArg kArgsTypeDescribe[] = { {L"source", L"string", false}, {L"address", L"string", false}, {L"type", L"string", false}, {L"fields", L"array", false} };
     const McpToolArg kArgsCallbacks[] = { {L"scope", L"string", false}, {L"module", L"string", false} };
+    const McpToolArg kArgsCallbacksSet[] =
+    {
+        {L"action", L"string", true},
+        {L"module", L"string", true},
+        {L"scope", L"string", false}
+    };
     const McpToolArg kArgsWfp[] = { {L"scope", L"string", false}, {L"module", L"string", false}, {L"provider", L"string", false}, {L"layer", L"string", false} };
     const McpToolArg kArgsAlpc[] = { {L"scope", L"string", false}, {L"name", L"string", false}, {L"pid", L"string", false} };
     const McpToolArg kArgsVad[] = { {L"mode", L"string", false}, {L"pid", L"string", false}, {L"image", L"string", false}, {L"eprocess", L"string", false}, {L"exec", L"boolean", false}, {L"private", L"boolean", false}, {L"wx", L"boolean", false}, {L"pe", L"boolean", false}, {L"hiddenpte", L"boolean", false}, {L"dkom", L"boolean", false}, {L"summary", L"boolean", false}, {L"limit", L"string", false} };
@@ -201,6 +207,7 @@ namespace
         { L"memory.move", L"[WRITE] Copy a kernel range from source to dest.", false, MCP_ARG_TABLE(kArgsMove) },
         { L"type.set_field", L"[WRITE] Set a struct field at an address (setfield).", false, MCP_ARG_TABLE(kArgsSetField) },
         { L"minifilter.set_irp", L"[WRITE] Enable or disable a minifilter IRP pre/post handler. action=enable|disable; irp=IRP_MJ_* or all; which=pre|post|both.", false, MCP_ARG_TABLE(kArgsMinifilterSetIrp) },
+        { L"callbacks.set", L"[WRITE] Enable or disable one driver's callbacks by type. action=enable|disable|enable-all|disable-all; scope=all|object|registry|process|thread|imageload|minifilter; module required. Never NULL/unlink.", false, MCP_ARG_TABLE(kArgsCallbacksSet) },
         { L"process.set_protection", L"[WRITE] Set a process PS_PROTECTION. pid (optional, defaults to self); level=none|ppl-antimalware|ppl-lsa|ppl-windows|ppl-wintcb|pp-windows|pp-wintcb|pp-winsystem.", false, MCP_ARG_TABLE(kArgsSetProtection) },
         { L"ti.export", L"[WRITE] Export the Threat-Intelligence ETW ring to a JSONL file.", false, MCP_ARG_TABLE(kArgsTiExport) },
         { L"ti.clear", L"[WRITE] Clear the in-memory Threat-Intelligence ETW ring.", false, nullptr, 0 },

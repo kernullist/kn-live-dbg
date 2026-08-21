@@ -235,6 +235,10 @@ The command now behaves like a small tool-using agent and intent router. The ope
 - Disable/enable of minifilter IRP handlers is not on the AI planner. Use the
   console (`!minifilter disable <name> all` / `disable-all`) or MCP
   `minifilter.set_irp` with `irp=all` under `--allow-write`.
+- Disable/enable of object/registry/process/thread/imageload callbacks is also
+  not on the AI planner. Use `!callbacks disable <scope> <module>` /
+  `disable-all` or MCP `callbacks.set` under `--allow-write`. Minifilter
+  through `!callbacks` reuses the same live CallbackNodes path.
 - "why is this address suspicious?" -> `address.inspect` with `address=<va-or-symbol>`
 - "decode WNF state name 0x41c64e6da3bc0075" -> `wnf.decode` with `hash=0x41c64e6da3bc0075`
 - "list live WNF instances" -> `wnf.list` with `scope=instances`

@@ -232,7 +232,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. When more than one match remains, the prompt prints an annotated list instead of a bare name grid: the parent command's description and full usage line, then each remaining token with its own syntax and summary. Root listings with many matches stay one line per command (`name` + summary). Examples include `!callbacks <Tab>` for callback scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. When more than one match remains, the prompt prints an annotated list instead of a bare name grid: the parent command's description and full usage line, then each remaining token with its own syntax and summary. Root listings with many matches stay one line per command (`name` + summary). Examples include `!callbacks <Tab>` for callback scopes plus `disable`/`enable`/`disable-all`/`enable-all`, `!callbacks disable <Tab>` for per-type scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `disable`, `enable`, `disable-all`, `enable-all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -285,6 +285,10 @@ dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
 !callbacks [scope] /module <module>
+!callbacks disable <scope> <module>
+!callbacks enable <scope> <module>
+!callbacks disable-all <module>
+!callbacks enable-all <module>
 !dml_proc [pid|name]
 !hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
@@ -414,6 +418,10 @@ knkd> !callbacks imageload
 knkd> !callbacks minifilter
 knkd> !callbacks all WdFilter.sys
 knkd> !callbacks /module WdFilter.sys
+knkd> write on
+knkd> !callbacks disable object WdFilter
+knkd> !callbacks disable-all WdFilter
+knkd> !callbacks enable-all WdFilter
 knkd> !dml_proc
 knkd> !dml_proc 4
 knkd> !dml_proc lsass
@@ -1187,6 +1195,13 @@ The elevated positive-control gate exercises every VAD filter plus both new mode
 !callbacks minifilter
 !callbacks object WdFilter.sys
 !callbacks minifilter UnionFS
+write on
+!callbacks disable object WdFilter
+!callbacks disable process WdFilter.sys
+!callbacks disable minifilter WdFilter
+!callbacks disable-all WdFilter
+!callbacks enable object WdFilter
+!callbacks enable-all WdFilter
 ```
 
 The scanner currently covers:
@@ -1197,6 +1212,8 @@ The scanner currently covers:
 4. Thread creation callbacks by enumerating and validating create-thread notify routine table candidates such as `PspCreateThreadNotifyRoutine`, then decoding callback routine blocks with the same stable x64 fallback.
 5. Image load callbacks by enumerating and validating load-image notify routine table candidates such as `PspLoadImageNotifyRoutine`, then decoding callback routine blocks with the same stable x64 fallback.
 6. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
+
+`disable`/`enable` require `write on` and a target module. They patch only that module's callbacks and never write NULL or unlink lists. Object/registry/process/thread/image-load slots are replaced with a CFG-valid return-0 thunk (`OB_PREOP_SUCCESS` / `STATUS_SUCCESS` / ignored VOID). Minifilter disable/enable reuses the existing `!minifilter` live `CallbackNodes` path: Pre returns `FLT_PREOP_SUCCESS_NO_CALLBACK` (1), Post returns `FLT_POSTOP_FINISHED_PROCESSING` (0). Original pointers stay in this session so `enable` can restore them; `enable` fails closed if this session never disabled that module. After disable, `!callbacks <scope> <module>` still lists those records with a `DISABLED` tag. `disable-all`/`enable-all` apply every scope. A module name is required. JSON schema `kn-live-dbg.callbacks-set.v1` is emitted for MCP `callbacks.set`.
 
 Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Image-load output uses `function` for the `PLOAD_IMAGE_NOTIFY_ROUTINE` owner and reports the decoded notify block plus raw encoded slot value. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `!callbacks object WdFilter.sys` or `!callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
 

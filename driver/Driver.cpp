@@ -97,9 +97,11 @@ KnDbgMinifilterPreCallbackNop(
     return 1;
 }
 
-// CFG-valid minifilter Post stand-in.
-// Must return 0 (FLT_POSTOP_FINISHED_PROCESSING). Return 1 is
-// FLT_POSTOP_MORE_PROCESSING_REQUIRED and hangs the I/O.
+// CFG-valid return-0 stand-in.
+// Minifilter Post: FLT_POSTOP_FINISHED_PROCESSING.
+// Ob Pre: OB_PREOP_SUCCESS. Cm/Ps: STATUS_SUCCESS or ignored VOID.
+// Return 1 is FLT_POSTOP_MORE_PROCESSING_REQUIRED and hangs I/O.
+// Do not use this thunk as a minifilter Pre (that must return 1).
 extern "C"
 __declspec(dllexport)
 __declspec(noinline)

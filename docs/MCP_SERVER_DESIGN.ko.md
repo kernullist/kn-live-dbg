@@ -278,6 +278,7 @@ v1 툴(18종)과 인자 스키마(= 기존 화이트리스트, `additionalProper
 | `process.describe` | source, pid, eprocess, fields | `_EPROCESS` 필드 |
 | `type.describe` | source, address, type, fields | `dt` 구조 |
 | `callbacks.list` | scope, module | `CallbackScanner` |
+| `callbacks.set` | action, module, scope | `KernelCallbackScanner::SetModuleCallbacks` (WRITE) |
 | `wfp.list` | scope, module, provider, layer | `WfpScanner` (+커널 callout 포인터) |
 | `alpc.list` | scope, name, pid | `AlpcScanner` |
 | `vad.list` | source, image, pid, eprocess, exec, private, wx, pe, hiddenpte, dkom, summary, limit | `ProcessTriageScanner::ScanVad` |
@@ -566,6 +567,7 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 | `kpage.list` | `!kpage` | `BuildOrphanKernelPageJson` (`.kpage.v1`) | 고아 페이지; args deep/wx/pe/limit; deep는 기본 아님 |
 | `minifilter.list` | `!minifilter` | `BuildMinifilterIrpJson` (`.minifilter.v1`) | args filter/name |
 | `minifilter.set_irp` | `!minifilter disable/enable` | `BuildMinifilterIrpChangeJson` (`.minifilter-irp.v1`) 또는 `BuildMinifilterIrpBatchJson` (`.minifilter-irp-batch.v1`) | WRITE; action enable/disable; `irp=all`이면 배치 |
+| `callbacks.set` | `!callbacks disable/enable` | `BuildCallbackSetJson` (`.callbacks-set.v1`) | WRITE; action enable/disable/enable-all/disable-all; module 필수; *-all 제외하면 scope 필수 |
 | `hunt.run` | `!hunt` | `BuildHuntJson`(기존) | args mode(quick/deep); `/summary` 강제 |
 | `snapshot.capture` | `!snapshot baseline` | `BuildSnapshotJson`(기존) | args name; baseline 파일 write(커널 write 아님 → read-only 모드 허용) |
 
