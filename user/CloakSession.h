@@ -35,6 +35,7 @@ struct CloakSession
 
 bool ParseCloakArgs(int argc, const wchar_t* const* argv, CloakArgs* args);
 bool IsValidCloakLeafName(const std::wstring& name);
+bool CloakCopiesRuntimeSidecar(const std::wstring& fileName);
 std::wstring GenerateCloakLeafName();
 bool BuildCloakSession(CloakSession* session, std::wstring* error);
 bool SaveCloakSession(const CloakSession& session, std::wstring* error);

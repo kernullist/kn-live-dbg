@@ -29988,6 +29988,16 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 generated.empty() || IsValidCloakLeafName(generated),
                 L"cloak-generated-name-is-valid-or-empty");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                CloakCopiesRuntimeSidecar(L"dbgcore.dll") &&
+                    CloakCopiesRuntimeSidecar(L"dbgeng.dll") &&
+                    CloakCopiesRuntimeSidecar(L"dbghelp.dll") &&
+                    CloakCopiesRuntimeSidecar(L"DbgModel.dll") &&
+                    CloakCopiesRuntimeSidecar(L"msdia140.dll") &&
+                    CloakCopiesRuntimeSidecar(L"symsrv.yes") &&
+                    !CloakCopiesRuntimeSidecar(L"KnLiveDbg.sys"),
+                L"cloak-copies-dbgeng-runtime-sidecars");
         }
 
         TimelineStats populatedTimelineStats = {};
@@ -50161,6 +50171,8 @@ int wmain(int argc, wchar_t** argv)
             return 1;
         }
 
+        std::wcout << L"cloak: launched " << session.ServiceName
+                   << L" in a new console\n";
         return 0;
     }
 
