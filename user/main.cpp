@@ -1800,7 +1800,7 @@ static void PrintHelp(bool includeDbgEng)
 
     PrintColoredText(L"high-value topics", KNDBG_COLOR_ACCENT);
     std::wcout << L"\n";
-    std::wcout << L"  help !callbacks      callback scanners and module filters\n";
+    std::wcout << L"  help !callbacks      list callbacks; disable/enable one module per type\n";
     std::wcout << L"  help !hunt           whole-system user-mode anomaly hunt\n";
     std::wcout << L"  help !vad            VAD triage, injection scan, hidden PTEs, mapped-PE inventory\n";
     std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
@@ -1844,7 +1844,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  memory        dq nt!PsLoadedModuleList 8 | db /process <pid> <user-address> 80\n";
     std::wcout << L"  memory        procctx <pid> | vtop /process <pid> <user-address> | pdb <pa> 80\n";
     std::wcout << L"  types/code    dt nt!_EPROCESS <address> | u nt!KiSystemCall64 8 | uf nt!KiSystemCall64 512\n";
-    std::wcout << L"  callbacks     !callbacks all | !callbacks imageload | !callbacks process WdFilter.sys\n";
+    std::wcout << L"  callbacks     !callbacks all | !callbacks process WdFilter.sys | !callbacks disable object WdFilter\n";
     std::wcout << L"  process       !hunt /deep /summary | !vad scan <pid> | !vad modules <pid> | !threads <pid> /apc\n";
     std::wcout << L"  kernel        !wfp providers | !alpc ports | !fwtable providers | !wnf instances\n";
     std::wcout << L"  integrity     !vbs | !ci options | !securekernel | !etw integrity | !nmi callbacks\n";
@@ -1880,6 +1880,10 @@ static void PrintCallbacksHelp()
     std::wcout << L"!callbacks command:\n";
     std::wcout << L"  !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
     std::wcout << L"  !callbacks [scope] /module <module>\n";
+    std::wcout << L"  !callbacks disable <scope> <module>\n";
+    std::wcout << L"  !callbacks enable <scope> <module>\n";
+    std::wcout << L"  !callbacks disable-all <module>\n";
+    std::wcout << L"  !callbacks enable-all <module>\n";
     std::wcout << L"  !callbacks <scope> help\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
@@ -1896,6 +1900,13 @@ static void PrintCallbacksHelp()
     std::wcout << L"  The scanner locates callback roots from symbols or self-discovered kernel lists.\n";
     std::wcout << L"  Module filters match callback function owners case-insensitively by image name or stem.\n";
     std::wcout << L"  Some private callback item layouts are absent from public PDBs; fallback notes are printed per record.\n";
+    std::wcout << L"  disable/enable patch only that module's function pointers. They never write NULL and never unlink lists.\n";
+    std::wcout << L"  Ob/Cm/Ps use a CFG-valid return-0 thunk (OB_PREOP_SUCCESS / STATUS_SUCCESS / VOID).\n";
+    std::wcout << L"  minifilter disable/enable reuses !minifilter SetAllIrps: Pre returns 1, Post returns 0, live CallbackNodes included.\n";
+    std::wcout << L"  Original pointers are saved in this session so enable can restore them. Requires 'write on'.\n";
+    std::wcout << L"  disable-all/enable-all apply every scope to that module. A module name is required; fail-closed otherwise.\n";
+    std::wcout << L"  After disable, list rows for that module print DISABLED and keep the original owner in notes.\n";
+    std::wcout << L"  help !callbacks disable and !callbacks disable help show the write syntax.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !callbacks all\n";
@@ -1907,6 +1918,12 @@ static void PrintCallbacksHelp()
     std::wcout << L"  !callbacks minifilter\n";
     std::wcout << L"  !callbacks object WdFilter.sys\n";
     std::wcout << L"  !callbacks minifilter UnionFS\n";
+    std::wcout << L"  write on\n";
+    std::wcout << L"  !callbacks disable object WdFilter\n";
+    std::wcout << L"  !callbacks disable process WdFilter.sys\n";
+    std::wcout << L"  !callbacks disable minifilter WdFilter\n";
+    std::wcout << L"  !callbacks disable-all WdFilter\n";
+    std::wcout << L"  !callbacks enable-all WdFilter\n";
 }
 
 static std::wstring NormalizeCallbackHelpScope(const std::wstring& value)
@@ -1930,6 +1947,8 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"!callbacks object:\n";
         std::wcout << L"  !callbacks object [module]\n";
         std::wcout << L"  !callbacks object /module <module>\n";
+        std::wcout << L"  !callbacks disable object <module>\n";
+        std::wcout << L"  !callbacks enable object <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Object-manager pre/post filters from each _OBJECT_TYPE.CallbackList.\n";
@@ -1939,12 +1958,15 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  object/typeIndex/objectType/source identify the protected object type.\n";
         std::wcout << L"  pre/post are callback routines; registrationContext is the callback entry context.\n";
         std::wcout << L"  operations decodes create and duplicate filter bits.\n";
+        std::wcout << L"  disable patches that module's Pre/Post to a CFG return-0 thunk (OB_PREOP_SUCCESS). Never NULL/unlink.\n";
     }
     else if (scope == L"registry")
     {
         std::wcout << L"!callbacks registry:\n";
         std::wcout << L"  !callbacks registry [module]\n";
         std::wcout << L"  !callbacks registry /module <module>\n";
+        std::wcout << L"  !callbacks disable registry <module>\n";
+        std::wcout << L"  !callbacks enable registry <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Registry callbacks from CmpCallbackListHead-style callback-list candidates.\n";
@@ -1953,12 +1975,15 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  function is the Cm callback routine owner.\n";
         std::wcout << L"  callbackContext is operator-supplied registration context, not a module owner.\n";
         std::wcout << L"  cookie is printed when the kernel record exposes it.\n";
+        std::wcout << L"  disable patches that module's Function to a CFG return-0 thunk (STATUS_SUCCESS). Never NULL/unlink.\n";
     }
     else if (scope == L"process")
     {
         std::wcout << L"!callbacks process:\n";
         std::wcout << L"  !callbacks process [module]\n";
         std::wcout << L"  !callbacks process /module <module>\n";
+        std::wcout << L"  !callbacks disable process <module>\n";
+        std::wcout << L"  !callbacks enable process <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Process creation notification blocks from PspCreateProcessNotifyRoutine candidates.\n";
@@ -1967,12 +1992,15 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  function is the create-process notify routine.\n";
         std::wcout << L"  notifyMetadata is low-bit metadata from the encoded notify entry, not a callback context.\n";
         std::wcout << L"  raw is the encoded pointer value before routine/metadata separation.\n";
+        std::wcout << L"  disable patches that module's Function to a CFG return-0 thunk (VOID / STATUS_SUCCESS).\n";
     }
     else if (scope == L"thread")
     {
         std::wcout << L"!callbacks thread:\n";
         std::wcout << L"  !callbacks thread [module]\n";
         std::wcout << L"  !callbacks thread /module <module>\n";
+        std::wcout << L"  !callbacks disable thread <module>\n";
+        std::wcout << L"  !callbacks enable thread <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Thread creation notification blocks from PspCreateThreadNotifyRoutine candidates.\n";
@@ -1980,12 +2008,15 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"important output:\n";
         std::wcout << L"  function is the create-thread notify routine.\n";
         std::wcout << L"  callbackContext is printed when the record layout exposes a context-like field.\n";
+        std::wcout << L"  disable patches that module's Function to a CFG return-0 thunk. Never NULL/unlink.\n";
     }
     else if (scope == L"imageload")
     {
         std::wcout << L"!callbacks imageload:\n";
         std::wcout << L"  !callbacks imageload [module]\n";
         std::wcout << L"  !callbacks imageload /module <module>\n";
+        std::wcout << L"  !callbacks disable imageload <module>\n";
+        std::wcout << L"  !callbacks enable imageload <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Image load notification blocks from PspLoadImageNotifyRoutine candidates.\n";
@@ -1994,12 +2025,15 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  function is the image load notify routine.\n";
         std::wcout << L"  callbackContext is printed when the record layout exposes a context-like field.\n";
         std::wcout << L"  root and block show the notify table slot and decoded callback block.\n";
+        std::wcout << L"  disable patches that module's Function to a CFG return-0 thunk. Never NULL/unlink.\n";
     }
     else if (scope == L"minifilter")
     {
         std::wcout << L"!callbacks minifilter:\n";
         std::wcout << L"  !callbacks minifilter [module]\n";
         std::wcout << L"  !callbacks minifilter /module <module>\n";
+        std::wcout << L"  !callbacks disable minifilter <module>\n";
+        std::wcout << L"  !callbacks enable minifilter <module>\n";
         std::wcout << L"\n";
         std::wcout << L"what it scans:\n";
         std::wcout << L"  Minifilter filters and operation callbacks discovered from fltmgr!FltGlobals.\n";
@@ -2007,6 +2041,26 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"important output:\n";
         std::wcout << L"  altitude, filter, frame, driverObject, major, function, and post identify filter ownership.\n";
         std::wcout << L"  module filters match operation callback function owners case-insensitively.\n";
+        std::wcout << L"  disable/enable reuse !minifilter SetAllIrps on matching FilterName: Pre returns 1, Post returns 0.\n";
+    }
+    else if (scope == L"disable" || scope == L"enable")
+    {
+        std::wcout << L"!callbacks " << scope << L":\n";
+        std::wcout << L"  !callbacks " << scope << L" <all|object|registry|process|thread|imageload|minifilter> <module>\n";
+        std::wcout << L"  !callbacks " << scope << L" <scope> /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"  Needs write on. Patches only that module. Never writes NULL and never unlinks lists.\n";
+        std::wcout << L"  Ob/Cm/Ps use a CFG return-0 thunk. minifilter reuses !minifilter SetAllIrps (Pre=1, Post=0).\n";
+        std::wcout << L"  enable restores same-session backups only.\n";
+    }
+    else if (scope == L"disable-all" || scope == L"enable-all")
+    {
+        std::wcout << L"!callbacks " << scope << L":\n";
+        std::wcout << L"  !callbacks " << scope << L" <module>\n";
+        std::wcout << L"  !callbacks " << scope << L" /module <module>\n";
+        std::wcout << L"\n";
+        std::wcout << L"  Same as disable/enable with scope=all. A module name is required.\n";
+        std::wcout << L"  Needs write on. enable-all skips types this session never disabled.\n";
     }
     else
     {
@@ -3499,6 +3553,19 @@ static void AddCallbackModuleOptionCompletionCandidates(std::vector<std::wstring
     AddCompletionCandidates(candidates, values);
 }
 
+static void AddCallbackWriteActionCompletionCandidates(std::vector<std::wstring>* candidates)
+{
+    static const wchar_t* values[] =
+    {
+        L"disable",
+        L"enable",
+        L"disable-all",
+        L"enable-all"
+    };
+
+    AddCompletionCandidates(candidates, values);
+}
+
 static void AddVadOptionCompletionCandidates(std::vector<std::wstring>* candidates)
 {
     static const wchar_t* values[] =
@@ -4341,6 +4408,20 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             if (argsBefore.size() <= 1)
             {
                 AddCallbackScopeCompletionCandidates(&candidates);
+                AddCallbackWriteActionCompletionCandidates(&candidates);
+            }
+            else if (IsCallbackWriteAction(argsBefore[1]))
+            {
+                const std::wstring action = ToLower(argsBefore[1]);
+                if ((action == L"disable" || action == L"enable") &&
+                    argsBefore.size() == 2)
+                {
+                    AddCallbackScopeCompletionCandidates(&candidates);
+                }
+                else
+                {
+                    AddCallbackModuleOptionCompletionCandidates(&candidates);
+                }
             }
             else
             {
@@ -12967,19 +13048,7 @@ static bool CallbackRecordMatchesModuleFilter(
             break;
         }
 
-        if (CallbackModuleTextMatchesFilter(record.FunctionModule, moduleFilter) ||
-            CallbackModuleTextMatchesFilter(record.PostFunctionModule, moduleFilter))
-        {
-            matched = true;
-            break;
-        }
-
-        if (record.Kind == L"minifilter" &&
-            CallbackModuleTextMatchesFilter(record.FilterName, moduleFilter))
-        {
-            matched = true;
-            break;
-        }
+        matched = KernelCallbackRecordMatchesModule(record, moduleFilter);
     } while (false);
 
     return matched;
@@ -13163,6 +13232,48 @@ static void PrintCallbackContext(const KernelCallbackRecord& record)
     } while (false);
 }
 
+static void PrintCallbackSetResult(const KernelCallbackSetResult& result)
+{
+    PrintColoredText(L"callback.change", KNDBG_COLOR_TITLE);
+    std::wcout << L" action=" << result.Action
+               << L" scope=" << result.Scope
+               << L" module=";
+    PrintColoredText(result.Module, KNDBG_COLOR_OK);
+    std::wcout << L" changed=" << result.Changed
+               << L" skipped=" << result.Skipped
+               << L" failed=" << result.Failed
+               << L" attempted=" << result.Attempted;
+    if (result.MinifilterLiveNodesChanged != 0 || result.MinifilterLiveNodesFailed != 0)
+    {
+        std::wcout << L" live_nodes=" << result.MinifilterLiveNodesChanged;
+        if (result.MinifilterLiveNodesFailed != 0)
+        {
+            std::wcout << L" live_failed=" << result.MinifilterLiveNodesFailed;
+        }
+    }
+    std::wcout << L"\n";
+
+    for (const KernelCallbackPointerChange& change : result.Changes)
+    {
+        if (!change.Changed && change.Skipped)
+        {
+            continue;
+        }
+
+        std::wcout << L"  [" << change.Kind << L"] ";
+        if (!change.Target.empty())
+        {
+            std::wcout << change.Target << L" ";
+        }
+        std::wcout << change.Which
+                   << L" " << HexTextWidth(change.Before, 16, true)
+                   << L" -> " << HexTextWidth(change.After, 16, true)
+                   << L" ";
+        PrintColoredText(change.Changed ? L"UPDATED" : L"SKIPPED", KNDBG_COLOR_WARN);
+        std::wcout << L"\n";
+    }
+}
+
 static void HandleCallbacksCommand(
     const std::vector<std::wstring>& args,
     DeviceClient& device,
@@ -13180,6 +13291,125 @@ static void HandleCallbacksCommand(
             if (HasHelpToken(args, 1))
             {
                 PrintCallbacksHelpFromArgs(args, 1);
+                break;
+            }
+
+            if (IsCallbackWriteAction(args[1]))
+            {
+                const std::wstring actionToken = ToLower(args[1]);
+                KernelCallbackSetAction setAction = KernelCallbackSetAction::Disable;
+                std::wstring setScope;
+                std::wstring setModule;
+                size_t index = 2;
+                if (actionToken == L"disable-all" || actionToken == L"enable-all")
+                {
+                    setAction = (actionToken == L"enable-all")
+                        ? KernelCallbackSetAction::Enable
+                        : KernelCallbackSetAction::Disable;
+                    setScope = L"all";
+                }
+                else
+                {
+                    setAction = (actionToken == L"enable")
+                        ? KernelCallbackSetAction::Enable
+                        : KernelCallbackSetAction::Disable;
+                    if (index >= args.size() || !IsCallbackScopeName(args[index]))
+                    {
+                        std::wcerr << L"usage: !callbacks " << actionToken
+                                   << L" <all|object|registry|process|thread|imageload|minifilter> <module>\n";
+                        PrintCallbacksHelp();
+                        break;
+                    }
+
+                    setScope = args[index];
+                    ++index;
+                }
+
+                while (index < args.size())
+                {
+                    if (IsCallbackModuleOption(args[index]))
+                    {
+                        if (index + 1 >= args.size() || !setModule.empty())
+                        {
+                            std::wcerr << L"usage: !callbacks " << actionToken << L" [scope] <module>\n";
+                            break;
+                        }
+
+                        setModule = args[index + 1];
+                        index += 2;
+                        continue;
+                    }
+
+                    if (IsDeprecatedCallbackModuleOption(args[index]) ||
+                        IsDeprecatedCallbackScopeAlias(args[index]) ||
+                        IsSwitchLikeToken(args[index]))
+                    {
+                        std::wcerr << L"usage: !callbacks " << actionToken << L" [scope] <module>\n";
+                        break;
+                    }
+
+                    if (setModule.empty())
+                    {
+                        setModule = args[index];
+                        ++index;
+                        continue;
+                    }
+
+                    std::wcerr << L"usage: !callbacks " << actionToken << L" [scope] <module>\n";
+                    break;
+                }
+
+                if (index < args.size())
+                {
+                    break;
+                }
+
+                if (setModule.empty())
+                {
+                    std::wcerr << L"usage: !callbacks " << actionToken
+                               << L" requires a target module; refusing to touch every callback\n";
+                    PrintCallbacksHelp();
+                    break;
+                }
+
+                if (!device.IsOpen())
+                {
+                    std::wcerr << L"!callbacks disable/enable requires the KnLiveDbg.sys driver device to be open\n";
+                    break;
+                }
+
+                if (symbols.Modules().empty())
+                {
+                    if (!symbols.LoadKernelModules(&error))
+                    {
+                        std::wcerr << L"callback set failed: " << error << L"\n";
+                        break;
+                    }
+                }
+
+                KernelCallbackScanner scanner(device, symbols);
+                KernelCallbackSetResult setResult = {};
+                if (!scanner.SetModuleCallbacks(setScope, setModule, setAction, &setResult, &error))
+                {
+                    std::wcerr << L"callback set failed: " << error << L"\n";
+                    break;
+                }
+
+                if (structuredJsonOut != nullptr)
+                {
+                    *structuredJsonOut = BuildCallbackSetJson(setResult);
+                }
+
+                for (const std::wstring& warning : setResult.Warnings)
+                {
+                    std::wcerr << L"callback warning: " << warning << L"\n";
+                }
+                for (const std::wstring& failure : setResult.Failures)
+                {
+                    std::wcerr << L"callback warning: " << failure << L"\n";
+                }
+
+                PrintCallbackSetResult(setResult);
                 break;
             }
 
@@ -13264,6 +13494,7 @@ static void HandleCallbacksCommand(
             break;
         }
 
+        OverlayCallbackSessionDisabled(&result);
         ApplyCallbackModuleFilter(moduleFilter, &result);
 
         if (structuredJsonOut != nullptr)
@@ -13298,6 +13529,11 @@ static void HandleCallbacksCommand(
         for (const KernelCallbackRecord& record : result.Records)
         {
             PrintColoredText(L"[" + record.Kind + L"]", CallbackKindColor(record.Kind));
+            if (record.SessionDisabled)
+            {
+                std::wcout << L" ";
+                PrintColoredText(L"DISABLED", KNDBG_COLOR_WARN);
+            }
             if (record.Kind == L"ob")
             {
                 std::wcout << L" object=";
@@ -28614,6 +28850,10 @@ static std::wstring FirstTokenMissingCompletionHint()
         {L"!pool", L"big"},
         {L"!pool", L"tags"},
         {L"!callbacks"},
+        {L"!callbacks", L"disable"},
+        {L"!callbacks", L"enable"},
+        {L"!callbacks", L"disable-all"},
+        {L"!callbacks", L"enable-all"},
         {L"!byovd"},
         {L"!byovd", L"fixture"},
         {L"!byovd", L"update"},
@@ -29388,7 +29628,8 @@ static int RunConsoleSurfaceSelfTest()
                 IsNativeOwnedCommand(L"!hv") &&
                 IsNativeOwnedCommand(L"!minifilter") &&
                 IsNativeOwnedCommand(L"!fltmgr") &&
-                MinifilterIrpScannerSelfTest(),
+                MinifilterIrpScannerSelfTest() &&
+                KernelCallbackScannerSelfTest(),
             L"minifilter-command-native-and-self-test");
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -29412,6 +29653,17 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"help"}, L"!callbacks", L"help-callbacks-completion");
         CheckCompletionCandidate(&context, {L"help"}, L"!byovd", L"help-byovd-completion");
         CheckCompletionCandidate(&context, {L"!callbacks"}, L"all", L"callbacks-all-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks"}, L"disable", L"callbacks-disable-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks"}, L"enable", L"callbacks-enable-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks"}, L"disable-all", L"callbacks-disable-all-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks"}, L"enable-all", L"callbacks-enable-all-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks", L"disable"}, L"object", L"callbacks-disable-object-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks", L"enable"}, L"registry", L"callbacks-enable-registry-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks", L"disable"}, L"minifilter", L"callbacks-disable-minifilter-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks", L"disable-all"}, L"/module", L"callbacks-disable-all-module-completion");
+        CheckCompletionCandidate(&context, {L"!callbacks", L"enable-all"}, L"/module", L"callbacks-enable-all-module-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!callbacks"}, L"disable-all", L"help-callbacks-disable-all-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!callbacks"}, L"enable", L"help-callbacks-enable-completion");
         CheckCompletionCandidate(&context, {L"!pool"}, L"pe", L"pool-pe-scope-completion");
         CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/suspicious", L"pool-pe-suspicious-completion");
         CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/dump", L"pool-pe-dump-completion");
@@ -29523,7 +29775,9 @@ static int RunConsoleSurfaceSelfTest()
                 callbacks.find(L"usage:") != std::wstring::npos &&
                     callbacks.find(L"object") != std::wstring::npos &&
                     callbacks.find(L"CallbackList") != std::wstring::npos &&
-                    callbacks.find(L"minifilter") != std::wstring::npos,
+                    callbacks.find(L"minifilter") != std::wstring::npos &&
+                    callbacks.find(L"disable") != std::wstring::npos &&
+                    callbacks.find(L"enable-all") != std::wstring::npos,
                 L"completion-listing-callbacks-scopes");
 
             const std::wstring byovd = CaptureCompletionListing({L"!byovd"}, L"");
@@ -29918,11 +30172,17 @@ static int RunConsoleSurfaceSelfTest()
                     kpageHelp.find(L"!pool pe") != std::wstring::npos,
                 L"leftover-help-routes");
             const std::wstring callbacksHelp = CaptureDetailedHelpOutput({L"help", L"!callbacks"}, 1);
+            const std::wstring callbacksDisableHelp = CaptureDetailedHelpOutput({L"help", L"!callbacks", L"disable"}, 1);
             const std::wstring poolHelp = CaptureDetailedHelpOutput({L"help", L"!pool"}, 1);
             const std::wstring poolPeHelp = CaptureDetailedHelpOutput({L"help", L"!pool", L"pe"}, 1);
             CheckConsoleSurfaceSelfTest(
                 &context,
                 callbacksHelp.find(L"!callbacks all") != std::wstring::npos &&
+                    callbacksHelp.find(L"disable <scope> <module>") != std::wstring::npos &&
+                    callbacksHelp.find(L"disable-all") != std::wstring::npos &&
+                    callbacksHelp.find(L"enable-all") != std::wstring::npos &&
+                    callbacksHelp.find(L"write on") != std::wstring::npos &&
+                    callbacksDisableHelp.find(L"disable <all|object|registry|process|thread|imageload|minifilter>") != std::wstring::npos &&
                     byovdHelp.find(L"!byovd scan") != std::wstring::npos &&
                     poolHelp.find(L"!pool pe") != std::wstring::npos &&
                     poolPeHelp.find(L"!pool pe /suspicious") != std::wstring::npos &&
@@ -31829,6 +32089,15 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             break;
         }
 
+        if (command == L"!callbacks" && args.size() >= 2)
+        {
+            if (IsCallbackWriteAction(args[1]))
+            {
+                writeLike = true;
+            }
+            break;
+        }
+
         if (command == L"!pool")
         {
             for (size_t i = 1; i < args.size(); ++i)
@@ -32478,7 +32747,34 @@ static bool ValidateCallbackCommandArgumentShape(
             break;
         }
 
-        if (IsCallbackScopeName(args[index]))
+        if (IsCallbackWriteAction(args[index]))
+        {
+            const std::wstring action = ToLower(args[index]);
+            ++index;
+            if (action == L"disable" || action == L"enable")
+            {
+                if (index >= args.size() || !IsCallbackScopeName(args[index]))
+                {
+                    if (reason != nullptr)
+                    {
+                        *reason = L"callback disable/enable requires a scope and a module";
+                    }
+                    break;
+                }
+
+                ++index;
+            }
+
+            if (index >= args.size())
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"callback disable/enable requires a target module";
+                }
+                break;
+            }
+        }
+        else if (IsCallbackScopeName(args[index]))
         {
             ++index;
         }
@@ -34676,6 +34972,52 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             else
             {
                 plan.Warning = L"unrecognized !timeline write-like action";
+            }
+        }
+        else if (command == L"!callbacks")
+        {
+            const std::wstring action = commandArgs.size() >= 2 ? ToLower(commandArgs[1]) : L"";
+            plan.TargetKind = L"kernel-callback";
+            plan.Target = commandLine;
+            plan.ByteCountText = L"8";
+            std::wstring setScope = L"all";
+            std::wstring setModule;
+            if (action == L"disable" || action == L"enable")
+            {
+                if (commandArgs.size() >= 3)
+                {
+                    setScope = commandArgs[2];
+                }
+                if (commandArgs.size() >= 4)
+                {
+                    setModule = commandArgs[3];
+                }
+            }
+            else if (commandArgs.size() >= 3)
+            {
+                setModule = commandArgs[2];
+            }
+
+            if (!setModule.empty())
+            {
+                plan.BackupCommand = L"!callbacks " + setScope + L" " + setModule;
+                plan.VerifyCommand = plan.BackupCommand;
+            }
+
+            if (action == L"disable" || action == L"disable-all")
+            {
+                plan.Warning = L"replaces that module's Ob/Cm/Ps function pointers with a CFG return-0 thunk "
+                               L"and disables matching minifilter IRPs via live CallbackNodes; originals stay "
+                               L"in this session for enable. Never writes NULL and never unlinks lists.";
+            }
+            else if (action == L"enable" || action == L"enable-all")
+            {
+                plan.Warning = L"restores same-session callback backups for that module; slots never disabled "
+                               L"in this session are skipped";
+            }
+            else
+            {
+                plan.Warning = L"unrecognized !callbacks write-like action";
             }
         }
         else if (command == L"!minifilter" || command == L"!fltmgr")
@@ -48459,6 +48801,57 @@ static McpEngineResult DispatchMcpWriteTool(
                 result.IsError = true;
                 result.Text = L"minifilter.set_irp which must be pre, post, or both";
                 break;
+            }
+        }
+        else if (tool == L"callbacks.set")
+        {
+            std::wstring action;
+            std::wstring module;
+            std::wstring scope;
+            if (!McpGetArg(argsJson, L"action", &action) ||
+                !McpGetArg(argsJson, L"module", &module))
+            {
+                result.IsError = true;
+                result.Text = L"callbacks.set requires 'action' and 'module'";
+                break;
+            }
+            McpGetArg(argsJson, L"scope", &scope);
+            if (!McpValidateToken(action, &argError) ||
+                !McpValidateToken(module, &argError) ||
+                (!scope.empty() && !McpValidateToken(scope, &argError)))
+            {
+                result.IsError = true;
+                result.Text = L"invalid argument: " + argError;
+                break;
+            }
+            action = ToLower(action);
+            scope = ToLower(scope);
+            if (action == L"disable-all" || action == L"enable-all")
+            {
+                if (!scope.empty() && scope != L"all")
+                {
+                    action = (action == L"disable-all") ? L"disable" : L"enable";
+                }
+                else
+                {
+                    command = L"!callbacks " + action + L" " + module;
+                }
+            }
+            if (command.empty())
+            {
+                if (action != L"enable" && action != L"disable")
+                {
+                    result.IsError = true;
+                    result.Text = L"callbacks.set action must be enable, disable, enable-all, or disable-all";
+                    break;
+                }
+                if (scope.empty() || !IsCallbackScopeName(scope))
+                {
+                    result.IsError = true;
+                    result.Text = L"callbacks.set disable/enable requires scope=all|object|registry|process|thread|imageload|minifilter";
+                    break;
+                }
+                command = L"!callbacks " + action + L" " + scope + L" " + module;
             }
         }
         else if (tool == L"process.set_protection")

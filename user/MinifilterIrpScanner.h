@@ -143,3 +143,10 @@ std::wstring BuildMinifilterIrpChangeJson(const MinifilterIrpChange& change);
 std::wstring BuildMinifilterIrpBatchJson(const MinifilterIrpBatchResult& batch);
 bool MinifilterIrpScannerSelfTest();
 uint32_t MinifilterCallbackIndexFromMajor(uint32_t majorFunction);
+bool ResolveMinifilterNopThunks(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint64_t* preThunk,
+    uint64_t* postThunk,
+    std::wstring* error);
+bool IsMinifilterNopThunkAddress(uint64_t address);

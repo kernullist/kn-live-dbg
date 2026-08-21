@@ -224,7 +224,30 @@ namespace
         { L"thread", L"!callbacks thread [module]", L"PspCreateThreadNotifyRoutine blocks" },
         { L"imageload", L"!callbacks imageload [module]", L"PspLoadImageNotifyRoutine blocks" },
         { L"minifilter", L"!callbacks minifilter [module]", L"minifilter operations from fltmgr!FltGlobals" },
+        { L"disable", L"!callbacks disable <scope> <module>", L"patch that module's callbacks to a CFG return-0 thunk" },
+        { L"enable", L"!callbacks enable <scope> <module>", L"restore same-session callback backups" },
+        { L"disable-all", L"!callbacks disable-all <module>", L"disable every callback type for that module" },
+        { L"enable-all", L"!callbacks enable-all <module>", L"restore every same-session backup for that module" },
         { L"/module", L"!callbacks [scope] /module <module>", L"keep records owned by that module name or stem" },
+        { L"help", nullptr, L"show !callbacks usage" },
+    };
+
+    const CompletionHint kCallbackWriteTokens[] =
+    {
+        { L"all", L"!callbacks disable all <module>", L"every callback type for that module" },
+        { L"object", L"!callbacks disable object <module>", L"object-manager Pre/Post for that module" },
+        { L"registry", L"!callbacks disable registry <module>", L"Cm callbacks for that module" },
+        { L"process", L"!callbacks disable process <module>", L"process-notify for that module" },
+        { L"thread", L"!callbacks disable thread <module>", L"thread-notify for that module" },
+        { L"imageload", L"!callbacks disable imageload <module>", L"image-load notify for that module" },
+        { L"minifilter", L"!callbacks disable minifilter <module>", L"minifilter IRPs via live CallbackNodes" },
+        { L"/module", L"!callbacks disable|enable <scope> /module <module>", L"target module name or stem" },
+        { L"help", nullptr, L"show !callbacks usage" },
+    };
+
+    const CompletionHint kCallbackWriteAllTokens[] =
+    {
+        { L"/module", L"!callbacks disable-all|enable-all /module <module>", L"target module name or stem" },
         { L"help", nullptr, L"show !callbacks usage" },
     };
 
@@ -1134,8 +1157,10 @@ namespace
 
     const CompletionScopeTable kCallbackScopes[] =
     {
-        SCOPE(L"", L"!callbacks [all|object|registry|process|thread|imageload|minifilter] [module]", L"kernel callback / notify / filter inventory", kCallbackTokens),
+        SCOPE(L"", L"!callbacks [all|object|registry|process|thread|imageload|minifilter] [module] | disable|enable <scope> <module>", L"list callbacks; disable/enable one module per type", kCallbackTokens),
         SCOPE(L"filter", L"!callbacks [scope] /module <module>", L"module-filtered callback listing", kCallbackTokens),
+        SCOPE(L"write", L"!callbacks disable|enable <scope> <module>", L"per-type callback control (needs write on)", kCallbackWriteTokens),
+        SCOPE(L"write-all", L"!callbacks disable-all|enable-all <module>", L"all callback types for one module (needs write on)", kCallbackWriteAllTokens),
     };
 
     const CompletionScopeTable kDmlProcScopes[] =
@@ -1820,7 +1845,15 @@ namespace
         }
         else if (command == L"!callbacks")
         {
-            if (!first.empty() && first != L"help")
+            if (first == L"disable" || first == L"enable")
+            {
+                scope = L"write";
+            }
+            else if (first == L"disable-all" || first == L"enable-all")
+            {
+                scope = L"write-all";
+            }
+            else if (!first.empty() && first != L"help")
             {
                 scope = L"filter";
             }

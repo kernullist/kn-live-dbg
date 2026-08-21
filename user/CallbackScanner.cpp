@@ -1,10 +1,16 @@
 #include "CallbackScanner.h"
+#include "LeftoverCommon.h"
 #include "McpJson.h"
+#include "MinifilterIrpScanner.h"
+#include "../shared/KnLiveDbgIoctl.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <map>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -1911,6 +1917,7 @@ static bool ScanExCallbackTableRoot(
             record.RawValue = rawValue;
             record.CallbackBlock = blockAddress;
             record.Function = functionAddress;
+            record.FunctionSlot = functionAddressField;
             record.Context = callbackContext;
             if (layout.UsedSyntheticFields)
             {
@@ -2109,6 +2116,14 @@ static bool ScanRegistryCallbackListRoot(
                 record.Entry = blockAddress;
                 record.Function = preCallback;
                 record.PostFunction = postCallback;
+                if (layout.PreCallback.Length != 0)
+                {
+                    context.TryAdd(blockAddress, layout.PreCallback.Offset, &record.FunctionSlot);
+                }
+                if (layout.PostCallback.Length != 0)
+                {
+                    context.TryAdd(blockAddress, layout.PostCallback.Offset, &record.PostFunctionSlot);
+                }
                 record.Context = callbackContext;
                 record.Cookie = cookie;
                 record.Altitude = altitude;
@@ -2717,6 +2732,8 @@ static bool ScanMinifilterOperationArray(
             record.CallbackFlags = static_cast<uint32_t>(flags);
             record.Function = preOperation;
             record.PostFunction = postOperation;
+            AddOffset(context, entryAddress, layout.OperationPre.Offset, &record.FunctionSlot, nullptr);
+            AddOffset(context, entryAddress, layout.OperationPost.Offset, &record.PostFunctionSlot, nullptr);
             context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
             context.AnnotateAddress(record.PostFunction, &record.PostFunctionModule, &record.PostFunctionSymbol);
             result->Records.push_back(record);
@@ -3130,11 +3147,27 @@ std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result)
         out += L",\"function\":" + mcpjson::Quote(CallbacksJsonHex(record.Function));
         out += L",\"functionModule\":" + mcpjson::Quote(record.FunctionModule);
         out += L",\"functionSymbol\":" + mcpjson::Quote(record.FunctionSymbol);
+        if (record.FunctionSlot != 0)
+        {
+            out += L",\"functionSlot\":" + mcpjson::Quote(CallbacksJsonHex(record.FunctionSlot));
+        }
         if (record.PostFunction != 0)
         {
             out += L",\"postFunction\":" + mcpjson::Quote(CallbacksJsonHex(record.PostFunction));
             out += L",\"postFunctionModule\":" + mcpjson::Quote(record.PostFunctionModule);
             out += L",\"postFunctionSymbol\":" + mcpjson::Quote(record.PostFunctionSymbol);
+        }
+        if (record.PostFunctionSlot != 0)
+        {
+            out += L",\"postFunctionSlot\":" + mcpjson::Quote(CallbacksJsonHex(record.PostFunctionSlot));
+        }
+        if (record.Poisoned)
+        {
+            out += L",\"poisoned\":true";
+        }
+        if (record.SessionDisabled)
+        {
+            out += L",\"sessionDisabled\":true";
         }
         if (record.Context != 0)
         {
@@ -3921,6 +3954,9 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 record.Context = registrationContext;
                 record.Operations = static_cast<uint32_t>(operations);
                 record.Altitude = altitude;
+                context.TryAdd(itemAddress, layout.PreOperation.Offset, &record.FunctionSlot);
+                context.TryAdd(itemAddress, layout.PostOperation.Offset, &record.PostFunctionSlot);
+                record.Poisoned = !fieldsValid;
                 if (!layout.UsedSyntheticItemType && layout.UsedSyntheticFields)
                 {
                     record.Notes = L"partial fallback object callback item fields";
@@ -3979,6 +4015,1197 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
         }
 
         ok = true;
+    } while (false);
+
+    return ok;
+}
+
+namespace
+{
+    std::mutex g_CallbackBackupLock;
+
+    bool CallbackPointerOwnedByModule(
+        const std::wstring& pointerModule,
+        uint64_t pointer,
+        const std::wstring& moduleFilter);
+
+    struct CallbackPointerBackup
+    {
+        uint64_t Original = 0;
+        std::wstring ModuleFilter;
+        std::wstring OwnerModule;
+    };
+
+    std::map<uint64_t, CallbackPointerBackup> g_CallbackPointerBackups;
+
+    std::wstring CallbackTrimCopy(const std::wstring& value)
+    {
+        size_t start = 0;
+        while (start < value.size() && iswspace(value[start]) != 0)
+        {
+            ++start;
+        }
+
+        size_t end = value.size();
+        while (end > start && iswspace(value[end - 1]) != 0)
+        {
+            --end;
+        }
+
+        return value.substr(start, end - start);
+    }
+
+    std::wstring CallbackComparableModuleNameLocal(const std::wstring& value, bool removeExtension)
+    {
+        std::wstring comparable;
+        do
+        {
+            std::wstring text = CallbackTrimCopy(value);
+            if (text.empty())
+            {
+                break;
+            }
+
+            if (text.size() >= 2 &&
+                ((text.front() == L'"' && text.back() == L'"') ||
+                 (text.front() == L'\'' && text.back() == L'\'')))
+            {
+                text = text.substr(1, text.size() - 2);
+            }
+
+            const size_t bang = text.find(L'!');
+            if (bang != std::wstring::npos)
+            {
+                text = text.substr(0, bang);
+            }
+
+            const size_t slash = text.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+            {
+                text = text.substr(slash + 1);
+            }
+
+            text = ToLowerLocal(text);
+            if (removeExtension)
+            {
+                const size_t dot = text.find_last_of(L'.');
+                if (dot != std::wstring::npos)
+                {
+                    text = text.substr(0, dot);
+                }
+            }
+
+            comparable = text;
+        } while (false);
+
+        return comparable;
+    }
+
+    bool CallbackModuleTextMatchesLocal(const std::wstring& moduleText, const std::wstring& moduleFilter)
+    {
+        bool matched = false;
+        do
+        {
+            const std::wstring filterBase = CallbackComparableModuleNameLocal(moduleFilter, false);
+            if (filterBase.empty())
+            {
+                matched = true;
+                break;
+            }
+
+            const std::wstring moduleBase = CallbackComparableModuleNameLocal(moduleText, false);
+            if (moduleBase.empty())
+            {
+                break;
+            }
+
+            if (moduleBase == filterBase)
+            {
+                matched = true;
+                break;
+            }
+
+            const std::wstring filterStem = CallbackComparableModuleNameLocal(moduleFilter, true);
+            const std::wstring moduleStem = CallbackComparableModuleNameLocal(moduleText, true);
+            if (!filterStem.empty() && moduleStem == filterStem)
+            {
+                matched = true;
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool CallbackWriteModeEnabled(DeviceClient& device, std::wstring* error)
+    {
+        bool enabled = false;
+        DriverSessionStatus session = {};
+        if (!device.QuerySessionStatus(&session, error))
+        {
+            return false;
+        }
+
+        enabled = (session.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) != 0;
+        if (!enabled && error != nullptr)
+        {
+            *error = L"write mode is off; run 'write on' before changing kernel callbacks";
+        }
+
+        return enabled;
+    }
+
+    bool WriteCallbackPointer(
+        DeviceClient& device,
+        uint64_t address,
+        uint64_t value,
+        std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            if (value == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"refusing to write NULL into a callback slot (kCFG 0x139)";
+                }
+                break;
+            }
+
+            if (!LeftoverIsKernelCanonical(address) || !LeftoverIsKernelCanonical(value))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"refusing non-canonical callback pointer write at " +
+                             LeftoverFormatHex(address, 16);
+                }
+                break;
+            }
+
+            std::vector<uint8_t> bytes(sizeof(uint64_t));
+            memcpy(bytes.data(), &value, sizeof(uint64_t));
+            if (!device.WriteMemory(address, bytes, error))
+            {
+                break;
+            }
+
+            uint64_t readBack = 0;
+            if (!LeftoverReadU64(device, address, &readBack, error))
+            {
+                break;
+            }
+
+            if (readBack != value)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"write verify failed at " + LeftoverFormatHex(address, 16) +
+                             L" expected=" + LeftoverFormatHex(value, 16) +
+                             L" read=" + LeftoverFormatHex(readBack, 16);
+                }
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    bool BackupModuleMatches(const std::wstring& stored, const std::wstring& requested)
+    {
+        bool matched = false;
+        do
+        {
+            if (CallbackTrimCopy(requested).empty())
+            {
+                matched = true;
+                break;
+            }
+
+            if (CallbackModuleTextMatchesLocal(stored, requested) ||
+                CallbackModuleTextMatchesLocal(requested, stored))
+            {
+                matched = true;
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool RememberCallbackBackup(
+        uint64_t slotAddress,
+        uint64_t original,
+        const std::wstring& moduleFilter,
+        const std::wstring& ownerModule)
+    {
+        bool stored = false;
+        do
+        {
+            if (slotAddress == 0 || original == 0)
+            {
+                break;
+            }
+
+            std::lock_guard<std::mutex> guard(g_CallbackBackupLock);
+            if (g_CallbackPointerBackups.find(slotAddress) == g_CallbackPointerBackups.end())
+            {
+                CallbackPointerBackup backup = {};
+                backup.Original = original;
+                backup.ModuleFilter = moduleFilter;
+                backup.OwnerModule = ownerModule;
+                g_CallbackPointerBackups[slotAddress] = backup;
+            }
+            stored = true;
+        } while (false);
+
+        return stored;
+    }
+
+    bool LookupCallbackBackupForModule(
+        uint64_t slotAddress,
+        const std::wstring& moduleFilter,
+        uint64_t* original)
+    {
+        bool found = false;
+        do
+        {
+            if (slotAddress == 0)
+            {
+                break;
+            }
+
+            std::lock_guard<std::mutex> guard(g_CallbackBackupLock);
+            auto existing = g_CallbackPointerBackups.find(slotAddress);
+            if (existing == g_CallbackPointerBackups.end())
+            {
+                break;
+            }
+
+            if (!BackupModuleMatches(existing->second.ModuleFilter, moduleFilter))
+            {
+                break;
+            }
+
+            if (original != nullptr)
+            {
+                *original = existing->second.Original;
+            }
+            found = true;
+        } while (false);
+
+        return found;
+    }
+
+    bool RecordHasBackupForModule(const KernelCallbackRecord& record, const std::wstring& moduleFilter)
+    {
+        return LookupCallbackBackupForModule(record.FunctionSlot, moduleFilter, nullptr) ||
+            LookupCallbackBackupForModule(record.PostFunctionSlot, moduleFilter, nullptr);
+    }
+
+    bool MinifilterNameIsUnnamed(const std::wstring& name)
+    {
+        const std::wstring lowered = ToLowerLocal(CallbackTrimCopy(name));
+        return lowered.empty() || lowered == L"<unnamed>";
+    }
+
+    bool RecordOwnedForWrite(const KernelCallbackRecord& record, const std::wstring& moduleFilter)
+    {
+        bool owned = false;
+        do
+        {
+            if (record.Poisoned)
+            {
+                break;
+            }
+
+            if (record.Kind == L"minifilter")
+            {
+                if (!MinifilterNameIsUnnamed(record.FilterName))
+                {
+                    owned = CallbackModuleTextMatchesLocal(record.FilterName, moduleFilter);
+                    break;
+                }
+
+                owned = CallbackPointerOwnedByModule(record.FunctionModule, record.Function, moduleFilter) ||
+                    CallbackPointerOwnedByModule(record.PostFunctionModule, record.PostFunction, moduleFilter);
+                break;
+            }
+
+            owned = CallbackPointerOwnedByModule(record.FunctionModule, record.Function, moduleFilter) ||
+                CallbackPointerOwnedByModule(record.PostFunctionModule, record.PostFunction, moduleFilter);
+        } while (false);
+
+        return owned;
+    }
+
+    void OverlaySessionDisabledRecords(std::vector<KernelCallbackRecord>* records)
+    {
+        do
+        {
+            if (records == nullptr)
+            {
+                break;
+            }
+
+            for (KernelCallbackRecord& record : *records)
+            {
+                std::wstring originalOwner;
+                {
+                    std::lock_guard<std::mutex> guard(g_CallbackBackupLock);
+                    auto pre = g_CallbackPointerBackups.find(record.FunctionSlot);
+                    if (pre != g_CallbackPointerBackups.end())
+                    {
+                        originalOwner = pre->second.OwnerModule;
+                    }
+                    else
+                    {
+                        auto post = g_CallbackPointerBackups.find(record.PostFunctionSlot);
+                        if (post != g_CallbackPointerBackups.end())
+                        {
+                            originalOwner = post->second.OwnerModule;
+                        }
+                    }
+                }
+
+                if (originalOwner.empty() &&
+                    !RecordHasBackupForModule(record, std::wstring()))
+                {
+                    continue;
+                }
+
+                record.SessionDisabled = true;
+                std::wstring note = L"disabled this session (function pointer replaced with CFG nop thunk)";
+                if (!originalOwner.empty())
+                {
+                    note += L"; original module=";
+                    note += originalOwner;
+                }
+                if (record.Notes.empty())
+                {
+                    record.Notes = note;
+                }
+                else if (record.Notes.find(L"disabled this session") == std::wstring::npos)
+                {
+                    record.Notes += L"; ";
+                    record.Notes += note;
+                }
+            }
+        } while (false);
+    }
+
+    bool CallbackPointerOwnedByModule(
+        const std::wstring& pointerModule,
+        uint64_t pointer,
+        const std::wstring& moduleFilter)
+    {
+        bool owned = false;
+        do
+        {
+            if (pointer == 0)
+            {
+                break;
+            }
+
+            if (CallbackModuleTextMatchesLocal(pointerModule, moduleFilter))
+            {
+                owned = true;
+            }
+        } while (false);
+
+        return owned;
+    }
+
+    void AppendCallbackSetChange(
+        KernelCallbackSetResult* result,
+        const KernelCallbackPointerChange& change)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            ++result->Attempted;
+            if (change.Changed)
+            {
+                ++result->Changed;
+            }
+            else if (change.Skipped)
+            {
+                ++result->Skipped;
+            }
+
+            result->Changes.push_back(change);
+        } while (false);
+    }
+
+    bool PatchOwnedCallbackPointer(
+        DeviceClient& device,
+        const KernelCallbackRecord& record,
+        const std::wstring& which,
+        uint64_t slotAddress,
+        uint64_t scannedValue,
+        const std::wstring& pointerModule,
+        const std::wstring& moduleFilter,
+        KernelCallbackSetAction action,
+        uint64_t returnZeroThunk,
+        KernelCallbackSetResult* result)
+    {
+        bool ok = false;
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            uint64_t backupOriginal = 0;
+            const bool haveBackup = LookupCallbackBackupForModule(
+                slotAddress,
+                moduleFilter,
+                &backupOriginal);
+            const bool currentlyOwned = CallbackPointerOwnedByModule(
+                pointerModule,
+                scannedValue,
+                moduleFilter);
+            if (!currentlyOwned && !haveBackup)
+            {
+                ok = true;
+                break;
+            }
+
+            KernelCallbackPointerChange change = {};
+            change.Kind = record.Kind;
+            change.Target = record.Target;
+            change.Which = which;
+            change.Module = pointerModule;
+            change.SlotAddress = slotAddress;
+            change.Before = scannedValue;
+
+            if (record.Poisoned)
+            {
+                change.Skipped = true;
+                change.Notes = L"poisoned object callback item; refusing write";
+                AppendCallbackSetChange(result, change);
+                result->Failures.push_back(record.Kind + L" " + which + L": poisoned item");
+                ++result->Failed;
+                ok = true;
+                break;
+            }
+
+            if (slotAddress == 0 || !LeftoverIsKernelCanonical(slotAddress))
+            {
+                change.Skipped = true;
+                change.Notes = L"callback pointer slot is missing";
+                AppendCallbackSetChange(result, change);
+                result->Failures.push_back(record.Kind + L" " + which + L": missing slot");
+                ++result->Failed;
+                ok = true;
+                break;
+            }
+
+            uint64_t live = 0;
+            std::wstring readError;
+            if (!LeftoverReadU64(device, slotAddress, &live, &readError))
+            {
+                change.Skipped = true;
+                change.Notes = L"failed to read live pointer: " + readError;
+                AppendCallbackSetChange(result, change);
+                result->Failures.push_back(record.Kind + L" " + which + L": " + readError);
+                ++result->Failed;
+                ok = true;
+                break;
+            }
+
+            change.Before = live;
+            if (live == 0)
+            {
+                change.Skipped = true;
+                change.Notes = L"empty slot; never write NULL or fill a vacant callback";
+                AppendCallbackSetChange(result, change);
+                ok = true;
+                break;
+            }
+
+            const bool liveIsNop = (returnZeroThunk != 0 && live == returnZeroThunk) ||
+                IsMinifilterNopThunkAddress(live);
+
+            if (action == KernelCallbackSetAction::Disable)
+            {
+                if (liveIsNop)
+                {
+                    change.After = live;
+                    change.Skipped = true;
+                    change.Notes = haveBackup
+                        ? L"already replaced with return-0 thunk"
+                        : L"already a CFG nop thunk; no original pointer to save";
+                    AppendCallbackSetChange(result, change);
+                    ok = true;
+                    break;
+                }
+
+                if (!currentlyOwned)
+                {
+                    if (haveBackup)
+                    {
+                        change.Skipped = true;
+                        change.Notes = L"session backup exists but live pointer is not this module or a nop thunk";
+                        AppendCallbackSetChange(result, change);
+                        result->Failures.push_back(record.Kind + L" " + which + L": unexpected live pointer");
+                        ++result->Failed;
+                    }
+                    ok = true;
+                    break;
+                }
+
+                if (live != scannedValue)
+                {
+                    change.Skipped = true;
+                    change.Notes = L"live pointer changed since scan; refusing stale write";
+                    AppendCallbackSetChange(result, change);
+                    result->Failures.push_back(record.Kind + L" " + which + L": stale slot");
+                    ++result->Failed;
+                    ok = true;
+                    break;
+                }
+
+                RememberCallbackBackup(slotAddress, live, moduleFilter, pointerModule);
+                std::wstring writeError;
+                if (!WriteCallbackPointer(device, slotAddress, returnZeroThunk, &writeError))
+                {
+                    change.Skipped = true;
+                    change.Notes = writeError;
+                    AppendCallbackSetChange(result, change);
+                    result->Failures.push_back(record.Kind + L" " + which + L": " + writeError);
+                    ++result->Failed;
+                    ok = true;
+                    break;
+                }
+
+                change.After = returnZeroThunk;
+                change.Changed = true;
+                change.Notes = L"patched to CFG return-0 thunk";
+                AppendCallbackSetChange(result, change);
+                ok = true;
+                break;
+            }
+
+            if (!haveBackup || backupOriginal == 0)
+            {
+                change.Skipped = true;
+                change.Notes = L"no same-session backup";
+                AppendCallbackSetChange(result, change);
+                ok = true;
+                break;
+            }
+
+            change.UsedBackup = true;
+            if (live == backupOriginal)
+            {
+                change.After = live;
+                change.Skipped = true;
+                change.Notes = L"already restored from this session";
+                AppendCallbackSetChange(result, change);
+                ok = true;
+                break;
+            }
+
+            if (!liveIsNop)
+            {
+                change.Skipped = true;
+                change.Notes = L"live pointer is not the session thunk; refusing to clobber";
+                AppendCallbackSetChange(result, change);
+                result->Failures.push_back(record.Kind + L" " + which + L": unexpected live pointer");
+                ++result->Failed;
+                ok = true;
+                break;
+            }
+
+            std::wstring writeError;
+            if (!WriteCallbackPointer(device, slotAddress, backupOriginal, &writeError))
+            {
+                change.Skipped = true;
+                change.Notes = writeError;
+                AppendCallbackSetChange(result, change);
+                result->Failures.push_back(record.Kind + L" " + which + L": " + writeError);
+                ++result->Failed;
+                ok = true;
+                break;
+            }
+
+            change.After = backupOriginal;
+            change.Changed = true;
+            change.Notes = L"restored same-session original";
+            AppendCallbackSetChange(result, change);
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void MergeMinifilterBatch(
+        const MinifilterIrpBatchResult& batch,
+        KernelCallbackSetResult* result)
+    {
+        do
+        {
+            if (result == nullptr)
+            {
+                break;
+            }
+
+            result->MinifilterLiveNodesChanged += batch.LiveNodesChanged;
+            result->MinifilterLiveNodesFailed += batch.LiveNodesFailed;
+            result->Failed += batch.Failed;
+            for (const std::wstring& failure : batch.Failures)
+            {
+                result->Failures.push_back(L"minifilter: " + failure);
+            }
+
+            for (const MinifilterIrpChange& irpChange : batch.Changes)
+            {
+                if (irpChange.PreChanged)
+                {
+                    KernelCallbackPointerChange change = {};
+                    change.Kind = L"minifilter";
+                    change.Target = irpChange.FilterName;
+                    change.Which = irpChange.Before.MajorName + L" pre";
+                    change.Module = irpChange.Before.PreModule;
+                    change.Before = irpChange.Before.Pre;
+                    change.After = irpChange.After.Pre;
+                    change.Changed = true;
+                    change.UsedBackup = irpChange.UsedBackup;
+                    change.Notes = L"FLT_FILTER.Operations + live CallbackNodes";
+                    AppendCallbackSetChange(result, change);
+                }
+
+                if (irpChange.PostChanged)
+                {
+                    KernelCallbackPointerChange change = {};
+                    change.Kind = L"minifilter";
+                    change.Target = irpChange.FilterName;
+                    change.Which = irpChange.Before.MajorName + L" post";
+                    change.Module = irpChange.Before.PostModule;
+                    change.Before = irpChange.Before.Post;
+                    change.After = irpChange.After.Post;
+                    change.Changed = true;
+                    change.UsedBackup = irpChange.UsedBackup;
+                    change.Notes = L"FLT_FILTER.Operations + live CallbackNodes";
+                    AppendCallbackSetChange(result, change);
+                }
+
+                if (!irpChange.PreChanged && !irpChange.PostChanged && irpChange.LiveNodesChanged > 0)
+                {
+                    KernelCallbackPointerChange change = {};
+                    change.Kind = L"minifilter";
+                    change.Target = irpChange.FilterName;
+                    change.Which = irpChange.Before.MajorName;
+                    change.Changed = true;
+                    change.UsedBackup = irpChange.UsedBackup;
+                    change.Notes = L"live CallbackNodes patched";
+                    AppendCallbackSetChange(result, change);
+                }
+            }
+
+            result->Skipped += batch.Skipped;
+        } while (false);
+    }
+}
+
+bool KernelCallbackRecordMatchesModule(const KernelCallbackRecord& record, const std::wstring& moduleFilter)
+{
+    bool matched = false;
+    do
+    {
+        if (CallbackTrimCopy(moduleFilter).empty())
+        {
+            matched = true;
+            break;
+        }
+
+        if (CallbackModuleTextMatchesLocal(record.FunctionModule, moduleFilter) ||
+            CallbackModuleTextMatchesLocal(record.PostFunctionModule, moduleFilter))
+        {
+            matched = true;
+            break;
+        }
+
+        if (record.Kind == L"minifilter" &&
+            CallbackModuleTextMatchesLocal(record.FilterName, moduleFilter))
+        {
+            matched = true;
+            break;
+        }
+
+        if (RecordHasBackupForModule(record, moduleFilter))
+        {
+            matched = true;
+        }
+    } while (false);
+
+    return matched;
+}
+
+bool KernelCallbackRecordMatchesModuleForWrite(const KernelCallbackRecord& record, const std::wstring& moduleFilter)
+{
+    return RecordOwnedForWrite(record, moduleFilter);
+}
+
+bool KernelCallbackRecordHasSessionBackup(const KernelCallbackRecord& record, const std::wstring& moduleFilter)
+{
+    return RecordHasBackupForModule(record, moduleFilter);
+}
+
+void OverlayCallbackSessionDisabled(KernelCallbackScanResult* result)
+{
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+
+        OverlaySessionDisabledRecords(&result->Records);
+    } while (false);
+}
+
+bool IsCallbackWriteAction(const std::wstring& text)
+{
+    bool result = false;
+    const std::wstring lowered = ToLowerLocal(text);
+    if (lowered == L"disable" ||
+        lowered == L"enable" ||
+        lowered == L"disable-all" ||
+        lowered == L"enable-all")
+    {
+        result = true;
+    }
+
+    return result;
+}
+
+std::wstring BuildCallbackSetJson(const KernelCallbackSetResult& result)
+{
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.callbacks-set.v1\"";
+    out += L",\"action\":" + mcpjson::Quote(result.Action);
+    out += L",\"scope\":" + mcpjson::Quote(result.Scope);
+    out += L",\"module\":" + mcpjson::Quote(result.Module);
+    out += L",\"attempted\":" + std::to_wstring(result.Attempted);
+    out += L",\"changed\":" + std::to_wstring(result.Changed);
+    out += L",\"skipped\":" + std::to_wstring(result.Skipped);
+    out += L",\"failed\":" + std::to_wstring(result.Failed);
+    out += L",\"minifilterLiveNodesChanged\":" + std::to_wstring(result.MinifilterLiveNodesChanged);
+    out += L",\"minifilterLiveNodesFailed\":" + std::to_wstring(result.MinifilterLiveNodesFailed);
+    out += L",\"changes\":[";
+    for (size_t index = 0; index < result.Changes.size(); ++index)
+    {
+        const KernelCallbackPointerChange& change = result.Changes[index];
+        if (index > 0)
+        {
+            out += L",";
+        }
+
+        out += L"{\"kind\":" + mcpjson::Quote(change.Kind);
+        out += L",\"target\":" + mcpjson::Quote(change.Target);
+        out += L",\"which\":" + mcpjson::Quote(change.Which);
+        out += L",\"module\":" + mcpjson::Quote(change.Module);
+        out += L",\"slot\":" + mcpjson::Quote(CallbacksJsonHex(change.SlotAddress));
+        out += L",\"before\":" + mcpjson::Quote(CallbacksJsonHex(change.Before));
+        out += L",\"after\":" + mcpjson::Quote(CallbacksJsonHex(change.After));
+        out += L",\"changed\":";
+        out += change.Changed ? L"true" : L"false";
+        out += L",\"usedBackup\":";
+        out += change.UsedBackup ? L"true" : L"false";
+        out += L",\"skipped\":";
+        out += change.Skipped ? L"true" : L"false";
+        if (!change.Notes.empty())
+        {
+            out += L",\"notes\":" + mcpjson::Quote(change.Notes);
+        }
+        out += L"}";
+    }
+
+    out += L"],\"failures\":[";
+    for (size_t index = 0; index < result.Failures.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Failures[index]);
+    }
+
+    out += L"],\"warnings\":[";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        if (index > 0)
+        {
+            out += L",";
+        }
+        out += mcpjson::Quote(result.Warnings[index]);
+    }
+
+    out += L"]}";
+    return out;
+}
+
+bool KernelCallbackScanner::SetModuleCallbacks(
+    const std::wstring& scope,
+    const std::wstring& moduleFilter,
+    KernelCallbackSetAction action,
+    KernelCallbackSetResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"callback set output is null";
+            }
+            break;
+        }
+
+        *result = KernelCallbackSetResult{};
+        result->Action = (action == KernelCallbackSetAction::Disable) ? L"disable" : L"enable";
+        result->Scope = scope.empty() ? L"all" : ToLowerLocal(scope);
+        result->Module = CallbackTrimCopy(moduleFilter);
+        if (result->Module.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"module is required; refusing to change every registered callback";
+            }
+            break;
+        }
+
+        if (!device_.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"!callbacks disable/enable requires the KnLiveDbg.sys device to be open";
+            }
+            break;
+        }
+
+        if (!CallbackWriteModeEnabled(device_, error))
+        {
+            break;
+        }
+
+        KernelCallbackScanResult scan = {};
+        if (!Scan(result->Scope, &scan, error))
+        {
+            break;
+        }
+
+        OverlayCallbackSessionDisabled(&scan);
+        result->Warnings = scan.Warnings;
+        std::vector<KernelCallbackRecord> owned;
+        owned.reserve(scan.Records.size());
+        for (const KernelCallbackRecord& record : scan.Records)
+        {
+            if (record.Poisoned)
+            {
+                continue;
+            }
+
+            const bool writeOwned = RecordOwnedForWrite(record, result->Module);
+            const bool backupOwned = RecordHasBackupForModule(record, result->Module);
+            if (writeOwned || backupOwned)
+            {
+                owned.push_back(record);
+            }
+        }
+
+        if (owned.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"no " + result->Scope + L" callbacks owned by " + result->Module;
+            }
+            break;
+        }
+
+        uint64_t preThunk = 0;
+        uint64_t postThunk = 0;
+        bool needPointerThunk = false;
+        for (const KernelCallbackRecord& record : owned)
+        {
+            if (record.Kind != L"minifilter")
+            {
+                needPointerThunk = true;
+                break;
+            }
+        }
+
+        if (needPointerThunk &&
+            !ResolveMinifilterNopThunks(device_, symbols_, &preThunk, &postThunk, error))
+        {
+            break;
+        }
+
+        if (needPointerThunk && (postThunk == 0 || postThunk == preThunk))
+        {
+            if (error != nullptr)
+            {
+                *error = L"no CFG-valid return-0 thunk for Ob/Cm/Ps callbacks; "
+                         L"rebuild KnLiveDbg.sys for KnDbgMinifilterPostCallbackNop";
+            }
+            break;
+        }
+
+        std::set<uint64_t> minifilterSeen;
+        bool anyMinifilterAttempted = false;
+        for (const KernelCallbackRecord& record : owned)
+        {
+            if (record.Kind != L"minifilter")
+            {
+                continue;
+            }
+
+            if (record.Filter == 0 || minifilterSeen.find(record.Filter) != minifilterSeen.end())
+            {
+                continue;
+            }
+
+            minifilterSeen.insert(record.Filter);
+            anyMinifilterAttempted = true;
+            MinifilterIrpScanner irpScanner(device_, symbols_);
+            MinifilterIrpBatchResult batch = {};
+            MinifilterIrpScanResult irpScan = {};
+            std::wstring irpError;
+            const std::wstring specifier = LeftoverFormatHex(record.Filter, 16);
+            const MinifilterIrpAction irpAction =
+                (action == KernelCallbackSetAction::Disable)
+                    ? MinifilterIrpAction::Disable
+                    : MinifilterIrpAction::Enable;
+            if (!irpScanner.SetAllIrps(
+                    specifier,
+                    irpAction,
+                    MinifilterIrpWhich::Both,
+                    &batch,
+                    &irpScan,
+                    &irpError))
+            {
+                const bool enableWithoutBackup =
+                    action == KernelCallbackSetAction::Enable &&
+                    (irpError.find(L"no saved IRP handlers") != std::wstring::npos ||
+                     irpError.find(L"only works after") != std::wstring::npos);
+                if (enableWithoutBackup)
+                {
+                    KernelCallbackPointerChange skip = {};
+                    skip.Kind = L"minifilter";
+                    skip.Target = record.FilterName;
+                    skip.Which = L"all";
+                    skip.Skipped = true;
+                    skip.Notes = irpError;
+                    AppendCallbackSetChange(result, skip);
+                    continue;
+                }
+
+                result->Failures.push_back(
+                    L"minifilter " +
+                    (record.FilterName.empty() ? specifier : record.FilterName) +
+                    L": " + irpError);
+                ++result->Failed;
+                continue;
+            }
+
+            MergeMinifilterBatch(batch, result);
+        }
+
+        for (const KernelCallbackRecord& record : owned)
+        {
+            if (record.Kind == L"minifilter")
+            {
+                continue;
+            }
+
+            const wchar_t* primaryWhich = L"pre";
+            if (record.Kind == L"process" ||
+                record.Kind == L"thread" ||
+                record.Kind == L"imageload")
+            {
+                primaryWhich = L"function";
+            }
+
+            PatchOwnedCallbackPointer(
+                device_,
+                record,
+                primaryWhich,
+                record.FunctionSlot,
+                record.Function,
+                record.FunctionModule,
+                result->Module,
+                action,
+                postThunk,
+                result);
+            PatchOwnedCallbackPointer(
+                device_,
+                record,
+                L"post",
+                record.PostFunctionSlot,
+                record.PostFunction,
+                record.PostFunctionModule,
+                result->Module,
+                action,
+                postThunk,
+                result);
+        }
+
+        if (action == KernelCallbackSetAction::Enable &&
+            result->Changed == 0 &&
+            result->Attempted == result->Skipped &&
+            !anyMinifilterAttempted)
+        {
+            bool anyBackup = false;
+            for (const KernelCallbackRecord& record : owned)
+            {
+                if (RecordHasBackupForModule(record, result->Module))
+                {
+                    anyBackup = true;
+                    break;
+                }
+            }
+
+            if (!anyBackup)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"no saved " + result->Scope + L" callbacks for " + result->Module +
+                             L"; enable only works after a disable in this session";
+                }
+                break;
+            }
+        }
+
+        if (result->Changed == 0 && result->Failed != 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"failed to change any " + result->Scope + L" callback owned by " + result->Module;
+                if (!result->Failures.empty())
+                {
+                    *error += L" (" + result->Failures.front() + L")";
+                }
+            }
+            break;
+        }
+
+        if (result->Changed == 0 && result->Skipped == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"no writable " + result->Scope + L" callback slots owned by " + result->Module;
+            }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool KernelCallbackScannerSelfTest()
+{
+    bool ok = true;
+    do
+    {
+        if (!IsCallbackWriteAction(L"disable") ||
+            !IsCallbackWriteAction(L"ENABLE-ALL") ||
+            IsCallbackWriteAction(L"object") ||
+            IsCallbackWriteAction(L"list"))
+        {
+            ok = false;
+            break;
+        }
+
+        KernelCallbackRecord wdProcess = {};
+        wdProcess.Kind = L"process";
+        wdProcess.Function = 0xfffff80000001000ull;
+        wdProcess.FunctionModule = L"WdFilter.sys";
+        KernelCallbackRecord ntThread = {};
+        ntThread.Kind = L"thread";
+        ntThread.Function = 0xfffff80000002000ull;
+        ntThread.FunctionModule = L"ntoskrnl.exe";
+        KernelCallbackRecord wdFilter = {};
+        wdFilter.Kind = L"minifilter";
+        wdFilter.FilterName = L"WdFilter";
+        wdFilter.FunctionModule = L"FLTMGR.SYS";
+        if (!KernelCallbackRecordMatchesModule(wdProcess, L"wdfilter") ||
+            !KernelCallbackRecordMatchesModule(wdProcess, L"WdFilter.sys") ||
+            KernelCallbackRecordMatchesModule(ntThread, L"WdFilter") ||
+            !KernelCallbackRecordMatchesModule(wdFilter, L"WdFilter") ||
+            KernelCallbackRecordMatchesModule(wdProcess, L"fltmgr"))
+        {
+            ok = false;
+            break;
+        }
+
+        if (!KernelCallbackRecordMatchesModuleForWrite(wdFilter, L"WdFilter") ||
+            KernelCallbackRecordMatchesModuleForWrite(wdFilter, L"fltmgr") ||
+            KernelCallbackRecordMatchesModuleForWrite(ntThread, L"WdFilter") ||
+            !KernelCallbackRecordMatchesModule(wdFilter, L"fltmgr"))
+        {
+            ok = false;
+            break;
+        }
+
+        KernelCallbackRecord unnamedFilter = {};
+        unnamedFilter.Kind = L"minifilter";
+        unnamedFilter.FilterName = L"<unnamed>";
+        unnamedFilter.Function = 0xfffff80000004000ull;
+        unnamedFilter.FunctionModule = L"WdFilter.sys";
+        if (!KernelCallbackRecordMatchesModuleForWrite(unnamedFilter, L"WdFilter") ||
+            KernelCallbackRecordMatchesModuleForWrite(unnamedFilter, L"fltmgr"))
+        {
+            ok = false;
+            break;
+        }
+
+        KernelCallbackSetResult setResult = {};
+        setResult.Action = L"disable";
+        setResult.Scope = L"object";
+        setResult.Module = L"WdFilter";
+        setResult.Changed = 2;
+        KernelCallbackPointerChange change = {};
+        change.Kind = L"ob";
+        change.Target = L"Process";
+        change.Which = L"pre";
+        change.Changed = true;
+        setResult.Changes.push_back(change);
+        const std::wstring json = BuildCallbackSetJson(setResult);
+        if (json.find(L"kn-live-dbg.callbacks-set.v1") == std::wstring::npos ||
+            json.find(L"\"changed\":2") == std::wstring::npos ||
+            json.find(L"\"scope\":\"object\"") == std::wstring::npos)
+        {
+            ok = false;
+            break;
+        }
+
+        KernelCallbackScanResult scan = {};
+        KernelCallbackRecord poisoned = {};
+        poisoned.Kind = L"ob";
+        poisoned.Function = 0xfffff80000003000ull;
+        poisoned.FunctionModule = L"WdFilter.sys";
+        poisoned.Poisoned = true;
+        scan.Records.push_back(wdProcess);
+        scan.Records.push_back(poisoned);
+        poisoned.SessionDisabled = true;
+        scan.Records.back().SessionDisabled = true;
+        const std::wstring listJson = BuildCallbacksJson(scan);
+        if (listJson.find(L"\"poisoned\":true") == std::wstring::npos ||
+            listJson.find(L"\"sessionDisabled\":true") == std::wstring::npos)
+        {
+            ok = false;
+            break;
+        }
     } while (false);
 
     return ok;

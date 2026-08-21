@@ -3879,6 +3879,21 @@ std::wstring BuildMinifilterIrpBatchJson(const MinifilterIrpBatchResult& batch)
     return out;
 }
 
+bool ResolveMinifilterNopThunks(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint64_t* preThunk,
+    uint64_t* postThunk,
+    std::wstring* error)
+{
+    return EnsureFltNopThunks(device, symbols, preThunk, postThunk, error);
+}
+
+bool IsMinifilterNopThunkAddress(uint64_t address)
+{
+    return IsNopThunk(address);
+}
+
 bool MinifilterIrpScannerSelfTest()
 {
     bool ok = true;

@@ -568,7 +568,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 
 > `snapshot.capture`/`snapshot.diff` **do not write files to disk** on the MCP path (in-memory). Read the baseline via `kn://snapshot/current` or use `snapshot.show` for summary + structuredContent. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show`/`timeline.status`/`timeline.query`/`timeline.reconcile`/`graph.query` return structuredContent (JSON), and the remaining new tools return text content. `timeline.export` returns JSONL text in the MCP response and does not write a file. `ti.subscribe` is a read category, but because of the side effect of starting/stopping the ETW session, only start/stop require write mode (status is always available, the same data as `kn://ti/stats`).
 
-### 6.2 Write tools (11, `--allow-write` required)
+### 6.2 Write tools (12, `--allow-write` required)
 
 | Tool | Description | Required args | Optional args |
 |-----|------|-----------|-----------|
@@ -578,6 +578,7 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 | `memory.move` | Copy a kernel range (src->dest) | `source`, `dest`, `length` | — |
 | `type.set_field` | Set a struct field at an address (setfield) | `address`, `type`, `field`, `value` | — |
 | `minifilter.set_irp` | Enable or disable a minifilter IRP pre/post handler (`irp=all` for every slot) | `filter`, `irp`, `action` | `which` (pre/post/both) |
+| `callbacks.set` | Enable or disable one driver's callbacks by type | `action`, `module` | `scope` (all\|object\|registry\|process\|thread\|imageload\|minifilter) |
 | `process.set_protection` | Set PS_PROTECTION on an arbitrary target (PPL/PP) | `level` (none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid` (unspecified=self) |
 | `ti.export` | Export the current Threat-Intelligence ETW ring to JSONL | `path` | — |
 | `ti.clear` | Clear the in-memory Threat-Intelligence ETW ring | — | — |
@@ -586,7 +587,9 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 
 > **Caution — `process.set_protection` arbitrary target**: with `pid` you can raise the PPL/PP of an arbitrary process (e.g. promote a process to un-killable PP) or strip it (e.g. neutralize a PPL anti-cheat/AV). The driver IOCTL supports arbitrary targets (gated only by write-ack + write mode) and is for `--allow-write` lab mode only. Capturing a target-process baseline and a VM snapshot before the change is recommended. The response includes the before/after/requested bytes + the verification (readback) result.
 >
-> **`minifilter.set_irp`**: `irp` is a major name (`IRP_MJ_CREATE`, `CREATE`, `0x00`) or `all`. `irp=all` (or `action=disable-all`/`enable-all` with `irp=all`) walks every registered slot on that filter and returns `kn-live-dbg.minifilter-irp-batch.v1`. Enable restores only pointers saved in this session. Inbox names warn and are not blocked.
+> **`minifilter.set_irp`**: `irp` is a major name (`IRP_MJ_CREATE`, `CREATE`, `0x00`) or `all`. `irp=all` (or `action=disable-all`/`enable-all` with `irp=all`) walks every registered slot on that filter and returns `kn-live-dbg.minifilter-irp-batch.v1`. Enable restores only pointers saved in this session. Inbox names warn and are not blocked. Pre/Post are replaced with CFG-valid thunks (Pre=1, Post=0); NULL and list unlink are refused.
+>
+> **`callbacks.set`**: `action` is `disable`/`enable`/`disable-all`/`enable-all`. `module` is required. `scope` is required for disable/enable (`all|object|registry|process|thread|imageload|minifilter`). Maps to `!callbacks disable <scope> <module>`. Ob/Cm/Ps use a CFG return-0 thunk; minifilter reuses `minifilter.set_irp` with `irp=all`. Never NULL/unlink. Enable restores same-session backups only. JSON schema `kn-live-dbg.callbacks-set.v1`.
 
 ### 6.3 Resources (8)
 

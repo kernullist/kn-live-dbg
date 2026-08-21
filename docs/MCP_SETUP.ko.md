@@ -567,7 +567,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 > `snapshot.capture`/`snapshot.diff`는 MCP 경로에서 **디스크에 파일을 쓰지 않는다**(in-memory). baseline은 `kn://snapshot/current`로 읽거나 `snapshot.show`로 summary + structuredContent를 받는다. `memory.read_virtual`/`read_physical`/`symbol.search`/`snapshot.show`/`timeline.status`/`timeline.query`/`timeline.reconcile`/`graph.query`는 structuredContent(JSON)를 반환하고, 나머지 신규 툴은 텍스트 콘텐츠를 반환한다. `timeline.export`는 MCP 응답에 JSONL 텍스트를 반환하며 파일을 쓰지 않는다. `ti.subscribe`는 읽기 카테고리지만 ETW 세션을 시작/중지하는 부수효과 때문에 start/stop만 write 모드를 요구한다(status는 항상 가능, `kn://ti/stats`와 동일 데이터).
 
-### 6.2 Write 툴 (11종, `--allow-write` 필수)
+### 6.2 Write 툴 (12종, `--allow-write` 필수)
 
 | 툴 | 설명 | 필수 인자 | 선택 인자 |
 |-----|------|-----------|-----------|
@@ -577,6 +577,7 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 | `memory.move` | 커널 범위 복사(src->dest) | `source`, `dest`, `length` | — |
 | `type.set_field` | 주소의 구조체 필드 설정(setfield) | `address`, `type`, `field`, `value` | — |
 | `minifilter.set_irp` | 미니필터 IRP pre/post 핸들러 켜거나 끄기 (`irp=all`이면 해당 필터 전체 슬롯) | `filter`, `irp`, `action` | `which` (pre/post/both) |
+| `callbacks.set` | 드라이버 하나, 콜백 타입별로 켜거나 끄기 | `action`, `module` | `scope` (all\|object\|registry\|process\|thread\|imageload\|minifilter) |
 | `process.set_protection` | 임의 타깃 PS_PROTECTION 설정 (PPL/PP) | `level`(none/ppl-antimalware/ppl-lsa/ppl-windows/ppl-wintcb/pp-windows/pp-wintcb/pp-winsystem) | `pid`(미지정=self) |
 | `ti.export` | 현재 Threat-Intelligence ETW 링을 JSONL로 내보내기 | `path` | — |
 | `ti.clear` | 인메모리 Threat-Intelligence ETW 링 비우기 | — | — |
@@ -585,7 +586,9 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 
 > **주의 — `process.set_protection` 임의 타깃**: `pid`로 임의 프로세스의 PPL/PP를 올리거나(예: 프로세스를 un-killable PP로 승격) 벗길 수 있다(예: PPL 안티치트/AV 무력화). 드라이버 IOCTL은 임의 타깃을 지원하며(write-ack + write 모드로만 게이트), `--allow-write` lab 모드 전용이다. 변경 전 대상 프로세스 baseline·VM 스냅샷을 권장한다. 응답에 before/after/requested 바이트 + 검증(readback) 결과가 포함된다.
 >
-> **`minifilter.set_irp`**: `irp`는 major 이름(`IRP_MJ_CREATE`, `CREATE`, `0x00`) 또는 `all`. `irp=all`(또는 `action=disable-all`/`enable-all` + `irp=all`)은 해당 필터의 등록 슬롯 전체를 돌고 `kn-live-dbg.minifilter-irp-batch.v1`을 반환한다. enable은 이 세션에서 저장한 포인터만 복구한다. inbox 이름은 경고만 하고 막지 않는다.
+> **`minifilter.set_irp`**: `irp`는 major 이름(`IRP_MJ_CREATE`, `CREATE`, `0x00`) 또는 `all`. `irp=all`(또는 `action=disable-all`/`enable-all` + `irp=all`)은 해당 필터의 등록 슬롯 전체를 돌고 `kn-live-dbg.minifilter-irp-batch.v1`을 반환한다. enable은 이 세션에서 저장한 포인터만 복구한다. inbox 이름은 경고만 하고 막지 않는다. Pre/Post는 CFG-valid thunk로 바꾼다(Pre=1, Post=0). NULL과 리스트 unlink는 거부한다.
+>
+> **`callbacks.set`**: `action`은 `disable`/`enable`/`disable-all`/`enable-all`. `module`은 필수. disable/enable에는 `scope`가 필요하다(`all|object|registry|process|thread|imageload|minifilter`). `!callbacks disable <scope> <module>`로 매핑된다. Ob/Cm/Ps는 CFG return-0 thunk, minifilter는 `minifilter.set_irp` `irp=all`을 재사용한다. NULL/unlink 없음. enable은 같은 세션 백업만 복구한다. JSON 스키마 `kn-live-dbg.callbacks-set.v1`.
 
 ### 6.3 리소스 (8종)
 

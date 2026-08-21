@@ -308,7 +308,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"dS", L"dS", L"memory", L"display counted string as UTF-16", CommandSupport::Alias),
         Make(L"dt", L"dt", L"type", L"display type fields or enumerate type patterns", CommandSupport::Native),
         Make(L"dtx", L"dtx", L"type", L"display type fields through native type reader", CommandSupport::Alias),
-        Make(L"!callbacks", L"!callbacks", L"kernel", L"list callbacks: all|object|registry|process|thread|imageload|minifilter [module]", CommandSupport::Native),
+        Make(L"!callbacks", L"!callbacks", L"kernel", L"list callbacks; disable/enable one module: object|registry|process|thread|imageload|minifilter", CommandSupport::Native),
         Make(L"!dml_proc", L"!dml_proc [pid|name]", L"kernel", L"list processes from EPROCESS ActiveProcessLinks, optionally filtered by PID or image-name substring", CommandSupport::Native),
         Make(L"!hunt", L"!hunt", L"kernel", L"scan all processes for masquerade, hidden mapped code, module stomping, and thread/APC evidence", CommandSupport::Native),
         Make(L"!vad", L"!vad [scan|modules|mappedpe] <pid|image|eprocess>", L"kernel", L"walk VADs, detect hidden executable/injected regions, or inventory loader/VAD/memory PE mappings", CommandSupport::Native),

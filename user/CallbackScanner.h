@@ -41,9 +41,50 @@ struct KernelCallbackRecord
     uint64_t CallbackEntry = 0;
     uint64_t Function = 0;
     uint64_t PostFunction = 0;
+    uint64_t FunctionSlot = 0;
+    uint64_t PostFunctionSlot = 0;
     uint64_t Context = 0;
     uint64_t Cookie = 0;
     uint64_t RawValue = 0;
+    bool Poisoned = false;
+    bool SessionDisabled = false;
+};
+
+enum class KernelCallbackSetAction
+{
+    Disable,
+    Enable
+};
+
+struct KernelCallbackPointerChange
+{
+    std::wstring Kind;
+    std::wstring Target;
+    std::wstring Which;
+    std::wstring Module;
+    uint64_t SlotAddress = 0;
+    uint64_t Before = 0;
+    uint64_t After = 0;
+    bool Changed = false;
+    bool UsedBackup = false;
+    bool Skipped = false;
+    std::wstring Notes;
+};
+
+struct KernelCallbackSetResult
+{
+    std::wstring Action;
+    std::wstring Scope;
+    std::wstring Module;
+    uint32_t Attempted = 0;
+    uint32_t Changed = 0;
+    uint32_t Skipped = 0;
+    uint32_t Failed = 0;
+    uint32_t MinifilterLiveNodesChanged = 0;
+    uint32_t MinifilterLiveNodesFailed = 0;
+    std::vector<KernelCallbackPointerChange> Changes;
+    std::vector<std::wstring> Failures;
+    std::vector<std::wstring> Warnings;
 };
 
 struct KernelCallbackScanResult
@@ -64,6 +105,12 @@ public:
     KernelCallbackScanner(DeviceClient& device, SymbolEngine& symbols);
 
     bool Scan(const std::wstring& scope, KernelCallbackScanResult* result, std::wstring* error);
+    bool SetModuleCallbacks(
+        const std::wstring& scope,
+        const std::wstring& moduleFilter,
+        KernelCallbackSetAction action,
+        KernelCallbackSetResult* result,
+        std::wstring* error);
 
 private:
     bool ScanProcessCallbacks(KernelCallbackScanResult* result, std::wstring* error);
@@ -85,3 +132,10 @@ private:
 };
 
 std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result);
+std::wstring BuildCallbackSetJson(const KernelCallbackSetResult& result);
+bool KernelCallbackRecordMatchesModule(const KernelCallbackRecord& record, const std::wstring& moduleFilter);
+bool KernelCallbackRecordMatchesModuleForWrite(const KernelCallbackRecord& record, const std::wstring& moduleFilter);
+bool KernelCallbackRecordHasSessionBackup(const KernelCallbackRecord& record, const std::wstring& moduleFilter);
+void OverlayCallbackSessionDisabled(KernelCallbackScanResult* result);
+bool IsCallbackWriteAction(const std::wstring& text);
+bool KernelCallbackScannerSelfTest();

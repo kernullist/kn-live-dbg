@@ -406,6 +406,13 @@ int RunMcpToolCatalogSelfTest()
             !writeEntry.ReadOnly;
         Check(&context, writeToolOk, L"write-tools-marked-write");
 
+        McpToolCatalogEntry callbackSetEntry = {};
+        const bool callbackSetOk =
+            FindMcpToolCatalogEntry(L"callbacks.set", &callbackSetEntry) &&
+            !callbackSetEntry.ReadOnly &&
+            HasExactlyArguments(callbackSetEntry, {L"action", L"module", L"scope"});
+        Check(&context, callbackSetOk, L"callbacks-set-write-tool");
+
         std::wcout << L"[mcp.selftest] passed=" << context.Passed
                    << L" failed=" << context.Failed << L"\n";
         if (context.Failed == 0)
