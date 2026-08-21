@@ -4,6 +4,7 @@
 #include <bcrypt.h>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -24,6 +25,7 @@ namespace
     const wchar_t* kSidecarNames[] = {
         L"dbghelp.dll",
         L"dbgeng.dll",
+        L"dbgcore.dll",
         L"DbgModel.dll",
         L"srcsrv.dll",
         L"symsrv.dll",
@@ -182,7 +184,162 @@ namespace
 
     std::wstring Quote(const std::wstring& value)
     {
-        return L"\"" + value + L"\"";
+        std::wstring out = L"\"";
+        for (wchar_t ch : value)
+        {
+            if (ch == L'"')
+            {
+                out += L"\\\"";
+            }
+            else
+            {
+                out += ch;
+            }
+        }
+        out += L'"';
+        return out;
+    }
+
+    bool CopySidecarsFromExeDir(
+        const std::wstring& exeDir,
+        const std::wstring& workDir,
+        std::vector<std::wstring>* copied,
+        std::wstring* error)
+    {
+        bool ok = false;
+        HANDLE findHandle = INVALID_HANDLE_VALUE;
+        do
+        {
+            if (copied == nullptr)
+            {
+                break;
+            }
+            copied->clear();
+
+            std::set<std::wstring> seen;
+            WIN32_FIND_DATAW find = {};
+            findHandle = FindFirstFileW((exeDir + L"\\*.dll").c_str(), &find);
+            if (findHandle == INVALID_HANDLE_VALUE)
+            {
+                const DWORD findError = GetLastError();
+                if (findError != ERROR_FILE_NOT_FOUND && findError != ERROR_PATH_NOT_FOUND)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"FindFirstFileW sidecar dlls failed (gle=" +
+                            std::to_wstring(findError) + L")";
+                    }
+                    break;
+                }
+            }
+            else
+            {
+                bool globFailed = false;
+                do
+                {
+                    if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                    {
+                        continue;
+                    }
+                    const std::wstring name = find.cFileName;
+                    if (name.empty() || !seen.insert(ToLowerCopy(name)).second)
+                    {
+                        continue;
+                    }
+                    const std::wstring dest = workDir + L"\\" + name;
+                    if (!CopyOneFile(exeDir + L"\\" + name, dest, error))
+                    {
+                        globFailed = true;
+                        break;
+                    }
+                    copied->push_back(dest);
+                } while (FindNextFileW(findHandle, &find));
+
+                const DWORD globEnd = GetLastError();
+                FindClose(findHandle);
+                findHandle = INVALID_HANDLE_VALUE;
+                if (globFailed)
+                {
+                    break;
+                }
+                if (globEnd != ERROR_NO_MORE_FILES && globEnd != ERROR_SUCCESS)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"FindNextFileW sidecar dlls failed (gle=" +
+                            std::to_wstring(globEnd) + L")";
+                    }
+                    break;
+                }
+            }
+
+            bool listedFailed = false;
+            for (const wchar_t* sidecar : kSidecarNames)
+            {
+                if (sidecar == nullptr)
+                {
+                    continue;
+                }
+                const std::wstring name = sidecar;
+                const std::wstring source = exeDir + L"\\" + name;
+                if (GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES)
+                {
+                    continue;
+                }
+                if (!seen.insert(ToLowerCopy(name)).second)
+                {
+                    continue;
+                }
+                const std::wstring dest = workDir + L"\\" + name;
+                if (!CopyOneFile(source, dest, error))
+                {
+                    listedFailed = true;
+                    break;
+                }
+                copied->push_back(dest);
+            }
+            if (listedFailed)
+            {
+                break;
+            }
+
+            bool missingRequired = false;
+            for (const wchar_t* sidecar : kSidecarNames)
+            {
+                if (sidecar == nullptr)
+                {
+                    continue;
+                }
+                const std::wstring source = exeDir + L"\\" + sidecar;
+                if (GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES)
+                {
+                    continue;
+                }
+                const std::wstring dest = workDir + L"\\" + sidecar;
+                if (GetFileAttributesW(dest.c_str()) == INVALID_FILE_ATTRIBUTES)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"cloak sidecar missing after copy: " +
+                            std::wstring(sidecar);
+                    }
+                    missingRequired = true;
+                    break;
+                }
+            }
+            if (missingRequired)
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        if (findHandle != INVALID_HANDLE_VALUE)
+        {
+            FindClose(findHandle);
+        }
+        return ok;
     }
 
     void TryDeleteFile(const std::wstring& path)
@@ -301,6 +458,21 @@ namespace
             needed);
         return out;
     }
+}
+
+bool CloakCopiesRuntimeSidecar(const std::wstring& fileName)
+{
+    bool found = false;
+    const std::wstring wanted = ToLowerCopy(fileName);
+    for (const wchar_t* sidecar : kSidecarNames)
+    {
+        if (sidecar != nullptr && ToLowerCopy(sidecar) == wanted)
+        {
+            found = true;
+            break;
+        }
+    }
+    return found;
 }
 
 bool IsValidCloakLeafName(const std::wstring& name)
@@ -510,25 +682,7 @@ bool BuildCloakSession(CloakSession* session, std::wstring* error)
             break;
         }
 
-        session->CopiedSidecarFiles.clear();
-        bool sidecarFailed = false;
-        for (const wchar_t* sidecar : kSidecarNames)
-        {
-            const std::wstring source = exeDir + L"\\" + sidecar;
-            if (GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES)
-            {
-                continue;
-            }
-
-            const std::wstring dest = workDir + L"\\" + sidecar;
-            if (!CopyOneFile(source, dest, error))
-            {
-                sidecarFailed = true;
-                break;
-            }
-            session->CopiedSidecarFiles.push_back(dest);
-        }
-        if (sidecarFailed)
+        if (!CopySidecarsFromExeDir(exeDir, workDir, &session->CopiedSidecarFiles, error))
         {
             break;
         }
@@ -773,14 +927,19 @@ bool LaunchCloakChild(const CloakSession& session, int argc, const wchar_t* cons
 
         STARTUPINFOW startup = {};
         startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESHOWWINDOW;
+        startup.wShowWindow = SW_SHOWNORMAL;
         PROCESS_INFORMATION info = {};
+        // A new console is required. The parent returns immediately so the
+        // original EXE name leaves the process list; Windows Terminal then
+        // closes the tab and kills inherited-console children.
         if (!CreateProcessW(
                 session.CopiedExePath.c_str(),
                 commandLine.data(),
                 nullptr,
                 nullptr,
-                TRUE,
-                0,
+                FALSE,
+                CREATE_NEW_CONSOLE,
                 nullptr,
                 session.WorkDirectory.c_str(),
                 &startup,
@@ -791,6 +950,34 @@ bool LaunchCloakChild(const CloakSession& session, int argc, const wchar_t* cons
                 *error = L"CreateProcessW cloak child failed (gle=" +
                     std::to_wstring(GetLastError()) + L")";
             }
+            break;
+        }
+
+        const DWORD wait = WaitForSingleObject(info.hProcess, 2000);
+        if (wait == WAIT_OBJECT_0)
+        {
+            DWORD exitCode = 0;
+            GetExitCodeProcess(info.hProcess, &exitCode);
+            if (error != nullptr)
+            {
+                std::wstringstream stream;
+                stream << L"cloak child exited immediately (code=0x" << std::hex
+                       << static_cast<unsigned long>(exitCode) << L")";
+                *error = stream.str();
+            }
+            CloseHandle(info.hThread);
+            CloseHandle(info.hProcess);
+            break;
+        }
+        if (wait == WAIT_FAILED)
+        {
+            if (error != nullptr)
+            {
+                *error = L"WaitForSingleObject cloak child failed (gle=" +
+                    std::to_wstring(GetLastError()) + L")";
+            }
+            CloseHandle(info.hThread);
+            CloseHandle(info.hProcess);
             break;
         }
 
