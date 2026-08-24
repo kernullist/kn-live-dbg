@@ -340,7 +340,8 @@ Implementation notes:
 2. Reject unknown tools, unknown fields, write-like actions, raw `kd`, nested
    `ai`, session mutation, unload/shutdown, and command chaining.
 3. Return local tool evidence first, then ask the provider to explain the
-   captured output.
+   captured output. Empty stderr is omitted from the explanation prompt;
+   trailing empty-stderr echo is stripped from the printed report.
 4. Prefer structured local execution and named playbooks over natural-language
    keyword rules. Generic playbooks do not fire when the goal already names a
    `.sys`/`.exe`/`.dll`/`.drv` file, so prompts such as
