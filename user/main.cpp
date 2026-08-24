@@ -27549,6 +27549,9 @@ static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const Symbol
     stream << L"- Treat AI output as advisory and require operator confirmation for writes.\n";
     stream << L"- For memory writes, mention backup, restore, and readback verification commands.\n";
     stream << L"- Do not claim live state was inspected unless command output was provided in the prompt.\n";
+    stream << L"- Reply with the operator-facing report only. No chain-of-thought, no restating instructions, no language debate.\n";
+    stream << L"- If the operator text contains Hangul, reply in Korean. Otherwise reply in English.\n";
+    stream << L"- Use short sections and bullet lists. Keep addresses and module names exact.\n";
 
     return stream.str();
 }
@@ -29941,6 +29944,10 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 AiModelCatalog::SelfTest(),
                 L"ai-model-catalog-self-test");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                AiProviderRuntime::ParseAssistantSelfTest(),
+                L"ai-provider-parse-assistant-self-test");
             {
                 const std::wstring aiHelp = CaptureDetailedHelpOutput({L"help", L"ai"}, 1);
                 CheckConsoleSurfaceSelfTest(
@@ -35572,7 +35579,12 @@ static std::wstring BuildAiEvidencePrompt(
     std::wstringstream stream;
 
     stream << title << L"\n\n";
-    stream << instructions << L"\n\n";
+    stream << instructions << L"\n";
+    stream << L"Write the operator-facing report only. Use short headings and bullets:\n";
+    stream << L"## Findings\n";
+    stream << L"## Anomalies\n";
+    stream << L"## Follow-up\n";
+    stream << L"Do not restate these instructions, debate language, or narrate your plan.\n\n";
     stream << L"Command:\n";
     stream << commandLine << L"\n\n";
     stream << L"Deterministic output summary:\n```text\n";
@@ -35596,9 +35608,10 @@ static void CompleteAndPrintAiRequest(
 {
     do
     {
-        std::wcout << L"ai request: provider=" << ai.ProviderName()
-                   << L" model=" << ai.Settings().Model
-                   << L" credential=" << ai.CredentialStatus() << L"\n";
+        std::wcout << L"\n";
+        PrintColoredText(L"ai explain", KNDBG_COLOR_TITLE);
+        std::wcout << L": " << ai.ProviderName() << L" / "
+                   << (ai.Settings().Model.empty() ? L"(default)" : ai.Settings().Model) << L"\n";
 
         AiCompletionResponse response = {};
         std::wstring error;
@@ -35612,11 +35625,17 @@ static void CompleteAndPrintAiRequest(
         WriteAiTranscriptEvent(aiState, eventName, L"request completed", L"");
         if (!response.Text.empty())
         {
+            std::wcout << L"\n";
             std::wcout << response.Text;
             if (response.Text.back() != L'\n')
             {
                 std::wcout << L"\n";
             }
+        }
+
+        if (response.Truncated)
+        {
+            std::wcout << L"ai note: model hit the token limit; the reply may be incomplete.\n";
         }
     } while (false);
 }
@@ -35694,7 +35713,7 @@ static AiEvidenceAnalysisMetadata BuildAiEvidenceAnalysisMetadata(
         {
             metadata.EventName = defaultEventName + L"_callbacks";
             metadata.Title = L"Analyze this KnLiveDbg kernel callback scan.";
-            metadata.Instructions = L"Produce a callback analysis report from this KnLiveDbg callback scan output. Count records by surface, group by module, decode process notify metadata, call out image-load notify owners, non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes.";
+            metadata.Instructions = L"Produce a callback analysis report from this KnLiveDbg callback scan output. Count records by surface, group by module, decode process notify metadata, call out image-load notify owners, non-image owners, missing symbols, unusual minifilter metadata, shared module ownership across surfaces, and concrete follow-up commands. Preserve raw addresses and confidence notes. Write the report only; no chain-of-thought.";
         }
         if (topic == L"dt" || topic == L"dtx")
         {
@@ -45722,12 +45741,6 @@ static bool ExecuteAiCapabilityPlan(
 
     do
     {
-        if (!plan.Summary.empty())
-        {
-            PrintColoredText(L"ai tools", KNDBG_COLOR_TITLE);
-            std::wcout << L": " << plan.Summary << L"\n";
-        }
-
         for (const AiCapabilityStep& step : plan.Steps)
         {
             AiCapabilityStepResult result = {};
@@ -46384,7 +46397,7 @@ static void ExplainAiCapturedTools(
     request.System = BuildAiSystemPrompt(state, symbols);
     request.Prompt = BuildAiEvidencePrompt(
         L"Explain this KnLiveDbg local tool output for the operator.",
-        L"The operator may not know the underlying command names. Explain important findings, anomalies, uncertainty, and concrete follow-up commands. Preserve raw addresses and values. Reply in the operator's language (Korean or English).",
+        L"The operator may not know the underlying command names. Explain important findings, anomalies, uncertainty, and concrete follow-up commands. Preserve raw addresses and values. If the operator text contains Hangul, reply in Korean; otherwise English. Do not write chain-of-thought or restate the prompt.",
         query + (summary.empty() ? L"" : (L" [" + summary + L"]")),
         result);
     CompleteAndPrintAiRequest(L"ai_tool_explain", request, ai, aiState);
@@ -47159,9 +47172,6 @@ static void HandleAiFreeFormCommand(
             AiCompletionRequest request = {};
             request.System = BuildAiSystemPrompt(state, symbols);
             request.Prompt = query;
-            std::wcout << L"ai request: provider=" << ai.ProviderName()
-                       << L" model=" << ai.Settings().Model
-                       << L" credential=" << ai.CredentialStatus() << L"\n";
             CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
             break;
         }
@@ -47191,9 +47201,6 @@ static void HandleAiFreeFormCommand(
         AiCompletionRequest request = {};
         request.System = BuildAiSystemPrompt(state, symbols);
         request.Prompt = query;
-        std::wcout << L"ai request: provider=" << ai.ProviderName()
-                   << L" model=" << ai.Settings().Model
-                   << L" credential=" << ai.CredentialStatus() << L"\n";
         CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
     } while (false);
 }
@@ -47702,27 +47709,7 @@ static void HandleAiCommand(
                 break;
             }
 
-            std::wcout << L"ai request: provider=" << ai.ProviderName()
-                       << L" model=" << ai.Settings().Model
-                       << L" credential=" << ai.CredentialStatus() << L"\n";
-            AiCompletionResponse response = {};
-            std::wstring error;
-            if (!ai.Complete(request, &response, &error))
-            {
-                std::wcerr << L"ai request failed: " << error << L"\n";
-                WriteAiTranscriptEvent(aiState, L"ai_ask_failed", error, L"");
-                break;
-            }
-
-            WriteAiTranscriptEvent(aiState, L"ai_ask", L"request completed", L"");
-            if (!response.Text.empty())
-            {
-                std::wcout << response.Text;
-                if (response.Text.back() != L'\n')
-                {
-                    std::wcout << L"\n";
-                }
-            }
+            CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
         }
         else if (action == L"plan")
         {

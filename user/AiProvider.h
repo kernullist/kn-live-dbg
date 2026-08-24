@@ -47,6 +47,7 @@ struct AiCompletionResponse
     std::wstring Text;
     std::wstring RawBody;
     uint32_t StatusCode;
+    bool Truncated;
 };
 
 class AiProviderRuntime
@@ -81,6 +82,7 @@ public:
 
     static std::vector<std::wstring> SupportedProviderNames();
     static bool NormalizeProviderName(const std::wstring& value, AiProviderKind* provider, std::wstring* normalized);
+    static bool ParseAssistantSelfTest();
 
 private:
     struct ConfigEntry
