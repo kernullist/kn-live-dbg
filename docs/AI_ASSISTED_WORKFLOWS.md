@@ -22,8 +22,8 @@ The first integration layer is implemented as a user-mode `ai` command and `AiPr
 4. `ai plan <prompt>` remains an explicit override that asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
 5. `ai explain <read-only-command...>` remains an explicit override for evidence analysis. The same path is also reached implicitly when the operator types `ai !callbacks ...`, `ai dt ...`, `ai uf ...`, `ai !ci options`, or another recognized read-only evidence command.
 6. `ai show` prints session hints, a pending expensive tool plan, and the loaded command plan. `ai show evidence` reprints the last captured tool or evidence output. `ai go` / `ai no` confirm or cancel a pending expensive tool plan.
-7. `ai run <index|all>` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands.
-8. `ai write <index> [confirm]` provides an explicit confirmation path for planned write-like commands. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
+7. `ai run [index|all]` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands. If the plan has one read-only command, `ai run` with no index runs it. A single write-like plan item is refused and the operator is sent to `ai write confirm`.
+8. `ai write [index] [confirm]` provides an explicit confirmation path for planned write-like commands. If the plan has one write, `ai write` previews it and `ai write confirm` executes it. `[1]` in the listing is that index, not a menu. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
 9. `ai report <path>` exports a Markdown report with session context, provider status, transcript settings, write-audit path, the parsed plan, and the raw AI plan response.
 
 The older detailed forms remain accepted for compatibility: `ai providers`, `ai provider`, `ai policy`, `ai model`, `ai base-url`, `ai effort`, `ai auth`, `ai preview`, `ai ask`, `ai analyze !callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit`.
@@ -171,13 +171,13 @@ OpenRouter defaults:
 1. Model: `anthropic/claude-opus-5` when `KNLIVEDBG_AI_MODEL` is unset.
 2. Base URL: `https://openrouter.ai/api/v1`.
 
-The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. AI callback analysis now fits under both `ai !callbacks ...` and `ai explain !callbacks ...`, and consumes normal `!callbacks <scope> [module]` evidence. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
+The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write confirm` (or `ai write <index> confirm`). Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. AI callback analysis now fits under both `ai !callbacks ...` and `ai explain !callbacks ...`, and consumes normal `!callbacks <scope> [module]` evidence. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
 
 The main `ai help` output stays focused on the primary workflow. Detailed compatibility topics still have operator help through `ai <subcommand> help` and `ai help <subcommand>`.
 
 ## Operator Command Examples
 
-Default rule: prefer `ai <goal>` during normal use. Exact read-only command lines after `ai` are treated as evidence to run and explain. Known playbooks and process field queries run locally first. Cheap selected tools run after a preview and are explained. Expensive tools wait for `ai go`. Conceptual `what`/`why` questions stay advisory. Use `ai plan` only when you want a stored command proposal.
+Default rule: prefer `ai <goal>` during normal use. Exact read-only command lines after `ai` are treated as evidence to run and explain. Known playbooks and process field queries run locally first. Cheap selected tools run after a preview and are explained. Expensive tools wait for `ai go`. Conceptual `what`/`why` questions stay advisory. Use `ai plan` only when you want a stored command proposal. Disable/enable goals and exact write-like commands do not run list playbooks and do not mutate immediately. They stage a write plan. If that plan has one write, `ai write` previews it and `ai write confirm` executes it (`write on` required). `[1]` in the listing is the plan index, not a menu. Use `ai write <index> confirm` when several writes are staged.
 
 Provider and session setup:
 
@@ -231,6 +231,17 @@ Callback analysis:
 
 ```text
 ai !callbacks all WdFilter.sys
+ai disable wdfilter minifilter
+ai disable wdfilter callbacks
+ai disable wdfilter object
+ai enable ppl
+ai load byovd fixture
+ai reset timeline
+ai dump-pe nt .\\ntos-live.exe
+ai !callbacks disable-all WdFilter
+ai write
+ai write confirm
+ai write 1 confirm
 ai !callbacks object WdFilter.sys
 ai !callbacks process
 ai !callbacks imageload
@@ -344,7 +355,24 @@ ai report .\reports\session-ai.md
 
 Implemented entrypoint: `ai <question>`.
 
-The command now behaves like a small tool-using agent and intent router. The operator can usually type `ai <goal>` without knowing command names. Exact read-only commands are executed as evidence and explained. Known Korean/English playbooks and local process field queries run without a model round-trip. Generic playbooks are skipped when the goal already names a `.sys`/`.exe`/`.dll`/`.drv` file, so a prompt such as `WdFilter.sys object callbacks` stays on the tool planner with a module filter instead of running an unfiltered callback dump. Otherwise the model receives the operator request plus the shared capability catalog (not live memory), returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. After the tools finish, the model explains the captured output. Expensive tools preview and wait for `ai go`. Every AI subcommand supports `ai help <sub>` / `ai <sub> help` and Tab completion; `ai explain !vad <tab>` reuses `!vad` completion, and `ai explain !vad help` prints `!vad` help. The catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, dispatches callback/WFP/ALPC/hidden-process/handle/DMA requests to native scanners, and routes VAD/thread triage through the read-only process scanner:
+The command now behaves like a small tool-using agent and intent router. The operator can usually type `ai <goal>` without knowing command names. Exact read-only commands are executed as evidence and explained. Known Korean/English playbooks and local process field queries run without a model round-trip. Generic playbooks are skipped when the goal already names a `.sys`/`.exe`/`.dll`/`.drv` file, so a prompt such as `WdFilter.sys object callbacks` stays on the tool planner with a module filter instead of running an unfiltered callback dump. They are also skipped for disable/enable goals, which become a write plan instead of a list. Examples:
+
+- `ai disable wdfilter minifilter` -> `!minifilter disable-all wdfilter`
+- `ai disable wdfilter callbacks` -> `!callbacks disable-all wdfilter`
+- `ai disable wdfilter object` -> `!callbacks disable object wdfilter`
+- `ai disable wdfilter process` -> `!callbacks disable process wdfilter`
+- `ai enable wdfilter minifilter` -> `!minifilter enable-all wdfilter`
+- `ai enable ppl` / `ai disable ppl` -> `set-ppl-antimalware on` / `off`
+- `ai load byovd fixture` / `ai unload fixture` -> `!byovd fixture load` / `unload`
+- `ai reset timeline` -> `!timeline reset`
+- `ai clear ti` -> `!ti clear`
+- `ai disable wdfilter` without a surface is rejected (it must not silently disable every callback type)
+- Typed write-like lines (`ai !callbacks disable-all WdFilter`, `ai !minifilter disable-all WdFilter /pre`, `ai !ti start`, `ai dump-pe nt .\\ntos-live.exe`) are staged as-is, including flags
+- `ai start ti` / `ai stop ti` / `ai timeline live off` / `ai disable timeline live` stage the matching write command
+- Session TUI commands stay out of the write plan and print the real command instead: `write on|off`, `log enable|disable`, `mcp on|off`, `probe load|unload`, `backend auto|native|dbgeng`
+- `dump-kernel` / `dump-live` stay blocked from AI plans (full-memory dumps)
+
+If the plan has one write, type `ai write` then `ai write confirm`. `[1]` is the index, not a picker. The command does not run until confirm (and `write on`). Otherwise the model receives the operator request plus the shared capability catalog (not live memory), returns a strict `kn-live-dbg.ai-capability-plan.v1` JSON object, and the local executor runs only supported read-only tools. After the tools finish, the model explains the captured output. Expensive tools preview and wait for `ai go`. Every AI subcommand supports `ai help <sub>` / `ai <sub> help` and Tab completion; `ai explain !vad <tab>` reuses `!vad` completion, and `ai explain !vad help` prints `!vad` help. The catalog handles process and `_EPROCESS` questions by walking `_EPROCESS.ActiveProcessLinks` through the same native data path as `!dml_proc`, dispatches callback/WFP/ALPC/hidden-process/handle/DMA requests to native scanners, and routes VAD/thread triage through the read-only process scanner:
 
 - "a.exe pid" -> matching PID records from the live process list
 - "a.exe eprocess" -> matching `_EPROCESS` addresses
@@ -445,7 +473,7 @@ The command layers semantic explanations on top of native `dt` and `dtx` output:
 
 ### Write Safety Assistant
 
-Implemented entrypoint: `ai write <index> [confirm]`.
+Implemented entrypoint: `ai write [index] [confirm]`. If the plan has one write, `ai write` and `ai write confirm` do not need an index.
 
 Because write mode is enabled by default per device handle, the AI path adds an operator safety layer around planned mutations:
 
@@ -528,7 +556,7 @@ Completed implementation-order items:
 1. Transcript/event rotation and redaction controls are implemented with `ai transcript max` and `ai transcript redact`.
 2. Write-command JSONL audit logging is implemented with `ai audit <path>`.
 3. Callback module filtering is implemented with `!callbacks [scope] [module]`, and `ai explain !callbacks` consumes the same filtered command output as evidence.
-4. Deterministic before/after diff rendering is implemented for `ai write <index> confirm` verification output.
+4. Deterministic before/after diff rendering is implemented for `ai write confirm` / `ai write <index> confirm` verification output.
 5. Model-proposed command plans are validated at ingestion with the v2 schema contract: empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected before they can be shown as a runnable plan. Write-like proposals, including raw `kd` write-like wrappers, are forced to require confirmation.
 6. Command transcript and AI evidence prompts include deterministic output summaries with stdout/stderr character counts, line counts, interesting-line counts, and first/last non-empty lines before raw output.
 7. Local/offline provider policy is implemented with `ai config policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`. HTTP complete and `ai models refresh` are blocked; the selected provider is not cleared. Use `ai use private` for the local Codex CLI.

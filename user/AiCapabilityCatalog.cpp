@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <sstream>
+#include <vector>
 
 namespace
 {
@@ -133,6 +134,361 @@ namespace
             }
         } while (false);
         return hit;
+    }
+
+    std::vector<std::wstring> CatalogTokens(const std::wstring& query)
+    {
+        std::vector<std::wstring> tokens;
+        std::wstring current;
+        for (wchar_t ch : CatalogTrim(query))
+        {
+            if (iswspace(ch) != 0 || ch == L',' || ch == L';')
+            {
+                if (!current.empty())
+                {
+                    tokens.push_back(current);
+                    current.clear();
+                }
+            }
+            else
+            {
+                current.push_back(ch);
+            }
+        }
+        if (!current.empty())
+        {
+            tokens.push_back(current);
+        }
+        return tokens;
+    }
+
+    bool TokenStartsWithNoCase(const std::wstring& token, const std::wstring& prefix)
+    {
+        const std::wstring lowered = CatalogLower(token);
+        const std::wstring needle = CatalogLower(prefix);
+        return !needle.empty() &&
+            lowered.size() >= needle.size() &&
+            lowered.compare(0, needle.size(), needle) == 0;
+    }
+
+    bool IsDisableActionToken(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        bool match = false;
+        if (lowered == L"disabled" || lowered == L"disablement")
+        {
+            match = false;
+        }
+        else if (lowered == L"disable" ||
+                 lowered == L"disable-all" ||
+                 lowered == L"disableall")
+        {
+            match = true;
+        }
+        else if (TokenStartsWithNoCase(lowered, L"disable") && lowered.size() > 7)
+        {
+            match = true;
+        }
+        else if (TokenStartsWithNoCase(lowered, L"\xBE44\xD65C\xC131") ||
+                 TokenStartsWithNoCase(lowered, L"\xBB34\xB825\xD654"))
+        {
+            match = true;
+        }
+        return match;
+    }
+
+    bool IsEnableActionToken(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        bool match = false;
+        if (lowered == L"enabled" || lowered == L"enablement")
+        {
+            match = false;
+        }
+        else if (IsDisableActionToken(token))
+        {
+            match = false;
+        }
+        else if (lowered == L"enable" ||
+                 lowered == L"enable-all" ||
+                 lowered == L"enableall" ||
+                 lowered == L"restore")
+        {
+            match = true;
+        }
+        else if (TokenStartsWithNoCase(lowered, L"enable") && lowered.size() > 6)
+        {
+            match = true;
+        }
+        else if (TokenStartsWithNoCase(lowered, L"\xD65C\xC131") ||
+                 TokenStartsWithNoCase(lowered, L"\xBCF5\xC6D0"))
+        {
+            match = true;
+        }
+        return match;
+    }
+
+    bool IsMutationActionToken(const std::wstring& token)
+    {
+        return IsDisableActionToken(token) || IsEnableActionToken(token);
+    }
+
+    bool IsTiSurfaceToken(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        return lowered == L"ti" ||
+            lowered == L"!ti" ||
+            lowered == L"threat-intelligence" ||
+            lowered == L"threatintelligence";
+    }
+
+    bool IsTimelineSurfaceToken(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        return lowered == L"timeline" || lowered == L"!timeline";
+    }
+
+    bool IsStartToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"start";
+    }
+
+    bool IsStopToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"stop";
+    }
+
+    bool IsOnToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"on";
+    }
+
+    bool IsOffToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"off";
+    }
+
+    bool IsLiveToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"live";
+    }
+
+    bool IsPplToken(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        return lowered == L"ppl" ||
+            lowered == L"set-ppl" ||
+            lowered == L"set-ppl-antimalware";
+    }
+
+    bool IsByovdToken(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        return lowered == L"byovd" || lowered == L"!byovd";
+    }
+
+    bool IsFixtureToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"fixture";
+    }
+
+    bool IsMcpToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"mcp";
+    }
+
+    bool IsProbeToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"probe";
+    }
+
+    bool IsWriteGateToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"write";
+    }
+
+    bool IsBackendToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"backend";
+    }
+
+    bool IsResetToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"reset";
+    }
+
+    bool IsClearToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"clear";
+    }
+
+    bool IsLoadToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"load";
+    }
+
+    bool IsUnloadToken(const std::wstring& token)
+    {
+        return CatalogLower(CatalogTrim(token)) == L"unload";
+    }
+
+    bool IsMutationReservedToken(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        static const wchar_t* words[] =
+        {
+            L"log", L"logging", L"backend", L"probe", L"transcript", L"audit",
+            L"ti", L"!ti", L"timeline", L"!timeline", L"live", L"start", L"stop",
+            L"on", L"off", L"status", L"session", L"ppl", L"set-ppl", L"set-ppl-antimalware",
+            L"antimalware", L"byovd", L"!byovd", L"fixture", L"mcp", L"write", L"reset", L"clear",
+            L"load", L"unload"
+        };
+        for (const wchar_t* word : words)
+        {
+            if (lowered == word)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::wstring ClassifyMutationSurface(const std::wstring& token)
+    {
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        std::wstring surface;
+        if (lowered == L"minifilter" ||
+            lowered == L"minifilters" ||
+            lowered == L"!minifilter" ||
+            lowered == L"fltmgr" ||
+            lowered == L"!fltmgr" ||
+            lowered == L"\xBBF8\xB2C8\xD544\xD130")
+        {
+            surface = L"minifilter";
+        }
+        else if (lowered == L"irp" || lowered == L"irps")
+        {
+            surface = L"irp";
+        }
+        else if (lowered == L"object" ||
+                 lowered == L"objects" ||
+                 lowered == L"object-callbacks" ||
+                 lowered == L"object-manager")
+        {
+            surface = L"object";
+        }
+        else if (lowered == L"registry" || lowered == L"cm")
+        {
+            surface = L"registry";
+        }
+        else if (lowered == L"process" || lowered == L"processes")
+        {
+            surface = L"process";
+        }
+        else if (lowered == L"thread" || lowered == L"threads")
+        {
+            surface = L"thread";
+        }
+        else if (lowered == L"imageload" ||
+                 lowered == L"image-load" ||
+                 lowered == L"image_load")
+        {
+            surface = L"imageload";
+        }
+        else if (lowered == L"callback" ||
+                 lowered == L"callbacks" ||
+                 lowered == L"!callbacks" ||
+                 lowered == L"\xCF5C\xBC31")
+        {
+            surface = L"callbacks";
+        }
+        return surface;
+    }
+
+    bool IsMutationStopword(const std::wstring& token)
+    {
+        static const wchar_t* words[] =
+        {
+            L"the", L"a", L"an", L"of", L"for", L"to", L"from", L"with", L"in", L"on",
+            L"and", L"or", L"please", L"me", L"my", L"this", L"that", L"those",
+            L"all", L"every", L"each", L"both", L"pre", L"post",
+            L"handler", L"handlers", L"registration", L"registrations",
+            L"filter", L"filters", L"filesystem", L"fs", L"slot", L"slots",
+            L"chain", L"module", L"driver", L"drivers", L"notify", L"notifications",
+            L"show", L"list", L"enumerate", L"check",
+            L"log", L"logging", L"backend", L"probe", L"transcript", L"audit",
+            L"ti", L"timeline", L"live", L"start", L"stop", L"on", L"off", L"status",
+            L"ppl", L"antimalware", L"fixture", L"byovd", L"mcp", L"write", L"reset", L"clear",
+            L"load", L"unload",
+            L"\xBAA8\xB450", L"\xC804\xBD80", L"\xD578\xB4E4\xB7EC", L"\xD574\xC918"
+        };
+        const std::wstring lowered = CatalogLower(CatalogTrim(token));
+        for (const wchar_t* word : words)
+        {
+            if (lowered == CatalogLower(word))
+            {
+                return true;
+            }
+        }
+        if (!lowered.empty() && lowered[0] == L'/')
+        {
+            return true;
+        }
+        return lowered.rfind(L"irp_mj", 0) == 0;
+    }
+
+    std::wstring StripDriverFileSuffix(const std::wstring& token)
+    {
+        std::wstring name = CatalogTrim(token);
+        const std::wstring lowered = CatalogLower(name);
+        static const wchar_t* suffixes[] = { L".sys", L".dll", L".drv", L".exe" };
+        for (const wchar_t* suffix : suffixes)
+        {
+            const size_t suffixLen = std::wstring(suffix).size();
+            if (lowered.size() > suffixLen &&
+                lowered.compare(lowered.size() - suffixLen, suffixLen, suffix) == 0)
+            {
+                name = name.substr(0, name.size() - suffixLen);
+                break;
+            }
+        }
+        return name;
+    }
+
+    bool IsSafeMutationModule(const std::wstring& token)
+    {
+        bool ok = false;
+        do
+        {
+            const std::wstring name = StripDriverFileSuffix(token);
+            if (name.empty() || name.size() > 64)
+            {
+                break;
+            }
+            if (name.find_first_of(L"\"\\;|&<> \t\r\n") != std::wstring::npos)
+            {
+                break;
+            }
+            if (iswalnum(name[0]) == 0 && name[0] != L'_')
+            {
+                break;
+            }
+            bool valid = true;
+            for (wchar_t ch : name)
+            {
+                if (iswalnum(ch) == 0 && ch != L'_' && ch != L'-' && ch != L'.')
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid)
+            {
+                break;
+            }
+            ok = true;
+        } while (false);
+        return ok;
     }
 
     const AiCapabilityToolDef kTools[] =
@@ -325,12 +681,557 @@ const AiPlaybookDef* AiCapabilityPlaybooks(size_t* count)
     return kPlaybooks;
 }
 
+bool AiQueryHasMutationIntent(const std::wstring& query)
+{
+    bool found = false;
+    bool hasTi = false;
+    bool hasTimeline = false;
+    bool hasLive = false;
+    bool hasStart = false;
+    bool hasStop = false;
+    bool hasOn = false;
+    bool hasOff = false;
+    bool hasPpl = false;
+    bool hasByovd = false;
+    bool hasFixture = false;
+    bool hasReset = false;
+    bool hasClear = false;
+    bool hasLoad = false;
+    bool hasUnload = false;
+    bool hasWriteGate = false;
+    bool hasMcp = false;
+    bool hasProbe = false;
+    bool hasLog = false;
+    const std::vector<std::wstring> tokens = CatalogTokens(query);
+    for (const std::wstring& token : tokens)
+    {
+        if (IsMutationActionToken(token))
+        {
+            found = true;
+            break;
+        }
+        if (IsTiSurfaceToken(token))
+        {
+            hasTi = true;
+        }
+        if (IsTimelineSurfaceToken(token))
+        {
+            hasTimeline = true;
+        }
+        if (IsLiveToken(token))
+        {
+            hasLive = true;
+        }
+        if (IsStartToken(token))
+        {
+            hasStart = true;
+        }
+        if (IsStopToken(token))
+        {
+            hasStop = true;
+        }
+        if (IsOnToken(token))
+        {
+            hasOn = true;
+        }
+        if (IsOffToken(token))
+        {
+            hasOff = true;
+        }
+        if (IsPplToken(token))
+        {
+            hasPpl = true;
+        }
+        if (IsByovdToken(token))
+        {
+            hasByovd = true;
+        }
+        if (IsFixtureToken(token))
+        {
+            hasFixture = true;
+        }
+        if (IsResetToken(token))
+        {
+            hasReset = true;
+        }
+        if (IsClearToken(token))
+        {
+            hasClear = true;
+        }
+        if (IsLoadToken(token))
+        {
+            hasLoad = true;
+        }
+        if (IsUnloadToken(token))
+        {
+            hasUnload = true;
+        }
+        if (IsWriteGateToken(token))
+        {
+            hasWriteGate = true;
+        }
+        if (IsMcpToken(token))
+        {
+            hasMcp = true;
+        }
+        if (IsProbeToken(token))
+        {
+            hasProbe = true;
+        }
+        if (CatalogLower(CatalogTrim(token)) == L"log" ||
+            CatalogLower(CatalogTrim(token)) == L"logging")
+        {
+            hasLog = true;
+        }
+    }
+    if (!found)
+    {
+        if (hasTi && (hasStart || hasStop || hasClear))
+        {
+            found = true;
+        }
+        else if (hasTimeline && hasLive && (hasOn || hasOff || hasStart || hasStop))
+        {
+            found = true;
+        }
+        else if (hasTimeline && (hasReset || hasClear) && !hasLive)
+        {
+            found = true;
+        }
+        else if (hasPpl && (hasOn || hasOff || hasStart || hasStop))
+        {
+            found = true;
+        }
+        else if ((hasByovd || hasFixture) && (hasLoad || hasUnload))
+        {
+            found = true;
+        }
+        else if (hasWriteGate && (hasOn || hasOff))
+        {
+            found = true;
+        }
+        else if (hasMcp && (hasOn || hasOff || hasStart || hasStop))
+        {
+            found = true;
+        }
+        else if (hasProbe && (hasLoad || hasUnload))
+        {
+            found = true;
+        }
+        else if (hasLog && (hasOn || hasOff || hasStart || hasStop))
+        {
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool TryBuildAiMutationCommand(
+    const std::wstring& query,
+    std::wstring* command,
+    std::wstring* purpose,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (command == nullptr || purpose == nullptr)
+        {
+            break;
+        }
+
+        command->clear();
+        purpose->clear();
+
+        const std::vector<std::wstring> tokens = CatalogTokens(query);
+        std::wstring action;
+        bool hasMinifilter = false;
+        bool hasCallbacks = false;
+        bool hasIrp = false;
+        bool hasTi = false;
+        bool hasTimeline = false;
+        bool hasLive = false;
+        bool hasStart = false;
+        bool hasStop = false;
+        bool hasOn = false;
+        bool hasOff = false;
+        bool hasLog = false;
+        bool hasPpl = false;
+        bool hasByovd = false;
+        bool hasFixture = false;
+        bool hasMcp = false;
+        bool hasProbe = false;
+        bool hasWriteGate = false;
+        bool hasBackend = false;
+        bool hasReset = false;
+        bool hasClear = false;
+        bool hasLoad = false;
+        bool hasUnload = false;
+        bool conflict = false;
+        std::wstring scope;
+        std::vector<std::wstring> modules;
+
+        for (const std::wstring& token : tokens)
+        {
+            if (IsDisableActionToken(token))
+            {
+                action = L"disable";
+                continue;
+            }
+            if (IsEnableActionToken(token))
+            {
+                action = L"enable";
+                continue;
+            }
+            if (IsTiSurfaceToken(token))
+            {
+                hasTi = true;
+                continue;
+            }
+            if (IsTimelineSurfaceToken(token))
+            {
+                hasTimeline = true;
+                continue;
+            }
+            if (IsLiveToken(token))
+            {
+                hasLive = true;
+                continue;
+            }
+            if (IsStartToken(token))
+            {
+                hasStart = true;
+                continue;
+            }
+            if (IsStopToken(token))
+            {
+                hasStop = true;
+                continue;
+            }
+            if (IsOnToken(token))
+            {
+                hasOn = true;
+                continue;
+            }
+            if (IsOffToken(token))
+            {
+                hasOff = true;
+                continue;
+            }
+            if (CatalogLower(CatalogTrim(token)) == L"log" ||
+                CatalogLower(CatalogTrim(token)) == L"logging")
+            {
+                hasLog = true;
+                continue;
+            }
+            if (IsPplToken(token))
+            {
+                hasPpl = true;
+                continue;
+            }
+            if (IsByovdToken(token))
+            {
+                hasByovd = true;
+                continue;
+            }
+            if (IsFixtureToken(token))
+            {
+                hasFixture = true;
+                continue;
+            }
+            if (IsMcpToken(token))
+            {
+                hasMcp = true;
+                continue;
+            }
+            if (IsProbeToken(token))
+            {
+                hasProbe = true;
+                continue;
+            }
+            if (IsWriteGateToken(token))
+            {
+                hasWriteGate = true;
+                continue;
+            }
+            if (IsBackendToken(token))
+            {
+                hasBackend = true;
+                continue;
+            }
+            if (IsResetToken(token))
+            {
+                hasReset = true;
+                continue;
+            }
+            if (IsClearToken(token))
+            {
+                hasClear = true;
+                continue;
+            }
+            if (IsLoadToken(token))
+            {
+                hasLoad = true;
+                continue;
+            }
+            if (IsUnloadToken(token))
+            {
+                hasUnload = true;
+                continue;
+            }
+
+            const std::wstring surface = ClassifyMutationSurface(token);
+            if (surface == L"minifilter")
+            {
+                hasMinifilter = true;
+                continue;
+            }
+            if (surface == L"irp")
+            {
+                hasIrp = true;
+                continue;
+            }
+            if (surface == L"callbacks")
+            {
+                hasCallbacks = true;
+                continue;
+            }
+            if (surface == L"object" ||
+                surface == L"registry" ||
+                surface == L"process" ||
+                surface == L"thread" ||
+                surface == L"imageload")
+            {
+                if (!scope.empty() && scope != surface)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"name one callback surface only (object, registry, process, thread, imageload)";
+                    }
+                    conflict = true;
+                    break;
+                }
+                scope = surface;
+                continue;
+            }
+
+            if (IsMutationStopword(token) || IsMutationReservedToken(token))
+            {
+                continue;
+            }
+            if (!IsSafeMutationModule(token))
+            {
+                continue;
+            }
+            modules.push_back(StripDriverFileSuffix(token));
+        }
+
+        if (conflict)
+        {
+            break;
+        }
+
+        const bool isolatedSession =
+            modules.empty() &&
+            !hasMinifilter &&
+            !hasCallbacks &&
+            !hasIrp &&
+            scope.empty();
+        // Kernel/protection mutations first so "backend"/"write" words cannot steal them.
+        if (isolatedSession && hasPpl)
+        {
+            const bool turningOff = hasOff || hasStop || action == L"disable";
+            const bool turningOn = hasOn || hasStart || action == L"enable";
+            if (!turningOff && !turningOn)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"say `ai enable ppl` or `ai disable ppl`";
+                }
+                break;
+            }
+            *command = turningOff ? L"set-ppl-antimalware off" : L"set-ppl-antimalware on";
+            *purpose = turningOff
+                ? L"clear this process PPL Antimalware protection byte"
+                : L"set this process to PPL Antimalware (TI prerequisite)";
+            ok = true;
+            break;
+        }
+        if (isolatedSession && (hasByovd || hasFixture) && (hasLoad || hasUnload || !action.empty()))
+        {
+            const bool unloading = hasUnload || action == L"disable" || hasStop;
+            *command = unloading ? L"!byovd fixture unload" : L"!byovd fixture load";
+            *purpose = unloading
+                ? L"unload the bundled BYOVD fixture service"
+                : L"load the bundled BYOVD fixture service";
+            ok = true;
+            break;
+        }
+        if (isolatedSession && hasTimeline && (hasReset || hasClear) && !hasLive)
+        {
+            *command = L"!timeline reset";
+            *purpose = L"drop the in-memory timeline store";
+            ok = true;
+            break;
+        }
+        if (isolatedSession && hasTi && hasClear && !hasStart && !hasStop)
+        {
+            *command = L"!ti clear";
+            *purpose = L"clear the in-memory Threat-Intelligence ring";
+            ok = true;
+            break;
+        }
+
+        // Do not let "timeline live" steal a module disable/enable goal.
+        if (hasTimeline && hasLive && isolatedSession)
+        {
+            const bool turningOff = hasOff || hasStop || action == L"disable";
+            const bool turningOn = hasOn || hasStart || action == L"enable";
+            if (turningOff || turningOn)
+            {
+                *command = turningOff ? L"!timeline live off" : L"!timeline live on";
+                *purpose = turningOff
+                    ? L"disable kernel live timeline callbacks"
+                    : L"enable kernel live timeline callbacks";
+                ok = true;
+                break;
+            }
+        }
+        if (hasTi && isolatedSession && (hasStart || hasStop || !action.empty()) && !hasClear)
+        {
+            const bool turningOff = hasStop || action == L"disable";
+            *command = turningOff ? L"!ti stop" : L"!ti start";
+            *purpose = turningOff
+                ? L"stop the Threat-Intelligence ETW subscription"
+                : L"start the Threat-Intelligence ETW subscription";
+            ok = true;
+            break;
+        }
+
+        if (isolatedSession && hasLog &&
+            (hasOn || hasOff || hasStart || hasStop || !action.empty()) &&
+            !hasTi && !hasTimeline)
+        {
+            if (error != nullptr)
+            {
+                *error = L"session log control is `log enable` / `log disable`, not an ai write plan";
+            }
+            break;
+        }
+        if (isolatedSession && hasWriteGate && (hasOn || hasOff || !action.empty()))
+        {
+            if (error != nullptr)
+            {
+                *error = L"session write gate is `write on` / `write off`, not an ai write plan";
+            }
+            break;
+        }
+        if (isolatedSession && hasMcp && (hasOn || hasOff || hasStart || hasStop || !action.empty()))
+        {
+            if (error != nullptr)
+            {
+                *error = L"MCP server control is `mcp on` / `mcp off`, not an ai write plan";
+            }
+            break;
+        }
+        if (isolatedSession && hasProbe && (hasLoad || hasUnload || !action.empty()))
+        {
+            if (error != nullptr)
+            {
+                *error = L"probe service control is `probe load` / `probe unload`, not an ai write plan";
+            }
+            break;
+        }
+        if (isolatedSession && hasBackend && !hasPpl && !hasByovd && !hasTi && !hasTimeline)
+        {
+            if (error != nullptr)
+            {
+                *error = L"backend mode is `backend auto|native|dbgeng`, not an ai write plan";
+            }
+            break;
+        }
+
+        if (action.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"disable/enable intent was not recognized";
+            }
+            break;
+        }
+
+        std::wstring surface;
+        if (hasMinifilter || (hasIrp && scope.empty() && !hasCallbacks))
+        {
+            surface = L"minifilter";
+        }
+        else if (!scope.empty())
+        {
+            surface = scope;
+        }
+        else if (hasCallbacks || hasIrp)
+        {
+            surface = L"callbacks";
+        }
+
+        if (surface.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"name a surface: minifilter, callbacks, object, registry, process, thread, or imageload";
+            }
+            break;
+        }
+        if (modules.size() != 1)
+        {
+            if (error != nullptr)
+            {
+                *error = L"name exactly one module (WdFilter, UnionFS, ...)";
+            }
+            break;
+        }
+
+        const std::wstring module = modules[0];
+        const bool disabling = action == L"disable";
+        if (surface == L"minifilter")
+        {
+            *command = std::wstring(L"!minifilter ") + (disabling ? L"disable-all " : L"enable-all ") + module;
+            *purpose = disabling
+                ? L"disable every registered IRP pre/post slot for that minifilter"
+                : L"restore every same-session minifilter IRP backup for that filter";
+        }
+        else if (surface == L"callbacks")
+        {
+            *command = std::wstring(L"!callbacks ") + (disabling ? L"disable-all " : L"enable-all ") + module;
+            *purpose = disabling
+                ? L"disable every callback type owned by that module"
+                : L"restore every same-session callback backup for that module";
+        }
+        else
+        {
+            *command = std::wstring(L"!callbacks ") + (disabling ? L"disable " : L"enable ") + surface + L" " + module;
+            *purpose = disabling
+                ? L"disable that module's callbacks on one surface"
+                : L"restore that module's same-session backups on one surface";
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 const AiPlaybookDef* FindAiPlaybook(const std::wstring& query)
 {
     const AiPlaybookDef* best = nullptr;
     size_t bestLen = 0;
     const size_t count = sizeof(kPlaybooks) / sizeof(kPlaybooks[0]);
     const std::wstring lowered = CatalogLower(CatalogTrim(query));
+    if (AiQueryHasMutationIntent(query))
+    {
+        return nullptr;
+    }
     for (size_t i = 0; i < count; ++i)
     {
         if (AliasHitsQuery(lowered, kPlaybooks[i].Name) &&
@@ -627,6 +1528,261 @@ bool AiCapabilityCatalogSelfTest()
             break;
         }
         if (FindAiPlaybook(L"WdFilter.sys object callbacks") != nullptr)
+        {
+            break;
+        }
+        if (FindAiPlaybook(L"disable wdfilter minifilter") != nullptr ||
+            FindAiPlaybook(L"minifilter") == nullptr)
+        {
+            break;
+        }
+        if (!AiQueryHasMutationIntent(L"disable wdfilter minifilter") ||
+            AiQueryHasMutationIntent(L"show minifilter") ||
+            AiQueryHasMutationIntent(L"why are callbacks disabled"))
+        {
+            break;
+        }
+        std::wstring mutationCommand;
+        std::wstring mutationPurpose;
+        std::wstring mutationError;
+        if (!TryBuildAiMutationCommand(
+                L"disable wdfilter minifilter",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!minifilter disable-all wdfilter")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"enable WdFilter.sys minifilter",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!minifilter enable-all WdFilter")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"disable wdfilter object",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!callbacks disable object wdfilter")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"disable wdfilter callbacks",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!callbacks disable-all wdfilter")
+        {
+            break;
+        }
+        if (TryBuildAiMutationCommand(
+                L"disable minifilter",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError))
+        {
+            break;
+        }
+        if (TryBuildAiMutationCommand(
+                L"disable wdfilter",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError))
+        {
+            break;
+        }
+        if (TryBuildAiMutationCommand(
+                L"disable wdfilter timeline live",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError))
+        {
+            break;
+        }
+        if (TryBuildAiMutationCommand(
+                L"log disable",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError))
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"disable wdfilter process",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!callbacks disable process wdfilter")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"enable wdfilter thread",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!callbacks enable thread wdfilter")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"disable wdfilter registry",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!callbacks disable registry wdfilter")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"disable wdfilter imageload",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!callbacks disable imageload wdfilter")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"start ti",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!ti start")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"stop ti",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!ti stop")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"timeline live off",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!timeline live off")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"enable timeline live",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!timeline live on")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"disable timeline live",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!timeline live off")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"enable ppl",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"set-ppl-antimalware on")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"enable ppl antimalware",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"set-ppl-antimalware on")
+        {
+            break;
+        }
+        if (TryBuildAiMutationCommand(
+                L"ppl",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError))
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"disable ppl",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"set-ppl-antimalware off")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"load byovd fixture",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!byovd fixture load")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"unload fixture",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!byovd fixture unload")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"reset timeline",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!timeline reset")
+        {
+            break;
+        }
+        if (!TryBuildAiMutationCommand(
+                L"clear ti",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError) ||
+            mutationCommand != L"!ti clear")
+        {
+            break;
+        }
+        if (TryBuildAiMutationCommand(
+                L"enable write",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError))
+        {
+            break;
+        }
+        if (TryBuildAiMutationCommand(
+                L"start mcp",
+                &mutationCommand,
+                &mutationPurpose,
+                &mutationError))
+        {
+            break;
+        }
+        if (AiQueryHasMutationIntent(L"timeline query") ||
+            AiQueryHasMutationIntent(L"!ti status"))
         {
             break;
         }

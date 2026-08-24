@@ -825,8 +825,8 @@ namespace
         { L"plan", L"ai plan <prompt>", L"build a validated command plan" },
         { L"go", L"ai go", L"run a pending expensive local-tool plan" },
         { L"no", L"ai no", L"cancel a pending expensive local-tool plan" },
-        { L"run", L"ai run <index|all>", L"execute planned read-only commands" },
-        { L"write", L"ai write <index> [confirm]", L"preview or confirm a write-like plan step" },
+        { L"run", L"ai run [index|all]", L"execute planned read-only commands" },
+        { L"write", L"ai write [index] [confirm]", L"preview or confirm a write-like plan step" },
         { L"explain", L"ai explain <read-only-command...>", L"run a command and explain the output" },
         { L"analyze", L"ai analyze <read-only-command...>", L"run a command and write an analysis report" },
         { L"annotate", L"ai annotate <u|uf> <addr>", L"annotate native disassembly" },
@@ -972,12 +972,14 @@ namespace
 
     const CompletionHint kAiWriteTokens[] =
     {
-        { L"confirm", L"ai write <index> confirm", L"execute that write-like plan step" },
+        { L"1", L"ai write 1 [confirm]", L"preview or confirm plan item 1" },
+        { L"confirm", L"ai write [index] confirm", L"execute the write; index optional when the plan has one write" },
         { L"help", nullptr, L"show ai write usage" },
     };
 
     const CompletionHint kAiRunTokens[] =
     {
+        { L"1", L"ai run 1", L"run plan item 1" },
         { L"all", L"ai run all", L"run every remaining read-only plan step" },
         { L"help", nullptr, L"show ai run usage" },
     };
@@ -1455,8 +1457,8 @@ namespace
         SCOPE(L"leaf", L"ai <subcommand> [help]", L"subcommand help", kHelpOnlyTokens),
         SCOPE(L"evidence", L"ai explain|analyze <read-only-command...>", L"run a command and explain or analyze the output", kAiEvidenceTokens),
         SCOPE(L"annotate", L"ai annotate <u|uf> <addr|symbol>", L"annotate native disassembly", kAiAnnotateTokens),
-        SCOPE(L"write", L"ai write <index> [confirm]", L"preview or confirm a write-like plan step", kAiWriteTokens),
-        SCOPE(L"run", L"ai run <index|all>", L"execute planned read-only commands", kAiRunTokens),
+        SCOPE(L"write", L"ai write [index] [confirm]", L"preview or confirm a write-like plan step", kAiWriteTokens),
+        SCOPE(L"run", L"ai run [index|all]", L"execute planned read-only commands", kAiRunTokens),
         SCOPE(L"transcript", L"ai transcript <path>|status|off|max|redact", L"capture command stdout/stderr as JSONL", kAiTranscriptTokens),
         SCOPE(L"transcript-max", L"ai transcript max <n|off>", L"cap captured command output", kAiTranscriptMaxTokens),
         SCOPE(L"transcript-redact", L"ai transcript redact on|off", L"toggle path/token redaction", kAiTranscriptRedactTokens),

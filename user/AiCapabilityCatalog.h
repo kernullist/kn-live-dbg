@@ -43,6 +43,12 @@ AiCapabilityCost GetAiCapabilityToolCost(const std::wstring& name);
 const wchar_t* AiCapabilityCostLabel(AiCapabilityCost cost);
 const AiPlaybookDef* AiCapabilityPlaybooks(size_t* count);
 const AiPlaybookDef* FindAiPlaybook(const std::wstring& query);
+bool AiQueryHasMutationIntent(const std::wstring& query);
+bool TryBuildAiMutationCommand(
+    const std::wstring& query,
+    std::wstring* command,
+    std::wstring* purpose,
+    std::wstring* error);
 std::wstring SubstituteAiPlaybookPlaceholders(
     const std::wstring& argsJson,
     const std::wstring& address);
