@@ -33,7 +33,7 @@ Initial provider support:
 1. `openai-codex-cli` shells out to `codex exec`, mirroring KernForge's Codex CLI bridge pattern.
 2. `openai-codex-subscription` uses ChatGPT/Codex OAuth-style bearer tokens and the Codex Responses endpoint. It can read `KNLIVEDBG_CODEX_ACCESS_TOKEN`, `KERNFORGE_CODEX_ACCESS_TOKEN`, configured auth files, `%USERPROFILE%\.kernforge\codex_auth.json`, and `%USERPROFILE%\.codex\auth.json`.
 3. `deepseek` uses an OpenAI-compatible chat-completions request with DeepSeek defaults and optional reasoning effort.
-4. `openrouter` uses an OpenAI-compatible chat-completions request with OpenRouter defaults and metadata headers.
+4. `openrouter` uses an OpenAI-compatible chat-completions request with OpenRouter defaults and metadata headers. Chat completions send `max_tokens=8192` and `reasoning.exclude=true`. Reasoning is off unless `ai config effort` / `KNLIVEDBG_AI_REASONING_EFFORT` is set. The parser reads `choices[0].message.content` (or Codex `output` / `output_text`) and never prints nested `reasoning` / `reasoning_details`. The TUI prints `ai explain: <provider> / <model>` plus the report; it does not dump the credential path. If `finish_reason` is `length`, it adds `ai note: model hit the token limit`.
 
 The runtime automatically loads `.env` only from the executable directory. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys plus `KNLIVEDBG_AI_REMOTE_POLICY`. `.env` and `.env.local` are ignored by Git. `.env.local` is not loaded. `ai use`, `ai save`, `ai config provider`, `ai config model`, and `ai config policy` write provider/model/policy back to that EXE-dir `.env` (atomic replace via `.env.tmp`).
 

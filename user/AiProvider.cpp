@@ -647,26 +647,527 @@ static std::wstring ExtractProviderError(const std::wstring& body)
     return message;
 }
 
-static std::wstring ExtractAssistantText(const std::wstring& body)
+static bool ExtractJsonObjectAt(
+    const std::wstring& text,
+    size_t openBrace,
+    std::wstring* object,
+    size_t* end)
 {
-    std::wstring text;
+    bool ok = false;
 
     do
     {
-        if (ExtractJsonString(body, L"output_text", &text) && !Trim(text).empty())
+        if (object == nullptr || openBrace >= text.size() || text[openBrace] != L'{')
         {
             break;
         }
 
-        if (ExtractJsonString(body, L"content", &text) && !Trim(text).empty())
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (size_t index = openBrace; index < text.size(); ++index)
+        {
+            wchar_t ch = text[index];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == L'\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == L'\"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (ch == L'\"')
+            {
+                inString = true;
+            }
+            else if (ch == L'{')
+            {
+                ++depth;
+            }
+            else if (ch == L'}')
+            {
+                --depth;
+                if (depth == 0)
+                {
+                    *object = text.substr(openBrace, index - openBrace + 1);
+                    if (end != nullptr)
+                    {
+                        *end = index + 1;
+                    }
+
+                    ok = true;
+                    break;
+                }
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool FindJsonKeyColon(
+    const std::wstring& text,
+    const std::wstring& key,
+    size_t from,
+    size_t* colon)
+{
+    bool ok = false;
+    const std::wstring pattern = L"\"" + key + L"\"";
+    size_t pos = from;
+
+    while ((pos = text.find(pattern, pos)) != std::wstring::npos)
+    {
+        size_t after = pos + pattern.size();
+        while (after < text.size() && iswspace(text[after]) != 0)
+        {
+            ++after;
+        }
+
+        if (after < text.size() && text[after] == L':')
+        {
+            if (colon != nullptr)
+            {
+                *colon = after;
+            }
+
+            ok = true;
+            break;
+        }
+
+        ++pos;
+    }
+
+    return ok;
+}
+
+static size_t SkipJsonWhitespace(const std::wstring& text, size_t index)
+{
+    while (index < text.size() && iswspace(text[index]) != 0)
+    {
+        ++index;
+    }
+
+    return index;
+}
+
+static bool FindDirectJsonKeyValue(
+    const std::wstring& object,
+    const std::wstring& key,
+    size_t* valueIndex)
+{
+    bool ok = false;
+
+    do
+    {
+        if (valueIndex == nullptr || object.empty() || object[0] != L'{' || key.empty())
         {
             break;
         }
 
-        if (ExtractJsonString(body, L"text", &text) && !Trim(text).empty())
+        const std::wstring pattern = L"\"" + key + L"\"";
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (size_t index = 0; index < object.size(); ++index)
+        {
+            const wchar_t ch = object[index];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == L'\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == L'\"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (ch == L'\"')
+            {
+                bool matchedKey = false;
+                if (depth == 1 &&
+                    index + pattern.size() <= object.size() &&
+                    object.compare(index, pattern.size(), pattern) == 0)
+                {
+                    size_t after = SkipJsonWhitespace(object, index + pattern.size());
+                    if (after < object.size() && object[after] == L':')
+                    {
+                        *valueIndex = SkipJsonWhitespace(object, after + 1);
+                        matchedKey = true;
+                        ok = *valueIndex < object.size();
+                    }
+                }
+
+                if (matchedKey)
+                {
+                    break;
+                }
+
+                inString = true;
+                continue;
+            }
+
+            if (ch == L'{')
+            {
+                ++depth;
+            }
+            else if (ch == L'}')
+            {
+                --depth;
+                if (depth <= 0)
+                {
+                    break;
+                }
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
+static bool ExtractDirectJsonString(
+    const std::wstring& object,
+    const std::wstring& key,
+    std::wstring* value)
+{
+    bool ok = false;
+    size_t valueIndex = 0;
+
+    do
+    {
+        if (value == nullptr || !FindDirectJsonKeyValue(object, key, &valueIndex))
         {
             break;
         }
+
+        if (object[valueIndex] != L'\"')
+        {
+            break;
+        }
+
+        ok = ParseJsonStringAt(object, valueIndex, value, nullptr);
+    } while (false);
+
+    return ok;
+}
+
+static bool IsReasoningPartType(const std::wstring& type)
+{
+    const std::wstring lowered = ToLowerString(Trim(type));
+    return lowered.find(L"reason") != std::wstring::npos ||
+           lowered.find(L"think") != std::wstring::npos;
+}
+
+static bool ExtractNamedJsonObject(
+    const std::wstring& text,
+    const std::wstring& key,
+    std::wstring* object)
+{
+    bool ok = false;
+    size_t colon = 0;
+
+    do
+    {
+        if (!FindJsonKeyColon(text, key, 0, &colon))
+        {
+            break;
+        }
+
+        size_t open = SkipJsonWhitespace(text, colon + 1);
+        if (!ExtractJsonObjectAt(text, open, object, nullptr))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExtractFirstArrayObject(
+    const std::wstring& text,
+    const std::wstring& key,
+    std::wstring* object)
+{
+    bool ok = false;
+    size_t colon = 0;
+
+    do
+    {
+        if (!FindJsonKeyColon(text, key, 0, &colon))
+        {
+            break;
+        }
+
+        size_t open = SkipJsonWhitespace(text, colon + 1);
+        if (open >= text.size() || text[open] != L'[')
+        {
+            break;
+        }
+
+        size_t cursor = open + 1;
+        while (cursor < text.size() && text[cursor] != L'{' && text[cursor] != L']')
+        {
+            ++cursor;
+        }
+
+        if (!ExtractJsonObjectAt(text, cursor, object, nullptr))
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool ExtractMessageContent(const std::wstring& message, std::wstring* content)
+{
+    bool ok = false;
+    size_t value = 0;
+
+    do
+    {
+        if (content == nullptr || !FindDirectJsonKeyValue(message, L"content", &value))
+        {
+            break;
+        }
+
+        if (message[value] == L'n')
+        {
+            break;
+        }
+
+        if (message[value] == L'\"')
+        {
+            ok = ParseJsonStringAt(message, value, content, nullptr);
+            break;
+        }
+
+        if (message[value] != L'[')
+        {
+            break;
+        }
+
+        std::wstring combined;
+        size_t cursor = value + 1;
+        for (;;)
+        {
+            while (cursor < message.size() &&
+                   message[cursor] != L'{' &&
+                   message[cursor] != L']')
+            {
+                ++cursor;
+            }
+
+            if (cursor >= message.size() || message[cursor] == L']')
+            {
+                break;
+            }
+
+            std::wstring part;
+            size_t end = 0;
+            if (!ExtractJsonObjectAt(message, cursor, &part, &end))
+            {
+                break;
+            }
+
+            cursor = end;
+            std::wstring type;
+            ExtractDirectJsonString(part, L"type", &type);
+            if (IsReasoningPartType(type))
+            {
+                continue;
+            }
+
+            std::wstring text;
+            if (ExtractDirectJsonString(part, L"text", &text) && !Trim(text).empty())
+            {
+                combined += text;
+            }
+        }
+
+        if (Trim(combined).empty())
+        {
+            break;
+        }
+
+        *content = combined;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool FinishReasonIsTruncated(const std::wstring& reason)
+{
+    std::wstring text = ToLowerString(Trim(reason));
+    return text == L"length" ||
+           text == L"max_tokens" ||
+           text == L"max_output_tokens" ||
+           text == L"incomplete";
+}
+
+static void ApplyFinishReasonFlag(const std::wstring& object, bool* truncated)
+{
+    if (truncated == nullptr)
+    {
+        return;
+    }
+
+    std::wstring reason;
+    if (ExtractDirectJsonString(object, L"finish_reason", &reason) ||
+        ExtractDirectJsonString(object, L"native_finish_reason", &reason) ||
+        ExtractDirectJsonString(object, L"status", &reason))
+    {
+        if (FinishReasonIsTruncated(reason))
+        {
+            *truncated = true;
+        }
+    }
+}
+
+static bool ExtractAssistantFromOutputArray(const std::wstring& body, std::wstring* text)
+{
+    bool ok = false;
+    size_t colon = 0;
+
+    do
+    {
+        if (text == nullptr || !FindJsonKeyColon(body, L"output", 0, &colon))
+        {
+            break;
+        }
+
+        size_t open = SkipJsonWhitespace(body, colon + 1);
+        if (open >= body.size() || body[open] != L'[')
+        {
+            break;
+        }
+
+        std::wstring combined;
+        size_t cursor = open + 1;
+        for (;;)
+        {
+            while (cursor < body.size() &&
+                   body[cursor] != L'{' &&
+                   body[cursor] != L']')
+            {
+                ++cursor;
+            }
+
+            if (cursor >= body.size() || body[cursor] == L']')
+            {
+                break;
+            }
+
+            std::wstring part;
+            size_t end = 0;
+            if (!ExtractJsonObjectAt(body, cursor, &part, &end))
+            {
+                break;
+            }
+
+            cursor = end;
+            std::wstring type;
+            ExtractDirectJsonString(part, L"type", &type);
+            if (IsReasoningPartType(type))
+            {
+                continue;
+            }
+
+            std::wstring piece;
+            const std::wstring lowered = ToLowerString(Trim(type));
+            if (lowered == L"output_text" || lowered == L"text")
+            {
+                if (ExtractDirectJsonString(part, L"text", &piece) && !Trim(piece).empty())
+                {
+                    combined += piece;
+                }
+
+                continue;
+            }
+
+            if (ExtractMessageContent(part, &piece) && !Trim(piece).empty())
+            {
+                combined += piece;
+            }
+        }
+
+        if (Trim(combined).empty())
+        {
+            break;
+        }
+
+        *text = combined;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static std::wstring ExtractAssistantText(const std::wstring& body, bool* truncated)
+{
+    std::wstring text;
+
+    if (truncated != nullptr)
+    {
+        *truncated = false;
+    }
+
+    do
+    {
+        std::wstring choice;
+        if (ExtractFirstArrayObject(body, L"choices", &choice))
+        {
+            ApplyFinishReasonFlag(choice, truncated);
+
+            std::wstring message;
+            if (ExtractNamedJsonObject(choice, L"message", &message))
+            {
+                if (ExtractMessageContent(message, &text) && !Trim(text).empty())
+                {
+                    break;
+                }
+            }
+            else if (ExtractDirectJsonString(choice, L"text", &text) && !Trim(text).empty())
+            {
+                break;
+            }
+        }
+
+        if (ExtractAssistantFromOutputArray(body, &text) && !Trim(text).empty())
+        {
+            ApplyFinishReasonFlag(body, truncated);
+            break;
+        }
+
+        if (ExtractDirectJsonString(body, L"output_text", &text) && !Trim(text).empty())
+        {
+            ApplyFinishReasonFlag(body, truncated);
+            break;
+        }
+
+        text.clear();
     } while (false);
 
     return Trim(text);
@@ -2432,6 +2933,11 @@ bool AiProviderRuntime::Complete(const AiCompletionRequest& request, AiCompletio
             break;
         }
 
+        response->Text.clear();
+        response->RawBody.clear();
+        response->StatusCode = 0;
+        response->Truncated = false;
+
         if (Trim(request.Prompt).empty())
         {
             if (error != nullptr)
@@ -2713,8 +3219,25 @@ bool AiProviderRuntime::CompleteWithOpenAICompatible(const AiCompletionRequest& 
         body << "{\"role\":\"user\",\"content\":\"" << JsonEscape(request.Prompt) << "\"}";
         body << "],";
         body << "\"temperature\":0.2,";
-        body << "\"max_tokens\":1200";
-        if (settings_.Provider == AiProviderKind::DeepSeek && !settings_.ReasoningEffort.empty())
+        body << "\"max_tokens\":8192";
+        if (settings_.Provider == AiProviderKind::OpenRouter)
+        {
+            // TUI reports should not dump chain-of-thought. Disable reasoning
+            // unless the operator set an effort, and never return reasoning
+            // tokens even when the model still thinks internally.
+            body << ",\"reasoning\":{";
+            if (!settings_.ReasoningEffort.empty())
+            {
+                body << "\"effort\":\"" << JsonEscape(settings_.ReasoningEffort) << "\",";
+            }
+            else
+            {
+                body << "\"enabled\":false,";
+            }
+
+            body << "\"exclude\":true}";
+        }
+        else if (settings_.Provider == AiProviderKind::DeepSeek && !settings_.ReasoningEffort.empty())
         {
             body << ",\"reasoning_effort\":\"" << JsonEscape(settings_.ReasoningEffort) << "\"";
             body << ",\"thinking\":{\"type\":\"enabled\"}";
@@ -2744,12 +3267,19 @@ bool AiProviderRuntime::CompleteWithOpenAICompatible(const AiCompletionRequest& 
             break;
         }
 
-        response->Text = ExtractAssistantText(result.Body);
+        response->Text = ExtractAssistantText(result.Body, &response->Truncated);
         if (response->Text.empty())
         {
             if (error != nullptr)
             {
-                *error = ProviderName() + L" returned no assistant text";
+                if (response->Truncated)
+                {
+                    *error = ProviderName() + L" returned only truncated reasoning; try ai test or a non-reasoning model";
+                }
+                else
+                {
+                    *error = ProviderName() + L" returned no assistant text";
+                }
             }
             break;
         }
@@ -2828,13 +3358,93 @@ bool AiProviderRuntime::CompleteWithOpenAICodex(const AiCompletionRequest& reque
             break;
         }
 
-        response->Text = ExtractAssistantText(result.Body);
+        response->Text = ExtractAssistantText(result.Body, &response->Truncated);
         if (response->Text.empty())
         {
             if (error != nullptr)
             {
                 *error = L"OpenAI Codex returned no assistant text";
             }
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool AiProviderRuntime::ParseAssistantSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        bool truncated = false;
+        const std::wstring reasoningOnly =
+            L"{\"choices\":[{\"finish_reason\":\"length\",\"native_finish_reason\":\"length\","
+            L"\"message\":{\"role\":\"assistant\",\"content\":\"\","
+            L"\"reasoning\":\"We need to explain the output\","
+            L"\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"We need to explain the output\"}]}}]}";
+        std::wstring text = ExtractAssistantText(reasoningOnly, &truncated);
+        if (!text.empty() || !truncated)
+        {
+            break;
+        }
+
+        const std::wstring mixed =
+            L"{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+            L"\"content\":\"## Findings\\n- UCPD.sys\","
+            L"\"reasoning\":\"We need to explain the output\","
+            L"\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"We need to explain\"}]}}]}";
+        truncated = true;
+        text = ExtractAssistantText(mixed, &truncated);
+        if (truncated || text != L"## Findings\n- UCPD.sys" || text.find(L"We need to") != std::wstring::npos)
+        {
+            break;
+        }
+
+        const std::wstring normal =
+            L"{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+            L"\"content\":\"## Findings\\n- UCPD.sys and WdFilter.sys registered Process callbacks.\"}}]}";
+        truncated = true;
+        text = ExtractAssistantText(normal, &truncated);
+        if (truncated || text.find(L"UCPD.sys") == std::wstring::npos || text.find(L"We need to") != std::wstring::npos)
+        {
+            break;
+        }
+
+        const std::wstring arrayContent =
+            L"{\"choices\":[{\"message\":{\"content\":["
+            L"{\"type\":\"reasoning\",\"text\":\"ignore me\"},"
+            L"{\"type\":\"thinking\",\"text\":\"also ignore\"},"
+            L"{\"type\":\"text\",\"text\":\"Hello \"},"
+            L"{\"type\":\"text\",\"text\":\"world\"}]}}]}";
+        truncated = false;
+        text = ExtractAssistantText(arrayContent, &truncated);
+        if (text != L"Hello world" || truncated)
+        {
+            break;
+        }
+
+        const std::wstring legacy =
+            L"{\"choices\":[{\"text\":\"legacy completion\",\"finish_reason\":\"stop\"}]}";
+        truncated = true;
+        text = ExtractAssistantText(legacy, &truncated);
+        if (truncated || text != L"legacy completion")
+        {
+            break;
+        }
+
+        const std::wstring outputArray =
+            L"{\"status\":\"completed\",\"output\":["
+            L"{\"type\":\"reasoning\",\"content\":[{\"type\":\"reasoning.text\",\"text\":\"ignore\"}]},"
+            L"{\"type\":\"message\",\"role\":\"assistant\",\"content\":["
+            L"{\"type\":\"output_text\",\"text\":\"Codex report\"}]}]}";
+        truncated = true;
+        text = ExtractAssistantText(outputArray, &truncated);
+        if (truncated || text != L"Codex report")
+        {
             break;
         }
 
