@@ -22,6 +22,9 @@
     <ClCompile Include="AiCapabilityCatalog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AiModelCatalog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="AiProvider.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -205,6 +208,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AiCapabilityCatalog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AiModelCatalog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AiProvider.h">

@@ -1,4 +1,5 @@
 #include "AiProvider.h"
+#include "AiModelCatalog.h"
 
 #include <Windows.h>
 #include <winhttp.h>
@@ -774,7 +775,8 @@ struct HttpResult
     std::wstring Body;
 };
 
-static bool HttpPost(
+static bool HttpRequest(
+    const wchar_t* method,
     const std::wstring& url,
     const std::wstring& headers,
     const std::string& body,
@@ -846,7 +848,8 @@ static bool HttpPost(
         }
 
         DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
-        request = WinHttpOpenRequest(connect, L"POST", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        const wchar_t* verb = (method != nullptr && method[0] != L'\0') ? method : L"POST";
+        request = WinHttpOpenRequest(connect, verb, path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
         if (request == nullptr)
         {
             if (error != nullptr)
@@ -943,6 +946,160 @@ static bool HttpPost(
     if (session != nullptr)
     {
         WinHttpCloseHandle(session);
+    }
+
+    return ok;
+}
+
+static bool HttpPost(
+    const std::wstring& url,
+    const std::wstring& headers,
+    const std::string& body,
+    uint32_t timeoutSeconds,
+    HttpResult* result,
+    std::wstring* error)
+{
+    return HttpRequest(L"POST", url, headers, body, timeoutSeconds, result, error);
+}
+
+static bool HttpGet(
+    const std::wstring& url,
+    const std::wstring& headers,
+    uint32_t timeoutSeconds,
+    HttpResult* result,
+    std::wstring* error)
+{
+    return HttpRequest(L"GET", url, headers, std::string(), timeoutSeconds, result, error);
+}
+
+static std::wstring ExecutableDirectory()
+{
+    std::wstring directory;
+    wchar_t path[MAX_PATH];
+    DWORD written = GetModuleFileNameW(nullptr, path, MAX_PATH);
+
+    do
+    {
+        if (written == 0 || written >= MAX_PATH)
+        {
+            break;
+        }
+
+        directory = path;
+        size_t slash = directory.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+        {
+            directory.clear();
+            break;
+        }
+
+        directory.resize(slash);
+    } while (false);
+
+    return directory;
+}
+
+static std::wstring EncodeDotEnvValue(const std::wstring& value)
+{
+    std::wstring encoded = value;
+    bool quote = false;
+
+    for (wchar_t ch : value)
+    {
+        if (iswspace(ch) != 0 || ch == L'#' || ch == L'\"' || ch == L'\'')
+        {
+            quote = true;
+            break;
+        }
+    }
+
+    if (quote)
+    {
+        std::wstring escaped;
+        escaped.push_back(L'\"');
+        for (wchar_t ch : value)
+        {
+            if (ch == L'\\' || ch == L'\"')
+            {
+                escaped.push_back(L'\\');
+            }
+
+            escaped.push_back(ch);
+        }
+
+        escaped.push_back(L'\"');
+        encoded = escaped;
+    }
+
+    return encoded;
+}
+
+static bool WriteTextFileUtf8(const std::wstring& path, const std::wstring& text, std::wstring* error)
+{
+    bool ok = false;
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        if (path.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L".env path is empty";
+            }
+
+            break;
+        }
+
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L".env path is a reparse point";
+            }
+
+            break;
+        }
+
+        std::string bytes = WideToUtf8(text);
+        file = CreateFileW(
+            path.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"failed to write " + path;
+            }
+
+            break;
+        }
+
+        DWORD written = 0;
+        if (!WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) ||
+            written != bytes.size())
+        {
+            if (error != nullptr)
+            {
+                *error = L"failed to write " + path;
+            }
+
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
     }
 
     return ok;
@@ -1535,6 +1692,11 @@ bool AiProviderRuntime::LoadDotEnvFiles(const std::vector<std::wstring>& paths, 
             break;
         }
 
+        if (settings_.DotEnvWritePath.empty() && !paths.empty())
+        {
+            settings_.DotEnvWritePath = Trim(paths[0]);
+        }
+
         ReloadFromEnvironment();
     } while (false);
 
@@ -1619,6 +1781,13 @@ bool AiProviderRuntime::SetProvider(const std::wstring& provider, std::wstring* 
             break;
         }
 
+        if (settings_.Provider == kind)
+        {
+            LoadCredentials();
+            ok = true;
+            break;
+        }
+
         if (settings_.RemotePolicy == AiRemotePolicy::LocalOnly && IsRemoteNetworkProvider(kind))
         {
             if (error != nullptr)
@@ -1669,13 +1838,6 @@ bool AiProviderRuntime::SetRemotePolicy(const std::wstring& policy, std::wstring
                 *error = L"usage: ai config policy <allow-remote|local-only>";
             }
             break;
-        }
-
-        if (parsed == AiRemotePolicy::LocalOnly && IsRemoteNetworkProvider(settings_.Provider))
-        {
-            settings_.Provider = AiProviderKind::Disabled;
-            ApplyProviderDefaults(false);
-            LoadCredentials();
         }
 
         settings_.RemotePolicy = parsed;
@@ -1774,8 +1936,449 @@ std::wstring AiProviderRuntime::StatusText() const
         stream << L"reasoning effort: " << settings_.ReasoningEffort << L"\n";
     }
     stream << L"timeout: " << settings_.TimeoutSeconds << L"s\n";
+    if (AiModelCatalog::LiveModelCount() > 0)
+    {
+        stream << L"live models: " << AiModelCatalog::LiveModelCount() << L"\n";
+    }
 
     return stream.str();
+}
+
+std::wstring AiProviderRuntime::HealthText() const
+{
+    std::wstringstream stream;
+    const bool remoteBlocked =
+        settings_.RemotePolicy == AiRemotePolicy::LocalOnly &&
+        IsRemoteNetworkProvider(settings_.Provider);
+    const bool missingKey =
+        (settings_.Provider == AiProviderKind::DeepSeek ||
+         settings_.Provider == AiProviderKind::OpenRouter) &&
+        settings_.ApiKey.empty();
+    const bool missingCodex =
+        settings_.Provider == AiProviderKind::OpenAICodex &&
+        CredentialStatus().find(L"missing") != std::wstring::npos;
+
+    std::wstring state = L"ready";
+    std::wstring next;
+    if (settings_.Provider == AiProviderKind::Disabled)
+    {
+        state = L"off";
+        next = L"ai use cloud";
+        if (settings_.DotEnvPath.empty())
+        {
+            next += L"  (put .env next to KnLiveDbg.exe, not the repo root)";
+        }
+    }
+    else if (remoteBlocked)
+    {
+        state = L"blocked";
+        next = L"ai use private   or   ai config policy allow-remote";
+    }
+    else if (missingKey)
+    {
+        state = L"missing key";
+        if (settings_.Provider == AiProviderKind::OpenRouter)
+        {
+            next = L"set KNLIVEDBG_OPENROUTER_API_KEY in the EXE-dir .env, then ai test";
+        }
+        else
+        {
+            next = L"set KNLIVEDBG_DEEPSEEK_API_KEY in the EXE-dir .env, then ai test";
+        }
+    }
+    else if (missingCodex)
+    {
+        state = L"missing token";
+        next = L"run codex login outside KnLiveDbg, then ai test";
+    }
+    else
+    {
+        next = L"ai test";
+    }
+
+    stream << L"AI: " << state << L"\n";
+
+    AiPresetInfo preset = {};
+    if (AiModelCatalog::DetectPreset(settings_.Provider, settings_.Model, &preset))
+    {
+        stream << L"  preset: " << preset.Name << L"\n";
+    }
+
+    stream << L"  using:  " << ProviderName();
+    if (!settings_.Model.empty())
+    {
+        stream << L" / " << settings_.Model;
+    }
+
+    stream << L"\n";
+    stream << L"  data:   " << RemotePolicyName() << L"\n";
+    stream << L"  auth:   " << CredentialStatus() << L"\n";
+    stream << L"  env:    " << (settings_.DotEnvPath.empty() ? L"(none next to KnLiveDbg.exe)" : settings_.DotEnvPath) << L"\n";
+    if (AiModelCatalog::LiveModelCount() > 0)
+    {
+        stream << L"  live:   " << AiModelCatalog::LiveModelCount() << L" OpenRouter models cached\n";
+    }
+
+    stream << L"  next:   " << next << L"\n";
+    return stream.str();
+}
+
+std::wstring AiProviderRuntime::ModelsText(const std::wstring& query) const
+{
+    return AiModelCatalog::ModelsText(settings_.Provider, settings_.Model, query);
+}
+
+bool AiProviderRuntime::ApplyUse(
+    const std::wstring& spec,
+    const std::wstring& modelOverride,
+    std::wstring* error)
+{
+    bool ok = false;
+    AiUseTarget target = {};
+
+    do
+    {
+        if (!AiModelCatalog::Resolve(spec, &target, error))
+        {
+            break;
+        }
+
+        if (!Trim(modelOverride).empty())
+        {
+            AiUseTarget modelTarget = {};
+            if (!AiModelCatalog::ResolveModel(modelOverride, &modelTarget, error))
+            {
+                break;
+            }
+
+            if (!AiModelCatalog::ModelFitsProvider(target.Provider, modelTarget, error))
+            {
+                break;
+            }
+
+            target.Model = modelTarget.Model;
+            if (target.Preset.empty())
+            {
+                target.Provider = modelTarget.Provider;
+            }
+        }
+
+        if (settings_.RemotePolicy == AiRemotePolicy::LocalOnly &&
+            IsRemoteNetworkProvider(target.Provider))
+        {
+            if (error != nullptr)
+            {
+                *error = L"blocked by local-only policy. use: ai use private";
+            }
+
+            break;
+        }
+
+        if (settings_.Provider != target.Provider)
+        {
+            std::wstring providerName = AiModelCatalog::ProviderDisplayName(target.Provider);
+            if (target.Provider == AiProviderKind::Disabled)
+            {
+                providerName = L"off";
+            }
+
+            if (!SetProvider(providerName, error))
+            {
+                break;
+            }
+        }
+
+        if (target.Provider == AiProviderKind::Disabled)
+        {
+            settings_.Model.clear();
+            settings_.BaseUrl.clear();
+        }
+        else if (!target.Model.empty())
+        {
+            SetModel(target.Model);
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool AiProviderRuntime::SaveToDotEnv(std::wstring* savedPath, std::wstring* error)
+{
+    bool ok = false;
+    std::wstring path = settings_.DotEnvWritePath.empty() ? settings_.DotEnvPath : settings_.DotEnvWritePath;
+
+    do
+    {
+        if (path.empty())
+        {
+            std::wstring exeDir = ExecutableDirectory();
+            if (exeDir.empty())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"cannot locate KnLiveDbg.exe directory for .env";
+                }
+
+                break;
+            }
+
+            path = JoinPath(exeDir, L".env");
+        }
+
+        std::wstring existing;
+        (void)ReadTextFileUtf8OrWide(path, &existing);
+
+        std::wstring providerValue = ProviderName();
+        if (providerValue == L"disabled")
+        {
+            providerValue = L"off";
+        }
+
+        std::vector<std::pair<std::wstring, std::wstring>> updates;
+        updates.push_back({ L"KNLIVEDBG_AI_PROVIDER", providerValue });
+        updates.push_back({ L"KNLIVEDBG_AI_MODEL", settings_.Model });
+        updates.push_back({ L"KNLIVEDBG_AI_REMOTE_POLICY", RemotePolicyName() });
+
+        std::vector<bool> written(updates.size(), false);
+        std::wstring output;
+        if (existing.empty())
+        {
+            output += L"# KnLiveDbg AI settings. This file is loaded from the EXE directory only.\n";
+        }
+
+        size_t offset = 0;
+        while (offset <= existing.size())
+        {
+            size_t end = existing.find_first_of(L"\r\n", offset);
+            std::wstring line;
+            std::wstring newline = L"\n";
+            if (end == std::wstring::npos)
+            {
+                line = existing.substr(offset);
+                offset = existing.size() + 1;
+            }
+            else
+            {
+                line = existing.substr(offset, end - offset);
+                if (end + 1 < existing.size() && existing[end] == L'\r' && existing[end + 1] == L'\n')
+                {
+                    newline = L"\r\n";
+                    offset = end + 2;
+                }
+                else
+                {
+                    newline = existing.substr(end, 1);
+                    offset = end + 1;
+                }
+            }
+
+            std::wstring name;
+            std::wstring value;
+            bool replaced = false;
+            if (ParseDotEnvLine(line, &name, &value))
+            {
+                for (size_t index = 0; index < updates.size(); ++index)
+                {
+                    if (updates[index].first == name)
+                    {
+                        output += name;
+                        output += L"=";
+                        output += EncodeDotEnvValue(updates[index].second);
+                        output += newline;
+                        written[index] = true;
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!replaced && !(offset > existing.size() && line.empty()))
+            {
+                output += line;
+                if (offset <= existing.size())
+                {
+                    output += newline;
+                }
+            }
+        }
+
+        bool needLeadingNewline = !output.empty() && output.back() != L'\n';
+        for (size_t index = 0; index < updates.size(); ++index)
+        {
+            if (written[index])
+            {
+                continue;
+            }
+
+            if (needLeadingNewline)
+            {
+                output += L"\n";
+                needLeadingNewline = false;
+            }
+
+            output += updates[index].first;
+            output += L"=";
+            output += EncodeDotEnvValue(updates[index].second);
+            output += L"\n";
+        }
+
+        const std::wstring tmpPath = path + L".tmp";
+        if (!WriteTextFileUtf8(tmpPath, output, error))
+        {
+            break;
+        }
+
+        if (!MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        {
+            DeleteFileW(tmpPath.c_str());
+            if (error != nullptr)
+            {
+                *error = L"failed to replace " + path;
+            }
+
+            break;
+        }
+
+        for (const std::pair<std::wstring, std::wstring>& update : updates)
+        {
+            bool found = false;
+            for (ConfigEntry& entry : dotEnvValues_)
+            {
+                if (entry.Name == update.first)
+                {
+                    entry.Value = update.second;
+                    entry.Source = update.first + L" from " + path;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                ConfigEntry entry = {};
+                entry.Name = update.first;
+                entry.Value = update.second;
+                entry.Source = update.first + L" from " + path;
+                dotEnvValues_.push_back(entry);
+            }
+        }
+
+        if (savedPath != nullptr)
+        {
+            *savedPath = path;
+        }
+
+        settings_.DotEnvPath = path;
+        settings_.DotEnvWritePath = path;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool AiProviderRuntime::RefreshCloudModels(std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (settings_.RemotePolicy == AiRemotePolicy::LocalOnly)
+        {
+            if (error != nullptr)
+            {
+                *error = L"ai models refresh is blocked by local-only policy";
+            }
+
+            break;
+        }
+
+        std::wstring url = settings_.BaseUrl;
+        if (settings_.Provider != AiProviderKind::OpenRouter || url.empty())
+        {
+            url = kDefaultOpenRouterBaseUrl;
+        }
+
+        url = Trim(url);
+        while (!url.empty() && url.back() == L'/')
+        {
+            url.pop_back();
+        }
+
+        std::wstring lowered = ToLowerString(url);
+        const wchar_t* suffixes[] = { L"/chat/completions", L"/models" };
+        for (const wchar_t* suffix : suffixes)
+        {
+            size_t suffixLen = wcslen(suffix);
+            if (lowered.size() >= suffixLen &&
+                lowered.compare(lowered.size() - suffixLen, suffixLen, suffix) == 0)
+            {
+                url.resize(url.size() - suffixLen);
+                lowered = ToLowerString(url);
+            }
+        }
+
+        if (!url.empty() && url.back() == L'/')
+        {
+            url.pop_back();
+        }
+
+        url += L"/models";
+
+        std::wstring headers = L"Accept: application/json\r\nHTTP-Referer: https://github.com/kernullist/kn-live-dbg\r\nX-Title: KnLiveDbg\r\n";
+        std::wstring openRouterKey = settings_.ApiKey;
+        if (settings_.Provider != AiProviderKind::OpenRouter || openRouterKey.empty())
+        {
+            openRouterKey = ConfigValue(L"KNLIVEDBG_OPENROUTER_API_KEY", nullptr);
+            if (openRouterKey.empty())
+            {
+                openRouterKey = ConfigValue(L"OPENROUTER_API_KEY", nullptr);
+            }
+        }
+
+        if (!openRouterKey.empty())
+        {
+            headers += L"Authorization: Bearer " + openRouterKey + L"\r\n";
+        }
+
+        HttpResult result = {};
+        if (!HttpGet(url, headers, 30, &result, error))
+        {
+            break;
+        }
+
+        if (result.StatusCode >= 300)
+        {
+            if (error != nullptr)
+            {
+                *error = L"OpenRouter models HTTP " + std::to_wstring(result.StatusCode);
+            }
+
+            break;
+        }
+
+        std::vector<AiCloudModel> models;
+        if (!AiModelCatalog::ParseOpenRouterModelsJson(result.Body, &models, error))
+        {
+            break;
+        }
+
+        if (models.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"OpenRouter returned no usable text models";
+            }
+
+            break;
+        }
+
+        AiModelCatalog::SetLiveModels(models);
+        ok = true;
+    } while (false);
+
+    return ok;
 }
 
 std::wstring AiProviderRuntime::AuthHelpText() const
@@ -1784,6 +2387,7 @@ std::wstring AiProviderRuntime::AuthHelpText() const
 
     stream << L"AI auth sources:\n";
     stream << L"  .env file is loaded only from the executable directory\n";
+    stream << L"  Prefer: ai use cloud | ai use grok | ai models refresh\n";
     stream << L"  KNLIVEDBG_AI_PROVIDER=openai-codex-cli|openai-codex-subscription|deepseek|openrouter\n";
     stream << L"  KNLIVEDBG_AI_REMOTE_POLICY=allow-remote|local-only\n";
     stream << L"  KNLIVEDBG_AI_MODEL=<model>\n";
@@ -1861,7 +2465,7 @@ bool AiProviderRuntime::Complete(const AiCompletionRequest& request, AiCompletio
         default:
             if (error != nullptr)
             {
-                *error = L"AI provider is disabled; run ai config provider <name> or set KNLIVEDBG_AI_PROVIDER";
+                *error = L"AI provider is disabled; run ai use cloud or set KNLIVEDBG_AI_PROVIDER";
             }
             break;
         }
@@ -1946,6 +2550,13 @@ bool AiProviderRuntime::NormalizeProviderName(const std::wstring& value, AiProvi
 
 void AiProviderRuntime::ApplyProviderDefaults(bool preserveModel)
 {
+    if (settings_.Provider == AiProviderKind::Disabled)
+    {
+        settings_.Model.clear();
+        settings_.BaseUrl.clear();
+        return;
+    }
+
     if (!preserveModel)
     {
         settings_.BaseUrl.clear();
@@ -1965,7 +2576,7 @@ void AiProviderRuntime::ApplyProviderDefaults(bool preserveModel)
             settings_.Model = L"deepseek-chat";
             break;
         case AiProviderKind::OpenRouter:
-            settings_.Model = L"openai/gpt-oss-120b";
+            settings_.Model = L"anthropic/claude-opus-5";
             break;
         default:
             settings_.Model.clear();

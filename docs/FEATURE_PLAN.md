@@ -352,6 +352,11 @@ Implementation notes:
 7. Every `ai` subcommand supports `ai help <sub>` / `ai <sub> help` and Tab
    completion. `ai explain|analyze|annotate <cmd> help` prints that command's
    native help, and Tab after those verbs reuses the native completer.
+8. Provider setup is a preset layer in `user/AiModelCatalog.cpp`: `ai use`,
+   `ai models`, `ai test`, and `ai save`. Transports stay in `AiProviderRuntime`.
+   OpenRouter defaults to `anthropic/claude-opus-5`. Tab completes curated
+   frontier ids (2026-08-24 snapshot) plus live OpenRouter ids after
+   `ai models refresh`. EXE-dir `.env` merge persists provider/model/policy.
 
 Operational value:
 

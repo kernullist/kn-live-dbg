@@ -31,6 +31,7 @@ struct AiProviderSettings
     std::wstring CodexAuthFile;
     std::wstring ReasoningEffort;
     std::wstring DotEnvPath;
+    std::wstring DotEnvWritePath;
     std::wstring RemotePolicySource;
     uint32_t TimeoutSeconds;
 };
@@ -67,8 +68,14 @@ public:
     std::wstring RemotePolicyName() const;
     std::wstring CredentialStatus() const;
     std::wstring StatusText() const;
+    std::wstring HealthText() const;
     std::wstring AuthHelpText() const;
     std::wstring PreviewText(const AiCompletionRequest& request) const;
+    std::wstring ModelsText(const std::wstring& query) const;
+
+    bool ApplyUse(const std::wstring& spec, const std::wstring& modelOverride, std::wstring* error);
+    bool SaveToDotEnv(std::wstring* savedPath, std::wstring* error);
+    bool RefreshCloudModels(std::wstring* error);
 
     bool Complete(const AiCompletionRequest& request, AiCompletionResponse* response, std::wstring* error);
 
