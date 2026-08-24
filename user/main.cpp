@@ -4202,6 +4202,7 @@ static void AddAiCompletionCandidates(
         {
             static const wchar_t* values[] =
             {
+                L"1",
                 L"all",
                 L"help"
             };
@@ -4212,7 +4213,14 @@ static void AddAiCompletionCandidates(
         {
             if (argsBefore.size() == 2)
             {
-                AddCompletionCandidate(candidates, L"help");
+                static const wchar_t* values[] =
+                {
+                    L"1",
+                    L"confirm",
+                    L"help"
+                };
+
+                AddCompletionCandidates(candidates, values);
             }
             else
             {
@@ -28133,6 +28141,16 @@ static void PrintAiHelp()
     std::wcout << L"  ai \xCF5C\xBC31 \xC804\xC218\xC870\xC0AC\n";
     std::wcout << L"  ai pid 1234 dtb\n";
     std::wcout << L"  ai !callbacks all WdFilter.sys\n";
+    std::wcout << L"  ai disable wdfilter minifilter\n";
+    std::wcout << L"  ai disable wdfilter callbacks\n";
+    std::wcout << L"  ai disable wdfilter object\n";
+    std::wcout << L"  ai enable ppl\n";
+    std::wcout << L"  ai load byovd fixture\n";
+    std::wcout << L"  ai reset timeline\n";
+    std::wcout << L"  ai !callbacks disable-all WdFilter\n";
+    std::wcout << L"  ai dump-pe nt .\\ntos-live.exe\n";
+    std::wcout << L"  ai write\n";
+    std::wcout << L"  ai write confirm\n";
     std::wcout << L"  ai uf nt!PspCreateProcessNotifyRoutine 128\n";
     std::wcout << L"  ai check VBS status\n";
     std::wcout << L"  ai !ci options\n";
@@ -28153,6 +28171,11 @@ static void PrintAiHelp()
     std::wcout << L"  ai plan remains an explicit command-proposal override. Default ai <goal> no longer auto-builds that plan.\n";
     std::wcout << L"  Prefer ai use <preset|model>. .env is loaded only from the EXE directory.\n";
     std::wcout << L"  ai run executes read-only validated plan commands; write-like commands require ai write confirm.\n";
+      std::wcout << L"  disable/enable callback or minifilter goals need a surface (minifilter, callbacks, object, process, thread, registry, imageload).\n";
+    std::wcout << L"  Other staged writes include ai enable ppl, ai load byovd fixture, ai reset timeline, ai start ti, and ai dump-pe <module> <path>.\n";
+    std::wcout << L"  They become a write plan and do not run until ai write confirm (or ai write 1 confirm). Needs write on.\n";
+    std::wcout << L"  Exact write commands such as ai !callbacks disable-all WdFilter also stage a write plan; flags such as /pre are kept.\n";
+    std::wcout << L"  Session commands write/log/mcp/probe/backend are not staged; type them directly.\n";
     std::wcout << L"  ai <subcommand> help and ai help <subcommand> print that subcommand's usage.\n";
     std::wcout << L"  Legacy detailed commands still work; use ai help <topic> when needed.\n";
 }
@@ -28335,16 +28358,22 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     else if (name == L"run")
     {
         std::wcout << L"ai run:\n";
+        std::wcout << L"  ai run\n";
         std::wcout << L"  ai run <index|all>\n";
         std::wcout << L"  Execute planned commands that passed read-only validation.\n";
+        std::wcout << L"  If the plan has one command, ai run with no index runs that command.\n";
         std::wcout << L"  Session mutation, unload, backend changes, and write-like commands are blocked.\n";
     }
     else if (name == L"write")
     {
         std::wcout << L"ai write:\n";
+        std::wcout << L"  ai write\n";
+        std::wcout << L"  ai write confirm\n";
         std::wcout << L"  ai write <index>\n";
         std::wcout << L"  ai write <index> confirm\n";
         std::wcout << L"  Preview backup/translation/verify commands before operator-confirmed writes.\n";
+        std::wcout << L"  If the plan has one write, ai write and ai write confirm do not need an index.\n";
+        std::wcout << L"  `[1]` in the plan listing is that index, not a menu picker.\n";
     }
     else if (name == L"transcript")
     {
@@ -29958,6 +29987,34 @@ static int RunConsoleSurfaceSelfTest()
                         aiHelp.find(L"ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4") != std::wstring::npos &&
                         aiHelp.find(L"no longer auto-builds") != std::wstring::npos,
                     L"ai-help-covers-go-evidence-and-local-first");
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    aiHelp.find(L"ai disable wdfilter minifilter") != std::wstring::npos &&
+                        aiHelp.find(L"ai disable wdfilter callbacks") != std::wstring::npos &&
+                        aiHelp.find(L"ai enable ppl") != std::wstring::npos &&
+                        aiHelp.find(L"need a surface") != std::wstring::npos &&
+                        aiHelp.find(L"ai write confirm") != std::wstring::npos &&
+                        aiHelp.find(L"ai write 1 confirm") != std::wstring::npos &&
+                        aiHelp.find(L"write/log/mcp/probe/backend") != std::wstring::npos,
+                    L"ai-help-covers-mutation-write-plan");
+                CheckCompletionCandidate(&context, {L"ai", L"write"}, L"1", L"ai-write-index-completion");
+                CheckCompletionCandidate(&context, {L"ai", L"write"}, L"confirm", L"ai-write-confirm-completion");
+                CheckCompletionCandidate(&context, {L"ai", L"write", L"1"}, L"confirm", L"ai-write-index-confirm-completion");
+                CheckCompletionCandidate(&context, {L"ai", L"run"}, L"1", L"ai-run-index-completion");
+                {
+                    const std::wstring writeHelp = CaptureDetailedHelpOutput({L"help", L"ai", L"write"}, 1);
+                    CheckConsoleSurfaceSelfTest(
+                        &context,
+                        writeHelp.find(L"ai write confirm") != std::wstring::npos &&
+                            writeHelp.find(L"not a menu picker") != std::wstring::npos,
+                        L"ai-write-subcommand-help");
+                    const std::wstring writeList = CaptureCompletionListing({L"ai", L"write"}, L"");
+                    CheckConsoleSurfaceSelfTest(
+                        &context,
+                        writeList.find(L"confirm") != std::wstring::npos &&
+                            writeList.find(L"ai write") != std::wstring::npos,
+                        L"ai-write-completion-listing");
+                }
                 const std::wstring goHelp = CaptureDetailedHelpOutput({L"help", L"ai", L"go"}, 1);
                 CheckConsoleSurfaceSelfTest(
                     &context,
@@ -30098,6 +30155,11 @@ static int RunConsoleSurfaceSelfTest()
                 IsWriteLikeCommandLine(L"!pool pe /dump .\\poolpe-hits") &&
                     !IsWriteLikeCommandLine(L"!pool pe /suspicious") &&
                     !IsWriteLikeCommandLine(L"!pool find /wx") &&
+                    IsWriteLikeCommandLine(L"dump-pe nt .\\ntos.bin") &&
+                    IsWriteLikeCommandLine(L"dump-raw nt!KiSystemServiceUser 0x200 .\\out.bin") &&
+                    !IsWriteLikeCommandLine(L"dump-pe nt") &&
+                    !IsWriteLikeCommandLine(L"dump-pe help") &&
+                    !IsWriteLikeCommandLine(L"dump-analyze .\\memory.dmp") &&
                     IsBlockedAiRunCommand(L"!pool pe /dump .\\poolpe-hits", &blockReason) &&
                     !IsBlockedAiRunCommand(L"!pool pe /suspicious", &blockReason),
                 L"pool-pe-dump-is-write-like");
@@ -32309,6 +32371,24 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
             break;
         }
 
+        if (command == L"dump-pe")
+        {
+            if (args.size() >= 3 && !IsHelpToken(args[1]))
+            {
+                writeLike = true;
+            }
+            break;
+        }
+
+        if (command == L"dump-raw")
+        {
+            if (args.size() >= 4 && !IsHelpToken(args[1]))
+            {
+                writeLike = true;
+            }
+            break;
+        }
+
         if (IsEnterCommand(command) || IsPhysicalEnterCommand(command))
         {
             writeLike = true;
@@ -34128,6 +34208,28 @@ static bool ValidateAiPlanArgumentShape(
                 break;
             }
         }
+        else if (command == L"dump-pe")
+        {
+            if (args.size() < 3 || IsHelpToken(args[1]) || IsSwitchLikeToken(args[1]) || IsSwitchLikeToken(args[2]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"dump-pe requires an address and an output path";
+                }
+                break;
+            }
+        }
+        else if (command == L"dump-raw")
+        {
+            if (args.size() < 4 || IsHelpToken(args[1]) || IsSwitchLikeToken(args[1]))
+            {
+                if (reason != nullptr)
+                {
+                    *reason = L"dump-raw requires address, length, and an output path";
+                }
+                break;
+            }
+        }
 
         ok = true;
     } while (false);
@@ -35141,6 +35243,29 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
                 plan.Warning = L"unrecognized !callbacks write-like action";
             }
         }
+        else if (command == L"dump-raw" || command == L"dump-pe")
+        {
+            plan.TargetKind = L"host-file";
+            plan.Target = commandLine;
+            plan.ByteCountText = L"file";
+            plan.Warning = L"writes a host file from live kernel memory; confirm the path and that the range is intended";
+        }
+        else if (command == L"set-ppl-antimalware")
+        {
+            plan.TargetKind = L"process-protection";
+            plan.Target = commandLine;
+            plan.ByteCountText = L"1";
+            plan.BackupCommand = L"set-ppl-antimalware status";
+            plan.VerifyCommand = plan.BackupCommand;
+            plan.Warning = L"flips this process _EPROCESS.Protection; needs write on. off restores unprotected 0x00";
+        }
+        else if (command == L"!byovd")
+        {
+            plan.TargetKind = L"byovd-fixture";
+            plan.Target = commandLine;
+            plan.ByteCountText = L"n/a";
+            plan.Warning = L"loads or unloads the bundled BYOVD fixture service";
+        }
         else if (command == L"!minifilter" || command == L"!fltmgr")
         {
             const std::wstring action = commandArgs.size() >= 2 ? ToLower(commandArgs[1]) : L"";
@@ -36090,14 +36215,25 @@ static bool RunAiPlannedCommands(
             break;
         }
 
+        std::vector<size_t> indexes;
         if (args.size() < 3)
         {
-            std::wcerr << L"usage: ai run <index|all>\n";
-            break;
+            if (aiState.Commands.size() == 1)
+            {
+                if (IsWriteLikeCommandLine(aiState.Commands[0].Command))
+                {
+                    std::wcerr << L"this plan item is write-like; type `ai write confirm` (needs write on)\n";
+                    break;
+                }
+                indexes.push_back(1);
+            }
+            else
+            {
+                std::wcerr << L"usage: ai run <index|all>\n";
+                break;
+            }
         }
-
-        std::vector<size_t> indexes;
-        if (ToLower(args[2]) == L"all")
+        else if (ToLower(args[2]) == L"all")
         {
             for (size_t index = 1; index <= aiState.Commands.size(); ++index)
             {
@@ -36121,7 +36257,12 @@ static bool RunAiPlannedCommands(
             std::wstring reason;
             if (IsBlockedAiRunCommand(item.Command, &reason))
             {
-                std::wcerr << L"ai run blocked [" << index << L"]: " << reason << L" command=" << item.Command << L"\n";
+                std::wcerr << L"ai run blocked [" << index << L"]: " << reason << L" command=" << item.Command;
+                if (IsWriteLikeCommandLine(item.Command))
+                {
+                    std::wcerr << L"; type `ai write " << index << L" confirm`";
+                }
+                std::wcerr << L"\n";
                 WriteAiTranscriptEvent(aiState, L"ai_run_blocked", reason, item.Command);
                 continue;
             }
@@ -36215,6 +36356,30 @@ static void HandleAiPlaybookCommand(
     } while (false);
 }
 
+static size_t CountWriteLikePlanItems(const AiPlanState& plan, size_t* firstIndex)
+{
+    size_t count = 0;
+    size_t first = 0;
+    for (size_t i = 0; i < plan.Commands.size(); ++i)
+    {
+        if (plan.Commands[i].WriteLike || IsWriteLikeCommandLine(plan.Commands[i].Command))
+        {
+            ++count;
+            if (first == 0)
+            {
+                first = i + 1;
+            }
+        }
+    }
+
+    if (firstIndex != nullptr)
+    {
+        *firstIndex = first;
+    }
+
+    return count;
+}
+
 static void HandleAiPlannedWrite(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -36229,21 +36394,60 @@ static void HandleAiPlannedWrite(
     {
         if (aiState.Commands.empty())
         {
-            std::wcerr << L"no AI command plan is loaded. run ai plan <prompt> first\n";
+            std::wcerr << L"no AI command plan is loaded. run ai plan <prompt> or a disable/enable goal first\n";
             break;
         }
 
+        size_t firstWrite = 0;
+        const size_t writeCount = CountWriteLikePlanItems(aiState, &firstWrite);
+        size_t index = 0;
+        bool confirmed = false;
         if (args.size() < 3)
         {
-            std::wcerr << L"usage: ai write <index> [confirm]\n";
-            break;
+            if (writeCount == 1)
+            {
+                index = firstWrite;
+            }
+            else
+            {
+                std::wcerr << L"usage: ai write [index] [confirm]\n";
+                if (writeCount == 0)
+                {
+                    std::wcerr << L"the loaded plan has no write-like items; use `ai run` for read-only steps.\n";
+                }
+                else
+                {
+                    std::wcerr << L"the loaded plan has " << writeCount
+                               << L" write-like item(s); pick an index from `ai show plan`.\n";
+                }
+                PrintAiPlan(aiState);
+                break;
+            }
         }
-
-        size_t index = 0;
-        if (!ParseDecimalIndex(args[2], &index) || index == 0 || index > aiState.Commands.size())
+        else if (ToLower(args[2]) == L"confirm")
         {
-            std::wcerr << L"invalid AI plan index\n";
-            break;
+            if (writeCount == 1)
+            {
+                index = firstWrite;
+                confirmed = true;
+            }
+            else
+            {
+                std::wcerr << L"usage: ai write <index> confirm\n";
+                std::wcerr << L"the loaded plan has " << writeCount
+                           << L" write-like item(s); pick an index.\n";
+                PrintAiPlan(aiState);
+                break;
+            }
+        }
+        else
+        {
+            if (!ParseDecimalIndex(args[2], &index) || index == 0 || index > aiState.Commands.size())
+            {
+                std::wcerr << L"invalid AI plan index\n";
+                break;
+            }
+            confirmed = args.size() >= 4 && ToLower(args[3]) == L"confirm";
         }
 
         const AiCommandProposal& item = aiState.Commands[index - 1];
@@ -36263,7 +36467,6 @@ static void HandleAiPlannedWrite(
 
         AiWriteSafetyPlan safety = BuildWriteSafetyPlan(item.Command, state, symbols);
         PopulateWriteRestoreCommand(&safety, item.Command, state, device, symbols);
-        bool confirmed = args.size() >= 4 && ToLower(args[3]) == L"confirm";
         if (!confirmed)
         {
             std::wcout << L"AI write preview [" << index << L"]\n";
@@ -36280,7 +36483,14 @@ static void HandleAiPlannedWrite(
             ExecuteReadOnlySafetyCommand(safety.TranslationCommand, L"ai_write_preflight", state, dbgeng, device, service, symbols, ai, aiState);
             ExecuteReadOnlySafetyCommand(safety.BackupCommand, L"ai_write_preflight", state, dbgeng, device, service, symbols, ai, aiState);
             std::wcout << L"operator action required: inspect the command, backup/readback output, then type:\n";
-            std::wcout << L"  ai write " << index << L" confirm\n";
+            if (writeCount == 1)
+            {
+                std::wcout << L"  ai write confirm\n";
+            }
+            else
+            {
+                std::wcout << L"  ai write " << index << L" confirm\n";
+            }
             WriteAiTranscriptEvent(aiState, L"ai_write_preview", L"confirmation required", item.Command);
             break;
         }
@@ -47051,6 +47261,76 @@ static void HandleAiConfigCommand(
     } while (false);
 }
 
+static bool InstallAiWritePlan(
+    const std::wstring& command,
+    const std::wstring& purpose,
+    const std::wstring& title,
+    AiPlanState& aiState,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        AiCommandProposal item = {};
+        item.Command = JoinArgs(Split(command), 0);
+        item.Purpose = purpose;
+        item.Risk = L"write-like";
+        item.WriteLike = true;
+        item.RequiresConfirmation = true;
+        if (item.Command.rfind(L"!ti ", 0) == 0 || item.Command.rfind(L"!timeline ", 0) == 0)
+        {
+            item.ExpectedOutput = L"session-local TI/timeline mutation; not executed until ai write confirm";
+        }
+        else if (item.Command.rfind(L"dump-pe ", 0) == 0 || item.Command.rfind(L"dump-raw ", 0) == 0)
+        {
+            item.ExpectedOutput = L"host file written from live kernel memory; confirm the path";
+        }
+        else if (item.Command.rfind(L"set-ppl-antimalware", 0) == 0)
+        {
+            item.ExpectedOutput = L"this-process Protection byte change; verify with set-ppl-antimalware status";
+        }
+        else if (item.Command.rfind(L"!byovd fixture", 0) == 0)
+        {
+            item.ExpectedOutput = L"BYOVD fixture service load or unload";
+        }
+        else
+        {
+            item.ExpectedOutput = L"session-local mutation of the named module; originals stay in this session for enable";
+        }
+        item.Backend = InferAiPlanBackend(item.Command, ClassifyCommandLine(item.Command, true));
+        if (!ValidateAiPlanCommand(item, error))
+        {
+            break;
+        }
+
+        const bool replacing = !aiState.Commands.empty();
+        AiPlanState plan = {};
+        plan.Schema = L"kn-live-dbg.ai-plan.v2";
+        plan.Title = title;
+        plan.Summary = L"Write-like command is staged. It does not run until ai write confirm.";
+        plan.Commands.push_back(item);
+        PreserveAiSessionSettings(plan, aiState);
+        plan.HasPendingCapabilityPlan = false;
+        plan.PendingCapabilityJson.clear();
+        plan.PendingQuery.clear();
+        plan.PendingVerbose = false;
+        aiState = plan;
+        WriteAiTranscriptEvent(aiState, L"ai_mutation_plan", L"write plan staged", item.Command);
+        std::wcout << L"ai auto: write plan (not executed)\n";
+        if (replacing)
+        {
+            std::wcout << L"ai note: replaced the previous command plan\n";
+        }
+        PrintAiPlan(aiState);
+        std::wcout << L"needs `write on`. type `ai write` to preview, or `ai write confirm` to execute.\n";
+        std::wcout << L"if the plan has several writes, use `ai write <index> confirm`.\n";
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static void HandleAiFreeFormCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -47073,23 +47353,41 @@ static void HandleAiFreeFormCommand(
         std::wstring implicitEvidenceCommand;
         if (TryBuildImplicitAiEvidenceCommand(query, &implicitEvidenceCommand))
         {
-            AiEvidenceAnalysisMetadata metadata = BuildAiEvidenceAnalysisMetadata(
-                implicitEvidenceCommand,
-                L"ai_auto_explain");
-            std::wcout << L"ai auto: evidence analysis\n";
-            HandleAiEvidenceAnalysis(
-                metadata.EventName,
-                implicitEvidenceCommand,
-                metadata.Title,
-                metadata.Instructions,
-                state,
-                dbgeng,
-                device,
-                service,
-                symbols,
-                ai,
-                aiState);
-            break;
+            if (IsWriteLikeCommandLine(implicitEvidenceCommand))
+            {
+                std::vector<std::wstring> queryArgs = Split(query);
+                const std::wstring first = queryArgs.empty() ? L"" : ToLower(queryArgs[0]);
+                if (first == L"explain" ||
+                    first == L"analyze" ||
+                    first == L"interpret" ||
+                    first == L"annotate")
+                {
+                    std::wcerr << L"ai explain/analyze is read-only. stage the write with `ai "
+                               << implicitEvidenceCommand
+                               << L"` then `ai write confirm`.\n";
+                    break;
+                }
+            }
+            else
+            {
+                AiEvidenceAnalysisMetadata metadata = BuildAiEvidenceAnalysisMetadata(
+                    implicitEvidenceCommand,
+                    L"ai_auto_explain");
+                std::wcout << L"ai auto: evidence analysis\n";
+                HandleAiEvidenceAnalysis(
+                    metadata.EventName,
+                    implicitEvidenceCommand,
+                    metadata.Title,
+                    metadata.Instructions,
+                    state,
+                    dbgeng,
+                    device,
+                    service,
+                    symbols,
+                    ai,
+                    aiState);
+                break;
+            }
         }
 
         bool verbose = false;
@@ -47117,6 +47415,58 @@ static void HandleAiFreeFormCommand(
                 symbols,
                 ai,
                 aiState);
+            break;
+        }
+
+        // Prefer the typed write command as-is so flags such as /pre survive.
+        if (IsWriteLikeCommandLine(query))
+        {
+            std::wstring writeError;
+            if (!InstallAiWritePlan(
+                    query,
+                    L"operator-specified write command from ai <goal>",
+                    L"Staged write command",
+                    aiState,
+                    &writeError))
+            {
+                std::wcerr << L"ai write plan failed: " << writeError << L"\n";
+            }
+            break;
+        }
+
+        if (AiQueryHasMutationIntent(query) && !IsAiConceptualQuery(query))
+        {
+            std::wstring mutationCommand;
+            std::wstring mutationPurpose;
+            std::wstring mutationError;
+            if (TryBuildAiMutationCommand(query, &mutationCommand, &mutationPurpose, &mutationError))
+            {
+                if (!InstallAiWritePlan(
+                        mutationCommand,
+                        mutationPurpose,
+                        L"Staged write command",
+                        aiState,
+                        &mutationError))
+                {
+                    std::wcerr << L"ai write plan failed: " << mutationError << L"\n";
+                }
+            }
+            else
+            {
+                std::wcerr << L"ai mutation goal failed: " << mutationError << L"\n";
+                std::wcout << L"examples:\n";
+                std::wcout << L"  ai disable wdfilter minifilter\n";
+                std::wcout << L"  ai disable wdfilter callbacks\n";
+                std::wcout << L"  ai disable wdfilter object\n";
+                std::wcout << L"  ai disable wdfilter process\n";
+                std::wcout << L"  ai enable ppl\n";
+                std::wcout << L"  ai load byovd fixture\n";
+                std::wcout << L"  ai reset timeline\n";
+                std::wcout << L"  ai start ti\n";
+                std::wcout << L"  ai !minifilter disable-all WdFilter /pre\n";
+                std::wcout << L"  ai dump-pe nt .\\ntos-live.exe\n";
+                std::wcout << L"then: write on, ai write confirm\n";
+            }
             break;
         }
 

@@ -367,8 +367,8 @@ ai no
 ai plan <prompt>
 ai explain <read-only-command...>
 ai show [plan|pending|evidence]
-ai run <index|all>
-ai write <index> [confirm]
+ai run [index|all]
+ai write [index] [confirm]
 ai report <path>
 c <address1> <address2> <length>
 s [-b|-w|-d|-q] <address> <length> <value...>
@@ -394,7 +394,7 @@ Help syntax notes:
 - `nt!` is treated as the loaded kernel image for symbols and PDB type names.
 - `d*`, `e*`, and `vtop` support `/process <process-id>` for one command; `procctx <pid>` pins a default context.
 - Virtual `e*` writes default to System(pid 4) context for kernel addresses and temporarily restore read-only leaf PTE write bits after patching. Each write is verified by reading the bytes back before the PTE is restored, and writes through a read-only large-page (2 MB/1 GB) mapping are refused rather than flipping a shared parent entry's write bit.
-- API-key AI providers load `.env` only from the EXE directory. Prefer `ai use cloud` / `ai models` / `ai test`; `ai run` remains read-only and `ai write <index> confirm` is required for write-like plans.
+- API-key AI providers load `.env` only from the EXE directory. Prefer `ai use cloud` / `ai models` / `ai test`; `ai run` remains read-only and `ai write confirm` (or `ai write <index> confirm`) is required for write-like plans.
 
 Example:
 
@@ -543,8 +543,8 @@ ai no
 ai plan <prompt>
 ai explain <read-only-command...>
 ai show [plan|pending|evidence]
-ai run <index|all>
-ai write <index> [confirm]
+ai run [index|all]
+ai write [index] [confirm]
 ai report <path>
 ```
 
@@ -623,7 +623,7 @@ For `ai <goal>`, local playbooks and process-field queries run first. When the m
 
 `ai plan <prompt>` asks the selected model to return a strict `kn-live-dbg.ai-plan.v2` command proposal JSON object, validates proposed commands before storing them, and prints numbered commands with purpose, risk, backend, and expected-output notes. Empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected; write-like proposals are forced to require confirmation. Conceptual `what`/`why` questions stay advisory. `ai explain <read-only-command...>` is still available as an explicit evidence-analysis form; it preserves stdout/stderr, adds a deterministic output summary, then asks the selected model for analysis. It has tuned prompts for `callbacks`, `dt`/`dtx`, and `u`/`uf`, so the older `ai analyze callbacks` and `ai annotate` flows are now covered by the shorter explain form and by implicit `ai <read-only-command...>` routing.
 
-`ai run <index|all>` executes only non-write, non-shutdown planned commands. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, `m`, and raw `kd` wrappers around write-like commands are blocked from `ai run`; `ai write <index>` prints a write preview with target class, byte count, backup/read-current command, restore-current command for small ranges, verification command, and safe read-only preflight output. `ai write <index> confirm` re-runs the backup read, dispatches the write-like command, re-runs the verification command, and prints a deterministic before/after stdout/stderr diff for the verification command. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode, command class, write-like classification, stdout/stderr character counts, deterministic output summary, raw stdout/stderr, and keep-running state. `ai transcript max <bytes>` rotates long transcript files, `ai transcript redact on` redacts long hex addresses, `sk-...` style tokens, and HTTP `Bearer`/`Authorization` credentials from captured stdout/stderr, and `ai audit <path>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher. `ai report <path>` exports a Markdown summary of the current AI session, transcript settings, write-audit path, and plan.
+`ai run [index|all]` executes only non-write, non-shutdown planned commands. If the plan has one read-only command, `ai run` with no index runs it. Write-like commands such as `e*`, `pe*`, `setfield`, `f`, `m`, `!callbacks disable*`, `!minifilter disable*`, and raw `kd` wrappers around write-like commands are blocked from `ai run`. `ai write` (or `ai write <index>`) prints a write preview with target class, byte count, backup/read-current command, restore-current command for small ranges, verification command, and safe read-only preflight output. `ai write confirm` (or `ai write <index> confirm`) re-runs the backup read, dispatches the write-like command, re-runs the verification command, and prints a deterministic before/after stdout/stderr diff for the verification command. Disable/enable goals such as `ai disable wdfilter minifilter` stage a write plan and do not mutate until that confirm path; a surface is required so `ai disable wdfilter` cannot silently disable every callback type. The same confirm path covers `ai enable ppl`, `ai load byovd fixture`, `ai reset timeline`, `ai start ti`, and exact write-like lines such as `ai dump-pe nt .\\ntos-live.exe`. Session commands (`write on`, `log enable`, `mcp on`, `probe load`, `backend`) are not staged. `ai transcript <path>` enables JSONL capture of AI events and command stdout/stderr, including backend mode, command class, write-like classification, stdout/stderr character counts, deterministic output summary, raw stdout/stderr, and keep-running state. `ai transcript max <bytes>` rotates long transcript files, `ai transcript redact on` redacts long hex addresses, `sk-...` style tokens, and HTTP `Bearer`/`Authorization` credentials from captured stdout/stderr, and `ai audit <path>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher. `ai report <path>` exports a Markdown summary of the current AI session, transcript settings, write-audit path, and plan.
 
 ## DbgEng Backend
 
