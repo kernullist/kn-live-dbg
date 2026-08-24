@@ -28182,7 +28182,8 @@ static void PrintAiHelp()
     std::wcout << L"  ai chat <goal> skips playbooks, process shortcuts, and command-recommendation plans.\n";
     std::wcout << L"  Exact read-only command lines after ai or ai chat still run as evidence.\n";
     std::wcout << L"  Cheap tools run after a short preview. hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
-    std::wcout << L"  After tools run, AI explains the captured output. Conceptual why/what after ai <goal> stay advisory.\n";
+    std::wcout << L"  After tools run, AI explains the captured output. Empty stderr is omitted so reports do not end with a stderr line.\n";
+    std::wcout << L"  Conceptual why/what after ai <goal> stay advisory.\n";
     std::wcout << L"  ai chat still tries catalog tools for why/what. dump-kernel and dump-live are not available through AI.\n";
     std::wcout << L"  ai plan remains an explicit command-proposal override. Default ai <goal> no longer auto-builds that plan.\n";
     std::wcout << L"  Prefer ai use <preset|model>. .env is loaded only from the EXE directory.\n";
@@ -28313,6 +28314,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  Local playbooks, process-field shortcuts, and command-recommendation plans are not used.\n";
         std::wcout << L"  Exact read-only command lines still run as evidence and are explained.\n";
         std::wcout << L"  Cheap tools preview, run, then AI explains the captured output.\n";
+        std::wcout << L"  Empty command stderr is omitted from the explanation prompt and trailing empty-stderr echo is stripped.\n";
         std::wcout << L"  hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
         std::wcout << L"  disable/enable and exact write-like lines still stage a write plan.\n";
         std::wcout << L"  dump-kernel and dump-live are not available through ai chat.\n";
@@ -28339,6 +28341,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai analyze !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
         std::wcout << L"  ai analyze !callbacks [scope] /module <module>\n";
         std::wcout << L"  Runs a read-only evidence command and asks AI for an analysis report.\n";
+        std::wcout << L"  Empty command stderr is omitted from the explanation prompt and trailing empty-stderr echo is stripped.\n";
         std::wcout << L"  Callback analysis remains available for compatibility.\n";
     }
     else if (name == L"explain")
@@ -28352,6 +28355,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai explain !module integrity all /summary\n";
         std::wcout << L"  ai explain !wnf data <state-name-hash|entry-address>\n";
         std::wcout << L"  Runs a read-only evidence command and asks AI to explain fields, callbacks, or disassembly.\n";
+        std::wcout << L"  Empty command stderr is omitted from the explanation prompt and trailing empty-stderr echo is stripped.\n";
     }
     else if (name == L"annotate")
     {
@@ -28897,6 +28901,13 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
 static bool ValidateAiPlanCommand(const AiCommandProposal& item, std::wstring* reason);
 static bool IsWriteLikeCommandLine(const std::wstring& line);
 static bool IsBlockedAiRunCommand(const std::wstring& line, std::wstring* reason);
+static std::wstring BuildCommandOutputSummary(const CommandExecutionResult& result);
+static std::wstring BuildAiEvidencePrompt(
+    const std::wstring& title,
+    const std::wstring& instructions,
+    const std::wstring& commandLine,
+    const CommandExecutionResult& result);
+static void StripTrailingEmptyStderrEcho(std::wstring* text);
 static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge);
 static std::wstring BuildMcpClaudeCodeHttpServerJson(const std::wstring& url);
 static std::wstring BuildMcpCursorHttpJson(const std::wstring& url);
@@ -30024,6 +30035,56 @@ static int RunConsoleSurfaceSelfTest()
                 AiProviderRuntime::ParseAssistantSelfTest(),
                 L"ai-provider-parse-assistant-self-test");
             {
+                CommandExecutionResult emptyErr = {};
+                emptyErr.Output = L"callback count=3\n";
+                const std::wstring quietSummary = BuildCommandOutputSummary(emptyErr);
+                const std::wstring quietPrompt = BuildAiEvidencePrompt(
+                    L"Explain this output.",
+                    L"Keep it short.",
+                    L"!callbacks",
+                    emptyErr);
+                CommandExecutionResult withErr = emptyErr;
+                withErr.Error = L"symbol lookup failed\n";
+                const std::wstring noisyPrompt = BuildAiEvidencePrompt(
+                    L"Explain this output.",
+                    L"Keep it short.",
+                    L"!callbacks",
+                    withErr);
+                std::wstring echoed = L"## Follow-up\n- run !ssdt\n\nstderr: chars=0 lines=0\n";
+                StripTrailingEmptyStderrEcho(&echoed);
+                std::wstring fenced = L"## Follow-up\n- run !ssdt\n\nStderr:\n```text\n\n```\n";
+                StripTrailingEmptyStderrEcho(&fenced);
+                std::wstring wrapped = L"## Follow-up\n- run !ssdt\n\n```text\nstderr\n```\n";
+                StripTrailingEmptyStderrEcho(&wrapped);
+                std::wstring twice = L"## Follow-up\n- run !ssdt\n\nstderr: chars=0 lines=0\n\nStderr:\n";
+                StripTrailingEmptyStderrEcho(&twice);
+                std::wstring keepFence = L"## Follow-up\n```text\n!ssdt\n```\n";
+                StripTrailingEmptyStderrEcho(&keepFence);
+                std::wstring keep = L"## Follow-up\n- inspect the ETW stderr path\n";
+                StripTrailingEmptyStderrEcho(&keep);
+                std::wstring none = L"## Follow-up\n- run !ssdt\n\nno stderr.\n";
+                StripTrailingEmptyStderrEcho(&none);
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    quietSummary.find(L"stdout:") != std::wstring::npos &&
+                        quietSummary.find(L"stderr") == std::wstring::npos &&
+                        quietPrompt.find(L"Stderr:") == std::wstring::npos &&
+                        quietPrompt.find(L"stderr: chars=") == std::wstring::npos &&
+                        noisyPrompt.find(L"Stderr:") != std::wstring::npos &&
+                        noisyPrompt.find(L"symbol lookup failed") != std::wstring::npos &&
+                        echoed.find(L"stderr") == std::wstring::npos &&
+                        echoed.find(L"run !ssdt") != std::wstring::npos &&
+                        fenced.find(L"Stderr") == std::wstring::npos &&
+                        wrapped.find(L"```") == std::wstring::npos &&
+                        wrapped.find(L"run !ssdt") != std::wstring::npos &&
+                        twice.find(L"stderr") == std::wstring::npos &&
+                        keepFence.find(L"!ssdt") != std::wstring::npos &&
+                        keepFence.find(L"```") != std::wstring::npos &&
+                        keep.find(L"ETW stderr path") != std::wstring::npos &&
+                        none.find(L"no stderr") == std::wstring::npos,
+                    L"ai-evidence-prompt-omits-empty-stderr");
+            }
+            {
                 const std::wstring aiHelp = CaptureDetailedHelpOutput({L"help", L"ai"}, 1);
                 CheckConsoleSurfaceSelfTest(
                     &context,
@@ -30033,6 +30094,7 @@ static int RunConsoleSurfaceSelfTest()
                         aiHelp.find(L"ai chat") != std::wstring::npos &&
                         aiHelp.find(L"skips playbooks") != std::wstring::npos &&
                         aiHelp.find(L"dump-kernel and dump-live are not available") != std::wstring::npos &&
+                        aiHelp.find(L"Empty stderr is omitted") != std::wstring::npos &&
                         aiHelp.find(L"ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4") != std::wstring::npos &&
                         aiHelp.find(L"no longer auto-builds") != std::wstring::npos,
                     L"ai-help-covers-go-evidence-and-local-first");
@@ -30072,6 +30134,7 @@ static int RunConsoleSurfaceSelfTest()
                         chatHelp.find(L"evidence") != std::wstring::npos &&
                         chatHelp.find(L"write plan") != std::wstring::npos &&
                         chatHelp.find(L"dump-kernel") != std::wstring::npos &&
+                        chatHelp.find(L"Empty command stderr") != std::wstring::npos &&
                         chatHelp.find(L"ai chat object callbacks") != std::wstring::npos &&
                         chatHelp.find(L"ai use cloud") != std::wstring::npos,
                     L"ai-chat-subcommand-help");
@@ -31450,12 +31513,20 @@ static std::wstring BuildTextOutputSummary(const std::wstring& label, const std:
     return stream.str();
 }
 
+static bool IsBlankWideText(const std::wstring& text)
+{
+    return TrimWhitespace(text).empty();
+}
+
 static std::wstring BuildCommandOutputSummary(const CommandExecutionResult& result)
 {
     std::wstringstream stream;
 
-    stream << BuildTextOutputSummary(L"stdout", result.Output) << L"\n";
-    stream << BuildTextOutputSummary(L"stderr", result.Error);
+    stream << BuildTextOutputSummary(L"stdout", result.Output);
+    if (!IsBlankWideText(result.Error))
+    {
+        stream << L"\n" << BuildTextOutputSummary(L"stderr", result.Error);
+    }
 
     return stream.str();
 }
@@ -35762,6 +35833,234 @@ static void PrintWriteVerificationDiff(
     } while (false);
 }
 
+static std::wstring StripLineEndingCr(const std::wstring& line)
+{
+    std::wstring out = line;
+    if (!out.empty() && out.back() == L'\r')
+    {
+        out.pop_back();
+    }
+    return out;
+}
+
+static bool IsMarkdownFenceLine(const std::wstring& line)
+{
+    const std::wstring trimmed = TrimWhitespace(StripLineEndingCr(line));
+    return trimmed.size() >= 3 && trimmed.compare(0, 3, L"```") == 0;
+}
+
+static std::wstring NormalizeEchoHeading(const std::wstring& line)
+{
+    std::wstring text = TrimWhitespace(StripLineEndingCr(line));
+    while (!text.empty() && text[0] == L'#')
+    {
+        text.erase(text.begin());
+    }
+    text = TrimWhitespace(text);
+    while (text.size() >= 2 && text.front() == L'*' && text.back() == L'*')
+    {
+        text = TrimWhitespace(text.substr(1, text.size() - 2));
+    }
+    if (text.size() >= 2 && text.front() == L'`' && text.back() == L'`')
+    {
+        text = TrimWhitespace(text.substr(1, text.size() - 2));
+    }
+    return ToLower(text);
+}
+
+static bool IsEmptyStderrRemainder(const std::wstring& rest)
+{
+    bool empty = false;
+    do
+    {
+        std::wstring text = TrimWhitespace(rest);
+        while (!text.empty() &&
+               (text.back() == L'.' || text.back() == L':' || text.back() == L'!'))
+        {
+            text.pop_back();
+            text = TrimWhitespace(text);
+        }
+        if (text.empty() ||
+            text == L"none" ||
+            text == L"n/a" ||
+            text == L"na" ||
+            text == L"empty" ||
+            text == L"(empty)" ||
+            text == L"(none)" ||
+            text == L"-" ||
+            text == L"is empty" ||
+            text == L"was empty" ||
+            text == L"not present" ||
+            text == L"absent" ||
+            text.find(L"\xC5C6\xC74C") != std::wstring::npos)
+        {
+            empty = true;
+            break;
+        }
+        if (text.find(L"chars=0") != std::wstring::npos &&
+            text.find(L"lines=0") != std::wstring::npos &&
+            text.find(L"first=") == std::wstring::npos)
+        {
+            empty = true;
+        }
+    } while (false);
+
+    return empty;
+}
+
+static bool IsEmptyStderrEchoLine(const std::wstring& line)
+{
+    bool match = false;
+    do
+    {
+        std::wstring text = NormalizeEchoHeading(line);
+        while (!text.empty() &&
+               (text.back() == L'.' || text.back() == L':' || text.back() == L'!'))
+        {
+            text.pop_back();
+            text = TrimWhitespace(text);
+        }
+        if (text.empty())
+        {
+            break;
+        }
+        if (text == L"stderr" ||
+            text == L"no stderr" ||
+            text == L"empty stderr")
+        {
+            match = true;
+            break;
+        }
+        if (text.rfind(L"stderr", 0) == 0)
+        {
+            std::wstring rest = TrimWhitespace(text.substr(6));
+            if (!rest.empty() && rest[0] == L':')
+            {
+                rest = TrimWhitespace(rest.substr(1));
+            }
+            if (IsEmptyStderrRemainder(rest))
+            {
+                match = true;
+            }
+        }
+    } while (false);
+
+    return match;
+}
+
+static size_t CountMarkdownFenceLines(
+    const std::vector<std::wstring>& lines,
+    size_t begin,
+    size_t end)
+{
+    size_t count = 0;
+    if (end > lines.size())
+    {
+        end = lines.size();
+    }
+    for (size_t i = begin; i < end; ++i)
+    {
+        if (IsMarkdownFenceLine(lines[i]))
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static void StripTrailingEmptyStderrEcho(std::wstring* text)
+{
+    do
+    {
+        if (text == nullptr || text->empty())
+        {
+            break;
+        }
+
+        std::vector<std::wstring> lines;
+        {
+            std::wistringstream stream(*text);
+            std::wstring line;
+            while (std::getline(stream, line))
+            {
+                lines.push_back(StripLineEndingCr(line));
+            }
+        }
+        if (lines.empty())
+        {
+            break;
+        }
+
+        bool stripped = false;
+        for (;;)
+        {
+            while (!lines.empty() && TrimWhitespace(lines.back()).empty())
+            {
+                lines.pop_back();
+            }
+            if (lines.empty())
+            {
+                break;
+            }
+
+            size_t content = lines.size();
+            while (content > 0 &&
+                   (IsMarkdownFenceLine(lines[content - 1]) ||
+                    TrimWhitespace(lines[content - 1]).empty()))
+            {
+                --content;
+            }
+            if (content == 0 || !IsEmptyStderrEchoLine(lines[content - 1]))
+            {
+                break;
+            }
+
+            size_t start = content - 1;
+            if ((CountMarkdownFenceLines(lines, 0, start) % 2) == 1)
+            {
+                size_t opener = start;
+                while (opener > 0)
+                {
+                    --opener;
+                    if (IsMarkdownFenceLine(lines[opener]))
+                    {
+                        start = opener;
+                        break;
+                    }
+                }
+            }
+            lines.resize(start);
+            stripped = true;
+        }
+
+        if (!stripped)
+        {
+            break;
+        }
+
+        std::wstringstream out;
+        bool wrote = false;
+        for (const std::wstring& line : lines)
+        {
+            if (!wrote && TrimWhitespace(line).empty())
+            {
+                continue;
+            }
+            if (wrote)
+            {
+                out << L"\n";
+            }
+            out << line;
+            wrote = true;
+        }
+        if (wrote)
+        {
+            out << L"\n";
+        }
+        *text = out.str();
+    } while (false);
+}
+
 static std::wstring BuildAiEvidencePrompt(
     const std::wstring& title,
     const std::wstring& instructions,
@@ -35776,7 +36075,8 @@ static std::wstring BuildAiEvidencePrompt(
     stream << L"## Findings\n";
     stream << L"## Anomalies\n";
     stream << L"## Follow-up\n";
-    stream << L"Do not restate these instructions, debate language, or narrate your plan.\n\n";
+    stream << L"Do not restate these instructions, debate language, or narrate your plan.\n";
+    stream << L"Do not copy stdout/stderr labels. If no error-stream block is included below, do not mention one.\n\n";
     stream << L"Command:\n";
     stream << commandLine << L"\n\n";
     stream << L"Deterministic output summary:\n```text\n";
@@ -35784,10 +36084,13 @@ static std::wstring BuildAiEvidencePrompt(
     stream << L"\n```\n\n";
     stream << L"Stdout:\n```text\n";
     stream << TruncateForAiPrompt(result.Output, 60000);
-    stream << L"\n```\n\n";
-    stream << L"Stderr:\n```text\n";
-    stream << TruncateForAiPrompt(result.Error, 12000);
     stream << L"\n```\n";
+    if (!IsBlankWideText(result.Error))
+    {
+        stream << L"\nStderr:\n```text\n";
+        stream << TruncateForAiPrompt(result.Error, 12000);
+        stream << L"\n```\n";
+    }
 
     return stream.str();
 }
@@ -35815,11 +36118,13 @@ static void CompleteAndPrintAiRequest(
         }
 
         WriteAiTranscriptEvent(aiState, eventName, L"request completed", L"");
-        if (!response.Text.empty())
+        std::wstring report = response.Text;
+        StripTrailingEmptyStderrEcho(&report);
+        if (!report.empty())
         {
             std::wcout << L"\n";
-            std::wcout << response.Text;
-            if (response.Text.back() != L'\n')
+            std::wcout << report;
+            if (report.back() != L'\n')
             {
                 std::wcout << L"\n";
             }
