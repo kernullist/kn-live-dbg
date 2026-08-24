@@ -19,12 +19,13 @@ The first integration layer is implemented as a user-mode `ai` command and `AiPr
 1. `ai <goal>` is the default operator entrypoint. Routing is local-first: exact read-only evidence commands such as `!callbacks`, `dt`, `!hiddenproc`, or `dump-analyze` run and are explained; command-recommendation requests still build a `kn-live-dbg.ai-plan.v2` command plan; known playbooks (callbacks, hidden processes, handles, leftover mapper layers, integrity, VBS, DMA, one-address inspect) and local process field queries run immediately; conceptual `what`/`why` questions stay advisory. Remaining goals ask the selected provider to pick tools from the shared `AiCapabilityCatalog` (`kn-live-dbg.ai-capability-plan.v1`). Cheap tools preview and run, then the model explains the captured output. `hunt.run`, `payload.scan`, `snapshot.capture`, and `kpage.list` with `deep=true` wait for `ai go` / `ai no`. Default `ai <goal>` no longer auto-builds a v2 command plan; use `ai plan` when you want command proposals. Korean and English goals are both accepted. The catalog includes the P0-P2 scanners (`hiddenproc.list`, `handles.list`, `driver.object`, `dump.analyze`, and the rest) plus `assistant.answer`.
 2. `ai status` reports ready/blocked health, the selected preset/model, remote policy, credential source, loaded `.env` path, and the next setup step. `ai config status` adds the verbose dump.
 3. Daily setup is `ai use <preset|model>`, `ai models [query|refresh]`, `ai test`, and `ai save`. `ai config ...` remains the advanced provider surface (`status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`). Presets are `cloud` (OpenRouter + Claude Opus 5), `cheap` (gpt-oss-120b), `deepseek`, `private` (Codex CLI), `chatgpt`, and `off`. Tab completion includes curated frontier OpenRouter IDs as of 2026-08-24; `ai models refresh` fetches the live OpenRouter catalog.
-4. `ai plan <prompt>` remains an explicit override that asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
-5. `ai explain <read-only-command...>` remains an explicit override for evidence analysis. The same path is also reached implicitly when the operator types `ai !callbacks ...`, `ai dt ...`, `ai uf ...`, `ai !ci options`, or another recognized read-only evidence command.
-6. `ai show` prints session hints, a pending expensive tool plan, and the loaded command plan. `ai show evidence` reprints the last captured tool or evidence output. `ai go` / `ai no` confirm or cancel a pending expensive tool plan.
-7. `ai run [index|all]` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands. If the plan has one read-only command, `ai run` with no index runs it. A single write-like plan item is refused and the operator is sent to `ai write confirm`.
-8. `ai write [index] [confirm]` provides an explicit confirmation path for planned write-like commands. If the plan has one write, `ai write` previews it and `ai write confirm` executes it. `[1]` in the listing is that index, not a menu. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
-9. `ai report <path>` exports a Markdown report with session context, provider status, transcript settings, write-audit path, the parsed plan, and the raw AI plan response.
+4. `ai chat <goal>` is the explicit natural-language tool picker. It skips local playbooks, process-field shortcuts, conceptual `what`/`why` short-circuits, and command-recommendation plans. Exact read-only command lines after `ai chat` still run as evidence. The selected provider picks tools from `AiCapabilityCatalog`. Cheap tools preview and run; expensive tools wait for `ai go`. Disable/enable and exact write-like lines still stage a write plan; session commands (`write`/`log`/`mcp`/`probe`/`backend`) and `dump-kernel`/`dump-live` are not staged. `ai ask` remains the compatibility free-form Q&A path that does not run catalog tools.
+5. `ai plan <prompt>` remains an explicit override that asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
+6. `ai explain <read-only-command...>` remains an explicit override for evidence analysis. The same path is also reached implicitly when the operator types `ai !callbacks ...`, `ai dt ...`, `ai uf ...`, `ai !ci options`, or another recognized read-only evidence command.
+7. `ai show` prints session hints, a pending expensive tool plan, and the loaded command plan. `ai show evidence` reprints the last captured tool or evidence output. `ai go` / `ai no` confirm or cancel a pending expensive tool plan.
+8. `ai run [index|all]` executes only planned commands that are not write-like, shutdown, unload, or nested AI commands. If the plan has one read-only command, `ai run` with no index runs it. A single write-like plan item is refused and the operator is sent to `ai write confirm`.
+9. `ai write [index] [confirm]` provides an explicit confirmation path for planned write-like commands. If the plan has one write, `ai write` previews it and `ai write confirm` executes it. `[1]` in the listing is that index, not a menu. Without `confirm`, it prints target classification, size, backup/read-current, restore-current for small ranges, translation, verification, purpose, risk, and confirmation syntax.
+10. `ai report <path>` exports a Markdown report with session context, provider status, transcript settings, write-audit path, the parsed plan, and the raw AI plan response.
 
 The older detailed forms remain accepted for compatibility: `ai providers`, `ai provider`, `ai policy`, `ai model`, `ai base-url`, `ai effort`, `ai auth`, `ai preview`, `ai ask`, `ai analyze !callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit`.
 
@@ -177,7 +178,7 @@ The main `ai help` output stays focused on the primary workflow. Detailed compat
 
 ## Operator Command Examples
 
-Default rule: prefer `ai <goal>` during normal use. Exact read-only command lines after `ai` are treated as evidence to run and explain. Known playbooks and process field queries run locally first. Cheap selected tools run after a preview and are explained. Expensive tools wait for `ai go`. Conceptual `what`/`why` questions stay advisory. Use `ai plan` only when you want a stored command proposal. Disable/enable goals and exact write-like commands do not run list playbooks and do not mutate immediately. They stage a write plan. If that plan has one write, `ai write` previews it and `ai write confirm` executes it (`write on` required). `[1]` in the listing is the plan index, not a menu. Use `ai write <index> confirm` when several writes are staged.
+Default rule: prefer `ai <goal>` during normal use. Exact read-only command lines after `ai` are treated as evidence to run and explain. Known playbooks and process field queries run locally first. Cheap selected tools run after a preview and are explained. Expensive tools wait for `ai go`. Conceptual `what`/`why` questions stay advisory. Use `ai chat <goal>` when the model should pick catalog tools without playbook shortcuts. Use `ai plan` only when you want a stored command proposal. Disable/enable goals and exact write-like commands do not run list playbooks and do not mutate immediately. They stage a write plan. If that plan has one write, `ai write` previews it and `ai write confirm` executes it (`write on` required). `[1]` in the listing is the plan index, not a menu. Use `ai write <index> confirm` when several writes are staged.
 
 Provider and session setup:
 
@@ -209,6 +210,9 @@ ai pid 1234 peb
 ai show parent process for pid 1234
 ai find process named game.exe
 ai describe eprocess 0xffffc10212345080
+ai chat object callbacks
+ai chat any inline ETW hook?
+ai chat WdFilter.sys DRIVER_OBJECT
 ai 숨은 프로세스 찾아줘
 ai 콜백 전수조사
 ai go
@@ -353,9 +357,11 @@ ai report .\reports\session-ai.md
 
 ### Natural-Language Operator Entry
 
-Implemented entrypoint: `ai <question>`.
+Implemented entrypoint: `ai <question>`. `ai chat <goal>` is the explicit catalog-tool path.
 
-The command now behaves like a small tool-using agent and intent router. The operator can usually type `ai <goal>` without knowing command names. Exact read-only commands are executed as evidence and explained. Known Korean/English playbooks and local process field queries run without a model round-trip. Generic playbooks are skipped when the goal already names a `.sys`/`.exe`/`.dll`/`.drv` file, so a prompt such as `WdFilter.sys object callbacks` stays on the tool planner with a module filter instead of running an unfiltered callback dump. They are also skipped for disable/enable goals, which become a write plan instead of a list. Examples:
+The command now behaves like a small tool-using agent and intent router. Use `ai chat <goal>` when the model should pick tools from `AiCapabilityCatalog` without local playbooks or process-field shortcuts. `ai chat object callbacks` and `ai chat 콜백 전수조사` go to the tool planner even though the same text after plain `ai` would run playbook `callbacks`. Exact read-only lines such as `ai chat !ssdt` still run as evidence. Disable/enable goals after `ai chat` still stage a write plan. `dump-kernel` / `dump-live` and session commands are refused or redirected, not staged. A selected provider is required (`ai use cloud`). Cheap tools preview and run; expensive tools wait for `ai go`. If the model returns `assistant.answer`, chat falls through to advisory Q&A.
+
+The operator can usually type `ai <goal>` without knowing command names. Exact read-only commands are executed as evidence and explained. Known Korean/English playbooks and local process field queries run without a model round-trip. Generic playbooks are skipped when the goal already names a `.sys`/`.exe`/`.dll`/`.drv` file, so a prompt such as `WdFilter.sys object callbacks` stays on the tool planner with a module filter instead of running an unfiltered callback dump. They are also skipped for disable/enable goals, which become a write plan instead of a list. Examples:
 
 - `ai disable wdfilter minifilter` -> `!minifilter disable-all wdfilter`
 - `ai disable wdfilter callbacks` -> `!callbacks disable-all wdfilter`

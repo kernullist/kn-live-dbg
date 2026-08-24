@@ -345,13 +345,17 @@ Implementation notes:
    keyword rules. Generic playbooks do not fire when the goal already names a
    `.sys`/`.exe`/`.dll`/`.drv` file, so prompts such as
    `ai WdFilter.sys object callbacks` stay on the tool planner instead of the
-   unfiltered callbacks playbook.
+   unfiltered callbacks playbook. `ai chat <goal>` is the explicit planner
+   path: it skips playbooks and process-field shortcuts. Exact read-only
+   command lines still run as evidence. `dump-kernel` / `dump-live` stay
+   blocked from AI.
 5. Use `assistant.answer` only when no local read-only tool fits.
 6. Confirm `hunt.run`, `payload.scan`, `snapshot.capture`, and `kpage.list`
    with `deep=true` before execution.
 7. Every `ai` subcommand supports `ai help <sub>` / `ai <sub> help` and Tab
-   completion. `ai explain|analyze|annotate <cmd> help` prints that command's
-   native help, and Tab after those verbs reuses the native completer.
+   completion, including `ai chat`. `ai explain|analyze|annotate <cmd> help`
+   prints that command's native help, and Tab after those verbs reuses the
+   native completer.
 8. Provider setup is a preset layer in `user/AiModelCatalog.cpp`: `ai use`,
    `ai models`, `ai test`, and `ai save`. Transports stay in `AiProviderRuntime`.
    OpenRouter defaults to `anthropic/claude-opus-5`. Tab completes curated

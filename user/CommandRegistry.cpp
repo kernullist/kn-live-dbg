@@ -462,7 +462,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"reload", L".reload", L"symbols", L"reload kernel modules and symbols", CommandSupport::Alias),
         Make(L"modules", L"lm", L"symbols", L"list loaded modules", CommandSupport::Alias),
         Make(L"addr", L"ln", L"symbols", L"resolve address or symbol", CommandSupport::Alias),
-        Make(L"ai", L"ai", L"ai", L"intent router: local tools, playbooks, evidence analysis, and provider presets", CommandSupport::Native),
+        Make(L"ai", L"ai", L"ai", L"intent router: local tools, playbooks, ai chat, evidence analysis, and provider presets", CommandSupport::Native),
         Make(L"backend", L"backend", L"session", L"show or set native/dbgeng/auto backend mode", CommandSupport::Native),
 
         Make(L"drvstatus", L"drvstatus", L"session", L"show service, owner, handle, and write-gate state", CommandSupport::Native),

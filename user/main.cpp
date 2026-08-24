@@ -1863,7 +1863,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
     std::wcout << L"  timeline      !timeline | !timeline dashboard | !timeline help advanced\n";
-    std::wcout << L"  ai            ai a.exe eprocess | ai explain !callbacks all | ai plan check VBS status\n";
+    std::wcout << L"  ai            ai chat object callbacks | ai a.exe eprocess | ai explain !callbacks all\n";
     std::wcout << L"\n";
 
     CommandRegistry::PrintSummary(includeDbgEng);
@@ -3961,6 +3961,7 @@ static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidate
         L"auth",
         L"preview",
         L"ask",
+        L"chat",
         L"plan",
         L"go",
         L"no",
@@ -4193,6 +4194,16 @@ static void AddAiCompletionCandidates(
                 L"medium",
                 L"high",
                 L"xhigh",
+                L"help"
+            };
+
+            AddCompletionCandidates(candidates, values);
+        }
+        else if (action == L"chat")
+        {
+            static const wchar_t* values[] =
+            {
+                L"/verbose",
                 L"help"
             };
 
@@ -28126,6 +28137,7 @@ static void PrintAiHelp()
     std::wcout << L"  go           run a pending expensive local-tool plan\n";
     std::wcout << L"  no           cancel a pending expensive local-tool plan\n";
     std::wcout << L"  show         show the loaded command plan, pending tools, or last evidence\n";
+    std::wcout << L"  chat         natural-language tool picker; the model selects catalog tools\n";
     std::wcout << L"  plan         explicitly ask AI to produce executable command proposals\n";
     std::wcout << L"  run          execute planned read-only commands\n";
     std::wcout << L"  write        preview or confirm a planned write-like command\n";
@@ -28136,6 +28148,8 @@ static void PrintAiHelp()
     std::wcout << L"examples:\n";
     std::wcout << L"  ai a.exe pid\n";
     std::wcout << L"  ai a.exe eprocess\n";
+    std::wcout << L"  ai chat object callbacks\n";
+    std::wcout << L"  ai chat any inline ETW hook?\n";
     std::wcout << L"  ai WdFilter.sys object callbacks\n";
     std::wcout << L"  ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4 \xCC3E\xC544\xC918\n";
     std::wcout << L"  ai \xCF5C\xBC31 \xC804\xC218\xC870\xC0AC\n";
@@ -28165,13 +28179,15 @@ static void PrintAiHelp()
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Prefer ai <goal>. Local process queries and playbooks run first; the model only picks tools.\n";
-    std::wcout << L"  Exact read-only commands such as callbacks, dt, u, !ci, or !vbs are treated as evidence to explain.\n";
+    std::wcout << L"  ai chat <goal> skips playbooks, process shortcuts, and command-recommendation plans.\n";
+    std::wcout << L"  Exact read-only command lines after ai or ai chat still run as evidence.\n";
     std::wcout << L"  Cheap tools run after a short preview. hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
-    std::wcout << L"  After tools run, AI explains the captured output. Conceptual why/what questions stay advisory.\n";
+    std::wcout << L"  After tools run, AI explains the captured output. Conceptual why/what after ai <goal> stay advisory.\n";
+    std::wcout << L"  ai chat still tries catalog tools for why/what. dump-kernel and dump-live are not available through AI.\n";
     std::wcout << L"  ai plan remains an explicit command-proposal override. Default ai <goal> no longer auto-builds that plan.\n";
     std::wcout << L"  Prefer ai use <preset|model>. .env is loaded only from the EXE directory.\n";
     std::wcout << L"  ai run executes read-only validated plan commands; write-like commands require ai write confirm.\n";
-      std::wcout << L"  disable/enable callback or minifilter goals need a surface (minifilter, callbacks, object, process, thread, registry, imageload).\n";
+    std::wcout << L"  disable/enable callback or minifilter goals need a surface (minifilter, callbacks, object, process, thread, registry, imageload).\n";
     std::wcout << L"  Other staged writes include ai enable ppl, ai load byovd fixture, ai reset timeline, ai start ti, and ai dump-pe <module> <path>.\n";
     std::wcout << L"  They become a write plan and do not run until ai write confirm (or ai write 1 confirm). Needs write on.\n";
     std::wcout << L"  Exact write commands such as ai !callbacks disable-all WdFilter also stage a write plan; flags such as /pre are kept.\n";
@@ -28289,6 +28305,27 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  preview prints the request locally; ask sends it to the selected provider.\n";
         std::wcout << L"  If the prompt is literally help, use ai ask \"help\" or ai help ask to avoid ambiguity.\n";
     }
+    else if (name == L"chat")
+    {
+        std::wcout << L"ai chat:\n";
+        std::wcout << L"  ai chat <goal> [/verbose]\n";
+        std::wcout << L"  Send a Korean or English request to the catalog tool planner.\n";
+        std::wcout << L"  Local playbooks, process-field shortcuts, and command-recommendation plans are not used.\n";
+        std::wcout << L"  Exact read-only command lines still run as evidence and are explained.\n";
+        std::wcout << L"  Cheap tools preview, run, then AI explains the captured output.\n";
+        std::wcout << L"  hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
+        std::wcout << L"  disable/enable and exact write-like lines still stage a write plan.\n";
+        std::wcout << L"  dump-kernel and dump-live are not available through ai chat.\n";
+        std::wcout << L"  write/log/mcp/probe/backend stay session commands; they are not staged.\n";
+        std::wcout << L"  Needs a selected provider. type ai use cloud first.\n";
+        std::wcout << L"  If the prompt is literally help, use ai chat \"help\" or ai help chat.\n";
+        std::wcout << L"  examples:\n";
+        std::wcout << L"    ai chat object callbacks\n";
+        std::wcout << L"    ai chat \xCF5C\xBC31 \xC804\xC218\xC870\xC0AC\n";
+        std::wcout << L"    ai chat any inline ETW hook?\n";
+        std::wcout << L"    ai chat WdFilter.sys DRIVER_OBJECT\n";
+        std::wcout << L"    ai chat leftover unbacked kernel hook targets\n";
+    }
     else if (name == L"plan")
     {
         std::wcout << L"ai plan:\n";
@@ -28347,7 +28384,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     {
         std::wcout << L"ai go:\n";
         std::wcout << L"  ai go\n";
-        std::wcout << L"  Run the pending expensive local-tool plan previewed by ai <goal>.\n";
+        std::wcout << L"  Run the pending expensive local-tool plan previewed by ai <goal> or ai chat.\n";
     }
     else if (name == L"no")
     {
@@ -28427,7 +28464,11 @@ static void PrintAiHelpFromArgs(const std::vector<std::wstring>& args, size_t fi
 
 static bool IsAiPromptPayloadAction(const std::wstring& action)
 {
-    return action == L"ask" || action == L"preview" || action == L"plan" || action == L"diagnose";
+    return action == L"ask" ||
+        action == L"preview" ||
+        action == L"plan" ||
+        action == L"diagnose" ||
+        action == L"chat";
 }
 
 static bool IsAiEvidenceNestedAction(const std::wstring& action)
@@ -29041,6 +29082,7 @@ static std::wstring FirstTokenMissingCompletionHint()
         {L"ai", L"no"},
         {L"ai", L"status"},
         {L"ai", L"show"},
+        {L"ai", L"chat"},
         {L"!ti", L"watch"},
         {L"!ti", L"recent"},
         {L"help", L"!ti", L"by"},
@@ -29942,10 +29984,14 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 aiList.find(L"usage:") != std::wstring::npos &&
                     aiList.find(L"playbook") != std::wstring::npos &&
+                    aiList.find(L"chat") != std::wstring::npos &&
                     aiList.find(L"config") != std::wstring::npos &&
                     aiList.find(L"go") != std::wstring::npos &&
                     aiList.find(L"no") != std::wstring::npos,
                 L"completion-listing-ai-actions");
+            CheckCompletionCandidate(&context, {L"ai"}, L"chat", L"ai-chat-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"chat"}, L"/verbose", L"ai-chat-verbose-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"chat"}, L"help", L"ai-chat-help-completion");
             CheckCompletionCandidate(&context, {L"ai"}, L"go", L"ai-go-completion");
             CheckCompletionCandidate(&context, {L"ai"}, L"no", L"ai-no-completion");
             CheckCompletionCandidate(&context, {L"ai"}, L"use", L"ai-use-completion");
@@ -29984,6 +30030,9 @@ static int RunConsoleSurfaceSelfTest()
                     aiHelp.find(L"ai go") != std::wstring::npos &&
                         aiHelp.find(L"ai show evidence") != std::wstring::npos &&
                         aiHelp.find(L"ai use cloud") != std::wstring::npos &&
+                        aiHelp.find(L"ai chat") != std::wstring::npos &&
+                        aiHelp.find(L"skips playbooks") != std::wstring::npos &&
+                        aiHelp.find(L"dump-kernel and dump-live are not available") != std::wstring::npos &&
                         aiHelp.find(L"ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4") != std::wstring::npos &&
                         aiHelp.find(L"no longer auto-builds") != std::wstring::npos,
                     L"ai-help-covers-go-evidence-and-local-first");
@@ -30015,11 +30064,29 @@ static int RunConsoleSurfaceSelfTest()
                             writeList.find(L"ai write") != std::wstring::npos,
                         L"ai-write-completion-listing");
                 }
+                const std::wstring chatHelp = CaptureDetailedHelpOutput({L"help", L"ai", L"chat"}, 1);
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    chatHelp.find(L"ai chat <goal>") != std::wstring::npos &&
+                        chatHelp.find(L"playbooks") != std::wstring::npos &&
+                        chatHelp.find(L"evidence") != std::wstring::npos &&
+                        chatHelp.find(L"write plan") != std::wstring::npos &&
+                        chatHelp.find(L"dump-kernel") != std::wstring::npos &&
+                        chatHelp.find(L"ai chat object callbacks") != std::wstring::npos &&
+                        chatHelp.find(L"ai use cloud") != std::wstring::npos,
+                    L"ai-chat-subcommand-help");
+                const std::wstring suffixChatHelp = CaptureDetailedHelpOutput({L"ai", L"chat", L"help"}, 0);
+                CheckConsoleSurfaceSelfTest(
+                    &context,
+                    suffixChatHelp.find(L"ai chat <goal>") != std::wstring::npos &&
+                        suffixChatHelp.find(L"playbooks") != std::wstring::npos,
+                    L"ai-chat-suffix-help");
                 const std::wstring goHelp = CaptureDetailedHelpOutput({L"help", L"ai", L"go"}, 1);
                 CheckConsoleSurfaceSelfTest(
                     &context,
                     goHelp.find(L"ai go") != std::wstring::npos &&
-                        goHelp.find(L"pending expensive") != std::wstring::npos,
+                        goHelp.find(L"pending expensive") != std::wstring::npos &&
+                        goHelp.find(L"ai chat") != std::wstring::npos,
                     L"ai-go-subcommand-help");
                 const std::wstring suffixGoHelp = CaptureDetailedHelpOutput({L"ai", L"go", L"help"}, 0);
                 CheckConsoleSurfaceSelfTest(
@@ -47331,6 +47398,10 @@ static bool InstallAiWritePlan(
     return ok;
 }
 
+static void PrintAiMutationGoalExamples();
+static bool AiMutationErrorNeedsGoalExamples(const std::wstring& error);
+static bool IsAiBlockedFullDumpCommandLine(const std::wstring& query);
+
 static void HandleAiFreeFormCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -47404,6 +47475,12 @@ static void HandleAiFreeFormCommand(
             break;
         }
 
+        if (IsAiBlockedFullDumpCommandLine(query))
+        {
+            std::wcerr << L"ai: full-memory dumps are not available through AI. type dump-kernel or dump-live directly.\n";
+            break;
+        }
+
         if (IsAiCommandRecommendationQuery(query))
         {
             std::wcout << L"ai auto: command recommendation request; building command plan\n";
@@ -47454,18 +47531,10 @@ static void HandleAiFreeFormCommand(
             else
             {
                 std::wcerr << L"ai mutation goal failed: " << mutationError << L"\n";
-                std::wcout << L"examples:\n";
-                std::wcout << L"  ai disable wdfilter minifilter\n";
-                std::wcout << L"  ai disable wdfilter callbacks\n";
-                std::wcout << L"  ai disable wdfilter object\n";
-                std::wcout << L"  ai disable wdfilter process\n";
-                std::wcout << L"  ai enable ppl\n";
-                std::wcout << L"  ai load byovd fixture\n";
-                std::wcout << L"  ai reset timeline\n";
-                std::wcout << L"  ai start ti\n";
-                std::wcout << L"  ai !minifilter disable-all WdFilter /pre\n";
-                std::wcout << L"  ai dump-pe nt .\\ntos-live.exe\n";
-                std::wcout << L"then: write on, ai write confirm\n";
+                if (AiMutationErrorNeedsGoalExamples(mutationError))
+                {
+                    PrintAiMutationGoalExamples();
+                }
             }
             break;
         }
@@ -47552,6 +47621,195 @@ static void HandleAiFreeFormCommand(
         request.System = BuildAiSystemPrompt(state, symbols);
         request.Prompt = query;
         CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
+    } while (false);
+}
+
+static void PrintAiMutationGoalExamples()
+{
+    std::wcout << L"examples:\n";
+    std::wcout << L"  ai disable wdfilter minifilter\n";
+    std::wcout << L"  ai disable wdfilter callbacks\n";
+    std::wcout << L"  ai disable wdfilter object\n";
+    std::wcout << L"  ai disable wdfilter process\n";
+    std::wcout << L"  ai enable ppl\n";
+    std::wcout << L"  ai load byovd fixture\n";
+    std::wcout << L"  ai reset timeline\n";
+    std::wcout << L"  ai start ti\n";
+    std::wcout << L"  ai !minifilter disable-all WdFilter /pre\n";
+    std::wcout << L"  ai dump-pe nt .\\ntos-live.exe\n";
+    std::wcout << L"then: write on, ai write confirm\n";
+}
+
+static bool AiMutationErrorNeedsGoalExamples(const std::wstring& error)
+{
+    return error.find(L"not an ai write plan") == std::wstring::npos;
+}
+
+static bool IsAiBlockedFullDumpCommandLine(const std::wstring& query)
+{
+    std::vector<std::wstring> args = Split(query);
+    if (args.empty())
+    {
+        return false;
+    }
+
+    const std::wstring command = NormalizeInputCommand(args[0]);
+    return command == L"dump-kernel" || command == L"dump-live";
+}
+
+static void HandleAiChatCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    do
+    {
+        std::wstring query = JoinArgs(args, 2);
+        if (TrimWhitespace(query).empty())
+        {
+            PrintAiSubcommandHelp(L"chat");
+            break;
+        }
+
+        bool verbose = false;
+        StripAiGoalOptions(&query, &verbose);
+        query = ApplyAiSessionContext(
+            query,
+            aiState.LastPid,
+            aiState.LastImage,
+            aiState.LastAddress,
+            aiState.LastDumpPath);
+        query = TrimWhitespace(query);
+        if (query.empty() || IsHelpToken(query))
+        {
+            PrintAiSubcommandHelp(L"chat");
+            break;
+        }
+
+        if (IsAiBlockedFullDumpCommandLine(query))
+        {
+            std::wcerr << L"ai chat: full-memory dumps are not available through AI. type dump-kernel or dump-live directly.\n";
+            break;
+        }
+
+        std::wstring implicitEvidenceCommand;
+        if (TryBuildImplicitAiEvidenceCommand(query, &implicitEvidenceCommand))
+        {
+            if (IsWriteLikeCommandLine(implicitEvidenceCommand))
+            {
+                std::vector<std::wstring> queryArgs = Split(query);
+                const std::wstring first = queryArgs.empty() ? L"" : ToLower(queryArgs[0]);
+                if (first == L"explain" ||
+                    first == L"analyze" ||
+                    first == L"interpret" ||
+                    first == L"annotate")
+                {
+                    std::wcerr << L"ai chat explain/analyze is read-only. stage the write with `ai "
+                               << implicitEvidenceCommand
+                               << L"` then `ai write confirm`.\n";
+                    break;
+                }
+            }
+            else
+            {
+                std::wcout << L"ai chat: exact read-only command run as evidence\n";
+                AiEvidenceAnalysisMetadata metadata = BuildAiEvidenceAnalysisMetadata(
+                    implicitEvidenceCommand,
+                    L"ai_chat_explain");
+                HandleAiEvidenceAnalysis(
+                    metadata.EventName,
+                    implicitEvidenceCommand,
+                    metadata.Title,
+                    metadata.Instructions,
+                    state,
+                    dbgeng,
+                    device,
+                    service,
+                    symbols,
+                    ai,
+                    aiState);
+                break;
+            }
+        }
+
+        if (IsWriteLikeCommandLine(query))
+        {
+            std::wstring writeError;
+            if (!InstallAiWritePlan(
+                    query,
+                    L"operator-specified write command from ai chat",
+                    L"Staged write command",
+                    aiState,
+                    &writeError))
+            {
+                std::wcerr << L"ai write plan failed: " << writeError << L"\n";
+            }
+            break;
+        }
+
+        if (AiQueryHasMutationIntent(query) && !IsAiConceptualQuery(query))
+        {
+            std::wstring mutationCommand;
+            std::wstring mutationPurpose;
+            std::wstring mutationError;
+            if (TryBuildAiMutationCommand(query, &mutationCommand, &mutationPurpose, &mutationError))
+            {
+                if (!InstallAiWritePlan(
+                        mutationCommand,
+                        mutationPurpose,
+                        L"Staged write command",
+                        aiState,
+                        &mutationError))
+                {
+                    std::wcerr << L"ai write plan failed: " << mutationError << L"\n";
+                }
+            }
+            else
+            {
+                std::wcerr << L"ai mutation goal failed: " << mutationError << L"\n";
+                if (AiMutationErrorNeedsGoalExamples(mutationError))
+                {
+                    PrintAiMutationGoalExamples();
+                }
+            }
+            break;
+        }
+
+        if (ToLower(ai.ProviderName()) == L"off")
+        {
+            std::wcout << L"ai chat needs a model. type ai use cloud.\n";
+            std::wcout << L"playbooks still run from ai <goal>, for example ai "
+                       << L"\xCF5C\xBC31 \xC804\xC218\xC870\xC0AC.\n";
+            break;
+        }
+
+        std::wcout << L"ai chat: model picks catalog tools (playbooks skipped)\n";
+        WriteAiTranscriptEvent(aiState, L"ai_chat", L"catalog tool planner", query);
+
+        AiCapabilityQueryResult capabilityResult = TryHandleAiCapabilityQuery(
+            query,
+            verbose,
+            state,
+            device,
+            symbols,
+            ai,
+            aiState);
+        if (capabilityResult == AiCapabilityQueryResult::Handled ||
+            capabilityResult == AiCapabilityQueryResult::Deferred ||
+            capabilityResult == AiCapabilityQueryResult::Failed)
+        {
+            break;
+        }
+
+        AiCompletionRequest request = {};
+        request.System = BuildAiSystemPrompt(state, symbols);
+        request.Prompt = query;
+        CompleteAndPrintAiRequest(L"ai_chat_ask", request, ai, aiState);
     } while (false);
 }
 
@@ -48040,6 +48298,10 @@ static void HandleAiCommand(
         else if (action == L"playbook")
         {
             HandleAiPlaybookCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
+        }
+        else if (action == L"chat")
+        {
+            HandleAiChatCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
         }
         else if (action == L"preview" || action == L"ask")
         {

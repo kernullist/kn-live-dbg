@@ -822,6 +822,7 @@ namespace
         { L"auth", L"ai auth", L"compatibility: show credential source" },
         { L"preview", L"ai preview <prompt>", L"compatibility: print the request locally" },
         { L"ask", L"ai ask <prompt>", L"compatibility: send a free-form request" },
+        { L"chat", L"ai chat <goal> [/verbose]", L"natural-language tool picker; skips playbooks" },
         { L"plan", L"ai plan <prompt>", L"build a validated command plan" },
         { L"go", L"ai go", L"run a pending expensive local-tool plan" },
         { L"no", L"ai no", L"cancel a pending expensive local-tool plan" },
@@ -989,6 +990,12 @@ namespace
         { L"run", L"ai playbook <name> run", L"load the playbook and execute it" },
         { L"dry-run", L"ai playbook <name> dry-run", L"load the playbook without executing" },
         { L"help", nullptr, L"show playbook run usage" },
+    };
+
+    const CompletionHint kAiChatTokens[] =
+    {
+        { L"/verbose", nullptr, L"print extra planner detail" },
+        { L"help", nullptr, L"show ai chat usage" },
     };
 
     const CompletionHint kAiProviderNameTokens[] =
@@ -1442,7 +1449,7 @@ namespace
 
     const CompletionScopeTable kAiScopes[] =
     {
-        SCOPE(L"", L"ai <goal> | ai <subcommand> ...", L"intent router: local tools, playbooks, and evidence analysis", kAiRootTokens),
+        SCOPE(L"", L"ai <goal> | ai chat <goal> | ai <subcommand> ...", L"intent router: local tools, playbooks, chat planner, and evidence analysis", kAiRootTokens),
         SCOPE(L"config", L"ai config [status|provider|policy|model|test|...]", L"advanced provider setup", kAiConfigTokens),
         SCOPE(L"config-provider", L"ai config provider <name|off>", L"select the AI provider", kAiProviderNameTokens),
         SCOPE(L"config-policy", L"ai config policy <allow-remote|local-only|status>", L"allow or block HTTP providers", kAiPolicyTokens),
@@ -1453,6 +1460,7 @@ namespace
         SCOPE(L"models", L"ai models [query|refresh]", L"list or search cloud models", kAiModelsTokens),
         SCOPE(L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver|hidden|...>", L"repeatable read-only plans", kAiPlaybookTokens),
         SCOPE(L"playbook-run", L"ai playbook <name> [run|dry-run]", L"execute or preview a playbook", kAiPlaybookRunTokens),
+        SCOPE(L"chat", L"ai chat <goal> [/verbose]", L"natural-language catalog tool picker", kAiChatTokens),
         SCOPE(L"show", L"ai show [plan|pending|evidence]", L"loaded plan, pending tools, or last evidence", kAiShowTokens),
         SCOPE(L"leaf", L"ai <subcommand> [help]", L"subcommand help", kHelpOnlyTokens),
         SCOPE(L"evidence", L"ai explain|analyze <read-only-command...>", L"run a command and explain or analyze the output", kAiEvidenceTokens),
@@ -1998,6 +2006,10 @@ namespace
             else if (first == L"annotate")
             {
                 scope = L"annotate";
+            }
+            else if (first == L"chat")
+            {
+                scope = L"chat";
             }
             else if (first == L"write")
             {
