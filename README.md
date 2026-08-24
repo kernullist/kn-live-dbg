@@ -52,7 +52,7 @@ kn-live-dbg/
 12. Routes stop-state, parser-heavy, extension, and meta commands through the DbgEng backend.
 13. Provides an optional DbgEng backend for raw WinDbg command execution against the local kernel target.
 14. Parses kernel PDB types to enumerate object-manager filters, registry callbacks, process/thread/image-load callbacks, and minifilter callbacks with function/module/context annotations.
-15. Provides an initial AI assistant provider layer for advisory command planning and result interpretation through Codex CLI, ChatGPT/Codex OAuth, DeepSeek, and OpenRouter.
+15. Provides an initial AI assistant provider layer for advisory command planning and result interpretation through Codex CLI, ChatGPT/Codex OAuth, DeepSeek, and OpenRouter. Daily setup is `ai use <preset|model>` / `ai models` / `ai test`; OpenRouter defaults to `anthropic/claude-opus-5`, Tab completes curated frontier ids, and `ai models refresh` fetches the live OpenRouter catalog.
 16. Enforces a single-controller device owner and exposes owner/write-mode state through `drvstatus`.
 17. Resolves process DTBs from `_EPROCESS.Pcb.DirectoryTableBase` and optional `UserDirectoryTableBase` for process-aware `vtop`, `d*`, and `e*` commands; native `e*` writes default to the System process context (`pid 4`).
 18. Detects active LA57 paging and reports whether translation used PML4 or PML5, including the physical address of each page-table entry that was walked.
@@ -232,7 +232,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. When more than one match remains, the prompt prints an annotated list instead of a bare name grid: the parent command's description and full usage line, then each remaining token with its own syntax and summary. Root listings with many matches stay one line per command (`name` + summary). Examples include `!callbacks <Tab>` for callback scopes plus `disable`/`enable`/`disable-all`/`enable-all`, `!callbacks disable <Tab>` for per-type scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `disable`, `enable`, `disable-all`, `enable-all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. When more than one match remains, the prompt prints an annotated list instead of a bare name grid: the parent command's description and full usage line, then each remaining token with its own syntax and summary. Root listings with many matches stay one line per command (`name` + summary). Examples include `!callbacks <Tab>` for callback scopes plus `disable`/`enable`/`disable-all`/`enable-all`, `!callbacks disable <Tab>` for per-type scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions including `use`/`models`/`save`/`test`, `ai use <Tab>` for presets and frontier OpenRouter model IDs, `ai models <Tab>` for `refresh` plus curated IDs, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `ai config model <Tab>` for the same model catalog, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `disable`, `enable`, `disable-all`, `enable-all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -357,6 +357,10 @@ set-ppl-antimalware [on|off|status]
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 ai <goal> [/verbose]
 ai status
+ai use <preset|model> [model]
+ai models [query|refresh]
+ai test [prompt]
+ai save
 ai config [status|providers|provider|policy|model|base-url|effort|auth|test]
 ai go
 ai no
@@ -390,7 +394,7 @@ Help syntax notes:
 - `nt!` is treated as the loaded kernel image for symbols and PDB type names.
 - `d*`, `e*`, and `vtop` support `/process <process-id>` for one command; `procctx <pid>` pins a default context.
 - Virtual `e*` writes default to System(pid 4) context for kernel addresses and temporarily restore read-only leaf PTE write bits after patching. Each write is verified by reading the bytes back before the PTE is restored, and writes through a read-only large-page (2 MB/1 GB) mapping are refused rather than flipping a shared parent entry's write bit.
-- API-key AI providers load `.env` only from the EXE directory; `ai run` remains read-only and `ai write <index> confirm` is required for write-like plans.
+- API-key AI providers load `.env` only from the EXE directory. Prefer `ai use cloud` / `ai models` / `ai test`; `ai run` remains read-only and `ai write <index> confirm` is required for write-like plans.
 
 Example:
 
@@ -494,8 +498,8 @@ knkd> !wnf decode 0x41c64e6da3bc0075
 knkd> !wnf instances
 knkd> !wnf instance 0xfffff80300000000
 knkd> !wnf data 0xfffff80300000000
-knkd> ai config provider openai-codex-cli
-knkd> ai config test
+knkd> ai use cloud
+knkd> ai test
 knkd> ai a.exe eprocess
 knkd> ai pid 1234 dtb
 knkd> ai !callbacks all WdFilter.sys
@@ -521,6 +525,10 @@ The `ai` command is an operator intent layer plus an advisory provider bridge. P
 ```text
 ai <goal> [/verbose]
 ai status
+ai use <preset|model> [model]
+ai models [query|refresh]
+ai test [prompt]
+ai save
 ai config [status]
 ai config providers
 ai config provider <openai-codex-cli|openai-codex-subscription|deepseek|openrouter|off>
@@ -543,6 +551,11 @@ ai report <path>
 Examples:
 
 ```text
+ai use cloud
+ai use grok
+ai models
+ai models refresh
+ai test
 ai a.exe pid
 ai a.exe eprocess
 ai a.exe process eprocess info
@@ -561,12 +574,25 @@ ai !ci options
 
 See `docs/AI_ASSISTED_WORKFLOWS.md` for the full operator command example catalog, including process, callback, VBS/HVCI/CI, module integrity, driver integrity, WFP/ALPC, VAD/thread, ETW/NMI/pool/WNF/TI, auto-plan, advisory, and explicit override examples.
 
-Provider configuration is loaded from `.env` beside `KnLiveDbg.exe` and can be overridden by real process environment variables. Copy `.env.example` to the EXE directory as `.env` and fill in only the provider you want to use:
+Provider configuration is loaded from `.env` beside `KnLiveDbg.exe` only. Repo-root and cwd `.env` files are ignored. Real process environment variables override `.env` values. Copy `.env.example` to the EXE directory as `.env` and fill in the API key. Daily setup:
+
+1. `ai use cloud` -- OpenRouter + `anthropic/claude-opus-5` (frontier default as of 2026-08-24).
+2. `ai use cheap` -- OpenRouter + `openai/gpt-oss-120b`.
+3. `ai use grok` / `opus` / `gpt` -- aliases for current OpenRouter frontier ids (`x-ai/grok-4.6`, `anthropic/claude-opus-5`, `openai/gpt-5.6-sol`).
+4. `ai use private` -- local `codex exec`; this process does not make HTTP model calls.
+5. `ai use chatgpt` -- ChatGPT/Codex OAuth. This is not the same as the OpenRouter alias `gpt-5.5`.
+6. `ai models` lists presets and the curated catalog. `ai models <query>` searches ids/names. `ai models refresh` fetches the live OpenRouter catalog into a process cache and adds top hits to Tab.
+7. `ai test` smoke-checks the selected provider/model. `ai save` writes provider/model/policy without changing them.
+8. `ai use` / `ai save` / `ai config provider|model|policy` merge those three keys into the EXE-dir `.env` through an atomic `.env.tmp` replace. API keys, `BASE_URL`, effort, and timeout are left untouched. `off` is stored as `KNLIVEDBG_AI_PROVIDER=off` with an empty model so a previous model cannot return.
+
+`ai use` accepts one or two tokens. `ai use cloud x-ai/grok-4.6` keeps OpenRouter and overrides the model. Mixing providers (`ai use cloud deepseek-chat`, `ai use deepseek grok`) is rejected. Re-selecting the same provider does not reset a custom base URL. Tab on `ai use` / `ai config model` completes presets, aliases, and curated IDs; after `ai models refresh` it also completes live OpenRouter ids. Resolve order is preset, alias, exact id, unique tail (`gpt-5.6-sol` does not pick `...-sol-pro`), then unique substring.
+
+The full preset table, alias table, curated id list, `.env` rules, and `local-only` behavior are in `docs/AI_ASSISTED_WORKFLOWS.md` under **Provider Presets and Model Catalog**.
 
 ```text
 KNLIVEDBG_AI_PROVIDER=openrouter
 KNLIVEDBG_AI_REMOTE_POLICY=allow-remote
-KNLIVEDBG_AI_MODEL=openai/gpt-oss-120b
+KNLIVEDBG_AI_MODEL=anthropic/claude-opus-5
 KNLIVEDBG_OPENROUTER_API_KEY=sk-or-...
 ```
 
@@ -580,17 +606,18 @@ KNLIVEDBG_DEEPSEEK_API_KEY=sk-...
 
 Supported keys:
 
-1. `KNLIVEDBG_AI_PROVIDER` selects `openai-codex-cli`, `openai-codex-subscription`, `deepseek`, or `openrouter`.
-2. `KNLIVEDBG_AI_REMOTE_POLICY` selects `allow-remote` or `local-only`; `local-only` blocks HTTP-backed providers such as ChatGPT/Codex OAuth, DeepSeek, and OpenRouter.
-3. `KNLIVEDBG_AI_MODEL` overrides the provider default model.
-4. `KNLIVEDBG_AI_BASE_URL` overrides the provider base URL.
+1. `KNLIVEDBG_AI_PROVIDER` selects `openai-codex-cli`, `openai-codex-subscription`, `deepseek`, `openrouter`, or `off`.
+2. `KNLIVEDBG_AI_REMOTE_POLICY` selects `allow-remote` or `local-only`; `local-only` blocks HTTP complete and `ai models refresh` without clearing the selected provider. Use `ai use private` for local Codex CLI.
+3. `KNLIVEDBG_AI_MODEL` overrides the provider default model. OpenRouter's default is `anthropic/claude-opus-5` when this key is unset.
+4. `KNLIVEDBG_AI_BASE_URL` overrides the provider base URL. It is load-only unless edited by hand; `ai use` does not rewrite it when the provider stays the same.
 5. `KNLIVEDBG_DEEPSEEK_API_KEY` or `DEEPSEEK_API_KEY` supplies the DeepSeek API key.
 6. `KNLIVEDBG_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` supplies the OpenRouter API key.
 7. `KNLIVEDBG_CODEX_ACCESS_TOKEN`, `KERNFORGE_CODEX_ACCESS_TOKEN`, `KNLIVEDBG_CODEX_AUTH_FILE`, or `KERNFORGE_CODEX_AUTH_FILE` supplies ChatGPT/Codex OAuth credentials.
 8. If no Codex auth file is configured, Kn Live Dbg checks `%USERPROFILE%\.kernforge\codex_auth.json` and `%USERPROFILE%\.codex\auth.json`.
 9. `KNLIVEDBG_CODEX_CLI_PATH` overrides the `codex` executable used by `openai-codex-cli`.
+10. `KNLIVEDBG_AI_REASONING_EFFORT` and `KNLIVEDBG_AI_TIMEOUT_SECONDS` are load-only optional overrides.
 
-Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` shows the loaded `.env` path, remote policy, and credential source. `ai config test` sends a tiny marker request to the selected provider/model and prints transport status, HTTP status when available, elapsed time, and whether the expected marker came back. `ai config policy local-only` can be used during a sensitive session to block HTTP-backed providers without editing `.env`. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze !callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups provider setup under `ai config` and evidence analysis under `ai explain`.
+Run `codex login` outside Kn Live Dbg when ChatGPT/Codex OAuth credentials are missing or expired. `ai status` prints ready/blocked health and the next setup step. `ai test` / `ai config test` send a tiny marker request to the selected provider/model and print transport status, HTTP status when available, elapsed time, and whether the expected marker came back. Legacy direct forms such as `ai policy local-only`, `ai ask`, `ai preview`, `ai analyze !callbacks`, `ai annotate`, `ai diagnose`, `ai playbook`, `ai transcript`, and `ai audit` are still accepted for compatibility, but the main help surface groups daily setup under `ai use` / `ai models` and evidence analysis under `ai explain`.
 
 For `ai <goal>`, local playbooks and process-field queries run first. When the model is used, it sees the operator prompt plus the shared capability catalog, not live memory contents. The catalog includes `process.find`, `process.describe`, `type.describe`, `callbacks.list`, `wfp.list`, `alpc.list`, `vad.list`, `threads.list`, `etw.integrity`, `nmi.list`, `minifilter.list`, `payload.inspect`, `payload.scan`, `mapper.list`, `kpage.list`, `fwtable.list`, `pool.find`, `address.inspect`, `wnf.decode`, `wnf.list`, `ti.query`, `module.integrity`, `driver.integrity`, `driver.object`, `handles.list`, `hiddenproc.list`, `wdfilter.list`, `inputstack.list`, `dma.posture`, `hv.posture`, and `dump.analyze`, so prompts such as `ai a.exe process eprocess info` can become a structured tool plan that finds the process through `_EPROCESS.ActiveProcessLinks` and prints PID, EPROCESS, DTB, PEB, or a `dt nt!_EPROCESS` view locally. Callback/WFP/ALPC prompts route through their native scanners with validated scope/filter args. Firmware table provider prompts route through the passive `!fwtable` scanner and never invoke firmware handlers. Requests that ask to list, show, recommend, or suggest commands route to the command planner first, so command-advice prompts do not run native scanners immediately. Process memory prompts route through `!vad` or `!threads`, including VAD DKOM prompts that set `hiddenpte=true` and run `!vad <target> /hiddenpte`. Integrity prompts such as `ai any inline ETW hook?`, `ai list NMI callbacks`, `ai list firmware table providers`, `ai show W+X pool allocations`, `ai why is nt!Foo suspicious?`, `ai decode this WNF state name 0x41c64e6da3bc0075`, `ai list live WNF instances`, `ai query recent TI WriteVM events`, `ai inspect module text integrity with headers and sections`, `ai find W+X kernel modules`, and `ai check driver dispatch integrity` route through the corresponding local read-only tool. Exact read-only commands after `ai`, such as `ai callbacks all WdFilter.sys`, `ai dt nt!_EPROCESS <address>`, `ai uf nt!Foo`, `ai !ci options`, `ai !vbs`, `ai !hiddenproc`, or `ai !fwtable providers`, are treated as evidence commands: Kn Live Dbg runs the command, captures stdout/stderr, and asks the selected model to explain the evidence. After local tools run, the model explains the captured output. `hunt.run`, `payload.scan`, `snapshot.capture`, and `kpage.list` with `deep=true` preview and wait for `ai go`. Default `ai <goal>` does not auto-build a `kn-live-dbg.ai-plan.v2` command plan. `module.integrity` accepts validated `target`/`module`/`name`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, `mismatch`, `disk`, `iat`, and `prologue` args before the local executor builds the native command. The capability parser rejects unknown tools, unknown fields, unsafe characters, invalid scalars, write-like actions, raw `kd`, nested `ai`, session mutation, unload/shutdown, and command chaining before any native handler is called. The compatibility local process resolver still runs when the provider is disabled.
 

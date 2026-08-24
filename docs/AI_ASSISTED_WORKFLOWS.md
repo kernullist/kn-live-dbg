@@ -17,8 +17,8 @@ This document captures the implemented AI assistance surface in Kn Live Dbg plus
 The first integration layer is implemented as a user-mode `ai` command and `AiProviderRuntime` module. It is intentionally advisory, but the visible surface is now smaller:
 
 1. `ai <goal>` is the default operator entrypoint. Routing is local-first: exact read-only evidence commands such as `!callbacks`, `dt`, `!hiddenproc`, or `dump-analyze` run and are explained; command-recommendation requests still build a `kn-live-dbg.ai-plan.v2` command plan; known playbooks (callbacks, hidden processes, handles, leftover mapper layers, integrity, VBS, DMA, one-address inspect) and local process field queries run immediately; conceptual `what`/`why` questions stay advisory. Remaining goals ask the selected provider to pick tools from the shared `AiCapabilityCatalog` (`kn-live-dbg.ai-capability-plan.v1`). Cheap tools preview and run, then the model explains the captured output. `hunt.run`, `payload.scan`, `snapshot.capture`, and `kpage.list` with `deep=true` wait for `ai go` / `ai no`. Default `ai <goal>` no longer auto-builds a v2 command plan; use `ai plan` when you want command proposals. Korean and English goals are both accepted. The catalog includes the P0-P2 scanners (`hiddenproc.list`, `handles.list`, `driver.object`, `dump.analyze`, and the rest) plus `assistant.answer`.
-2. `ai status` reports the selected provider, model, base URL, remote policy, credential source, loaded `.env` path, Codex CLI path, reasoning effort, and timeout.
-3. `ai config ...` groups provider setup and smoke checks under one visible subcommand. It supports `status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`.
+2. `ai status` reports ready/blocked health, the selected preset/model, remote policy, credential source, loaded `.env` path, and the next setup step. `ai config status` adds the verbose dump.
+3. Daily setup is `ai use <preset|model>`, `ai models [query|refresh]`, `ai test`, and `ai save`. `ai config ...` remains the advanced provider surface (`status`, `providers`, `provider`, `policy`, `model`, `base-url`, `effort`, `auth`, and `test`). Presets are `cloud` (OpenRouter + Claude Opus 5), `cheap` (gpt-oss-120b), `deepseek`, `private` (Codex CLI), `chatgpt`, and `off`. Tab completion includes curated frontier OpenRouter IDs as of 2026-08-24; `ai models refresh` fetches the live OpenRouter catalog.
 4. `ai plan <prompt>` remains an explicit override that asks the model for a strict command proposal JSON object and stores the parsed command plan in memory.
 5. `ai explain <read-only-command...>` remains an explicit override for evidence analysis. The same path is also reached implicitly when the operator types `ai !callbacks ...`, `ai dt ...`, `ai uf ...`, `ai !ci options`, or another recognized read-only evidence command.
 6. `ai show` prints session hints, a pending expensive tool plan, and the loaded command plan. `ai show evidence` reprints the last captured tool or evidence output. `ai go` / `ai no` confirm or cancel a pending expensive tool plan.
@@ -35,9 +35,141 @@ Initial provider support:
 3. `deepseek` uses an OpenAI-compatible chat-completions request with DeepSeek defaults and optional reasoning effort.
 4. `openrouter` uses an OpenAI-compatible chat-completions request with OpenRouter defaults and metadata headers.
 
-The runtime automatically loads `.env` only from the executable directory. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys plus `KNLIVEDBG_AI_REMOTE_POLICY`. `.env` and `.env.local` are ignored by Git.
+The runtime automatically loads `.env` only from the executable directory. Real process environment variables override `.env` values. `.env.example` documents the common OpenRouter and DeepSeek keys plus `KNLIVEDBG_AI_REMOTE_POLICY`. `.env` and `.env.local` are ignored by Git. `.env.local` is not loaded. `ai use`, `ai save`, `ai config provider`, `ai config model`, and `ai config policy` write provider/model/policy back to that EXE-dir `.env` (atomic replace via `.env.tmp`).
 
-`ai config test [prompt]` is the provider round-trip smoke check. Without a custom prompt, it asks the selected provider/model to return `kn-live-dbg-ai-ok`, then prints the configured provider, model, remote policy, credential status, transport result, HTTP status when available, elapsed time, and marker match result.
+`ai test [prompt]` / `ai config test [prompt]` is the provider round-trip smoke check. Without a custom prompt, it asks the selected provider/model to return `kn-live-dbg-ai-ok`, then prints the configured provider, model, remote policy, credential status, transport result, HTTP status when available, elapsed time, and marker match result.
+
+## Provider Presets and Model Catalog
+
+Operator-facing setup is a preset plus an optional OpenRouter model id. The four HTTP/CLI transports stay under `AiProviderRuntime`. `user/AiModelCatalog.cpp` is the name table: presets, aliases, curated frontier IDs, live OpenRouter cache, and resolve/search.
+
+### Daily commands
+
+```text
+ai status
+ai use <preset|model> [model]
+ai models [query]
+ai models refresh
+ai test [prompt]
+ai save
+```
+
+`ai status` is a health view (`ready` / `off` / `missing key` / `missing token` / `blocked`) plus the next setup step. `ai config status` prints that health view and then the verbose dump (base URL, Codex CLI path, timeout, live-catalog count).
+
+`ai use` takes one or two tokens only. Extra tokens are rejected. A leading `/` (for example `/verbose`) is not a model id.
+
+`chatgpt` is the ChatGPT/Codex OAuth preset. `gpt` / `gpt-5.5` are OpenRouter model aliases, not that OAuth path.
+
+### Presets
+
+| Preset | Provider | Default model | Data path |
+| --- | --- | --- | --- |
+| `cloud` | `openrouter` | `anthropic/claude-opus-5` | remote HTTP |
+| `cheap` | `openrouter` | `openai/gpt-oss-120b` | remote HTTP |
+| `deepseek` | `deepseek` | `deepseek-chat` | remote HTTP |
+| `private` | `openai-codex-cli` | CLI default (`codex exec` without `-c model=`) | local process |
+| `chatgpt` | `openai-codex-subscription` | `gpt-5.5` | remote HTTP (Codex OAuth) |
+| `off` | disabled | empty | none |
+
+`ai use <preset> <model>` keeps the preset's provider and overrides only the model. The override must belong to that provider: DeepSeek native names (`deepseek-chat`, `deepseek-reasoner`) stay on DeepSeek; OpenRouter accepts `vendor/model` ids such as `x-ai/grok-4.6`. `ai use cloud deepseek-chat` and `ai use deepseek grok` are rejected. `ai use off` does not take a model.
+
+Re-selecting the same provider does not reset a custom `base-url` or the current model. Switching providers still applies that provider's defaults.
+
+### Model resolve order
+
+`ai use <spec>` and `ai models <query>` resolve in this order:
+
+1. Exact preset name (`cloud`, `cheap`, `deepseek`, `private`, `chatgpt`, `off`).
+2. Exact alias (`opus`, `grok`, `gpt`, `sol`, ...).
+3. Exact curated or live catalog id (`anthropic/claude-opus-5`).
+4. Unique exact tail (`gpt-5.6-sol` -> `openai/gpt-5.6-sol`, not `...-sol-pro`).
+5. Unique substring of id or display name; multiple hits print the matches and tell the operator to run `ai models <query>`.
+6. Otherwise a `vendor/model` string is accepted as an OpenRouter id. Names with a leading `/` or a space are invalid.
+
+Bare names without `/` are OpenRouter unless they are the DeepSeek native ids `deepseek-chat` / `deepseek-reasoner`.
+
+### Aliases
+
+| Alias | OpenRouter (or native) id |
+| --- | --- |
+| `opus`, `opus5`, `claude`, `claude-opus-5` | `anthropic/claude-opus-5` |
+| `fable` | `anthropic/claude-fable-5` |
+| `sonnet`, `sonnet5` | `anthropic/claude-sonnet-5` |
+| `gpt`, `gpt5`, `gpt-5.6`, `sol` | `openai/gpt-5.6-sol` |
+| `gpt-5.5` | `openai/gpt-5.5` |
+| `grok`, `grok4`, `grok-4.6` | `x-ai/grok-4.6` |
+| `grok-4.5` | `x-ai/grok-4.5` |
+| `gemini`, `flash` | `google/gemini-3.7-flash` |
+| `kimi`, `k3` | `moonshotai/kimi-k3` |
+| `glm` | `z-ai/glm-5.3` |
+| `qwen` | `qwen/qwen3.8-max` |
+| `muse` | `meta/muse-spark-1.2` |
+| `oss`, `gpt-oss` | `openai/gpt-oss-120b` |
+| `r1` | `deepseek/deepseek-r1` |
+| `v4`, `deepseek-v4` | `deepseek/deepseek-v4-pro-0813` |
+
+### Curated OpenRouter snapshot (2026-08-24)
+
+Tab completion and `ai models` always include this offline list. Scores are Artificial Analysis intelligence indexes from OpenRouter at that date, used only for ranking/display.
+
+| Id | Name | Notes |
+| --- | --- | --- |
+| `anthropic/claude-opus-5` | Claude Opus 5 | `cloud` default |
+| `anthropic/claude-fable-5` | Claude Fable 5 | |
+| `openai/gpt-5.6-sol` | GPT-5.6 Sol | |
+| `x-ai/grok-4.6` | Grok 4.6 | |
+| `moonshotai/kimi-k3` | Kimi K3 | |
+| `z-ai/glm-5.3` | GLM 5.3 | |
+| `qwen/qwen3.8-max` | Qwen3.8 Max | |
+| `anthropic/claude-opus-4.8` | Claude Opus 4.8 | |
+| `meta/muse-spark-1.2` | Muse Spark 1.2 | |
+| `openai/gpt-5.6-terra` | GPT-5.6 Terra | |
+| `openai/gpt-5.5` | GPT-5.5 | OpenRouter, not the `chatgpt` preset |
+| `google/gemini-3.7-flash` | Gemini 3.7 Flash | |
+| `x-ai/grok-4.5` | Grok 4.5 | |
+| `anthropic/claude-sonnet-5` | Claude Sonnet 5 | |
+| `deepseek/deepseek-v4-pro-0813` | DeepSeek V4 Pro 0813 | |
+| `openai/gpt-5.6-luna` | GPT-5.6 Luna | |
+| `deepseek/deepseek-v4-flash-0731` | DeepSeek V4 Flash 0731 | |
+| `google/gemini-3.6-flash` | Gemini 3.6 Flash | |
+| `google/gemini-3.1-pro-preview` | Gemini 3.1 Pro Preview | |
+| `anthropic/claude-opus-5-fast` | Claude Opus 5 Fast | |
+| `openai/gpt-5.6-sol-pro` | GPT-5.6 Sol Pro | |
+| `openai/gpt-oss-120b` | gpt-oss-120b | `cheap` default |
+| `deepseek/deepseek-r1` | DeepSeek R1 | legacy |
+| `deepseek-chat` | deepseek-chat | DeepSeek native |
+| `deepseek-reasoner` | deepseek-reasoner | DeepSeek native |
+
+`ai models refresh` GETs `https://openrouter.ai/api/v1/models` (or the current OpenRouter `base-url` with `/chat/completions` and `/models` stripped, then `/models` appended). Batch, `~` alias, and image/imagine ids are dropped. The live list is a process-lifetime cache; the top intelligence hits are added to Tab after a successful refresh. `local-only` blocks refresh. An OpenRouter API key is optional for the public catalog and is read from the OpenRouter key slots even when the current provider is not OpenRouter.
+
+### Tab completion
+
+| Input | Candidates |
+| --- | --- |
+| `ai <Tab>` | primary actions including `use`, `models`, `save`, `test` |
+| `ai use <Tab>` | presets, aliases, curated ids, live top ids, `help` |
+| `ai use cloud <Tab>` | curated/live model ids |
+| `ai models <Tab>` | `refresh`, curated/live ids, `help` |
+| `ai config model <Tab>` / `ai model <Tab>` | curated/live model ids |
+
+Every completed token has a one-line summary. `ai <subcommand> help` and `ai help <subcommand>` cover `use`, `models`, `save`, and `test`.
+
+### `.env` load and save
+
+1. Search path is only `<KnLiveDbg.exe directory>\.env`. Repo-root `.env` and cwd `.env` are not read.
+2. Process environment variables override `.env` keys.
+3. `ai use` / `ai save` / `ai config provider|model|policy` merge `KNLIVEDBG_AI_PROVIDER`, `KNLIVEDBG_AI_MODEL`, and `KNLIVEDBG_AI_REMOTE_POLICY` into that file and replace it via `.env.tmp`. Other keys (API keys, `BASE_URL`, effort, timeout) are preserved. Disabled provider is stored as `off`. Empty model is stored so a previous model cannot come back after `ai use off`.
+4. `KNLIVEDBG_AI_BASE_URL`, `KNLIVEDBG_AI_REASONING_EFFORT`, and `KNLIVEDBG_AI_TIMEOUT_SECONDS` are load-only unless the operator edits `.env` by hand.
+5. Save failure leaves the in-memory session updated and prints `ai note: session updated, but .env was not saved`.
+
+### Remote policy
+
+`allow-remote` is the default. `local-only` (`.env`, process env, or `ai config policy local-only`) blocks HTTP complete and `ai models refresh` without clearing the selected provider. `ai use` of a remote preset fails with `use: ai use private`. Codex CLI (`private`) is not an HTTP provider from this process.
+
+OpenRouter defaults:
+
+1. Model: `anthropic/claude-opus-5` when `KNLIVEDBG_AI_MODEL` is unset.
+2. Base URL: `https://openrouter.ai/api/v1`.
 
 The current layer can execute approved read-only model-proposed commands through `ai run`. Write-like commands remain blocked from `ai run` and require `ai write <index> confirm`. Write confirmation now runs deterministic preflight reads before mutation, emits exact byte restore commands for small recognized ranges, runs verification reads afterward when the command can be classified, and prints a deterministic before/after stdout/stderr diff for the verification command. Transcript mode captures full command output after it is enabled, including backend mode, origin, command class, write-like classification, stdout, stderr, keep-running state, output character counts, and deterministic output summaries. Transcript rotation and stdout/stderr redaction are configurable for long live sessions, and the optional write audit log records every write-like command that passes through the normal dispatcher. AI callback analysis now fits under both `ai !callbacks ...` and `ai explain !callbacks ...`, and consumes normal `!callbacks <scope> [module]` evidence. The command proposal JSON is now versioned as `kn-live-dbg.ai-plan.v2`, with stricter command metadata validation for purpose, risk, backend expectation, expected output, command chaining, session mutation, and raw `kd` write/session wrapping.
 
@@ -51,11 +183,18 @@ Provider and session setup:
 
 ```text
 ai status
-ai config status
-ai config provider openrouter
-ai config model deepseek/deepseek-r1
+ai use cloud
+ai use grok
+ai use cloud x-ai/grok-4.6
+ai use cheap
+ai use private
+ai models
+ai models refresh
+ai models opus
+ai test
+ai save
 ai config policy local-only
-ai config test
+ai help use
 ai help
 ```
 
@@ -392,7 +531,8 @@ Completed implementation-order items:
 4. Deterministic before/after diff rendering is implemented for `ai write <index> confirm` verification output.
 5. Model-proposed command plans are validated at ingestion with the v2 schema contract: empty commands, missing purpose metadata, unsupported backend expectations, command chaining, multiline commands, nested `ai`, shutdown/unload commands, backend/session mutation, probe service control, bare `kd`, raw `kd` wrapping of blocked commands, overlong commands, and unknown non-DbgEng commands are rejected before they can be shown as a runnable plan. Write-like proposals, including raw `kd` write-like wrappers, are forced to require confirmation.
 6. Command transcript and AI evidence prompts include deterministic output summaries with stdout/stderr character counts, line counts, interesting-line counts, and first/last non-empty lines before raw output.
-7. Local/offline provider policy is implemented with `ai config policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`, which block HTTP-backed providers.
+7. Local/offline provider policy is implemented with `ai config policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`. HTTP complete and `ai models refresh` are blocked; the selected provider is not cleared. Use `ai use private` for the local Codex CLI.
+8. Provider presets, aliases, curated frontier OpenRouter IDs, live catalog refresh, EXE-dir `.env` merge/save, and health status are implemented in `AiModelCatalog` plus `AiProviderRuntime`. Daily setup is `ai use` / `ai models` / `ai test` / `ai save`.
 
 ## Non-Goals
 

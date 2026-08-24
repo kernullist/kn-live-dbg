@@ -1,5 +1,6 @@
 #include "AddressInspector.h"
 #include "AiCapabilityCatalog.h"
+#include "AiModelCatalog.h"
 #include "AiProvider.h"
 #include "AlpcScanner.h"
 #include "BindFilterScanner.h"
@@ -3946,6 +3947,10 @@ static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidate
     {
         L"status",
         L"help",
+        L"use",
+        L"models",
+        L"save",
+        L"test",
         L"config",
         L"providers",
         L"provider",
@@ -4111,6 +4116,48 @@ static void AddAiCompletionCandidates(
 
                 AddCompletionCandidates(candidates, values);
             }
+            else if (ToLower(argsBefore[2]) == L"model")
+            {
+                for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
+                {
+                    AddCompletionCandidate(candidates, token.c_str());
+                }
+
+                AddCompletionCandidate(candidates, L"help");
+            }
+        }
+        else if (action == L"use")
+        {
+            if (argsBefore.size() == 2)
+            {
+                for (const std::wstring& token : AiModelCatalog::CompletionTokens())
+                {
+                    AddCompletionCandidate(candidates, token.c_str());
+                }
+            }
+            else
+            {
+                for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
+                {
+                    AddCompletionCandidate(candidates, token.c_str());
+                }
+
+                AddCompletionCandidate(candidates, L"help");
+            }
+        }
+        else if (action == L"models")
+        {
+            static const wchar_t* values[] =
+            {
+                L"refresh",
+                L"help"
+            };
+
+            AddCompletionCandidates(candidates, values);
+            for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
+            {
+                AddCompletionCandidate(candidates, token.c_str());
+            }
         }
         else if (action == L"provider")
         {
@@ -4189,8 +4236,18 @@ static void AddAiCompletionCandidates(
                  action == L"plan" ||
                  action == L"providers" ||
                  action == L"model" ||
-                 action == L"base-url")
+                 action == L"base-url" ||
+                 action == L"save" ||
+                 action == L"test")
         {
+            if (action == L"model")
+            {
+                for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
+                {
+                    AddCompletionCandidate(candidates, token.c_str());
+                }
+            }
+
             AddCompletionCandidate(candidates, L"help");
         }
         else if (action == L"analyze")
@@ -12836,7 +12893,7 @@ static void PrintStartupTui(
                  L" modules=" + std::to_wstring(symbols.Modules().size()), symbols.IsReady() ? KNDBG_COLOR_OK : KNDBG_COLOR_WARN);
     PrintTuiLine(L"AI: provider=" + ai.ProviderName() + L" model=" + model +
                  L" policy=" + ai.RemotePolicyName() + L" credential=" + ai.CredentialStatus(), KNDBG_COLOR_TEXT);
-    PrintTuiLine(L"Env: " + dotEnv, dotEnv == L"none" ? KNDBG_COLOR_DIM : KNDBG_COLOR_OK);
+    PrintTuiLine(L"Env: " + dotEnv + L"  (ai use cloud | ai models)", dotEnv == L"none" ? KNDBG_COLOR_DIM : KNDBG_COLOR_OK);
     PrintTuiLine(BuildProbePanelText(), KNDBG_COLOR_TEXT);
     PrintTuiRule();
     PrintTuiLine(L"Quick actions", KNDBG_COLOR_TITLE);
@@ -12845,7 +12902,8 @@ static void PrintStartupTui(
     PrintTuiLine(L"  drvstatus     inspect service/session/write gate state", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  probe load    load positive-control VA/PA and fwtable provider", KNDBG_COLOR_TEXT);
     PrintTuiLine(L"  !callbacks all enumerate callback surfaces including minifilters", KNDBG_COLOR_TEXT);
-    PrintTuiLine(L"  ai status     inspect provider, model, policy, and credentials", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  ai use cloud  pick a provider/model and save EXE-dir .env", KNDBG_COLOR_TEXT);
+    PrintTuiLine(L"  ai status     inspect whether the selected model is ready", KNDBG_COLOR_TEXT);
     PrintTuiBlank();
     PrintTuiLine(L"Examples", KNDBG_COLOR_TITLE);
     PrintTuiLine(L"  lm nt                    x nt!*Process*", KNDBG_COLOR_DIM);
@@ -28048,8 +28106,12 @@ static void PrintAiHelp()
     std::wcout << L"  ai <subcommand> [args...]\n";
     std::wcout << L"\n";
     std::wcout << L"primary subcommands:\n";
-    std::wcout << L"  status       show provider, model, credential, and policy state\n";
-    std::wcout << L"  config       configure provider, policy, model, base URL, effort, or auth\n";
+    std::wcout << L"  use          pick a preset or cloud model and save it next to the EXE\n";
+    std::wcout << L"  models       list/search cloud models; refresh fetches live OpenRouter IDs\n";
+    std::wcout << L"  status       ready/blocked health and the next setup step\n";
+    std::wcout << L"  test         smoke-check the selected provider/model\n";
+    std::wcout << L"  save         write the current provider/model to the EXE-dir .env\n";
+    std::wcout << L"  config       advanced provider, policy, base URL, effort, or auth\n";
     std::wcout << L"  go           run a pending expensive local-tool plan\n";
     std::wcout << L"  no           cancel a pending expensive local-tool plan\n";
     std::wcout << L"  show         show the loaded command plan, pending tools, or last evidence\n";
@@ -28075,8 +28137,10 @@ static void PrintAiHelp()
     std::wcout << L"  ai show evidence\n";
     std::wcout << L"  ai explain !module integrity all /summary\n";
     std::wcout << L"  ai analyze !wnf candidates\n";
-    std::wcout << L"  ai config provider openrouter\n";
-    std::wcout << L"  ai config test\n";
+    std::wcout << L"  ai use cloud\n";
+    std::wcout << L"  ai use grok\n";
+    std::wcout << L"  ai models\n";
+    std::wcout << L"  ai test\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Prefer ai <goal>. Local process queries and playbooks run first; the model only picks tools.\n";
@@ -28084,7 +28148,7 @@ static void PrintAiHelp()
     std::wcout << L"  Cheap tools run after a short preview. hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
     std::wcout << L"  After tools run, AI explains the captured output. Conceptual why/what questions stay advisory.\n";
     std::wcout << L"  ai plan remains an explicit command-proposal override. Default ai <goal> no longer auto-builds that plan.\n";
-    std::wcout << L"  API-key providers load .env only from the EXE directory.\n";
+    std::wcout << L"  Prefer ai use <preset|model>. .env is loaded only from the EXE directory.\n";
     std::wcout << L"  ai run executes read-only validated plan commands; write-like commands require ai write confirm.\n";
     std::wcout << L"  ai <subcommand> help and ai help <subcommand> print that subcommand's usage.\n";
     std::wcout << L"  Legacy detailed commands still work; use ai help <topic> when needed.\n";
@@ -28099,7 +28163,38 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
     {
         std::wcout << L"ai status:\n";
         std::wcout << L"  ai status\n";
-        std::wcout << L"  Show current AI provider runtime settings.\n";
+        std::wcout << L"  Show whether the selected preset/model is ready and what to do next.\n";
+        std::wcout << L"  ai config status prints the verbose provider dump.\n";
+    }
+    else if (name == L"use")
+    {
+        std::wcout << L"ai use:\n";
+        std::wcout << L"  ai use <preset|model> [model]\n";
+        std::wcout << L"  Presets: cloud, cheap, deepseek, private, chatgpt, off\n";
+        std::wcout << L"  Cloud models: ai use grok | ai use opus | ai use anthropic/claude-opus-5\n";
+        std::wcout << L"  chatgpt is Codex OAuth; gpt / gpt-5.5 are OpenRouter model IDs.\n";
+        std::wcout << L"  Optional second token overrides the preset model on the same provider.\n";
+        std::wcout << L"  Saves provider/model/policy to the EXE-dir .env.\n";
+    }
+    else if (name == L"models")
+    {
+        std::wcout << L"ai models:\n";
+        std::wcout << L"  ai models [query]\n";
+        std::wcout << L"  ai models refresh\n";
+        std::wcout << L"  Lists presets and curated frontier OpenRouter models.\n";
+        std::wcout << L"  refresh fetches the live OpenRouter catalog so Tab can complete new IDs.\n";
+    }
+    else if (name == L"save")
+    {
+        std::wcout << L"ai save:\n";
+        std::wcout << L"  ai save\n";
+        std::wcout << L"  Write the current provider, model, and remote policy to EXE-dir .env.\n";
+    }
+    else if (name == L"test")
+    {
+        std::wcout << L"ai test:\n";
+        std::wcout << L"  ai test [prompt]\n";
+        std::wcout << L"  Alias for ai config test. Sends a tiny marker request to the selected model.\n";
     }
     else if (name == L"config")
     {
@@ -28113,7 +28208,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai config effort <minimal|low|medium|high|xhigh>\n";
         std::wcout << L"  ai config auth\n";
         std::wcout << L"  ai config test [prompt]\n";
-        std::wcout << L"  Groups provider setup and connectivity checks under one visible subcommand.\n";
+        std::wcout << L"  Advanced provider setup. Prefer ai use / ai models for daily changes.\n";
     }
     else if (name == L"providers")
     {
@@ -28139,7 +28234,8 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"ai model:\n";
         std::wcout << L"  ai model <model>\n";
         std::wcout << L"  Sets the provider model string without changing provider.\n";
-        std::wcout << L"  The accepted model names depend on the selected provider.\n";
+        std::wcout << L"  Tab completes curated frontier OpenRouter IDs plus live catalog IDs.\n";
+        std::wcout << L"  Prefer ai use <model> when the provider should change with the model.\n";
     }
     else if (name == L"base-url")
     {
@@ -28898,6 +28994,10 @@ static std::wstring FirstTokenMissingCompletionHint()
         {L"ai", L"config", L"provider"},
         {L"ai", L"config", L"policy"},
         {L"ai", L"config", L"effort"},
+        {L"ai", L"config", L"model"},
+        {L"ai", L"use"},
+        {L"ai", L"use", L"cloud"},
+        {L"ai", L"models"},
         {L"ai", L"playbook"},
         {L"ai", L"playbook", L"callbacks"},
         {L"ai", L"explain"},
@@ -29816,6 +29916,15 @@ static int RunConsoleSurfaceSelfTest()
                 L"completion-listing-ai-actions");
             CheckCompletionCandidate(&context, {L"ai"}, L"go", L"ai-go-completion");
             CheckCompletionCandidate(&context, {L"ai"}, L"no", L"ai-no-completion");
+            CheckCompletionCandidate(&context, {L"ai"}, L"use", L"ai-use-completion");
+            CheckCompletionCandidate(&context, {L"ai"}, L"models", L"ai-models-completion");
+            CheckCompletionCandidate(&context, {L"ai"}, L"save", L"ai-save-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"use"}, L"cloud", L"ai-use-cloud-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"use"}, L"grok", L"ai-use-grok-alias-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"use"}, L"anthropic/claude-opus-5", L"ai-use-opus5-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"use"}, L"x-ai/grok-4.6", L"ai-use-grok46-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"models"}, L"refresh", L"ai-models-refresh-completion");
+            CheckCompletionCandidate(&context, {L"ai", L"config", L"model"}, L"openai/gpt-5.6-sol", L"ai-config-model-sol-completion");
             CheckCompletionCandidate(&context, {L"ai", L"show"}, L"evidence", L"ai-show-evidence-completion");
             CheckCompletionCandidate(&context, {L"ai", L"playbook"}, L"hidden", L"ai-playbook-hidden-completion");
             CheckCompletionCandidate(&context, {L"ai", L"go"}, L"help", L"ai-go-help-completion");
@@ -29828,12 +29937,17 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 AiCapabilityCatalogSelfTest(),
                 L"ai-capability-catalog-self-test");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                AiModelCatalog::SelfTest(),
+                L"ai-model-catalog-self-test");
             {
                 const std::wstring aiHelp = CaptureDetailedHelpOutput({L"help", L"ai"}, 1);
                 CheckConsoleSurfaceSelfTest(
                     &context,
                     aiHelp.find(L"ai go") != std::wstring::npos &&
                         aiHelp.find(L"ai show evidence") != std::wstring::npos &&
+                        aiHelp.find(L"ai use cloud") != std::wstring::npos &&
                         aiHelp.find(L"ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4") != std::wstring::npos &&
                         aiHelp.find(L"no longer auto-builds") != std::wstring::npos,
                     L"ai-help-covers-go-evidence-and-local-first");
@@ -46257,7 +46371,7 @@ static void ExplainAiCapturedTools(
     RememberAiEvidence(aiState, summary.empty() ? query : summary, stdoutText);
     if (ToLower(ai.ProviderName()) == L"off")
     {
-        std::wcout << L"ai note: provider is off; raw tool output is above. type ai config provider to enable explanations.\n";
+        std::wcout << L"ai note: provider is off; raw tool output is above. type ai use cloud to enable explanations.\n";
         return;
     }
 
@@ -46660,6 +46774,88 @@ static AiCapabilityQueryResult TryHandleAiCapabilityQuery(
     return result;
 }
 
+static void PersistAiSettings(AiProviderRuntime& ai)
+{
+    std::wstring path;
+    std::wstring error;
+    if (!ai.SaveToDotEnv(&path, &error))
+    {
+        std::wcout << L"ai note: session updated, but .env was not saved: " << error << L"\n";
+    }
+    else
+    {
+        std::wcout << L"saved: " << path << L"\n";
+    }
+}
+
+static void HandleAiUseCommand(const std::vector<std::wstring>& args, AiProviderRuntime& ai)
+{
+    do
+    {
+        if (args.size() < 3 || args.size() > 4)
+        {
+            std::wcout << L"usage: ai use <preset|model> [model]\n";
+            if (args.size() < 3)
+            {
+                std::wcout << ai.ModelsText(L"");
+            }
+
+            break;
+        }
+
+        std::wstring overrideModel;
+        if (args.size() == 4)
+        {
+            overrideModel = args[3];
+        }
+
+        std::wstring error;
+        if (!ai.ApplyUse(args[2], overrideModel, &error))
+        {
+            std::wcerr << L"ai use failed: " << error << L"\n";
+            break;
+        }
+
+        PersistAiSettings(ai);
+        std::wcout << ai.HealthText();
+    } while (false);
+}
+
+static void HandleAiModelsCommand(const std::vector<std::wstring>& args, AiProviderRuntime& ai)
+{
+    do
+    {
+        std::wstring query;
+        if (args.size() >= 3 && ToLower(args[2]) == L"refresh")
+        {
+            if (args.size() > 3)
+            {
+                std::wcerr << L"usage: ai models refresh\n";
+                break;
+            }
+
+            std::wstring error;
+            std::wcout << L"ai models refresh: fetching OpenRouter catalog...\n";
+            if (!ai.RefreshCloudModels(&error))
+            {
+                std::wcerr << L"ai models refresh failed: " << error << L"\n";
+                break;
+            }
+
+            std::wcout << L"live models: " << AiModelCatalog::LiveModelCount() << L"\n";
+            std::wcout << ai.ModelsText(L"");
+            break;
+        }
+
+        if (args.size() >= 3)
+        {
+            query = JoinArgs(args, 2);
+        }
+
+        std::wcout << ai.ModelsText(query);
+    } while (false);
+}
+
 static void HandleAiConfigTestCommand(const std::vector<std::wstring>& args, AiProviderRuntime& ai)
 {
     static const std::wstring expectedMarker = L"kn-live-dbg-ai-ok";
@@ -46668,16 +46864,29 @@ static void HandleAiConfigTestCommand(const std::vector<std::wstring>& args, AiP
     {
         AiCompletionRequest request = {};
         request.System = L"You are a KnLiveDbg AI provider connectivity smoke test. Return exactly this marker and no other text: " + expectedMarker;
-        if (args.size() >= 4)
+        size_t promptIndex = 3;
+        if (args.size() >= 2 && ToLower(args[1]) == L"test")
         {
-            request.Prompt = JoinArgs(args, 3);
+            promptIndex = 2;
+        }
+
+        if (args.size() > promptIndex)
+        {
+            request.Prompt = JoinArgs(args, promptIndex);
         }
         else
         {
             request.Prompt = L"Return exactly: " + expectedMarker;
         }
 
-        std::wcout << L"ai config test\n";
+        if (args.size() >= 2 && ToLower(args[1]) == L"test")
+        {
+            std::wcout << L"ai test\n";
+        }
+        else
+        {
+            std::wcout << L"ai config test\n";
+        }
         std::wcout << L"  provider: " << ai.ProviderName() << L"\n";
         std::wcout << L"  model: " << (ai.Settings().Model.empty() ? L"(default)" : ai.Settings().Model) << L"\n";
         std::wcout << L"  remote policy: " << ai.RemotePolicyName() << L"\n";
@@ -46729,6 +46938,8 @@ static void HandleAiConfigCommand(
     {
         if (args.size() < 3 || ToLower(args[2]) == L"status")
         {
+            std::wcout << ai.HealthText();
+            std::wcout << L"\n";
             std::wcout << ai.StatusText();
             break;
         }
@@ -46757,7 +46968,8 @@ static void HandleAiConfigCommand(
                 break;
             }
 
-            std::wcout << ai.StatusText();
+            PersistAiSettings(ai);
+            std::wcout << ai.HealthText();
         }
         else if (setting == L"policy")
         {
@@ -46774,7 +46986,8 @@ static void HandleAiConfigCommand(
                 break;
             }
 
-            std::wcout << ai.StatusText();
+            PersistAiSettings(ai);
+            std::wcout << ai.HealthText();
         }
         else if (setting == L"model")
         {
@@ -46785,7 +46998,8 @@ static void HandleAiConfigCommand(
             }
 
             ai.SetModel(JoinArgs(args, 3));
-            std::wcout << ai.StatusText();
+            PersistAiSettings(ai);
+            std::wcout << ai.HealthText();
         }
         else if (setting == L"base-url")
         {
@@ -46796,7 +47010,7 @@ static void HandleAiConfigCommand(
             }
 
             ai.SetBaseUrl(JoinArgs(args, 3));
-            std::wcout << ai.StatusText();
+            std::wcout << ai.HealthText();
         }
         else if (setting == L"effort")
         {
@@ -46807,7 +47021,7 @@ static void HandleAiConfigCommand(
             }
 
             ai.SetReasoningEffort(args[3]);
-            std::wcout << ai.StatusText();
+            std::wcout << ai.HealthText();
         }
         else if (setting == L"auth")
         {
@@ -46970,7 +47184,7 @@ static void HandleAiFreeFormCommand(
         if (ToLower(ai.ProviderName()) == L"off")
         {
             std::wcout << L"ai provider is off. Local playbooks still run for known goals such as hidden processes or callbacks.\n";
-            std::wcout << L"type ai config provider <name> to enable tool planning and explanations.\n";
+            std::wcout << L"type ai use cloud to enable tool planning and explanations.\n";
             break;
         }
 
@@ -46998,7 +47212,7 @@ static void HandleAiCommand(
     {
         if (args.size() == 1)
         {
-            std::wcout << ai.StatusText();
+            std::wcout << ai.HealthText();
             break;
         }
 
@@ -47016,7 +47230,24 @@ static void HandleAiCommand(
         }
         else if (action == L"status")
         {
-            std::wcout << ai.StatusText();
+            std::wcout << ai.HealthText();
+        }
+        else if (action == L"use")
+        {
+            HandleAiUseCommand(args, ai);
+        }
+        else if (action == L"models")
+        {
+            HandleAiModelsCommand(args, ai);
+        }
+        else if (action == L"save")
+        {
+            PersistAiSettings(ai);
+            std::wcout << ai.HealthText();
+        }
+        else if (action == L"test")
+        {
+            HandleAiConfigTestCommand(args, ai);
         }
         else if (action == L"config")
         {
@@ -47041,7 +47272,8 @@ static void HandleAiCommand(
                 break;
             }
 
-            std::wcout << ai.StatusText();
+            PersistAiSettings(ai);
+            std::wcout << ai.HealthText();
         }
         else if (action == L"policy")
         {
@@ -47058,7 +47290,8 @@ static void HandleAiCommand(
                 break;
             }
 
-            std::wcout << ai.StatusText();
+            PersistAiSettings(ai);
+            std::wcout << ai.HealthText();
         }
         else if (action == L"model")
         {
@@ -47069,7 +47302,8 @@ static void HandleAiCommand(
             }
 
             ai.SetModel(JoinArgs(args, 2));
-            std::wcout << ai.StatusText();
+            PersistAiSettings(ai);
+            std::wcout << ai.HealthText();
         }
         else if (action == L"base-url")
         {
@@ -47080,7 +47314,7 @@ static void HandleAiCommand(
             }
 
             ai.SetBaseUrl(JoinArgs(args, 2));
-            std::wcout << ai.StatusText();
+            std::wcout << ai.HealthText();
         }
         else if (action == L"effort")
         {
@@ -47091,7 +47325,7 @@ static void HandleAiCommand(
             }
 
             ai.SetReasoningEffort(args[2]);
-            std::wcout << ai.StatusText();
+            std::wcout << ai.HealthText();
         }
         else if (action == L"auth")
         {

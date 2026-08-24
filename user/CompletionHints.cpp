@@ -1,5 +1,6 @@
 #include "CompletionHints.h"
 
+#include "AiModelCatalog.h"
 #include "CommandRegistry.h"
 
 #include <algorithm>
@@ -805,9 +806,13 @@ namespace
 
     const CompletionHint kAiRootTokens[] =
     {
-        { L"status", L"ai status", L"provider, model, credential, and policy" },
+        { L"status", L"ai status", L"ready/blocked health and next setup step" },
         { L"help", L"ai help [subcommand]", L"AI usage" },
-        { L"config", L"ai config [status|provider|policy|model|...]", L"provider setup and smoke test" },
+        { L"use", L"ai use <preset|model> [model]", L"pick a preset or cloud model and save .env" },
+        { L"models", L"ai models [query|refresh]", L"list/search cloud models, or refresh OpenRouter" },
+        { L"save", L"ai save", L"write provider/model to the EXE-dir .env" },
+        { L"test", L"ai test [prompt]", L"smoke-check the selected provider/model" },
+        { L"config", L"ai config [status|provider|policy|model|...]", L"advanced provider setup" },
         { L"providers", L"ai providers", L"compatibility: list providers" },
         { L"provider", L"ai provider <name>", L"compatibility: select a provider" },
         { L"policy", L"ai policy <allow-remote|local-only>", L"compatibility: remote policy" },
@@ -839,12 +844,29 @@ namespace
         { L"providers", L"ai config providers", L"list built-in providers" },
         { L"provider", L"ai config provider <name>", L"select the provider" },
         { L"policy", L"ai config policy <allow-remote|local-only|status>", L"allow or block HTTP providers" },
-        { L"model", L"ai config model <model>", L"set the model name" },
+        { L"model", L"ai config model <model>", L"set model; Tab lists curated/live OpenRouter IDs" },
         { L"base-url", L"ai config base-url <url>", L"set the API base URL" },
         { L"effort", L"ai config effort <level>", L"reasoning effort" },
         { L"auth", L"ai config auth", L"credential source" },
         { L"test", L"ai config test [prompt]", L"tiny marker round-trip" },
         { L"help", nullptr, L"show ai config usage" },
+    };
+
+    const CompletionHint kAiUseTokens[] =
+    {
+        { L"cloud", L"ai use cloud", L"OpenRouter + Claude Opus 5" },
+        { L"cheap", L"ai use cheap", L"OpenRouter + gpt-oss-120b" },
+        { L"deepseek", L"ai use deepseek", L"DeepSeek native API" },
+        { L"private", L"ai use private", L"local Codex CLI" },
+        { L"chatgpt", L"ai use chatgpt", L"ChatGPT/Codex OAuth" },
+        { L"off", L"ai use off", L"disable the model provider" },
+        { L"help", nullptr, L"show ai use usage" },
+    };
+
+    const CompletionHint kAiModelsTokens[] =
+    {
+        { L"refresh", L"ai models refresh", L"fetch live OpenRouter model IDs" },
+        { L"help", nullptr, L"show ai models usage" },
     };
 
     const CompletionHint kAiPlaybookTokens[] =
@@ -1419,10 +1441,14 @@ namespace
     const CompletionScopeTable kAiScopes[] =
     {
         SCOPE(L"", L"ai <goal> | ai <subcommand> ...", L"intent router: local tools, playbooks, and evidence analysis", kAiRootTokens),
-        SCOPE(L"config", L"ai config [status|provider|policy|model|test|...]", L"provider setup", kAiConfigTokens),
+        SCOPE(L"config", L"ai config [status|provider|policy|model|test|...]", L"advanced provider setup", kAiConfigTokens),
         SCOPE(L"config-provider", L"ai config provider <name|off>", L"select the AI provider", kAiProviderNameTokens),
         SCOPE(L"config-policy", L"ai config policy <allow-remote|local-only|status>", L"allow or block HTTP providers", kAiPolicyTokens),
         SCOPE(L"config-effort", L"ai config effort <minimal|low|medium|high|xhigh>", L"reasoning effort", kAiEffortTokens),
+        SCOPE(L"config-model", L"ai config model <model>", L"set a cloud or native model id", kHelpOnlyTokens),
+        SCOPE(L"use", L"ai use <preset|model> [model]", L"pick a preset or cloud model", kAiUseTokens),
+        SCOPE(L"use-model", L"ai use <preset> <model>", L"override the preset model", kHelpOnlyTokens),
+        SCOPE(L"models", L"ai models [query|refresh]", L"list or search cloud models", kAiModelsTokens),
         SCOPE(L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver|hidden|...>", L"repeatable read-only plans", kAiPlaybookTokens),
         SCOPE(L"playbook-run", L"ai playbook <name> [run|dry-run]", L"execute or preview a playbook", kAiPlaybookRunTokens),
         SCOPE(L"show", L"ai show [plan|pending|evidence]", L"loaded plan, pending tools, or last evidence", kAiShowTokens),
@@ -1928,10 +1954,29 @@ namespace
                 {
                     scope = L"config-effort";
                 }
+                else if (second == L"model")
+                {
+                    scope = L"config-model";
+                }
                 else
                 {
                     scope = L"config";
                 }
+            }
+            else if (first == L"use")
+            {
+                if (!second.empty() && second != L"help")
+                {
+                    scope = L"use-model";
+                }
+                else
+                {
+                    scope = L"use";
+                }
+            }
+            else if (first == L"models")
+            {
+                scope = L"models";
             }
             else if (first == L"playbook")
             {
@@ -1975,7 +2020,9 @@ namespace
                      first == L"plan" ||
                      first == L"model" ||
                      first == L"base-url" ||
-                     first == L"providers")
+                     first == L"providers" ||
+                     first == L"save" ||
+                     first == L"test")
             {
                 scope = L"leaf";
             }
@@ -2189,6 +2236,20 @@ namespace
                 {
                     found = true;
                 }
+            }
+        }
+
+        if (!found && hint != nullptr && HintLower(command) == L"ai")
+        {
+            static thread_local std::wstring s_syntax;
+            static thread_local std::wstring s_summary;
+            if (AiModelCatalog::DescribeToken(token, &s_syntax, &s_summary) &&
+                !s_summary.empty())
+            {
+                hint->Token = token.c_str();
+                hint->Syntax = s_syntax.c_str();
+                hint->Summary = s_summary.c_str();
+                found = true;
             }
         }
 
