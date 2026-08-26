@@ -8,6 +8,7 @@ This document covers the **operational procedure for actually launching KnLiveDb
 - Transport: in-process Streamable HTTP (`http.sys`), endpoint path `/mcp`
 - Default port: `51766`  ·  Authentication: a **session password** typed at `mcp on` (not persisted)
 - Default exposure: **all interfaces** (`0.0.0.0` / http.sys `+`). Use `--loopback` to stay on `127.0.0.1` only.
+- `mcp on` and `remote on` cannot run at the same time (listen XOR). For a human `knkd>` on another LAN PC, see [`REMOTE_SETUP.md`](./REMOTE_SETUP.md). That path is not `kdinit /remote`.
 
 ---
 

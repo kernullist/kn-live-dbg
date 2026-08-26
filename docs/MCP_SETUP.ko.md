@@ -8,6 +8,7 @@
 - 전송: 인프로세스 Streamable HTTP(`http.sys`), 엔드포인트 경로 `/mcp`
 - 기본 포트: `51766`  ·  인증: `mcp on` 때 입력하는 **세션 비밀번호**(재기동 시 유지되지 않음)
 - 기본 노출: **모든 인터페이스**(`0.0.0.0` / http.sys `+`). 로컬만 쓰려면 `--loopback`.
+- `mcp on`과 `remote on`은 동시에 못 켠다(listen XOR). 다른 LAN PC에서 인간 `knkd>`를 쓰려면 [`REMOTE_SETUP.ko.md`](./REMOTE_SETUP.ko.md). 그건 `kdinit /remote`가 아니다.
 
 ---
 

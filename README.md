@@ -33,6 +33,7 @@ kn-live-dbg/
   tools/release.ps1             build and zip release package helper
   tools/validate-timeline-selftest.ps1  driver-free timeline regression check
   tools/validate-console-surface.ps1    driver-free help/completion regression check
+  tools/validate-remote-protocol.ps1    driver-free remote session protocol check
   research/evasion-research-ledger.json  source-to-detector claim ledger
 ```
 
@@ -88,6 +89,7 @@ kn-live-dbg/
 48. Captures Filter Manager volume and instance attachment state in every `!snapshot` through the documented `FltLib` enumeration APIs. Each bounded, strictly parsed record preserves filter, instance, altitude, volume, frame, filesystem, supported-feature, and raw attachment flags, including `FLTFL_IASIM_DETACHED_VOLUME`; failed or partial enumeration leaves explicit incomplete coverage instead of a clean result. Same-boot `!diff` promotes a stable attachment's attached-to-detached transition. It also reports a missing attachment only when attachment and callback coverage are complete, the same volume remains enumerated, and the same minifilter remains registered in the independent kernel callback view. A clean attachment for the same filter, volume, and altitude suppresses the removal signal even when the instance name changes; when altitude is unavailable, the instance name is the fallback discriminator. A different-altitude decoy attachment no longer masks removal. Static detached state, cross-boot comparison, filter unload, volume removal, and incomplete coverage remain non-findings. Imported snapshot JSON must keep attachment/volume/detached counters, coverage state, record tags, and evidence mutually consistent before removal logic can use it. The bundled no-op minifilter fixture and `tools\run-minifilter-detach-e2e.ps1` exercise the supported attach/detach/reattach path and independently validate the raw snapshots plus positive and recovery diffs. This closes the documented Filter Manager view of ABYSSWORKER-style detach behavior; it does not claim full arbitrary device-stack topology or causal attribution.
 49. Quiet kernel surfaces (Phase 2): `!hal` checks PDB-described HalDispatchTable pointer fields; `!hive` walks PDB-described registry hive GetCellRoutine ownership with list-link validation; `!token` inspects process privilege Present/Enabled masks plus TokenType/SessionId/integrity SID and propagates incomplete coverage into `!hunt`; `!etw providers` emits unclassified heuristic diagnostics while `!etw ti-cross` treats silence alone as inconclusive; `!dpc` / `!timer` require PDB-bounded deferred-execution layouts, and `!workitem` explicitly remains incomplete. Snapshot domains include `hal`, `hive`, `dpc-timer`, and token fingerprints under `process-security`.
 50. P0-P2 investigation scanners (no driver ABI change): `!drvobj` / `!devstack` walk DRIVER_OBJECT device stacks; `!module integrity` adds `/disk` `/iat` `/prologue`; `!handles` triages VM/DUP cross-process handles; `!hiddenproc` cross-views ActiveProcessLinks vs SPI vs Toolhelp vs handle owners; `!wdfilter` lists WdFilter RuntimeDriver leftovers; `!inputstack` flags unknown kbd/mou attached drivers; `!vad` annotates ControlArea/FILE_OBJECT section names; `!dma` reports IOMMU firmware and Kernel DMA Protection; `!hv` reports hypervisor presence without `IA32_FEATURE_CONTROL`; `dump-analyze` walks dump DTB with PML4 or PML5; `!byovd` Authenticode is on by default (`/no-sign` skips it).
+51. Optional LAN remote operator session: PC A runs `remote on` (default `0.0.0.0:51767`, session password 5-128 printable ASCII, process-managed firewall rule `knlivedbg-remote`); PC B runs `KnLiveDbg.exe --connect <ipv4>:51767` as a thin `knkd>` with the same Tab tables as the local TUI. Engine, driver, symbols, and dumps stay on A. This is not `kdinit /remote`. See `docs/REMOTE_SETUP.md`.
 
 ## Design Notes
 
@@ -96,6 +98,7 @@ kn-live-dbg/
 - `docs/AI_ASSISTED_WORKFLOWS.md` documents the implemented AI intent router, evidence analysis, command planning, write safety, playbooks, reporting, and operator examples.
 - `docs/FEATURE_PLAN.md` tracks completed feature slices and remaining high-value work such as richer driver-object/device-stack inspection (`!drvobj`/`!devstack`), WNF stabilization, and probe fixtures.
 - `docs/MCP_SERVER_DESIGN.md` covers the in-process MCP server design and security rationale; `docs/MCP_SETUP.md` is the operator guide for starting the server (`mcp on`, all-interface bind, session password) and connecting Claude Code/Desktop. Docs are English-first; Korean translations are the sibling `*.ko.md` files.
+- `docs/REMOTE_SETUP.md` is the operator guide for the LAN `knkd>` session (`remote on` / `KnLiveDbg.exe --connect`). `docs/REMOTE_OPERATOR_SESSION.md` is the design. This is not `kdinit /remote`. `mcp on` and `remote on` cannot run at the same time.
 - `docs/TIMELINE_COMMAND_USAGE.md` documents scenario-based `!timeline` usage for TI, snapshot reconciliation, kernel live callback collection, graphing, JSONL export, and reset workflows. The Korean mirror is `docs/TIMELINE_COMMAND_USAGE.ko.md`.
 
 ## Build
@@ -141,6 +144,7 @@ Driver-free regression checks after a build:
 .\tools\validate-timeline-selftest.ps1 -Configuration Release
 .\tools\validate-mcp-tool-catalog.ps1 -Configuration Release
 .\tools\validate-console-surface.ps1 -Configuration Release
+.\tools\validate-remote-protocol.ps1 -Configuration Release
 .\tools\validate-hunt-clean-host-selftest.ps1
 .\tools\analyze-hunt-clean-host-selftest.ps1
 .\tools\validate-cloudfiles-hunt-e2e-selftest.ps1
@@ -232,7 +236,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. When more than one match remains, the prompt prints an annotated list instead of a bare name grid: the parent command's description and full usage line, then each remaining token with its own syntax and summary. Root listings with many matches stay one line per command (`name` + summary). Examples include `!callbacks <Tab>` for callback scopes plus `disable`/`enable`/`disable-all`/`enable-all`, `!callbacks disable <Tab>` for per-type scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions including `use`/`models`/`save`/`test`, `ai use <Tab>` for presets and frontier OpenRouter model IDs, `ai models <Tab>` for `refresh` plus curated IDs, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `ai config model <Tab>` for the same model catalog, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `disable`, `enable`, `disable-all`, `enable-all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
+The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. The `--connect` client uses the same `CompletionHints` tables locally (`ApplyTabCompletion`), including `remote on --loopback` / `--bind` / `--peer`. When more than one match remains, the prompt prints an annotated list instead of a bare name grid: the parent command's description and full usage line, then each remaining token with its own syntax and summary. Root listings with many matches stay one line per command (`name` + summary). Examples include `!callbacks <Tab>` for callback scopes plus `disable`/`enable`/`disable-all`/`enable-all`, `!callbacks disable <Tab>` for per-type scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions including `use`/`models`/`save`/`test`, `ai use <Tab>` for presets and frontier OpenRouter model IDs, `ai models <Tab>` for `refresh` plus curated IDs, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `ai config model <Tab>` for the same model catalog, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `disable`, `enable`, `disable-all`, `enable-all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
 Native `<address|symbol>` parameters accept simple arithmetic before dispatching to memory, type, disassembly, translation, and AI-preview helpers. Examples include `dt nt!_PS_PROTECTION 0xffffb40c8c1540c0+5fa`, `dq nt!PsLoadedModuleList+10`, and `u nt!KiSystemCall64-20`.
 
@@ -259,6 +263,7 @@ kddetach
 version
 drvstatus
 mcp [on [port] [--allow-write] [--loopback] [--bind <addr>]|off|status|client-setup|endpoint]
+remote [on [port] [--loopback] [--bind <ipv4>] [--peer <ipv4>]|off|status|disconnect]
 log [enable|disable|status]
 probe [status|load [sys-path]|info|reset|unload]
 .sympath [path]
@@ -661,6 +666,34 @@ knkd> kddetach
 ```
 
 DbgEng uses `IDebugClient5::AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, ...)` for local mode and `DEBUG_ATTACH_KERNEL_CONNECTION` for `kdinit /remote <connection-options>`. Local mode still follows the limits of Windows local kernel debugging; not every KD command has the same behavior as a remote break-in session. Use native `!dml_proc` when you need a process list without relying on DbgEng current process/thread state or extension exports.
+
+`kdinit /remote` is not the LAN operator session. To use an already-running KnLiveDbg on another PC, see [Remote Operator Session](#remote-operator-session).
+
+## Remote Operator Session
+
+Use this when PC A already has elevated `KnLiveDbg.exe` (and the driver) and you want a `knkd>` on PC B on the same LAN. Full steps: `docs/REMOTE_SETUP.md`.
+
+This is **not** `kdinit /remote` (DbgEng KD attach) and **not** MCP (`mcp on`, port 51766). `mcp on` and `remote on` cannot run at the same time.
+
+```text
+# PC A (elevated knkd>)
+knkd> remote on
+```
+
+Bare `remote on` binds `0.0.0.0:51767`, prompts for a session password (**5-128** printable ASCII, no spaces, not saved), and adds inbound firewall rule `knlivedbg-remote`. `--loopback` stays on `127.0.0.1` with no firewall rule. `--peer <ipv4>` accepts only that client.
+
+```powershell
+# PC B (no elevation, same EXE, no driver)
+.\KnLiveDbg.exe --connect 192.168.1.10:51767
+```
+
+`--connect` runs before cloak, mutex, SCM, and `DeviceClient`. Tab on B uses the same completion tables as the local TUI. `cls` and history are local. `disconnect` / `q` / `quit` / `exit` drop the TCP session; they do not unload A's driver.
+
+B is denied session-lifetime and raw KD commands (`unload`, `mcp`, `kd`, `kdinit`, `backend`, `probe load`, ...). Writes otherwise match the local TUI. Address-only `e*`/`pe*` must include values on the line (`eb <addr> 90`). Dumps land on A's disk.
+
+A's console while listening is a control plane: `off`, `status`, `disconnect`, `write off`, or `q`/`unload` to tear down the process.
+
+Cleartext kernel-command traffic. Isolated lab only. Encrypt later with `ssh -L 51767:127.0.0.1:51767` and `remote on --loopback`.
 
 ## Native `dt`
 
@@ -2199,3 +2232,4 @@ The buffer pattern is `(index * 13 + 0x5a) & 0xff`. `probe info` prints both the
 19. `!wnf data` on the LIST_ENTRY path heuristically locates the `_WNF_DATA_BLOCK` descriptor by scanning the first `0x200` bytes of the matched entry for kernel-canonical pointers whose dereferenced 16-byte header matches the documented `_WNF_DATA_BLOCK` layout (`DataSize @ +0x00`, `AllocatedSize @ +0x04` with `DataSize <= AllocatedSize` and `AllocatedSize <= 0x1000`, `ChangeStamp @ +0x08` UINT64). The slot is consistently at entry `+0x88` on the Win11 builds tested so far, but the walker probes adaptively and emits a per-pointer census diagnostic when no candidate validates so operators can manually identify the slot on different builds. `AllocatedSize` is treated as the user-requested size (not pool-aligned), so no alignment assumption is enforced.
 20. `!wnf` subscriber and owning-process resolution has converged on a working multi-layer view. Each `_WNF_NAME_INSTANCE` exposes a LIST_ENTRY chain at entry `+0x48`; field testing established that this chain is NOT a subscription-only list but a generic per-entry tracked-objects list mixing real WNF subscription records with other process-scope kernel objects (Section / NTFS / SeAt / AlVi / AlRe / PnpY / ObNm / CMNb / DCxx / APpt / DxgK / SLS / Ustm / PcwC / ClfA / SeSd / RvaL / ...). The walker (a) extracts each node's pool tag from `nodeBytes[+0x14]` (POOL_HEADER sits at `+0x10`), (b) classifies nodes by tag (`Ntfc` / `Wnf ` / `WnfN` = real subscriber; everything else = backing/related kernel object), (c) resolves the entry's stable owning EPROCESS from the prefix slot at `node-0x30` (100% recovery rate on entries with at least one chained node in field testing), and (d) attempts shape-only EPROCESS resolution for individual nodes via PDB-resolved `_EPROCESS.UniqueProcessId` (must be 4-aligned, `0 < pid <= 0x100000`) AND `ImageFileName` (must be `>= 3` printable-ASCII chars). Node candidates whose pointer falls within `0x200` bytes of the node itself are rejected to suppress same-chunk false positives. The listing path (`!wnf instances`) prints `chained_nodes=N subscribers=X resolved=Y other_objects=Z tags={Ntfc:N Wnf:N Sect:N ...}` per entry and emits only resolved subscriber lines underneath; single-entry views (`!wnf instance`, `!wnf data`) still print every chained node plus prefix/body hex dumps for deeper RE. Open follow-up: some `Ntfc` / `Wnf ` nodes still fail EPROCESS resolution because their per-record subscriber pointer lives outside the first `0x80` bytes -- the full `_WNF_NAME_SUBSCRIPTION` layout (DeliveryEvent / ContextPointer / callback target slots) is still to be reverse-engineered for `pid=N image="..."` to fire on those records too.
 21. `!wnf` symbolic state-name lookup is not yet wired up. With the canonical state-name slot still under investigation (caveat 18), the printed `state=` field reflects whichever `0x000001030000XXXX` candidate the walker found in the entry head and is not yet stable across runs for the same logical state. Cross-referencing against published WNF state-name databases (e.g. Ionescu wnfdump, leaked LMK string tables) is therefore deferred until caveat 18 is closed. Once the canonical slot is locked down, the planned follow-up is to ship a static well-known-state-name table that decodes recognized state-names alongside the raw hash + lifetime/scope fields.
+22. `remote on` is cleartext TCP on the lab LAN. Stolen password plus LAN reachability is kernel RW. Isolated segment only. This is not `kdinit /remote`.

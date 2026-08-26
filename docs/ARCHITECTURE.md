@@ -18,6 +18,14 @@ Kn Live Dbg follows a LiveKD-style split:
    - Enforces one active controller PID at a time.
 
 2. User-mode TUI
+   - Optional `remote on` listener lets another LAN PC attach with
+     `KnLiveDbg.exe --connect <ipv4>:51767`. The driver, exclusive
+     device handle, and symbols stay on the controller PC. Default
+     bind is `0.0.0.0:51767` with a session password (5-128 printable
+     ASCII) and a process-managed firewall rule. The client Tab prompt
+     uses the same `CompletionHints` tables as the local TUI. See
+     `docs/REMOTE_SETUP.md` and `docs/REMOTE_OPERATOR_SESSION.md`.
+     This is not `kdinit /remote`.
    - Owns driver install/load/unload through SCM.
    - Acquires a process-wide named mutex before touching SCM so only one `KnLiveDbg.exe` instance can run at a time.
    - Displays colored staged lifecycle output for elevation checks, single-instance acquisition, SCM query/install/start, device open, ABI verification, symbol initialization, probe load, and service unload paths.
@@ -422,6 +430,7 @@ Completed hardening items:
 10. LA57 detection and PML5E reporting are implemented in the page-table walker.
 11. DIA fallback is implemented for UDT field metadata when `DbgHelp` fails.
 12. `KnLiveDbgProbe.sys` provides a positive-control contiguous virtual and physical test buffer.
-13. Remote KD attach is available through `kdinit /remote <connection-options>`.
+13. Remote KD attach is available through `kdinit /remote <connection-options>`. That is DbgEng `DEBUG_ATTACH_KERNEL_CONNECTION`, not the LAN `knkd>` session.
 14. AI command proposal validation is versioned as `kn-live-dbg.ai-plan.v2` and rejects missing purpose metadata, command chaining, session mutation, raw `kd` blocked-command wrappers, and unsupported backend expectations.
 15. AI command evidence and transcripts include deterministic output summaries before raw stdout/stderr.
+16. LAN remote operator session (`remote on` / `KnLiveDbg.exe --connect`) is a sibling of MCP: plain TCP `KNR1`, session password, process-managed firewall rule `knlivedbg-remote`, listen XOR with `mcp on`. Operator guide: `docs/REMOTE_SETUP.md`.

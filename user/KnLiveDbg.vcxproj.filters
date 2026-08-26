@@ -58,6 +58,18 @@
     <ClCompile Include="McpSelfTest.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="RemoteFirewall.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="RemoteServer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="RemoteClient.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="RemoteSelfTest.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="DbgEngBackend.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -244,6 +256,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="McpSelfTest.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RemoteFirewall.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RemoteProtocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RemoteServer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="McpJson.h">
