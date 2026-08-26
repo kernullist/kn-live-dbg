@@ -72,6 +72,22 @@ int RunRemoteProtocolSelfTest()
     Check(&ctx, !knremote::SanitizeRemotePassword(L"abcd", &password, &error), L"password-min");
     Check(&ctx, knremote::SanitizeRemotePassword(L"abcde", &password, &error), L"password-ok");
     {
+        const std::wstring colored = L"\x1b[92mok\x1b[0m";
+        const std::wstring quoted = knremote::Quote(colored);
+        std::wstring json = L"{\"stdout\":" + quoted + L"}";
+        std::wstring decoded;
+        Check(&ctx, knremote::GetStringField(json, L"stdout", &decoded), L"color-json-parse");
+        Check(&ctx, decoded == colored, L"color-json-roundtrip");
+        Check(&ctx, quoted.find(L"\\u001b") != std::wstring::npos, L"color-json-esc-escape");
+        const std::string csi = "\x1b[92mhangul";
+        Check(&ctx, knremote::ColorSafeChunkEnd(csi, 0, 2) == 5, L"color-chunk-keeps-csi");
+        Check(
+            &ctx,
+            knremote::StripVtSequences(L"\x1b[92mok\x1b[0m!") == L"ok!",
+            L"strip-vt-sgr");
+        Check(&ctx, knremote::StripVtSequences(L"plain") == L"plain", L"strip-vt-plain");
+    }
+    {
         const DWORD started = GetTickCount() - 50;
         Check(&ctx, knremote::IntervalElapsed(started, 10), L"interval-elapsed");
         Check(&ctx, knremote::DeadlineReached(GetTickCount() - 1), L"deadline-reached");

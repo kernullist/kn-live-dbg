@@ -71,6 +71,123 @@ namespace knremote
         return end;
     }
 
+    // Do not split an ESC CSI sequence across command-result chunks.
+    inline size_t ColorSafeChunkEnd(const std::string& utf8, size_t offset, size_t maxBytes)
+    {
+        const size_t end = Utf8ChunkEnd(utf8, offset, maxBytes);
+        if (end <= offset)
+        {
+            return end;
+        }
+
+        size_t lastEsc = std::string::npos;
+        for (size_t i = offset; i < end; ++i)
+        {
+            if (static_cast<unsigned char>(utf8[i]) == 0x1b)
+            {
+                lastEsc = i;
+            }
+        }
+        if (lastEsc == std::string::npos)
+        {
+            return end;
+        }
+
+        bool terminated = false;
+        for (size_t i = lastEsc + 1; i < end; ++i)
+        {
+            const unsigned char ch = static_cast<unsigned char>(utf8[i]);
+            if (ch == 0x5B)
+            {
+                continue;
+            }
+            if (ch >= 0x40 && ch <= 0x7E)
+            {
+                terminated = true;
+                break;
+            }
+        }
+        if (terminated)
+        {
+            return end;
+        }
+        if (lastEsc > offset)
+        {
+            return lastEsc;
+        }
+
+        size_t limit = offset + 16;
+        if (limit > utf8.size())
+        {
+            limit = utf8.size();
+        }
+        for (size_t i = offset + 1; i < limit; ++i)
+        {
+            const unsigned char ch = static_cast<unsigned char>(utf8[i]);
+            if (ch == 0x5B)
+            {
+                continue;
+            }
+            if (ch >= 0x40 && ch <= 0x7E)
+            {
+                return i + 1;
+            }
+        }
+        return end;
+    }
+
+    // ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004). False on pipes/files.
+    inline bool EnableVirtualTerminalHandle(HANDLE handle)
+    {
+        DWORD mode = 0;
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        if (!GetConsoleMode(handle, &mode))
+        {
+            return false;
+        }
+        return SetConsoleMode(handle, mode | 0x0004) != FALSE;
+    }
+
+    inline bool EnableVirtualTerminalConsoles()
+    {
+        const bool outOk = EnableVirtualTerminalHandle(GetStdHandle(STD_OUTPUT_HANDLE));
+        const bool errOk = EnableVirtualTerminalHandle(GetStdHandle(STD_ERROR_HANDLE));
+        return outOk || errOk;
+    }
+
+    // Drop CSI SGR (and other CSI) so piped/file output stays readable.
+    inline std::wstring StripVtSequences(const std::wstring& text)
+    {
+        std::wstring out;
+        out.reserve(text.size());
+        for (size_t i = 0; i < text.size(); ++i)
+        {
+            if (text[i] != 0x1b)
+            {
+                out.push_back(text[i]);
+                continue;
+            }
+            if (i + 1 < text.size() && text[i + 1] == L'[')
+            {
+                i += 2;
+                while (i < text.size())
+                {
+                    const wchar_t ch = text[i];
+                    if (ch >= 0x40 && ch <= 0x7E)
+                    {
+                        break;
+                    }
+                    ++i;
+                }
+                continue;
+            }
+        }
+        return out;
+    }
+
     inline uint64_t UnixTimeMs()
     {
         FILETIME ft = {};
@@ -484,6 +601,42 @@ namespace knremote
                     else if (next == L't')
                     {
                         out.push_back(L'\t');
+                    }
+                    else if (next == L'u')
+                    {
+                        if (pos + 4 > json.size())
+                        {
+                            break;
+                        }
+                        unsigned int codepoint = 0;
+                        bool hexOk = true;
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            const wchar_t hex = json[pos++];
+                            codepoint <<= 4;
+                            if (hex >= L'0' && hex <= L'9')
+                            {
+                                codepoint += static_cast<unsigned int>(hex - L'0');
+                            }
+                            else if (hex >= L'a' && hex <= L'f')
+                            {
+                                codepoint += static_cast<unsigned int>(hex - L'a' + 10);
+                            }
+                            else if (hex >= L'A' && hex <= L'F')
+                            {
+                                codepoint += static_cast<unsigned int>(hex - L'A' + 10);
+                            }
+                            else
+                            {
+                                hexOk = false;
+                                break;
+                            }
+                        }
+                        if (!hexOk)
+                        {
+                            break;
+                        }
+                        out.push_back(static_cast<wchar_t>(codepoint));
                     }
                     else
                     {
