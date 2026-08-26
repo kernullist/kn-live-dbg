@@ -1127,7 +1127,7 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
             {
                 while (offset < utf8.size())
                 {
-                    const size_t end = knremote::Utf8ChunkEnd(
+                    const size_t end = knremote::ColorSafeChunkEnd(
                         utf8,
                         offset,
                         knremote::kResultChunkBytes);

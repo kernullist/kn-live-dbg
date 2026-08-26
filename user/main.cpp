@@ -200,8 +200,37 @@ private:
     bool active_;
 };
 
+static std::wstring VtForegroundPrefix(WORD color)
+{
+    const WORD fg = static_cast<WORD>(color & 0x0f);
+    int index = 0;
+    if ((fg & FOREGROUND_RED) != 0)
+    {
+        index |= 1;
+    }
+    if ((fg & FOREGROUND_GREEN) != 0)
+    {
+        index |= 2;
+    }
+    if ((fg & FOREGROUND_BLUE) != 0)
+    {
+        index |= 4;
+    }
+    const int sgr = ((fg & FOREGROUND_INTENSITY) != 0) ? (90 + index) : (30 + index);
+    wchar_t buffer[16] = {};
+    swprintf_s(buffer, L"\x1b[%dm", sgr);
+    return buffer;
+}
+
 static void PrintColoredText(const std::wstring& text, WORD color)
 {
+    // Local TUI colors the console attribute. Remote capture only sees the
+    // character stream, so embed VT SGR when origin is remote.
+    if (g_RemoteOriginActive.load())
+    {
+        std::wcout << VtForegroundPrefix(color) << text << L"\x1b[0m";
+        return;
+    }
     ScopedConsoleColor scopedColor(GetStdHandle(STD_OUTPUT_HANDLE), color);
     std::wcout << text;
 }
@@ -52358,6 +52387,7 @@ int wmain(int argc, wchar_t** argv)
     // capture's chain (which would silently drop the tee on the next
     // capture's destructor).
     InstallOutputTee();
+    knremote::EnableVirtualTerminalConsoles();
     CommandRegistry::SetColorPrinter(PrintCommandRegistryColoredText);
 
     if (argc >= 2 && ToLower(argv[1]) == L"--self-test")

@@ -156,13 +156,39 @@ namespace
         return ok;
     }
 
+    void WriteRemoteText(
+        std::wostream& stream,
+        const std::wstring& text,
+        bool vtEnabled,
+        const wchar_t* wrapOn)
+    {
+        const std::wstring body = vtEnabled ? text : knremote::StripVtSequences(text);
+        if (body.empty())
+        {
+            return;
+        }
+        if (vtEnabled && wrapOn != nullptr)
+        {
+            stream << wrapOn << body << L"\x1b[0m";
+        }
+        else
+        {
+            stream << body;
+        }
+        if (body.back() != L'\n')
+        {
+            stream << L"\n";
+        }
+    }
+
     void DrawRemoteLine(
         HANDLE output,
         COORD start,
         const wchar_t* prompt,
         const std::wstring& line,
         size_t cursor,
-        size_t* rendered)
+        size_t* rendered,
+        bool colorPrompt)
     {
         CONSOLE_SCREEN_BUFFER_INFO info = {};
         if (!GetConsoleScreenBufferInfo(output, &info))
@@ -178,7 +204,18 @@ namespace
         DWORD written = 0;
         if (prompt != nullptr && promptLen > 0)
         {
-            WriteConsoleW(output, prompt, static_cast<DWORD>(promptLen), &written, nullptr);
+            if (colorPrompt)
+            {
+                const wchar_t colorOn[] = L"\x1b[96m";
+                const wchar_t colorOff[] = L"\x1b[0m";
+                WriteConsoleW(output, colorOn, 5, &written, nullptr);
+                WriteConsoleW(output, prompt, static_cast<DWORD>(promptLen), &written, nullptr);
+                WriteConsoleW(output, colorOff, 4, &written, nullptr);
+            }
+            else
+            {
+                WriteConsoleW(output, prompt, static_cast<DWORD>(promptLen), &written, nullptr);
+            }
         }
         if (!line.empty())
         {
@@ -291,7 +328,9 @@ namespace
         SOCKET sock,
         DWORD* lastHeartbeat,
         bool* disconnected,
-        std::wstring* error)
+        std::wstring* error,
+        bool stdoutVt,
+        bool stderrVt)
     {
         bool ok = false;
         HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -346,7 +385,7 @@ namespace
             std::wstring draft;
             bool hasDraft = false;
 
-            DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+            DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
 
             while (true)
             {
@@ -373,29 +412,22 @@ namespace
                 {
                     std::wstring code;
                     knremote::GetStringField(incoming, L"code", &code);
-                    std::wcerr << L"error: " << code << L"\n";
+                    WriteRemoteText(std::wcerr, L"error: " + code, stderrVt, L"\x1b[91m");
                     GetConsoleScreenBufferInfo(output, &info);
                     start = info.dwCursorPosition;
                     rendered = 0;
-                    DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                    DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     continue;
                 }
                 if (kind == IncomingKind::CommandResult)
                 {
                     std::wstring stdoutText;
                     knremote::GetStringField(incoming, L"stdout", &stdoutText);
-                    if (!stdoutText.empty())
-                    {
-                        std::wcout << stdoutText;
-                        if (stdoutText.back() != L'\n')
-                        {
-                            std::wcout << L"\n";
-                        }
-                    }
+                    WriteRemoteText(std::wcout, stdoutText, stdoutVt, nullptr);
                     GetConsoleScreenBufferInfo(output, &info);
                     start = info.dwCursorPosition;
                     rendered = 0;
-                    DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                    DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     continue;
                 }
 
@@ -427,7 +459,7 @@ namespace
                         }
                         *line = (*history)[historyIndex];
                         cursor = line->size();
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else if (extended == 80 && history != nullptr)
                     {
@@ -447,34 +479,34 @@ namespace
                             *line = hasDraft ? draft : L"";
                         }
                         cursor = line->size();
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else if (extended == 75 && cursor > 0)
                     {
                         --cursor;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else if (extended == 77 && cursor < line->size())
                     {
                         ++cursor;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else if (extended == 71)
                     {
                         cursor = 0;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else if (extended == 79)
                     {
                         cursor = line->size();
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else if (extended == 83 && cursor < line->size())
                     {
                         line->erase(cursor, 1);
                         historyIndex = history != nullptr ? history->size() : 0;
                         hasDraft = false;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     continue;
                 }
@@ -493,7 +525,7 @@ namespace
                         cursor = 0;
                         historyIndex = history != nullptr ? history->size() : 0;
                         hasDraft = false;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                         continue;
                     }
                     std::wcout << L"^C\n";
@@ -515,13 +547,13 @@ namespace
                         GetConsoleScreenBufferInfo(output, &info);
                         start = info.dwCursorPosition;
                         rendered = 0;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else if (changed)
                     {
                         historyIndex = history != nullptr ? history->size() : 0;
                         hasDraft = false;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     else
                     {
@@ -537,7 +569,7 @@ namespace
                         --cursor;
                         historyIndex = history != nullptr ? history->size() : 0;
                         hasDraft = false;
-                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                        DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                     }
                     continue;
                 }
@@ -547,7 +579,7 @@ namespace
                     ++cursor;
                     historyIndex = history != nullptr ? history->size() : 0;
                     hasDraft = false;
-                    DrawRemoteLine(output, start, prompt, *line, cursor, &rendered);
+                    DrawRemoteLine(output, start, prompt, *line, cursor, &rendered, stdoutVt);
                 }
             }
         } while (false);
@@ -568,6 +600,9 @@ int RemoteClientMain(int argc, wchar_t** argv)
     }
 
     WSADATA wsa = {};
+    const bool stdoutVt = knremote::EnableVirtualTerminalHandle(GetStdHandle(STD_OUTPUT_HANDLE));
+    const bool stderrVt = knremote::EnableVirtualTerminalHandle(GetStdHandle(STD_ERROR_HANDLE));
+
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
     {
         std::wcerr << L"WSAStartup failed\n";
@@ -685,15 +720,19 @@ int RemoteClientMain(int argc, wchar_t** argv)
         knremote::GetBoolField(helloJson, L"cloak", &cloak);
         knremote::GetBoolField(helloJson, L"cleartext", &cleartext);
 
-        std::wcout << L"connected " << hostname << L" " << os
-                   << L" abi=" << abi
-                   << L" write=" << (writeMode ? L"on" : L"off")
-                   << L" cloak=" << (cloak ? L"yes" : L"no")
-                   << L" cleartext=" << (cleartext ? L"true" : L"false")
-                   << L"\n";
+        std::wstring connected = L"connected " + hostname + L" " + os +
+            L" abi=" + std::to_wstring(abi) +
+            L" write=" + std::wstring(writeMode ? L"on" : L"off") +
+            L" cloak=" + std::wstring(cloak ? L"yes" : L"no") +
+            L" cleartext=" + std::wstring(cleartext ? L"true" : L"false");
+        WriteRemoteText(std::wcout, connected, stdoutVt, L"\x1b[96m");
         if (cleartext)
         {
-            std::wcout << L"warning: session is cleartext; lab LAN only\n";
+            WriteRemoteText(
+                std::wcout,
+                L"warning: session is cleartext; lab LAN only",
+                stdoutVt,
+                L"\x1b[93m");
         }
 
         uint32_t nextId = 2;
@@ -711,7 +750,9 @@ int RemoteClientMain(int argc, wchar_t** argv)
                     sock,
                     &lastHeartbeat,
                     &disconnected,
-                    &error))
+                    &error,
+                    stdoutVt,
+                    stderrVt))
             {
                 exitCode = disconnected ? 5 : 0;
                 break;
@@ -805,7 +846,7 @@ int RemoteClientMain(int argc, wchar_t** argv)
                 {
                     std::wstring code;
                     knremote::GetStringField(msg, L"code", &code);
-                    std::wcerr << L"error: " << code << L"\n";
+                    WriteRemoteText(std::wcerr, L"error: " + code, stderrVt, L"\x1b[91m");
                     done = true;
                     continue;
                 }
@@ -817,22 +858,8 @@ int RemoteClientMain(int argc, wchar_t** argv)
                     knremote::GetStringField(msg, L"stdout", &stdoutText);
                     knremote::GetStringField(msg, L"stderr", &stderrText);
                     knremote::GetBoolField(msg, L"last", &last);
-                    if (!stdoutText.empty())
-                    {
-                        std::wcout << stdoutText;
-                        if (stdoutText.back() != L'\n')
-                        {
-                            std::wcout << L"\n";
-                        }
-                    }
-                    if (!stderrText.empty())
-                    {
-                        std::wcerr << stderrText;
-                        if (stderrText.back() != L'\n')
-                        {
-                            std::wcerr << L"\n";
-                        }
-                    }
+                    WriteRemoteText(std::wcout, stdoutText, stdoutVt, nullptr);
+                    WriteRemoteText(std::wcerr, stderrText, stderrVt, L"\x1b[91m");
                     if (last)
                     {
                         done = true;

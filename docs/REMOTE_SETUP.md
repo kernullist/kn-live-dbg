@@ -114,6 +114,7 @@ Reconnect is a new session. Type the password again.
 | Input | Behavior |
 |-------|----------|
 | Tab | Same `CompletionHints` tables as the local TUI (`ApplyTabCompletion`). Ambiguous prefixes print the annotated listing. Does **not** wait on A. |
+| color | Command output uses the same colors as A's TUI on a real console. If stdout is a pipe/file, B strips VT and prints plain text. |
 | Up / Down | Local history |
 | `cls` | Local screen clear. Not sent to A. |
 | `disconnect` / `q` / `quit` / `exit` | Protocol disconnect. Exit code 0. B cannot unload A's driver. |

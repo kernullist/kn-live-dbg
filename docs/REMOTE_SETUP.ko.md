@@ -114,6 +114,7 @@ knkd>
 | 입력 | 동작 |
 |------|------|
 | Tab | 로컬 TUI와 같은 `CompletionHints` 테이블(`ApplyTabCompletion`). 모호한 prefix는 annotated listing. **A를 기다리지 않음.** |
+| 색 | 실제 콘솔에서는 A TUI와 같은 색. stdout이 파이프/파일이면 B가 VT를 걷어내고 평문만 출력한다. |
 | Up / Down | 로컬 history |
 | `cls` | 로컬 화면 지우기. A로 안 보냄. |
 | `disconnect` / `q` / `quit` / `exit` | 프로토콜 disconnect. exit code 0. B는 A 드라이버를 unload하지 못함. |

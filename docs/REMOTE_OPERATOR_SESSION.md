@@ -552,7 +552,8 @@ flowchart TD
 
 ### Client UX on B (implemented)
 
-- `knkd>` line editor: `_getwch`, 로컬 history, 화살표, Home/End. Ctrl+C는 입력 중이면 라인 clear.
+- `knkd>` line editor: `_getwch`, 로컬 history, 화살표, Home/End. Ctrl+C는 입력 중이면 라인 clear. VT prompt 색 (`knkd>`).
+- 명령 출력 색: A `PrintColoredText`가 remote origin이면 VT SGR을 캡처 스트림에 넣는다. B는 콘솔이면 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, 파이프/파일이면 CSI를 스트립한다. JSON `\u001b` round-trip.
 - **Tab은 로컬** `ApplyTabCompletion` / `CollectCompletionCandidates` (`user/CompletionHints.cpp`). A TUI와 **같은 테이블**. 모호한 prefix는 annotated listing. `remote on <Tab>`은 `--loopback` / `--bind` / `--peer`. 클라 Tab은 `completion-request`를 보내지 않는다 (프로토콜 타입은 서버에 남아 있음).
 - `cls`는 클라 로컬. `disconnect` / `q` / `quit` / `exit`는 프로토콜 disconnect (A `HandleCommand`로 안 감).
 - Password: TCP 후 prompt. **5–128** printable ASCII, 공백 없음 (`SanitizeRemotePassword`, `kPasswordMin=5`).
