@@ -35,10 +35,12 @@ Completed core slices:
     password of 5-128 printable ASCII (not persisted) and a
     process-managed inbound firewall rule `knlivedbg-remote`. The client
     Tab prompt uses the same `CompletionHints` tables as the local TUI.
-    Writes match the local TUI. B cannot run `q` / `unload` / `mcp` /
-    `kd` / `probe load`. Address-only `e*`/`pe*` need values on the
-    command line. This is not `kdinit /remote`. Operator guide:
-    `docs/REMOTE_SETUP.md`. Design: `docs/REMOTE_OPERATOR_SESSION.md`.
+    Command output is colored like the local TUI; B strips VT when stdout
+    is a pipe or file. Writes match the local TUI. B cannot run `q`,
+    `unload`, `mcp`, `kd`, or `probe load`. Address-only `e*`/`pe*` need
+    values on the command line. This is not `kdinit /remote`. Operator
+    guide: `docs/REMOTE_SETUP.md`. Design:
+    `docs/REMOTE_OPERATOR_SESSION.md`.
 
 Remaining priority order:
 
