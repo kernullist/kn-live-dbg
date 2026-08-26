@@ -6,8 +6,8 @@
 
 - 서버 이름: `knlivedbg`  ·  서버 버전: `0.1.0`  ·  MCP 프로토콜: `2025-06-18`
 - 전송: 인프로세스 Streamable HTTP(`http.sys`), 엔드포인트 경로 `/mcp`
-- 기본 포트: `51766`  ·  인증: 저장된 값이 없거나 명시적으로 회전할 때만 바뀌는 256-bit bearer 토큰
-- 기본 노출: **loopback 전용**(`127.0.0.1` + `[::1]`). 네트워크 노출은 `--bind`로만 옵트인.
+- 기본 포트: `51766`  ·  인증: `mcp on` 때 입력하는 **세션 비밀번호**(재기동 시 유지되지 않음)
+- 기본 노출: **모든 인터페이스**(`0.0.0.0` / http.sys `+`). 로컬만 쓰려면 `--loopback`.
 
 ---
 
@@ -20,7 +20,7 @@ MCP 서버는 **드라이버를 소유한 elevated KnLiveDbg.exe 안에 인프�
 | `mcp on ...` | **분석 대상 PC/VM**(커널 RW가 일어나는 곳) | KnLiveDbg.exe의 `knkd>` 프롬프트 안 콘솔 명령 |
 | `claude mcp add ...` | **클라이언트 PC**(Claude Code를 돌리는 곳) | 일반 셸 명령 (KnLiveDbg 밖) |
 
-> 서버 PC와 클라이언트 PC가 같으면 loopback으로, 물리적으로 다른 PC면 `--bind`로 네트워크 노출 후 서버 PC의 IP로 연결한다.
+> 서버 PC와 클라이언트 PC가 같으면 `127.0.0.1`로 연결한다. 물리적으로 다른 PC면 `mcp on`이 찍어 주는 listen IP를 쓴다(기본 바인드는 이미 모든 인터페이스).
 
 ---
 
@@ -72,10 +72,12 @@ cd .\x64\Release
 `knkd>` 프롬프트에서 입력한다. 인자 순서는 자유다.
 
 ```text
-mcp on [port] [--allow-write] [--bind <addr>]
+mcp on [port] [--allow-write] [--loopback] [--bind <addr>]
 mcp off        # 서버 중지 (엔진 루프 안에서는 off + Enter)
 mcp status     # 현재 상태
 ```
+
+`mcp on`은 매번 세션용 임시 비밀번호를 두 번 입력받는다. 재기동 후에도 유지되지 않는다.
 
 ### 3.1 옵션
 
@@ -83,43 +85,52 @@ mcp status     # 현재 상태
 |------|------|--------|
 | `<port>` (위치 인자) | 리스닝 포트. `0 < port < 65536`만 적용, 그 외는 무시 | `51766` |
 | `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 10종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
-| `--bind <addr>` | 네트워크 노출. `<addr>`에 추가로 바인드 | 없음 = loopback 전용 |
+| `--loopback` | `127.0.0.1` / `[::1]`만 리스닝 | 끔 = 모든 인터페이스 |
+| `--bind <addr>` | 리스닝 주소 지정. `0.0.0.0` / `*` / `+` = 모든 어댑터, `loopback` = 로컬만, 또는 구체 IP | `0.0.0.0` |
 | `--bind=<addr>` | 위와 동일(붙여 쓰는 형태) | 없음 |
-| `--token <t>` | 16-512자 printable ASCII 고정 bearer 토큰 사용(영속), 자동 관리 토큰 대신 | auto |
-| `--new-token` | 회전: 영속 토큰 폐기 후 새 랜덤 토큰 발급 | off |
 
-`<addr>`에는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0` / `*` / `+`(http.sys 강한 와일드카드 `+`로 매핑)를 줄 수 있다.
+기본 바인드는 **모든 어댑터**(`0.0.0.0`, http.sys 강한 와일드카드 `+`)다. 물리 NIC + Hyper-V/VMware/VPN이 섞인 호스트에서 엉뚱한 어댑터에 붙지 않게 하기 위해서다. 특별한 이유가 없으면 단일 IP로 고정하지 마라.
 
-**권장 재연결 모델 (토큰 붙여넣기 없음):** `mcp on`이 실제 bind 주소와 포트에 맞는 네이티브 Streamable HTTP 스니펫을 갱신한다. 이를 Claude Code, Cursor, Codex, Grok Build에 사용한다. 같은 PC에서는 클라이언트를 시작하기 전에 `%LOCALAPPDATA%\kn-live-dbg\mcp-load-env.ps1`을 dot-source한다. 설정에는 bearer 토큰 원문 대신 `KNLIVEDBG_TOKEN` 참조만 남는다. Claude Desktop 로컬 MCP만 예외다. 원격 connector 연결이 Anthropic 클라우드에서 시작되어 loopback/사설망에 도달하지 못하므로 `tools\mcp-bridge.ps1`을 쓴다.
+클라이언트가 필요한 것은 다음뿐이다.
 
-**토큰 안정성.** bearer 토큰은 **재기동 후에도 유지**(기본은 포트별이 아닌 사용자 단위 파일)되므로 URL이 같으면 네이티브 클라이언트 설정도 계속 유효하다. 결정 순서: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token`(구버전 per-port 파일은 1회 마이그레이션) > 새 랜덤 발급(영속화). 포트나 bind 주소가 바뀌면 갱신된 클라이언트 URL을 적용한다. `--new-token` 후에는 네이티브 클라이언트가 `KNLIVEDBG_TOKEN`을 다시 읽고 재연결해야 한다. Claude Desktop/구형 클라이언트도 재시작해 새 브리지 프로세스가 endpoint 파일을 다시 읽게 해야 한다.
+1. `mcp on`이 찍어 주는 listen IP 하나
+2. 포트
+3. 세션 비밀번호 (`Authorization: Bearer <password>`)
 
-### 3.2 로컬(loopback) — 같은 PC
+같은 PC의 Desktop/구형 클라이언트는 이번 세션용 endpoint 파일과 `tools\mcp-bridge.ps1`을 그대로 쓸 수 있다.
+
+### 3.2 기본 — 모든 인터페이스
 
 ```text
 knkd> mcp on
+MCP password: ********
+Confirm password: ********
 ```
 
 출력 예:
 
 ```text
-MCP server started (loopback Streamable HTTP).
-  url      : http://127.0.0.1:51766/mcp
-  token    : 3f9c... (REUSED)
-  tokenFile: %LOCALAPPDATA%\kn-live-dbg\mcp-token
-  endpoint : %LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json  (Desktop/legacy bridge state)
+MCP server started (all interfaces Streamable HTTP).
+  listen   : 0.0.0.0:51766
+  port     : 51766
+  password : lab-pass  (session only, not saved)
   write    : disabled (read-only)
 
-  Native HTTP client files refreshed (no npx):
-    snippets: %LOCALAPPDATA%\kn-live-dbg\clients
-    separate client launch shell: . "$env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1"
+  Client connection (IP + port + password):
+    URL    : http://<ip>:51766/mcp
+    Header : Authorization: Bearer lab-pass
+
+  Addresses on this host:
+    127.0.0.1        loopback
+    192.168.56.10    Ethernet
+    172.24.80.1      vEthernet (Default Switch)
 ```
 
-이 시점부터 콘솔은 **MCP 엔진 루프**다. 중지하려면 `off` + Enter.
+이 시점부터 콘솔은 **MCP 엔진 루프**다. 중지하려면 `off` + Enter. 다음 `mcp on`에서 비밀번호를 다시 정한다.
 
 ### 3.2.1 클라이언트 등록 (네이티브 HTTP 권장)
 
-`mcp on`은 현재 URL로 스니펫을 자동 갱신한다. MCP 엔진 루프가 도는 동안 KnLiveDbg 콘솔은 `off`와 `status`만 받으므로, 생성된 파일은 **별도 PowerShell**에서 사용한다. 일반 REPL 상태(`mcp on` 전 또는 `off` 후)에서는 `mcp client-setup`으로 마지막 저장 설정을 출력할 수 있다:
+`mcp on`은 현재 URL로 스니펫을 갱신한다. 비밀번호는 세션용이다. 다시 `mcp on`하면 새 비밀번호가 필요하고, `mcp off`는 endpoint 파일에서 지운다. MCP 엔진 루프가 도는 동안 KnLiveDbg 콘솔은 `off`와 `status`만 받으므로, 생성된 파일은 **별도 PowerShell**에서 사용한다. 일반 REPL 상태(`mcp on` 전 또는 `off` 후)에서는 `mcp client-setup`으로 마지막 저장 설정을 출력할 수 있다:
 
 ```text
 knkd> mcp client-setup
@@ -142,71 +153,63 @@ knkd> mcp client-setup legacy
 | **Grok Build** | `clients\grok-http.powershell.txt` 실행 또는 `clients\grok-config.toml.snippet` 추가 |
 | **구형 stdio 전용 클라이언트** | 호환 폴백으로 `clients\legacy-stdio-mcp.json` 병합 |
 
-네이티브 클라이언트를 실행할 별도 PowerShell에서:
+같은 PC 헬퍼: `mcp-load-env.ps1`이 라이브 endpoint를 읽어 `KNLIVEDBG_TOKEN`에 **세션 비밀번호**를 넣는다. 원격 클라이언트는 `Authorization: Bearer <password>`로 비밀번호를 직접 넣는다.
 
 ```powershell
 . $env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1
-# 이 셸에서 클라이언트를 시작하거나 재시작한다.
+# 이 셸에서 클라이언트를 시작하거나 재시작한다(같은 PC만).
 ```
 
-같은 URL로 일반 재기동할 때는 안정 토큰 덕분에 설정을 수정할 필요가 없다. 포트나 bind 주소를 바꾸면 갱신된 네이티브 URL 스니펫을 적용한다. `mcp on --new-token`으로 명시 회전한 뒤에는 env loader를 다시 실행하고 네이티브 클라이언트를 재시작/재연결한다. Claude Desktop과 구형 클라이언트도 재시작해야 한다. 브리지는 HTTP 재연결마다가 아니라 프로세스 시작 시 URL과 토큰을 한 번 읽는다.
+### 3.3 원격 — 분리된 PC/VM
 
-### 3.3 원격(`--bind`) — 분리된 PC/VM
+기본 `mcp on`이 이미 모든 어댑터에서 듣는다. 출력된 목록에서 클라이언트가 실제로 닿는 IP를 고른다(이더넷/Wi-Fi. Hyper-V/VPN NIC는 그 경로일 때만).
 
-서버 PC에서 LAN IP를 먼저 확인한다:
+```text
+knkd> mcp on
+```
+
+다른 머신에서:
+
+```text
+URL    : http://192.168.56.10:51766/mcp
+Header : Authorization: Bearer <세션-비밀번호>
+```
+
+`--loopback`은 로컬만. `--bind 192.168.56.10`은 단일 IP 고정(멀티 NIC에서는 피하라).
+
+원격 클라이언트가 타임아웃이면 해당 포트 인바운드를 연다:
 
 ```powershell
-ipconfig    # 예: 192.168.56.10
+New-NetFirewallRule -DisplayName "KnLiveDbg MCP" -Direction Inbound -Protocol TCP -LocalPort 51766 -Action Allow
 ```
-
-그 IP로 바인드:
-
-```text
-knkd> mcp on 51766 --bind 192.168.56.10
-```
-
-출력에 `remote:` 줄과 네트워크 노출 경고가 추가로 찍힌다. 클라이언트는 이 `remote:` URL과 토큰을 쓴다.
-
-```text
-MCP server started (NETWORK Streamable HTTP).
-  url   : http://127.0.0.1:51766/mcp
-  remote: http://192.168.56.10:51766/mcp
-  token : <복사해서 클라이언트에 사용>
-  ...
-  WARNING: this elevated kernel read/write endpoint is now reachable over the
-           network. The bearer token is the ONLY barrier. Restrict access with a
-           firewall rule (allow only the client IP) and use a trusted lab segment.
-```
-
-> `--bind 0.0.0.0`(전체 인터페이스)을 쓰면 어느 인터페이스 IP로 접속할지 도구가 알 수 없어 URL에 `<this-host-ip>` 플레이스홀더를 찍는다. 가능하면 **구체 IP를 지정**하라.
 
 ### 3.4 Write 모드
 
 ```text
-knkd> mcp on 51766 --allow-write --bind 192.168.56.10
+knkd> mcp on 51766 --allow-write
 ```
 
 - 읽기 전용(기본): 엔진 진입 시 `SetWriteMode(false)`로 **커널 write 플래그 자체를 비무장**한다. write 툴은 등록되지 않으며, 호출 시 `writes are disabled; start the MCP server with --allow-write (lab mode)`로 거부된다.
 - `--allow-write`: write 툴 10종이 노출되고 `SetWriteMode(true)`로 커널 write가 무장된다. 커널 메모리 write는 preflight/backup/verify-diff/audit 레일을 타고, 파일/링 작업은 backup/verify가 의미 없는 경우에도 게이트·감사·경고를 유지한다(인터랙티브 확인은 생략).
-- **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. `--new-token`을 함께 쓰거나 `--token`/`KNLIVEDBG_TOKEN` 값을 바꾸지 않는 한 저장된 토큰은 그대로 유지된다.
+- **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. `mcp on`을 다시 하면 세션 비밀번호도 다시 입력한다.
 - **권고**: write 세션 전 VM 스냅샷을 찍고, 분석 baseline(`snapshot.capture`)을 캡처하라. 격리 VM 전용이며 라이브 EDR/AC 박스에서는 절대 쓰지 않는다.
 
 ---
 
 ## 4. MCP 클라이언트 연결 (클라이언트 PC)
 
-서버 콘솔이 출력한 **정확한 url/token**을 사용한다. 서버는 streamable HTTP를 쓰므로 `http` 전송을 지원하는 MCP 클라이언트는 바로 붙고, stdio만 지원하는 클라이언트는 `mcp-remote` 브리지를 쓴다.
+서버 콘솔이 출력한 **IP + port + 세션 비밀번호**를 사용한다. 서버는 streamable HTTP를 쓰므로 `http` 전송을 지원하는 MCP 클라이언트는 바로 붙고, stdio만 지원하는 클라이언트는 `mcp-remote` 브리지를 쓴다.
 
 ### 4.1 Claude Code
 
 ```bash
 # 로컬(같은 PC)
 claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
-  --header "Authorization: Bearer <서버가_찍어준_token>"
+  --header "Authorization: Bearer <세션-비밀번호>"
 
-# 원격(분리된 PC/VM) - 서버 PC의 IP 사용
+# 원격(분리된 PC/VM) - mcp on이 찍어 준 listen IP 사용
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
-  --header "Authorization: Bearer <서버가_찍어준_token>"
+  --header "Authorization: Bearer <세션-비밀번호>"
 ```
 
 연결 확인:
@@ -230,7 +233,7 @@ claude mcp list
 }
 ```
 
-> Claude Code는 시작 환경에서 `${KNLIVEDBG_TOKEN}`을 읽는다. 같은 PC에서는 Claude Code를 시작하기 전에 `mcp-load-env.ps1`을 dot-source한다. 명시 토큰 회전 후에는 환경을 다시 읽고 재연결한다. 최신 Claude Code에는 브리지가 필요 없다.
+> `${KNLIVEDBG_TOKEN}`은 **세션 비밀번호**다(저장된 256-bit 토큰이 아님). 같은 PC에서는 Claude Code를 시작하기 전에 `mcp-load-env.ps1`을 dot-source한다. `mcp on`을 다시 하면 환경을 다시 읽는다(비밀번호가 바뀜). 최신 Claude Code에는 브리지가 필요 없다.
 
 유용한 노브: per-server `timeout`(ms, 서버의 30초 엔진 한도보다 크게 유지), `headersHelper`(접속 시 회전 토큰 발급), `alwaysLoad`.
 
@@ -450,17 +453,17 @@ CLI 등가(stdio용 `--command`/`--args`가 아니라 `--url`/`--header` 사용)
 
 ```bash
 hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
-  --header "Authorization: Bearer <서버가_찍어준_token>"
+  --header "Authorization: Bearer <세션-비밀번호>"
 ```
 
 - Hermes는 시작 시 `config.yaml`을 한 번만 읽으므로 편집 후 **Hermes 재시작**. `hermes mcp list`로 확인(`knlivedbg`가 connected). 헤더 env 보간은 보장되지 않아 보통 토큰 원문이 YAML에 들어가므로, 파일을 비밀로 다루고 커밋하지 말 것.
 - 빌드가 오래돼 `url`을 거부하면 `tools/mcp-bridge.ps1`을 사용한다. 이 스크립트는 `mcp-remote` 버전을 고정하고 로컬 HTTP 허용 및 HTTP-only 전송 플래그를 명시한다. Windows에서는 PATH에 Node/`npx`가 있어야 한다. 출처: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
 
-### 4.11 토큰 취급 주의
+### 4.11 비밀번호 취급 주의
 
-- 토큰은 커널 RW 엔드포인트를 인증한다. **project-scope `.mcp.json`에 평문으로 붙여넣어 커밋하지 말 것.** user-scope 설정 + `${KNLIVEDBG_TOKEN}` 환경변수를 쓴다.
-- 토큰은 **재기동해도 유지**된다(§3.1): 클라이언트를 한 번 등록하면 매 `mcp on`마다 다시 추가할 필요 없다. `--new-token`(회전) 또는 다른 `--token`/`KNLIVEDBG_TOKEN`을 줄 때만 바뀌므로, 그때만 클라이언트를 갱신한다.
-- env 기반 end-to-end 안정성을 원하면 **서버 호스트(서버가 읽음, 우선순위 #2)와 클라이언트 양쪽에** 동일한 `KNLIVEDBG_TOKEN`을 설정한다 — 그러면 토큰이 디스크에 전혀 남지 않는다.
+- 세션 비밀번호가 커널 RW 엔드포인트를 인증한다. **project-scope `.mcp.json`에 붙여넣어 커밋하지 말 것.**
+- **재기동해도 유지되지 않는다.** `mcp on`마다 새 비밀번호를 묻고, `mcp off`는 endpoint 파일에서 지운다. 기동할 때마다 클라이언트 헤더를 갱신하거나 `mcp-load-env.ps1`을 다시 읽는다.
+- 스니펫 env 이름 `KNLIVEDBG_TOKEN`의 값은 **세션 비밀번호**다. 같은 PC는 `mcp-load-env.ps1`이 넣고, 원격은 출력된 비밀번호를 env에 넣거나 `Authorization: Bearer <password>`를 직접 쓴다.
 
 ---
 
@@ -468,12 +471,12 @@ hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
 
 서버는 JSON-RPC 처리 전에 다음 전송 게이트를 통과시킨다:
 
-1. **Bearer 토큰**(상수 시간 비교): `Authorization: Bearer <token>` 불일치 시 401. 실제 인증 경계.
-2. **Host 검사**: loopback 전용 모드(기본)에서는 Host가 `127.0.0.1`/`localhost`/`[::1]`/`::1`이 아니면 403(DNS-rebinding 방어). `--bind` 원격 모드에서는 이 검사를 건너뛴다(원격 Host 수용).
+1. **세션 비밀번호**(상수 시간 비교): `Authorization: Bearer <password>` 불일치 시 401. Bearer 없는 원문 비밀번호도 받는다. 실제 인증 경계.
+2. **Host 검사**: `--loopback`에서는 Host가 `127.0.0.1`/`localhost`/`[::1]`/`::1`이 아니면 403(DNS-rebinding 방어). 기본 전체 인터페이스 바인드(또는 구체 `--bind` IP)에서는 이 검사를 건너뛴다.
 3. **Origin 검사**: Origin 헤더가 **존재하는데** loopback authority가 아니면 403. 부재/빈 Origin은 허용(비브라우저 MCP 클라이언트는 Origin 미전송). **이 검사는 바인드 모드와 무관하게 항상 적용**되어 DNS-rebinding을 막는다.
 4. **Write 게이트**: `--allow-write` 없이는 write 툴 미노출 + 커널 플래그 비무장.
 
-원격 노출 시 토큰이 유일한 장벽이므로, 서버 PC 방화벽에서 **클라이언트 IP만 인바운드 허용**을 권장한다(관리자 PowerShell):
+원격 노출 시 세션 비밀번호가 유일한 장벽이므로, 서버 PC 방화벽에서 **클라이언트 IP만 인바운드 허용**을 권장한다(관리자 PowerShell):
 
 ```powershell
 New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
@@ -630,10 +633,10 @@ claude mcp list                      # connected 확인
 
 | 증상 | 원인 / 해결 |
 |------|-------------|
-| 연결이 401 | 토큰 불일치. 네이티브 클라이언트는 `KNLIVEDBG_TOKEN`을 다시 읽고 재연결한다. Claude Desktop/구형 클라이언트는 브리지를 재시작해 보호된 endpoint 파일을 다시 읽게 한다. |
-| 연결이 403 | (로컬) loopback이 아닌 Host로 접속 → 원격이면 `--bind` 필요 / (양쪽) Origin이 비-loopback인 브라우저 컨텍스트 |
-| 원격에서 접속 불가(타임아웃) | 방화벽 인바운드 차단. `New-NetFirewallRule`로 포트/클라이언트 IP 허용. 서버가 `--bind <IP>`로 떴는지 확인 |
-| `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write [--bind <addr>]`로 재기동. 명시적으로 회전하거나 덮어쓰지 않는 한 저장된 토큰은 유지됨 |
+| 연결이 401 | 비밀번호 불일치. `mcp on`에서 입력한 세션 비밀번호를 `Authorization: Bearer <password>`로 쓴다. `mcp on`을 다시 하면 비밀번호가 바뀐다. |
+| 연결이 403 | `--loopback`인데 loopback이 아닌 Host로 접속했거나, Origin이 비-loopback인 브라우저 컨텍스트 |
+| 원격에서 접속 불가(타임아웃) | 방화벽 인바운드 차단. `New-NetFirewallRule`로 포트/클라이언트 IP 허용. `mcp on`이 찍어 준 IP로 접속 중인지 확인(기본은 모든 인터페이스) |
+| `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write`로 재기동. `mcp on`을 다시 하면 세션 비밀번호도 다시 입력한다. |
 | `engine busy; retry shortly` 또는 `engine timeout` | tools/call은 JSON-RPC 에러코드가 아니라 `isError:true` CallToolResult로 옴. 대기 큐(8개) 포화 시 `engine busy`(audit `engine-busy`), 30초 엔진 대기 초과 시 `engine timeout`(audit `tool-error`). 큐가 비면 재시도하거나 `limit`/`count`로 범위를 줄이거나 나눈다. 클라이언트 timeout을 키워도 서버 한도는 늘지 않는다. (`-32603`은 `resources/read` 혼잡 경로에서만 발생) |
 | 드라이버 로드 실패 | 테스트 서명 미활성 → `bcdedit /set testsigning on` 후 재부팅 / 비-elevated 실행 |
 | `symType=0 (SymNone)` | 심볼 DLL 묶음을 EXE 옆에 두지 않음(2.1 참고) |
@@ -644,15 +647,15 @@ claude mcp list                      # connected 확인
 
 ```text
 # 서버(VM/대상 PC, knkd> 프롬프트)
-mcp on                                   # 로컬, 읽기 전용
-mcp on 51766 --bind 192.168.56.10        # 원격, 읽기 전용
-mcp on 51766 --allow-write --bind 192.168.56.10   # 원격, write (VM 스냅샷 권장)
+mcp on                                   # 모든 인터페이스, 비밀번호 입력
+mcp on --loopback                        # 127.0.0.1만
+mcp on 51766 --allow-write               # 모든 인터페이스, write (VM 스냅샷 권장)
 mcp status
 mcp off                                  # 또는 엔진 루프에서 off + Enter
 
-# 클라이언트(Claude Code)
+# 클라이언트(Claude Code) -- mcp on이 찍어 준 listen IP 사용
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
-  --header "Authorization: Bearer $KNLIVEDBG_TOKEN"
+  --header "Authorization: Bearer <세션-비밀번호>"
 claude mcp list
 ```
 

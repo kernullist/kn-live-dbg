@@ -189,28 +189,28 @@ Designed on the premise of exposing an elevated kernel-RW tool to a potentially 
 
 ### 5.1 Network
 
-1. **Loopback-only bind**: `127.0.0.1` + `::1` only. Never `0.0.0.0`. OFF by default, activated only via `mcp on`.
-2. **Host header whitelist**: reject anything that is not `127.0.0.1` / `[::1]` / `localhost` -> blocks DNS rebinding.
+1. **Default bind is all interfaces**: `http://+:<port>/mcp/` (`0.0.0.0`). Multi-NIC hosts must not pin a guessed adapter IP. `--loopback` keeps `127.0.0.1` + `::1` only.
+2. **Host header whitelist in `--loopback` only**: reject anything that is not `127.0.0.1` / `[::1]` / `localhost` -> blocks DNS rebinding. Default all-interface bind accepts a remote Host.
 3. **Origin validation**: if an Origin **exists** and is not on the whitelist, return 403. (Note: an absent Origin is a normal non-browser client, so allow it. "Reject whenever Origin exists" would break conforming clients.)
-4. Loopback is not an authentication boundary (on a multi-user/RDP host, another local user can reach it). Real authentication is handled by the token.
+4. All-interface bind is not an authentication boundary. Real authentication is the session password.
 
-#### 5.1.1 Opt-in network bind (`--bind <addr>`, lab only)
+#### 5.1.1 Network bind
 
-Practical constraint: if the lab test VM is on a **physically separate PC**, an external Claude host cannot reach a loopback-only listener. For this, provide an **explicit opt-in** network exposure -- the default does not change.
+Practical constraint: a lab VM on a **physically separate PC** cannot be reached on loopback. Default all-interface bind covers that without picking a NIC.
 
-1. **The default stays loopback-only** (`BindAddress` empty): only `127.0.0.1`+`[::1]` are registered, with the strict Host whitelist applied. The safe default is preserved.
-2. **`mcp on <port> --bind <addr>`**: leave the loopback URL as is and **additionally** register the requested address (`http://<addr>:<port>/mcp/`). `<addr>` is a concrete IP (e.g., `192.168.56.10`) or `0.0.0.0`/`*`/`+` for all interfaces (mapped to http.sys's strong wildcard `+`). Because http.sys reserves the non-loopback prefix, **if running as elevated/SYSTEM no separate `netsh urlacl` is needed** (same as loopback).
-3. **Relax the Host check + keep the Origin defense**: in remote mode, accept an arbitrary Host (a remote client's Host is the lab IP), but **keep Origin rejection (403 if an Origin exists and is not a loopback authority)** -> the DNS-rebinding defense remains valid regardless of bind mode (non-browser MCP clients send no Origin, so they pass).
-4. **The bearer token becomes the only barrier** (§5.2). Therefore on remote exposure, **allow inbound only from the client IP at the firewall** and print a console warning to use it only on a **trusted lab segment**. When binding `0.0.0.0`, the server cannot know which interface IP the client should connect to, so it prints a `<this-host-ip>` placeholder in the URL.
-5. **Threat model change**: with loopback-only, only a local user on the same host could reach it, but remote exposure lets any host on the lab segment reach elevated kernel RW if it knows the token. Forbid use outside a lab/isolated network (absolutely never on a live EDR/AC box).
+1. **Default is `0.0.0.0` / `+`**: one prefix covers every adapter, including loopback. If the strong wildcard cannot be reserved, fall back to registering each local IPv4 plus loopback. Host check is relaxed; Origin rejection stays.
+2. **`--loopback`**: register only `127.0.0.1`+`[::1]`, with the strict Host whitelist. Elevated/SYSTEM needs no extra `netsh urlacl`.
+3. **`--bind <ipv4>`**: pin a concrete IPv4 (plus loopback). Avoid this on multi-NIC hosts. Origin rejection stays in every bind mode.
+4. **The session password is the barrier** (§5.2). Restrict inbound TCP at the firewall on a trusted lab segment. Print every local IPv4 so the operator copies the reachable one.
+5. **Threat model**: any host on the lab segment that knows the password can reach elevated kernel RW. Forbid use outside a lab/isolated network (absolutely never on a live EDR/AC box).
 
-### 5.2 Authentication and token handling
+### 5.2 Authentication and password handling
 
-1. Bearer tokens are **stable by default** across restarts (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, constant-time compare, 401 + close on mismatch). A fresh 256-bit token is minted only when missing or when the operator passes `--new-token`.
-2. `mcp on` writes `mcp-endpoint.json` (url + token). The protected file feeds `mcp-load-env.ps1` for native HTTP clients and the **stdio bridge** (`tools/mcp-bridge.ps1`) used by Claude Desktop local MCP or legacy clients. Native client configs keep only an environment-variable reference, not the bearer token.
-3. Server side: print the token source (reused/new/env/override); audit keeps request fingerprints, not the raw secret. Token and endpoint files are atomically replaced with a protected DACL granting full access only to the current user. Token persistence or endpoint persistence failure aborts MCP startup.
-4. **Client-side storage is the real leak point**: do **not** paste bearer tokens into committable project configs. Prefer native HTTP with user-scope config + `${KNLIVEDBG_TOKEN}` / `bearer_token_env_var` and `mcp-load-env.ps1`. Use the bridge only for Claude Desktop local MCP or a legacy stdio-only client. Never commit secrets to git.
-5. Optional: bind the token to the loopback peer PID via `GetExtendedTcpTable` (defense-in-depth, though vulnerable to reconnect/PID reuse).
+1. `mcp on` **prompts the operator** for a temporary session password (type + confirm). 4-128 printable ASCII, no spaces. It is **not persisted** and is cleared on `mcp off` / process exit.
+2. Clients send `Authorization: Bearer <password>` (the raw password is also accepted). Constant-time compare, 401 on mismatch.
+3. `mcp on` still writes a protected `mcp-endpoint.json` for the same-box Desktop/legacy stdio bridge. Native clients should use IP + port + password directly. Never commit the password to git.
+4. Print listen IPs so the operator can tell a remote client which address to use. Do not mint or reuse a disk token.
+5. Optional: bind the password to the loopback peer PID via `GetExtendedTcpTable` (defense-in-depth, though vulnerable to reconnect/PID reuse).
 
 ### 5.3 Two modes: read-only (default) vs Lab write mode (updated by decision §10-Q1)
 
@@ -405,24 +405,22 @@ Mitigation: before serialization, sanitize all wide strings against ill-formed U
 ### 8.2 Claude Code
 
 ```bash
-# Recommended: native Streamable HTTP. Keep the token in the environment.
-# `mcp client-setup claude-code` prints the env-indirected user-scope form.
+# Recommended: native Streamable HTTP. Use the session password from `mcp on`.
 claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
-  --header "Authorization: Bearer YOUR_TOKEN"
+  --header "Authorization: Bearer YOUR_PASSWORD"
 
-# Remote (lab VM on a separate PC): on the lab host, start it with `mcp on 51766 --bind 192.168.56.10`,
-# then connect from the client PC to the lab IP. Use the exact url/token printed by `mcp on`.
+# Remote: default `mcp on` already listens on all adapters. Pick a printed listen IP.
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
-  --header "Authorization: Bearer YOUR_TOKEN"
+  --header "Authorization: Bearer YOUR_PASSWORD"
 
 # Legacy fallback only (does not directly expose the live process)
 claude mcp add --transport stdio knlivedbg-bridge -- \
-  npx -y mcp-remote@0.1.38 http://127.0.0.1:51766/mcp --allow-http --transport http-only --silent --header "Authorization: Bearer YOUR_TOKEN"
+  npx -y mcp-remote@0.1.38 http://127.0.0.1:51766/mcp --allow-http --transport http-only --silent --header "Authorization: Bearer YOUR_PASSWORD"
 ```
 
-On a remote bind (§5.1.1): since the bearer token is the only barrier, **allow inbound only from the client IP at the firewall** and use it only on a trusted lab segment. `--bind 0.0.0.0` opens on all interfaces, so specify a concrete IP if possible.
+On a network bind (§5.1.1): the session password is the only barrier, so **allow inbound only from the client IP at the firewall** and use it only on a trusted lab segment.
 
-`.mcp.json` (but with the token via env indirection -- no plaintext in a committable file):
+`.mcp.json` (password via env or a literal header -- no secret in a committable file):
 
 ```jsonc
 {
@@ -436,11 +434,13 @@ On a remote bind (§5.1.1): since the bearer token is the only barrier, **allow 
 }
 ```
 
+`${KNLIVEDBG_TOKEN}` is the session password. Same-box: `mcp-load-env.ps1` loads it from the live endpoint.
+
 Useful knobs: per-server `timeout` (ms, raise it for slow scans -- not extended by progress notifications), `headersHelper` (rotating token at connect time), `alwaysLoad`.
 
 ### 8.3 Claude Desktop
 
-Claude Desktop's remote connectors support Streamable HTTP, but Claude connects to them from Anthropic's cloud. They cannot reach `127.0.0.1` or a private lab address, and Claude Desktop does not connect to a remote HTTP server declared directly in `claude_desktop_config.json`. For this local KnLiveDbg endpoint, merge the stdio config printed by `mcp client-setup claude-desktop`; it launches `tools/mcp-bridge.ps1`, which reads the protected endpoint once at process startup and forwards stdio to HTTP. Fully restart Desktop after editing or after changing the endpoint URL/token.
+Claude Desktop's remote connectors support Streamable HTTP, but Claude connects to them from Anthropic's cloud. They cannot reach `127.0.0.1` or a private lab address, and Claude Desktop does not connect to a remote HTTP server declared directly in `claude_desktop_config.json`. For this local KnLiveDbg endpoint, merge the stdio config printed by `mcp client-setup claude-desktop`; it launches `tools/mcp-bridge.ps1`, which reads the protected endpoint once at process startup and forwards stdio to HTTP. Fully restart Desktop after editing or after a new `mcp on` / `mcp off`.
 
 Do not expose the kernel endpoint publicly merely to use a Claude remote connector. Keep it on loopback and use the local bridge. This is the only current first-class client path where the bridge is preferred.
 
@@ -450,7 +450,7 @@ Do not expose the kernel endpoint publicly merely to use a Claude remote connect
 
 | Phase | Content | Deliverable (smallest ship) |
 |-------|------|----------------------|
-| **0. Plumbing** | http.sys listener (127.0.0.1 bind), `mcp on/off` console command, token issuance/printing, Host/Origin validation, `Mcp-Session-Id`/`MCP-Protocol-Version`, JSON-RPC framing (initialize/tools/list/tools/call/resources/*/prompts/*). Expose only `kn://capabilities` + `kn://session/info` (cached). | The client can connect, authenticate, tools/list, and query the session. Zero device access. Proves transport/auth/session before kernel exposure. |
+| **0. Plumbing** | http.sys listener (default `+` / 0.0.0.0), `mcp on/off` console command, session-password prompt, Host/Origin validation, `Mcp-Session-Id`/`MCP-Protocol-Version`, JSON-RPC framing (initialize/tools/list/tools/call/resources/*/prompts/*). Expose only `kn://capabilities` + `kn://session/info` (cached). | The client can connect, authenticate, tools/list, and query the session. Zero device access. Proves transport/auth/session before kernel exposure. |
 | **1. Read catalog (Tier A)** | Engine queue + console-line-as-job drain loop, 18 read-only tools reusing `ExecuteAiCapabilityPlan` + `ScopedWideStreamCapture` text. origin="mcp" audit. Default read-only mode = `SetWriteMode(false)` disarmed. | The external LLM drives the full read forensics surface under guards/audit. **The first ship with real value.** |
 | **2. Structured JSON (Tier B)** | Write/reuse a `Build*Json` per scanner -> `structuredContent` + outputSchema. offset/limit pagination. Unified surrogate-safe escaper. | Promote text->structured per tool with no contract change. |
 | **3. Resources + prompts** | `kn://modules`/`drivers`/`snapshot`/`ti/stats`/`audit/tail` + 7 playbook prompts. Large payloads via `resource_link`. | Model self-grounding + slash-command workflows. |
@@ -464,11 +464,11 @@ Each stage can ship independently, and no later stage weakens the Phase-0 securi
 
 The 6 open items of the §3 initial design are finalized as below.
 
-1. **Server stack -> http.sys (`httpapi.lib`)**. A hand-rolled HTTP parser in an elevated process is a top-priority EoP surface, so offload to the kernel-audited http.sys. **Administrator/SYSTEM needs no separate `netsh urlacl` reservation for `HttpAddUrlToUrlGroup`** -> resolves the URL ACL concern. Loopback-only prefix `http://127.0.0.1:<port>/mcp` + `http://[::1]:<port>/mcp`. WinSock rejected.
-2. **Port -> fixed default + override**. A loopback port scan is trivially available -> the security benefit of randomization is approximately 0 while the cost of breaking the client config every session is large (real authentication is the token). A fixed default in the private range (e.g., `51766`) + `mcp on <port>` override.
+1. **Server stack -> http.sys (`httpapi.lib`)**. A hand-rolled HTTP parser in an elevated process is a top-priority EoP surface, so offload to the kernel-audited http.sys. **Administrator/SYSTEM needs no separate `netsh urlacl` reservation for `HttpAddUrlToUrlGroup`**. Default prefix `http://+:<port>/mcp/` (all interfaces). `--loopback` uses `http://127.0.0.1:<port>/mcp` + `http://[::1]:<port>/mcp`. WinSock rejected.
+2. **Port -> fixed default + override**. A port scan is trivially available -> the security benefit of randomization is approximately 0 while the cost of breaking the client config every session is large (real authentication is the session password). A fixed default in the private range (e.g., `51766`) + `mcp on <port>` override.
 3. **Write exposure -> full open in Lab write mode (Q1, updated 2026-06-24)**. Since it is an isolated lab/VM (Q2), open the full typed write tool set (§6.1.1) via `mcp on --allow-write` for analysis fidelity. But "open != safety rails removed" -- keep frictionless automatic preflight/backup/verify-diff/audit (§5.3.2) and continue to forbid raw kd / arbitrary commands / hidden writes. The non-lab default is read-only + kernel flag disarmed (§5.3.1). VM snapshot recommended before writing (§5.3.3). *(Replaces the earlier "PPL exception only" decision.)*
-4. **Client token -> static (newly issued per `mcp on`) + `${KNLIVEDBG_TOKEN}` env indirection**, with `headersHelper` rotation optional. No project-scope commit. (Works on both Claude Code/Desktop + minimal setup; new per session + idle TTL gives a rotation effect.)
-5. **Execution environment -> centered on an isolated analysis VM (Q2)**. Since inbound loopback listener exposure is moot, http.sys loopback alone is sufficient with no additional transport layer such as a named pipe. (If a need arises to use it on a live EDR/AC box, review the named-pipe option from the backlog.)
+4. **Client auth -> operator-typed session password at `mcp on`**. Not persisted. Clients send `Authorization: Bearer <password>`. Same-box snippets may load that password into `KNLIVEDBG_TOKEN` via `mcp-load-env.ps1`. No project-scope commit.
+5. **Execution environment -> centered on an isolated analysis VM (Q2)**. Default all-interface bind is for lab NICs; `--loopback` remains available. (If a need arises to use it on a live EDR/AC box, review the named-pipe option from the backlog.)
 6. **Timeouts/caps -> adopt starting defaults, tune by measurement on a live VM**. Engine wait 30s (split or bound scans that exceed it; client timeout alone cannot extend it), MCP waiting queue 8, per-result 64KB/200 records, raw read 1MB (driver cap), forced `limit` on hunt/pool-scan. All exposed in config.
 
 Remaining backlog (decide at operation/implementation time): whether to limit the port ACL to the elevated account via http.sys SDDL; the driver hardening (§5.3.1) that adds a gate independent of `WriteEnabled` to `SetProcessProtection` to remove the momentary write window.
@@ -503,11 +503,11 @@ An initial scaffold that implements Phase 0~1 + the write namespace (§6.1.1) al
 
 New files:
 - `user/McpJson.h` -- header-only, surrogate-safe JSON escape / UTF-8 conversion / top-level value extraction (transport layer only, no dependency on main.cpp statics).
-- `user/McpServer.h` / `user/McpServer.cpp` -- http.sys loopback listener (127.0.0.1 + [::1], `/mcp`), overlapped receive + stop event, bearer token (32 bytes per `mcp on`) constant-time comparison, Host/Origin validation, single `Mcp-Session-Id` pin, JSON-RPC (initialize/ping/tools.list/tools.call/resources.list+read/prompts.list+get/notifications), static tool/resource/prompt catalog, bounded serial job queue.
+- `user/McpServer.h` / `user/McpServer.cpp` -- http.sys listener (default `+` / 0.0.0.0, `/mcp`), overlapped receive + stop event, session-password constant-time comparison, Host/Origin validation, single `Mcp-Session-Id` pin, JSON-RPC (initialize/ping/tools.list/tools.call/resources.list+read/prompts.list+get/notifications), static tool/resource/prompt catalog, bounded serial job queue.
 
 main.cpp integration:
 - One global `static McpServer g_McpServer;`.
-- `HandleMcpCommand` (`mcp on [port] [--allow-write]` / `off` / `status`) -- `HandleCommand` dispatch + `CommandRegistry` registration.
+- `HandleMcpCommand` (`mcp on [port] [--allow-write] [--loopback] [--bind <addr>]` / `off` / `status`) -- `HandleCommand` dispatch + `CommandRegistry` registration.
 - `DispatchMcpRequest` (engine thread): read tools synthesize a `kn-live-dbg.ai-capability-plan.v1` plan -> `ParseAiCapabilityPlanResponse` -> `ExecuteAiCapabilityPlan` inside a `ScopedWideStreamCapture` (reusing validation + executor). Write tools have `DispatchMcpWriteTool` validate typed arguments (`ContainsUnsafeAiCommandCharacters`/whitespace/hex) -> build a command line -> `BuildWriteSafetyPlan` backup -> `ExecuteCommandWithTranscript` (automatic write-audit) -> verify.
 - `RunMcpEngineLoop` (engine thread): polls via `WaitForSingleObject(JobReadyEvent, 200)` and does `TryPopJob` -> `DispatchMcpRequest` -> promise. The console control reader thread (`off`/`status`) uses only `ReadConsoleW` (no wcout access -> avoids the global rdbuf race). On `mcp on`, arm/disarm write mode; restore on exit.
 - At the `wmain` REPL loop entry, if `g_McpServer.IsRunning()`, enter `RunMcpEngineLoop` (preserving the read-only-default / single-engine-thread invariants). `g_McpServer.Stop()` on the shutdown path.
