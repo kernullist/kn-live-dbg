@@ -23,9 +23,10 @@ Kn Live Dbg follows a LiveKD-style split:
      device handle, and symbols stay on the controller PC. Default
      bind is `0.0.0.0:51767` with a session password (5-128 printable
      ASCII) and a process-managed firewall rule. The client Tab prompt
-     uses the same `CompletionHints` tables as the local TUI. See
-     `docs/REMOTE_SETUP.md` and `docs/REMOTE_OPERATOR_SESSION.md`.
-     This is not `kdinit /remote`.
+     uses the same `CompletionHints` tables as the local TUI. Command
+     output uses the same console colors; a pipe or file on the client
+     strips VT sequences. See `docs/REMOTE_SETUP.md` and
+     `docs/REMOTE_OPERATOR_SESSION.md`. This is not `kdinit /remote`.
    - Owns driver install/load/unload through SCM.
    - Acquires a process-wide named mutex before touching SCM so only one `KnLiveDbg.exe` instance can run at a time.
    - Displays colored staged lifecycle output for elevation checks, single-instance acquisition, SCM query/install/start, device open, ABI verification, symbol initialization, probe load, and service unload paths.
