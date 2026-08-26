@@ -35,3 +35,17 @@ std::wstring BuildCompletionListing(
     const std::vector<std::wstring>& matches,
     const std::wstring& command,
     const std::vector<std::wstring>& argsBefore);
+
+// Tokens offered for the next argument given the completed words to the left
+// of the current token. Empty argsBefore lists registered command names.
+std::vector<std::wstring> CollectCompletionCandidates(
+    const std::vector<std::wstring>& argsBefore);
+
+// Applies Tab to *line at *cursor using CollectCompletionCandidates.
+// If several matches share no extra prefix, *listing receives the annotated
+// listing (including a leading newline) and *listed is true.
+bool ApplyTabCompletion(
+    std::wstring* line,
+    size_t* cursor,
+    bool* listed,
+    std::wstring* listing);

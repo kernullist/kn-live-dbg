@@ -96,6 +96,23 @@ namespace
         { L"help", nullptr, L"show mcp usage" },
     };
 
+    const CompletionHint kRemoteRootTokens[] =
+    {
+        { L"on", L"remote on [port] [--loopback] [--bind <ipv4>] [--peer <ipv4>]", L"start remote operator session on 0.0.0.0:51767" },
+        { L"off", L"remote off", L"stop the remote listener" },
+        { L"status", L"remote status", L"show listen address and peer" },
+        { L"disconnect", L"remote disconnect", L"drop the current remote client" },
+        { L"help", nullptr, L"show remote usage" },
+    };
+
+    const CompletionHint kRemoteOnTokens[] =
+    {
+        { L"--loopback", nullptr, L"listen on 127.0.0.1 only" },
+        { L"--bind", L"--bind <ipv4>", L"0.0.0.0 (default) or a specific IPv4" },
+        { L"--peer", L"--peer <ipv4>", L"accept only this client IPv4" },
+        { L"help", nullptr, L"show remote on usage" },
+    };
+
     const CompletionHint kMcpOnTokens[] =
     {
         { L"--allow-write", nullptr, L"enable write tools (test VM only)" },
@@ -1090,6 +1107,12 @@ namespace
         SCOPE(L"client-setup", L"mcp client-setup [all|claude|cursor|codex|grok|legacy]", L"client config snippets", kMcpClientTokens),
     };
 
+    const CompletionScopeTable kRemoteScopes[] =
+    {
+        SCOPE(L"", L"remote on|off|status|disconnect", L"LAN operator session", kRemoteRootTokens),
+        SCOPE(L"on", L"remote on [port] [--loopback] [--bind] [--peer]", L"start the remote listener", kRemoteOnTokens),
+    };
+
     const CompletionScopeTable kLogScopes[] =
     {
         SCOPE(L"", L"log [enable|disable|status]", L"mirror console output to a file", kLogTokens),
@@ -1626,6 +1649,7 @@ namespace
         CMD(L"kd", kKdScopes),
         CMD(L"probe", kProbeScopes),
         CMD(L"mcp", kMcpScopes),
+        CMD(L"remote", kRemoteScopes),
         CMD(L"log", kLogScopes),
         CMD(L"write", kWriteScopes),
         CMD(L"procctx", kProcctxScopes),
@@ -2082,6 +2106,30 @@ namespace
                 scope = L"client-setup";
             }
         }
+        else if (command == L"remote")
+        {
+            if (first == L"on")
+            {
+                scope = L"on";
+            }
+        }
+
+        if (scope.empty() && !first.empty())
+        {
+            const CompletionCommandTable* table = FindCommandTable(command);
+            if (table != nullptr)
+            {
+                for (size_t i = 0; i < table->ScopeCount; ++i)
+                {
+                    const wchar_t* name = table->Scopes[i].Scope;
+                    if (name != nullptr && name[0] != L'\0' && SameToken(name, first))
+                    {
+                        scope = first;
+                        break;
+                    }
+                }
+            }
+        }
 
         return scope;
     }
@@ -2507,4 +2555,268 @@ std::wstring BuildCompletionListing(
     }
 
     return out.str();
+}
+
+namespace
+{
+    void AddUniqueToken(std::vector<std::wstring>* out, const wchar_t* token)
+    {
+        do
+        {
+            if (out == nullptr || token == nullptr || token[0] == L'\0')
+            {
+                break;
+            }
+
+            std::wstring item = token;
+            if (std::find(out->begin(), out->end(), item) == out->end())
+            {
+                out->push_back(item);
+            }
+        } while (false);
+    }
+
+    void AddHintTableTokens(
+        std::vector<std::wstring>* out,
+        const CompletionHint* tokens,
+        size_t count)
+    {
+        if (out == nullptr || tokens == nullptr)
+        {
+            return;
+        }
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            AddUniqueToken(out, tokens[i].Token);
+        }
+    }
+
+    void AddScopeTokens(
+        std::vector<std::wstring>* out,
+        const std::wstring& command,
+        const std::vector<std::wstring>& argsBefore)
+    {
+        const CompletionCommandTable* table = FindCommandTable(command);
+        if (table == nullptr)
+        {
+            return;
+        }
+
+        const std::wstring scopeKey = SelectScopeKey(HintLower(command), argsBefore);
+        const CompletionScopeTable* scope = FindScopeTable(*table, scopeKey);
+        if (scope != nullptr)
+        {
+            AddHintTableTokens(out, scope->Tokens, scope->TokenCount);
+        }
+        if (!scopeKey.empty())
+        {
+            const CompletionScopeTable* root = FindScopeTable(*table, L"");
+            if (root != nullptr && root != scope)
+            {
+                AddHintTableTokens(out, root->Tokens, root->TokenCount);
+            }
+        }
+    }
+}
+
+std::vector<std::wstring> CollectCompletionCandidates(
+    const std::vector<std::wstring>& argsBefore)
+{
+    std::vector<std::wstring> out;
+
+    do
+    {
+        if (argsBefore.empty())
+        {
+            for (const CommandInfo& info : CommandRegistry::Commands())
+            {
+                AddUniqueToken(&out, info.Name);
+            }
+            break;
+        }
+
+        const std::wstring command = HintCanonicalCommand(argsBefore[0]);
+        if (command == L"help" || command == L"?")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                AddUniqueToken(&out, L"all");
+                for (const CommandInfo& info : CommandRegistry::Commands())
+                {
+                    AddUniqueToken(&out, info.Name);
+                }
+            }
+            else
+            {
+                std::vector<std::wstring> topic(argsBefore.begin() + 1, argsBefore.end());
+                out = CollectCompletionCandidates(topic);
+            }
+            break;
+        }
+
+        AddScopeTokens(&out, command, argsBefore);
+
+        for (size_t index = argsBefore.size(); index > 1; --index)
+        {
+            const size_t nestedIndex = index - 1;
+            const std::wstring nested = HintCanonicalCommand(argsBefore[nestedIndex]);
+            if (FindCommandTable(nested) == nullptr)
+            {
+                continue;
+            }
+
+            std::vector<std::wstring> nestedArgs;
+            for (size_t copy = nestedIndex; copy < argsBefore.size(); ++copy)
+            {
+                nestedArgs.push_back(argsBefore[copy]);
+            }
+            AddScopeTokens(&out, nested, nestedArgs);
+        }
+
+        AddHintTableTokens(
+            &out,
+            kGenericTokens,
+            sizeof(kGenericTokens) / sizeof(kGenericTokens[0]));
+
+        if (command == L"ai")
+        {
+            for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
+            {
+                AddUniqueToken(&out, token.c_str());
+            }
+        }
+    } while (false);
+
+    return out;
+}
+
+bool ApplyTabCompletion(
+    std::wstring* line,
+    size_t* cursor,
+    bool* listed,
+    std::wstring* listing)
+{
+    bool changed = false;
+
+    do
+    {
+        if (listed != nullptr)
+        {
+            *listed = false;
+        }
+        if (listing != nullptr)
+        {
+            listing->clear();
+        }
+        if (line == nullptr || cursor == nullptr)
+        {
+            break;
+        }
+        if (*cursor > line->size())
+        {
+            *cursor = line->size();
+        }
+
+        size_t tokenStart = *cursor;
+        size_t tokenEnd = *cursor;
+        while (tokenStart > 0 && std::iswspace((*line)[tokenStart - 1]) == 0)
+        {
+            --tokenStart;
+        }
+        while (tokenEnd < line->size() && std::iswspace((*line)[tokenEnd]) == 0)
+        {
+            ++tokenEnd;
+        }
+
+        const std::wstring prefix = line->substr(tokenStart, *cursor - tokenStart);
+        std::wstring left = line->substr(0, tokenStart);
+        std::vector<std::wstring> argsBefore;
+        std::wstring word;
+        for (wchar_t ch : left)
+        {
+            if (ch == L' ' || ch == L'\t')
+            {
+                if (!word.empty())
+                {
+                    argsBefore.push_back(word);
+                    word.clear();
+                }
+            }
+            else
+            {
+                word.push_back(ch);
+            }
+        }
+        if (!word.empty())
+        {
+            argsBefore.push_back(word);
+        }
+
+        const std::vector<std::wstring> candidates = CollectCompletionCandidates(argsBefore);
+        std::vector<std::wstring> matches;
+        const std::wstring prefixLower = HintLower(prefix);
+        for (const std::wstring& item : candidates)
+        {
+            if (prefixLower.empty() || HintLower(item).rfind(prefixLower, 0) == 0)
+            {
+                matches.push_back(item);
+            }
+        }
+        if (matches.empty())
+        {
+            break;
+        }
+
+        std::wstring replacement;
+        bool appendSpace = false;
+        if (matches.size() == 1)
+        {
+            replacement = matches[0];
+            appendSpace = true;
+        }
+        else
+        {
+            replacement = matches[0];
+            for (size_t i = 1; i < matches.size(); ++i)
+            {
+                size_t n = 0;
+                while (n < replacement.size() &&
+                       n < matches[i].size() &&
+                       replacement[n] == matches[i][n])
+                {
+                    ++n;
+                }
+                replacement.resize(n);
+            }
+            if (HintLower(replacement).size() <= prefixLower.size())
+            {
+                std::wstring command;
+                if (!argsBefore.empty())
+                {
+                    command = HintCanonicalCommand(argsBefore[0]);
+                }
+                if (listing != nullptr)
+                {
+                    *listing = BuildCompletionListing(matches, command, argsBefore);
+                }
+                if (listed != nullptr)
+                {
+                    *listed = true;
+                }
+                break;
+            }
+        }
+
+        line->replace(tokenStart, tokenEnd - tokenStart, replacement);
+        *cursor = tokenStart + replacement.size();
+        if (appendSpace && *cursor == line->size())
+        {
+            line->insert(*cursor, L" ");
+            ++(*cursor);
+        }
+        changed = true;
+    } while (false);
+
+    return changed;
 }

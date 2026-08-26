@@ -235,6 +235,26 @@ clean bill on the others:
   entry's write bit. (Hard to trigger on demand; verify the message appears if a
   large-page target is hit, and that normal 4 KB writes are unaffected.)
 
+## Remote operator session
+
+Same-box (driver loaded on A):
+
+1. `remote on --loopback`, password `abcde` accepted, `abcd` rejected.
+2. From a second console: `KnLiveDbg.exe --connect 127.0.0.1:51767`.
+3. B Tab expands `rem` to `remote` and lists `!callbacks` scopes the same way as local `knkd>`.
+4. B `dt nt!_EPROCESS` prints type layout. B `q` disconnects without unloading the driver on A.
+5. B `unload` / `kd r` / `probe load` / `mcp on` return `denied`.
+6. B `eb <addr>` with no bytes returns `supply values on the command line`. `eb <addr> 90` writes when write mode is on.
+7. A `off` then Enter returns to local `knkd>`. Firewall rule `knlivedbg-remote` is absent after `--loopback`.
+
+Two-PC LAN:
+
+1. A `remote on` (no extra flags) prints a reachable IPv4 and `cleartext=true`.
+2. B `--connect <that-ipv4>:51767` with the session password.
+3. Confirm inbound rule `knlivedbg-remote` exists while listening and is gone after `remote off`.
+
+Driver-free: `.\tools\validate-remote-protocol.ps1 -Configuration Release`.
+
 ## Deferred
 
 - 1B `IsValidKernelPointer` retrofits -- assessed low value: the existing

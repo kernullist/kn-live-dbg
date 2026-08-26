@@ -29,6 +29,16 @@ Completed core slices:
 9. Default/deep `!hunt` collectors for Policy-based QoS, Bind Filter
    mappings, CloudFiles placeholders, and Filter Manager attachments,
    plus the corresponding E2E fixtures.
+10. Remote operator session (`remote on` / `KnLiveDbg.exe --connect`):
+    implemented. Thin TUI on another LAN PC; engine and driver stay on
+    the analysis target. Default bind is `0.0.0.0:51767` with a session
+    password of 5-128 printable ASCII (not persisted) and a
+    process-managed inbound firewall rule `knlivedbg-remote`. The client
+    Tab prompt uses the same `CompletionHints` tables as the local TUI.
+    Writes match the local TUI. B cannot run `q` / `unload` / `mcp` /
+    `kd` / `probe load`. Address-only `e*`/`pe*` need values on the
+    command line. This is not `kdinit /remote`. Operator guide:
+    `docs/REMOTE_SETUP.md`. Design: `docs/REMOTE_OPERATOR_SESSION.md`.
 
 Remaining priority order:
 

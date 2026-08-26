@@ -467,6 +467,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
 
         Make(L"drvstatus", L"drvstatus", L"session", L"show service, owner, handle, and write-gate state", CommandSupport::Native),
         Make(L"mcp", L"mcp", L"session", L"MCP server: on/off/status/client-setup/endpoint (0.0.0.0 + session password)", CommandSupport::Native),
+        Make(L"remote", L"remote", L"session", L"remote operator session: on/off/status/disconnect (0.0.0.0:51767 + session password)", CommandSupport::Native),
         Make(L"kd", L"kd", L"session", L"execute a raw command through DbgEng", CommandSupport::Native),
         Make(L"kdinit", L"kdinit", L"session", L"initialize local-kernel DbgEng backend", CommandSupport::Native),
         Make(L"kddetach", L"kddetach", L"session", L"end DbgEng session", CommandSupport::Native),

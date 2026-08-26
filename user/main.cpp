@@ -32,6 +32,7 @@
 #include "McpJson.h"
 #include "McpServer.h"
 #include "McpSelfTest.h"
+#include "RemoteServer.h"
 #include "MemoryDumper.h"
 #include "CloakSession.h"
 #include "MinifilterAttachmentScanner.h"
@@ -108,6 +109,9 @@ static std::atomic_uint64_t g_CommandStreamOutputSerial = 0;
 // listener thread only enqueues jobs; the wmain engine thread drains and
 // dispatches them (see RunMcpEngineLoop / DispatchMcpRequest below).
 static McpServer g_McpServer;
+static RemoteServer g_RemoteServer;
+static std::atomic<bool> g_RemoteOriginActive{ false };
+static DWORD g_EngineTid = 0;
 
 static constexpr WORD KNDBG_COLOR_TEXT = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
 static constexpr WORD KNDBG_COLOR_DIM = FOREGROUND_BLUE | FOREGROUND_GREEN;
@@ -10868,6 +10872,15 @@ static bool PromptForEnterBytes(
 
         bytes->clear();
         *cancelled = false;
+
+        if (g_RemoteOriginActive.load())
+        {
+            if (error != nullptr)
+            {
+                *error = L"supply values on the command line";
+            }
+            break;
+        }
 
         PrintColoredText(HexTextWidth(address, 16, false), KNDBG_COLOR_ACCENT);
         std::wcout << L"  ";
@@ -28110,6 +28123,17 @@ static void PrintSessionHelp(const std::wstring& command)
         std::wcout << L"  kddetach\n";
         std::wcout << L"  Shut down the current DbgEng backend instance.\n";
     }
+    else if (name == L"remote")
+    {
+        std::wcout << L"remote commands:\n";
+        std::wcout << L"  remote on [port] [--loopback] [--bind <ipv4>] [--peer <ipv4>]\n";
+        std::wcout << L"  remote off | remote status | remote disconnect | remote help\n";
+        std::wcout << L"  Start a LAN operator session. Default bind is 0.0.0.0:51767.\n";
+        std::wcout << L"  Session password is 5-128 printable ASCII, not saved.\n";
+        std::wcout << L"  Client: KnLiveDbg.exe --connect <ipv4>:<port>\n";
+        std::wcout << L"  Client Tab uses the same completion tables as this prompt.\n";
+        std::wcout << L"  This is not kdinit /remote. Cannot run with mcp on.\n";
+    }
 }
 
 static void PrintQueryHelp()
@@ -28543,6 +28567,10 @@ static bool TryPrintAiNestedCommandHelp(const std::vector<std::wstring>& args)
 }
 
 static void HandleMcpCommand(const std::vector<std::wstring>& args);
+static void HandleRemoteCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device);
 
 static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size_t commandIndex)
 {
@@ -28882,6 +28910,8 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         else if (command == L"home" || command == L"dashboard" || command == L"drvstatus" ||
                  command == L"version" || command == L"vertarget" || command == L"vercommand" ||
                  command == L"kd" || command == L"kddetach" || command == L"unload" ||
+                 command == L"remote" ||
+                 command == L"mcp" ||
                  command == L"||" || command == L"||s" || command == L"|" ||
                  command == L"q" || command == L"qq" || command == L"qd" ||
                  command == L"quit" || command == L"exit" || command == L"cls")
@@ -34997,7 +35027,8 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     DriverService& service,
     SymbolEngine& symbols,
     AiProviderRuntime& ai,
-    AiPlanState& aiState);
+    AiPlanState& aiState,
+    bool enableConsoleProgress = true);
 
 static std::wstring ByteCountText(uint64_t byteCount)
 {
@@ -49536,6 +49567,10 @@ static bool HandleCommand(
         {
             HandleMcpCommand(args);
         }
+        else if (command == L"remote")
+        {
+            HandleRemoteCommand(args, state, device);
+        }
         else if (command == L"||" || command == L"||s")
         {
             std::wcout << L"0: kd> local live-memory system\n";
@@ -49612,7 +49647,8 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     DriverService& service,
     SymbolEngine& symbols,
     AiProviderRuntime& ai,
-    AiPlanState& aiState)
+    AiPlanState& aiState,
+    bool enableConsoleProgress)
 {
     CommandExecutionResult result = {};
     result.KeepRunning = true;
@@ -49622,7 +49658,7 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
 
     do
     {
-        ScopedCommandProgress progress(originalLine, origin, !args.empty());
+        ScopedCommandProgress progress(originalLine, origin, enableConsoleProgress && !args.empty());
         {
             ScopedWideStreamCapture capture(&result.Output, &result.Error);
             result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
@@ -51923,6 +51959,396 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     }
 }
 
+static bool PromptRemoteSessionPassword(std::wstring* password, std::wstring* error)
+{
+    bool ok = false;
+    std::wstring first;
+    std::wstring second;
+    do
+    {
+        if (password == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid remote password output";
+            }
+            break;
+        }
+        std::wcout << L"Set a temporary remote password for this session.\n";
+        std::wcout << L"Clients connect with IP, port, and this password.\n";
+        std::wcout.flush();
+        if (!ReadHiddenConsoleLine(L"Remote password: ", &first) ||
+            !ReadHiddenConsoleLine(L"Confirm password: ", &second))
+        {
+            if (error != nullptr)
+            {
+                *error = L"remote password prompt requires an interactive console";
+            }
+            break;
+        }
+        if (first != second)
+        {
+            if (error != nullptr)
+            {
+                *error = L"remote passwords did not match";
+            }
+            break;
+        }
+        if (!knremote::SanitizeRemotePassword(first, password, error))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+    SecureClearWString(&first);
+    SecureClearWString(&second);
+    return ok;
+}
+
+static void RunRemoteEngineLoop(
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    std::wcout << L"[remote] engine active: " << g_RemoteServer.BindAddress()
+               << L":" << g_RemoteServer.Port()
+               << L"  -- type 'off' then Enter to stop\n";
+
+    std::atomic<bool> controlStop{ false };
+    std::atomic<bool> statusRequested{ false };
+    std::atomic<bool> writeOffRequested{ false };
+    std::thread reader([&controlStop, &statusRequested, &writeOffRequested]()
+    {
+        while (!controlStop.load())
+        {
+            std::wstring line;
+            if (!McpReadConsoleLine(&line))
+            {
+                break;
+            }
+            std::wstring lowered = ToLower(line);
+            if (lowered == L"off" || lowered == L"remote off" ||
+                lowered == L"q" || lowered == L"quit" || lowered == L"exit" ||
+                lowered == L"unload")
+            {
+                if (lowered == L"q" || lowered == L"quit" || lowered == L"exit" ||
+                    lowered == L"unload")
+                {
+                    g_StopRequested = true;
+                }
+                g_RemoteServer.RequestStop();
+                break;
+            }
+            else if (lowered == L"disconnect" || lowered == L"remote disconnect")
+            {
+                g_RemoteServer.DisconnectSession();
+            }
+            else if (lowered == L"status" || lowered == L"remote status")
+            {
+                statusRequested.store(true);
+            }
+            else if (lowered == L"write off")
+            {
+                writeOffRequested.store(true);
+                SetEvent(g_RemoteServer.WriteOffEvent());
+            }
+        }
+    });
+
+    while (g_RemoteServer.IsRunning() && !g_StopRequested)
+    {
+        WaitForSingleObject(g_RemoteServer.JobReadyEvent(), 200);
+
+        if (writeOffRequested.exchange(false))
+        {
+            std::wstring writeError;
+            device.SetWriteMode(false, &writeError);
+            g_RemoteServer.SetHelloWriteMode(false);
+            ResetEvent(g_RemoteServer.WriteOffEvent());
+            std::wcout << L"[remote] write off\n";
+        }
+
+        if (statusRequested.exchange(false))
+        {
+            std::wcout << L"[remote] running bind=" << g_RemoteServer.BindAddress()
+                       << L":" << g_RemoteServer.Port()
+                       << L" peer=" << g_RemoteServer.PeerIp()
+                       << L"\n";
+        }
+
+        std::shared_ptr<RemoteJob> job;
+        while ((job = g_RemoteServer.TryPopJob()) != nullptr)
+        {
+            if (g_EngineTid != 0 && GetCurrentThreadId() != g_EngineTid)
+            {
+                RemoteEngineResult bad;
+                bad.IsError = true;
+                bad.Code = L"denied";
+                bad.Stderr = L"engine thread mismatch";
+                try
+                {
+                    job->ResultPromise.set_value(bad);
+                }
+                catch (...)
+                {
+                }
+                continue;
+            }
+            RemoteEngineResult dispatchResult;
+            if (job->Cancelled && job->Cancelled->load())
+            {
+                dispatchResult.IsError = true;
+                dispatchResult.Code = L"denied";
+                dispatchResult.Stderr = L"cancelled";
+            }
+            else
+            {
+                std::wstring denyReason;
+                if (IsRemoteDeniedCommandLine(job->Line, &denyReason))
+                {
+                    dispatchResult.IsError = true;
+                    dispatchResult.Code = L"denied";
+                    dispatchResult.Stderr = L"denied: " + denyReason;
+                }
+                else if (IsRemoteAddressOnlyEnter(job->Line))
+                {
+                    dispatchResult.IsError = true;
+                    dispatchResult.Code = L"denied";
+                    dispatchResult.Stderr = L"supply values on the command line";
+                }
+                else
+                {
+                    std::vector<std::wstring> args = Split(job->Line);
+                    struct RemoteOriginScope
+                    {
+                        RemoteOriginScope()
+                        {
+                            g_RemoteOriginActive.store(true);
+                        }
+                        ~RemoteOriginScope()
+                        {
+                            g_RemoteOriginActive.store(false);
+                        }
+                    } originScope;
+                    CommandExecutionResult executed = ExecuteCommandWithTranscript(
+                        args,
+                        job->Line,
+                        L"remote",
+                        state,
+                        dbgeng,
+                        device,
+                        service,
+                        symbols,
+                        ai,
+                        aiState,
+                        false);
+                    dispatchResult.Stdout = executed.Output;
+                    dispatchResult.Stderr = executed.Error;
+                    dispatchResult.KeepRunning = executed.KeepRunning;
+                    dispatchResult.IsError = false;
+                }
+            }
+
+            try
+            {
+                job->ResultPromise.set_value(dispatchResult);
+            }
+            catch (...)
+            {
+            }
+
+            std::wstring audit = L"{";
+            audit += L"\"ts\":" + std::to_wstring(knremote::UnixTimeMs());
+            audit += L",\"peerIp\":" + knremote::Quote(g_RemoteServer.PeerIp());
+            audit += L",\"origin\":\"remote\"";
+            audit += L",\"command\":" + knremote::Quote(job->Line.substr(0, 512));
+            audit += L",\"decision\":" + knremote::Quote(dispatchResult.IsError ? L"deny" : L"allow");
+            if (dispatchResult.IsError)
+            {
+                audit += L",\"deniedReason\":" + knremote::Quote(dispatchResult.Code);
+            }
+            audit += L"}";
+            g_RemoteServer.AppendAuditLine(audit);
+        }
+    }
+
+    controlStop.store(true);
+    CancelSynchronousIo(reader.native_handle());
+    if (reader.joinable())
+    {
+        reader.join();
+    }
+    g_RemoteServer.Stop();
+    std::wcout << L"[remote] engine stopped\n";
+}
+
+static void HandleRemoteCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device)
+{
+    std::wstring sub = args.size() >= 2 ? ToLower(args[1]) : L"status";
+
+    if (sub == L"help" || sub == L"?")
+    {
+        PrintSessionHelp(L"remote");
+        return;
+    }
+
+    if (sub == L"off" || sub == L"stop")
+    {
+        if (!g_RemoteServer.IsRunning())
+        {
+            std::wcout << L"remote server is not running\n";
+            return;
+        }
+        g_RemoteServer.RequestStop();
+        return;
+    }
+
+    if (sub == L"disconnect")
+    {
+        g_RemoteServer.DisconnectSession();
+        std::wcout << L"remote session disconnected\n";
+        return;
+    }
+
+    if (sub == L"on" || sub == L"start")
+    {
+        if (g_RemoteServer.IsRunning())
+        {
+            std::wcout << L"remote server is already running on port "
+                       << g_RemoteServer.Port() << L"\n";
+            return;
+        }
+        if (g_McpServer.IsRunning())
+        {
+            std::wcerr << L"remote on failed: MCP server is running (listen XOR)\n";
+            return;
+        }
+
+        RemoteServerConfig config;
+        config.Port = knremote::kDefaultPort;
+        config.BindAddress = L"0.0.0.0";
+        for (size_t i = 2; i < args.size(); ++i)
+        {
+            if (args[i] == L"--loopback")
+            {
+                config.BindAddress = L"127.0.0.1";
+            }
+            else if (args[i] == L"--bind" && i + 1 < args.size())
+            {
+                config.BindAddress = args[++i];
+            }
+            else if (args[i] == L"--peer" && i + 1 < args.size())
+            {
+                config.Peer = args[++i];
+            }
+            else if (args[i] == L"--allow-public-peer")
+            {
+                config.AllowPublicPeer = true;
+            }
+            else
+            {
+                unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
+                if (parsed > 0 && parsed < 65536)
+                {
+                    config.Port = static_cast<uint16_t>(parsed);
+                }
+            }
+        }
+
+        if (config.Port == knremote::kMcpPort)
+        {
+            std::wcerr << L"remote on failed: MCP port; use 51767\n";
+            return;
+        }
+
+        config.BindAddress = knremote::NormalizeBindAddress(config.BindAddress);
+        config.AuditPath = GetExecutableDirectory() + L"\\.kn-live-dbg\\remote-audit-" +
+                           std::to_wstring(config.Port) + L".jsonl";
+        config.AddFirewall = !knremote::IsLoopbackBind(config.BindAddress);
+
+        std::wstring passwordError;
+        if (!PromptRemoteSessionPassword(&config.Password, &passwordError))
+        {
+            std::wcerr << L"remote on failed: " << passwordError << L"\n";
+            return;
+        }
+
+        DriverSessionStatus session = {};
+        std::wstring sessionError;
+        if (device.IsOpen())
+        {
+            device.QuerySessionStatus(&session, &sessionError);
+        }
+        config.Hello.Hostname.clear();
+        config.Hello.Os = L"Windows";
+        config.Hello.Abi = KNDBG_ABI_VERSION;
+        config.Hello.WriteMode = (session.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) != 0;
+        config.Hello.Cloak = state.CloakActive;
+
+        std::wstring startError;
+        if (!g_RemoteServer.Start(config, &startError))
+        {
+            SecureClearWString(&config.Password);
+            std::wcerr << L"remote on failed: " << startError << L"\n";
+            return;
+        }
+        SecureClearWString(&config.Password);
+
+        std::wcout << L"[remote] listen " << g_RemoteServer.BindAddress()
+                   << L":" << g_RemoteServer.Port()
+                   << L" cleartext=true\n";
+        if (!g_RemoteServer.FirewallWarning().empty())
+        {
+            std::wcout << L"[remote] warning: " << g_RemoteServer.FirewallWarning()
+                       << L"\n";
+        }
+        if (!g_RemoteServer.IsLoopbackOnly())
+        {
+            std::wcout << L"[remote] warning: cleartext kernel-command traffic on the LAN\n";
+            std::vector<McpListenAddress> addresses;
+            CollectMcpListenAddresses(&addresses);
+            for (const McpListenAddress& addr : addresses)
+            {
+                std::wcout << L"  " << addr.Ip;
+                if (!addr.AdapterName.empty())
+                {
+                    std::wcout << L"  " << addr.AdapterName;
+                }
+                std::wcout << L"\n";
+            }
+            std::wcout << L"  client: KnLiveDbg.exe --connect <ipv4>:"
+                       << g_RemoteServer.Port() << L"\n";
+        }
+        else
+        {
+            std::wcout << L"  client: KnLiveDbg.exe --connect 127.0.0.1:"
+                       << g_RemoteServer.Port() << L"\n";
+        }
+        return;
+    }
+
+    if (g_RemoteServer.IsRunning())
+    {
+        std::wcout << L"remote server: running bind=" << g_RemoteServer.BindAddress()
+                   << L":" << g_RemoteServer.Port()
+                   << L" peer=" << g_RemoteServer.PeerIp() << L"\n";
+        std::wcout << L"  audit: " << g_RemoteServer.AuditPath() << L"\n";
+    }
+    else
+    {
+        std::wcout << L"remote server: stopped.\n";
+        std::wcout << L"  usage: remote on [port] [--loopback] [--bind <ipv4>] [--peer <ipv4>]\n";
+        std::wcout << L"  client: KnLiveDbg.exe --connect <ipv4>:51767\n";
+    }
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     // Permanently install the tee buffer in front of std::wcout. Must
@@ -51943,6 +52369,14 @@ int wmain(int argc, wchar_t** argv)
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-tools")
         {
             return RunMcpToolCatalogSelfTest();
+        }
+        if (argc >= 3 && ToLower(argv[2]) == L"remote-protocol")
+        {
+            return RunRemoteProtocolSelfTest();
+        }
+        if (argc >= 3 && ToLower(argv[2]) == L"connect-argv")
+        {
+            return RunRemoteConnectArgvSelfTest();
         }
         if (argc >= 3 && ToLower(argv[2]) == L"console")
         {
@@ -51970,7 +52404,18 @@ int wmain(int argc, wchar_t** argv)
             return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|cloudfiles-query <path>|minifilter-attachments-query|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
+        return 2;
+    }
+
+    if (argc >= 2 && ToLower(argv[1]) == L"--connect")
+    {
+        return RemoteClientMain(argc, argv);
+    }
+
+    if (HasUnknownControllerArgv(argc, argv))
+    {
+        std::wcerr << L"unknown argument. controller accepts --cloak* only.\n";
         return 2;
     }
 
@@ -52058,6 +52503,7 @@ int wmain(int argc, wchar_t** argv)
             0,
             FALSE,
             DUPLICATE_SAME_ACCESS);
+        g_EngineTid = GetCurrentThreadId();
         SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
         PrintLifecycleHeader(L"KnLiveDbg launch", L"preflight checks");
@@ -52239,6 +52685,11 @@ int wmain(int argc, wchar_t** argv)
 
         while (!g_StopRequested)
         {
+            if (g_RemoteServer.IsRunning())
+            {
+                RunRemoteEngineLoop(state, dbgeng, device, service, symbols, ai, aiState);
+                continue;
+            }
             if (g_McpServer.IsRunning())
             {
                 RunMcpEngineLoop(state, dbgeng, device, service, symbols, ai, aiState);
@@ -52280,6 +52731,7 @@ int wmain(int argc, wchar_t** argv)
     } while (false);
 
     StopMcpServer();
+    g_RemoteServer.Stop();
     StopTimelineAutoDrainWorker();
     dbgeng.Shutdown();
     bool cleanupOk = true;
