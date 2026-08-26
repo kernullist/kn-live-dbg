@@ -97,7 +97,38 @@ exit /b 0
         throw "wildcard remote endpoint was accepted as a concrete URL"
     }
 
-    Write-Host "[mcp.bridge.selftest] PASS pinned HTTP-only arguments and wildcard-remote rejection"
+    @"
+{
+  "schema": "kn-live-dbg.mcp-endpoint.v1",
+  "url": "http://127.0.0.1:51766/mcp",
+  "remote_url": "http://<this-host-ip>:51766/mcp",
+  "client_url": "http://<this-host-ip>:51766/mcp",
+  "password": "lab1",
+  "token": "lab1",
+  "listen_ips": ["127.0.0.1", "192.0.2.10"],
+  "token_source": "password",
+  "port": 51766,
+  "write": false
+}
+"@ | Set-Content -LiteralPath $endpointPath -Encoding UTF8
+    Remove-Item -LiteralPath $capturePath -ErrorAction SilentlyContinue
+
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $BridgePath -EndpointPath $endpointPath -PreferRemote
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "MCP bridge with listen_ips exited with code $LASTEXITCODE"
+    }
+    $capturedListen = Get-Content -LiteralPath $capturePath -Raw
+    if ($capturedListen -notlike "*http://192.0.2.10:51766/mcp*")
+    {
+        throw "bridge did not use listen_ips LAN address`ncaptured: $capturedListen"
+    }
+    if ($capturedListen -notlike "*Authorization: Bearer lab1*")
+    {
+        throw "bridge did not use session password`ncaptured: $capturedListen"
+    }
+
+    Write-Host "[mcp.bridge.selftest] PASS pinned HTTP-only arguments, wildcard-remote rejection, listen_ips"
 }
 finally
 {

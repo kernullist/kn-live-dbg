@@ -6,8 +6,8 @@ This document covers the **operational procedure for actually launching KnLiveDb
 
 - Server name: `knlivedbg`  ·  Server version: `0.1.0`  ·  MCP protocol: `2025-06-18`
 - Transport: in-process Streamable HTTP (`http.sys`), endpoint path `/mcp`
-- Default port: `51766`  ·  Authentication: a stable 256-bit bearer token, rotated only on request or when no saved token exists
-- Default exposure: **loopback only** (`127.0.0.1` + `[::1]`). Network exposure is opt-in via `--bind` only.
+- Default port: `51766`  ·  Authentication: a **session password** typed at `mcp on` (not persisted)
+- Default exposure: **all interfaces** (`0.0.0.0` / http.sys `+`). Use `--loopback` to stay on `127.0.0.1` only.
 
 ---
 
@@ -20,7 +20,7 @@ The MCP server runs **in-process inside the elevated KnLiveDbg.exe that owns the
 | `mcp on ...` | **Analysis target PC/VM** (where kernel RW happens) | Console command inside KnLiveDbg.exe's `knkd>` prompt |
 | `claude mcp add ...` | **Client PC** (where Claude Code runs) | Regular shell command (outside KnLiveDbg) |
 
-> If the server PC and client PC are the same, connect over loopback; if they are physically different machines, expose over the network with `--bind` and connect to the server PC's IP.
+> If the server PC and client PC are the same, connect to `127.0.0.1`. If they are physically different machines, pick a listen IP printed by `mcp on` (default bind is already all interfaces).
 
 ---
 
@@ -72,10 +72,12 @@ The boot stages proceed with `[ OK ]` (elevation -> single instance -> symbols/D
 Type this at the `knkd>` prompt. Argument order is free.
 
 ```text
-mcp on [port] [--allow-write] [--bind <addr>]
+mcp on [port] [--allow-write] [--loopback] [--bind <addr>]
 mcp off        # stop the server (inside the engine loop: off + Enter)
 mcp status     # current state
 ```
+
+`mcp on` always prompts for a temporary session password (type it twice). It is not saved across restarts.
 
 ### 3.1 Options
 
@@ -83,44 +85,52 @@ mcp status     # current state
 |------|------|--------|
 | `<port>` (positional arg) | Listening port. Only `0 < port < 65536` applies; anything else is ignored | `51766` |
 | `--allow-write` (or `allow-write`) | Lab write mode. Registers the 10 write tools + arms kernel write | none = read-only |
-| `--bind <addr>` | Network exposure. Additionally binds to `<addr>` | none = loopback only |
+| `--loopback` | Listen on `127.0.0.1` / `[::1]` only | off = all interfaces |
+| `--bind <addr>` | Override listen address. `0.0.0.0` / `*` / `+` = all adapters; `loopback` = local only; or a concrete IP | `0.0.0.0` |
 | `--bind=<addr>` | Same as above (joined form) | none |
-| `--token <t>` | Use a fixed 16-512 character printable-ASCII bearer token (persisted), instead of the auto-managed one | auto |
-| `--new-token` | Rotate: discard the persisted token and mint a fresh random one | off |
 
-For `<addr>` you can give a concrete IP (e.g. `192.168.56.10`) or, for all interfaces, `0.0.0.0` / `*` / `+` (mapped to the http.sys strong wildcard `+`).
+Default bind is **all adapters** (`0.0.0.0`, http.sys strong wildcard `+`). This is required on multi-NIC hosts (physical + Hyper-V/VMware/VPN). Do not pin a single adapter IP unless you have a reason: that is how the server used to bind the wrong NIC.
 
-**Recommended reconnect model (no token paste):** `mcp on` refreshes native Streamable HTTP snippets for the actual bind address and port. Use them with Claude Code, Cursor, Codex, or Grok Build. Before launching a client on the same PC, dot-source `%LOCALAPPDATA%\kn-live-dbg\mcp-load-env.ps1`; the configuration reads `KNLIVEDBG_TOKEN` without storing the bearer token in a project file. Claude Desktop local MCP is the exception and uses `tools\mcp-bridge.ps1` because its remote connectors originate in Anthropic's cloud and cannot reach loopback/private endpoints.
+The client only needs:
 
-**Token stability.** The bearer token is **stable across restarts** (and no longer per-port by default), so a native client config remains valid while the URL is unchanged. Resolution order: `--token <t>` > `KNLIVEDBG_TOKEN` env > `%LOCALAPPDATA%\kn-live-dbg\mcp-token` (legacy per-port files under `<exeDir>\.kn-live-dbg\` are migrated once) > freshly minted random token (persisted). If the port or bind address changes, apply the refreshed client URL. After `--new-token`, native clients must reload `KNLIVEDBG_TOKEN` and reconnect. Claude Desktop/legacy bridges must also be restarted so the new bridge process rereads the endpoint file.
+1. One IP from the list printed by `mcp on`
+2. The port
+3. The session password, sent as `Authorization: Bearer <password>`
 
-### 3.2 Local (loopback) — same PC
+Same-box Desktop/legacy clients can still use `tools\mcp-bridge.ps1` plus the endpoint file written for this session.
+
+### 3.2 Default — all interfaces
 
 ```text
 knkd> mcp on
+MCP password: ********
+Confirm password: ********
 ```
 
 Example output:
 
 ```text
-MCP server started (loopback Streamable HTTP).
-  url      : http://127.0.0.1:51766/mcp
-  token    : 3f9c... (REUSED)
-  tokenFile: %LOCALAPPDATA%\kn-live-dbg\mcp-token
-  endpoint : %LOCALAPPDATA%\kn-live-dbg\mcp-endpoint.json  (Desktop/legacy bridge state)
+MCP server started (all interfaces Streamable HTTP).
+  listen   : 0.0.0.0:51766
+  port     : 51766
+  password : lab-pass  (session only, not saved)
   write    : disabled (read-only)
-  audit    : <exeDir>\.kn-live-dbg\mcp-audit-51766.jsonl
 
-  Native HTTP client files refreshed (no npx):
-    snippets: %LOCALAPPDATA%\kn-live-dbg\clients
-    separate client launch shell: . "$env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1"
+  Client connection (IP + port + password):
+    URL    : http://<ip>:51766/mcp
+    Header : Authorization: Bearer lab-pass
+
+  Addresses on this host:
+    127.0.0.1        loopback
+    192.168.56.10    Ethernet
+    172.24.80.1      vEthernet (Default Switch)
 ```
 
-From this point the console is the **MCP engine loop**. To stop, type `off` + Enter.
+From this point the console is the **MCP engine loop**. To stop, type `off` + Enter. The next `mcp on` asks for a new password.
 
 ### 3.2.1 Client registration (native HTTP preferred)
 
-`mcp on` automatically rewrites the snippets with the live URL. While the MCP engine loop is running, the KnLiveDbg console accepts only `off` and `status`; use the generated files from a **separate PowerShell**. When the normal REPL is active (before `mcp on` or after `off`), `mcp client-setup` prints the last saved setup:
+`mcp on` rewrites the snippets with the live URL. The password is session-only: a new `mcp on` requires a new password, and `mcp off` clears it from the endpoint file. While the MCP engine loop is running, the KnLiveDbg console accepts only `off` and `status`; use the generated files from a **separate PowerShell**. When the normal REPL is active (before `mcp on` or after `off`), `mcp client-setup` prints the last saved setup:
 
 ```text
 knkd> mcp client-setup
@@ -143,71 +153,63 @@ Snippets are also written under `%LOCALAPPDATA%\kn-live-dbg\clients\`.
 | **Grok Build** | Run `clients\grok-http.powershell.txt`, or append `clients\grok-config.toml.snippet` |
 | **Older stdio-only client** | Merge `clients\legacy-stdio-mcp.json` as a compatibility fallback |
 
-In the separate PowerShell session that will launch the native client:
+Same-box helper: `mcp-load-env.ps1` reads the live endpoint and sets `KNLIVEDBG_TOKEN` to the **session password** so snippets that still use that env name work. Remote clients should paste the password directly as `Authorization: Bearer <password>`.
 
 ```powershell
 . $env:LOCALAPPDATA\kn-live-dbg\mcp-load-env.ps1
-# Start or restart the client from this shell.
+# Start or restart the client from this shell (same PC only).
 ```
 
-The stable token means normal restarts at the same URL do not require config edits. A port or bind-address change requires applying the refreshed native URL snippet. After explicit rotation (`mcp on --new-token`), rerun the env loader and restart/reconnect a native client. Restart Claude Desktop or any legacy client too: the bridge reads URL and token once when its process starts, not on each HTTP reconnect.
+### 3.3 Remote — separate PC/VM
 
-### 3.3 Remote (`--bind`) — separate PC/VM
+Default `mcp on` already listens on every adapter. Pick the IP the client can actually reach from the printed list (Ethernet/Wi-Fi, not a Hyper-V/VPN NIC unless that is the path).
 
-On the server PC, first find the LAN IP:
+```text
+knkd> mcp on
+```
+
+Client on another machine:
+
+```text
+URL    : http://192.168.56.10:51766/mcp
+Header : Authorization: Bearer <the-session-password>
+```
+
+`--loopback` keeps the listener local. `--bind 192.168.56.10` pins a single IP (avoid this on multi-NIC hosts).
+
+If remote clients time out, allow inbound TCP on the port:
 
 ```powershell
-ipconfig    # e.g. 192.168.56.10
+New-NetFirewallRule -DisplayName "KnLiveDbg MCP" -Direction Inbound -Protocol TCP -LocalPort 51766 -Action Allow
 ```
-
-Bind to that IP:
-
-```text
-knkd> mcp on 51766 --bind 192.168.56.10
-```
-
-The output adds a `remote:` line and a network-exposure warning. The client uses this `remote:` URL and token.
-
-```text
-MCP server started (NETWORK Streamable HTTP).
-  url   : http://127.0.0.1:51766/mcp
-  remote: http://192.168.56.10:51766/mcp
-  token : <copy-to-client>
-  ...
-  WARNING: this elevated kernel read/write endpoint is now reachable over the
-           network. The bearer token is the ONLY barrier. Restrict access with a
-           firewall rule (allow only the client IP) and use a trusted lab segment.
-```
-
-> If you use `--bind 0.0.0.0` (all interfaces), the tool cannot know which interface IP will be used to connect, so it prints a `<this-host-ip>` placeholder in the URL. When possible, **specify a concrete IP**.
 
 ### 3.4 Write mode
 
 ```text
-knkd> mcp on 51766 --allow-write --bind 192.168.56.10
+knkd> mcp on 51766 --allow-write
 ```
 
 - Read-only (default): on engine entry, `SetWriteMode(false)` **disarms the kernel write flag itself**. The write tools are not registered, and when called they are rejected with `writes are disabled; start the MCP server with --allow-write (lab mode)`.
 - `--allow-write`: the 10 write tools are exposed and `SetWriteMode(true)` arms kernel writes. Kernel-memory writes use the preflight/backup/verify-diff/audit rails; file/ring operations are still gated, audited, and warned when backup/verify is not meaningful (interactive confirmation is skipped).
-- **Mode-switch caveat**: if the server is already running, `mcp on --allow-write` (or `--bind`/port change) is **ignored** (it only prints `MCP server is already running on port N`). To change flags, first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch. The saved token remains valid unless you also pass `--new-token` or change `--token`/`KNLIVEDBG_TOKEN`.
+- **Mode-switch caveat**: if the server is already running, `mcp on --allow-write` (or `--bind`/port change) is **ignored** (it only prints `MCP server is already running on port N`). To change flags, first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch. A new `mcp on` always asks for a new session password.
 - **Recommendation**: take a VM snapshot before a write session, and capture an analysis baseline (`snapshot.capture`). It is for isolated VMs only; never use it on a live EDR/AC box.
 
 ---
 
 ## 4. Connecting an MCP client (client PC)
 
-Use the **exact url/token** printed by the server console. The server speaks streamable HTTP, so any MCP client that supports the `http` transport connects directly; clients limited to stdio use the `mcp-remote` bridge.
+Use the **IP + port + session password** printed by the server console. The server speaks streamable HTTP, so any MCP client that supports the `http` transport connects directly; clients limited to stdio use the `mcp-remote` bridge.
 
 ### 4.1 Claude Code
 
 ```bash
 # local (same PC)
 claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
-  --header "Authorization: Bearer <token-from-server>"
+  --header "Authorization: Bearer <session-password>"
 
-# remote (separate PC/VM) - use the server PC's IP
+# remote (separate PC/VM) - use a listen IP printed by mcp on
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
-  --header "Authorization: Bearer <token-from-server>"
+  --header "Authorization: Bearer <session-password>"
 ```
 
 Verify the connection:
@@ -231,7 +233,7 @@ If you write `.mcp.json` directly (token via **env indirection**, never commit i
 }
 ```
 
-> `${KNLIVEDBG_TOKEN}` is read by Claude Code from its launch environment. On the same PC, dot-source `mcp-load-env.ps1` before starting Claude Code. After explicit token rotation, reload the environment and reconnect. The bridge is not needed for current Claude Code builds.
+> `${KNLIVEDBG_TOKEN}` is the **session password**, not a saved 256-bit token. On the same PC, dot-source `mcp-load-env.ps1` before starting Claude Code. After another `mcp on`, load the env again (the password changed). The bridge is not needed for current Claude Code builds.
 
 Useful knobs: per-server `timeout` (ms; keep it above the server's 30-second engine limit), `headersHelper` (issue a rotating token on connect), `alwaysLoad`.
 
@@ -251,7 +253,7 @@ Claude Desktop's remote connectors support Streamable HTTP, but their traffic or
 }
 ```
 
-`mcp client-setup claude-desktop` writes the exact path to `%LOCALAPPDATA%\kn-live-dbg\clients\claude-desktop-mcp.json`. Merge it into `%APPDATA%\Claude\claude_desktop_config.json`, then fully restart Desktop. Each bridge process reads the protected endpoint once at startup, so the token stays out of Desktop config. Restart Desktop after a URL or token change so it launches a bridge with the new state.
+`mcp client-setup claude-desktop` writes the exact path to `%LOCALAPPDATA%\kn-live-dbg\clients\claude-desktop-mcp.json`. Merge it into `%APPDATA%\Claude\claude_desktop_config.json`, then fully restart Desktop. Each bridge process reads the protected endpoint once at startup, so the session password stays out of Desktop config. Restart Desktop after `mcp on`/`mcp off` so it launches a bridge with the new state.
 
 Do not publish the elevated kernel endpoint to the internet merely to make it reachable by a Claude remote connector. Keep this path loopback-only.
 
@@ -457,11 +459,11 @@ hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
 - Hermes reads `config.yaml` once at startup — **restart Hermes** after editing. Verify with `hermes mcp list` (should show `knlivedbg` connected). Header env interpolation is not guaranteed, so the literal token usually lands in the YAML — treat the file as a secret and do not commit it.
 - If your build is old enough that it rejects `url`, use `tools/mcp-bridge.ps1`; it pins `mcp-remote` and supplies the explicit local-HTTP and HTTP-only transport flags. On Windows this needs Node/`npx` on PATH. Source: [Hermes MCP config reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
 
-### 4.11 Token handling caveats
+### 4.11 Password handling caveats
 
-- The token authenticates the kernel RW endpoint. **Do not paste it in plaintext into a project-scope `.mcp.json` and commit it.** Use user-scope settings + the `${KNLIVEDBG_TOKEN}` environment variable.
-- The token is **stable across restarts** (§3.1): a client registered once keeps working, so you do not re-add the server on every `mcp on`. It changes only when you pass `--new-token` (rotation) or supply a different `--token`/`KNLIVEDBG_TOKEN` — refresh the client only then.
-- For end-to-end env-driven stability, set the same `KNLIVEDBG_TOKEN` on **both** the server host (the server reads it, precedence #2) and the client (via `${KNLIVEDBG_TOKEN}`); then no token ever lands on disk.
+- The session password authenticates the kernel RW endpoint. **Do not paste it into a project-scope `.mcp.json` and commit it.**
+- It is **not stable across restarts**. Every `mcp on` asks for a new password; `mcp off` clears it from the endpoint file. Update the client header (or reload `mcp-load-env.ps1`) after each start.
+- Snippets still use the env name `KNLIVEDBG_TOKEN`. That value **is the session password**. Same-box: `mcp-load-env.ps1` loads it. Remote: set the env to the printed password, or put `Authorization: Bearer <password>` in the client config.
 
 ---
 
@@ -469,12 +471,12 @@ hermes mcp add knlivedbg --url "http://127.0.0.1:51766/mcp" \
 
 Before processing JSON-RPC, the server passes the request through these transport gates:
 
-1. **Bearer token** (constant-time comparison): on `Authorization: Bearer <token>` mismatch, 401. This is the real authentication boundary.
-2. **Host check**: in loopback-only mode (default), if Host is not `127.0.0.1`/`localhost`/`[::1]`/`::1`, 403 (DNS-rebinding defense). In `--bind` remote mode, this check is skipped (remote Host accepted).
+1. **Session password** (constant-time comparison): on `Authorization: Bearer <password>` mismatch, 401. The raw password without the Bearer scheme is also accepted. This is the real authentication boundary.
+2. **Host check**: in `--loopback` mode, if Host is not `127.0.0.1`/`localhost`/`[::1]`/`::1`, 403 (DNS-rebinding defense). On the default all-interface bind (or a concrete `--bind` IP), this check is skipped (remote Host accepted).
 3. **Origin check**: if the Origin header **is present** but is not a loopback authority, 403. Absent/empty Origin is allowed (non-browser MCP clients do not send Origin). **This check is always applied regardless of bind mode** and stops DNS-rebinding.
 4. **Write gate**: without `--allow-write`, the write tools are not exposed and the kernel flag is not armed.
 
-Since the token is the only barrier when exposed remotely, on the server PC firewall it is recommended to **allow inbound only from the client IP** (admin PowerShell):
+Since the session password is the only barrier when exposed remotely, on the server PC firewall it is recommended to **allow inbound only from the client IP** (admin PowerShell):
 
 ```powershell
 New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
@@ -631,10 +633,10 @@ claude mcp list                      # confirm connected
 
 | Symptom | Cause / Fix |
 |------|-------------|
-| Connection 401 | Token mismatch. Native client: reload `KNLIVEDBG_TOKEN` and reconnect. Claude Desktop/legacy client: restart its bridge so it rereads the protected endpoint file. |
-| Connection 403 | (local) Connected with a non-loopback Host -> if remote, `--bind` is needed / (both) Browser context where Origin is non-loopback |
-| Cannot connect from remote (timeout) | Firewall inbound blocked. Allow the port/client IP with `New-NetFirewallRule`. Confirm the server came up with `--bind <IP>` |
-| `writes are disabled` | Read-only mode. **If already running, `mcp on --allow-write` is ignored** (prints `MCP server is already running`) -> first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch with `mcp on <port> --allow-write [--bind <addr>]`. The saved token remains valid unless explicitly rotated or overridden |
+| Connection 401 | Password mismatch. Use the session password typed at `mcp on` as `Authorization: Bearer <password>`. After another `mcp on`, the password is new. |
+| Connection 403 | `--loopback` plus a non-loopback Host, or a browser Origin that is not loopback |
+| Cannot connect from remote (timeout) | Firewall inbound blocked. Allow the port/client IP with `New-NetFirewallRule`. Confirm `mcp on` listed the IP the client is using (default is all interfaces) |
+| `writes are disabled` | Read-only mode. **If already running, `mcp on --allow-write` is ignored** (prints `MCP server is already running`) -> first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch with `mcp on <port> --allow-write`. A new `mcp on` asks for a new session password |
 | `engine busy; retry shortly` or `engine timeout` | tools/call arrives not as a JSON-RPC error code but as an `isError:true` CallToolResult. On wait-queue (8) saturation, `engine busy` (audit `engine-busy`); on exceeding the 30s engine wait, `engine timeout` (audit `tool-error`). Retry after the queue drains, or shorten/split the scan with `limit`/`count`; a larger client timeout does not extend this server limit. (`-32603` occurs only on the congested `resources/read` path) |
 | Driver load failure | Test signing not enabled -> reboot after `bcdedit /set testsigning on` / running non-elevated |
 | `symType=0 (SymNone)` | The symbol DLL bundle was not placed next to the EXE (see 2.1) |
@@ -645,15 +647,15 @@ claude mcp list                      # confirm connected
 
 ```text
 # server (VM/target PC, knkd> prompt)
-mcp on                                   # local, read-only
-mcp on 51766 --bind 192.168.56.10        # remote, read-only
-mcp on 51766 --allow-write --bind 192.168.56.10   # remote, write (VM snapshot recommended)
+mcp on                                   # all interfaces, prompts for password
+mcp on --loopback                        # 127.0.0.1 only
+mcp on 51766 --allow-write               # all interfaces, write (VM snapshot recommended)
 mcp status
 mcp off                                  # or off + Enter in the engine loop
 
-# client (Claude Code)
+# client (Claude Code) -- use a listen IP printed by mcp on
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
-  --header "Authorization: Bearer $KNLIVEDBG_TOKEN"
+  --header "Authorization: Bearer <session-password>"
 claude mcp list
 ```
 

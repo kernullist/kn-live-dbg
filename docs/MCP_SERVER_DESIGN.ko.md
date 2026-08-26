@@ -189,27 +189,27 @@ elevated 커널 RW 도구를 잠재적으로 적대적/인젝션된 LLM에 노�
 
 ### 5.1 네트워크
 
-1. **loopback 전용 바인드**: `127.0.0.1` + `::1`만. `0.0.0.0` 절대 금지. 기본 OFF, `mcp on`으로만 활성화.
+1. **기본 바인드는 모든 인터페이스**: `http://+:<port>/mcp/` (`0.0.0.0`). 멀티 NIC에서 추정 IP로 고정하지 않는다. `--loopback`만 `127.0.0.1` + `::1`.
 2. **Host 헤더 화이트리스트**: `127.0.0.1` / `[::1]` / `localhost`가 아니면 거부 → DNS rebinding 차단.
 3. **Origin 검증**: Origin이 **존재하고** 화이트리스트에 없으면 403. (주의: Origin 부재는 정상 비브라우저 클라이언트이므로 허용. "Origin 있으면 무조건 거부"는 적합 클라이언트를 깨뜨린다.)
-4. loopback은 인증 경계가 아니다(멀티유저/RDP 호스트에서 다른 로컬 사용자가 도달 가능). 실제 인증은 토큰이 담당.
+4. 모든 인터페이스 바인드는 인증 경계가 아니다. 실제 인증은 세션 비밀번호다.
 
-#### 5.1.1 옵트인 네트워크 바인드 (`--bind <addr>`, lab 전용)
+#### 5.1.1 네트워크 바인드
 
-실무 제약: lab 테스트 VM이 **물리적으로 분리된 PC**에 있으면 loopback-only 리스너에 외부 Claude 호스트가 도달할 수 없다. 이를 위해 **명시 옵트인** 네트워크 노출을 둔다 — 기본값은 바뀌지 않는다.
+실무 제약: lab 테스트 VM이 **물리적으로 분리된 PC**에 있으면 loopback 리스너에 외부 클라이언트가 도달할 수 없다. 기본 전체 인터페이스 바인드가 NIC를 고르지 않고 이를 커버한다.
 
-1. **기본은 그대로 loopback-only**(`BindAddress` 비어 있음): `127.0.0.1`+`[::1]`만 등록, Host 화이트리스트 엄격 적용. 안전 기본값 유지.
-2. **`mcp on <port> --bind <addr>`**: loopback URL은 그대로 두고 요청한 주소(`http://<addr>:<port>/mcp/`)를 **추가** 등록한다. `<addr>`는 구체 IP(예: `192.168.56.10`) 또는 전체 인터페이스용 `0.0.0.0`/`*`/`+`(http.sys 강한 와일드카드 `+`로 매핑). http.sys가 비-loopback prefix를 예약하므로 **elevated/SYSTEM이면 별도 `netsh urlacl` 불필요**(loopback과 동일).
-3. **Host 검사 완화 + Origin 방어 유지**: 원격 모드에서는 임의 Host를 수용(원격 클라이언트의 Host가 곧 lab IP)하되, **Origin 거부(존재하는데 loopback authority가 아니면 403)는 그대로 둔다** → DNS-rebinding 방어는 바인드 모드와 무관하게 유효(비브라우저 MCP 클라이언트는 Origin 미전송이라 통과).
-4. **bearer 토큰이 유일한 장벽**이 된다(§5.2). 따라서 원격 노출 시 **방화벽으로 클라이언트 IP만 인바운드 허용**하고 **신뢰된 lab 세그먼트**에서만 쓰도록 콘솔에 경고를 출력한다. `0.0.0.0` 바인드 시 클라이언트가 어느 인터페이스 IP로 접속해야 하는지는 알 수 없어 URL에 `<this-host-ip>` 플레이스홀더를 찍는다.
-5. **위협 모델 변화**: loopback-only에서는 같은 호스트의 로컬 사용자만 도달 가능했으나, 원격 노출은 lab 세그먼트의 임의 호스트가 토큰만 알면 elevated 커널 RW에 도달 가능해진다. lab/격리망 외 사용 금지(라이브 EDR/AC 박스 절대 금지).
+1. **기본은 `0.0.0.0` / `+`**: 한 prefix가 loopback 포함 모든 어댑터를 커버. 강한 와일드카드 예약이 실패하면 로컬 IPv4 + loopback을 각각 등록. Host 검사는 완화, Origin 거부는 유지.
+2. **`--loopback`**: `127.0.0.1`+`[::1]`만 등록하고 Host 화이트리스트를 엄격히 적용. elevated/SYSTEM이면 별도 `netsh urlacl` 불필요.
+3. **`--bind <ipv4>`**: 구체 IPv4(+ loopback)만 등록. 멀티 NIC에서는 피하라. Origin 거부는 모든 바인드 모드에서 유지.
+4. **세션 비밀번호가 장벽**이다(§5.2). 신뢰된 lab 세그먼트에서 방화벽으로 클라이언트 IP만 인바운드 허용. 로컬 IPv4를 모두 찍어 클라이언트가 도달 가능한 주소를 고르게 한다.
+5. **위협 모델**: 비밀번호를 아는 lab 세그먼트의 임의 호스트가 elevated 커널 RW에 도달 가능하다. lab/격리망 외 사용 금지(라이브 EDR/AC 박스 절대 금지).
 
-### 5.2 인증과 토큰 취급
+### 5.2 인증과 비밀번호 취급
 
-1. Bearer 토큰은 기본 **재기동 안정** (`%LOCALAPPDATA%\kn-live-dbg\mcp-token`, 상수 시간 비교, 불일치 시 401). 신규 256-bit 발급은 파일 없음 또는 `--new-token`일 때만. `mcp on`은 네이티브 HTTP 클라이언트용 `mcp-load-env.ps1`과 Claude Desktop/구형 클라이언트용 **stdio 브리지**가 읽는 `mcp-endpoint.json`을 기록한다. 네이티브 클라이언트 설정에는 토큰 원문 대신 환경변수 참조만 둔다.
-2. 서버는 토큰 출처(reused/new/env/override)를 출력하고 audit에는 요청 fingerprint만 남긴다. 토큰과 endpoint 파일은 현재 사용자만 전체 접근 가능한 보호 DACL로 임시 파일에 쓴 뒤 원자적으로 교체한다. 토큰 또는 endpoint 영속화가 실패하면 MCP 시작도 실패한다.
-3. **클라이언트 측 저장이 진짜 누출 지점**: 커널 RW 엔드포인트를 인증하는 토큰을 **committable한 project-scope `.mcp.json`에 붙여넣지 말 것.** 네이티브 HTTP와 user-scope 설정 + `${KNLIVEDBG_TOKEN}`/`bearer_token_env_var` + `mcp-load-env.ps1`을 우선한다. 브리지는 Claude Desktop 로컬 MCP나 구형 stdio 전용 클라이언트에만 쓴다. 절대 git 커밋 금지.
-4. 옵션: `GetExtendedTcpTable`로 loopback peer PID에 토큰을 바인딩(방어 심화, 단 재접속/PID 재사용에 취약).
+1. `mcp on`은 운영자에게 세션용 임시 비밀번호를 입력받는다(입력+확인). 4-128자 printable ASCII, 공백 없음. **디스크에 저장하지 않으며** `mcp off`/프로세스 종료 시 지운다. 클라이언트는 `Authorization: Bearer <password>`를 보낸다.
+2. 클라이언트는 `Authorization: Bearer <password>`를 보낸다(원문 비밀번호도 허용). 상수 시간 비교, 불일치 시 401.
+3. `mcp on`은 같은 PC Desktop/구형 stdio 브리지용으로 보호된 `mcp-endpoint.json`을 쓴다. 네이티브 클라이언트는 IP + port + 비밀번호를 직접 쓴다. 비밀번호를 git에 커밋하지 말 것. `mcp off`는 endpoint에서 비밀번호를 지운다.
+4. listen IP를 출력해 원격 클라이언트가 주소를 고르게 한다. 디스크 토큰을 발급하거나 재사용하지 않는다.
 
 ### 5.3 두 모드: 읽기 전용(기본) vs Lab write 모드 (결정 §10-Q1 갱신)
 
@@ -404,22 +404,20 @@ Claude Code에서 `/mcp__knlivedbg__<prompt>` 슬래시 명령으로 노출. 읽
 ### 8.2 Claude Code
 
 ```bash
-# 권장: 네이티브 Streamable HTTP. 토큰은 환경변수에 둔다.
-# `mcp client-setup claude-code`가 env 인다이렉션 user-scope 설정을 출력한다.
+# 권장: 네이티브 Streamable HTTP. `mcp on`에서 입력한 세션 비밀번호를 쓴다.
 claude mcp add --transport http knlivedbg http://127.0.0.1:51766/mcp \
-  --header "Authorization: Bearer YOUR_TOKEN"
+  --header "Authorization: Bearer YOUR_PASSWORD"
 
-# 원격(분리된 PC의 lab VM): lab 호스트에서 `mcp on 51766 --bind 192.168.56.10`로 띄운 뒤
-# 클라이언트 PC에서 lab IP로 연결. `mcp on`이 찍어주는 정확한 url/token을 그대로 사용.
+# 원격: 기본 `mcp on`이 이미 모든 어댑터에서 듣는다. 출력된 listen IP를 고른다.
 claude mcp add --transport http knlivedbg http://192.168.56.10:51766/mcp \
-  --header "Authorization: Bearer YOUR_TOKEN"
+  --header "Authorization: Bearer YOUR_PASSWORD"
 
 # 구형 stdio 전용 호스트 폴백(라이브 프로세스를 직접 노출하지 않음)
 claude mcp add --transport stdio knlivedbg-bridge -- \
-  npx -y mcp-remote@0.1.38 http://127.0.0.1:51766/mcp --allow-http --transport http-only --silent --header "Authorization: Bearer YOUR_TOKEN"
+  npx -y mcp-remote@0.1.38 http://127.0.0.1:51766/mcp --allow-http --transport http-only --silent --header "Authorization: Bearer YOUR_PASSWORD"
 ```
 
-원격 바인드 시(§5.1.1): bearer 토큰이 유일한 장벽이므로 **방화벽에서 클라이언트 IP만 인바운드 허용**하고 신뢰된 lab 세그먼트에서만 사용. `--bind 0.0.0.0`은 모든 인터페이스에 열리니 가능하면 구체 IP를 지정.
+네트워크 바인드 시(§5.1.1): 세션 비밀번호가 유일한 장벽이므로 **방화벽에서 클라이언트 IP만 인바운드 허용**하고 신뢰된 lab 세그먼트에서만 사용.
 
 `.mcp.json` (단, 토큰은 env 인다이렉션 — committable 파일에 평문 금지):
 
@@ -466,8 +464,8 @@ Claude 원격 connector를 쓰려고 커널 엔드포인트를 인터넷에 공�
 1. **서버 스택 → http.sys (`httpapi.lib`)**. elevated 프로세스에 hand-rolled HTTP 파서를 두는 것이 최우선 EoP 표면이므로 커널-감사된 http.sys로 오프로드. **관리자/SYSTEM은 `HttpAddUrlToUrlGroup`에 별도 `netsh urlacl` 예약 불필요** → URL ACL 우려 해소. loopback 한정 prefix `http://127.0.0.1:<port>/mcp` + `http://[::1]:<port>/mcp`. WinSock 기각.
 2. **포트 → 고정 기본값 + override**. loopback 포트 스캔은 즉시 가능 → 랜덤의 보안 이득 ≈ 0인데 매 세션 클라 설정 깨짐 비용이 큼(실제 인증은 토큰). private 범위 고정 기본값(예: `51766`) + `mcp on <port>` override.
 3. **write 노출 → Lab write 모드 전면 개방 (Q1, 2026-06-24 갱신)**. 격리 lab/VM(Q2)이므로 분석 충실도를 위해 `mcp on --allow-write`로 전체 타입 write 툴(§6.1.1)을 연다. 단 "개방 ≠ 안전 레일 제거" — 마찰 없는 자동 preflight/backup/verify-diff/audit를 유지(§5.3.2)하고 raw kd/임의 명령/숨은 write는 계속 금지. 비-lab 기본은 읽기 전용 + 커널 플래그 비무장(§5.3.1). write 전 VM 스냅샷 권장(§5.3.3). *(이전 "PPL 예외만" 결정을 대체.)*
-4. **클라이언트 토큰 → 정적(per-`mcp on` 신규 발급) + `${KNLIVEDBG_TOKEN}` env 인다이렉션**, `headersHelper` 회전은 옵션. project-scope 커밋 금지. (Claude Code/Desktop 양쪽 동작 + 최소 셋업; 세션마다 신규 + idle TTL로 회전 효과.)
-5. **실행 환경 → 격리 분석 VM 중심 (Q2)**. 인바운드 loopback 리스너 노출이 무관하므로 http.sys loopback 단독, named pipe 등 추가 전송 계층 불필요. (라이브 EDR/AC 박스에서 쓸 일이 생기면 named pipe 옵션을 백로그에서 검토.)
+4. **클라이언트 인증 → `mcp on`에서 운영자가 입력하는 세션 비밀번호**. 디스크에 저장하지 않는다. 클라이언트는 `Authorization: Bearer <password>`. 같은 PC 스니펫은 `mcp-load-env.ps1`이 그 값을 `KNLIVEDBG_TOKEN`에 넣을 수 있다. project-scope 커밋 금지.
+5. **실행 환경 → 격리 분석 VM 중심 (Q2)**. 기본은 lab NIC용 전체 인터페이스 바인드. `--loopback`도 가능. (라이브 EDR/AC 박스에서 쓸 일이 생기면 named pipe 옵션을 백로그에서 검토.)
 6. **타임아웃/캡 → 시작 기본값 채택, 라이브 VM 실측 튜닝**. 엔진 대기 30s(넘는 스캔은 범위를 나누거나 제한하며 클라이언트 timeout만으로 연장 불가), MCP 대기 큐 8, per-result 64KB/200 레코드, raw read 1MB(드라이버 캡), hunt/pool-scan 강제 `limit`. 전부 config 노출.
 
 남은 백로그(운영/구현 시 결정): http.sys SDDL로 포트 ACL을 elevated 계정에 한정할지; `SetProcessProtection`에 `WriteEnabled`와 독립된 게이트를 추가하는 드라이버 하드닝(§5.3.1)으로 momentary write window 제거.
@@ -502,11 +500,11 @@ Phase 0~1 + write 네임스페이스(§6.1.1)를 한 번에 구현한 초기 스
 
 신규 파일:
 - `user/McpJson.h` — header-only, surrogate-safe JSON escape/UTF-8 변환/탑레벨 값 추출(전송 계층 전용, main.cpp static 의존 없음).
-- `user/McpServer.h` / `user/McpServer.cpp` — http.sys loopback 리스너(127.0.0.1 + [::1], `/mcp`), 오버랩드 receive + stop 이벤트, bearer 토큰(per-`mcp on` 32바이트) 상수시간 비교, Host/Origin 검증, 단일 `Mcp-Session-Id` 핀, JSON-RPC(initialize/ping/tools.list/tools.call/resources.list+read/prompts.list+get/notifications), 정적 tool/resource/prompt 카탈로그, bounded 직렬 job 큐.
+- `user/McpServer.h` / `user/McpServer.cpp` — http.sys 리스너(기본 `+` / 0.0.0.0, `/mcp`), 오버랩드 receive + stop 이벤트, 세션 비밀번호 상수시간 비교, Host/Origin 검증, 단일 `Mcp-Session-Id` 핀, JSON-RPC(initialize/ping/tools.list/tools.call/resources.list+read/prompts.list+get/notifications), 정적 tool/resource/prompt 카탈로그, bounded 직렬 job 큐.
 
 main.cpp 통합:
 - `static McpServer g_McpServer;` 전역 1개.
-- `HandleMcpCommand`(`mcp on [port] [--allow-write]` / `off` / `status`) — `HandleCommand` 디스패치 + `CommandRegistry` 등록.
+- `HandleMcpCommand`(`mcp on [port] [--allow-write] [--loopback] [--bind <addr>]` / `off` / `status`) — `HandleCommand` 디스패치 + `CommandRegistry` 등록.
 - `DispatchMcpRequest`(엔진 스레드): 읽기 툴은 합성 `kn-live-dbg.ai-capability-plan.v1` 플랜 → `ParseAiCapabilityPlanResponse` → `ScopedWideStreamCapture` 안에서 `ExecuteAiCapabilityPlan`(검증+실행기 재사용). 쓰기 툴은 `DispatchMcpWriteTool`가 타입 인자 검증(`ContainsUnsafeAiCommandCharacters`/whitespace/hex) → 명령 라인 빌드 → `BuildWriteSafetyPlan` backup → `ExecuteCommandWithTranscript`(자동 write-audit) → verify.
 - `RunMcpEngineLoop`(엔진 스레드): `WaitForSingleObject(JobReadyEvent, 200)`로 폴링하며 `TryPopJob`→`DispatchMcpRequest`→promise. 콘솔 제어 reader 스레드(`off`/`status`)는 `ReadConsoleW`만 사용(wcout 미접근 → 전역 rdbuf 경쟁 회피). `mcp on` 시 write 모드 arm/disarm, 종료 시 복원.
 - `wmain` REPL 루프 진입부에서 `g_McpServer.IsRunning()`이면 `RunMcpEngineLoop` 진입(읽기 전용 기본/단일 엔진 스레드 불변식 유지). 종료 경로에서 `g_McpServer.Stop()`.

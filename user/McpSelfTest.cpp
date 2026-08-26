@@ -393,6 +393,71 @@ int RunMcpToolCatalogSelfTest()
         Check(&context, replacementOk, L"mcp-sensitive-file-atomic-replace");
         Check(&context, daclOk, L"mcp-sensitive-file-current-user-dacl");
 
+        std::wstring password;
+        std::wstring passwordError;
+        Check(
+            &context,
+            !SanitizeMcpPassword(L"ab", &password, &passwordError),
+            L"mcp-password-too-short");
+        Check(
+            &context,
+            SanitizeMcpPassword(L"lab1", &password, &passwordError) &&
+                password == L"lab1",
+            L"mcp-password-min-length");
+        Check(
+            &context,
+            !SanitizeMcpPassword(L"bad pass", &password, &passwordError),
+            L"mcp-password-rejects-space");
+        Check(
+            &context,
+            IsMcpWildcardBind(L"") &&
+                IsMcpWildcardBind(L"0.0.0.0") &&
+                IsMcpWildcardBind(L"+") &&
+                NormalizeMcpBindAddress(L"*") == L"0.0.0.0",
+            L"mcp-bind-wildcard");
+        Check(
+            &context,
+            IsMcpLoopbackBind(L"loopback") &&
+                IsMcpLoopbackBind(L"127.0.0.1") &&
+                NormalizeMcpBindAddress(L"localhost") == L"loopback",
+            L"mcp-bind-loopback");
+        Check(
+            &context,
+            NormalizeMcpBindAddress(L"192.168.56.10") == L"192.168.56.10",
+            L"mcp-bind-specific-ip");
+        Check(
+            &context,
+            IsMcpConcreteIpv4Bind(L"192.168.56.10") &&
+                !IsMcpConcreteIpv4Bind(L"999.0.0.1") &&
+                !IsMcpConcreteIpv4Bind(L"192.168.56") &&
+                !IsMcpConcreteIpv4Bind(L"--allow-write"),
+            L"mcp-bind-concrete-ipv4");
+        Check(
+            &context,
+            McpAuthorizationMatchesPassword("Bearer lab1", L"lab1") &&
+                McpAuthorizationMatchesPassword("bearer lab1", L"lab1") &&
+                McpAuthorizationMatchesPassword("lab1", L"lab1"),
+            L"mcp-auth-accepts-bearer-and-raw");
+        Check(
+            &context,
+            !McpAuthorizationMatchesPassword("Bearer lab2", L"lab1") &&
+                !McpAuthorizationMatchesPassword("Bearer lab1x", L"lab1") &&
+                !McpAuthorizationMatchesPassword("", L"lab1"),
+            L"mcp-auth-rejects-mismatch");
+
+        std::vector<McpListenAddress> listenAddresses;
+        CollectMcpListenAddresses(&listenAddresses);
+        bool hasLoopback = false;
+        for (const McpListenAddress& address : listenAddresses)
+        {
+            if (address.Ip == L"127.0.0.1" && address.Loopback)
+            {
+                hasLoopback = true;
+                break;
+            }
+        }
+        Check(&context, hasLoopback, L"mcp-listen-addresses-include-loopback");
+
         Check(&context, !CatalogContains(catalog, L"timeline.clear"), L"timeline-clear-not-mcp-tool");
         Check(&context, !CatalogContains(catalog, L"timeline.ingest"), L"timeline-ingest-not-mcp-tool");
         Check(&context, !CatalogContains(catalog, L"timeline.live"), L"timeline-live-not-mcp-tool");

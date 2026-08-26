@@ -1,11 +1,18 @@
 #define _CRT_RAND_S
 
-#include "McpServer.h"
-#include "McpJson.h"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <Windows.h>
 #include <http.h>
+#include <iphlpapi.h>
 #include <sddl.h>
+
+#include "McpServer.h"
+#include "McpJson.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -16,6 +23,63 @@
 
 #pragma comment(lib, "httpapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
+static std::wstring TrimCopy(const std::wstring& raw)
+{
+    size_t begin = 0;
+    size_t end = raw.size();
+    while (begin < end &&
+           (raw[begin] == L' ' || raw[begin] == L'\t' ||
+            raw[begin] == L'\r' || raw[begin] == L'\n'))
+    {
+        ++begin;
+    }
+    while (end > begin &&
+           (raw[end - 1] == L' ' || raw[end - 1] == L'\t' ||
+            raw[end - 1] == L'\r' || raw[end - 1] == L'\n'))
+    {
+        --end;
+    }
+    return raw.substr(begin, end - begin);
+}
+
+static std::wstring FormatIpv4(const in_addr& address)
+{
+    const unsigned char* bytes =
+        reinterpret_cast<const unsigned char*>(&address);
+    wchar_t text[16] = {};
+    swprintf_s(
+        text,
+        L"%u.%u.%u.%u",
+        static_cast<unsigned int>(bytes[0]),
+        static_cast<unsigned int>(bytes[1]),
+        static_cast<unsigned int>(bytes[2]),
+        static_cast<unsigned int>(bytes[3]));
+    return text;
+}
+
+static std::wstring FormatHttpSysHost(const std::wstring& host)
+{
+    std::wstring formatted = host;
+    do
+    {
+        if (host.empty() || host.front() == L'[')
+        {
+            break;
+        }
+        if (host == L"+" || host == L"*")
+        {
+            break;
+        }
+        if (host.find(L':') != std::wstring::npos)
+        {
+            formatted = L"[" + host + L"]";
+        }
+    } while (false);
+    return formatted;
+}
 
 // ---------------------------------------------------------------------------
 // Static tool / resource / prompt catalog and transport helpers.
@@ -261,146 +325,6 @@ namespace
             out += pair;
         }
         return out;
-    }
-
-    // Trim surrounding whitespace and reject a token that is empty or carries
-    // whitespace/control characters (which could corrupt the Authorization
-    // header comparison). Returns the sanitized token, or empty if invalid.
-    std::wstring SanitizeToken(const std::wstring& raw)
-    {
-        size_t begin = 0;
-        size_t end = raw.size();
-        while (begin < end && (raw[begin] == L' ' || raw[begin] == L'\t' || raw[begin] == L'\r' || raw[begin] == L'\n'))
-        {
-            ++begin;
-        }
-        while (end > begin && (raw[end - 1] == L' ' || raw[end - 1] == L'\t' || raw[end - 1] == L'\r' || raw[end - 1] == L'\n'))
-        {
-            --end;
-        }
-        std::wstring token = raw.substr(begin, end - begin);
-        if (token.size() < 16 || token.size() > 512)
-        {
-            return std::wstring();
-        }
-        for (wchar_t ch : token)
-        {
-            if (ch < 0x21 || ch > 0x7e)
-            {
-                // Restrict to printable ASCII without spaces; the minted token
-                // is lowercase hex, and an operator-supplied token must be a
-                // single safe header value.
-                return std::wstring();
-            }
-        }
-        return token;
-    }
-
-    std::wstring ReadEnvToken(bool* present)
-    {
-        if (present != nullptr)
-        {
-            *present = false;
-        }
-        wchar_t buffer[1024];
-        SetLastError(ERROR_SUCCESS);
-        DWORD len = GetEnvironmentVariableW(L"KNLIVEDBG_TOKEN", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
-        if (len == 0)
-        {
-            if (present != nullptr && GetLastError() != ERROR_ENVVAR_NOT_FOUND)
-            {
-                *present = true;
-            }
-            return std::wstring();
-        }
-        if (present != nullptr)
-        {
-            *present = true;
-        }
-        if (len >= sizeof(buffer) / sizeof(buffer[0]))
-        {
-            return std::wstring();
-        }
-        return SanitizeToken(std::wstring(buffer, len));
-    }
-
-    std::wstring ReadTokenFile(const std::wstring& path)
-    {
-        if (path.empty())
-        {
-            return std::wstring();
-        }
-        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE)
-        {
-            return std::wstring();
-        }
-        char bytes[1024];
-        DWORD read = 0;
-        std::wstring token;
-        if (ReadFile(file, bytes, sizeof(bytes) - 1, &read, nullptr) && read > 0)
-        {
-            bytes[read] = '\0';
-            // The token is ASCII hex (or a printable ASCII operator token), so a
-            // direct widen is sufficient.
-            std::wstring wide;
-            wide.reserve(read);
-            for (DWORD i = 0; i < read; ++i)
-            {
-                wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(bytes[i])));
-            }
-            token = SanitizeToken(wide);
-        }
-        CloseHandle(file);
-        return token;
-    }
-
-    bool RemoveLegacyTokenFiles(
-        const std::vector<std::wstring>& paths,
-        const std::wstring& activePath,
-        std::wstring* error)
-    {
-        for (const std::wstring& path : paths)
-        {
-            if (path.empty() || _wcsicmp(path.c_str(), activePath.c_str()) == 0)
-            {
-                continue;
-            }
-
-            const DWORD attributes = GetFileAttributesW(path.c_str());
-            if (attributes == INVALID_FILE_ATTRIBUTES)
-            {
-                const DWORD status = GetLastError();
-                if (status == ERROR_FILE_NOT_FOUND ||
-                    status == ERROR_PATH_NOT_FOUND)
-                {
-                    continue;
-                }
-                if (error != nullptr)
-                {
-                    *error = L"could not inspect legacy MCP token file '" +
-                        path + L"': " + std::to_wstring(status);
-                }
-                return false;
-            }
-
-            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
-                !DeleteFileW(path.c_str()))
-            {
-                const DWORD status =
-                    (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
-                        ? ERROR_DIRECTORY
-                        : GetLastError();
-                if (error != nullptr)
-                {
-                    *error = L"could not remove legacy MCP token file '" +
-                        path + L"': " + std::to_wstring(status);
-                }
-                return false;
-            }
-        }
-        return true;
     }
 
     bool BuildCurrentUserSecurityDescriptor(
@@ -850,6 +774,300 @@ namespace
     }
 }
 
+bool SanitizeMcpPassword(
+    const std::wstring& raw,
+    std::wstring* password,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (password == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid MCP password output";
+            }
+            break;
+        }
+
+        password->clear();
+        const std::wstring value = TrimCopy(raw);
+        if (value.size() < 4 || value.size() > 128)
+        {
+            if (error != nullptr)
+            {
+                *error = L"MCP password must be 4-128 printable ASCII characters without spaces";
+            }
+            break;
+        }
+
+        bool printable = true;
+        for (wchar_t ch : value)
+        {
+            if (ch < 0x21 || ch > 0x7e)
+            {
+                printable = false;
+                break;
+            }
+        }
+        if (!printable)
+        {
+            if (error != nullptr)
+            {
+                *error = L"MCP password must be 4-128 printable ASCII characters without spaces";
+            }
+            break;
+        }
+
+        *password = value;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool McpAuthorizationMatchesPassword(
+    const std::string& authorization,
+    const std::wstring& password)
+{
+    bool matches = false;
+
+    do
+    {
+        const std::string expected = mcpjson::WideToUtf8(password);
+        if (expected.empty())
+        {
+            break;
+        }
+
+        std::string presented = authorization;
+        if (presented.size() >= 7)
+        {
+            bool bearer = true;
+            const char kBearer[] = "bearer ";
+            for (size_t index = 0; index < 7; ++index)
+            {
+                char ch = presented[index];
+                if (ch >= 'A' && ch <= 'Z')
+                {
+                    ch = static_cast<char>(ch - 'A' + 'a');
+                }
+                if (ch != kBearer[index])
+                {
+                    bearer = false;
+                    break;
+                }
+            }
+            if (bearer)
+            {
+                presented = presented.substr(7);
+            }
+        }
+
+        matches = ConstantTimeEqual(presented, expected);
+    } while (false);
+
+    return matches;
+}
+
+bool IsMcpWildcardBind(const std::wstring& bindAddress)
+{
+    const std::wstring value = TrimCopy(bindAddress);
+    return value.empty() ||
+           _wcsicmp(value.c_str(), L"0.0.0.0") == 0 ||
+           _wcsicmp(value.c_str(), L"*") == 0 ||
+           _wcsicmp(value.c_str(), L"+") == 0 ||
+           _wcsicmp(value.c_str(), L"all") == 0 ||
+           _wcsicmp(value.c_str(), L"any") == 0;
+}
+
+bool IsMcpLoopbackBind(const std::wstring& bindAddress)
+{
+    const std::wstring value = TrimCopy(bindAddress);
+    return _wcsicmp(value.c_str(), L"loopback") == 0 ||
+           _wcsicmp(value.c_str(), L"localhost") == 0 ||
+           _wcsicmp(value.c_str(), L"127.0.0.1") == 0 ||
+           _wcsicmp(value.c_str(), L"::1") == 0 ||
+           _wcsicmp(value.c_str(), L"[::1]") == 0;
+}
+
+bool IsMcpConcreteIpv4Bind(const std::wstring& bindAddress)
+{
+    bool ok = false;
+    const std::wstring value = TrimCopy(bindAddress);
+    size_t pos = 0;
+
+    do
+    {
+        for (int octetIndex = 0; octetIndex < 4; ++octetIndex)
+        {
+            if (pos >= value.size() || value[pos] < L'0' || value[pos] > L'9')
+            {
+                break;
+            }
+
+            unsigned int octet = 0;
+            size_t digits = 0;
+            while (pos < value.size() && value[pos] >= L'0' && value[pos] <= L'9')
+            {
+                octet = octet * 10u + static_cast<unsigned int>(value[pos] - L'0');
+                ++pos;
+                ++digits;
+                if (digits > 3 || octet > 255)
+                {
+                    break;
+                }
+            }
+            if (digits == 0 || digits > 3 || octet > 255)
+            {
+                break;
+            }
+            if (octetIndex < 3)
+            {
+                if (pos >= value.size() || value[pos] != L'.')
+                {
+                    break;
+                }
+                ++pos;
+            }
+            else if (pos == value.size())
+            {
+                ok = true;
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
+std::wstring NormalizeMcpBindAddress(const std::wstring& bindAddress)
+{
+    std::wstring value;
+    do
+    {
+        if (IsMcpLoopbackBind(bindAddress))
+        {
+            value = L"loopback";
+            break;
+        }
+        if (IsMcpWildcardBind(bindAddress))
+        {
+            value = L"0.0.0.0";
+            break;
+        }
+        value = TrimCopy(bindAddress);
+    } while (false);
+    return value;
+}
+
+void CollectMcpListenAddresses(std::vector<McpListenAddress>* addresses)
+{
+    do
+    {
+        if (addresses == nullptr)
+        {
+            break;
+        }
+        addresses->clear();
+
+        McpListenAddress loopback = {};
+        loopback.Ip = L"127.0.0.1";
+        loopback.AdapterName = L"loopback";
+        loopback.Loopback = true;
+        addresses->push_back(loopback);
+
+        ULONG flags =
+            GAA_FLAG_SKIP_ANYCAST |
+            GAA_FLAG_SKIP_MULTICAST |
+            GAA_FLAG_SKIP_DNS_SERVER;
+        ULONG status = ERROR_BUFFER_OVERFLOW;
+        std::vector<unsigned char> buffer;
+        for (int attempt = 0; attempt < 3 && status == ERROR_BUFFER_OVERFLOW; ++attempt)
+        {
+            ULONG size = static_cast<ULONG>(buffer.size());
+            if (size < 16 * 1024)
+            {
+                size = 16 * 1024;
+            }
+            buffer.resize(size);
+            status = GetAdaptersAddresses(
+                AF_INET,
+                flags,
+                nullptr,
+                reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()),
+                &size);
+            if (status == ERROR_BUFFER_OVERFLOW && size > buffer.size())
+            {
+                buffer.resize(size);
+            }
+        }
+        if (status != NO_ERROR || buffer.empty())
+        {
+            break;
+        }
+
+        IP_ADAPTER_ADDRESSES* adapters =
+            reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+
+        for (IP_ADAPTER_ADDRESSES* adapter = adapters;
+             adapter != nullptr;
+             adapter = adapter->Next)
+        {
+            if (adapter->OperStatus != IfOperStatusUp ||
+                adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            {
+                continue;
+            }
+
+            for (IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress;
+                 unicast != nullptr;
+                 unicast = unicast->Next)
+            {
+                if (unicast->Address.lpSockaddr == nullptr ||
+                    unicast->Address.lpSockaddr->sa_family != AF_INET)
+                {
+                    continue;
+                }
+
+                const sockaddr_in* v4 =
+                    reinterpret_cast<const sockaddr_in*>(unicast->Address.lpSockaddr);
+                const std::wstring ip = FormatIpv4(v4->sin_addr);
+                if (ip.empty() || ip == L"0.0.0.0" || ip == L"127.0.0.1")
+                {
+                    continue;
+                }
+
+                bool duplicate = false;
+                for (const McpListenAddress& existing : *addresses)
+                {
+                    if (existing.Ip == ip)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate)
+                {
+                    continue;
+                }
+
+                McpListenAddress item = {};
+                item.Ip = ip;
+                if (adapter->FriendlyName != nullptr)
+                {
+                    item.AdapterName = adapter->FriendlyName;
+                }
+                const unsigned char* bytes =
+                    reinterpret_cast<const unsigned char*>(&v4->sin_addr);
+                item.LinkLocal = (bytes[0] == 169 && bytes[1] == 254);
+                addresses->push_back(item);
+            }
+        }
+    } while (false);
+}
+
 // ---------------------------------------------------------------------------
 // McpServer
 //
@@ -1102,7 +1320,60 @@ uint16_t McpServer::Port() const
     return config_.Port;
 }
 
+std::wstring McpServer::BindAddress() const
+{
+    return config_.BindAddress;
+}
+
+bool McpServer::IsLoopbackOnly() const
+{
+    if (wildcardBound_ || !registeredHosts_.empty())
+    {
+        return !IsNetworkExposed();
+    }
+    return IsMcpLoopbackBind(config_.BindAddress);
+}
+
+bool McpServer::WildcardBound() const
+{
+    return wildcardBound_;
+}
+
+bool McpServer::IsNetworkExposed() const
+{
+    bool exposed = false;
+
+    do
+    {
+        if (wildcardBound_)
+        {
+            exposed = true;
+            break;
+        }
+        for (const std::wstring& host : registeredHosts_)
+        {
+            if (!IsMcpLoopbackBind(host) && host != L"[::1]")
+            {
+                exposed = true;
+                break;
+            }
+        }
+    } while (false);
+
+    return exposed;
+}
+
+std::vector<std::wstring> McpServer::RegisteredHosts() const
+{
+    return registeredHosts_;
+}
+
 std::wstring McpServer::Token() const
+{
+    return token_;
+}
+
+std::wstring McpServer::Password() const
 {
     return token_;
 }
@@ -1112,162 +1383,48 @@ std::wstring McpServer::TokenSource() const
     return tokenSource_;
 }
 
-bool McpServer::ResolveToken(std::wstring* token, std::wstring* error)
+bool McpServer::AddUrlPrefix(void* urlGroup, const std::wstring& host, std::wstring* error)
 {
-    if (token == nullptr)
-    {
-        if (error != nullptr)
-        {
-            *error = L"invalid MCP token output";
-        }
-        return false;
-    }
-    token->clear();
-    if (error != nullptr)
-    {
-        error->clear();
-    }
+    bool ok = false;
 
-    auto mintAndPersistFresh = [&]() -> bool
+    do
     {
-        std::wstring fresh = RandomHex(32);
-        if (fresh.empty())
+        if (urlGroup == nullptr || host.empty())
         {
             if (error != nullptr)
             {
-                *error = L"cryptographic token generation failed";
+                *error = L"invalid MCP URL prefix";
             }
-            return false;
-        }
-        if (!WriteMcpSensitiveFile(
-                config_.TokenPath,
-                mcpjson::WideToUtf8(fresh),
-                error))
-        {
-            return false;
-        }
-        tokenSource_ = L"new";
-        *token = fresh;
-        return true;
-    };
-
-    // 1) explicit --token: use and persist (so later restarts without --token,
-    //    and without an env var, reuse it from the file).
-    std::wstring explicitToken = SanitizeToken(config_.TokenOverride);
-    if (!config_.TokenOverride.empty() && explicitToken.empty())
-    {
-        if (error != nullptr)
-        {
-            *error = L"--token must be 16-512 printable ASCII characters without spaces";
-        }
-        return false;
-    }
-    if (!explicitToken.empty())
-    {
-        if (!WriteMcpSensitiveFile(
-                config_.TokenPath,
-                mcpjson::WideToUtf8(explicitToken),
-                error))
-        {
-            return false;
-        }
-        if (!RemoveLegacyTokenFiles(
-                config_.LegacyTokenPaths,
-                config_.TokenPath,
-                error))
-        {
-            return false;
-        }
-        tokenSource_ = L"override";
-        *token = explicitToken;
-        return true;
-    }
-
-    // 2) KNLIVEDBG_TOKEN env: authoritative each run, not persisted (env wins).
-    bool envTokenPresent = false;
-    std::wstring envToken = ReadEnvToken(&envTokenPresent);
-    if (envTokenPresent && envToken.empty())
-    {
-        if (error != nullptr)
-        {
-            *error = L"KNLIVEDBG_TOKEN must be 16-512 printable ASCII characters without spaces";
-        }
-        return false;
-    }
-    if (!envToken.empty())
-    {
-        if (!RemoveLegacyTokenFiles(
-                config_.LegacyTokenPaths,
-                config_.TokenPath,
-                error))
-        {
-            return false;
-        }
-        tokenSource_ = L"env";
-        *token = envToken;
-        return true;
-    }
-
-    // 3) persisted file: reuse unless an explicit rotation was requested.
-    if (!config_.RotateToken)
-    {
-        std::wstring saved = ReadTokenFile(config_.TokenPath);
-        if (!saved.empty())
-        {
-            if (!WriteMcpSensitiveFile(
-                    config_.TokenPath,
-                    mcpjson::WideToUtf8(saved),
-                    error))
-            {
-                return false;
-            }
-            std::wstring cleanupError;
-            if (!RemoveLegacyTokenFiles(
-                    config_.LegacyTokenPaths,
-                    config_.TokenPath,
-                    &cleanupError))
-            {
-                // A legacy plaintext copy could contain this same token. If it
-                // cannot be removed, rotate so the leftover value is invalid.
-                return mintAndPersistFresh();
-            }
-            tokenSource_ = L"reused";
-            *token = saved;
-            return true;
+            break;
         }
 
-        for (const std::wstring& legacyPath : config_.LegacyTokenPaths)
+        const std::wstring formattedHost = FormatHttpSysHost(host);
+        const std::wstring url =
+            L"http://" + formattedHost + L":" +
+            std::to_wstring(config_.Port) + L"/mcp/";
+        const ULONG status = HttpAddUrlToUrlGroup(
+            reinterpret_cast<HTTP_URL_GROUP_ID>(urlGroup),
+            url.c_str(),
+            0,
+            0);
+        if (status != NO_ERROR)
         {
-            std::wstring legacy = ReadTokenFile(legacyPath);
-            if (legacy.empty())
+            if (error != nullptr)
             {
-                continue;
+                *error = L"HttpAddUrlToUrlGroup(" + url + L") failed: " +
+                    std::to_wstring(status);
             }
-            if (!WriteMcpSensitiveFile(
-                    config_.TokenPath,
-                    mcpjson::WideToUtf8(legacy),
-                    error))
-            {
-                return false;
-            }
-            std::wstring cleanupError;
-            if (!RemoveLegacyTokenFiles(
-                    config_.LegacyTokenPaths,
-                    config_.TokenPath,
-                    &cleanupError))
-            {
-                // Preserve availability without accepting a token that may
-                // still be readable from an obsolete plaintext location.
-                return mintAndPersistFresh();
-            }
-            tokenSource_ = L"reused";
-            *token = legacy;
-            return true;
+            break;
         }
-    }
+        if (host == L"+" || host == L"*")
+        {
+            wildcardBound_ = true;
+        }
+        registeredHosts_.push_back(host);
+        ok = true;
+    } while (false);
 
-    // 4) mint a fresh random token and persist it for the next restart.
-    return mintAndPersistFresh();
+    return ok;
 }
 
 std::wstring McpServer::AuditPath() const
@@ -1357,11 +1514,27 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         }
 
         config_ = config;
+        config_.BindAddress = NormalizeMcpBindAddress(config_.BindAddress);
         sessionId_.clear();
+        token_.clear();
+        tokenSource_.clear();
+        registeredHosts_.clear();
+        wildcardBound_ = false;
         stopRequested_.store(false);
 
-        // Ensure the audit directory exists. Audit logging is best-effort;
-        // bearer-token persistence below is mandatory.
+        std::wstring passwordError;
+        if (!SanitizeMcpPassword(config_.Password, &token_, &passwordError))
+        {
+            if (error != nullptr)
+            {
+                *error = passwordError;
+            }
+            break;
+        }
+        tokenSource_ = L"password";
+        config_.Password = token_;
+
+        // Ensure the audit directory exists. Audit logging is best-effort.
         if (!config_.AuditPath.empty())
         {
             size_t slash = config_.AuditPath.find_last_of(L"\\/");
@@ -1438,61 +1611,87 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             break;
         }
 
-        std::wstring url4 = L"http://127.0.0.1:" + std::to_wstring(config_.Port) + L"/mcp/";
-        status = HttpAddUrlToUrlGroup(urlGroup, url4.c_str(), 0, 0);
-        if (status != NO_ERROR)
+        bool prefixesOk = false;
+        std::wstring prefixError;
+        if (IsMcpLoopbackBind(config_.BindAddress))
         {
-            if (error != nullptr)
-            {
-                *error = L"HttpAddUrlToUrlGroup(127.0.0.1) failed: " + std::to_wstring(status) +
-                         L" (port in use or insufficient rights)";
-            }
-            break;
+            prefixesOk = AddUrlPrefix(urlGroupId_, L"127.0.0.1", &prefixError);
+            AddUrlPrefix(urlGroupId_, L"[::1]", nullptr);
         }
-
-        // IPv6 loopback is best-effort; ignore failure so IPv4-only hosts work.
-        std::wstring url6 = L"http://[::1]:" + std::to_wstring(config_.Port) + L"/mcp/";
-        HttpAddUrlToUrlGroup(urlGroup, url6.c_str(), 0, 0);
-
-        // Opt-in NETWORK exposure: also register the requested address so a
-        // remote client (reachable IP) can connect directly over HTTP. Loopback
-        // stays registered for local use. "0.0.0.0"/"*"/"+" => all interfaces.
-        if (!config_.BindAddress.empty())
+        else if (IsMcpWildcardBind(config_.BindAddress))
         {
-            std::wstring host = config_.BindAddress;
-            if (host == L"0.0.0.0" || host == L"*" || host == L"+")
+            // Strong wildcard covers every adapter, including loopback. Do not
+            // also register 127.0.0.1: overlapping prefixes can fail.
+            prefixesOk = AddUrlPrefix(urlGroupId_, L"+", &prefixError);
+            if (!prefixesOk)
             {
-                host = L"+";
+                prefixesOk = AddUrlPrefix(urlGroupId_, L"127.0.0.1", &prefixError);
+                AddUrlPrefix(urlGroupId_, L"[::1]", nullptr);
+
+                std::vector<McpListenAddress> listenAddresses;
+                CollectMcpListenAddresses(&listenAddresses);
+                size_t extra = 0;
+                for (const McpListenAddress& address : listenAddresses)
+                {
+                    if (address.Loopback)
+                    {
+                        continue;
+                    }
+                    if (AddUrlPrefix(urlGroupId_, address.Ip, nullptr))
+                    {
+                        ++extra;
+                    }
+                }
+                if (!prefixesOk && extra == 0)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = prefixError +
+                            L" (port in use, URL reserved, or insufficient rights)";
+                    }
+                    break;
+                }
+                prefixesOk = true;
             }
-            std::wstring urlRemote = L"http://" + host + L":" + std::to_wstring(config_.Port) + L"/mcp/";
-            status = HttpAddUrlToUrlGroup(urlGroup, urlRemote.c_str(), 0, 0);
-            if (status != NO_ERROR)
+        }
+        else
+        {
+            prefixesOk = AddUrlPrefix(urlGroupId_, config_.BindAddress, &prefixError);
+            if (!prefixesOk)
             {
                 if (error != nullptr)
                 {
-                    *error = L"HttpAddUrlToUrlGroup(" + config_.BindAddress + L") failed: " + std::to_wstring(status) +
-                             L" (port in use, address not local, or insufficient rights)";
+                    *error = prefixError +
+                        L" (address is not local, port in use, or insufficient rights)";
                 }
                 break;
             }
+            AddUrlPrefix(urlGroupId_, L"127.0.0.1", nullptr);
+            AddUrlPrefix(urlGroupId_, L"[::1]", nullptr);
         }
-
-        // Resolve the stable bearer token only after all listener prefixes are
-        // reserved. A failed bind must not rotate or overwrite client state.
-        // Persistence remains mandatory before the listener thread starts.
-        std::wstring tokenError;
-        if (!ResolveToken(&token_, &tokenError))
+        if (!prefixesOk)
         {
             if (error != nullptr)
             {
-                *error = L"failed to resolve MCP bearer token: " + tokenError;
+                *error = prefixError +
+                    L" (port in use or insufficient rights)";
             }
             break;
         }
 
-        running_.store(true);
-        listener_ = std::thread(&McpServer::ListenerThreadMain, this);
-        ok = true;
+        try
+        {
+            listener_ = std::thread(&McpServer::ListenerThreadMain, this);
+            running_.store(true);
+            ok = true;
+        }
+        catch (...)
+        {
+            if (error != nullptr)
+            {
+                *error = L"failed to start MCP listener thread";
+            }
+        }
     } while (false);
 
     if (!ok)
@@ -1586,6 +1785,21 @@ void McpServer::Stop()
         CloseHandle(jobReadyEvent_);
         jobReadyEvent_ = nullptr;
     }
+
+    if (!token_.empty())
+    {
+        SecureZeroMemory(&token_[0], token_.size() * sizeof(wchar_t));
+    }
+    token_.clear();
+    tokenSource_.clear();
+    sessionId_.clear();
+    if (!config_.Password.empty())
+    {
+        SecureZeroMemory(&config_.Password[0], config_.Password.size() * sizeof(wchar_t));
+    }
+    config_.Password.clear();
+    registeredHosts_.clear();
+    wildcardBound_ = false;
 }
 
 void McpServer::ListenerThreadMain()
@@ -1724,11 +1938,11 @@ void McpServer::ListenerThreadMain()
         }
 
         // Loopback-only mode enforces a strict loopback Host (DNS-rebinding
-        // defense). When network exposure is opted in (--bind), any Host is
-        // accepted; the bearer token plus the Origin rejection below remain the
-        // barrier (non-browser MCP clients send no Origin).
+        // defense). Wildcard/all-interface and specific-IP binds accept any
+        // Host; the session password plus Origin rejection remain the barrier
+        // (non-browser MCP clients send no Origin).
         std::string host = KnownHeader(request, HttpHeaderHost);
-        if (config_.BindAddress.empty() && !IsLoopbackHost(host))
+        if (!IsNetworkExposed() && !IsLoopbackHost(host))
         {
             sendResponse(requestId, 403, "Forbidden", L"");
             return;
@@ -1742,8 +1956,7 @@ void McpServer::ListenerThreadMain()
         }
 
         std::string authorization = KnownHeader(request, HttpHeaderAuthorization);
-        std::string expected = "Bearer " + mcpjson::WideToUtf8(token_);
-        if (!ConstantTimeEqual(authorization, expected))
+        if (!McpAuthorizationMatchesPassword(authorization, token_))
         {
             sendResponse(requestId, 401, "Unauthorized", L"");
             return;

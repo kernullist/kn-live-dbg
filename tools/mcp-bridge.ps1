@@ -3,8 +3,8 @@
 # Register this script for Claude Desktop local MCP, or use it as a fallback
 # only when an older MCP client cannot connect with Streamable HTTP directly.
 # On every bridge process start it reads the endpoint file written by `mcp on`
-# and attaches with the current bearer token -- no token paste in client config.
-# Restart the bridge/client after changing the endpoint URL or bearer token.
+# and attaches with the current session password -- no secret paste in client config.
+# Restart the bridge/client after changing the endpoint URL or session password.
 #
 # Prerequisite: KnLiveDbg is running with `mcp on`.
 #
@@ -112,6 +112,10 @@ catch
 }
 
 $token = (Get-JsonStringProperty -Object $endpoint -Name "token").Trim()
+if ([string]::IsNullOrWhiteSpace($token))
+{
+    $token = (Get-JsonStringProperty -Object $endpoint -Name "password").Trim()
+}
 $loopUrl = (Get-JsonStringProperty -Object $endpoint -Name "url").Trim()
 $remoteUrl = (Get-JsonStringProperty -Object $endpoint -Name "remote_url").Trim()
 $clientUrl = (Get-JsonStringProperty -Object $endpoint -Name "client_url").Trim()
@@ -119,17 +123,33 @@ $tokenSource = (Get-JsonStringProperty -Object $endpoint -Name "token_source").T
 $port = Get-JsonStringProperty -Object $endpoint -Name "port"
 $write = Get-JsonStringProperty -Object $endpoint -Name "write"
 
-if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 16)
+if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 4)
 {
-    throw "Invalid MCP endpoint token in '$endpointPath' (empty or too short)."
+    throw "Invalid MCP endpoint password in '$endpointPath' (empty or too short)."
 }
 
 # Prefer loopback for same-box agents. Use remote only when requested or when
-# loopback url is missing and client_url/remote_url is set.
+# loopback url is missing and client_url/remote_url/listen_ips is set.
 $url = $loopUrl
 if ($PreferRemote)
 {
-    if (-not [string]::IsNullOrWhiteSpace($remoteUrl) -and $remoteUrl -notlike "*<this-host-ip>*")
+    $listenIps = @()
+    if ($null -ne $endpoint.listen_ips)
+    {
+        $listenIps = @($endpoint.listen_ips | ForEach-Object { [string]$_ })
+    }
+    $lanIp = $listenIps | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        $_ -ne "127.0.0.1" -and
+        $_ -ne "::1" -and
+        $_ -notlike "169.254.*"
+    } | Select-Object -First 1
+
+    if (-not [string]::IsNullOrWhiteSpace($lanIp) -and -not [string]::IsNullOrWhiteSpace($port))
+    {
+        $url = "http://{0}:{1}/mcp" -f $lanIp, $port
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($remoteUrl) -and $remoteUrl -notlike "*<this-host-ip>*")
     {
         $url = $remoteUrl
     }
@@ -142,7 +162,7 @@ if ($PreferRemote)
     }
     else
     {
-        throw "A concrete remote MCP URL is unavailable. Start the server with --bind <specific-ip> instead of a wildcard bind."
+        throw "A concrete remote MCP URL is unavailable. Use one of the listen IPs printed by mcp on."
     }
 }
 if ([string]::IsNullOrWhiteSpace($url))

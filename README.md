@@ -95,7 +95,7 @@ kn-live-dbg/
 - `docs/WINDBG_COMMAND_COVERAGE.md` tracks native and DbgEng-routed WinDbg command coverage.
 - `docs/AI_ASSISTED_WORKFLOWS.md` documents the implemented AI intent router, evidence analysis, command planning, write safety, playbooks, reporting, and operator examples.
 - `docs/FEATURE_PLAN.md` tracks completed feature slices and remaining high-value work such as richer driver-object/device-stack inspection (`!drvobj`/`!devstack`), WNF stabilization, and probe fixtures.
-- `docs/MCP_SERVER_DESIGN.md` covers the in-process MCP server design and security rationale; `docs/MCP_SETUP.md` is the operator guide for starting the server (`mcp on`), remote `--bind` exposure, and connecting Claude Code/Desktop. Docs are English-first; Korean translations are the sibling `*.ko.md` files.
+- `docs/MCP_SERVER_DESIGN.md` covers the in-process MCP server design and security rationale; `docs/MCP_SETUP.md` is the operator guide for starting the server (`mcp on`, all-interface bind, session password) and connecting Claude Code/Desktop. Docs are English-first; Korean translations are the sibling `*.ko.md` files.
 - `docs/TIMELINE_COMMAND_USAGE.md` documents scenario-based `!timeline` usage for TI, snapshot reconciliation, kernel live callback collection, graphing, JSONL export, and reset workflows. The Korean mirror is `docs/TIMELINE_COMMAND_USAGE.ko.md`.
 
 ## Build
@@ -258,7 +258,7 @@ kd <windbg-command>
 kddetach
 version
 drvstatus
-mcp [on [port]|off|status|client-setup|endpoint]
+mcp [on [port] [--allow-write] [--loopback] [--bind <addr>]|off|status|client-setup|endpoint]
 log [enable|disable|status]
 probe [status|load [sys-path]|info|reset|unload]
 .sympath [path]

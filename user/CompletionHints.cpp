@@ -88,9 +88,9 @@ namespace
 
     const CompletionHint kMcpRootTokens[] =
     {
-        { L"on", L"mcp on [port] [--allow-write] [--bind <addr>] [--token <t>]", L"start the native HTTP MCP server" },
+        { L"on", L"mcp on [port] [--allow-write] [--loopback] [--bind <addr>]", L"start MCP on 0.0.0.0; prompts for a session password" },
         { L"off", L"mcp off", L"stop the MCP server" },
-        { L"status", L"mcp status", L"show listen address, token, and write-allow state" },
+        { L"status", L"mcp status", L"show listen address, password mode, and write-allow state" },
         { L"client-setup", L"mcp client-setup [all|claude|cursor|codex|grok|legacy]", L"print client config snippets" },
         { L"endpoint", L"mcp endpoint", L"show the live endpoint file path and summary" },
         { L"help", nullptr, L"show mcp usage" },
@@ -99,9 +99,8 @@ namespace
     const CompletionHint kMcpOnTokens[] =
     {
         { L"--allow-write", nullptr, L"enable write tools (test VM only)" },
-        { L"--bind", L"--bind <addr>", L"listen address, default loopback" },
-        { L"--token", L"--token <t>", L"set the bearer token" },
-        { L"--new-token", nullptr, L"generate a fresh bearer token" },
+        { L"--loopback", nullptr, L"listen on 127.0.0.1 only" },
+        { L"--bind", L"--bind <addr>", L"0.0.0.0 (default, all adapters), loopback, or a specific IP" },
         { L"help", nullptr, L"show mcp on usage" },
     };
 
@@ -1087,7 +1086,7 @@ namespace
     const CompletionScopeTable kMcpScopes[] =
     {
         SCOPE(L"", L"mcp on|off|status|client-setup|endpoint", L"native HTTP MCP server", kMcpRootTokens),
-        SCOPE(L"on", L"mcp on [port] [--allow-write] [--bind] [--token|--new-token]", L"start the MCP server", kMcpOnTokens),
+        SCOPE(L"on", L"mcp on [port] [--allow-write] [--loopback] [--bind]", L"start the MCP server", kMcpOnTokens),
         SCOPE(L"client-setup", L"mcp client-setup [all|claude|cursor|codex|grok|legacy]", L"client config snippets", kMcpClientTokens),
     };
 
