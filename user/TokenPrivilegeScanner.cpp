@@ -122,6 +122,250 @@ namespace
         return bytes->size() == length;
     }
 
+    bool ReadU16(DeviceClient& device, uint64_t address, uint16_t* value)
+    {
+        std::vector<uint8_t> bytes;
+        if (!ReadBytes(device, address, sizeof(uint16_t), &bytes) ||
+            bytes.size() != sizeof(uint16_t))
+        {
+            return false;
+        }
+        memcpy(value, bytes.data(), sizeof(uint16_t));
+        return true;
+    }
+
+    std::wstring ToLowerCopy(const std::wstring& value)
+    {
+        std::wstring lowered = value;
+        for (wchar_t& ch : lowered)
+        {
+            if (ch >= L'A' && ch <= L'Z')
+            {
+                ch = static_cast<wchar_t>(ch - L'A' + L'a');
+            }
+        }
+        return lowered;
+    }
+
+    std::wstring NormalizeKernelImagePath(const std::wstring& path)
+    {
+        std::wstring normalized = ToLowerCopy(path);
+        for (wchar_t& ch : normalized)
+        {
+            if (ch == L'/')
+            {
+                ch = L'\\';
+            }
+        }
+
+        while (normalized.size() >= 4 &&
+            (normalized.compare(0, 4, L"\\??\\") == 0 ||
+             normalized.compare(0, 4, L"\\\\?\\") == 0 ||
+             normalized.compare(0, 4, L"\\\\.\\") == 0))
+        {
+            normalized.erase(0, 4);
+        }
+
+        if (normalized.compare(0, 8, L"\\device\\") == 0)
+        {
+            const size_t slash = normalized.find(L'\\', 8);
+            if (slash != std::wstring::npos)
+            {
+                normalized = normalized.substr(slash);
+            }
+        }
+
+        if (normalized.compare(0, 11, L"\\systemroot") == 0)
+        {
+            normalized = std::wstring(L"\\windows") + normalized.substr(11);
+        }
+
+        return normalized;
+    }
+
+    bool NormalizedPathStartsWith(const std::wstring& normalized, const std::wstring& prefix)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (prefix.empty())
+            {
+                break;
+            }
+
+            if (normalized.size() >= 2 && normalized[1] == L':')
+            {
+                matched = normalized.compare(2, prefix.size(), prefix) == 0;
+                break;
+            }
+
+            matched = normalized.compare(0, prefix.size(), prefix) == 0;
+        } while (false);
+
+        return matched;
+    }
+
+    bool PathLooksLikeSystemProfilePath(const std::wstring& path)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (path.empty())
+            {
+                break;
+            }
+
+            const std::wstring normalized = NormalizeKernelImagePath(path);
+            if (NormalizedPathStartsWith(normalized, L"\\windows\\system32\\") ||
+                NormalizedPathStartsWith(normalized, L"\\windows\\syswow64\\") ||
+                NormalizedPathStartsWith(normalized, L"\\windows\\servicing\\") ||
+                NormalizedPathStartsWith(normalized, L"\\windows\\winsxs\\") ||
+                NormalizedPathStartsWith(normalized, L"\\program files\\windows defender\\") ||
+                NormalizedPathStartsWith(normalized, L"\\program files (x86)\\windows defender\\") ||
+                NormalizedPathStartsWith(normalized, L"\\programdata\\microsoft\\windows defender\\"))
+            {
+                matched = true;
+                break;
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool PathHasDirectorySeparator(const std::wstring& path)
+    {
+        return path.find_last_of(L"\\/") != std::wstring::npos;
+    }
+
+    bool ReadKernelUnicodeString(DeviceClient& device, uint64_t address, std::wstring* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr)
+            {
+                break;
+            }
+
+            value->clear();
+            uint16_t length = 0;
+            uint64_t buffer = 0;
+            if (!ReadU16(device, address, &length))
+            {
+                break;
+            }
+            uint16_t maximum = 0;
+            ReadU16(device, address + 2, &maximum);
+            if (!ReadU64(device, address + 8, &buffer))
+            {
+                break;
+            }
+            if (length == 0)
+            {
+                ok = true;
+                break;
+            }
+            if (maximum != 0 && maximum < length)
+            {
+                length = maximum;
+            }
+            length = static_cast<uint16_t>(length & ~static_cast<uint16_t>(1));
+            if (length == 0)
+            {
+                ok = true;
+                break;
+            }
+            if (buffer == 0 || !IsKernelAddress(buffer))
+            {
+                break;
+            }
+            if (length > 2048)
+            {
+                length = 2048;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!ReadBytes(device, buffer, length, &bytes) || bytes.size() < 2)
+            {
+                break;
+            }
+
+            value->assign(
+                reinterpret_cast<const wchar_t*>(bytes.data()),
+                bytes.size() / sizeof(wchar_t));
+            ok = !value->empty();
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadProcessImagePath(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t eprocess,
+        std::wstring* path)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (path == nullptr || eprocess == 0)
+            {
+                break;
+            }
+
+            path->clear();
+            TypeFieldInfo field = {};
+            std::wstring ignored;
+            uint64_t nameInfo = 0;
+            if (symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"SeAuditProcessCreationInfo.ImageFileName",
+                    &field,
+                    &ignored) ||
+                symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"SeAuditProcessCreationInfo",
+                    &field,
+                    &ignored))
+            {
+                if (ReadU64(device, eprocess + field.Offset, &nameInfo) &&
+                    nameInfo != 0 &&
+                    IsKernelAddress(nameInfo) &&
+                    ReadKernelUnicodeString(device, nameInfo, path) &&
+                    !path->empty())
+                {
+                    ok = true;
+                    break;
+                }
+            }
+
+            TypeFieldInfo imageFile = {};
+            TypeFieldInfo fileName = {};
+            if (!symbols.FindField(L"nt!_EPROCESS", L"ImageFilePointer", &imageFile, &ignored) ||
+                !symbols.FindField(L"nt!_FILE_OBJECT", L"FileName", &fileName, &ignored))
+            {
+                break;
+            }
+
+            uint64_t fileObject = 0;
+            if (!ReadU64(device, eprocess + imageFile.Offset, &fileObject) ||
+                fileObject == 0 ||
+                !IsKernelAddress(fileObject))
+            {
+                break;
+            }
+
+            ok = ReadKernelUnicodeString(device, fileObject + fileName.Offset, path) &&
+                !path->empty();
+        } while (false);
+
+        return ok;
+    }
+
     bool EqualsCI(const std::wstring& a, const std::wstring& b)
     {
         if (a.size() != b.size())
@@ -146,6 +390,65 @@ namespace
             }
         }
         return true;
+    }
+
+    std::wstring PrivilegeImageLeaf(const std::wstring& image)
+    {
+        std::wstring leaf = image;
+        const size_t slash = leaf.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && slash + 1 < leaf.size())
+        {
+            leaf = leaf.substr(slash + 1);
+        }
+        return leaf;
+    }
+
+    bool MatchesKnownSystemImageName(
+        const std::wstring& value,
+        const wchar_t* const* names,
+        size_t count)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (value.empty() || names == nullptr || count == 0)
+            {
+                break;
+            }
+
+            const std::wstring leaf = PrivilegeImageLeaf(value);
+            if (leaf.empty())
+            {
+                break;
+            }
+
+            for (size_t index = 0; index < count; ++index)
+            {
+                if (names[index] == nullptr)
+                {
+                    continue;
+                }
+                if (EqualsCI(leaf, names[index]))
+                {
+                    matched = true;
+                    break;
+                }
+
+                // EPROCESS.ImageFileName is 15 bytes. "TrustedInstalle" must
+                // still match TrustedInstaller.exe when the full path is absent.
+                const std::wstring known(names[index]);
+                if (leaf.size() == 15 &&
+                    known.size() > 15 &&
+                    EqualsCI(leaf, known.substr(0, 15)))
+                {
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
     }
 
     bool ContainsCI(const std::wstring& haystack, const std::wstring& needle)
@@ -336,47 +639,66 @@ bool TokenPrivilegeScanner::IsHighRiskPrivilegeName(const std::wstring& name)
     return false;
 }
 
-bool TokenPrivilegeScanner::IsSystemProfileImage(const std::wstring& imageName, uint32_t pid)
+bool TokenPrivilegeScanner::IsSystemProfileImage(
+    const std::wstring& imageName,
+    uint32_t pid,
+    const std::wstring& imagePath)
 {
-    if (pid == 0 || pid == 4)
+    bool systemProfile = false;
+
+    do
     {
-        return true;
-    }
-    // Keep this list to true kernel/session service hosts. Do not include
-    // interactive shells (explorer, conhost) or arbitrary user apps - those
-    // are exactly the surfaces where unexpected elevation matters.
-    static const wchar_t* kSystemImages[] =
-    {
-        L"System",
-        L"smss.exe",
-        L"csrss.exe",
-        L"wininit.exe",
-        L"winlogon.exe",
-        L"services.exe",
-        L"lsass.exe",
-        L"svchost.exe",
-        L"LsaIso.exe",
-        L"Memory Compression",
-        L"Registry",
-        L"Secure System",
-        L"fontdrvhost.exe",
-        L"dwm.exe",
-        L"MsMpEng.exe",
-        L"NisSrv.exe",
-        L"SecurityHealthService.exe",
-        L"TrustedInstaller.exe",
-        L"TiWorker.exe",
-        L"spoolsv.exe",
-        L"WmiPrvSE.exe",
-    };
-    for (const wchar_t* item : kSystemImages)
-    {
-        if (EqualsCI(imageName, item))
+        if (pid == 0 || pid == 4)
         {
-            return true;
+            systemProfile = true;
+            break;
         }
-    }
-    return false;
+        // Keep this list to true kernel/session service hosts. Do not include
+        // interactive shells (explorer, conhost) or arbitrary user apps - those
+        // are exactly the surfaces where unexpected elevation matters.
+        static const wchar_t* kSystemImages[] =
+        {
+            L"System",
+            L"smss.exe",
+            L"csrss.exe",
+            L"wininit.exe",
+            L"winlogon.exe",
+            L"services.exe",
+            L"lsass.exe",
+            L"svchost.exe",
+            L"LsaIso.exe",
+            L"Memory Compression",
+            L"Registry",
+            L"Secure System",
+            L"fontdrvhost.exe",
+            L"dwm.exe",
+            L"MsMpEng.exe",
+            L"NisSrv.exe",
+            L"SecurityHealthService.exe",
+            L"TrustedInstaller.exe",
+            L"TiWorker.exe",
+            L"spoolsv.exe",
+            L"WmiPrvSE.exe",
+        };
+
+        const size_t knownCount = sizeof(kSystemImages) / sizeof(kSystemImages[0]);
+        if (!MatchesKnownSystemImageName(imageName, kSystemImages, knownCount) &&
+            !MatchesKnownSystemImageName(imagePath, kSystemImages, knownCount))
+        {
+            break;
+        }
+
+        const std::wstring& pathToCheck = imagePath.empty() ? imageName : imagePath;
+        if (!PathHasDirectorySeparator(pathToCheck))
+        {
+            systemProfile = true;
+            break;
+        }
+
+        systemProfile = PathLooksLikeSystemProfilePath(pathToCheck);
+    } while (false);
+
+    return systemProfile;
 }
 
 std::wstring TokenPrivilegeScanner::PrivilegeNameFromBit(uint32_t bitIndex)
@@ -416,6 +738,65 @@ bool TokenPrivilegeMaskInvariantSelfTest()
         TokenPrivilegeScanner::HasStructuralMaskInconsistency(
             0x20800000ull,
             0x60800000ull);
+}
+
+bool TokenPrivilegeSystemProfileSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        if (!TokenPrivilegeScanner::IsSystemProfileImage(L"svchost.exe", 500) ||
+            !TokenPrivilegeScanner::IsSystemProfileImage(
+                L"svchost.exe",
+                500,
+                L"C:\\Windows\\System32\\svchost.exe") ||
+            TokenPrivilegeScanner::IsSystemProfileImage(
+                L"svchost.exe",
+                500,
+                L"C:\\Temp\\svchost.exe") ||
+            TokenPrivilegeScanner::IsSystemProfileImage(
+                L"lsass.exe",
+                500,
+                L"C:\\cheat\\Windows\\System32\\lsass.exe") ||
+            !TokenPrivilegeScanner::IsSystemProfileImage(L"System", 4) ||
+            TokenPrivilegeScanner::IsSystemProfileImage(L"cheat.exe", 1234) ||
+            !TokenPrivilegeScanner::IsSystemProfileImage(
+                L"MsMpEng.exe",
+                500,
+                L"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.0\\MsMpEng.exe") ||
+            TokenPrivilegeScanner::IsSystemProfileImage(
+                L"winlogon.exe",
+                500,
+                L"C:\\Users\\Public\\winlogon.exe") ||
+            !TokenPrivilegeScanner::IsSystemProfileImage(
+                L"svchost.exe",
+                500,
+                L"\\\\?\\C:\\Windows\\System32\\svchost.exe") ||
+            !TokenPrivilegeScanner::IsSystemProfileImage(
+                L"lsass.exe",
+                500,
+                L"\\\\.\\C:\\Windows\\System32\\lsass.exe") ||
+            !TokenPrivilegeScanner::IsSystemProfileImage(
+                L"TrustedInstalle",
+                500,
+                L"C:\\Windows\\System32\\TrustedInstaller.exe") ||
+            TokenPrivilegeScanner::IsSystemProfileImage(
+                L"TrustedInstalle",
+                500,
+                L"C:\\Temp\\TrustedInstaller.exe") ||
+            !TokenPrivilegeScanner::IsSystemProfileImage(L"Memory Compress", 500) ||
+            TokenPrivilegeScanner::IsSystemProfileImage(
+                L"SecurityHealthS",
+                500,
+                L"C:\\Temp\\SecurityHealthService.exe"))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
 }
 
 TokenPrivilegeScanner::TokenPrivilegeScanner(DeviceClient& device, SymbolEngine& symbols) :
@@ -500,6 +881,7 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             uint64_t Eprocess = 0;
             uint32_t Pid = 0;
             std::wstring Image;
+            std::wstring ImagePath;
             bool IdentityResolved = false;
         };
 
@@ -526,6 +908,7 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
                 imageField.Offset,
                 &imageResolved);
             target.IdentityResolved = pidResolved && imageResolved;
+            ReadProcessImagePath(device_, symbols_, options.Eprocess, &target.ImagePath);
             result->ProcessWalkComplete =
                 target.IdentityResolved && result->ProcessLayoutFromPdb;
             targets.push_back(target);
@@ -649,6 +1032,7 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
                     target.Pid = pid;
                     target.Image = image;
                     target.IdentityResolved = pidResolved && imageResolved;
+                    ReadProcessImagePath(device_, symbols_, eprocess, &target.ImagePath);
                     targets.push_back(target);
                     if (options.HasProcessId && !options.ScanAll && options.ImageFilter.empty())
                     {
@@ -714,10 +1098,19 @@ bool TokenPrivilegeScanner::Scan(const Options& options, TokenPrivilegeScanResul
             record.Eprocess = target.Eprocess;
             record.ProcessId = target.Pid;
             record.ImageName = target.Image;
+            record.ImagePath = target.ImagePath;
             record.IdentityResolved = target.IdentityResolved;
             record.SystemProfile =
                 target.IdentityResolved &&
-                IsSystemProfileImage(target.Image, target.Pid);
+                IsSystemProfileImage(target.Image, target.Pid, target.ImagePath);
+            if (target.IdentityResolved &&
+                !record.SystemProfile &&
+                PathHasDirectorySeparator(target.ImagePath.empty() ? target.Image : target.ImagePath) &&
+                IsSystemProfileImage(target.Image, target.Pid))
+            {
+                record.Notes.push_back(
+                    L"system-named process is not running from an inbox path; system-profile suppression disabled");
+            }
             if (!record.IdentityResolved)
             {
                 record.CoverageIncomplete = true;
@@ -989,6 +1382,7 @@ std::wstring BuildTokenPrivilegeJson(const TokenPrivilegeScanResult& result)
         out += L"{\"pid\":" + std::to_wstring(record.ProcessId);
         out += L",\"eprocess\":" + mcpjson::Quote(JsonHex(record.Eprocess));
         out += L",\"image\":" + mcpjson::Quote(record.ImageName);
+        out += L",\"imagePath\":" + mcpjson::Quote(record.ImagePath);
         out += L",\"token\":" + mcpjson::Quote(JsonHex(record.TokenObject));
         out += L",\"tokenType\":" + std::to_wstring(record.TokenType);
         out += L",\"primaryToken\":";

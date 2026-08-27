@@ -349,6 +349,7 @@ private:
 std::wstring HuntModeToText(HuntMode mode);
 std::wstring HuntFirstCommandLineImage(const std::wstring& commandLine);
 bool HuntProcessLifecycleSelfTest();
+bool HuntInjectedModuleSelfTest();
 bool HuntCidTableAnchorSelfTest();
 bool HuntDiskPeBoundsSelfTest();
 bool HuntBaseRelocationMaskSelfTest();
