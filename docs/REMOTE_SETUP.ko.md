@@ -68,7 +68,6 @@ B가 실제로 도달하는 IPv4를 고른다(물리 Ethernet/Wi-Fi. Hyper-V/VPN
 | `--loopback` | `127.0.0.1`만. 방화벽 규칙 없음. 같은 박스 / SSH `-L`. |
 | `--bind <ipv4>` | 그 주소만 listen. `127.0.0.1`이면 `--loopback`과 같음. |
 | `--peer <ipv4>` | 그 클라이언트 IPv4만 accept. 방화벽 `RemoteAddresses`도 핀. |
-| `--allow-public-peer` | RFC1918이 아닌 peer 허용. 기본은 private/loopback/link-local만. |
 
 `--lan` / `--allow-write`는 없다. 쓰기는 로컬 TUI와 같다(`WriteEnabled`를 건드리지 않음).
 
@@ -180,7 +179,7 @@ A에서 `remote <Tab>`은 `on` / `off` / `status` / `disconnect` / `help`. `remo
 
 - loopback이 아닌 `remote on`은 inbound TCP 규칙 `knlivedbg-remote`(DOMAIN|PRIVATE|PUBLIC)를 추가한다. `remote off` / 프로세스 종료 때 삭제. 크래시 leftover는 다음 Start에서 같은 이름을 지우고 다시 넣는다.
 - COM 실패는 경고만 찍고 listen은 유지. B가 timeout이면 `remote on`이 찍은 IP를 확인하고 포트를 수동으로 연다.
-- 기본 peer 필터: RFC1918 / loopback / link-local. 공인 IPv4는 `--allow-public-peer` 없으면 reset.
+- IPv4 peer는 제한하지 않는다 (Tailscale `100.x`, Hamachi, 공인, RFC1918). 한 클라이언트만 받으려면 `--peer`.
 - Auth lockout은 프로세스 수명: peer IP당 5회, 전역 15회 실패면 `remote off`까지 신규 auth 거부.
 - remote가 떠 있는 동안 `mcp on`(반대도)은 실패: `listen XOR`.
 - 격리 lab 세그먼트만. 공유 사무실 LAN / 인터넷에 `0.0.0.0`을 열지 않는다. 와이어 암호가 필요하면 `--loopback` + `ssh -L 51767:127.0.0.1:51767`. TLS는 설계 문서 Appendix A(v2)이고 이 빌드에는 없다.

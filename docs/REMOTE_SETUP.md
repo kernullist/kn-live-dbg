@@ -68,7 +68,6 @@ Pick the IPv4 that B can actually reach (physical Ethernet/Wi-Fi, not a Hyper-V/
 | `--loopback` | Bind `127.0.0.1` only. No firewall rule. Same box or SSH `-L`. |
 | `--bind <ipv4>` | Listen on that address only. `127.0.0.1` behaves like `--loopback`. |
 | `--peer <ipv4>` | Accept only that client IPv4. Firewall `RemoteAddresses` is pinned too. |
-| `--allow-public-peer` | Allow a non-RFC1918 peer. Default is private/loopback/link-local only. |
 
 `--lan` and `--allow-write` do not exist. Writes follow the local TUI (`WriteEnabled` stays as it is).
 
@@ -180,7 +179,7 @@ The protocol also defines `completion-request` for a server-side pass. The shipp
 
 - Non-loopback `remote on` adds inbound TCP `knlivedbg-remote` (DOMAIN|PRIVATE|PUBLIC). `remote off` / process exit deletes it. A leftover rule from a crash is deleted on the next successful Start.
 - COM failure prints a warning and still listens. If B times out, add the port by hand or check which IP `remote on` printed.
-- Default peer filter: RFC1918 / loopback / link-local. Public IPv4 is reset unless `--allow-public-peer`.
+- Any IPv4 peer is accepted (Tailscale `100.x`, Hamachi, public, RFC1918). Pin a single client with `--peer` if needed.
 - Auth lockout is process-lifetime: 5 failures per peer IP, 15 global, then new auth is refused until `remote off`.
 - `mcp on` while remote is up (or the reverse) fails: `listen XOR`.
 - Isolated lab segment only. Shared office LAN / internet: do not bind `0.0.0.0`. Use `--loopback` plus `ssh -L 51767:127.0.0.1:51767` if the wire must be encrypted. TLS is v2 (Appendix A of the design doc), not this build.

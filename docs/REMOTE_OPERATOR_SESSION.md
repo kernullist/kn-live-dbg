@@ -4,8 +4,8 @@
 |---|---|
 | Title | Dedicated Remote Operator Session (thin TUI on PC B, engine+driver on PC A) |
 | Author | Kn-Live-Dbg / 꿀보 |
-| Date | 2026-08-26 |
-| Status | Implemented (rev 8, 2026-08-26). Operator guide: `docs/REMOTE_SETUP.md` |
+| Date | 2026-08-27 |
+| Status | Implemented (rev 9, 2026-08-27). Operator guide: `docs/REMOTE_SETUP.md` |
 | Audience | Kn-Live-Dbg maintainers (driver ABI, user-mode engine, MCP) |
 | Related | `docs/REMOTE_SETUP.md`, `docs/ARCHITECTURE.md`, `docs/MCP_SERVER_DESIGN.md`, `docs/MCP_SETUP.md`, `docs/FEATURE_PLAN.md`. Canonical copy: `docs/REMOTE_OPERATOR_SESSION.md` |
 
@@ -298,7 +298,7 @@ while (!g_StopRequested)
 | `cancel` | B→A | (queued only) |
 | `heartbeat` | both | no extra |
 | `disconnect` | both | `reason`? |
-| `error` | A→B | `code`: `engine-busy` \| `denied` \| `too-large` \| `session-busy` \| `peer-not-private` \| `unsupported-v` \| `frame-timeout` \| `not-cancelable` |
+| `error` | A→B | `code`: `engine-busy` \| `denied` \| `too-large` \| `session-busy` \| `unsupported-v` \| `frame-timeout` \| `not-cancelable` |
 
 **넣지 않음 (v1):** `audit-ack`, `structured` 결과, ALPN, 다수 in-flight command.
 
@@ -533,12 +533,12 @@ flowchart TD
   kill --> stop["RequestStop; delete firewall rule; write mode left as-is"]
 ```
 
-쓰기는 로컬과 같다. `--allow-write` 없음. A per-write confirm 없음. 잔여: stolen password + LAN = kernel RW **and** cleartext. 완화: password min 5, IP lockout, `--peer`, RFC1918 peer 기본, 프로세스 방화벽 규칙, A `remote off`, isolated lab. wire 암호가 필요하면 SSH `-L` 또는 v2 Appendix A.
+쓰기는 로컬과 같다. `--allow-write` 없음. A per-write confirm 없음. 잔여: stolen password + LAN = kernel RW **and** cleartext. 완화: password min 5, IP lockout, `--peer`, 프로세스 방화벽 규칙, A `remote off`, isolated lab. wire 암호가 필요하면 SSH `-L` 또는 v2 Appendix A.
 
 ### Auth / network
 
 - **v1 `remote on`은 평문 kernel-command traffic.** isolated lab segment에서만. 배너에 그 사실을 인쇄. 공유 사무실 LAN / 인터넷에 열지 않음. wire 암호가 필요하면 `ssh -L 51767:127.0.0.1:51767` 후 `--loopback`, 또는 v2 Appendix A.
-- non-loopback일 때 peer가 RFC1918/loopback/link-local이 아니면 accept-reset. 끄려면 `--allow-public-peer`.
+- IPv4 peer source는 필터하지 않는다 (RFC1918 / Tailscale `100.64/10` / 공인 모두 accept). 한 클라이언트로 제한하려면 `--peer`.
 - workgroup. AD 없음.
 
 **방화벽 (사용자 결정: 프로세스가 추가/삭제).** loopback이면 규칙을 만들지 않는다. 그 외:
@@ -697,7 +697,7 @@ LLM 가드 (`no raw command string`)를 허묾. 기각.
 
 | Threat | Sev | Mitigation |
 |---|---|---|
-| Lab peer + stolen password | High | min 5, process-lifetime IP lockout, `--peer`, RFC1918 peer default, process firewall rule, A `RequestStop`. **writes are on** (사용자 결정) |
+| Lab peer + stolen password | High | min 5, process-lifetime IP lockout, `--peer`, process firewall rule, A `RequestStop`. **writes are on** (사용자 결정) |
 | Wire sniff | High (accepted for v1 lab) | **v1 is cleartext.** isolated lab segment only. banner warns. Encrypt later: SSH `-L` or Appendix A (v2) |
 | MITM | High (accepted for v1 lab) | same as sniff. password still required; does not stop active MITM |
 | B workstation stolen while session up | High | 60s dead peer; `remote off` on A |

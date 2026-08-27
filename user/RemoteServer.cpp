@@ -359,14 +359,19 @@ void RemoteServer::RequestStop()
 
 void RemoteServer::DisconnectSession()
 {
-    std::lock_guard<std::mutex> lock(sessionMutex_);
-    if (sessionSock_ != INVALID_SOCKET)
+    SOCKET sock = INVALID_SOCKET;
     {
-        shutdown(sessionSock_, SD_BOTH);
-        closesocket(sessionSock_);
+        std::lock_guard<std::mutex> lock(sessionMutex_);
+        sock = sessionSock_;
         sessionSock_ = INVALID_SOCKET;
+        peerIp_.clear();
     }
-    peerIp_.clear();
+    if (sock != INVALID_SOCKET)
+    {
+        // Wake a recv/select in HandleClient. Last protocol bytes must already
+        // have been send()ed; HandleClient owns closesocket.
+        shutdown(sock, SD_BOTH);
+    }
 }
 
 bool RemoteServer::IsRunning() const
@@ -542,33 +547,40 @@ void RemoteServer::ListenerThreadMain()
             continue;
         }
 
+        knremote::EnableTcpNoDelay(client);
+
+        bool sessionBusy = false;
         {
             std::lock_guard<std::mutex> lock(sessionMutex_);
-            if (sessionSock_ != INVALID_SOCKET)
-            {
-                closesocket(client);
-                continue;
-            }
+            sessionBusy = sessionSock_ != INVALID_SOCKET;
+        }
+        if (sessionBusy)
+        {
+            SendJson(
+                client,
+                knremote::MakeObject(L"error", L"s-0", L"\"code\":\"session-busy\""),
+                nullptr);
+            knremote::CloseTcpGraceful(client, knremote::kCloseDrainMs);
+            continue;
         }
 
         const std::wstring peerIp = Ipv4Text(peer.sin_addr);
         if (!config_.Peer.empty() && peerIp != config_.Peer)
         {
-            closesocket(client);
+            knremote::CloseTcpGraceful(client, knremote::kCloseDrainMs);
             continue;
         }
-        if (!config_.AllowPublicPeer &&
-            !knremote::IsLoopbackBind(config_.BindAddress) &&
-            !knremote::IsPrivateIpv4(peer.sin_addr))
+
+        fd_set probeSet;
+        FD_ZERO(&probeSet);
+        FD_SET(client, &probeSet);
+        timeval probeTimeout = {};
+        probeTimeout.tv_sec = static_cast<long>(knremote::kAuthFirstByteMs / 1000);
+        probeTimeout.tv_usec = static_cast<long>((knremote::kAuthFirstByteMs % 1000) * 1000);
+        const int probeReady = select(0, &probeSet, nullptr, nullptr, &probeTimeout);
+        if (probeReady <= 0)
         {
-            const std::wstring json = knremote::MakeObject(
-                L"error",
-                L"s-0",
-                L"\"code\":\"peer-not-private\"");
-            std::string bytes;
-            knremote::EncodeFrame(json, &bytes, nullptr);
-            send(client, bytes.data(), static_cast<int>(bytes.size()), 0);
-            closesocket(client);
+            knremote::CloseTcpGraceful(client, knremote::kCloseDrainMs);
             continue;
         }
 
@@ -808,7 +820,6 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
     std::wstring error;
     DWORD authDeadline = GetTickCount() + knremote::kAuthDeadlineMs;
     std::wstring authJson;
-    bool authed = false;
 
     do
     {
@@ -848,7 +859,9 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
         }
 
         std::wstring presented;
+        std::wstring id;
         knremote::GetStringField(authJson, L"password", &presented);
+        knremote::GetStringField(authJson, L"id", &id);
         Sleep(250);
         std::string left = mcpjson::WideToUtf8(presented);
         std::string right = mcpjson::WideToUtf8(config_.Password);
@@ -873,28 +886,29 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
             SecureZeroMemory(&authJson[0], authJson.size() * sizeof(wchar_t));
             authJson.clear();
         }
+        if (id.empty())
+        {
+            id = L"c-1";
+        }
         if (!passwordOk)
         {
             RecordAuthFailure(peerHost);
             const wchar_t* code = AuthAllowed(peerHost) ? L"bad-password" : L"lockout";
             std::wstring extra = L"\"code\":";
             extra += knremote::Quote(code);
-            SendJson(client, knremote::MakeObject(L"auth-err", L"s-0", extra), nullptr);
+            SendJson(client, knremote::MakeObject(L"auth-err", id, extra), nullptr);
             break;
         }
 
         RecordAuthSuccess(peerHost);
         const std::wstring session = MakeSessionId();
-        std::wstring id;
-        knremote::GetStringField(authJson, L"id", &id);
-        if (id.empty())
-        {
-            id = L"c-1";
-        }
-        SendJson(
+        if (!SendJson(
             client,
             knremote::MakeObject(L"auth-ok", id, L"\"session\":" + knremote::Quote(session)),
-            nullptr);
+            nullptr))
+        {
+            break;
+        }
 
         RemoteHelloInfo hello = Hello();
         std::wstring extra;
@@ -909,8 +923,10 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
         extra += L",\"port\":" + std::to_wstring(config_.Port);
         extra += L",\"cleartext\":true";
         extra += L",\"caps\":[\"command\",\"completion\"]";
-        SendJson(client, knremote::MakeObject(L"hello", id, extra), nullptr);
-        authed = true;
+        if (!SendJson(client, knremote::MakeObject(L"hello", id, extra), nullptr))
+        {
+            break;
+        }
 
         DWORD lastActivity = GetTickCount();
         DWORD lastHeartbeat = GetTickCount();
@@ -1154,7 +1170,15 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
         }
     } while (false);
 
-    DisconnectSession();
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex_);
+        if (sessionSock_ == client)
+        {
+            sessionSock_ = INVALID_SOCKET;
+            peerIp_.clear();
+        }
+    }
+    knremote::CloseTcpGraceful(client, knremote::kCloseDrainMs);
 }
 
 bool IsRemoteDeniedCommandLine(const std::wstring& line, std::wstring* reason)

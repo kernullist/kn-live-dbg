@@ -27,7 +27,9 @@ namespace knremote
     static constexpr DWORD kHeartbeatMs = 15000;
     static constexpr DWORD kDeadPeerMs = 60000;
     static constexpr DWORD kAuthDeadlineMs = 10000;
+    static constexpr DWORD kAuthFirstByteMs = 1000;
     static constexpr DWORD kFrameDeadlineMs = 60000;
+    static constexpr DWORD kCloseDrainMs = 500;
     static constexpr int kAuthFailLockout = 5;
     static constexpr int kGlobalAuthLockout = 15;
     static constexpr size_t kMaxPending = 4;
@@ -44,6 +46,54 @@ namespace knremote
     {
         return static_cast<int32_t>(GetTickCount() - startTick) >=
                static_cast<int32_t>(intervalMs);
+    }
+
+    inline void EnableTcpNoDelay(SOCKET sock)
+    {
+        if (sock == INVALID_SOCKET)
+        {
+            return;
+        }
+        BOOL nodelay = TRUE;
+        setsockopt(
+            sock,
+            IPPROTO_TCP,
+            TCP_NODELAY,
+            reinterpret_cast<const char*>(&nodelay),
+            sizeof(nodelay));
+    }
+
+    // Unread recv data plus SD_BOTH makes Windows RST, which drops the last
+    // sent frame (auth-err / auth-ok) before the client can read it.
+    inline void CloseTcpGraceful(SOCKET sock, DWORD drainMs)
+    {
+        if (sock == INVALID_SOCKET)
+        {
+            return;
+        }
+        shutdown(sock, SD_SEND);
+        const DWORD deadline = GetTickCount() + drainMs;
+        char sink[256];
+        while (!DeadlineReached(deadline))
+        {
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(sock, &readSet);
+            timeval timeout = {};
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 50000;
+            const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+            if (ready <= 0)
+            {
+                break;
+            }
+            const int n = recv(sock, sink, static_cast<int>(sizeof(sink)), 0);
+            if (n <= 0)
+            {
+                break;
+            }
+        }
+        closesocket(sock);
     }
 
     // Largest index in (offset, offset+maxBytes] that does not split a UTF-8
@@ -327,34 +377,6 @@ namespace knremote
             ok = true;
         } while (false);
         return ok;
-    }
-
-    inline bool IsPrivateIpv4(const in_addr& addr)
-    {
-        const uint32_t host = ntohl(addr.s_addr);
-        const uint32_t b1 = (host >> 24) & 0xffu;
-        const uint32_t b2 = (host >> 16) & 0xffu;
-        if (b1 == 10)
-        {
-            return true;
-        }
-        if (b1 == 127)
-        {
-            return true;
-        }
-        if (b1 == 169 && b2 == 254)
-        {
-            return true;
-        }
-        if (b1 == 172 && b2 >= 16 && b2 <= 31)
-        {
-            return true;
-        }
-        if (b1 == 192 && b2 == 168)
-        {
-            return true;
-        }
-        return false;
     }
 
     inline bool ParseHostPort(

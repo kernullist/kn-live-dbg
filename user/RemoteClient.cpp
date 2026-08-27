@@ -8,13 +8,22 @@
 
 namespace
 {
-    bool RecvAll(SOCKET sock, char* buffer, int length, DWORD deadlineTick)
+    bool RecvAll(
+        SOCKET sock,
+        char* buffer,
+        int length,
+        DWORD deadlineTick,
+        std::wstring* error)
     {
         int received = 0;
         while (received < length)
         {
             if (knremote::DeadlineReached(deadlineTick))
             {
+                if (error != nullptr)
+                {
+                    *error = L"frame-timeout";
+                }
                 return false;
             }
             fd_set readSet;
@@ -28,6 +37,10 @@ namespace
             {
                 if (ready == SOCKET_ERROR)
                 {
+                    if (error != nullptr)
+                    {
+                        *error = L"recv failed";
+                    }
                     return false;
                 }
                 continue;
@@ -35,6 +48,10 @@ namespace
             const int n = recv(sock, buffer + received, length - received, 0);
             if (n <= 0)
             {
+                if (error != nullptr)
+                {
+                    *error = L"peer drop";
+                }
                 return false;
             }
             received += n;
@@ -45,12 +62,8 @@ namespace
     bool RecvJson(SOCKET sock, std::wstring* json, DWORD deadlineTick, std::wstring* error)
     {
         unsigned char header[8] = {};
-        if (!RecvAll(sock, reinterpret_cast<char*>(header), 8, deadlineTick))
+        if (!RecvAll(sock, reinterpret_cast<char*>(header), 8, deadlineTick, error))
         {
-            if (error != nullptr)
-            {
-                *error = L"peer drop";
-            }
             return false;
         }
         uint32_t length = 0;
@@ -60,12 +73,8 @@ namespace
         }
         std::string body;
         body.resize(length);
-        if (!RecvAll(sock, &body[0], static_cast<int>(length), deadlineTick))
+        if (!RecvAll(sock, &body[0], static_cast<int>(length), deadlineTick, error))
         {
-            if (error != nullptr)
-            {
-                *error = L"peer drop";
-            }
             return false;
         }
         if (json != nullptr)
@@ -644,6 +653,7 @@ int RemoteClientMain(int argc, wchar_t** argv)
             exitCode = 5;
             break;
         }
+        knremote::EnableTcpNoDelay(sock);
 
         std::wstring auth = knremote::MakeObject(
             L"auth",

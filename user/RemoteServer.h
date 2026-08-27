@@ -29,7 +29,6 @@ struct RemoteServerConfig
     std::wstring Peer;
     std::wstring Password;
     std::wstring AuditPath;
-    bool AllowPublicPeer = false;
     bool AddFirewall = true;
     RemoteHelloInfo Hello;
 };
