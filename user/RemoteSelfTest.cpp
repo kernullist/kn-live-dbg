@@ -33,6 +33,158 @@ namespace
             std::wcerr << L"[remote.selftest] FAIL " << name << L"\n";
         }
     }
+
+    SOCKET ConnectLoopback(uint16_t port)
+    {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET)
+        {
+            return INVALID_SOCKET;
+        }
+        knremote::EnableTcpNoDelay(sock);
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        if (inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1)
+        {
+            closesocket(sock);
+            return INVALID_SOCKET;
+        }
+        if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+        {
+            closesocket(sock);
+            return INVALID_SOCKET;
+        }
+        return sock;
+    }
+
+    bool SendAuth(SOCKET sock, const wchar_t* password)
+    {
+        const std::wstring json = knremote::MakeObject(
+            L"auth",
+            L"c-1",
+            L"\"password\":" + knremote::Quote(password));
+        std::string bytes;
+        if (!knremote::EncodeFrame(json, &bytes, nullptr))
+        {
+            return false;
+        }
+        int sent = 0;
+        while (sent < static_cast<int>(bytes.size()))
+        {
+            const int n = send(
+                sock,
+                bytes.data() + sent,
+                static_cast<int>(bytes.size()) - sent,
+                0);
+            if (n <= 0)
+            {
+                return false;
+            }
+            sent += n;
+        }
+        return true;
+    }
+
+    bool RecvAuthJson(SOCKET sock, std::wstring* json, std::wstring* error)
+    {
+        unsigned char header[8] = {};
+        int received = 0;
+        const DWORD deadline = GetTickCount() + knremote::kAuthDeadlineMs;
+        while (received < 8)
+        {
+            if (knremote::DeadlineReached(deadline))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"frame-timeout";
+                }
+                return false;
+            }
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(sock, &readSet);
+            timeval timeout = {};
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 200000;
+            const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+            if (ready <= 0)
+            {
+                if (ready == SOCKET_ERROR)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"recv failed";
+                    }
+                    return false;
+                }
+                continue;
+            }
+            const int n = recv(sock, reinterpret_cast<char*>(header) + received, 8 - received, 0);
+            if (n <= 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"peer drop";
+                }
+                return false;
+            }
+            received += n;
+        }
+        uint32_t length = 0;
+        if (!knremote::DecodeHeader(header, &length, error))
+        {
+            return false;
+        }
+        std::string body;
+        body.resize(length);
+        received = 0;
+        while (received < static_cast<int>(length))
+        {
+            if (knremote::DeadlineReached(deadline))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"frame-timeout";
+                }
+                return false;
+            }
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(sock, &readSet);
+            timeval timeout = {};
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 200000;
+            const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+            if (ready <= 0)
+            {
+                if (ready == SOCKET_ERROR)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"recv failed";
+                    }
+                    return false;
+                }
+                continue;
+            }
+            const int n = recv(sock, &body[static_cast<size_t>(received)], static_cast<int>(length) - received, 0);
+            if (n <= 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"peer drop";
+                }
+                return false;
+            }
+            received += n;
+        }
+        if (json != nullptr)
+        {
+            *json = mcpjson::Utf8ToWide(body);
+        }
+        return true;
+    }
 }
 
 int RunRemoteConnectArgvSelfTest()
@@ -183,6 +335,65 @@ int RunRemoteProtocolSelfTest()
     {
         Check(&ctx, true, L"server-start");
         Check(&ctx, server.IsLoopbackOnly(), L"loopback-bind");
+
+        {
+            SOCKET badSock = ConnectLoopback(config.Port);
+            Check(&ctx, badSock != INVALID_SOCKET, L"auth-bad-connect");
+            if (badSock != INVALID_SOCKET)
+            {
+                Check(&ctx, SendAuth(badSock, L"wrong-password"), L"auth-bad-send");
+                std::wstring reply;
+                std::wstring recvError;
+                const bool got = RecvAuthJson(badSock, &reply, &recvError);
+                std::wstring type;
+                std::wstring code;
+                knremote::GetStringField(reply, L"type", &type);
+                knremote::GetStringField(reply, L"code", &code);
+                Check(
+                    &ctx,
+                    got && type == L"auth-err" && code == L"bad-password",
+                    L"auth-bad-password");
+                if (!got)
+                {
+                    std::wcerr << L"[remote.selftest] auth-bad recv: " << recvError << L"\n";
+                }
+                knremote::CloseTcpGraceful(badSock, knremote::kCloseDrainMs);
+            }
+        }
+        {
+            SOCKET probeSock = ConnectLoopback(config.Port);
+            Check(&ctx, probeSock != INVALID_SOCKET, L"probe-connect");
+            Sleep(static_cast<DWORD>(knremote::kAuthFirstByteMs + 200));
+            if (probeSock != INVALID_SOCKET)
+            {
+                knremote::CloseTcpGraceful(probeSock, knremote::kCloseDrainMs);
+            }
+        }
+        {
+            SOCKET okSock = ConnectLoopback(config.Port);
+            Check(&ctx, okSock != INVALID_SOCKET, L"auth-ok-connect");
+            if (okSock != INVALID_SOCKET)
+            {
+                Check(&ctx, SendAuth(okSock, config.Password.c_str()), L"auth-ok-send");
+                std::wstring reply;
+                std::wstring recvError;
+                const bool got = RecvAuthJson(okSock, &reply, &recvError);
+                std::wstring type;
+                knremote::GetStringField(reply, L"type", &type);
+                Check(&ctx, got && type == L"auth-ok", L"auth-ok-reply");
+                if (!got)
+                {
+                    std::wcerr << L"[remote.selftest] auth-ok recv: " << recvError << L"\n";
+                }
+                std::wstring hello;
+                const bool gotHello = RecvAuthJson(okSock, &hello, &recvError);
+                std::wstring helloType;
+                knremote::GetStringField(hello, L"type", &helloType);
+                Check(&ctx, gotHello && helloType == L"hello", L"auth-ok-hello");
+                knremote::CloseTcpGraceful(okSock, knremote::kCloseDrainMs);
+            }
+        }
+
         server.Stop();
         Check(&ctx, !server.IsRunning(), L"server-stop");
     }

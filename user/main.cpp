@@ -52277,10 +52277,6 @@ static void HandleRemoteCommand(
             {
                 config.Peer = args[++i];
             }
-            else if (args[i] == L"--allow-public-peer")
-            {
-                config.AllowPublicPeer = true;
-            }
             else
             {
                 unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
