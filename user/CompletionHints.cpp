@@ -300,6 +300,7 @@ namespace
 
     const CompletionHint kThreadsTokens[] =
     {
+        { L"/summary", L"!threads <pid> /summary", L"print header and summary only" },
         { L"/apc", L"!threads <pid> /apc", L"include conservative APC-queue evidence" },
         { L"/stacks", L"!threads <pid> /stacks", L"include user-stack bounds and suspicious refs" },
         { L"/limit", L"/limit <n>", L"cap printed threads" },
@@ -1233,7 +1234,7 @@ namespace
 
     const CompletionScopeTable kThreadsScopes[] =
     {
-        SCOPE(L"", L"!threads <pid|image|eprocess> [/apc] [/stacks] [/limit] [/json]", L"thread list, start addresses, APC evidence", kThreadsTokens),
+        SCOPE(L"", L"!threads <pid|image|eprocess> [/summary] [/apc] [/stacks] [/limit] [/json]", L"thread list, start addresses, APC evidence", kThreadsTokens),
     };
 
     const CompletionScopeTable kSnapshotScopes[] =
@@ -1370,7 +1371,7 @@ namespace
 
     const CompletionScopeTable kDevstackScopes[] =
     {
-        SCOPE(L"", L"!devstack <device-address> [/json]", L"walk a DEVICE_OBJECT stack", kDevstackTokens),
+        SCOPE(L"", L"!devstack <device-address|driver-name> [/json]", L"walk a DEVICE_OBJECT stack", kDevstackTokens),
     };
 
     const CompletionScopeTable kHandlesScopes[] =

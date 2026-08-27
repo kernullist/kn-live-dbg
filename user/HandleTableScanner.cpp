@@ -135,6 +135,17 @@ namespace
         return text;
     }
 
+    std::wstring ImageBaseName(const std::wstring& image)
+    {
+        std::wstring lowered = ToLowerCopy(image);
+        const size_t slash = lowered.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && slash + 1 < lowered.size())
+        {
+            lowered = lowered.substr(slash + 1);
+        }
+        return lowered;
+    }
+
     bool IsSystemOwnerImage(const std::wstring& image, uint32_t pid)
     {
         if (pid == 0 || pid == 4)
@@ -142,14 +153,146 @@ namespace
             return true;
         }
 
-        const std::wstring lowered = ToLowerCopy(image);
+        const std::wstring lowered = ImageBaseName(image);
         return lowered == L"system" ||
             lowered == L"csrss.exe" ||
             lowered == L"smss.exe" ||
             lowered == L"lsass.exe" ||
             lowered == L"services.exe" ||
             lowered == L"svchost.exe" ||
-            lowered == L"wininit.exe";
+            lowered == L"wininit.exe" ||
+            lowered == L"winlogon.exe";
+    }
+
+    std::wstring ImageStem(const std::wstring& image)
+    {
+        std::wstring base = ImageBaseName(image);
+        const size_t dot = base.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot > 0)
+        {
+            const std::wstring ext = base.substr(dot);
+            if (ext == L"." || ext == L".exe" || ext == L".ex" || ext == L".e" ||
+                ext == L".sys" || ext == L".dll")
+            {
+                base.resize(dot);
+            }
+        }
+        return base;
+    }
+
+    bool SameProcessImage(const std::wstring& left, const std::wstring& right)
+    {
+        if (left.empty() || right.empty())
+        {
+            return false;
+        }
+
+        const std::wstring leftBase = ImageBaseName(left);
+        const std::wstring rightBase = ImageBaseName(right);
+        if (leftBase == rightBase)
+        {
+            return true;
+        }
+
+        // EPROCESS.ImageFileName is 15 bytes. A truncated owner/target pair
+        // still names the same image when one is a prefix of the other.
+        const size_t minSize = (std::min)(leftBase.size(), rightBase.size());
+        if (minSize >= 8 &&
+            (leftBase.compare(0, minSize, rightBase, 0, minSize) == 0))
+        {
+            return true;
+        }
+
+        const std::wstring leftStem = ImageStem(left);
+        const std::wstring rightStem = ImageStem(right);
+        return !leftStem.empty() && leftStem == rightStem;
+    }
+
+    bool IsSensitiveSystemTarget(const std::wstring& stem)
+    {
+        return stem == L"lsass" ||
+            stem == L"csrss" ||
+            stem == L"smss" ||
+            stem == L"services" ||
+            stem == L"wininit" ||
+            stem == L"winlogon" ||
+            stem == L"system";
+    }
+
+    bool IsKnownOsHandlePair(const std::wstring& owner, const std::wstring& target)
+    {
+        const std::wstring ownerStem = ImageStem(owner);
+        const std::wstring targetStem = ImageStem(target);
+        if (ownerStem.empty() || targetStem.empty())
+        {
+            return false;
+        }
+
+        const bool consoleHost =
+            ownerStem == L"conhost" ||
+            ownerStem == L"openconsole" ||
+            ownerStem == L"windowsterminal" ||
+            ownerStem == L"windowstermina";
+        if ((consoleHost || ownerStem == L"runtimebroker") &&
+            !IsSensitiveSystemTarget(targetStem))
+        {
+            return true;
+        }
+
+        if ((ownerStem == L"winlogon" && targetStem == L"dwm") ||
+            (ownerStem == L"explorer" && targetStem == L"runtimebroker") ||
+            (ownerStem == L"searchindexer" &&
+                (targetStem == L"searchfilterhost" ||
+                 targetStem == L"searchprotocolhost" ||
+                 targetStem == L"searchfilterho" ||
+                 targetStem == L"searchprotocol")) ||
+            ((ownerStem == L"searchapp" || targetStem == L"searchapp") &&
+                (ownerStem == L"msedgewebview2" || ownerStem == L"msedgewebview" ||
+                 targetStem == L"msedgewebview2" || targetStem == L"msedgewebview")) ||
+            (ownerStem.find(L"copilot") != std::wstring::npos &&
+                (targetStem == L"msedgewebview2" || targetStem == L"msedgewebview")) ||
+            (ownerStem == L"steam" && targetStem == L"steamwebhelper") ||
+            (ownerStem == L"steamwebhelper" && targetStem == L"steam") ||
+            (ownerStem.size() >= 8 &&
+                ownerStem.compare(0, 8, L"protonvp") == 0 &&
+                targetStem.compare(0, 8, L"protonvp") == 0))
+        {
+            return true;
+        }
+
+        // NVIDIA overlay/container helpers open VM/DUP into sibling NVIDIA
+        // processes and rundll32 hosts. Same-stem already covers nvcontainer
+        // to nvcontainer.
+        // nv.exe / nvi.exe are not NVIDIA helpers. Inbox NVIDIA stems are
+        // nvcontainer, nvidia*, nvsphelper, nvvsvc, nvtray, ...
+        if (ownerStem.size() >= 4 && ownerStem.compare(0, 2, L"nv") == 0 &&
+            (targetStem.compare(0, 2, L"nv") == 0 || targetStem == L"rundll32"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    bool IsExpectedVmDupHandle(
+        const std::wstring& ownerImage,
+        uint32_t ownerPid,
+        const std::wstring& targetImage,
+        uint32_t targetPid)
+    {
+        if (ownerPid == targetPid)
+        {
+            return true;
+        }
+        if (IsSystemOwnerImage(ownerImage, ownerPid))
+        {
+            return true;
+        }
+        if (SameProcessImage(ownerImage, targetImage))
+        {
+            return true;
+        }
+        return IsKnownOsHandlePair(ownerImage, targetImage);
     }
 
     bool EnumerateKernelProcesses(
@@ -428,7 +571,11 @@ bool HandleTableScanner::Scan(
             if (record.PointsToProcess &&
                 record.OwnerPid != record.TargetPid &&
                 (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle) &&
-                !IsSystemOwnerImage(record.OwnerImage, record.OwnerPid))
+                !IsExpectedVmDupHandle(
+                    record.OwnerImage,
+                    record.OwnerPid,
+                    record.TargetImage,
+                    record.TargetPid))
             {
                 record.Suspicious = true;
                 record.Notes = L"non-system process holds VM/DUP access to another process";
@@ -536,11 +683,38 @@ bool HandleTableAccessMaskSelfTest()
         {
             break;
         }
-        if (!IsSystemOwnerImage(L"csrss.exe", 500))
+        if (!IsSystemOwnerImage(L"csrss.exe", 500) ||
+            !IsSystemOwnerImage(L"C:\\Windows\\System32\\lsass.exe", 500) ||
+            !IsSystemOwnerImage(L"winlogon.exe", 500) ||
+            IsSystemOwnerImage(L"conhost.exe", 500) ||
+            IsSystemOwnerImage(L"OpenConsole.exe", 500))
         {
             break;
         }
         if (IsSystemOwnerImage(L"cheat.exe", 1234))
+        {
+            break;
+        }
+        if (!SameProcessImage(L"chrome.exe", L"chrome.exe") ||
+            !SameProcessImage(L"nvcontainer.ex", L"nvcontainer.exe") ||
+            SameProcessImage(L"chrome.exe", L"notepad.exe"))
+        {
+            break;
+        }
+        if (!IsExpectedVmDupHandle(L"chrome.exe", 10, L"chrome.exe", 11) ||
+            !IsExpectedVmDupHandle(L"winlogon.exe", 10, L"dwm.exe", 11) ||
+            !IsExpectedVmDupHandle(L"nvcontainer.exe", 10, L"nvsphelper64.exe", 11) ||
+            !IsExpectedVmDupHandle(L"nvcontainer.exe", 10, L"rundll32.exe", 11) ||
+            !IsExpectedVmDupHandle(L"SearchIndexer.", 10, L"SearchFilterHo", 11) ||
+            !IsExpectedVmDupHandle(L"OpenConsole.exe", 10, L"pwsh.exe", 11) ||
+            !IsExpectedVmDupHandle(L"steam.exe", 10, L"steamwebhelper.exe", 11) ||
+            IsExpectedVmDupHandle(L"cheat.exe", 10, L"lsass.exe", 11) ||
+            IsExpectedVmDupHandle(L"nv.exe", 10, L"rundll32.exe", 11) ||
+            !IsExpectedVmDupHandle(L"OpenConsole.exe", 10, L"grok.exe", 11) ||
+            !IsExpectedVmDupHandle(L"RuntimeBroker.exe", 10, L"LockApp.exe", 11) ||
+            IsExpectedVmDupHandle(L"OpenConsole.exe", 10, L"lsass.exe", 11) ||
+            IsExpectedVmDupHandle(L"conhost.exe", 10, L"lsass.exe", 11) ||
+            IsExpectedVmDupHandle(L"RuntimeBroker.exe", 10, L"lsass.exe", 11))
         {
             break;
         }

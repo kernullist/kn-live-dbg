@@ -1,14 +1,13 @@
 #include "HiddenProcessScanner.h"
 
 #include "HandleTableScanner.h"
-#include "LayoutResolver.h"
 #include "McpJson.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
 
 #include <cstring>
-#include <iomanip>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string>
@@ -20,6 +19,7 @@ namespace
     constexpr ULONG kSystemProcessInformation = 5;
     constexpr uint32_t kMaxProcesses = 8192;
     constexpr uint32_t kMaxInfoBytes = 32u * 1024u * 1024u;
+    constexpr size_t kSystemProcessInfoPrefix = 0x100;
 
     typedef LONG NTSTATUS_LOCAL;
     typedef NTSTATUS_LOCAL (NTAPI* PfnNtQuerySystemInformation)(
@@ -46,6 +46,10 @@ namespace
         HANDLE InheritedFromUniqueProcessId;
     };
 
+    static_assert(
+        sizeof(SystemProcessInfoHeader) <= kSystemProcessInfoPrefix,
+        "SYSTEM_PROCESS_INFORMATION header must fit in the documented x64 prefix");
+
     struct ProcessView
     {
         uint32_t Pid = 0;
@@ -55,11 +59,72 @@ namespace
         bool Spi = false;
         bool Toolhelp = false;
         bool HandleOwner = false;
+        bool UserBefore = false;
+        bool UserAfter = false;
+        bool Auxiliary = false;
+        bool ProcessExiting = false;
+        bool ProcessDelete = false;
+        bool ProcessRundown = false;
+        bool HasActiveThreads = false;
+        bool HasExitTime = false;
+        bool HasLifecycle = false;
+        uint32_t ActiveThreads = 0;
+        uint64_t ExitTime = 0;
+    };
+
+    struct UserInventory
+    {
+        std::map<uint32_t, std::wstring> Images;
+        uint32_t Count = 0;
+    };
+
+    struct HiddenProcessClassifyInput
+    {
+        uint32_t Pid = 0;
+        bool Kernel = false;
+        bool Spi = false;
+        bool Toolhelp = false;
+        bool UserBefore = false;
+        bool UserAfter = false;
+        bool KernelWalkOk = false;
+        bool KernelInventoryComplete = false;
+        bool UserWalkOk = false;
+        bool RequireStableUserPresence = false;
+        bool LifecycleLayoutAvailable = false;
+        bool HasLifecycle = false;
+        bool HasActiveThreads = false;
+        uint32_t ActiveThreads = 0;
+        bool HasExitTime = false;
+        uint64_t ExitTime = 0;
+        bool Auxiliary = false;
+        bool ProcessExiting = false;
+        bool ProcessDelete = false;
+        bool ProcessRundown = false;
+    };
+
+    struct HiddenProcessClassifyResult
+    {
+        bool Suspicious = false;
+        bool Ignored = false;
+        bool IgnoredAuxiliary = false;
+        bool IgnoredTerminating = false;
+        bool IgnoredRace = false;
+        std::wstring Notes;
     };
 
     bool IsKernelAddress(uint64_t value)
     {
         return value >= kKernelSpaceMin;
+    }
+
+    bool TryAddOffset(uint64_t base, uint64_t offset, uint64_t* result)
+    {
+        if (result == nullptr || offset > (std::numeric_limits<uint64_t>::max)() - base)
+        {
+            return false;
+        }
+        *result = base + offset;
+        return true;
     }
 
     bool ReadU64(DeviceClient& device, uint64_t address, uint64_t* value)
@@ -71,6 +136,120 @@ namespace
             return false;
         }
         memcpy(value, bytes.data(), sizeof(uint64_t));
+        return true;
+    }
+
+    bool ReadInteger(DeviceClient& device, uint64_t address, size_t width, uint64_t* value)
+    {
+        if (value == nullptr || width == 0 || width > sizeof(uint64_t))
+        {
+            return false;
+        }
+
+        std::vector<uint8_t> bytes;
+        if (!device.ReadMemory(address, static_cast<uint32_t>(width), &bytes, nullptr) ||
+            bytes.size() != width)
+        {
+            return false;
+        }
+
+        uint64_t parsed = 0;
+        memcpy(&parsed, bytes.data(), width);
+        *value = parsed;
+        return true;
+    }
+
+    size_t FieldStorageWidth(const TypeFieldInfo& field, size_t fallback)
+    {
+        size_t width = fallback;
+        if (field.IsBitField)
+        {
+            const uint64_t bitEnd = static_cast<uint64_t>(field.BitPosition) + field.Length;
+            if (bitEnd <= 8)
+            {
+                width = 1;
+            }
+            else if (bitEnd <= 16)
+            {
+                width = 2;
+            }
+            else if (bitEnd <= 32)
+            {
+                width = 4;
+            }
+            else
+            {
+                width = 8;
+            }
+        }
+        else if (field.Length > 0 && field.Length <= sizeof(uint64_t))
+        {
+            width = static_cast<size_t>(field.Length);
+        }
+        return width;
+    }
+
+    bool ReadFieldInteger(
+        DeviceClient& device,
+        uint64_t base,
+        const TypeFieldInfo& field,
+        size_t fallbackWidth,
+        uint64_t* value)
+    {
+        if (value == nullptr)
+        {
+            return false;
+        }
+
+        uint64_t address = 0;
+        if (!TryAddOffset(base, field.Offset, &address))
+        {
+            return false;
+        }
+
+        uint64_t raw = 0;
+        if (!ReadInteger(device, address, FieldStorageWidth(field, fallbackWidth), &raw))
+        {
+            return false;
+        }
+
+        if (field.IsBitField)
+        {
+            if (field.Length == 0 ||
+                field.Length > 64 ||
+                field.BitPosition >= 64 ||
+                field.Length > 64 - field.BitPosition)
+            {
+                return false;
+            }
+            const uint64_t mask = field.Length == 64
+                ? (std::numeric_limits<uint64_t>::max)()
+                : ((1ull << field.Length) - 1ull);
+            raw = (raw >> field.BitPosition) & mask;
+        }
+
+        *value = raw;
+        return true;
+    }
+
+    bool ReadBitFlag(
+        DeviceClient& device,
+        uint64_t eprocess,
+        const TypeFieldInfo& field,
+        bool resolved,
+        bool* value)
+    {
+        if (!resolved || value == nullptr)
+        {
+            return false;
+        }
+
+        uint64_t raw = 0;
+        if (!ReadFieldInteger(device, eprocess, field, sizeof(uint32_t), &raw))
+        {
+            return false;
+        }
+        *value = raw != 0;
         return true;
     }
 
@@ -86,6 +265,421 @@ namespace
             out.push_back(static_cast<wchar_t>(static_cast<unsigned char>(text[i])));
         }
         return out;
+    }
+
+    bool IsTerminatingView(const HiddenProcessClassifyInput& input)
+    {
+        if (input.HasExitTime && input.ExitTime != 0)
+        {
+            return true;
+        }
+        if (input.HasActiveThreads && input.ActiveThreads == 0)
+        {
+            return true;
+        }
+        return input.ProcessExiting || input.ProcessDelete || input.ProcessRundown;
+    }
+
+    HiddenProcessClassifyResult ClassifyHiddenProcess(const HiddenProcessClassifyInput& input)
+    {
+        HiddenProcessClassifyResult result = {};
+        if (input.Pid <= 4 || !input.KernelWalkOk || !input.UserWalkOk)
+        {
+            return result;
+        }
+
+        const uint32_t userViews =
+            static_cast<uint32_t>(input.Spi) +
+            static_cast<uint32_t>(input.Toolhelp);
+
+        if (input.Kernel && userViews == 0)
+        {
+            if (input.Auxiliary)
+            {
+                result.Ignored = true;
+                result.IgnoredAuxiliary = true;
+                result.Notes = L"ActiveProcessLinks auxiliary/snapshot clone omitted from SPI";
+                return result;
+            }
+            if (IsTerminatingView(input))
+            {
+                result.Ignored = true;
+                result.IgnoredTerminating = true;
+                result.Notes = L"exiting or threadless process still linked in ActiveProcessLinks";
+                return result;
+            }
+            if (!input.HasLifecycle)
+            {
+                if (input.LifecycleLayoutAvailable)
+                {
+                    result.Ignored = true;
+                    result.IgnoredRace = true;
+                    result.Notes = L"kernel-only process disappeared before lifecycle revalidation";
+                    return result;
+                }
+            }
+            result.Suspicious = true;
+            result.Notes = L"present in ActiveProcessLinks but absent from SPI and Toolhelp";
+            return result;
+        }
+
+        if (!input.Kernel && userViews > 0)
+        {
+            if (!input.KernelInventoryComplete)
+            {
+                result.Ignored = true;
+                result.IgnoredRace = true;
+                result.Notes = L"ActiveProcessLinks walk was incomplete; API-only process was not escalated";
+                return result;
+            }
+            if (input.RequireStableUserPresence && !(input.UserBefore && input.UserAfter))
+            {
+                result.Ignored = true;
+                result.IgnoredRace = true;
+                result.Notes = L"user-mode view appeared in only one snapshot";
+                return result;
+            }
+            result.Suspicious = true;
+            result.Notes = L"visible to user-mode enumeration but missing from ActiveProcessLinks";
+            return result;
+        }
+
+        return result;
+    }
+
+    HiddenProcessClassifyInput MakeClassifyInput(
+        const ProcessView& view,
+        bool kernelWalkOk,
+        bool kernelInventoryComplete,
+        bool userWalkOk,
+        bool requireStableUserPresence,
+        bool lifecycleLayoutAvailable)
+    {
+        HiddenProcessClassifyInput input = {};
+        input.Pid = view.Pid;
+        input.Kernel = view.Kernel;
+        input.Spi = view.Spi;
+        input.Toolhelp = view.Toolhelp;
+        input.UserBefore = view.UserBefore;
+        input.UserAfter = view.UserAfter;
+        input.KernelWalkOk = kernelWalkOk;
+        input.KernelInventoryComplete = kernelInventoryComplete;
+        input.UserWalkOk = userWalkOk;
+        input.RequireStableUserPresence = requireStableUserPresence;
+        input.LifecycleLayoutAvailable = lifecycleLayoutAvailable;
+        input.HasLifecycle = view.HasLifecycle;
+        input.HasActiveThreads = view.HasActiveThreads;
+        input.ActiveThreads = view.ActiveThreads;
+        input.HasExitTime = view.HasExitTime;
+        input.ExitTime = view.ExitTime;
+        input.Auxiliary = view.Auxiliary;
+        input.ProcessExiting = view.ProcessExiting;
+        input.ProcessDelete = view.ProcessDelete;
+        input.ProcessRundown = view.ProcessRundown;
+        return input;
+    }
+
+    void MergeUserInventory(
+        std::map<uint32_t, ProcessView>& views,
+        const UserInventory& inventory,
+        bool spi,
+        bool toolhelp,
+        bool before)
+    {
+        for (const auto& item : inventory.Images)
+        {
+            ProcessView& view = views[item.first];
+            view.Pid = item.first;
+            if (spi)
+            {
+                view.Spi = true;
+            }
+            if (toolhelp)
+            {
+                view.Toolhelp = true;
+            }
+            if (before)
+            {
+                view.UserBefore = true;
+            }
+            else
+            {
+                view.UserAfter = true;
+            }
+            if (view.Image.empty() && !item.second.empty())
+            {
+                view.Image = item.second;
+            }
+        }
+    }
+
+    void AdoptInventoryCount(uint32_t* count, uint32_t snapshotCount)
+    {
+        if (count != nullptr && snapshotCount > *count)
+        {
+            *count = snapshotCount;
+        }
+    }
+
+    bool CollectSystemProcessInformation(UserInventory* inventory, std::wstring* warning)
+    {
+        if (inventory == nullptr)
+        {
+            return false;
+        }
+        *inventory = UserInventory{};
+
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        auto query = ntdll == nullptr ? nullptr : reinterpret_cast<PfnNtQuerySystemInformation>(
+            GetProcAddress(ntdll, "NtQuerySystemInformation"));
+        if (query == nullptr)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"SystemProcessInformation query was unavailable";
+            }
+            return false;
+        }
+
+        size_t cap = 0x40000;
+        std::vector<uint8_t> buffer(cap);
+        ULONG needed = 0;
+        NTSTATUS_LOCAL status = query(
+            kSystemProcessInformation,
+            buffer.data(),
+            static_cast<ULONG>(buffer.size()),
+            &needed);
+        while (status < 0 && cap < kMaxInfoBytes)
+        {
+            if (needed > cap && needed <= kMaxInfoBytes)
+            {
+                cap = static_cast<size_t>(needed) + 0x10000;
+            }
+            else
+            {
+                cap *= 2;
+            }
+            if (cap > kMaxInfoBytes)
+            {
+                cap = kMaxInfoBytes;
+            }
+            buffer.resize(cap);
+            status = query(
+                kSystemProcessInformation,
+                buffer.data(),
+                static_cast<ULONG>(buffer.size()),
+                &needed);
+        }
+        if (status < 0)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"SystemProcessInformation query failed";
+            }
+            return false;
+        }
+        if (needed == 0 || needed > buffer.size())
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"SystemProcessInformation returned an invalid buffer length";
+            }
+            return false;
+        }
+
+        const size_t validLength = static_cast<size_t>(needed);
+        size_t offset = 0;
+        uint32_t spiCount = 0;
+        bool malformed = false;
+        bool terminalEntrySeen = false;
+        const uint8_t* bufStart = buffer.data();
+        const uint8_t* bufEnd = buffer.data() + validLength;
+        UserInventory parsed = {};
+        while (offset + sizeof(SystemProcessInfoHeader) <= validLength && spiCount < kMaxProcesses)
+        {
+            const SystemProcessInfoHeader* info =
+                reinterpret_cast<const SystemProcessInfoHeader*>(buffer.data() + offset);
+            const uintptr_t processId = reinterpret_cast<uintptr_t>(info->UniqueProcessId);
+            if (processId > (std::numeric_limits<uint32_t>::max)())
+            {
+                malformed = true;
+                break;
+            }
+            const uint32_t pid = static_cast<uint32_t>(processId);
+            std::wstring image;
+            if (info->ImageName.Buffer != nullptr && info->ImageName.Length > 0)
+            {
+                const uint8_t* namePtr =
+                    reinterpret_cast<const uint8_t*>(info->ImageName.Buffer);
+                const size_t nameBytes = info->ImageName.Length;
+                // namePtr > bufEnd makes (bufEnd - namePtr) a huge size_t and
+                // would skip the remaining-bytes check.
+                if (namePtr < bufStart || namePtr > bufEnd)
+                {
+                    malformed = true;
+                    break;
+                }
+                const size_t remaining = static_cast<size_t>(bufEnd - namePtr);
+                if ((nameBytes % sizeof(wchar_t)) != 0 || nameBytes > remaining)
+                {
+                    malformed = true;
+                    break;
+                }
+                image.assign(
+                    info->ImageName.Buffer,
+                    info->ImageName.Buffer + (nameBytes / sizeof(wchar_t)));
+            }
+            if (!parsed.Images.emplace(pid, std::move(image)).second)
+            {
+                malformed = true;
+                break;
+            }
+            ++spiCount;
+
+            if (info->NextEntryOffset == 0)
+            {
+                terminalEntrySeen = true;
+                break;
+            }
+            if (info->NextEntryOffset < sizeof(SystemProcessInfoHeader) ||
+                (info->NextEntryOffset % alignof(void*)) != 0 ||
+                offset + info->NextEntryOffset < offset ||
+                offset + info->NextEntryOffset > validLength)
+            {
+                malformed = true;
+                break;
+            }
+            offset += info->NextEntryOffset;
+        }
+
+        if (malformed || !terminalEntrySeen || spiCount == 0)
+        {
+            if (warning != nullptr)
+            {
+                *warning = malformed
+                    ? L"SystemProcessInformation snapshot was malformed"
+                    : L"SystemProcessInformation snapshot was incomplete";
+            }
+            return false;
+        }
+
+        parsed.Count = spiCount;
+        *inventory = std::move(parsed);
+        return true;
+    }
+
+    bool CollectToolhelpProcesses(UserInventory* inventory, std::wstring* warning)
+    {
+        if (inventory == nullptr)
+        {
+            return false;
+        }
+        *inventory = UserInventory{};
+
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"CreateToolhelp32Snapshot failed";
+            }
+            return false;
+        }
+
+        PROCESSENTRY32W entry = {};
+        entry.dwSize = sizeof(entry);
+        UserInventory parsed = {};
+        bool ok = false;
+        if (Process32FirstW(snap, &entry))
+        {
+            do
+            {
+                parsed.Images[entry.th32ProcessID] = entry.szExeFile;
+            } while (Process32NextW(snap, &entry) &&
+                parsed.Images.size() < kMaxProcesses);
+            parsed.Count = static_cast<uint32_t>(parsed.Images.size());
+            ok = parsed.Count > 0;
+        }
+        CloseHandle(snap);
+        if (!ok)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"CreateToolhelp32Snapshot returned no processes";
+            }
+            return false;
+        }
+
+        *inventory = std::move(parsed);
+        return true;
+    }
+
+    struct LifecycleLayout
+    {
+        TypeFieldInfo ExitTime = {};
+        TypeFieldInfo ActiveThreads = {};
+        TypeFieldInfo Auxiliary = {};
+        TypeFieldInfo ProcessExiting = {};
+        TypeFieldInfo ProcessDelete = {};
+        TypeFieldInfo ProcessRundown = {};
+        bool HasExitTime = false;
+        bool HasActiveThreads = false;
+        bool HasAuxiliary = false;
+        bool HasProcessExiting = false;
+        bool HasProcessDelete = false;
+        bool HasProcessRundown = false;
+    };
+
+    bool ReadProcessLifecycle(
+        DeviceClient& device,
+        const LifecycleLayout& layout,
+        ProcessView* view)
+    {
+        if (view == nullptr || view->Eprocess == 0)
+        {
+            return false;
+        }
+
+        if (layout.HasActiveThreads)
+        {
+            uint64_t threads = 0;
+            if (ReadFieldInteger(device, view->Eprocess, layout.ActiveThreads, sizeof(uint32_t), &threads))
+            {
+                view->ActiveThreads = static_cast<uint32_t>(threads);
+                view->HasActiveThreads = true;
+            }
+        }
+        if (layout.HasExitTime)
+        {
+            uint64_t exitTime = 0;
+            if (ReadFieldInteger(device, view->Eprocess, layout.ExitTime, sizeof(uint64_t), &exitTime))
+            {
+                view->ExitTime = exitTime;
+                view->HasExitTime = true;
+            }
+        }
+
+        bool flag = false;
+        if (ReadBitFlag(device, view->Eprocess, layout.Auxiliary, layout.HasAuxiliary, &flag))
+        {
+            view->Auxiliary = flag;
+        }
+        if (ReadBitFlag(device, view->Eprocess, layout.ProcessExiting, layout.HasProcessExiting, &flag))
+        {
+            view->ProcessExiting = flag;
+        }
+        if (ReadBitFlag(device, view->Eprocess, layout.ProcessDelete, layout.HasProcessDelete, &flag))
+        {
+            view->ProcessDelete = flag;
+        }
+        if (ReadBitFlag(device, view->Eprocess, layout.ProcessRundown, layout.HasProcessRundown, &flag))
+        {
+            view->ProcessRundown = flag;
+        }
+
+        // Flags alone are not proof the EPROCESS is still the same live object.
+        view->HasLifecycle = view->HasActiveThreads || view->HasExitTime;
+        return view->HasLifecycle;
     }
 }
 
@@ -113,11 +707,38 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
         *result = HiddenProcessScanResult{};
         std::map<uint32_t, ProcessView> views;
 
+        UserInventory spiBefore = {};
+        std::wstring spiWarning;
+        const bool spiBeforeOk = CollectSystemProcessInformation(&spiBefore, &spiWarning);
+        if (spiBeforeOk)
+        {
+            MergeUserInventory(views, spiBefore, true, false, true);
+            AdoptInventoryCount(&result->SystemProcessInfoCount, spiBefore.Count);
+        }
+        else if (!spiWarning.empty())
+        {
+            result->Warnings.push_back(spiWarning);
+        }
+
+        UserInventory toolhelpBefore = {};
+        std::wstring toolhelpWarning;
+        const bool toolhelpBeforeOk = CollectToolhelpProcesses(&toolhelpBefore, &toolhelpWarning);
+        if (toolhelpBeforeOk)
+        {
+            MergeUserInventory(views, toolhelpBefore, false, true, true);
+            AdoptInventoryCount(&result->ToolhelpCount, toolhelpBefore.Count);
+        }
+        else if (!toolhelpWarning.empty())
+        {
+            result->Warnings.push_back(toolhelpWarning);
+        }
+
         TypeFieldInfo linksField = {};
         TypeFieldInfo pidField = {};
         TypeFieldInfo imageField = {};
         std::wstring ignored;
         uint64_t listHead = 0;
+        bool kernelInventoryComplete = false;
         if (symbols_.FindField(L"nt!_EPROCESS", L"ActiveProcessLinks", &linksField, &ignored) &&
             symbols_.FindField(L"nt!_EPROCESS", L"UniqueProcessId", &pidField, &ignored) &&
             symbols_.ResolveSymbol(L"nt!PsActiveProcessHead", &listHead, &ignored) &&
@@ -129,29 +750,64 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
             {
                 uint32_t walked = 0;
                 uint64_t current = flink;
+                bool kernelWalkAborted = false;
+                std::unordered_set<uint64_t> visited;
+                visited.insert(listHead);
                 while (current != 0 &&
                     current != listHead &&
                     IsKernelAddress(current) &&
                     walked < kMaxProcesses)
                 {
-                    ++walked;
-                    uint64_t eprocess = current - linksField.Offset;
-                    uint64_t pidValue = 0;
-                    if (!ReadU64(device_, eprocess + pidField.Offset, &pidValue))
+                    if (!visited.insert(current).second)
                     {
+                        result->Warnings.push_back(L"ActiveProcessLinks walk hit a cycle");
+                        kernelWalkAborted = true;
+                        break;
+                    }
+                    if (current < linksField.Offset)
+                    {
+                        result->Warnings.push_back(L"ActiveProcessLinks entry underflowed the list offset");
+                        kernelWalkAborted = true;
+                        break;
+                    }
+                    const uint64_t eprocess = current - linksField.Offset;
+                    uint64_t pidAddress = 0;
+                    uint64_t pidValue = 0;
+                    if (!TryAddOffset(eprocess, pidField.Offset, &pidAddress) ||
+                        !ReadU64(device_, pidAddress, &pidValue))
+                    {
+                        result->Warnings.push_back(L"ActiveProcessLinks UniqueProcessId read failed");
+                        kernelWalkAborted = true;
+                        break;
+                    }
+                    if (pidValue > (std::numeric_limits<uint32_t>::max)())
+                    {
+                        result->Warnings.push_back(L"ActiveProcessLinks UniqueProcessId was outside the 32-bit PID range");
+                        kernelWalkAborted = true;
                         break;
                     }
 
-                    ProcessView& view = views[static_cast<uint32_t>(pidValue)];
-                    view.Pid = static_cast<uint32_t>(pidValue);
-                    view.Eprocess = eprocess;
-                    view.Kernel = true;
+                    const uint32_t pid = static_cast<uint32_t>(pidValue);
+                    ProcessView& view = views[pid];
+                    view.Pid = pid;
+                    if (view.Kernel && view.Eprocess != 0 && view.Eprocess != eprocess)
+                    {
+                        result->Warnings.push_back(
+                            L"ActiveProcessLinks contained a duplicate PID with a different EPROCESS");
+                    }
+                    else
+                    {
+                        view.Eprocess = eprocess;
+                        view.Kernel = true;
+                    }
                     if (view.Image.empty() && imageField.Offset != 0)
                     {
+                        uint64_t imageAddress = 0;
                         std::vector<uint8_t> nameBytes;
                         uint32_t nameLen = imageField.Length > 16 ? 16 : static_cast<uint32_t>(imageField.Length);
                         if (nameLen > 0 &&
-                            device_.ReadMemory(eprocess + imageField.Offset, nameLen, &nameBytes, nullptr) &&
+                            TryAddOffset(eprocess, imageField.Offset, &imageAddress) &&
+                            device_.ReadMemory(imageAddress, nameLen, &nameBytes, nullptr) &&
                             !nameBytes.empty())
                         {
                             view.Image = AsciiToWide(
@@ -163,11 +819,26 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
                     uint64_t next = 0;
                     if (!ReadU64(device_, current, &next) || next == current)
                     {
+                        result->Warnings.push_back(L"ActiveProcessLinks Flink read failed");
+                        kernelWalkAborted = true;
                         break;
                     }
+                    ++walked;
                     current = next;
                 }
                 result->KernelListCount = walked;
+                if (!kernelWalkAborted && current == listHead && walked > 0)
+                {
+                    kernelInventoryComplete = true;
+                }
+                else if (walked > 0 && current != listHead)
+                {
+                    kernelWalkAborted = true;
+                }
+                if (kernelWalkAborted)
+                {
+                    result->Warnings.push_back(L"kernel ActiveProcessLinks walk was incomplete");
+                }
             }
         }
         else
@@ -175,122 +846,30 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
             result->Warnings.push_back(L"kernel ActiveProcessLinks walk was not resolved");
         }
 
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        auto query = ntdll == nullptr ? nullptr : reinterpret_cast<PfnNtQuerySystemInformation>(
-            GetProcAddress(ntdll, "NtQuerySystemInformation"));
-        if (query != nullptr)
+        UserInventory spiAfter = {};
+        spiWarning.clear();
+        const bool spiAfterOk = CollectSystemProcessInformation(&spiAfter, &spiWarning);
+        if (spiAfterOk)
         {
-            size_t cap = 0x40000;
-            std::vector<uint8_t> buffer(cap);
-            ULONG needed = 0;
-            NTSTATUS_LOCAL status = query(
-                kSystemProcessInformation,
-                buffer.data(),
-                static_cast<ULONG>(buffer.size()),
-                &needed);
-            while (status < 0 && cap < kMaxInfoBytes)
-            {
-                if (needed > cap && needed <= kMaxInfoBytes)
-                {
-                    cap = static_cast<size_t>(needed) + 0x10000;
-                }
-                else
-                {
-                    cap *= 2;
-                }
-                if (cap > kMaxInfoBytes)
-                {
-                    cap = kMaxInfoBytes;
-                }
-                buffer.resize(cap);
-                status = query(
-                    kSystemProcessInformation,
-                    buffer.data(),
-                    static_cast<ULONG>(buffer.size()),
-                    &needed);
-            }
-            if (status >= 0)
-            {
-                size_t offset = 0;
-                uint32_t spiCount = 0;
-                const uint8_t* bufStart = buffer.data();
-                const uint8_t* bufEnd = buffer.data() + buffer.size();
-                while (offset + sizeof(SystemProcessInfoHeader) <= buffer.size() && spiCount < kMaxProcesses)
-                {
-                    const SystemProcessInfoHeader* info =
-                        reinterpret_cast<const SystemProcessInfoHeader*>(buffer.data() + offset);
-                    uint32_t pid = static_cast<uint32_t>(reinterpret_cast<ULONG_PTR>(info->UniqueProcessId));
-                    ProcessView& view = views[pid];
-                    view.Pid = pid;
-                    view.Spi = true;
-                    ++spiCount;
-                    if (view.Image.empty() &&
-                        info->ImageName.Buffer != nullptr &&
-                        info->ImageName.Length > 0)
-                    {
-                        const uint8_t* namePtr =
-                            reinterpret_cast<const uint8_t*>(info->ImageName.Buffer);
-                        const size_t nameBytes = info->ImageName.Length;
-                        if (namePtr >= bufStart &&
-                            nameBytes <= static_cast<size_t>(bufEnd - namePtr) &&
-                            (nameBytes % sizeof(wchar_t)) == 0)
-                        {
-                            view.Image.assign(
-                                info->ImageName.Buffer,
-                                info->ImageName.Buffer + (nameBytes / sizeof(wchar_t)));
-                        }
-                    }
-                    if (info->NextEntryOffset == 0)
-                    {
-                        break;
-                    }
-                    if (info->NextEntryOffset < sizeof(ULONG) * 2)
-                    {
-                        result->Warnings.push_back(L"SystemProcessInformation NextEntryOffset was too small");
-                        break;
-                    }
-                    if (offset + info->NextEntryOffset < offset ||
-                        offset + info->NextEntryOffset > buffer.size())
-                    {
-                        result->Warnings.push_back(L"SystemProcessInformation NextEntryOffset overflowed the snapshot");
-                        break;
-                    }
-                    offset += info->NextEntryOffset;
-                }
-                result->SystemProcessInfoCount = spiCount;
-            }
-            else
-            {
-                result->Warnings.push_back(L"SystemProcessInformation query failed");
-            }
+            MergeUserInventory(views, spiAfter, true, false, false);
+            AdoptInventoryCount(&result->SystemProcessInfoCount, spiAfter.Count);
+        }
+        else if (!spiWarning.empty())
+        {
+            result->Warnings.push_back(L"second " + spiWarning);
         }
 
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap != INVALID_HANDLE_VALUE)
+        UserInventory toolhelpAfter = {};
+        toolhelpWarning.clear();
+        const bool toolhelpAfterOk = CollectToolhelpProcesses(&toolhelpAfter, &toolhelpWarning);
+        if (toolhelpAfterOk)
         {
-            PROCESSENTRY32W entry = {};
-            entry.dwSize = sizeof(entry);
-            uint32_t toolCount = 0;
-            if (Process32FirstW(snap, &entry))
-            {
-                do
-                {
-                    ProcessView& view = views[entry.th32ProcessID];
-                    view.Pid = entry.th32ProcessID;
-                    view.Toolhelp = true;
-                    ++toolCount;
-                    if (view.Image.empty() && entry.szExeFile[0] != 0)
-                    {
-                        view.Image = entry.szExeFile;
-                    }
-                } while (Process32NextW(snap, &entry) && toolCount < kMaxProcesses);
-            }
-            CloseHandle(snap);
-            result->ToolhelpCount = toolCount;
+            MergeUserInventory(views, toolhelpAfter, false, true, false);
+            AdoptInventoryCount(&result->ToolhelpCount, toolhelpAfter.Count);
         }
-        else
+        else if (!toolhelpWarning.empty())
         {
-            result->Warnings.push_back(L"CreateToolhelp32Snapshot failed");
+            result->Warnings.push_back(L"second " + toolhelpWarning);
         }
 
         HandleTableScanner handles(device_, symbols_);
@@ -317,18 +896,74 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
             result->Warnings.push_back(L"handle-owner view failed: " + handleError);
         }
 
+        LifecycleLayout lifecycle = {};
+        lifecycle.HasExitTime = symbols_.FindField(L"nt!_EPROCESS", L"ExitTime", &lifecycle.ExitTime, &ignored);
+        lifecycle.HasActiveThreads =
+            symbols_.FindField(L"nt!_EPROCESS", L"ActiveThreads", &lifecycle.ActiveThreads, &ignored);
+        lifecycle.HasAuxiliary =
+            symbols_.FindField(L"nt!_EPROCESS", L"AuxiliaryProcess", &lifecycle.Auxiliary, &ignored);
+        lifecycle.HasProcessExiting =
+            symbols_.FindField(L"nt!_EPROCESS", L"ProcessExiting", &lifecycle.ProcessExiting, &ignored);
+        lifecycle.HasProcessDelete =
+            symbols_.FindField(L"nt!_EPROCESS", L"ProcessDelete", &lifecycle.ProcessDelete, &ignored);
+        lifecycle.HasProcessRundown =
+            symbols_.FindField(L"nt!_EPROCESS", L"ProcessRundown", &lifecycle.ProcessRundown, &ignored);
+        if (!lifecycle.HasExitTime || !lifecycle.HasActiveThreads)
+        {
+            result->Warnings.push_back(L"kernel process lifecycle fields were not fully resolved");
+        }
+
         result->CoverageComplete =
-            result->KernelListCount > 0 &&
+            kernelInventoryComplete &&
             result->SystemProcessInfoCount > 0 &&
             result->ToolhelpCount > 0;
 
-        for (const auto& pair : views)
+        const bool kernelWalkOk = result->KernelListCount > 0;
+        const bool userWalkOk =
+            result->SystemProcessInfoCount > 0 ||
+            result->ToolhelpCount > 0;
+        const bool userBeforeOk = spiBeforeOk || toolhelpBeforeOk;
+        const bool userAfterOk = spiAfterOk || toolhelpAfterOk;
+        const bool requireStableUserPresence = userBeforeOk && userAfterOk;
+        const bool lifecycleLayoutAvailable =
+            lifecycle.HasExitTime || lifecycle.HasActiveThreads;
+
+        for (auto& pair : views)
         {
-            const ProcessView& view = pair.second;
+            ProcessView& view = pair.second;
             if (view.Pid == 0)
             {
                 continue;
             }
+
+            const bool kernelOnly =
+                kernelWalkOk &&
+                userWalkOk &&
+                view.Kernel &&
+                !view.Spi &&
+                !view.Toolhelp &&
+                view.Pid > 4;
+            if (kernelOnly)
+            {
+                uint64_t pidAddress = 0;
+                uint64_t livePid = 0;
+                if (TryAddOffset(view.Eprocess, pidField.Offset, &pidAddress) &&
+                    ReadU64(device_, pidAddress, &livePid) &&
+                    livePid == view.Pid)
+                {
+                    ReadProcessLifecycle(device_, lifecycle, &view);
+                }
+            }
+
+            const HiddenProcessClassifyInput classifiedInput =
+                MakeClassifyInput(
+                    view,
+                    kernelWalkOk,
+                    kernelInventoryComplete,
+                    userWalkOk,
+                    requireStableUserPresence,
+                    lifecycleLayoutAvailable);
+            const HiddenProcessClassifyResult classified = ClassifyHiddenProcess(classifiedInput);
 
             HiddenProcessRecord record = {};
             record.ProcessId = view.Pid;
@@ -338,31 +973,31 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
             record.InSystemProcessInfo = view.Spi;
             record.InToolhelp = view.Toolhelp;
             record.InHandleOwners = view.HandleOwner;
+            record.Auxiliary = view.Auxiliary;
+            record.Terminating = IsTerminatingView(classifiedInput);
+            record.HasActiveThreads = view.HasActiveThreads;
+            record.HasExitTime = view.HasExitTime;
+            record.ActiveThreads = view.ActiveThreads;
+            record.ExitTime = view.ExitTime;
+            record.Suspicious = classified.Suspicious;
+            record.Notes = classified.Notes;
 
-            const uint32_t userViews =
-                static_cast<uint32_t>(view.Spi) +
-                static_cast<uint32_t>(view.Toolhelp);
-            const bool kernelWalkOk = result->KernelListCount > 0;
-            const bool userWalkOk =
-                result->SystemProcessInfoCount > 0 ||
-                result->ToolhelpCount > 0;
-            if (kernelWalkOk &&
-                userWalkOk &&
-                view.Kernel &&
-                userViews == 0 &&
-                view.Pid > 4)
+            if (classified.Ignored)
             {
-                record.Suspicious = true;
-                record.Notes = L"present in ActiveProcessLinks but absent from SPI and Toolhelp";
-            }
-            else if (kernelWalkOk &&
-                userWalkOk &&
-                !view.Kernel &&
-                userViews > 0 &&
-                view.Pid > 4)
-            {
-                record.Suspicious = true;
-                record.Notes = L"visible to user-mode enumeration but missing from ActiveProcessLinks";
+                ++result->IgnoredCount;
+                if (classified.IgnoredAuxiliary)
+                {
+                    ++result->IgnoredAuxiliaryCount;
+                }
+                if (classified.IgnoredTerminating)
+                {
+                    ++result->IgnoredTerminatingCount;
+                }
+                if (classified.IgnoredRace)
+                {
+                    ++result->IgnoredRaceCount;
+                }
+                continue;
             }
 
             if (record.Suspicious)
@@ -392,6 +1027,10 @@ std::wstring BuildHiddenProcessJson(const HiddenProcessScanResult& result)
     json << L",\"toolhelp\":" << result.ToolhelpCount;
     json << L",\"handle_owners\":" << result.HandleOwnerCount;
     json << L",\"suspicious\":" << result.SuspiciousCount;
+    json << L",\"ignored\":" << result.IgnoredCount;
+    json << L",\"ignored_auxiliary\":" << result.IgnoredAuxiliaryCount;
+    json << L",\"ignored_terminating\":" << result.IgnoredTerminatingCount;
+    json << L",\"ignored_race\":" << result.IgnoredRaceCount;
     json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
     json << L",\"records\":[";
     bool first = true;
@@ -409,6 +1048,12 @@ std::wstring BuildHiddenProcessJson(const HiddenProcessScanResult& result)
         json << L",\"spi\":" << (record.InSystemProcessInfo ? L"true" : L"false");
         json << L",\"toolhelp\":" << (record.InToolhelp ? L"true" : L"false");
         json << L",\"handle_owner\":" << (record.InHandleOwners ? L"true" : L"false");
+        json << L",\"auxiliary\":" << (record.Auxiliary ? L"true" : L"false");
+        json << L",\"terminating\":" << (record.Terminating ? L"true" : L"false");
+        json << L",\"has_active_threads\":" << (record.HasActiveThreads ? L"true" : L"false");
+        json << L",\"active_threads\":" << record.ActiveThreads;
+        json << L",\"has_exit_time\":" << (record.HasExitTime ? L"true" : L"false");
+        json << L",\"exit_time\":\"0x" << std::hex << record.ExitTime << std::dec << L"\"";
         json << L",\"suspicious\":" << (record.Suspicious ? L"true" : L"false");
         json << L",\"notes\":\"" << mcpjson::Escape(record.Notes) << L"\"}";
     }
@@ -422,30 +1067,106 @@ bool HiddenProcessViewSelfTest()
 
     do
     {
-        HiddenProcessRecord hidden = {};
-        hidden.ProcessId = 1234;
-        hidden.InKernelList = true;
-        hidden.InSystemProcessInfo = false;
-        hidden.InToolhelp = false;
-        const uint32_t userViews =
-            static_cast<uint32_t>(hidden.InSystemProcessInfo) +
-            static_cast<uint32_t>(hidden.InToolhelp);
-        if (!(hidden.InKernelList && userViews == 0 && hidden.ProcessId > 4))
+        HiddenProcessClassifyInput hidden = {};
+        hidden.Pid = 1234;
+        hidden.Kernel = true;
+        hidden.KernelWalkOk = true;
+        hidden.UserWalkOk = true;
+        hidden.HasLifecycle = true;
+        hidden.HasActiveThreads = true;
+        hidden.ActiveThreads = 4;
+        hidden.HasExitTime = true;
+        hidden.ExitTime = 0;
+        hidden.LifecycleLayoutAvailable = true;
+        const HiddenProcessClassifyResult hiddenResult = ClassifyHiddenProcess(hidden);
+        if (!hiddenResult.Suspicious || hiddenResult.Ignored)
         {
             break;
         }
 
-        HiddenProcessRecord visible = {};
-        visible.ProcessId = 4321;
-        visible.InKernelList = false;
-        visible.InSystemProcessInfo = true;
-        visible.InToolhelp = true;
-        if (visible.InKernelList ||
-            (static_cast<uint32_t>(visible.InSystemProcessInfo) +
-             static_cast<uint32_t>(visible.InToolhelp)) == 0)
+        HiddenProcessClassifyInput clone = hidden;
+        clone.Auxiliary = true;
+        const HiddenProcessClassifyResult cloneResult = ClassifyHiddenProcess(clone);
+        if (cloneResult.Suspicious || !cloneResult.IgnoredAuxiliary)
         {
             break;
         }
+
+        HiddenProcessClassifyInput zombie = hidden;
+        zombie.ActiveThreads = 0;
+        const HiddenProcessClassifyResult zombieResult = ClassifyHiddenProcess(zombie);
+        if (zombieResult.Suspicious || !zombieResult.IgnoredTerminating)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput exiting = hidden;
+        exiting.ProcessExiting = true;
+        const HiddenProcessClassifyResult exitingResult = ClassifyHiddenProcess(exiting);
+        if (exitingResult.Suspicious || !exitingResult.IgnoredTerminating)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput vanished = hidden;
+        vanished.HasLifecycle = false;
+        vanished.HasActiveThreads = false;
+        vanished.HasExitTime = false;
+        vanished.LifecycleLayoutAvailable = true;
+        const HiddenProcessClassifyResult vanishedResult = ClassifyHiddenProcess(vanished);
+        if (vanishedResult.Suspicious || !vanishedResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput noLayout = vanished;
+        noLayout.LifecycleLayoutAvailable = false;
+        const HiddenProcessClassifyResult noLayoutResult = ClassifyHiddenProcess(noLayout);
+        if (!noLayoutResult.Suspicious || noLayoutResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput visible = {};
+        visible.Pid = 4321;
+        visible.KernelWalkOk = true;
+        visible.UserWalkOk = true;
+        visible.Spi = true;
+        visible.Toolhelp = true;
+        visible.UserBefore = true;
+        visible.UserAfter = true;
+        visible.RequireStableUserPresence = true;
+        visible.KernelInventoryComplete = true;
+        const HiddenProcessClassifyResult visibleResult = ClassifyHiddenProcess(visible);
+        if (!visibleResult.Suspicious || visibleResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput race = visible;
+        race.UserAfter = false;
+        const HiddenProcessClassifyResult raceResult = ClassifyHiddenProcess(race);
+        if (raceResult.Suspicious || !raceResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput singleSnapshot = race;
+        singleSnapshot.RequireStableUserPresence = false;
+        const HiddenProcessClassifyResult singleSnapshotResult = ClassifyHiddenProcess(singleSnapshot);
+        if (!singleSnapshotResult.Suspicious || singleSnapshotResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput incompleteWalk = visible;
+        incompleteWalk.KernelInventoryComplete = false;
+        const HiddenProcessClassifyResult incompleteWalkResult = ClassifyHiddenProcess(incompleteWalk);
+        if (incompleteWalkResult.Suspicious || !incompleteWalkResult.IgnoredRace)
+        {
+            break;
+        }
+
         ok = true;
     } while (false);
 

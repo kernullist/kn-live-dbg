@@ -68,6 +68,25 @@ namespace
         return overlaps;
     }
 
+    bool LooksLikePciMmioHole(uint64_t physical)
+    {
+        return physical >= 0x00000000F0000000ull &&
+            physical < 0x0000000100000000ull;
+    }
+
+    bool LooksLikeSystemWxWindow(const OrphanKernelPageRegion& region)
+    {
+        if (region.HasPe)
+        {
+            return false;
+        }
+        if (region.Size >= 0x200000ull)
+        {
+            return true;
+        }
+        return LooksLikePciMmioHole(region.PhysicalAddress);
+    }
+
     std::wstring ClassifyRegion(const OrphanKernelPageRegion& region)
     {
         std::wstring classification = L"independent_or_system_pte";
@@ -94,6 +113,16 @@ namespace
                 classification = L"session";
                 break;
             }
+            if (LooksLikePciMmioHole(region.PhysicalAddress) && !region.HasPe)
+            {
+                classification = L"mmio";
+                break;
+            }
+            if (region.Size >= 0x200000ull && !region.HasPe)
+            {
+                classification = L"large_page";
+                break;
+            }
             if (region.Writable && region.Executable)
             {
                 classification = L"wx_orphan";
@@ -110,7 +139,17 @@ namespace
 
         do
         {
-            if ((region.Writable && region.Executable) || region.HasPe)
+            if (region.HasPe)
+            {
+                risk = L"high";
+                break;
+            }
+            if (LooksLikeSystemWxWindow(region))
+            {
+                risk = L"medium";
+                break;
+            }
+            if (region.Writable && region.Executable)
             {
                 risk = L"high";
                 break;
@@ -650,7 +689,13 @@ void OrphanKernelPageScanner::FinalizeRegions(
         if (device_.ReadMemory(probeAt, 0x1000, &head, &ignored) && head.size() >= 0x40)
         {
             PeHeaderProbe probe = {};
-            if (ProbeForPageStartPeHeader(head.data(), head.size(), &probe) && probe.IsPe)
+            // Kernel leftover pages that execute on x64 are PE32+. PE32/I386
+            // headers in this VA range are firmware/option-ROM mappings, not
+            // a mapped kernel driver.
+            if (ProbeForPageStartPeHeader(head.data(), head.size(), &probe) &&
+                PeProbeLooksLikeImage(probe, 0) &&
+                probe.Is64Bit &&
+                probe.Machine == 0x8664)
             {
                 region.HasPe = true;
                 region.Pe = probe;
@@ -659,10 +704,21 @@ void OrphanKernelPageScanner::FinalizeRegions(
 
         region.Classification = ClassifyRegion(region);
         region.Risk = RiskForRegion(region);
+        if (region.Classification == L"large_page" && !region.LargePage)
+        {
+            LeftoverAppendNote(&region.Notes, L"coalesced 2MB+ window");
+        }
+        if (region.Classification == L"mmio")
+        {
+            LeftoverAppendNote(&region.Notes, L"PCI MMIO hole");
+        }
         if (region.Writable && region.Executable)
         {
             LeftoverAppendNote(&region.Notes, L"effective W+X");
-            result->AnyHighRisk = true;
+            if (!LooksLikeSystemWxWindow(region))
+            {
+                result->AnyHighRisk = true;
+            }
         }
         if (region.HasPe)
         {
@@ -891,6 +947,53 @@ bool OrphanKernelPageSelfTest()
         region.HasPe = true;
         region.Classification = ClassifyRegion(region);
         if (region.Classification != L"unbacked_pe" || RiskForRegion(region) != L"high")
+        {
+            ok = false;
+            break;
+        }
+
+        OrphanKernelPageRegion largePage = {};
+        largePage.Writable = true;
+        largePage.Executable = true;
+        largePage.LargePage = false;
+        largePage.Size = 0x200000;
+        largePage.HasPe = false;
+        if (ClassifyRegion(largePage) != L"large_page" ||
+            RiskForRegion(largePage) != L"medium")
+        {
+            ok = false;
+            break;
+        }
+
+        OrphanKernelPageRegion mmio = {};
+        mmio.Writable = true;
+        mmio.Executable = true;
+        mmio.Size = 0x86000;
+        mmio.PhysicalAddress = 0x00000000FFF7A000ull;
+        mmio.HasPe = false;
+        if (ClassifyRegion(mmio) != L"mmio" || RiskForRegion(mmio) != L"medium")
+        {
+            ok = false;
+            break;
+        }
+
+        PeHeaderProbe tooSmall = {};
+        tooSmall.IsPe = true;
+        tooSmall.Machine = 0x8664;
+        tooSmall.NumberOfSections = 3;
+        tooSmall.SizeOfImage = 0x760;
+        PeHeaderProbe overflow = tooSmall;
+        overflow.SizeOfImage = 0x1d000;
+        PeHeaderProbe aligned = tooSmall;
+        aligned.SizeOfImage = 0x3000;
+        PeHeaderProbe i386 = aligned;
+        i386.Machine = 0x14c;
+        i386.Is64Bit = false;
+        if (PeProbeLooksLikeImage(tooSmall, 0x3000) ||
+            PeProbeLooksLikeImage(overflow, 0x1000) ||
+            !PeProbeLooksLikeImage(aligned, 0x3000) ||
+            !PeProbeLooksLikeImage(aligned, 0) ||
+            !PeProbeLooksLikeImage(i386, 0))
         {
             ok = false;
             break;

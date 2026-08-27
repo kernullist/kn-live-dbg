@@ -1775,11 +1775,12 @@ bool AlpcScanner::Scan(const Options& options, AlpcScanResult* result, std::wstr
                 {
                     record.Name = record.DirectoryPath.substr(lastSep + 1);
                 }
-                else
+                else if (record.DirectoryPath != L"\\")
                 {
                     record.Name = record.DirectoryPath;
                 }
             }
+            record.IsNamedDirectoryPort = !record.Name.empty();
 
             initialRecords.push_back(std::move(record));
         }

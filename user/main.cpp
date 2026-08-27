@@ -16455,7 +16455,11 @@ static void HandleMapperCommand(
         if (!jsonPath.empty())
         {
             std::wstring writeError;
-            if (!WriteUtf8TextFile(jsonPath, json, &writeError))
+            if (WriteUtf8TextFile(jsonPath, json, &writeError))
+            {
+                std::wcout << L"!mapper json=" << jsonPath << L"\n";
+            }
+            else
             {
                 std::wcerr << L"!mapper: failed to write JSON: " << writeError << L"\n";
             }
@@ -16488,20 +16492,32 @@ static void HandleMapperCommand(
         }
 
         PrintColoredText(L"mapper", KNDBG_COLOR_TITLE);
-        std::wcout << L" suspicious=" << (result.AnySuspicious ? L"yes" : L"no")
-                   << L" unloaded=" << result.Unloaded.size()
-                   << L"(" << (result.UnloadedComplete ? L"complete" : L"partial") << L")"
-                   << L" piddb=" << result.Piddb.size()
-                   << L"(" << (result.PiddbComplete ? L"complete" : L"partial");
-        if (!result.PiddbWalkMode.empty())
+        std::wcout << L" suspicious=" << (result.AnySuspicious ? L"yes" : L"no");
+        if (options.IncludeUnloaded)
         {
-            std::wcout << L"/" << result.PiddbWalkMode;
+            std::wcout << L" unloaded=" << result.Unloaded.size()
+                       << L"(" << (result.UnloadedComplete ? L"complete" : L"partial") << L")";
         }
-        std::wcout << L",leftover=" << piddbLeftover << L")"
-                   << L" hash=" << result.HashEntries.size()
-                   << L"(" << (result.HashComplete ? L"complete" : L"partial")
-                   << L",leftover=" << hashLeftover << L")\n";
+        if (options.IncludePiddb)
+        {
+            std::wcout << L" piddb=" << result.Piddb.size()
+                       << L"(" << (result.PiddbComplete ? L"complete" : L"partial");
+            if (!result.PiddbWalkMode.empty())
+            {
+                std::wcout << L"/" << result.PiddbWalkMode;
+            }
+            std::wcout << L",leftover=" << piddbLeftover << L")";
+        }
+        if (options.IncludeHash)
+        {
+            std::wcout << L" hash=" << result.HashEntries.size()
+                       << L"(" << (result.HashComplete ? L"complete" : L"partial")
+                       << L",leftover=" << hashLeftover << L")";
+        }
+        std::wcout << L"\n";
 
+        if (options.IncludeUnloaded)
+        {
         for (const MapperUnloadedRecord& record : result.Unloaded)
         {
             PrintColoredText(L"[unloaded]", KNDBG_COLOR_TITLE);
@@ -16545,6 +16561,7 @@ static void HandleMapperCommand(
             {
                 std::wcout << L"  notes=" << record.Notes << L"\n";
             }
+        }
         }
 
         uint32_t piddbPrinted = 0;
@@ -16711,12 +16728,16 @@ static void HandleKpageCommand(
             if (region.Writable && region.Executable)
             {
                 std::wcout << L" ";
-                PrintColoredText(L"[W+X]", KNDBG_COLOR_FAIL);
+                PrintColoredText(
+                    L"[W+X]",
+                    region.Risk == L"high" ? KNDBG_COLOR_FAIL : KNDBG_COLOR_WARN);
             }
             if (region.HasPe)
             {
                 std::wcout << L" ";
                 PrintColoredText(L"PE", KNDBG_COLOR_FAIL);
+                std::wcout << L" sizeOfImage=0x" << std::hex << region.Pe.SizeOfImage
+                           << L" nt=0x" << region.Pe.NtOffset << std::dec;
             }
             if (region.InBigPool)
             {
@@ -19304,7 +19325,7 @@ static void PrintDriverIntegrityHelp()
     std::wcout << L"  !driver object <name|address> [/dispatch] [/devices] [/json <path>]\n";
     std::wcout << L"  !driver integrity [driver|all] [/limit <n>] [/json <path>]\n";
     std::wcout << L"  !drvobj <name|address> [/dispatch] [/devices] [/json <path>]\n";
-    std::wcout << L"  !devstack <device-object-address> [/json <path>]\n";
+    std::wcout << L"  !devstack <device-object-address|driver-name> [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Walks the Object Manager \\Driver directory, reads _DRIVER_OBJECT entries,\n";
@@ -19325,6 +19346,7 @@ static void PrintDriverIntegrityHelp()
     std::wcout << L"  !driver integrity WdFilter\n";
     std::wcout << L"  !drvobj kbdclass /devices\n";
     std::wcout << L"  !devstack ffffce8f12340000\n";
+    std::wcout << L"  !devstack kbdclass\n";
 }
 
 static bool ParseIntegrityLimitOption(
@@ -20533,7 +20555,7 @@ static void HandleDriverIntegrityCommand(
                 PrintColoredText(
                     record.Suspicious ? L"[driver.list.suspicious]" : L"[driver.list]",
                     record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
-                std::wcout << L" " << record.Name
+                std::wcout << L" " << (record.Name.empty() ? L"<unnamed>" : record.Name)
                            << L" object=" << std::hex << record.DriverObject
                            << L" start=" << record.DriverStart
                            << L" size=" << std::dec << record.DriverSize
@@ -20822,6 +20844,49 @@ static void HandleDrvobjCommand(
     } while (false);
 }
 
+static std::wstring DriverLeafName(const std::wstring& value)
+{
+    const size_t slash = value.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash + 1 >= value.size())
+    {
+        return value;
+    }
+    return value.substr(slash + 1);
+}
+
+static uint64_t DevstackAddressFromInspect(
+    const std::wstring& target,
+    const DriverObjectInspectResult& inspect)
+{
+    const std::wstring want = ToLower(DriverLeafName(target));
+    const DriverIntegrityRecord* chosen = nullptr;
+    for (const DriverIntegrityRecord& driver : inspect.Drivers)
+    {
+        if (ToLower(DriverLeafName(driver.Name)) == want)
+        {
+            chosen = &driver;
+            break;
+        }
+    }
+    if (chosen == nullptr)
+    {
+        return 0;
+    }
+    if (chosen->DeviceObject >= 0xffff800000000000ull)
+    {
+        return chosen->DeviceObject;
+    }
+    for (const DeviceObjectRecord& deviceRecord : inspect.Devices)
+    {
+        if (deviceRecord.DriverObject == chosen->DriverObject &&
+            deviceRecord.DeviceObject >= 0xffff800000000000ull)
+        {
+            return deviceRecord.DeviceObject;
+        }
+    }
+    return 0;
+}
+
 static void HandleDevstackCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -20880,19 +20945,63 @@ static void HandleDevstackCommand(
         {
             if (target.empty() && !parseError)
             {
-                std::wcerr << L"usage: !devstack <device-object-address> [/json <path>]\n";
+                std::wcerr << L"usage: !devstack <device-object-address|driver-name> [/json <path>]\n";
             }
             break;
         }
 
+        IntegrityScanner scanner(device, symbols);
         uint64_t address = 0;
-        if (!ParseUnsigned(target, state.NumberBase, &address) || address < 0xffff800000000000ull)
+        if (!ParseUnsigned(target, state.NumberBase, &address) ||
+            address < 0xffff800000000000ull)
         {
-            std::wcerr << L"!devstack: target must be a kernel DEVICE_OBJECT address\n";
-            break;
+            DriverObjectInspectResult inspect = {};
+            std::wstring inspectError;
+            if (!scanner.InspectDriverObject(target, false, true, &inspect, &inspectError) ||
+                inspect.Drivers.empty())
+            {
+                std::wcerr << L"!devstack: target must be a kernel DEVICE_OBJECT address or driver name";
+                if (!inspectError.empty())
+                {
+                    std::wcerr << L" (" << inspectError << L")";
+                }
+                std::wcerr << L"\n";
+                break;
+            }
+            address = DevstackAddressFromInspect(target, inspect);
+            if (address < 0xffff800000000000ull)
+            {
+                const std::wstring want = ToLower(DriverLeafName(target));
+                bool exactName = false;
+                for (const DriverIntegrityRecord& driver : inspect.Drivers)
+                {
+                    if (ToLower(DriverLeafName(driver.Name)) == want)
+                    {
+                        exactName = true;
+                        break;
+                    }
+                }
+                if (!exactName)
+                {
+                    std::wcerr << L"!devstack: \"" << target
+                               << L"\" is not an exact driver name; use !drvobj "
+                               << target << L" or a DEVICE_OBJECT address\n";
+                }
+                else
+                {
+                    std::wcerr << L"!devstack: driver \"" << target
+                               << L"\" has no DEVICE_OBJECT\n";
+                }
+                break;
+            }
+            std::wcout << L"!devstack resolved " << target << L" -> "
+                       << std::hex << address << std::dec << L"\n";
+            for (const std::wstring& warning : inspect.Warnings)
+            {
+                std::wcerr << L"!devstack warning: " << warning << L"\n";
+            }
         }
 
-        IntegrityScanner scanner(device, symbols);
         DeviceStackResult result = {};
         std::wstring error;
         if (!scanner.InspectDeviceStack(address, &result, &error))
@@ -21165,8 +21274,10 @@ static void PrintHiddenProcHelp()
     std::wcout << L"  !hiddenproc [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"cross-views ActiveProcessLinks, SystemProcessInformation, Toolhelp, and handle\n";
-    std::wcout << L"owners. Processes in the kernel list but missing from user views, or the reverse,\n";
-    std::wcout << L"are marked suspicious. Full PspCidTable coverage stays on !hunt /deep.\n";
+    std::wcout << L"owners. Live processes in the kernel list but missing from both user snapshots,\n";
+    std::wcout << L"or stably visible to user APIs but missing from ActiveProcessLinks, are marked\n";
+    std::wcout << L"suspicious. Threadless clones, exiting processes, and auxiliary snapshot processes\n";
+    std::wcout << L"are ignored. Full PspCidTable coverage stays on !hunt /deep.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /json <path>  write kn-live-dbg.hidden-process.v1.\n";
@@ -21269,6 +21380,7 @@ static void HandleHiddenProcCommand(
                    << L" toolhelp=" << result.ToolhelpCount
                    << L" handle_owners=" << result.HandleOwnerCount
                    << L" suspicious=" << result.SuspiciousCount
+                   << L" ignored=" << result.IgnoredCount
                    << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete") << L"\n";
     } while (false);
 }
@@ -27795,9 +27907,10 @@ static void PrintVadHelp()
 static void PrintThreadsHelp()
 {
     std::wcout << L"!threads command:\n";
-    std::wcout << L"  !threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !threads <pid|image|eprocess> [/summary] [/apc] [/stacks] [/limit <n>] [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
+    std::wcout << L"  /summary  print the header and summary only\n";
     std::wcout << L"  /apc      inspect ETHREAD APC queue fields when PDB layout is available\n";
     std::wcout << L"  /stacks   include stack base/limit fields in the table\n";
     std::wcout << L"  /limit n  cap printed/JSON records while still walking the thread list\n";
@@ -29830,12 +29943,20 @@ static int RunConsoleSurfaceSelfTest()
             L"handle-table-access-mask");
         CheckConsoleSurfaceSelfTest(
             &context,
+            HalDispatchOwnershipSelfTest(),
+            L"hal-dispatch-inbox-ownership");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             HiddenProcessViewSelfTest(),
             L"hidden-process-view-classification");
         CheckConsoleSurfaceSelfTest(
             &context,
             IntegrityIatOwnerSelfTest(),
             L"module-iat-owner-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IntegrityDiscardedSectionSelfTest(),
+            L"module-discardable-init-section");
         CheckConsoleSurfaceSelfTest(
             &context,
             IntegrityProloguePatternSelfTest(),
@@ -33591,7 +33712,7 @@ static bool ValidateThreadsCommandArgumentShape(
         while (index < args.size())
         {
             std::wstring option = ToLower(args[index]);
-            if (option == L"/apc" || option == L"/stacks")
+            if (option == L"/apc" || option == L"/stacks" || option == L"/summary")
             {
                 ++index;
                 continue;
@@ -33615,7 +33736,7 @@ static bool ValidateThreadsCommandArgumentShape(
 
             if (reason != nullptr)
             {
-                *reason = L"!threads supports /apc, /stacks, /limit, and /json options";
+                *reason = L"!threads supports /summary, /apc, /stacks, /limit, and /json options";
             }
             shapeOk = false;
             break;
@@ -37724,7 +37845,11 @@ static void PrintThreadRecord(const ProcessThreadRecord& record, bool includeSta
     }
 }
 
-static void PrintThreadScanResult(const ProcessThreadScanResult& result, bool includeStacks, bool includeApc)
+static void PrintThreadScanResult(
+    const ProcessThreadScanResult& result,
+    bool includeStacks,
+    bool includeApc,
+    bool summaryOnly)
 {
     PrintColoredText(L"!threads", KNDBG_COLOR_TITLE);
     std::wcout << L" pid=" << std::dec << result.Target.ProcessId
@@ -37732,9 +37857,12 @@ static void PrintThreadScanResult(const ProcessThreadScanResult& result, bool in
                << L" eprocess=" << HexTextWidth(result.Target.Eprocess, 16, true)
                << L"\n";
 
-    for (const ProcessThreadRecord& record : result.Records)
+    if (!summaryOnly)
     {
-        PrintThreadRecord(record, includeStacks, includeApc);
+        for (const ProcessThreadRecord& record : result.Records)
+        {
+            PrintThreadRecord(record, includeStacks, includeApc);
+        }
     }
 
     PrintColoredText(L"[threads.summary]", KNDBG_COLOR_TITLE);
@@ -40728,11 +40856,16 @@ static void HandleThreadsCommand(
 
         std::wstring jsonPath;
         bool parseOk = true;
+        bool summaryOnly = false;
         for (size_t index = 2; index < args.size(); ++index)
         {
             std::wstring option = ToLower(args[index]);
 
-            if (option == L"/apc")
+            if (option == L"/summary")
+            {
+                summaryOnly = true;
+            }
+            else if (option == L"/apc")
             {
                 options.IncludeApc = true;
             }
@@ -40789,7 +40922,7 @@ static void HandleThreadsCommand(
         }
 
         result.Warnings.insert(result.Warnings.begin(), targetWarnings.begin(), targetWarnings.end());
-        PrintThreadScanResult(result, options.IncludeStacks, options.IncludeApc);
+        PrintThreadScanResult(result, options.IncludeStacks, options.IncludeApc, summaryOnly);
         PrintProcessTriageWarnings(L"!threads", result.Warnings);
 
         if (structuredJsonOut != nullptr)

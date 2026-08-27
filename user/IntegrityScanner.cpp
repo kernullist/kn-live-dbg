@@ -74,6 +74,13 @@ namespace
         return _wcsicmp(a.c_str(), b.c_str()) == 0;
     }
 
+    bool SectionLooksDiscarded(const std::wstring& name, uint32_t characteristics)
+    {
+        return (characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0 ||
+            EqualsNoCaseLocal(name, L"INIT") ||
+            EqualsNoCaseLocal(name, L"INITKDBG");
+    }
+
     bool IsKernelAddress(uint64_t value)
     {
         return value >= kKernelSpaceMin;
@@ -3142,7 +3149,8 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                 section.FirstPageQueryFailed = true;
                                                 section.PageAttributeQueryFailed = true;
                                                 section.PageAttributeError = firstProbe.Error;
-                                                if (section.Executable)
+                                                if (section.Executable &&
+                                                    !SectionLooksDiscarded(section.Name, section.Characteristics))
                                                 {
                                                     section.MismatchEvidence = true;
                                                     AddSectionReason(&section, L"exec_first_page_query_failed", L"first executable page translation failed");
@@ -3186,7 +3194,8 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                         {
                                                             section.PageAttributeError = lastProbe.Error;
                                                         }
-                                                        if (section.Executable)
+                                                        if (section.Executable &&
+                                                            !SectionLooksDiscarded(section.Name, section.Characteristics))
                                                         {
                                                             section.MismatchEvidence = true;
                                                             AddSectionReason(&section, L"exec_last_page_query_failed", L"last executable page translation failed");
@@ -3264,7 +3273,8 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                             {
                                                                 section.PageAttributeError = midProbe.Error;
                                                             }
-                                                            if (section.Executable)
+                                                            if (section.Executable &&
+                                                                !SectionLooksDiscarded(section.Name, section.Characteristics))
                                                             {
                                                                 section.MismatchEvidence = true;
                                                                 AddSectionReason(
@@ -4358,6 +4368,13 @@ std::wstring BuildDriverObjectJson(const DriverObjectInspectResult& result)
     }
     json << L"]\n}\n";
     return json.str();
+}
+
+bool IntegrityDiscardedSectionSelfTest()
+{
+    return SectionLooksDiscarded(L"INIT", 0) &&
+        SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_DISCARDABLE) &&
+        !SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_EXECUTE);
 }
 
 bool IntegrityIatOwnerSelfTest()

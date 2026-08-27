@@ -736,6 +736,7 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
                 : totalEntries);
 
         result->AttributesAttempted = options.AnnotateAttributes;
+        bool limitNoted = false;
 
         for (ULONG i = 0; i < safeCount; ++i)
         {
@@ -785,6 +786,17 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
                 {
                     continue;
                 }
+            }
+
+            if (options.LimitEntries != 0 && result->Entries.size() >= options.LimitEntries)
+            {
+                if (!limitNoted)
+                {
+                    result->Diagnostics.push_back(
+                        L"output limit reached (/limit); remaining entries elided");
+                    limitNoted = true;
+                }
+                continue;
             }
 
             BigPoolEntryRecord rec;
@@ -881,12 +893,6 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
                 {
                     continue;
                 }
-            }
-
-            if (options.LimitEntries != 0 && result->Entries.size() >= options.LimitEntries)
-            {
-                result->Diagnostics.push_back(L"output limit reached (/limit); remaining entries elided");
-                break;
             }
 
             result->Entries.push_back(std::move(rec));

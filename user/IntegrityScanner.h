@@ -266,5 +266,6 @@ std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result);
 std::wstring BuildDriverObjectJson(const DriverObjectInspectResult& result);
 std::wstring BuildDeviceStackJson(const DeviceStackResult& result);
 bool IntegrityIatOwnerSelfTest();
+bool IntegrityDiscardedSectionSelfTest();
 bool IntegrityProloguePatternSelfTest();
 bool DeviceStackWalkSelfTest();

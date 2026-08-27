@@ -337,7 +337,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!module", L"!module", L"kernel", L"check loaded kernel module PE headers, IAT/prologue trampolines, disk/live pages, and executable section W+X integrity", CommandSupport::Native),
         Make(L"!driver", L"!driver", L"kernel", L"walk \\Driver objects, list DRIVER_OBJECT fields, and flag suspicious dispatch targets", CommandSupport::Native),
         Make(L"!drvobj", L"!drvobj", L"kernel", L"inspect one DRIVER_OBJECT and its DEVICE_OBJECT / attached-device chain", CommandSupport::Native),
-        Make(L"!devstack", L"!devstack", L"kernel", L"walk a DEVICE_OBJECT AttachedDevice/AttachedTo stack", CommandSupport::Native),
+        Make(L"!devstack", L"!devstack", L"kernel", L"walk a DEVICE_OBJECT AttachedDevice/AttachedTo stack from an address or driver name", CommandSupport::Native),
         Make(L"!handles", L"!handles", L"kernel", L"enumerate process handles and flag non-system VM/DUP access to another process", CommandSupport::Native),
         Make(L"!hiddenproc", L"!hiddenproc", L"kernel", L"cross-view hidden process: ActiveProcessLinks vs SPI vs Toolhelp vs handle owners", CommandSupport::Native),
         Make(L"!wdfilter", L"!wdfilter", L"kernel", L"walk WdFilter RuntimeDriver leftovers that survive after a mapper unloads", CommandSupport::Native),
