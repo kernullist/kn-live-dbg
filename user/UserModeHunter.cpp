@@ -5446,7 +5446,8 @@ namespace
                 break;
             }
 
-            if (length >= 12 &&
+            if (addressSize != 4 &&
+                length >= 12 &&
                 bytes[0] == 0x48 &&
                 bytes[1] == 0xB8 &&
                 (bytes[10] == 0xFF && (bytes[11] == 0xE0 || bytes[11] == 0xD0)))
@@ -5535,7 +5536,7 @@ namespace
         {
             if (bytes == nullptr ||
                 trampolineTarget == nullptr ||
-                length < 8)
+                length < 13)
             {
                 break;
             }
@@ -5555,10 +5556,11 @@ namespace
                 }
 
                 size_t after = look + 3;
-                if (after + 5 <= length && bytes[after] == 0xB8)
+                if (after + 5 > length || bytes[after] != 0xB8)
                 {
-                    after += 5;
+                    continue;
                 }
+                after += 5;
                 if (after >= length)
                 {
                     continue;
@@ -5608,7 +5610,7 @@ namespace
                 }
 
                 const size_t windowStart = index > 16 ? index - 16 : 0;
-                for (size_t look = windowStart; look < index; ++look)
+                for (size_t look = windowStart; look + 5 <= index; ++look)
                 {
                     if (bytes[look] == 0xB8)
                     {
@@ -18932,7 +18934,13 @@ namespace
             std::wstring openPath = DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(rawPath));
             if (openPath.empty())
             {
-                status = ERROR_PATH_NOT_FOUND;
+                break;
+            }
+
+            const std::wstring lowered = NormalizePathText(openPath);
+            if (lowered.compare(0, 8, L"\\device\\") == 0)
+            {
+                status = ERROR_NOT_SUPPORTED;
                 break;
             }
 
@@ -18968,6 +18976,20 @@ namespace
     bool DiskOpenErrorLooksLikeMissingImage(DWORD status)
     {
         return status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND;
+    }
+
+    bool PathIsPlausibleGhostingImagePath(const std::wstring& rawPath)
+    {
+        std::wstring openPath =
+            DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(rawPath));
+        for (wchar_t& ch : openPath)
+        {
+            if (ch == L'/')
+            {
+                ch = L'\\';
+            }
+        }
+        return IsDriveQualifiedPath(openPath);
     }
 
     bool CanOpenDiskImagePath(const std::wstring& rawPath)
@@ -21329,6 +21351,25 @@ namespace
                 break;
             }
 
+            uint32_t imageBase32 = 0;
+            if (!ReadProcessU32(
+                    device,
+                    process.Kernel,
+                    candidate + 0x08,
+                    &imageBase32) ||
+                imageBase32 == 0 ||
+                !IsUserAddress(imageBase32))
+            {
+                break;
+            }
+            if (process.HasPebImageBase &&
+                (process.PebImageBase & 0xFFFFFFFFULL) != 0 &&
+                imageBase32 != static_cast<uint32_t>(process.PebImageBase) &&
+                !LoaderModuleCoversAddress(process, imageBase32, nullptr))
+            {
+                break;
+            }
+
             *peb32 = candidate;
             ok = true;
         } while (false);
@@ -21566,25 +21607,12 @@ namespace
                 break;
             }
 
-            uint64_t table64 = 0;
-            if (ReadProcessU64(
-                    device,
-                    process.Kernel,
-                    process.Kernel.Peb + 0x58,
-                    &table64) &&
-                table64 != 0)
-            {
-                InspectKernelCallbackTable(
-                    device,
-                    result,
-                    process,
-                    table64,
-                    sizeof(uint64_t),
-                    L"peb64");
-            }
-
             uint64_t peb32 = 0;
-            if (ResolveWow64Peb32(device, symbols, process, &peb32) && peb32 != 0)
+            const bool wow64Peb32 =
+                process.ToolhelpModuleEnumerated &&
+                ResolveWow64Peb32(device, symbols, process, &peb32) &&
+                peb32 != 0;
+            if (wow64Peb32)
             {
                 uint32_t table32 = 0;
                 if (ReadProcessU32(
@@ -21601,6 +21629,25 @@ namespace
                         table32,
                         sizeof(uint32_t),
                         L"peb32");
+                }
+            }
+            else if (!ProcessNativePebShowsWow64(process))
+            {
+                uint64_t table64 = 0;
+                if (ReadProcessU64(
+                        device,
+                        process.Kernel,
+                        process.Kernel.Peb + 0x58,
+                        &table64) &&
+                    table64 != 0)
+                {
+                    InspectKernelCallbackTable(
+                        device,
+                        result,
+                        process,
+                        table64,
+                        sizeof(uint64_t),
+                        L"peb64");
                 }
             }
         } while (false);
@@ -21803,7 +21850,6 @@ namespace
                     continue;
                 }
 
-                ++scanned;
                 const uint32_t readSize =
                     vad.Size > 4096 ? 4096u : static_cast<uint32_t>(vad.Size);
                 std::vector<uint8_t> bytes;
@@ -21819,6 +21865,7 @@ namespace
                 {
                     continue;
                 }
+                ++scanned;
                 uint64_t indirectTarget = 0;
                 uint64_t indirectSlot = 0;
                 const bool directStub = LooksLikeDirectSyscallStub(bytes.data(), bytes.size());
@@ -22199,22 +22246,40 @@ namespace
             }
 
             const DWORD openStatus = ProbeDiskImageOpenStatus(diskPath);
-            if (DiskOpenErrorLooksLikeMissingImage(openStatus))
+            if (DiskOpenErrorLooksLikeMissingImage(openStatus) &&
+                PathIsPlausibleGhostingImagePath(diskPath))
             {
-                std::map<std::wstring, std::wstring> evidence;
-                evidence[L"disk_path"] = diskPath;
-                evidence[L"open_status"] = std::to_wstring(openStatus);
-                AddFinding(
-                    result,
-                    process,
-                    L"high",
-                    L"medium",
-                    L"process_image_integrity",
-                    L"process image path does not exist on disk while the image is still mapped (ghosting)",
-                    process.PebImageBase,
-                    BestProcessImageName(process),
-                    {L"process_ghosting_evidence", L"main_image_disk_missing"},
-                    evidence);
+                std::vector<uint8_t> mz;
+                std::wstring mzError;
+                uint16_t dosMagic = 0;
+                if (ReadHuntProcessMemory(
+                        device,
+                        process.Kernel,
+                        process.PebImageBase,
+                        sizeof(dosMagic),
+                        &mz,
+                        &mzError) &&
+                    mz.size() >= sizeof(dosMagic))
+                {
+                    std::memcpy(&dosMagic, mz.data(), sizeof(dosMagic));
+                }
+                if (dosMagic == IMAGE_DOS_SIGNATURE)
+                {
+                    std::map<std::wstring, std::wstring> evidence;
+                    evidence[L"disk_path"] = diskPath;
+                    evidence[L"open_status"] = std::to_wstring(openStatus);
+                    AddFinding(
+                        result,
+                        process,
+                        L"high",
+                        L"medium",
+                        L"process_image_integrity",
+                        L"process image path does not exist on disk while the image is still mapped (ghosting)",
+                        process.PebImageBase,
+                        BestProcessImageName(process),
+                        {L"process_ghosting_evidence", L"main_image_disk_missing"},
+                        evidence);
+                }
                 break;
             }
             if (openStatus != ERROR_SUCCESS)
@@ -25194,6 +25259,36 @@ bool HuntInjectedModuleSelfTest()
             x86Slot != 0x3000ull ||
             !IsSyscallGadgetModuleLeaf(L"ntdll.dll") ||
             IsSyscallGadgetModuleLeaf(L"kernel32.dll"))
+        {
+            break;
+        }
+
+        uint8_t indirectNoSsn[] = {
+            0x4C, 0x8B, 0xD1, 0xE9, 0x00, 0x10, 0x00, 0x00
+        };
+        uint64_t ignoredTarget = 0;
+        uint64_t ignoredSlot = 0;
+        uint8_t sysenterTruncatedB8[] = { 0x90, 0xB8, 0x0F, 0x34 };
+        if (LooksLikeIndirectSyscallStub(
+                indirectNoSsn,
+                sizeof(indirectNoSsn),
+                0x1000,
+                &ignoredTarget,
+                &ignoredSlot) ||
+            LooksLikeWow64SysenterStub(
+                sysenterTruncatedB8,
+                sizeof(sysenterTruncatedB8)) ||
+            !PathIsPlausibleGhostingImagePath(L"C:\\Temp\\gone.exe") ||
+            !PathIsPlausibleGhostingImagePath(L"C:/Temp/gone.exe") ||
+            PathIsPlausibleGhostingImagePath(L"svchost.exe") ||
+            PathIsPlausibleGhostingImagePath(L"") ||
+            DecodeUserTrampolineTarget(
+                absJmp,
+                sizeof(absJmp),
+                0x1000,
+                &absTarget,
+                &slot,
+                4))
         {
             break;
         }
