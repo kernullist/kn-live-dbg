@@ -1770,7 +1770,7 @@ bool AlpcScanner::Scan(const Options& options, AlpcScanResult* result, std::wstr
 
             if (!record.DirectoryPath.empty())
             {
-                size_t lastSep = record.DirectoryPath.find_last_of(L'\\');
+                size_t lastSep = record.DirectoryPath.find_last_of(L"\\/");
                 if (lastSep != std::wstring::npos && lastSep + 1 < record.DirectoryPath.size())
                 {
                     record.Name = record.DirectoryPath.substr(lastSep + 1);

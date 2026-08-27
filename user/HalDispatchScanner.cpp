@@ -30,7 +30,7 @@ namespace
         return true;
     }
 
-    std::wstring FindOwningModule(SymbolEngine& symbols, uint64_t address)
+    const KernelModuleInfo* FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
         for (const KernelModuleInfo& module : symbols.Modules())
         {
@@ -41,10 +41,10 @@ namespace
             }
             if (address >= module.Base && address < end)
             {
-                return module.ImageName;
+                return &module;
             }
         }
-        return std::wstring();
+        return nullptr;
     }
 
     std::wstring NearestSymbolText(SymbolEngine& symbols, uint64_t address)
@@ -66,14 +66,35 @@ namespace
         return stream.str();
     }
 
-    bool ModuleLooksLikeNtOrHal(const std::wstring& imageName)
+    bool PathLooksLikeInboxKernel(const std::wstring& path)
     {
-        if (imageName.empty())
+        if (path.empty() || path.find_last_of(L"\\/") == std::wstring::npos)
+        {
+            return true;
+        }
+
+        std::wstring lower = path;
+        for (wchar_t& ch : lower)
+        {
+            if (ch >= L'A' && ch <= L'Z')
+            {
+                ch = static_cast<wchar_t>(ch - L'A' + L'a');
+            }
+        }
+        return lower.find(L"\\system32\\") != std::wstring::npos ||
+            lower.find(L"/system32/") != std::wstring::npos ||
+            lower.find(L"system32\\") == 0 ||
+            lower.find(L"system32/") == 0;
+    }
+
+    bool ModuleLooksLikeNtOrHal(const std::wstring& imageName, const std::wstring& imagePath = std::wstring())
+    {
+        if (imageName.empty() && imagePath.empty())
         {
             return false;
         }
 
-        std::wstring lower = imageName;
+        std::wstring lower = imageName.empty() ? imagePath : imageName;
         for (wchar_t& ch : lower)
         {
             if (ch >= L'A' && ch <= L'Z')
@@ -87,24 +108,27 @@ namespace
             lower = lower.substr(slash + 1);
         }
 
-        if (lower.find(L"ntoskrnl") == 0 ||
-            lower.find(L"ntkrnl") == 0 ||
+        const bool inboxName =
+            lower == L"ntoskrnl.exe" ||
+            lower == L"ntkrnlmp.exe" ||
+            lower == L"ntkrnlpa.exe" ||
+            lower == L"ntkrnlup.exe" ||
             lower == L"hal.dll" ||
-            (lower.size() >= 4 && lower.compare(0, 4, L"hal.") == 0) ||
-            (lower.size() >= 4 && lower.compare(0, 4, L"hala") == 0) ||
-            lower.find(L"halmacpi") == 0 ||
+            lower == L"hal.sys" ||
+            lower == L"halaacpi.dll" ||
+            lower == L"halacpi.dll" ||
+            lower == L"halmacpi.dll" ||
             lower == L"pci.sys" ||
             lower == L"acpi.sys" ||
             lower == L"pciide.sys" ||
-            lower == L"pciidex.sys")
+            lower == L"pciidex.sys";
+        if (!inboxName)
         {
-            return true;
+            return false;
         }
 
-        // Some builds fold HAL into ntoskrnl. Inbox PCI/ACPI register HAL
-        // private-dispatch overrides (PciTranslateBusAddress, ACPILateRestore).
-        // Loaded third-party ownership is still unexpected.
-        return false;
+        const std::wstring& pathForCheck = imagePath.empty() ? imageName : imagePath;
+        return PathLooksLikeInboxKernel(pathForCheck);
     }
 
     bool ResolveTablePointerFields(
@@ -286,16 +310,17 @@ namespace
                 }
 
                 ++table->NonNullCount;
-                slot.Module = FindOwningModule(symbols, routine);
+                const KernelModuleInfo* owner = FindOwningModule(symbols, routine);
+                slot.Module = owner != nullptr ? owner->ImageName : std::wstring();
                 slot.Symbol = NearestSymbolText(symbols, routine);
 
-                if (!IsKernelAddress(routine) || slot.Module.empty())
+                if (!IsKernelAddress(routine) || slot.Module.empty() || owner == nullptr)
                 {
                     slot.Suspicious = true;
                     slot.Notes = L"HAL dispatch routine outside loaded kernel modules";
                     ++table->SuspiciousCount;
                 }
-                else if (!ModuleLooksLikeNtOrHal(slot.Module))
+                else if (!ModuleLooksLikeNtOrHal(owner->ImageName, owner->ImagePath))
                 {
                     slot.Suspicious = true;
                     slot.Notes =
@@ -575,6 +600,13 @@ bool HalDispatchOwnershipSelfTest()
         ModuleLooksLikeNtOrHal(L"ntoskrnl.exe") &&
         ModuleLooksLikeNtOrHal(L"hal.dll") &&
         ModuleLooksLikeNtOrHal(L"halaacpi.dll") &&
+        ModuleLooksLikeNtOrHal(L"pci.sys", L"\\SystemRoot\\System32\\drivers\\pci.sys") &&
+        ModuleLooksLikeNtOrHal(L"pci.sys", L"System32\\drivers\\pci.sys") &&
+        !ModuleLooksLikeNtOrHal(L"pci.sys", L"C:\\Temp\\pci.sys") &&
+        !ModuleLooksLikeNtOrHal(L"pci.sys", L"\\SystemRoot\\Temp\\pci.sys") &&
+        !ModuleLooksLikeNtOrHal(L"halaware.sys") &&
+        !ModuleLooksLikeNtOrHal(L"hal.evil.sys") &&
+        !ModuleLooksLikeNtOrHal(L"ntoskrnl_hook.sys") &&
         !ModuleLooksLikeNtOrHal(L"capcom.sys") &&
         !ModuleLooksLikeNtOrHal(L"notahalaware.sys") &&
         !ModuleLooksLikeNtOrHal(L"");

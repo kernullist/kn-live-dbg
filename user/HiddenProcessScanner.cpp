@@ -68,6 +68,8 @@ namespace
         bool HasActiveThreads = false;
         bool HasExitTime = false;
         bool HasLifecycle = false;
+        bool PidRevalidated = false;
+        bool HasAuxiliaryResolved = false;
         uint32_t ActiveThreads = 0;
         uint64_t ExitTime = 0;
     };
@@ -92,6 +94,8 @@ namespace
         bool RequireStableUserPresence = false;
         bool LifecycleLayoutAvailable = false;
         bool HasLifecycle = false;
+        bool PidRevalidated = false;
+        bool HasAuxiliaryResolved = false;
         bool HasActiveThreads = false;
         uint32_t ActiveThreads = 0;
         bool HasExitTime = false;
@@ -273,7 +277,13 @@ namespace
         {
             return true;
         }
-        if (input.HasActiveThreads && input.ActiveThreads == 0)
+        // ActiveThreads==0 alone is not an exit when AuxiliaryProcess was
+        // resolved -- snapshot clones set that bit, and an attacker can zero
+        // the thread count. If the PDB lacks AuxiliaryProcess, keep the
+        // threadless fallback so clones do not light up as hidden.
+        if (input.HasActiveThreads &&
+            input.ActiveThreads == 0 &&
+            !input.HasAuxiliaryResolved)
         {
             return true;
         }
@@ -305,12 +315,12 @@ namespace
             {
                 result.Ignored = true;
                 result.IgnoredTerminating = true;
-                result.Notes = L"exiting or threadless process still linked in ActiveProcessLinks";
+                result.Notes = L"exiting process still linked in ActiveProcessLinks";
                 return result;
             }
             if (!input.HasLifecycle)
             {
-                if (input.LifecycleLayoutAvailable)
+                if (input.LifecycleLayoutAvailable && !input.PidRevalidated)
                 {
                     result.Ignored = true;
                     result.IgnoredRace = true;
@@ -368,6 +378,8 @@ namespace
         input.RequireStableUserPresence = requireStableUserPresence;
         input.LifecycleLayoutAvailable = lifecycleLayoutAvailable;
         input.HasLifecycle = view.HasLifecycle;
+        input.PidRevalidated = view.PidRevalidated;
+        input.HasAuxiliaryResolved = view.HasAuxiliaryResolved;
         input.HasActiveThreads = view.HasActiveThreads;
         input.ActiveThreads = view.ActiveThreads;
         input.HasExitTime = view.HasExitTime;
@@ -663,6 +675,7 @@ namespace
         if (ReadBitFlag(device, view->Eprocess, layout.Auxiliary, layout.HasAuxiliary, &flag))
         {
             view->Auxiliary = flag;
+            view->HasAuxiliaryResolved = true;
         }
         if (ReadBitFlag(device, view->Eprocess, layout.ProcessExiting, layout.HasProcessExiting, &flag))
         {
@@ -771,10 +784,13 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
                         break;
                     }
                     const uint64_t eprocess = current - linksField.Offset;
-                    uint64_t pidAddress = 0;
                     uint64_t pidValue = 0;
-                    if (!TryAddOffset(eprocess, pidField.Offset, &pidAddress) ||
-                        !ReadU64(device_, pidAddress, &pidValue))
+                    if (!ReadFieldInteger(
+                            device_,
+                            eprocess,
+                            pidField,
+                            sizeof(uint64_t),
+                            &pidValue))
                     {
                         result->Warnings.push_back(L"ActiveProcessLinks UniqueProcessId read failed");
                         kernelWalkAborted = true;
@@ -812,7 +828,9 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
                         {
                             view.Image = AsciiToWide(
                                 reinterpret_cast<const char*>(nameBytes.data()),
-                                nameBytes.size());
+                                strnlen(
+                                    reinterpret_cast<const char*>(nameBytes.data()),
+                                    nameBytes.size()));
                         }
                     }
 
@@ -945,12 +963,17 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
                 view.Pid > 4;
             if (kernelOnly)
             {
-                uint64_t pidAddress = 0;
                 uint64_t livePid = 0;
-                if (TryAddOffset(view.Eprocess, pidField.Offset, &pidAddress) &&
-                    ReadU64(device_, pidAddress, &livePid) &&
-                    livePid == view.Pid)
+                if (ReadFieldInteger(
+                        device_,
+                        view.Eprocess,
+                        pidField,
+                        sizeof(uint64_t),
+                        &livePid) &&
+                    livePid <= (std::numeric_limits<uint32_t>::max)() &&
+                    static_cast<uint32_t>(livePid) == view.Pid)
                 {
+                    view.PidRevalidated = true;
                     ReadProcessLifecycle(device_, lifecycle, &view);
                 }
             }
@@ -996,6 +1019,15 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
                 if (classified.IgnoredRace)
                 {
                     ++result->IgnoredRaceCount;
+                }
+                // Keep kernel-only clones/zombies in the record list so the
+                // ignore decision is auditable. One-sided API races stay out.
+                if ((classified.IgnoredAuxiliary || classified.IgnoredTerminating) &&
+                    view.Kernel &&
+                    !view.Spi &&
+                    !view.Toolhelp)
+                {
+                    result->Records.push_back(record);
                 }
                 continue;
             }
@@ -1073,6 +1105,7 @@ bool HiddenProcessViewSelfTest()
         hidden.KernelWalkOk = true;
         hidden.UserWalkOk = true;
         hidden.HasLifecycle = true;
+        hidden.HasAuxiliaryResolved = true;
         hidden.HasActiveThreads = true;
         hidden.ActiveThreads = 4;
         hidden.HasExitTime = true;
@@ -1092,10 +1125,19 @@ bool HiddenProcessViewSelfTest()
             break;
         }
 
-        HiddenProcessClassifyInput zombie = hidden;
-        zombie.ActiveThreads = 0;
-        const HiddenProcessClassifyResult zombieResult = ClassifyHiddenProcess(zombie);
-        if (zombieResult.Suspicious || !zombieResult.IgnoredTerminating)
+        HiddenProcessClassifyInput threadless = hidden;
+        threadless.ActiveThreads = 0;
+        const HiddenProcessClassifyResult threadlessResult = ClassifyHiddenProcess(threadless);
+        if (!threadlessResult.Suspicious || threadlessResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput threadlessNoAuxField = threadless;
+        threadlessNoAuxField.HasAuxiliaryResolved = false;
+        const HiddenProcessClassifyResult threadlessNoAuxFieldResult =
+            ClassifyHiddenProcess(threadlessNoAuxField);
+        if (threadlessNoAuxFieldResult.Suspicious || !threadlessNoAuxFieldResult.IgnoredTerminating)
         {
             break;
         }
@@ -1112,9 +1154,18 @@ bool HiddenProcessViewSelfTest()
         vanished.HasLifecycle = false;
         vanished.HasActiveThreads = false;
         vanished.HasExitTime = false;
+        vanished.PidRevalidated = false;
         vanished.LifecycleLayoutAvailable = true;
         const HiddenProcessClassifyResult vanishedResult = ClassifyHiddenProcess(vanished);
         if (vanishedResult.Suspicious || !vanishedResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput liveUnread = vanished;
+        liveUnread.PidRevalidated = true;
+        const HiddenProcessClassifyResult liveUnreadResult = ClassifyHiddenProcess(liveUnread);
+        if (!liveUnreadResult.Suspicious || liveUnreadResult.Ignored)
         {
             break;
         }

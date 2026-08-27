@@ -154,14 +154,12 @@ namespace
         }
 
         const std::wstring lowered = ImageBaseName(image);
-        return lowered == L"system" ||
-            lowered == L"csrss.exe" ||
+        return lowered == L"csrss.exe" ||
             lowered == L"smss.exe" ||
             lowered == L"lsass.exe" ||
             lowered == L"services.exe" ||
             lowered == L"svchost.exe" ||
-            lowered == L"wininit.exe" ||
-            lowered == L"winlogon.exe";
+            lowered == L"wininit.exe";
     }
 
     std::wstring ImageStem(const std::wstring& image)
@@ -194,10 +192,12 @@ namespace
             return true;
         }
 
-        // EPROCESS.ImageFileName is 15 bytes. A truncated owner/target pair
-        // still names the same image when one is a prefix of the other.
+        // EPROCESS.ImageFileName is 15 bytes. Only treat a prefix as the same
+        // image when the shorter name is exactly that cap; "security" must not
+        // match "securityhealth.exe". Truncated extensions (.e / .ex) collapse
+        // through ImageStem.
         const size_t minSize = (std::min)(leftBase.size(), rightBase.size());
-        if (minSize >= 8 &&
+        if (minSize == 15 &&
             (leftBase.compare(0, minSize, rightBase, 0, minSize) == 0))
         {
             return true;
@@ -219,7 +219,62 @@ namespace
             stem == L"system";
     }
 
-    bool IsKnownOsHandlePair(const std::wstring& owner, const std::wstring& target)
+    bool StemHasInboxPrefix(const std::wstring& stem, const std::wstring& token)
+    {
+        if (stem.size() < token.size())
+        {
+            return false;
+        }
+        if (stem.compare(0, token.size(), token) != 0)
+        {
+            return false;
+        }
+        if (stem.size() == token.size())
+        {
+            return true;
+        }
+        const wchar_t next = stem[token.size()];
+        return next == L' ' ||
+            next == L'-' ||
+            next == L'_' ||
+            next == L'.' ||
+            (next >= L'0' && next <= L'9');
+    }
+
+    bool LooksLikeNvidiaHelperStem(const std::wstring& stem)
+    {
+        bool nvidia = false;
+
+        do
+        {
+            if (stem.size() < 4)
+            {
+                break;
+            }
+            if (StemHasInboxPrefix(stem, L"nvidia") ||
+                StemHasInboxPrefix(stem, L"nvcontainer") ||
+                StemHasInboxPrefix(stem, L"nvsphelper") ||
+                StemHasInboxPrefix(stem, L"nvdisplay") ||
+                StemHasInboxPrefix(stem, L"nvxdsync"))
+            {
+                nvidia = true;
+                break;
+            }
+            nvidia = stem == L"nvvsvc" ||
+                stem == L"nvtray" ||
+                stem == L"nview" ||
+                stem == L"nvnode" ||
+                stem == L"nvbackend" ||
+                stem == L"nvshim";
+        } while (false);
+
+        return nvidia;
+    }
+
+    bool IsKnownOsHandlePair(
+        const std::wstring& owner,
+        const std::wstring& target,
+        uint32_t grantedAccess)
     {
         const std::wstring ownerStem = ImageStem(owner);
         const std::wstring targetStem = ImageStem(target);
@@ -228,45 +283,56 @@ namespace
             return false;
         }
 
+        const bool writeOrDup =
+            (grantedAccess & (kProcessVmWrite | kProcessVmOperation | kProcessDupHandle)) != 0;
         const bool consoleHost =
             ownerStem == L"conhost" ||
             ownerStem == L"openconsole" ||
             ownerStem == L"windowsterminal" ||
             ownerStem == L"windowstermina";
+        // Console/RuntimeBroker attachments are QUERY/VM_READ. VM_WRITE and
+        // DUP_HANDLE from those names is the cheat-impersonation path.
         if ((consoleHost || ownerStem == L"runtimebroker") &&
+            !writeOrDup &&
             !IsSensitiveSystemTarget(targetStem))
         {
             return true;
         }
 
-        if ((ownerStem == L"winlogon" && targetStem == L"dwm") ||
+        if ((ownerStem == L"winlogon" &&
+                (targetStem == L"dwm" ||
+                 targetStem == L"userinit" ||
+                 targetStem == L"logonui" ||
+                 targetStem == L"lsass" ||
+                 targetStem == L"csrss" ||
+                 targetStem == L"explorer")) ||
             (ownerStem == L"explorer" && targetStem == L"runtimebroker") ||
             (ownerStem == L"searchindexer" &&
                 (targetStem == L"searchfilterhost" ||
                  targetStem == L"searchprotocolhost" ||
+                 targetStem == L"searchfilterhos" ||
+                 targetStem == L"searchprotocolh" ||
                  targetStem == L"searchfilterho" ||
                  targetStem == L"searchprotocol")) ||
             ((ownerStem == L"searchapp" || targetStem == L"searchapp") &&
                 (ownerStem == L"msedgewebview2" || ownerStem == L"msedgewebview" ||
                  targetStem == L"msedgewebview2" || targetStem == L"msedgewebview")) ||
-            (ownerStem.find(L"copilot") != std::wstring::npos &&
+            (StemHasInboxPrefix(ownerStem, L"copilot") &&
                 (targetStem == L"msedgewebview2" || targetStem == L"msedgewebview")) ||
             (ownerStem == L"steam" && targetStem == L"steamwebhelper") ||
             (ownerStem == L"steamwebhelper" && targetStem == L"steam") ||
-            (ownerStem.size() >= 8 &&
-                ownerStem.compare(0, 8, L"protonvp") == 0 &&
-                targetStem.compare(0, 8, L"protonvp") == 0))
+            (StemHasInboxPrefix(ownerStem, L"protonvpn") &&
+                StemHasInboxPrefix(targetStem, L"protonvpn")))
         {
             return true;
         }
 
         // NVIDIA overlay/container helpers open VM/DUP into sibling NVIDIA
         // processes and rundll32 hosts. Same-stem already covers nvcontainer
-        // to nvcontainer.
-        // nv.exe / nvi.exe are not NVIDIA helpers. Inbox NVIDIA stems are
-        // nvcontainer, nvidia*, nvsphelper, nvvsvc, nvtray, ...
-        if (ownerStem.size() >= 4 && ownerStem.compare(0, 2, L"nv") == 0 &&
-            (targetStem.compare(0, 2, L"nv") == 0 || targetStem == L"rundll32"))
+        // to nvcontainer. Do not treat every nv* image as NVIDIA -- nv.exe,
+        // nvi.exe, and cheat names like nvhook.exe are not inbox helpers.
+        if (LooksLikeNvidiaHelperStem(ownerStem) &&
+            (LooksLikeNvidiaHelperStem(targetStem) || targetStem == L"rundll32"))
         {
             return true;
         }
@@ -278,7 +344,8 @@ namespace
         const std::wstring& ownerImage,
         uint32_t ownerPid,
         const std::wstring& targetImage,
-        uint32_t targetPid)
+        uint32_t targetPid,
+        uint32_t grantedAccess = kProcessVmRead)
     {
         if (ownerPid == targetPid)
         {
@@ -286,13 +353,21 @@ namespace
         }
         if (IsSystemOwnerImage(ownerImage, ownerPid))
         {
-            return true;
+            const std::wstring ownerStem = ImageStem(ownerImage);
+            const bool writeOrDup =
+                (grantedAccess & (kProcessVmWrite | kProcessVmOperation | kProcessDupHandle)) != 0;
+            // svchost.exe is the usual impersonation name. QUERY/VM_READ from
+            // real hosts is expected; VM_WRITE/DUP is not.
+            if (!(ownerStem == L"svchost" && writeOrDup))
+            {
+                return true;
+            }
         }
         if (SameProcessImage(ownerImage, targetImage))
         {
             return true;
         }
-        return IsKnownOsHandlePair(ownerImage, targetImage);
+        return IsKnownOsHandlePair(ownerImage, targetImage, grantedAccess);
     }
 
     bool EnumerateKernelProcesses(
@@ -346,23 +421,68 @@ namespace
 
             uint32_t walked = 0;
             uint64_t current = flink;
+            std::unordered_set<uint64_t> visited;
+            visited.insert(listHead);
             while (current != 0 &&
                 current != listHead &&
                 IsKernelAddress(current) &&
                 walked < kMaxProcesses)
             {
                 ++walked;
-                uint64_t eprocess = current - linksField.Offset;
-                uint64_t pidValue = 0;
-                if (!ReadU64(device, eprocess + pidField.Offset, &pidValue))
+                if (!visited.insert(current).second)
                 {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(L"ActiveProcessLinks walk hit a cycle");
+                    }
+                    break;
+                }
+                if (current < linksField.Offset)
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(L"ActiveProcessLinks entry underflowed the list offset");
+                    }
+                    break;
+                }
+                uint64_t eprocess = current - linksField.Offset;
+                if (pidField.Offset > (~0ull - eprocess))
+                {
+                    break;
+                }
+                size_t pidWidth = sizeof(uint64_t);
+                if (pidField.Length > 0 && pidField.Length <= sizeof(uint64_t))
+                {
+                    pidWidth = static_cast<size_t>(pidField.Length);
+                }
+                std::vector<uint8_t> pidBytes;
+                if (!device.ReadMemory(
+                        eprocess + pidField.Offset,
+                        static_cast<uint32_t>(pidWidth),
+                        &pidBytes,
+                        nullptr) ||
+                    pidBytes.size() != pidWidth)
+                {
+                    break;
+                }
+                uint64_t pidValue = 0;
+                memcpy(&pidValue, pidBytes.data(), pidWidth);
+                if (pidValue > 0xFFFFFFFFull)
+                {
+                    if (warnings != nullptr)
+                    {
+                        warnings->push_back(
+                            L"ActiveProcessLinks UniqueProcessId was outside the 32-bit PID range");
+                    }
                     break;
                 }
 
                 ProcessIdentity identity = {};
                 identity.Pid = static_cast<uint32_t>(pidValue);
                 identity.Eprocess = eprocess;
-                if (imageField.Offset != 0 && imageField.Length >= 1)
+                if (imageField.Offset != 0 &&
+                    imageField.Length >= 1 &&
+                    imageField.Offset <= (~0ull - eprocess))
                 {
                     std::vector<uint8_t> nameBytes;
                     uint32_t nameLen = static_cast<uint32_t>(imageField.Length);
@@ -447,10 +567,26 @@ bool HandleTableScanner::Scan(
         EnumerateKernelProcesses(device_, symbols_, &processes, &result->Warnings);
         std::unordered_map<uint64_t, ProcessIdentity> byEprocess;
         std::unordered_map<uint32_t, ProcessIdentity> byPid;
+        bool duplicatePidWarned = false;
         for (const ProcessIdentity& process : processes)
         {
+            auto pidIt = byPid.find(process.Pid);
+            if (pidIt != byPid.end() &&
+                pidIt->second.Eprocess != 0 &&
+                pidIt->second.Eprocess != process.Eprocess)
+            {
+                if (!duplicatePidWarned)
+                {
+                    result->Warnings.push_back(
+                        L"ActiveProcessLinks contained a duplicate PID with a different EPROCESS");
+                    duplicatePidWarned = true;
+                }
+            }
             byEprocess[process.Eprocess] = process;
-            byPid[process.Pid] = process;
+            if (pidIt == byPid.end())
+            {
+                byPid[process.Pid] = process;
+            }
         }
 
         ULONG needed = 0;
@@ -523,7 +659,15 @@ bool HandleTableScanner::Scan(
         {
             const SystemHandleTableEntryEx& entry = table->Handles[index];
             HandleTableRecord record = {};
+            if (static_cast<uint64_t>(entry.UniqueProcessId) > 0xFFFFFFFFull)
+            {
+                continue;
+            }
             record.OwnerPid = static_cast<uint32_t>(entry.UniqueProcessId);
+            if (static_cast<uint64_t>(entry.HandleValue) > 0xFFFFFFFFull)
+            {
+                continue;
+            }
             record.HandleValue = static_cast<uint32_t>(entry.HandleValue);
             record.GrantedAccess = entry.GrantedAccess;
             record.ObjectTypeIndex = entry.ObjectTypeIndex;
@@ -575,7 +719,8 @@ bool HandleTableScanner::Scan(
                     record.OwnerImage,
                     record.OwnerPid,
                     record.TargetImage,
-                    record.TargetPid))
+                    record.TargetPid,
+                    record.GrantedAccess))
             {
                 record.Suspicious = true;
                 record.Notes = L"non-system process holds VM/DUP access to another process";
@@ -685,36 +830,73 @@ bool HandleTableAccessMaskSelfTest()
         }
         if (!IsSystemOwnerImage(L"csrss.exe", 500) ||
             !IsSystemOwnerImage(L"C:\\Windows\\System32\\lsass.exe", 500) ||
-            !IsSystemOwnerImage(L"winlogon.exe", 500) ||
+            IsSystemOwnerImage(L"winlogon.exe", 500) ||
             IsSystemOwnerImage(L"conhost.exe", 500) ||
             IsSystemOwnerImage(L"OpenConsole.exe", 500))
         {
             break;
         }
-        if (IsSystemOwnerImage(L"cheat.exe", 1234))
+        if (IsSystemOwnerImage(L"cheat.exe", 1234) ||
+            IsSystemOwnerImage(L"System", 1234) ||
+            !IsSystemOwnerImage(L"System", 4))
         {
             break;
         }
         if (!SameProcessImage(L"chrome.exe", L"chrome.exe") ||
             !SameProcessImage(L"nvcontainer.ex", L"nvcontainer.exe") ||
-            SameProcessImage(L"chrome.exe", L"notepad.exe"))
+            !SameProcessImage(L"RuntimeBroker.e", L"RuntimeBroker.exe") ||
+            SameProcessImage(L"chrome.exe", L"notepad.exe") ||
+            SameProcessImage(L"security", L"securityhealth.exe") ||
+            SameProcessImage(L"lsass.exe", L"lsass.exe.bak"))
         {
             break;
         }
         if (!IsExpectedVmDupHandle(L"chrome.exe", 10, L"chrome.exe", 11) ||
             !IsExpectedVmDupHandle(L"winlogon.exe", 10, L"dwm.exe", 11) ||
+            !IsExpectedVmDupHandle(L"winlogon.exe", 10, L"userinit.exe", 11) ||
+            IsExpectedVmDupHandle(L"winlogon.exe", 10, L"cheat.exe", 11) ||
+            IsExpectedVmDupHandle(L"nvxdll.exe", 10, L"rundll32.exe", 11) ||
             !IsExpectedVmDupHandle(L"nvcontainer.exe", 10, L"nvsphelper64.exe", 11) ||
             !IsExpectedVmDupHandle(L"nvcontainer.exe", 10, L"rundll32.exe", 11) ||
             !IsExpectedVmDupHandle(L"SearchIndexer.", 10, L"SearchFilterHo", 11) ||
+            !IsExpectedVmDupHandle(L"SearchIndexer.exe", 10, L"SearchFilterHos", 11) ||
+            !IsExpectedVmDupHandle(L"SearchIndexer.exe", 10, L"SearchProtocolH", 11) ||
             !IsExpectedVmDupHandle(L"OpenConsole.exe", 10, L"pwsh.exe", 11) ||
             !IsExpectedVmDupHandle(L"steam.exe", 10, L"steamwebhelper.exe", 11) ||
+            !IsExpectedVmDupHandle(L"ProtonVPN.exe", 10, L"ProtonVPN Service.exe", 11) ||
+            IsExpectedVmDupHandle(L"protonvp-hook.exe", 10, L"ProtonVPN.exe", 11) ||
+            IsExpectedVmDupHandle(L"notcopilot.exe", 10, L"msedgewebview2.exe", 11) ||
+            !IsExpectedVmDupHandle(L"svchost.exe", 10, L"notepad.exe", 11) ||
+            IsExpectedVmDupHandle(
+                L"svchost.exe",
+                10,
+                L"notepad.exe",
+                11,
+                kProcessVmWrite) ||
             IsExpectedVmDupHandle(L"cheat.exe", 10, L"lsass.exe", 11) ||
             IsExpectedVmDupHandle(L"nv.exe", 10, L"rundll32.exe", 11) ||
+            IsExpectedVmDupHandle(L"nvhook.exe", 10, L"rundll32.exe", 11) ||
+            IsExpectedVmDupHandle(L"nvhelper.exe", 10, L"rundll32.exe", 11) ||
+            !IsExpectedVmDupHandle(L"NVIDIA Overlay.exe", 10, L"rundll32.exe", 11) ||
             !IsExpectedVmDupHandle(L"OpenConsole.exe", 10, L"grok.exe", 11) ||
             !IsExpectedVmDupHandle(L"RuntimeBroker.exe", 10, L"LockApp.exe", 11) ||
             IsExpectedVmDupHandle(L"OpenConsole.exe", 10, L"lsass.exe", 11) ||
             IsExpectedVmDupHandle(L"conhost.exe", 10, L"lsass.exe", 11) ||
-            IsExpectedVmDupHandle(L"RuntimeBroker.exe", 10, L"lsass.exe", 11))
+            IsExpectedVmDupHandle(L"RuntimeBroker.exe", 10, L"lsass.exe", 11) ||
+            IsExpectedVmDupHandle(
+                L"OpenConsole.exe",
+                10,
+                L"grok.exe",
+                11,
+                kProcessVmWrite) ||
+            IsExpectedVmDupHandle(
+                L"RuntimeBroker.exe",
+                10,
+                L"LockApp.exe",
+                11,
+                kProcessVmWrite | kProcessDupHandle) ||
+            IsExpectedVmDupHandle(L"nvidiacheat.exe", 10, L"rundll32.exe", 11) ||
+            IsExpectedVmDupHandle(L"nvcontainercheat.exe", 10, L"rundll32.exe", 11))
         {
             break;
         }

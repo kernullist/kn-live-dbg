@@ -694,15 +694,14 @@ bool PeProbeLooksLikeImage(const PeHeaderProbe& probe, uint64_t containingSize)
         {
             break;
         }
-        if (probe.SizeOfImage < 0x1000ull ||
-            (probe.SizeOfImage & 0xfffull) != 0)
+        if (probe.SizeOfImage < 0x200ull ||
+            (probe.SizeOfImage & 0x1ffull) != 0)
         {
             break;
         }
-        if (containingSize != 0 && probe.SizeOfImage > containingSize)
-        {
-            break;
-        }
+        // SizeOfImage larger than the containing pool/page is still a staged
+        // image (raw .sys in a small NonPaged allocation). Do not drop it.
+        (void)containingSize;
         ok = true;
     } while (false);
 

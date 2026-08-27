@@ -601,7 +601,16 @@ namespace
 
     bool LooksLikeInlineUnloadedArrayHead(uint16_t length, uint16_t maximum, uint64_t buffer)
     {
-        return length > 0 && LeftoverLooksLikeUnicodeString(length, maximum, buffer);
+        if (length == 0)
+        {
+            // Empty first circular-log slot is valid. Reject the dummy-VA
+            // even-Length trap (maximum 0 / non-canonical Buffer).
+            return (maximum % 2) == 0 &&
+                maximum >= 2 &&
+                maximum <= kLeftoverMaxUnicodeBytes &&
+                (buffer == 0 || LeftoverIsKernelCanonical(buffer));
+        }
+        return LeftoverLooksLikeUnicodeString(length, maximum, buffer);
     }
 
     bool NameInRecordList(
@@ -1715,6 +1724,8 @@ bool MapperRemnantSelfTest()
             IsBrokenCircularFlink(0xFFFFF80000002000ull, 0xFFFFF80000001000ull) ||
             LooksLikeInlineUnloadedArrayHead(0, 0, 0xFFFFF80000001000ull) ||
             LooksLikeInlineUnloadedArrayHead(8, 8, 0x10) ||
+            LooksLikeInlineUnloadedArrayHead(0, 16, 0x10) ||
+            !LooksLikeInlineUnloadedArrayHead(0, 16, 0xFFFFF80000001000ull) ||
             !LooksLikeInlineUnloadedArrayHead(8, 16, 0xFFFFF80000001000ull))
         {
             ok = false;

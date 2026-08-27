@@ -190,6 +190,7 @@ struct DriverIntegrityOptions
 {
     std::wstring DriverFilter;
     uint32_t Limit = 0;
+    bool ExactName = false;
 };
 
 struct DriverIntegrityResult
@@ -253,7 +254,8 @@ public:
         bool includeDispatch,
         bool includeDevices,
         DriverObjectInspectResult* result,
-        std::wstring* error);
+        std::wstring* error,
+        bool exactName = false);
     bool InspectDeviceStack(uint64_t deviceObject, DeviceStackResult* result, std::wstring* error);
 
 private:
