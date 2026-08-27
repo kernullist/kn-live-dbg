@@ -66,3 +66,4 @@ private:
 };
 
 std::wstring BuildHiveJson(const HiveScanResult& result);
+bool HiveNtOwnershipSelfTest();

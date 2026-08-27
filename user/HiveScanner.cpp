@@ -29,7 +29,7 @@ namespace
         return true;
     }
 
-    std::wstring FindOwningModule(SymbolEngine& symbols, uint64_t address)
+    const KernelModuleInfo* FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
         for (const KernelModuleInfo& module : symbols.Modules())
         {
@@ -40,10 +40,15 @@ namespace
             }
             if (address >= module.Base && address < end)
             {
-                return module.ImageName;
+                return &module;
             }
         }
-        return std::wstring();
+        return nullptr;
+    }
+
+    std::wstring ModuleImageName(const KernelModuleInfo* module)
+    {
+        return module != nullptr ? module->ImageName : std::wstring();
     }
 
     std::wstring NearestSymbolText(SymbolEngine& symbols, uint64_t address)
@@ -64,13 +69,9 @@ namespace
         return stream.str();
     }
 
-    bool ModuleLooksLikeNt(const std::wstring& imageName)
+    std::wstring ToLowerCopy(const std::wstring& value)
     {
-        if (imageName.empty())
-        {
-            return false;
-        }
-        std::wstring lower = imageName;
+        std::wstring lower = value;
         for (wchar_t& ch : lower)
         {
             if (ch >= L'A' && ch <= L'Z')
@@ -78,8 +79,105 @@ namespace
                 ch = static_cast<wchar_t>(ch - L'A' + L'a');
             }
         }
-        return lower.find(L"ntoskrnl") != std::wstring::npos ||
-            lower.find(L"ntkrnl") != std::wstring::npos;
+        return lower;
+    }
+
+    std::wstring NormalizeKernelImagePath(const std::wstring& path)
+    {
+        std::wstring normalized = ToLowerCopy(path);
+        for (wchar_t& ch : normalized)
+        {
+            if (ch == L'/')
+            {
+                ch = L'\\';
+            }
+        }
+
+        while (normalized.size() >= 4 &&
+            (normalized.compare(0, 4, L"\\??\\") == 0 ||
+             normalized.compare(0, 4, L"\\\\?\\") == 0 ||
+             normalized.compare(0, 4, L"\\\\.\\") == 0))
+        {
+            normalized.erase(0, 4);
+        }
+
+        if (normalized.compare(0, 8, L"\\device\\") == 0)
+        {
+            const size_t slash = normalized.find(L'\\', 8);
+            if (slash != std::wstring::npos)
+            {
+                normalized = normalized.substr(slash);
+            }
+        }
+
+        if (normalized.compare(0, 11, L"\\systemroot") == 0)
+        {
+            normalized = std::wstring(L"\\windows") + normalized.substr(11);
+        }
+
+        return normalized;
+    }
+
+    bool PathLooksLikeInboxSystem32(const std::wstring& path)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (path.empty() || path.find_last_of(L"\\/") == std::wstring::npos)
+            {
+                matched = true;
+                break;
+            }
+
+            const std::wstring normalized = NormalizeKernelImagePath(path);
+            const std::wstring needle = L"\\windows\\system32\\";
+            if (normalized.size() >= 2 && normalized[1] == L':')
+            {
+                matched = normalized.compare(2, needle.size(), needle) == 0;
+                break;
+            }
+
+            matched = normalized.compare(0, needle.size(), needle) == 0;
+        } while (false);
+
+        return matched;
+    }
+
+    bool ModuleLooksLikeNt(const std::wstring& imageName, const std::wstring& imagePath = std::wstring())
+    {
+        bool inbox = false;
+
+        do
+        {
+            if (imageName.empty() && imagePath.empty())
+            {
+                break;
+            }
+
+            std::wstring lower = ToLowerCopy(imageName.empty() ? imagePath : imageName);
+            const size_t slash = lower.find_last_of(L"\\/");
+            if (slash != std::wstring::npos && slash + 1 < lower.size())
+            {
+                lower = lower.substr(slash + 1);
+            }
+
+            const bool inboxName =
+                lower == L"ntoskrnl.exe" ||
+                lower == L"ntkrnlmp.exe" ||
+                lower == L"ntkrnlpa.exe" ||
+                lower == L"ntkrnlup.exe" ||
+                lower == L"ntkrpamp.exe";
+            if (!inboxName)
+            {
+                break;
+            }
+
+            const std::wstring& pathForCheck = imagePath.empty() ? imageName : imagePath;
+            inbox = PathLooksLikeInboxSystem32(pathForCheck);
+        } while (false);
+
+        return inbox;
     }
 
     bool ResolveHiveListHead(SymbolEngine& symbols, uint64_t* address, std::wstring* matched)
@@ -399,15 +497,16 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
             else
             {
                 record.GetCellRoutine = getCell;
-                record.GetCellModule = FindOwningModule(symbols_, getCell);
+                const KernelModuleInfo* getCellOwner = FindOwningModule(symbols_, getCell);
+                record.GetCellModule = ModuleImageName(getCellOwner);
                 record.GetCellSymbol = NearestSymbolText(symbols_, getCell);
 
-                if (getCell == 0 || !IsKernelAddress(getCell) || record.GetCellModule.empty())
+                if (getCell == 0 || !IsKernelAddress(getCell) || getCellOwner == nullptr)
                 {
                     record.Suspicious = true;
                     record.Notes = L"GetCellRoutine outside loaded kernel modules";
                 }
-                else if (!ModuleLooksLikeNt(record.GetCellModule))
+                else if (!ModuleLooksLikeNt(getCellOwner->ImageName, getCellOwner->ImagePath))
                 {
                     record.Suspicious = true;
                     record.Notes = L"GetCellRoutine owned by non-nt module (" + record.GetCellModule + L")";
@@ -430,10 +529,12 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
                 {
                     record.HasReleaseCell = true;
                     record.ReleaseCellRoutine = releaseCell;
-                    record.ReleaseCellModule = FindOwningModule(symbols_, releaseCell);
+                    const KernelModuleInfo* releaseOwner = FindOwningModule(symbols_, releaseCell);
+                    record.ReleaseCellModule = ModuleImageName(releaseOwner);
                     record.ReleaseCellSymbol = NearestSymbolText(symbols_, releaseCell);
-                    if (!IsKernelAddress(releaseCell) || record.ReleaseCellModule.empty() ||
-                        !ModuleLooksLikeNt(record.ReleaseCellModule))
+                    if (!IsKernelAddress(releaseCell) ||
+                        releaseOwner == nullptr ||
+                        !ModuleLooksLikeNt(releaseOwner->ImageName, releaseOwner->ImagePath))
                     {
                         record.Suspicious = true;
                         if (!record.Notes.empty())
@@ -551,4 +652,31 @@ std::wstring BuildHiveJson(const HiveScanResult& result)
     }
     out += L"]}";
     return out;
+}
+
+bool HiveNtOwnershipSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        if (!ModuleLooksLikeNt(L"ntoskrnl.exe") ||
+            !ModuleLooksLikeNt(L"ntkrnlmp.exe") ||
+            !ModuleLooksLikeNt(L"ntoskrnl.exe", L"\\SystemRoot\\System32\\ntoskrnl.exe") ||
+            !ModuleLooksLikeNt(L"ntoskrnl.exe", L"C:\\Windows\\System32\\ntoskrnl.exe") ||
+            ModuleLooksLikeNt(L"ntoskrnl_hook.sys") ||
+            ModuleLooksLikeNt(L"ntoskrnl.exe", L"C:\\Temp\\ntoskrnl.exe") ||
+            ModuleLooksLikeNt(L"ntoskrnl.exe", L"\\SystemRoot\\Temp\\ntoskrnl.exe") ||
+            !ModuleLooksLikeNt(
+                L"ntoskrnl.exe",
+                L"\\\\?\\C:\\Windows\\System32\\ntoskrnl.exe") ||
+            ModuleLooksLikeNt(L"capcom.sys") ||
+            ModuleLooksLikeNt(L""))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
 }

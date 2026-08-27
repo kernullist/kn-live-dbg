@@ -54,6 +54,7 @@ namespace
     constexpr size_t kMaxDeepStackPointerSamplesPerProcess = 32768;
     constexpr uint64_t kMaxThreadStackScanBytes = 64ull * 1024ull;
     constexpr size_t kMaxBuiltinModuleProvenanceFindingsPerProcess = 8;
+    constexpr size_t kMaxInjectedModuleFindingsPerProcess = 8;
     constexpr size_t kMaxByovdMatchEvidence = 6;
     constexpr size_t kMaxDriverDispatchEvidence = 8;
     constexpr size_t kMaxTelemetryPayloadEvidence = 8;
@@ -216,6 +217,7 @@ namespace
         bool HasFileBasicIdentity = false;
         uint64_t ImageBase = 0;
         uint32_t EntryPointRva = 0;
+        uint32_t TimeDateStamp = 0;
         uint32_t FirstExecutableSectionRva = 0;
         uint32_t SizeOfHeaders = 0;
         uint32_t SizeOfImage = 0;
@@ -541,7 +543,15 @@ namespace
         size_t slash = normalized.find_last_of(L"\\/");
         if (slash != std::wstring::npos && slash + 1 < normalized.size())
         {
-            return normalized.substr(slash + 1);
+            normalized = normalized.substr(slash + 1);
+        }
+
+        // NT allows trailing space/dot names that Win32 tools collapse.
+        // "svchost.exe " must still match the builtin svchost profile.
+        while (!normalized.empty() &&
+            (normalized.back() == L' ' || normalized.back() == L'.'))
+        {
+            normalized.pop_back();
         }
 
         return normalized;
@@ -5156,6 +5166,367 @@ namespace
         return found;
     }
 
+    bool AddressInPrivateExecutableVad(const HuntProcessRecord& process, uint64_t address)
+    {
+        bool matched = false;
+
+        do
+        {
+            const ProcessVadRecord* vad = FindVadContaining(process, address);
+            if (vad == nullptr)
+            {
+                break;
+            }
+
+            matched = vad->Executable &&
+                vad->HasPrivateMemory &&
+                vad->PrivateMemory;
+        } while (false);
+
+        return matched;
+    }
+
+    bool IsCoreOsDllLeaf(const std::wstring& leaf)
+    {
+        return leaf == L"ntdll.dll" ||
+            leaf == L"kernel32.dll" ||
+            leaf == L"kernelbase.dll" ||
+            leaf == L"user32.dll" ||
+            leaf == L"gdi32.dll" ||
+            leaf == L"win32u.dll" ||
+            leaf == L"wow64.dll" ||
+            leaf == L"wow64cpu.dll" ||
+            leaf == L"wow64win.dll";
+    }
+
+    bool IsKernelCallbackTableHostLeaf(const std::wstring& leaf)
+    {
+        return leaf == L"user32.dll" ||
+            leaf == L"user32full.dll" ||
+            leaf == L"winsrv.dll" ||
+            leaf == L"csrsrv.dll" ||
+            leaf == L"wow64win.dll";
+    }
+
+    bool ParsePeIdentityStamp(
+        const std::vector<uint8_t>& bytes,
+        uint32_t* timeDateStamp,
+        uint32_t* sizeOfImage,
+        uint32_t* entryPointRva)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (timeDateStamp == nullptr ||
+                sizeOfImage == nullptr ||
+                entryPointRva == nullptr ||
+                bytes.size() < sizeof(IMAGE_DOS_HEADER) + sizeof(uint32_t) +
+                    sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t))
+            {
+                break;
+            }
+
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, bytes.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE)
+            {
+                break;
+            }
+
+            const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
+            if (ntOffset < sizeof(IMAGE_DOS_HEADER) ||
+                static_cast<uint64_t>(ntOffset) + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t) >
+                    bytes.size())
+            {
+                break;
+            }
+
+            uint32_t signature = 0;
+            std::memcpy(&signature, bytes.data() + ntOffset, sizeof(signature));
+            if (signature != IMAGE_NT_SIGNATURE)
+            {
+                break;
+            }
+
+            IMAGE_FILE_HEADER fileHeader = {};
+            std::memcpy(
+                &fileHeader,
+                bytes.data() + ntOffset + sizeof(uint32_t),
+                sizeof(fileHeader));
+            *timeDateStamp = fileHeader.TimeDateStamp;
+
+            const size_t optionalOffset =
+                static_cast<size_t>(ntOffset) + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
+            uint16_t magic = 0;
+            std::memcpy(&magic, bytes.data() + optionalOffset, sizeof(magic));
+            if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            {
+                if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER64, SizeOfImage) + sizeof(uint32_t) >
+                    bytes.size())
+                {
+                    break;
+                }
+                IMAGE_OPTIONAL_HEADER64 optional = {};
+                std::memcpy(
+                    &optional,
+                    bytes.data() + optionalOffset,
+                    (std::min)(bytes.size() - optionalOffset, sizeof(optional)));
+                *sizeOfImage = optional.SizeOfImage;
+                *entryPointRva = optional.AddressOfEntryPoint;
+            }
+            else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+            {
+                if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER32, SizeOfImage) + sizeof(uint32_t) >
+                    bytes.size())
+                {
+                    break;
+                }
+                IMAGE_OPTIONAL_HEADER32 optional = {};
+                std::memcpy(
+                    &optional,
+                    bytes.data() + optionalOffset,
+                    (std::min)(bytes.size() - optionalOffset, sizeof(optional)));
+                *sizeOfImage = optional.SizeOfImage;
+                *entryPointRva = optional.AddressOfEntryPoint;
+            }
+            else
+            {
+                break;
+            }
+
+            ok = *sizeOfImage != 0;
+        } while (false);
+
+        return ok;
+    }
+
+    bool PeIdentityStampsDiffer(
+        uint32_t diskStamp,
+        uint32_t diskSize,
+        uint32_t diskEntry,
+        uint32_t liveStamp,
+        uint32_t liveSize,
+        uint32_t liveEntry)
+    {
+        return diskStamp != liveStamp ||
+            diskSize != liveSize ||
+            diskEntry != liveEntry;
+    }
+
+    bool ProcessLooksLikeJitHost(const HuntProcessRecord& process)
+    {
+        bool jit = false;
+
+        do
+        {
+            std::wstring image = LeafName(process.ApiImagePath);
+            if (image.empty())
+            {
+                image = LeafName(process.PebImagePath);
+            }
+            if (image.empty())
+            {
+                image = LeafName(process.KernelImageName);
+            }
+            if (image.empty())
+            {
+                image = LeafName(process.ToolhelpImageName);
+            }
+            if (image == L"chrome.exe" ||
+                image == L"msedge.exe" ||
+                image == L"msedgewebview2.exe" ||
+                image == L"firefox.exe" ||
+                image == L"brave.exe" ||
+                image == L"powershell.exe" ||
+                image == L"pwsh.exe" ||
+                image == L"dotnet.exe" ||
+                image == L"w3wp.exe" ||
+                image == L"jsc.exe")
+            {
+                jit = true;
+                break;
+            }
+
+            for (const HuntModuleRecord& module : process.Modules)
+            {
+                const std::wstring leaf = LeafName(module.Name.empty() ? module.Path : module.Name);
+                if (leaf == L"coreclr.dll" ||
+                    leaf == L"clr.dll" ||
+                    leaf == L"clrjit.dll" ||
+                    leaf == L"mscorjit.dll" ||
+                    leaf == L"jscript9.dll" ||
+                    leaf == L"chakra.dll" ||
+                    leaf == L"chrome_elf.dll" ||
+                    leaf == L"mono.dll" ||
+                    leaf == L"mono-2.0-sgen.dll" ||
+                    leaf == L"lua.dll" ||
+                    leaf == L"lua51.dll" ||
+                    leaf == L"lua5.1.dll" ||
+                    leaf == L"lua52.dll" ||
+                    leaf == L"lua5.2.dll" ||
+                    leaf == L"lua53.dll" ||
+                    leaf == L"lua5.3.dll" ||
+                    leaf == L"lua54.dll" ||
+                    leaf == L"lua5.4.dll" ||
+                    leaf == L"luajit.dll" ||
+                    leaf == L"luajit-5.1.dll")
+                {
+                    jit = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return jit;
+    }
+
+    bool DecodeUserTrampolineTarget(
+        const uint8_t* bytes,
+        size_t length,
+        uint64_t ip,
+        uint64_t* target,
+        uint64_t* indirectSlot)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (bytes == nullptr || target == nullptr || length < 5)
+            {
+                break;
+            }
+            if (indirectSlot != nullptr)
+            {
+                *indirectSlot = 0;
+            }
+            *target = 0;
+
+            if (bytes[0] == 0xE9)
+            {
+                int32_t rel = 0;
+                std::memcpy(&rel, bytes + 1, sizeof(rel));
+                *target = ip + 5 + static_cast<int64_t>(rel);
+                ok = true;
+                break;
+            }
+
+            if (length >= 6 && bytes[0] == 0xFF && bytes[1] == 0x25)
+            {
+                int32_t disp = 0;
+                std::memcpy(&disp, bytes + 2, sizeof(disp));
+                const uint64_t slot = ip + 6 + static_cast<int64_t>(disp);
+                if (indirectSlot != nullptr)
+                {
+                    *indirectSlot = slot;
+                }
+                ok = true;
+                break;
+            }
+
+            if (length >= 12 &&
+                bytes[0] == 0x48 &&
+                bytes[1] == 0xB8 &&
+                (bytes[10] == 0xFF && (bytes[11] == 0xE0 || bytes[11] == 0xD0)))
+            {
+                std::memcpy(target, bytes + 2, sizeof(uint64_t));
+                ok = true;
+                break;
+            }
+
+            // Wow64 / x86: mov eax, imm32; jmp/call eax
+            if (length >= 7 &&
+                bytes[0] == 0xB8 &&
+                bytes[5] == 0xFF &&
+                (bytes[6] == 0xE0 || bytes[6] == 0xD0))
+            {
+                uint32_t eax = 0;
+                std::memcpy(&eax, bytes + 1, sizeof(eax));
+                *target = eax;
+                ok = true;
+                break;
+            }
+        } while (false);
+
+        return ok;
+    }
+
+    bool LooksLikeDirectSyscallStub(const uint8_t* bytes, size_t length)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (bytes == nullptr || length < 2)
+            {
+                break;
+            }
+
+            for (size_t index = 0; index + 1 < length; ++index)
+            {
+                if (bytes[index] != 0x0F || bytes[index + 1] != 0x05)
+                {
+                    continue;
+                }
+
+                const size_t windowStart = index > 16 ? index - 16 : 0;
+                bool hasMovR10Rcx = false;
+                for (size_t look = windowStart; look + 2 < index; ++look)
+                {
+                    if (bytes[look] == 0x4C &&
+                        bytes[look + 1] == 0x8B &&
+                        bytes[look + 2] == 0xD1)
+                    {
+                        hasMovR10Rcx = true;
+                        break;
+                    }
+                }
+                if (hasMovR10Rcx)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool HardwareBreakpointEnabled(uint64_t dr7, uint32_t index)
+    {
+        if (index > 3)
+        {
+            return false;
+        }
+        const uint64_t localBit = 1ull << (index * 2);
+        const uint64_t globalBit = 1ull << (index * 2 + 1);
+        return (dr7 & (localBit | globalBit)) != 0;
+    }
+
+    bool ReadKernelU64(DeviceClient& device, uint64_t address, uint64_t* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr)
+            {
+                break;
+            }
+            std::vector<uint8_t> bytes;
+            std::wstring ignored;
+            if (!device.ReadMemory(address, sizeof(uint64_t), &bytes, &ignored) ||
+                bytes.size() != sizeof(uint64_t))
+            {
+                break;
+            }
+            std::memcpy(value, bytes.data(), sizeof(uint64_t));
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     bool ReadFileBytesAt(HANDLE file, uint64_t offset, uint32_t length, std::vector<uint8_t>* bytes)
     {
         bool ok = false;
@@ -6319,6 +6690,7 @@ namespace
                 &fileHeader,
                 header.data() + ntOffset + sizeof(uint32_t),
                 sizeof(fileHeader));
+            metadata->TimeDateStamp = fileHeader.TimeDateStamp;
             const uint16_t numberOfSections = fileHeader.NumberOfSections;
             const uint16_t optionalHeaderSize = fileHeader.SizeOfOptionalHeader;
             size_t optionalOffset = ntOffset + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
@@ -9284,6 +9656,56 @@ namespace
         } while (false);
     }
 
+    bool CommandLineHasStandaloneSwitch(const std::wstring& commandLine, const wchar_t* token)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (token == nullptr || *token == L'\0')
+            {
+                break;
+            }
+
+            const size_t tokenLength = std::wcslen(token);
+            if (tokenLength == 0 || commandLine.size() < tokenLength)
+            {
+                break;
+            }
+
+            size_t pos = 0;
+            while (pos + tokenLength <= commandLine.size())
+            {
+                const size_t found = commandLine.find(token, pos);
+                if (found == std::wstring::npos)
+                {
+                    break;
+                }
+
+                const bool startOk =
+                    found == 0 ||
+                    commandLine[found - 1] == L' ' ||
+                    commandLine[found - 1] == L'\t' ||
+                    commandLine[found - 1] == L'"';
+                const size_t end = found + tokenLength;
+                const bool endOk =
+                    end == commandLine.size() ||
+                    commandLine[end] == L' ' ||
+                    commandLine[end] == L'\t' ||
+                    commandLine[end] == L'"';
+                if (startOk && endOk)
+                {
+                    matched = true;
+                    break;
+                }
+
+                pos = found + 1;
+            }
+        } while (false);
+
+        return matched;
+    }
+
     std::vector<std::wstring> ExpectedPathsForBuiltinProfile(
         const BuiltinProcessProfile& profile,
         const std::wstring& leaf)
@@ -9385,9 +9807,7 @@ namespace
                 !process->PebCommandLine.empty())
             {
                 std::wstring commandLine = HuntToLower(process->PebCommandLine);
-                if (commandLine.find(L" -k ") == std::wstring::npos &&
-                    commandLine.find(L" -k") == std::wstring::npos &&
-                    commandLine.find(L"\t-k") == std::wstring::npos)
+                if (!CommandLineHasStandaloneSwitch(commandLine, L"-k"))
                 {
                     AddUnique(&process->BuiltinProfileViolations, L"command_line_mismatch");
                 }
@@ -19429,6 +19849,156 @@ namespace
             : apc.KernelRoutineModule;
     }
 
+    bool ModuleLooksLikeKnownUserOverlay(const std::wstring& leaf)
+    {
+        return leaf.find(L"overlay") != std::wstring::npos ||
+            leaf.find(L"discordhook") != std::wstring::npos ||
+            leaf.find(L"discord_hook") != std::wstring::npos ||
+            leaf == L"rtsshooks.dll" ||
+            leaf == L"rtsshooks64.dll";
+    }
+
+    bool ProcessHasNonOverlayForeignModule(const HuntProcessRecord& process)
+    {
+        bool found = false;
+
+        do
+        {
+            const std::wstring imagePath = BestProcessImagePath(process);
+            std::wstring imageDirectory;
+            const size_t slash = imagePath.find_last_of(L"\\/");
+            if (slash != std::wstring::npos && slash > 0)
+            {
+                imageDirectory = imagePath.substr(0, slash);
+            }
+
+            for (const HuntModuleRecord& module : process.Modules)
+            {
+                if (module.Base == 0 ||
+                    module.Path.empty() ||
+                    !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)))
+                {
+                    continue;
+                }
+                if (process.HasPebImageBase && module.Base == process.PebImageBase)
+                {
+                    continue;
+                }
+                if (!imagePath.empty() && SameCanonicalPath(imagePath, module.Path))
+                {
+                    continue;
+                }
+                if (IsWindowsBackedModulePath(module.Path) &&
+                    !BindFilterPathIsUserControlledShape(module.Path))
+                {
+                    continue;
+                }
+                if (!imageDirectory.empty() &&
+                    CanonicalPathUnderDirectory(module.Path, imageDirectory))
+                {
+                    continue;
+                }
+
+                const std::wstring leaf = LeafName(module.Name.empty() ? module.Path : module.Name);
+                if (ModuleLooksLikeKnownUserOverlay(leaf))
+                {
+                    continue;
+                }
+
+                found = true;
+                break;
+            }
+        } while (false);
+
+        return found;
+    }
+
+    bool RemoteLoaderFindingIsWarranted(const HuntProcessRecord& process)
+    {
+        return ShouldAuditBuiltinModuleProvenance(process) ||
+            ProcessHasNonOverlayForeignModule(process);
+    }
+
+    bool IsConsoleSubsystemHost(const HuntProcessRecord& process)
+    {
+        const std::wstring leaf = LeafName(BestProcessImageName(process));
+        return leaf == L"conhost.exe" ||
+            leaf == L"openconsole.exe" ||
+            leaf == L"windowsterminal.exe" ||
+            leaf == L"csrss.exe";
+    }
+
+    bool ModuleLeafIsKernel32Family(const std::wstring& moduleName)
+    {
+        const std::wstring leaf = LeafName(moduleName);
+        return leaf == L"kernel32.dll" ||
+            leaf == L"kernelbase.dll";
+    }
+
+    bool ThreadStartLooksLikeRemoteLoader(const ProcessThreadRecord& thread)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (!thread.HasWin32StartAddress ||
+                thread.Win32StartAddress == 0 ||
+                thread.Win32StartModule.empty())
+            {
+                break;
+            }
+
+            matched = ModuleLeafIsKernel32Family(thread.Win32StartModule);
+        } while (false);
+
+        return matched;
+    }
+
+    bool ApcLooksLikeRemoteLoader(const ProcessApcEntryRecord& apc)
+    {
+        return ModuleLeafIsKernel32Family(apc.UserRoutineModule) ||
+            ModuleLeafIsKernel32Family(apc.NormalRoutineModule);
+    }
+
+    bool IsKnownInboxDllSideloadLeaf(const std::wstring& leaf)
+    {
+        static const wchar_t* kNames[] =
+        {
+            L"version.dll",
+            L"dwmapi.dll",
+            L"winmm.dll",
+            L"wininet.dll",
+            L"winhttp.dll",
+            L"msimg32.dll",
+            L"uxtheme.dll",
+            L"cryptbase.dll",
+            L"iphlpapi.dll",
+            L"wtsapi32.dll",
+            L"ntmarta.dll",
+            L"profapi.dll",
+            L"lp.dll",
+            L"usp10.dll",
+            L"urlmon.dll",
+            L"shlwapi.dll",
+            L"oleacc.dll",
+            L"midimap.dll",
+            L"ksuser.dll",
+            L"mpr.dll",
+            L"netapi32.dll",
+            L"textshaping.dll"
+        };
+
+        for (const wchar_t* name : kNames)
+        {
+            if (leaf == name)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void AddThreadFindings(HuntResult* result, const HuntProcessRecord& process)
     {
         do
@@ -19439,8 +20009,83 @@ namespace
             }
 
             size_t stackReferenceFindings = 0;
+            size_t remoteLoaderApcFindings = 0;
+            const bool skipRemoteLoaderHost = IsConsoleSubsystemHost(process);
             for (const ProcessThreadRecord& thread : process.ThreadRecords)
             {
+                if (!skipRemoteLoaderHost &&
+                    ThreadStartLooksLikeRemoteLoader(thread) &&
+                    RemoteLoaderFindingIsWarranted(process))
+                {
+                    uint64_t findingAddress = thread.Win32StartAddress;
+                    std::map<std::wstring, std::wstring> evidence;
+                    evidence[L"ethread"] = HuntHex(thread.Ethread, 16);
+                    evidence[L"tid"] = std::to_wstring(thread.ThreadId);
+                    evidence[L"start"] = HuntHex(thread.StartAddress, 16);
+                    evidence[L"win32_start"] = HuntHex(thread.Win32StartAddress, 16);
+                    evidence[L"start_module"] = thread.StartModule;
+                    evidence[L"win32_start_module"] = thread.Win32StartModule;
+                    evidence[L"notes"] = thread.Notes;
+
+                    std::vector<std::wstring> reasons = {L"remote_loadlibrary_thread"};
+                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, true);
+                    AddFinding(
+                        result,
+                        process,
+                        L"high",
+                        L"medium",
+                        L"process_injection",
+                        L"thread Win32 start is in kernel32/kernelbase (classic remote LoadLibrary injection)",
+                        findingAddress,
+                        thread.Win32StartModule,
+                        reasons,
+                        evidence);
+                }
+
+                if (!skipRemoteLoaderHost)
+                {
+                    for (const ProcessApcQueueRecord& queue : thread.ApcQueues)
+                    {
+                        for (const ProcessApcEntryRecord& apc : queue.Entries)
+                        {
+                            if (remoteLoaderApcFindings >= 4)
+                            {
+                                break;
+                            }
+                            if (!ApcLooksLikeRemoteLoader(apc) ||
+                                !RemoteLoaderFindingIsWarranted(process))
+                            {
+                                continue;
+                            }
+
+                            std::map<std::wstring, std::wstring> evidence;
+                            evidence[L"ethread"] = HuntHex(thread.Ethread, 16);
+                            evidence[L"tid"] = std::to_wstring(thread.ThreadId);
+                            evidence[L"user_routine"] = HuntHex(apc.UserRoutine, 16);
+                            evidence[L"normal_routine"] = HuntHex(apc.NormalRoutine, 16);
+                            evidence[L"user_routine_module"] = apc.UserRoutineModule;
+                            evidence[L"normal_routine_module"] = apc.NormalRoutineModule;
+
+                            std::vector<std::wstring> reasons = {L"remote_loadlibrary_apc"};
+                            AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, true);
+                            AddFinding(
+                                result,
+                                process,
+                                L"high",
+                                L"medium",
+                                L"process_injection",
+                                L"queued APC routine lands in kernel32/kernelbase (threadless LoadLibrary injection)",
+                                apc.UserRoutine != 0 ? apc.UserRoutine : apc.NormalRoutine,
+                                !apc.UserRoutineModule.empty()
+                                    ? apc.UserRoutineModule
+                                    : apc.NormalRoutineModule,
+                                reasons,
+                                evidence);
+                            ++remoteLoaderApcFindings;
+                        }
+                    }
+                }
+
                 if (thread.SuspiciousStart)
                 {
                     uint64_t findingAddress = thread.HasWin32StartAddress && thread.Win32StartAddress != 0
@@ -19556,20 +20201,31 @@ namespace
                     bool identityCorroborated =
                         process.BuiltinProfileMatched &&
                         !process.BuiltinProfileViolations.empty();
-                    if (!strongStackEvidence && !identityCorroborated)
+                    bool waitingThreadHijack =
+                        ref.ValueInPrivateExecVad &&
+                        ref.ValueOutsideUserModules &&
+                        !ProcessLooksLikeJitHost(process);
+                    if (!strongStackEvidence && !identityCorroborated && !waitingThreadHijack)
                     {
                         // Preserve the raw stack-reference record and counters,
                         // but a pointer to ordinary JIT/dynamic code is not an
                         // anomaly without stronger provenance.
                         continue;
                     }
+                    if (waitingThreadHijack)
+                    {
+                        AddUnique(&reasons, L"waiting_thread_hijack");
+                    }
                     AddBuiltinInjectionReasonIfNeeded(
                         process,
                         &reasons,
                         &evidence,
-                        strongStackEvidence || identityCorroborated);
+                        strongStackEvidence || identityCorroborated || waitingThreadHijack);
 
-                    std::wstring risk = strongStackEvidence || identityCorroborated ? L"high" : L"low";
+                    std::wstring risk =
+                        strongStackEvidence || identityCorroborated || waitingThreadHijack
+                            ? L"high"
+                            : L"low";
                     std::wstring confidence = strongStackEvidence ? L"high" : L"medium";
                     AddFinding(
                         result,
@@ -19964,6 +20620,41 @@ namespace
         return isMain;
     }
 
+    bool ModuleLooksLikeProcessMainImage(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module)
+    {
+        bool isMain = false;
+
+        do
+        {
+            if (process.HasPebImageBase && module.Base == process.PebImageBase)
+            {
+                isMain = true;
+                break;
+            }
+
+            const std::wstring imagePath = BestProcessImagePath(process);
+            if (!imagePath.empty() &&
+                !module.Path.empty() &&
+                SameCanonicalPath(imagePath, module.Path))
+            {
+                isMain = true;
+                break;
+            }
+
+            // Without a resolved image path, keep the looser leaf match so the
+            // real main image is not reported as injected.
+            if (imagePath.empty() && IsMainImageModule(process, module))
+            {
+                isMain = true;
+                break;
+            }
+        } while (false);
+
+        return isMain;
+    }
+
     void AddBuiltinModuleProvenanceFindings(HuntResult* result, const HuntProcessRecord& process)
     {
         do
@@ -19985,7 +20676,7 @@ namespace
                 if (module.Base == 0 ||
                     module.Size == 0 ||
                     module.Path.empty() ||
-                    IsMainImageModule(process, module) ||
+                    ModuleLooksLikeProcessMainImage(process, module) ||
                     !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)) ||
                     IsWindowsBackedModulePath(module.Path) ||
                     IsTrustedMicrosoftWindowsAppRuntimeModule(
@@ -20017,13 +20708,40 @@ namespace
                 bool builtinProfileViolated =
                     process.BuiltinProfileMatched &&
                     !process.BuiltinProfileViolations.empty();
-                AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, builtinProfileViolated);
+                bool userWritablePath = BindFilterPathIsUserControlledShape(module.Path);
+                const std::wstring verifyPath =
+                    DosPathFromDevicePath(
+                        Win32FilePathFromMaybeNtPath(module.Path));
+                ImageMetadataRecord metadata = {};
+                const bool signatureValid =
+                    !verifyPath.empty() &&
+                    VerifyImageAuthenticodeSignature(verifyPath, &metadata) &&
+                    metadata.SignatureChecked &&
+                    metadata.SignatureValid;
+                const bool unsignedModule = !signatureValid;
+                evidence[L"signature_valid"] = signatureValid ? L"true" : L"false";
+                evidence[L"user_writable_path"] = userWritablePath ? L"true" : L"false";
+                const bool elevate =
+                    builtinProfileViolated || unsignedModule;
+                AddBuiltinInjectionReasonIfNeeded(
+                    process,
+                    &reasons,
+                    &evidence,
+                    elevate);
+                if (unsignedModule)
+                {
+                    AddUnique(&reasons, L"unsigned_foreign_module");
+                }
+                if (unsignedModule && userWritablePath)
+                {
+                    AddUnique(&reasons, L"injected_module_user_path");
+                }
 
                 AddFinding(
                     result,
                     process,
-                    builtinProfileViolated ? L"high" : L"low",
-                    builtinProfileViolated ? L"medium" : L"low",
+                    elevate ? L"high" : L"low",
+                    elevate ? L"medium" : L"low",
                     L"builtin_module_provenance",
                     L"built-in Windows process loaded a module from a non-Windows path",
                     module.Base,
@@ -20032,6 +20750,1169 @@ namespace
                     evidence);
                 ++findings;
             }
+        } while (false);
+    }
+
+    std::wstring PathDirectoryName(const std::wstring& path)
+    {
+        std::wstring directory;
+
+        do
+        {
+            const size_t slash = path.find_last_of(L"\\/");
+            if (slash == std::wstring::npos || slash == 0)
+            {
+                break;
+            }
+
+            directory = path.substr(0, slash);
+        } while (false);
+
+        return directory;
+    }
+
+    bool ModulePathBelongsToProcessImage(
+        const HuntProcessRecord& process,
+        const std::wstring& modulePath)
+    {
+        bool belongs = false;
+
+        do
+        {
+            const std::wstring imagePath = BestProcessImagePath(process);
+            if (imagePath.empty() || modulePath.empty())
+            {
+                break;
+            }
+
+            const std::wstring imageDirectory = PathDirectoryName(imagePath);
+            if (imageDirectory.empty())
+            {
+                break;
+            }
+
+            belongs = CanonicalPathUnderDirectory(modulePath, imageDirectory);
+        } while (false);
+
+        return belongs;
+    }
+
+    bool ThreadStartLandsInModule(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module)
+    {
+        bool lands = false;
+
+        do
+        {
+            if (module.Base == 0 || module.Size == 0)
+            {
+                break;
+            }
+
+            for (const ProcessThreadRecord& thread : process.ThreadRecords)
+            {
+                if (AddressInsideModule(module, thread.StartAddress) ||
+                    (thread.HasWin32StartAddress &&
+                     AddressInsideModule(module, thread.Win32StartAddress)))
+                {
+                    lands = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return lands;
+    }
+
+    bool ModuleLooksLikeInjectedImage(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module,
+        bool signatureValid)
+    {
+        bool injected = false;
+
+        do
+        {
+            if (module.Base == 0 ||
+                module.Size == 0 ||
+                module.Path.empty() ||
+                ModuleLooksLikeProcessMainImage(process, module) ||
+                !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)))
+            {
+                break;
+            }
+
+            const bool userWritable = BindFilterPathIsUserControlledShape(module.Path);
+            if (IsWindowsBackedModulePath(module.Path) && !userWritable)
+            {
+                break;
+            }
+            if (IsTrustedMicrosoftWindowsAppRuntimeModule(module.Path))
+            {
+                break;
+            }
+            if (ModulePathBelongsToProcessImage(process, module.Path))
+            {
+                break;
+            }
+
+            injected = !signatureValid ||
+                ShouldAuditBuiltinModuleProvenance(process) ||
+                ThreadStartLandsInModule(process, module);
+        } while (false);
+
+        return injected;
+    }
+
+    void AddInjectedModuleFindings(HuntResult* result, const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr || process.ProcessId <= 4)
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            for (const HuntModuleRecord& module : process.Modules)
+            {
+                if (findings >= kMaxInjectedModuleFindingsPerProcess)
+                {
+                    AddUnique(
+                        &result->Warnings,
+                        L"injected-module findings were capped for pid " +
+                            std::to_wstring(process.ProcessId));
+                    break;
+                }
+
+                if (ShouldAuditBuiltinModuleProvenance(process) &&
+                    !IsWindowsBackedModulePath(module.Path))
+                {
+                    continue;
+                }
+                if (!ModuleLooksLikeInjectedImage(process, module, false))
+                {
+                    continue;
+                }
+
+                const std::wstring verifyPath =
+                    DosPathFromDevicePath(
+                        Win32FilePathFromMaybeNtPath(module.Path));
+                ImageMetadataRecord metadata = {};
+                const bool signatureChecked =
+                    !verifyPath.empty() &&
+                    VerifyImageAuthenticodeSignature(verifyPath, &metadata) &&
+                    metadata.SignatureChecked;
+                const bool signatureValid =
+                    signatureChecked && metadata.SignatureValid;
+                if (!ModuleLooksLikeInjectedImage(process, module, signatureValid))
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"module_base"] = HuntHex(module.Base, 16);
+                evidence[L"module_size"] = std::to_wstring(module.Size);
+                evidence[L"module_name"] = module.Name;
+                evidence[L"module_path"] = module.Path;
+                evidence[L"process_image_path"] = BestProcessImagePath(process);
+                evidence[L"signature_checked"] = signatureChecked ? L"true" : L"false";
+                evidence[L"signature_valid"] = signatureValid ? L"true" : L"false";
+                evidence[L"user_writable_path"] =
+                    BindFilterPathIsUserControlledShape(module.Path) ? L"true" : L"false";
+                evidence[L"thread_start_in_module"] =
+                    ThreadStartLandsInModule(process, module) ? L"true" : L"false";
+
+                std::vector<std::wstring> reasons = {L"injected_foreign_module"};
+                if (!signatureValid)
+                {
+                    AddUnique(&reasons, L"unsigned_foreign_module");
+                }
+                if (BindFilterPathIsUserControlledShape(module.Path))
+                {
+                    AddUnique(&reasons, L"injected_module_user_path");
+                }
+                if (ThreadStartLandsInModule(process, module))
+                {
+                    AddUnique(&reasons, L"thread_start_in_foreign_module");
+                }
+                if (process.BuiltinProfileMatched)
+                {
+                    AddUnique(&reasons, L"dll_load_in_builtin_process");
+                    AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, true);
+                }
+
+                const bool high =
+                    !signatureValid ||
+                    BindFilterPathIsUserControlledShape(module.Path) ||
+                    ThreadStartLandsInModule(process, module) ||
+                    (process.BuiltinProfileMatched &&
+                     !process.BuiltinProfileViolations.empty());
+                AddFinding(
+                    result,
+                    process,
+                    high ? L"high" : L"medium",
+                    signatureChecked ? L"medium" : L"low",
+                    L"process_injection",
+                    L"process loaded a foreign module outside its image directory",
+                    module.Base,
+                    module.Name,
+                    reasons,
+                    evidence);
+                ++findings;
+            }
+        } while (false);
+    }
+
+    bool ModuleLooksLikeInboxSideload(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module,
+        bool signatureValid)
+    {
+        bool sideload = false;
+
+        do
+        {
+            if (signatureValid ||
+                module.Path.empty() ||
+                module.Base == 0 ||
+                ModuleLooksLikeProcessMainImage(process, module) ||
+                !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)))
+            {
+                break;
+            }
+
+            if (!ModulePathBelongsToProcessImage(process, module.Path))
+            {
+                break;
+            }
+
+            if (IsWindowsBackedModulePath(module.Path) &&
+                !BindFilterPathIsUserControlledShape(module.Path))
+            {
+                break;
+            }
+
+            sideload = IsKnownInboxDllSideloadLeaf(LeafName(module.Path.empty() ? module.Name : module.Path));
+        } while (false);
+
+        return sideload;
+    }
+
+    void AddSideloadModuleFindings(HuntResult* result, const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr || process.ProcessId <= 4)
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            for (const HuntModuleRecord& module : process.Modules)
+            {
+                if (findings >= kMaxInjectedModuleFindingsPerProcess)
+                {
+                    AddUnique(
+                        &result->Warnings,
+                        L"sideload-module findings were capped for pid " +
+                            std::to_wstring(process.ProcessId));
+                    break;
+                }
+
+                if (!ModuleLooksLikeInboxSideload(process, module, false))
+                {
+                    continue;
+                }
+
+                const std::wstring verifyPath =
+                    DosPathFromDevicePath(
+                        Win32FilePathFromMaybeNtPath(module.Path));
+                ImageMetadataRecord metadata = {};
+                const bool signatureValid =
+                    !verifyPath.empty() &&
+                    VerifyImageAuthenticodeSignature(verifyPath, &metadata) &&
+                    metadata.SignatureChecked &&
+                    metadata.SignatureValid;
+                if (!ModuleLooksLikeInboxSideload(process, module, signatureValid))
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"module_base"] = HuntHex(module.Base, 16);
+                evidence[L"module_name"] = module.Name;
+                evidence[L"module_path"] = module.Path;
+                evidence[L"process_image_path"] = BestProcessImagePath(process);
+                evidence[L"signature_valid"] = L"false";
+
+                std::vector<std::wstring> reasons = {L"inbox_dll_sideload"};
+                AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, true);
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_injection",
+                    L"process loaded an unsigned copy of a Windows DLL from its own directory",
+                    module.Base,
+                    module.Name,
+                    reasons,
+                    evidence);
+                ++findings;
+            }
+        } while (false);
+    }
+
+    void AddCoreOsDllPathFindings(HuntResult* result, const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr || process.ProcessId <= 4)
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            for (const HuntModuleRecord& module : process.Modules)
+            {
+                if (findings >= kMaxInjectedModuleFindingsPerProcess)
+                {
+                    break;
+                }
+                if (!(module.ToolhelpSeen || ModuleHasCoreLdrView(module)) ||
+                    module.Path.empty())
+                {
+                    continue;
+                }
+
+                const std::wstring leaf = LeafName(module.Path.empty() ? module.Name : module.Path);
+                if (!IsCoreOsDllLeaf(leaf))
+                {
+                    continue;
+                }
+                if (IsWindowsBackedModulePath(module.Path))
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"module_name"] = module.Name;
+                evidence[L"module_path"] = module.Path;
+                evidence[L"module_base"] = HuntHex(module.Base, 16);
+                std::vector<std::wstring> reasons = {L"core_os_dll_non_windows_path"};
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"high",
+                    L"process_masquerade",
+                    L"core OS DLL is mapped from a non-Windows path",
+                    module.Base,
+                    module.Name,
+                    reasons,
+                    evidence);
+                ++findings;
+            }
+        } while (false);
+    }
+
+    void AddKernelCallbackTableFindings(
+        DeviceClient& device,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                !process.Kernel.HasPeb ||
+                process.Kernel.Peb == 0 ||
+                process.Modules.empty() ||
+                IsConsoleSubsystemHost(process) ||
+                !(process.PebLdrEnumerated || process.ToolhelpModuleEnumerated))
+            {
+                break;
+            }
+
+            uint64_t table = 0;
+            if (!ReadProcessU64(device, process.Kernel, process.Kernel.Peb + 0x58, &table) ||
+                table == 0)
+            {
+                break;
+            }
+
+            std::map<std::wstring, std::wstring> evidence;
+            evidence[L"kernel_callback_table"] = HuntHex(table, 16);
+
+            if (!IsUserAddress(table))
+            {
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_injection",
+                    L"PEB KernelCallbackTable is not a user-mode pointer",
+                    table,
+                    L"",
+                    {L"kernel_callback_table_relocated"},
+                    evidence);
+                break;
+            }
+
+            const HuntModuleRecord* tableOwner = FindLoaderModuleContainingAddress(process, table);
+            const bool inCallbackHost =
+                tableOwner != nullptr &&
+                IsKernelCallbackTableHostLeaf(
+                    LeafName(tableOwner->Name.empty() ? tableOwner->Path : tableOwner->Name));
+            if (!inCallbackHost)
+            {
+                if (tableOwner != nullptr)
+                {
+                    evidence[L"table_module"] = tableOwner->Name.empty() ? tableOwner->Path : tableOwner->Name;
+                }
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_injection",
+                    tableOwner == nullptr
+                        ? L"PEB KernelCallbackTable pointer is not inside a loaded module"
+                        : L"PEB KernelCallbackTable was relocated out of user32 (T1574.013)",
+                    table,
+                    tableOwner != nullptr ? tableOwner->Name : L"",
+                    {L"kernel_callback_table_relocated"},
+                    evidence);
+            }
+
+            std::vector<uint8_t> slots;
+            std::wstring ignored;
+            bool slotsRead = false;
+            const uint32_t slotReadSizes[] = {
+                static_cast<uint32_t>(128 * sizeof(uint64_t)),
+                static_cast<uint32_t>(32 * sizeof(uint64_t)),
+                static_cast<uint32_t>(8 * sizeof(uint64_t)),
+                static_cast<uint32_t>(4 * sizeof(uint64_t))
+            };
+            for (uint32_t slotBytes : slotReadSizes)
+            {
+                slots.clear();
+                ignored.clear();
+                if (ReadHuntProcessMemory(
+                        device,
+                        process.Kernel,
+                        table,
+                        slotBytes,
+                        &slots,
+                        &ignored) &&
+                    slots.size() >= sizeof(uint64_t))
+                {
+                    slotsRead = true;
+                    break;
+                }
+            }
+            if (!slotsRead)
+            {
+                break;
+            }
+
+            size_t hooked = 0;
+            const size_t count = slots.size() / sizeof(uint64_t);
+            for (size_t index = 0; index < count && hooked < 4; ++index)
+            {
+                uint64_t entry = 0;
+                std::memcpy(&entry, slots.data() + (index * sizeof(uint64_t)), sizeof(entry));
+                if (entry == 0)
+                {
+                    continue;
+                }
+                if (!IsUserAddress(entry))
+                {
+                    continue;
+                }
+                if (LoaderModuleCoversAddress(process, entry, nullptr))
+                {
+                    std::vector<uint8_t> prologue;
+                    std::wstring prologueError;
+                    if (ReadHuntProcessMemory(
+                            device,
+                            process.Kernel,
+                            entry,
+                            16,
+                            &prologue,
+                            &prologueError) &&
+                        prologue.size() >= 5)
+                    {
+                        uint64_t trampolineTarget = 0;
+                        uint64_t indirectSlot = 0;
+                        if (DecodeUserTrampolineTarget(
+                                prologue.data(),
+                                prologue.size(),
+                                entry,
+                                &trampolineTarget,
+                                &indirectSlot))
+                        {
+                            if (indirectSlot != 0 && IsUserAddress(indirectSlot))
+                            {
+                                ReadProcessU64(
+                                    device,
+                                    process.Kernel,
+                                    indirectSlot,
+                                    &trampolineTarget);
+                            }
+                            if (trampolineTarget != 0 &&
+                                IsUserAddress(trampolineTarget) &&
+                                !LoaderModuleCoversAddress(process, trampolineTarget, nullptr))
+                            {
+                                evidence[L"callback_index"] = std::to_wstring(static_cast<uint32_t>(index));
+                                evidence[L"callback"] = HuntHex(entry, 16);
+                                evidence[L"trampoline_target"] = HuntHex(trampolineTarget, 16);
+                                std::vector<std::wstring> reasons = {L"kernel_callback_inline_hook"};
+                                if (AddressInPrivateExecutableVad(process, trampolineTarget))
+                                {
+                                    AddUnique(&reasons, L"private_executable_vad");
+                                }
+                                AddFinding(
+                                    result,
+                                    process,
+                                    L"high",
+                                    L"medium",
+                                    L"process_injection",
+                                    L"user32 callback prologue jumps outside loaded modules",
+                                    trampolineTarget,
+                                    L"",
+                                    reasons,
+                                    evidence);
+                                ++hooked;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                evidence[L"callback_index"] = std::to_wstring(static_cast<uint32_t>(index));
+                evidence[L"callback"] = HuntHex(entry, 16);
+                std::vector<std::wstring> reasons = {L"kernel_callback_table_hook"};
+                if (AddressInPrivateExecutableVad(process, entry))
+                {
+                    AddUnique(&reasons, L"private_executable_vad");
+                }
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_injection",
+                    L"KernelCallbackTable slot points outside loaded modules",
+                    entry,
+                    L"",
+                    reasons,
+                    evidence);
+                ++hooked;
+            }
+        } while (false);
+    }
+
+    void AddInstrumentationCallbackFinding(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                process.Kernel.Eprocess == 0 ||
+                process.Modules.empty() ||
+                !(process.PebLdrEnumerated || process.ToolhelpModuleEnumerated))
+            {
+                break;
+            }
+
+            TypeFieldInfo field = {};
+            if (!symbols.FindField(
+                    L"nt!_KPROCESS",
+                    L"InstrumentationCallback",
+                    &field,
+                    nullptr) &&
+                !FindFieldRecursive(
+                    symbols,
+                    {L"nt!_KPROCESS", L"_KPROCESS", L"nt!_EPROCESS"},
+                    L"InstrumentationCallback",
+                    &field))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> callbackBytes;
+            std::wstring readError;
+            if (!device.ReadMemory(
+                    process.Kernel.Eprocess + field.Offset,
+                    sizeof(uint64_t),
+                    &callbackBytes,
+                    &readError) ||
+                callbackBytes.size() != sizeof(uint64_t))
+            {
+                break;
+            }
+            uint64_t callback = 0;
+            std::memcpy(&callback, callbackBytes.data(), sizeof(callback));
+            if (callback == 0)
+            {
+                break;
+            }
+            if (!IsUserAddress(callback))
+            {
+                break;
+            }
+            if (LoaderModuleCoversAddress(process, callback, nullptr))
+            {
+                break;
+            }
+
+            std::map<std::wstring, std::wstring> evidence;
+            evidence[L"instrumentation_callback"] = HuntHex(callback, 16);
+            std::vector<std::wstring> reasons = {L"instrumentation_callback_unbacked"};
+            if (AddressInPrivateExecutableVad(process, callback))
+            {
+                AddUnique(&reasons, L"private_executable_vad");
+            }
+            AddFinding(
+                result,
+                process,
+                L"high",
+                L"medium",
+                L"process_injection",
+                L"KPROCESS InstrumentationCallback is not inside a loaded module",
+                callback,
+                L"",
+                reasons,
+                evidence);
+        } while (false);
+    }
+
+    void AddTrapFrameRipFindings(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                process.ThreadRecords.empty() ||
+                ProcessLooksLikeJitHost(process))
+            {
+                break;
+            }
+
+            TypeFieldInfo trapField = {};
+            TypeFieldInfo ripField = {};
+            if (!symbols.FindField(L"nt!_KTHREAD", L"TrapFrame", &trapField, nullptr) &&
+                !FindFieldRecursive(
+                    symbols,
+                    {L"nt!_KTHREAD", L"_KTHREAD", L"nt!_ETHREAD"},
+                    L"TrapFrame",
+                    &trapField))
+            {
+                break;
+            }
+            if (!symbols.FindField(L"nt!_KTRAP_FRAME", L"Rip", &ripField, nullptr) &&
+                !FindFieldRecursive(
+                    symbols,
+                    {L"nt!_KTRAP_FRAME", L"_KTRAP_FRAME"},
+                    L"Rip",
+                    &ripField))
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            for (const ProcessThreadRecord& thread : process.ThreadRecords)
+            {
+                if (findings >= 4 || thread.Ethread == 0)
+                {
+                    continue;
+                }
+
+                uint64_t trapFrame = 0;
+                if (!ReadKernelU64(device, thread.Ethread + trapField.Offset, &trapFrame) ||
+                    trapFrame == 0 ||
+                    !IsKernelAddress(trapFrame))
+                {
+                    continue;
+                }
+
+                uint64_t rip = 0;
+                if (!ReadKernelU64(device, trapFrame + ripField.Offset, &rip) ||
+                    rip == 0 ||
+                    !IsUserAddress(rip))
+                {
+                    continue;
+                }
+                if (LoaderModuleCoversAddress(process, rip, nullptr) ||
+                    !AddressInPrivateExecutableVad(process, rip))
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"ethread"] = HuntHex(thread.Ethread, 16);
+                evidence[L"tid"] = std::to_wstring(thread.ThreadId);
+                evidence[L"trap_frame"] = HuntHex(trapFrame, 16);
+                evidence[L"rip"] = HuntHex(rip, 16);
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_injection",
+                    L"thread TrapFrame RIP is in private executable memory (thread hijack)",
+                    rip,
+                    L"",
+                    {L"trap_frame_rip_private_exec", L"thread_execution_hijack"},
+                    evidence);
+                ++findings;
+            }
+        } while (false);
+    }
+
+    void AddDirectSyscallStubFindings(
+        DeviceClient& device,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                ProcessLooksLikeJitHost(process))
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            size_t scanned = 0;
+            for (const ProcessVadRecord& vad : process.VadRecords)
+            {
+                if (findings >= 4 || scanned >= 8)
+                {
+                    break;
+                }
+                if (!vad.Executable ||
+                    !vad.HasPrivateMemory ||
+                    !vad.PrivateMemory ||
+                    vad.StartAddress == 0 ||
+                    vad.Size == 0)
+                {
+                    continue;
+                }
+
+                ++scanned;
+                const uint32_t readSize =
+                    vad.Size > 4096 ? 4096u : static_cast<uint32_t>(vad.Size);
+                std::vector<uint8_t> bytes;
+                std::wstring ignored;
+                if (!ReadHuntProcessMemory(
+                        device,
+                        process.Kernel,
+                        vad.StartAddress,
+                        readSize,
+                        &bytes,
+                        &ignored) ||
+                    bytes.size() < 8)
+                {
+                    continue;
+                }
+                if (!LooksLikeDirectSyscallStub(bytes.data(), bytes.size()))
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"vad"] = HuntHex(vad.VadAddress, 16);
+                evidence[L"start"] = HuntHex(vad.StartAddress, 16);
+                evidence[L"size"] = std::to_wstring(vad.Size);
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_injection",
+                    L"private executable VAD contains a direct syscall stub (Hell's Gate / Tartarus)",
+                    vad.StartAddress,
+                    L"",
+                    {L"direct_syscall_stub", L"private_executable_vad"},
+                    evidence);
+                ++findings;
+            }
+        } while (false);
+    }
+
+    void AddMainImageIatHookFindings(
+        DeviceClient& device,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                !process.HasPebImageBase ||
+                process.PebImageBase == 0 ||
+                process.Modules.empty())
+            {
+                break;
+            }
+
+            std::vector<uint8_t> header;
+            std::wstring ignored;
+            if (!ReadHuntProcessMemory(
+                    device,
+                    process.Kernel,
+                    process.PebImageBase,
+                    0x400,
+                    &header,
+                    &ignored) ||
+                header.size() < sizeof(IMAGE_DOS_HEADER) + sizeof(uint32_t) +
+                    sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t))
+            {
+                break;
+            }
+
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, header.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE)
+            {
+                break;
+            }
+            const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
+            if (ntOffset < sizeof(IMAGE_DOS_HEADER) ||
+                static_cast<uint64_t>(ntOffset) + sizeof(uint32_t) +
+                    sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t) >
+                    header.size())
+            {
+                break;
+            }
+            uint16_t magic = 0;
+            const size_t optionalOffset =
+                static_cast<size_t>(ntOffset) + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
+            if (optionalOffset + sizeof(uint16_t) > header.size())
+            {
+                break;
+            }
+            std::memcpy(&magic, header.data() + optionalOffset, sizeof(magic));
+
+            IMAGE_DATA_DIRECTORY iat = {};
+            size_t thunkSize = sizeof(uint64_t);
+            if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            {
+                if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER64, DataDirectory) +
+                        (IMAGE_DIRECTORY_ENTRY_IAT + 1) * sizeof(IMAGE_DATA_DIRECTORY) >
+                    header.size())
+                {
+                    break;
+                }
+                IMAGE_OPTIONAL_HEADER64 optional = {};
+                std::memcpy(
+                    &optional,
+                    header.data() + optionalOffset,
+                    (std::min)(header.size() - optionalOffset, sizeof(optional)));
+                if (optional.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+                {
+                    break;
+                }
+                iat = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+                thunkSize = sizeof(uint64_t);
+            }
+            else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+            {
+                if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER32, DataDirectory) +
+                        (IMAGE_DIRECTORY_ENTRY_IAT + 1) * sizeof(IMAGE_DATA_DIRECTORY) >
+                    header.size())
+                {
+                    break;
+                }
+                IMAGE_OPTIONAL_HEADER32 optional = {};
+                std::memcpy(
+                    &optional,
+                    header.data() + optionalOffset,
+                    (std::min)(header.size() - optionalOffset, sizeof(optional)));
+                if (optional.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+                {
+                    break;
+                }
+                iat = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+                thunkSize = sizeof(uint32_t);
+            }
+            else
+            {
+                break;
+            }
+            if (iat.VirtualAddress == 0 || iat.Size < thunkSize || iat.Size > 0x4000)
+            {
+                break;
+            }
+            if (static_cast<uint64_t>(iat.VirtualAddress) > (~0ull - process.PebImageBase))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> thunks;
+            if (!ReadHuntProcessMemory(
+                    device,
+                    process.Kernel,
+                    process.PebImageBase + iat.VirtualAddress,
+                    iat.Size,
+                    &thunks,
+                    &ignored) ||
+                thunks.size() < thunkSize)
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            const size_t count = thunks.size() / thunkSize;
+            for (size_t index = 0; index < count && findings < 4; ++index)
+            {
+                uint64_t thunk = 0;
+                std::memcpy(&thunk, thunks.data() + (index * thunkSize), thunkSize);
+                if (thunk == 0 || !IsUserAddress(thunk))
+                {
+                    continue;
+                }
+                if (LoaderModuleCoversAddress(process, thunk, nullptr))
+                {
+                    continue;
+                }
+                if (!AddressInPrivateExecutableVad(process, thunk))
+                {
+                    continue;
+                }
+
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"iat_index"] = std::to_wstring(static_cast<uint32_t>(index));
+                evidence[L"thunk"] = HuntHex(thunk, 16);
+                evidence[L"thunk_width"] = std::to_wstring(static_cast<uint32_t>(thunkSize));
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_injection",
+                    L"main-image IAT thunk points at private executable memory",
+                    thunk,
+                    BestProcessImageName(process),
+                    {L"iat_hook_private_exec"},
+                    evidence);
+                ++findings;
+            }
+        } while (false);
+    }
+
+    void AddHardwareBreakpointFindings(
+        DeviceClient& device,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                !process.Kernel.HasPeb ||
+                process.Kernel.Peb == 0)
+            {
+                break;
+            }
+
+            uint8_t beingDebugged = 0;
+            std::vector<uint8_t> flagBytes;
+            std::wstring ignored;
+            if (ReadHuntProcessMemory(
+                    device,
+                    process.Kernel,
+                    process.Kernel.Peb + 2,
+                    1,
+                    &flagBytes,
+                    &ignored) &&
+                !flagBytes.empty())
+            {
+                beingDebugged = flagBytes[0];
+            }
+            if (beingDebugged != 0)
+            {
+                break;
+            }
+
+            size_t findings = 0;
+            for (const ProcessThreadRecord& thread : process.ThreadRecords)
+            {
+                if (findings >= 4 ||
+                    !thread.HasThreadId ||
+                    thread.ThreadId == 0 ||
+                    thread.ThreadId > 0xFFFFFFFFull)
+                {
+                    continue;
+                }
+
+                HANDLE threadHandle = OpenThread(
+                    THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                    FALSE,
+                    static_cast<DWORD>(thread.ThreadId));
+                if (threadHandle == nullptr)
+                {
+                    continue;
+                }
+
+                alignas(16) CONTEXT ctx = {};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                const BOOL gotContext = GetThreadContext(threadHandle, &ctx);
+                CloseHandle(threadHandle);
+                if (!gotContext)
+                {
+                    continue;
+                }
+
+                const uint64_t dr[] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
+                for (uint32_t index = 0; index < 4; ++index)
+                {
+                    if (!HardwareBreakpointEnabled(ctx.Dr7, index) ||
+                        dr[index] == 0 ||
+                        !IsUserAddress(dr[index]))
+                    {
+                        continue;
+                    }
+
+                    const bool inPrivate = AddressInPrivateExecutableVad(process, dr[index]);
+                    const HuntModuleRecord* owner =
+                        FindLoaderModuleContainingAddress(process, dr[index]);
+                    bool coreOs = false;
+                    if (owner != nullptr)
+                    {
+                        coreOs = IsCoreOsDllLeaf(LeafName(owner->Name.empty() ? owner->Path : owner->Name));
+                    }
+                    if (!inPrivate && !coreOs)
+                    {
+                        continue;
+                    }
+
+                    std::map<std::wstring, std::wstring> evidence;
+                    evidence[L"tid"] = std::to_wstring(thread.ThreadId);
+                    evidence[L"dr_index"] = std::to_wstring(index);
+                    evidence[L"dr_address"] = HuntHex(dr[index], 16);
+                    evidence[L"dr7"] = HuntHex(ctx.Dr7, 16);
+                    std::vector<std::wstring> reasons = {L"hardware_breakpoint"};
+                    if (inPrivate)
+                    {
+                        AddUnique(&reasons, L"private_executable_vad");
+                    }
+                    if (coreOs)
+                    {
+                        AddUnique(&reasons, L"hwbp_on_core_os_dll");
+                    }
+                    AddFinding(
+                        result,
+                        process,
+                        L"high",
+                        L"medium",
+                        L"process_injection",
+                        L"thread debug register is armed on private or core-OS executable memory",
+                        dr[index],
+                        owner != nullptr ? owner->Name : L"",
+                        reasons,
+                        evidence);
+                    ++findings;
+                    break;
+                }
+            }
+        } while (false);
+    }
+
+    void AddMainImageHerpaderpFinding(
+        DeviceClient& device,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                !process.HasPebImageBase ||
+                process.PebImageBase == 0)
+            {
+                break;
+            }
+
+            const std::wstring diskPath = BestProcessImagePath(process);
+            if (diskPath.empty() || !CanOpenDiskImagePath(diskPath))
+            {
+                break;
+            }
+
+            DiskPeMetadata disk = {};
+            std::wstring diskError;
+            if (!ReadDiskPeMetadata(diskPath, &disk, &diskError) ||
+                disk.SizeOfImage == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> live;
+            std::wstring liveError;
+            if (!ReadHuntProcessMemory(
+                    device,
+                    process.Kernel,
+                    process.PebImageBase,
+                    0x400,
+                    &live,
+                    &liveError))
+            {
+                break;
+            }
+
+            uint32_t liveStamp = 0;
+            uint32_t liveSize = 0;
+            uint32_t liveEntry = 0;
+            if (!ParsePeIdentityStamp(live, &liveStamp, &liveSize, &liveEntry))
+            {
+                break;
+            }
+
+            if (!PeIdentityStampsDiffer(
+                    disk.TimeDateStamp,
+                    disk.SizeOfImage,
+                    disk.EntryPointRva,
+                    liveStamp,
+                    liveSize,
+                    liveEntry))
+            {
+                break;
+            }
+
+            std::map<std::wstring, std::wstring> evidence;
+            evidence[L"disk_path"] = diskPath;
+            evidence[L"disk_timedatestamp"] = std::to_wstring(disk.TimeDateStamp);
+            evidence[L"live_timedatestamp"] = std::to_wstring(liveStamp);
+            evidence[L"disk_size_of_image"] = std::to_wstring(disk.SizeOfImage);
+            evidence[L"live_size_of_image"] = std::to_wstring(liveSize);
+            evidence[L"disk_entry_point"] = std::to_wstring(disk.EntryPointRva);
+            evidence[L"live_entry_point"] = std::to_wstring(liveEntry);
+            AddFinding(
+                result,
+                process,
+                L"high",
+                L"high",
+                L"process_image_integrity",
+                L"in-memory PE identity does not match the on-disk image (herpaderping/hollowing)",
+                process.PebImageBase,
+                BestProcessImageName(process),
+                {L"main_image_disk_memory_mismatch", L"process_herpaderping_evidence"},
+                evidence);
         } while (false);
     }
 
@@ -22616,6 +24497,304 @@ bool HuntProcessLifecycleSelfTest()
     {
         CloseHandle(currentProcess);
     }
+    return ok;
+}
+
+bool HuntInjectedModuleSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        HuntProcessRecord game = {};
+        game.ProcessId = 1000;
+        game.ApiImagePath = L"C:\\Games\\Title\\game.exe";
+
+        HuntModuleRecord cheat = {};
+        cheat.Base = 0x10000;
+        cheat.Size = 0x2000;
+        cheat.Name = L"cheat.dll";
+        cheat.Path = L"C:\\Users\\Public\\cheat.dll";
+        cheat.ToolhelpSeen = true;
+
+        HuntModuleRecord local = {};
+        local.Base = 0x20000;
+        local.Size = 0x1000;
+        local.Name = L"engine.dll";
+        local.Path = L"C:\\Games\\Title\\engine.dll";
+        local.ToolhelpSeen = true;
+
+        HuntModuleRecord kernel32 = {};
+        kernel32.Base = 0x30000;
+        kernel32.Size = 0x1000;
+        kernel32.Name = L"kernel32.dll";
+        kernel32.Path = L"C:\\Windows\\System32\\kernel32.dll";
+        kernel32.ToolhelpSeen = true;
+
+        HuntModuleRecord overlay = {};
+        overlay.Base = 0x40000;
+        overlay.Size = 0x1000;
+        overlay.Name = L"discordoverlay.dll";
+        overlay.Path = L"C:\\Users\\user\\AppData\\Local\\Discord\\overlay.dll";
+        overlay.ToolhelpSeen = true;
+
+        HuntModuleRecord tempDll = {};
+        tempDll.Base = 0x50000;
+        tempDll.Size = 0x1000;
+        tempDll.Name = L"hook.dll";
+        tempDll.Path = L"C:\\Windows\\Temp\\hook.dll";
+        tempDll.ToolhelpSeen = true;
+
+        HuntProcessRecord svchost = {};
+        svchost.ProcessId = 800;
+        svchost.ApiImagePath = L"C:\\Windows\\System32\\svchost.exe";
+        svchost.BuiltinProfileMatched = true;
+        svchost.BuiltinProfile = L"svchost.exe";
+
+        HuntModuleRecord versionDll = {};
+        versionDll.Base = 0x60000;
+        versionDll.Size = 0x1000;
+        versionDll.Name = L"version.dll";
+        versionDll.Path = L"C:\\Games\\Title\\version.dll";
+        versionDll.ToolhelpSeen = true;
+
+        HuntModuleRecord dinput = {};
+        dinput.Base = 0x70000;
+        dinput.Size = 0x1000;
+        dinput.Name = L"dinput8.dll";
+        dinput.Path = L"C:\\Games\\Title\\dinput8.dll";
+        dinput.ToolhelpSeen = true;
+
+        ProcessThreadRecord loaderThread = {};
+        loaderThread.HasWin32StartAddress = true;
+        loaderThread.Win32StartAddress = 0x7ff80000;
+        loaderThread.Win32StartModule = L"C:\\Windows\\System32\\kernel32.dll";
+
+        ProcessThreadRecord gameThread = {};
+        gameThread.HasWin32StartAddress = true;
+        gameThread.Win32StartAddress = 0x140001000;
+        gameThread.Win32StartModule = L"game.exe";
+
+        ProcessThreadRecord ntdllOnly = {};
+        ntdllOnly.HasStartAddress = true;
+        ntdllOnly.StartAddress = 0x7ff90000;
+        ntdllOnly.StartModule = L"ntdll.dll";
+
+        HuntProcessRecord gui = {};
+        gui.ProcessId = 2000;
+        HuntModuleRecord user32 = {};
+        user32.Base = 0x7ff800000000ull;
+        user32.Size = 0x100000;
+        user32.Name = L"user32.dll";
+        user32.Path = L"C:\\Windows\\System32\\user32.dll";
+        user32.ToolhelpSeen = true;
+        user32.LdrLoadSeen = true;
+        gui.Modules.push_back(user32);
+
+        HuntModuleRecord fakeNtdll = {};
+        fakeNtdll.Base = 0x180000000ull;
+        fakeNtdll.Size = 0x1000;
+        fakeNtdll.Name = L"ntdll.dll";
+        fakeNtdll.Path = L"C:\\Temp\\ntdll.dll";
+        fakeNtdll.ToolhelpSeen = true;
+
+        std::vector<uint8_t> pe(0x200, 0);
+        IMAGE_DOS_HEADER dos = {};
+        dos.e_magic = IMAGE_DOS_SIGNATURE;
+        dos.e_lfanew = 0x80;
+        std::memcpy(pe.data(), &dos, sizeof(dos));
+        uint32_t peSig = IMAGE_NT_SIGNATURE;
+        std::memcpy(pe.data() + 0x80, &peSig, sizeof(peSig));
+        IMAGE_FILE_HEADER fileHeader = {};
+        fileHeader.TimeDateStamp = 0x11111111;
+        fileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        std::memcpy(pe.data() + 0x84, &fileHeader, sizeof(fileHeader));
+        IMAGE_OPTIONAL_HEADER64 optional = {};
+        optional.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        optional.AddressOfEntryPoint = 0x1000;
+        optional.SizeOfImage = 0x2000;
+        std::memcpy(pe.data() + 0x98, &optional, sizeof(optional));
+        uint32_t stamp = 0;
+        uint32_t size = 0;
+        uint32_t entry = 0;
+
+        if (!ModuleLooksLikeInjectedImage(game, cheat, false) ||
+            ModuleLooksLikeInjectedImage(game, local, false) ||
+            ModuleLooksLikeInjectedImage(game, kernel32, false) ||
+            ModuleLooksLikeInjectedImage(game, overlay, true) ||
+            !ModuleLooksLikeInjectedImage(game, overlay, false) ||
+            !ModuleLooksLikeInjectedImage(game, tempDll, false) ||
+            ModuleLooksLikeInjectedImage(game, tempDll, true) ||
+            !ModuleLooksLikeInjectedImage(svchost, cheat, true) ||
+            !ModuleLooksLikeInboxSideload(game, versionDll, false) ||
+            ModuleLooksLikeInboxSideload(game, versionDll, true) ||
+            ModuleLooksLikeInboxSideload(game, local, false) ||
+            ModuleLooksLikeInboxSideload(game, dinput, false) ||
+            !ThreadStartLooksLikeRemoteLoader(loaderThread) ||
+            ThreadStartLooksLikeRemoteLoader(gameThread) ||
+            ThreadStartLooksLikeRemoteLoader(ntdllOnly) ||
+            LeafName(L"svchost.exe ") != L"svchost.exe" ||
+            LeafName(L"svchost.exe.") != L"svchost.exe" ||
+            FindBuiltinProfileByLeaf(LeafName(L"C:\\Temp\\svchost.exe ")) == nullptr ||
+            !IsCoreOsDllLeaf(L"ntdll.dll") ||
+            IsCoreOsDllLeaf(L"version.dll") ||
+            !LoaderModuleCoversAddress(gui, 0x7ff800001000ull, nullptr) ||
+            LoaderModuleCoversAddress(gui, 0x123000ull, nullptr) ||
+            !ParsePeIdentityStamp(pe, &stamp, &size, &entry) ||
+            stamp != 0x11111111 ||
+            size != 0x2000 ||
+            entry != 0x1000 ||
+            !PeIdentityStampsDiffer(0x11111111, 0x2000, 0x1000, 0x22222222, 0x2000, 0x1000) ||
+            PeIdentityStampsDiffer(0x11111111, 0x2000, 0x1000, 0x11111111, 0x2000, 0x1000) ||
+            !IsCoreOsDllLeaf(LeafName(fakeNtdll.Path)))
+        {
+            break;
+        }
+
+        uint8_t relJmp[] = { 0xE9, 0x00, 0x10, 0x00, 0x00 };
+        uint64_t trampoline = 0;
+        uint64_t slot = 0;
+        uint8_t absJmp[12] = {
+            0x48, 0xB8,
+            0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xFF, 0xE0
+        };
+        uint64_t absTarget = 0;
+        uint8_t syscallStub[] = {
+            0x4C, 0x8B, 0xD1, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05
+        };
+        uint8_t randomExec[] = { 0x90, 0x90, 0x0F, 0x05, 0xC3 };
+        HuntProcessRecord chrome = {};
+        chrome.ApiImagePath = L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+        HuntProcessRecord nativeGame = {};
+        nativeGame.ApiImagePath = L"C:\\Games\\Title\\game.exe";
+        if (!DecodeUserTrampolineTarget(relJmp, sizeof(relJmp), 0x1000, &trampoline, &slot) ||
+            trampoline != 0x2005ull ||
+            !DecodeUserTrampolineTarget(absJmp, sizeof(absJmp), 0x1000, &absTarget, &slot) ||
+            absTarget != 0x100000ull ||
+            !LooksLikeDirectSyscallStub(syscallStub, sizeof(syscallStub)) ||
+            LooksLikeDirectSyscallStub(randomExec, sizeof(randomExec)) ||
+            !HardwareBreakpointEnabled(0x1, 0) ||
+            !HardwareBreakpointEnabled(0x2, 0) ||
+            HardwareBreakpointEnabled(0, 0) ||
+            !ProcessLooksLikeJitHost(chrome) ||
+            ProcessLooksLikeJitHost(nativeGame))
+        {
+            break;
+        }
+        HuntProcessRecord sourceGame = {};
+        sourceGame.ApiImagePath = L"C:\\Games\\hl2.exe";
+        HuntModuleRecord luaShared = {};
+        luaShared.Name = L"lua_shared.dll";
+        luaShared.Path = L"C:\\Games\\bin\\lua_shared.dll";
+        luaShared.ToolhelpSeen = true;
+        sourceGame.Modules.push_back(luaShared);
+        HuntProcessRecord luaHost = {};
+        luaHost.ApiImagePath = L"C:\\Games\\Title\\game.exe";
+        HuntModuleRecord luaDll = {};
+        luaDll.Name = L"lua51.dll";
+        luaDll.ToolhelpSeen = true;
+        luaHost.Modules.push_back(luaDll);
+        if (ProcessLooksLikeJitHost(sourceGame) ||
+            !ProcessLooksLikeJitHost(luaHost))
+        {
+            break;
+        }
+
+        HuntModuleRecord fakeMain = {};
+        fakeMain.Base = 0x90000;
+        fakeMain.Size = 0x1000;
+        fakeMain.Name = L"game.exe";
+        fakeMain.Path = L"C:\\cheat\\game.exe";
+        fakeMain.ToolhelpSeen = true;
+
+        HuntModuleRecord pfCheat = {};
+        pfCheat.Base = 0xa0000;
+        pfCheat.Size = 0x1000;
+        pfCheat.Name = L"hook.dll";
+        pfCheat.Path = L"C:\\Program Files\\Vendor\\hook.dll";
+        pfCheat.ToolhelpSeen = true;
+
+        uint8_t x86Jmp[] = { 0xB8, 0x00, 0x00, 0x10, 0x00, 0xFF, 0xE0 };
+        uint64_t x86Target = 0;
+        uint8_t movEaxOnly[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05 };
+
+        HuntProcessRecord overlayOnly = game;
+        overlayOnly.Modules.clear();
+        overlayOnly.Modules.push_back(overlay);
+        HuntProcessRecord cheatAndOverlay = game;
+        cheatAndOverlay.Modules.clear();
+        cheatAndOverlay.Modules.push_back(overlay);
+        cheatAndOverlay.Modules.push_back(cheat);
+
+        HuntProcessRecord svchostKeep = {};
+        svchostKeep.KernelImageName = L"svchost.exe";
+        svchostKeep.ApiImagePath = L"C:\\Windows\\System32\\svchost.exe";
+        svchostKeep.PebCommandLine = L"C:\\Windows\\System32\\svchost.exe -keep running";
+        svchostKeep.ParentImageName = L"services.exe";
+        svchostKeep.HasSessionId = true;
+        svchostKeep.SessionId = 0;
+        ApplyBuiltinProfile(&svchostKeep);
+
+        HuntProcessRecord svchostK = svchostKeep;
+        svchostK.PebCommandLine = L"C:\\Windows\\System32\\svchost.exe -k netsvcs";
+        svchostK.BuiltinProfile.clear();
+        svchostK.BuiltinProfileMatched = false;
+        svchostK.BuiltinProfileViolations.clear();
+        ApplyBuiltinProfile(&svchostK);
+
+        bool svchostKeepHasCommandMismatch = false;
+        bool svchostKHasCommandMismatch = false;
+        HuntProcessRecord dllhostProfile = {};
+        dllhostProfile.BuiltinProfileMatched = true;
+        dllhostProfile.BuiltinProfile = L"dllhost.exe";
+        HuntModuleRecord fakeSvcHost = {};
+        fakeSvcHost.Base = 0xb0000;
+        fakeSvcHost.Size = 0x1000;
+        fakeSvcHost.Name = L"svchost.exe";
+        fakeSvcHost.Path = L"C:\\cheat\\svchost.exe";
+        fakeSvcHost.ToolhelpSeen = true;
+        for (const std::wstring& violation : svchostKeep.BuiltinProfileViolations)
+        {
+            if (violation == L"command_line_mismatch")
+            {
+                svchostKeepHasCommandMismatch = true;
+            }
+        }
+        for (const std::wstring& violation : svchostK.BuiltinProfileViolations)
+        {
+            if (violation == L"command_line_mismatch")
+            {
+                svchostKHasCommandMismatch = true;
+            }
+        }
+
+        if (!ModuleLooksLikeInjectedImage(game, fakeMain, false) ||
+            ModuleLooksLikeProcessMainImage(game, fakeMain) ||
+            !ModuleLooksLikeInjectedImage(game, pfCheat, false) ||
+            ModuleLooksLikeInjectedImage(game, pfCheat, true) ||
+            !DecodeUserTrampolineTarget(x86Jmp, sizeof(x86Jmp), 0x1000, &x86Target, &slot) ||
+            x86Target != 0x100000ull ||
+            LooksLikeDirectSyscallStub(movEaxOnly, sizeof(movEaxOnly)) ||
+            ProcessHasNonOverlayForeignModule(overlayOnly) ||
+            !ProcessHasNonOverlayForeignModule(cheatAndOverlay) ||
+            RemoteLoaderFindingIsWarranted(overlayOnly) ||
+            !RemoteLoaderFindingIsWarranted(cheatAndOverlay) ||
+            !RemoteLoaderFindingIsWarranted(svchost) ||
+            RemoteLoaderFindingIsWarranted(dllhostProfile) ||
+            ModuleLooksLikeProcessMainImage(svchost, fakeSvcHost) ||
+            !IsKernelCallbackTableHostLeaf(L"user32.dll") ||
+            IsKernelCallbackTableHostLeaf(L"game.exe") ||
+            !svchostKeep.BuiltinProfileMatched ||
+            !svchostKeepHasCommandMismatch ||
+            !svchostK.BuiltinProfileMatched ||
+            svchostKHasCommandMismatch)
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
     return ok;
 }
 
@@ -26121,6 +28300,16 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 AddThreadFindings(result, process);
                 AddModuleCrossViewFindings(result, process);
                 AddBuiltinModuleProvenanceFindings(result, process);
+                AddInjectedModuleFindings(result, process);
+                AddSideloadModuleFindings(result, process);
+                AddCoreOsDllPathFindings(result, process);
+                AddKernelCallbackTableFindings(device_, result, process);
+                AddInstrumentationCallbackFinding(device_, symbols_, result, process);
+                AddTrapFrameRipFindings(device_, symbols_, result, process);
+                AddDirectSyscallStubFindings(device_, result, process);
+                AddMainImageIatHookFindings(device_, result, process);
+                AddHardwareBreakpointFindings(device_, result, process);
+                AddMainImageHerpaderpFinding(device_, result, process);
                 AddMainImageVadFinding(device_, symbols_, result, &process);
 
                 if (options.Mode == HuntMode::Deep)

@@ -29430,6 +29430,10 @@ static int RunConsoleSurfaceSelfTest()
             L"hunt-process-handle-lifecycle-identity");
         CheckConsoleSurfaceSelfTest(
             &context,
+            HuntInjectedModuleSelfTest(),
+            L"hunt-injected-foreign-module");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             HuntCidTableAnchorSelfTest(),
             L"hunt-cid-table-anchor-cross-function");
         CheckConsoleSurfaceSelfTest(
@@ -29516,6 +29520,10 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             TokenPrivilegeMaskInvariantSelfTest(),
             L"token-privilege-enabled-present-invariant");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            TokenPrivilegeSystemProfileSelfTest(),
+            L"token-privilege-system-profile-path");
         CheckCompletionCandidate(
             &context,
             {L"!vad"},
@@ -30009,6 +30017,10 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             HalDispatchOwnershipSelfTest(),
             L"hal-dispatch-inbox-ownership");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HiveNtOwnershipSelfTest(),
+            L"hive-nt-ownership");
         CheckConsoleSurfaceSelfTest(
             &context,
             HiddenProcessViewSelfTest(),

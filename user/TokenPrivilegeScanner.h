@@ -24,6 +24,7 @@ struct TokenPrivilegeRecord
     uint64_t TokenObject = 0;
     uint64_t TokenRaw = 0;
     std::wstring ImageName;
+    std::wstring ImagePath;
     uint64_t PresentMask = 0;
     uint64_t EnabledMask = 0;
     uint64_t EnabledByDefaultMask = 0;
@@ -92,7 +93,10 @@ public:
 
     // Pure helpers for self-tests / hunt integration.
     static bool IsHighRiskPrivilegeName(const std::wstring& name);
-    static bool IsSystemProfileImage(const std::wstring& imageName, uint32_t pid);
+    static bool IsSystemProfileImage(
+        const std::wstring& imageName,
+        uint32_t pid,
+        const std::wstring& imagePath = std::wstring());
     static std::wstring PrivilegeNameFromBit(uint32_t bitIndex);
     static std::wstring BuildPrivilegeFingerprint(uint64_t present, uint64_t enabled);
     static bool HasStructuralMaskInconsistency(
@@ -106,3 +110,4 @@ private:
 
 std::wstring BuildTokenPrivilegeJson(const TokenPrivilegeScanResult& result);
 bool TokenPrivilegeMaskInvariantSelfTest();
+bool TokenPrivilegeSystemProfileSelfTest();

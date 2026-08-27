@@ -56,11 +56,25 @@ namespace
         uint32_t Pid = 0;
         uint64_t Eprocess = 0;
         std::wstring Image;
+        std::wstring ImagePath;
     };
 
     bool IsKernelAddress(uint64_t value)
     {
         return value >= kKernelSpaceMin;
+    }
+
+    bool ReadU16(DeviceClient& device, uint64_t address, uint16_t* value)
+    {
+        std::vector<uint8_t> bytes;
+        if (!device.ReadMemory(address, sizeof(uint16_t), &bytes, nullptr) ||
+            bytes.size() != sizeof(uint16_t))
+        {
+            return false;
+        }
+
+        memcpy(value, bytes.data(), sizeof(uint16_t));
+        return true;
     }
 
     bool ReadU64(DeviceClient& device, uint64_t address, uint64_t* value)
@@ -146,13 +160,238 @@ namespace
         return lowered;
     }
 
-    bool IsSystemOwnerImage(const std::wstring& image, uint32_t pid)
+    std::wstring NormalizeKernelImagePath(const std::wstring& path)
     {
-        if (pid == 0 || pid == 4)
+        std::wstring normalized = ToLowerCopy(path);
+        for (wchar_t& ch : normalized)
         {
-            return true;
+            if (ch == L'/')
+            {
+                ch = L'\\';
+            }
         }
 
+        while (normalized.size() >= 4 &&
+            (normalized.compare(0, 4, L"\\??\\") == 0 ||
+             normalized.compare(0, 4, L"\\\\?\\") == 0 ||
+             normalized.compare(0, 4, L"\\\\.\\") == 0))
+        {
+            normalized.erase(0, 4);
+        }
+
+        if (normalized.compare(0, 8, L"\\device\\") == 0)
+        {
+            const size_t slash = normalized.find(L'\\', 8);
+            if (slash != std::wstring::npos)
+            {
+                normalized = normalized.substr(slash);
+            }
+        }
+
+        if (normalized.compare(0, 11, L"\\systemroot") == 0)
+        {
+            normalized = std::wstring(L"\\windows") + normalized.substr(11);
+        }
+
+        return normalized;
+    }
+
+    bool NormalizedPathStartsWithWindowsDir(const std::wstring& normalized, const wchar_t* directory)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (directory == nullptr || *directory == L'\0')
+            {
+                break;
+            }
+
+            const std::wstring needle = std::wstring(L"\\windows\\") + directory + L"\\";
+            if (normalized.size() >= 2 && normalized[1] == L':')
+            {
+                matched = normalized.compare(2, needle.size(), needle) == 0;
+                break;
+            }
+
+            matched = normalized.compare(0, needle.size(), needle) == 0;
+        } while (false);
+
+        return matched;
+    }
+
+    bool PathLooksLikeInboxSystem32(const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+
+        const std::wstring normalized = NormalizeKernelImagePath(path);
+        return NormalizedPathStartsWithWindowsDir(normalized, L"system32") ||
+            NormalizedPathStartsWithWindowsDir(normalized, L"syswow64");
+    }
+
+    bool PathLooksLikeWindowsRootImage(const std::wstring& path, const wchar_t* leaf)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (path.empty() || leaf == nullptr || *leaf == L'\0')
+            {
+                break;
+            }
+
+            const std::wstring normalized = NormalizeKernelImagePath(path);
+            const std::wstring want = std::wstring(L"\\windows\\") + ToLowerCopy(leaf);
+            if (normalized.size() >= 2 && normalized[1] == L':')
+            {
+                matched = normalized.compare(2, want.size(), want) == 0 &&
+                    normalized.size() == 2 + want.size();
+                break;
+            }
+
+            matched = normalized == want;
+        } while (false);
+
+        return matched;
+    }
+
+    bool PathHasDirectorySeparator(const std::wstring& path)
+    {
+        return path.find_last_of(L"\\/") != std::wstring::npos;
+    }
+
+    bool ReadKernelUnicodeString(DeviceClient& device, uint64_t address, std::wstring* value)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (value == nullptr)
+            {
+                break;
+            }
+
+            value->clear();
+            uint16_t length = 0;
+            uint64_t buffer = 0;
+            if (!ReadU16(device, address, &length))
+            {
+                break;
+            }
+            uint16_t maximum = 0;
+            ReadU16(device, address + 2, &maximum);
+            if (!ReadU64(device, address + 8, &buffer))
+            {
+                break;
+            }
+            if (length == 0)
+            {
+                ok = true;
+                break;
+            }
+            if (maximum != 0 && maximum < length)
+            {
+                length = maximum;
+            }
+            length = static_cast<uint16_t>(length & ~static_cast<uint16_t>(1));
+            if (length == 0)
+            {
+                ok = true;
+                break;
+            }
+            if (buffer == 0 || !IsKernelAddress(buffer))
+            {
+                break;
+            }
+            if (length > 2048)
+            {
+                length = 2048;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!device.ReadMemory(buffer, length, &bytes, nullptr) || bytes.size() < 2)
+            {
+                break;
+            }
+
+            value->assign(
+                reinterpret_cast<const wchar_t*>(bytes.data()),
+                bytes.size() / sizeof(wchar_t));
+            ok = !value->empty();
+        } while (false);
+
+        return ok;
+    }
+
+    bool ReadProcessImagePath(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t eprocess,
+        std::wstring* path)
+    {
+        bool ok = false;
+
+        do
+        {
+            if (path == nullptr || eprocess == 0)
+            {
+                break;
+            }
+
+            path->clear();
+            TypeFieldInfo field = {};
+            std::wstring ignored;
+            uint64_t nameInfo = 0;
+            if (symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"SeAuditProcessCreationInfo.ImageFileName",
+                    &field,
+                    &ignored) ||
+                symbols.FindField(
+                    L"nt!_EPROCESS",
+                    L"SeAuditProcessCreationInfo",
+                    &field,
+                    &ignored))
+            {
+                if (ReadU64(device, eprocess + field.Offset, &nameInfo) &&
+                    nameInfo != 0 &&
+                    IsKernelAddress(nameInfo) &&
+                    ReadKernelUnicodeString(device, nameInfo, path) &&
+                    !path->empty())
+                {
+                    ok = true;
+                    break;
+                }
+            }
+
+            TypeFieldInfo imageFile = {};
+            TypeFieldInfo fileName = {};
+            if (!symbols.FindField(L"nt!_EPROCESS", L"ImageFilePointer", &imageFile, &ignored) ||
+                !symbols.FindField(L"nt!_FILE_OBJECT", L"FileName", &fileName, &ignored))
+            {
+                break;
+            }
+
+            uint64_t fileObject = 0;
+            if (!ReadU64(device, eprocess + imageFile.Offset, &fileObject) ||
+                fileObject == 0 ||
+                !IsKernelAddress(fileObject))
+            {
+                break;
+            }
+
+            ok = ReadKernelUnicodeString(device, fileObject + fileName.Offset, path) &&
+                !path->empty();
+        } while (false);
+
+        return ok;
+    }
+
+    bool IsSystemOwnerName(const std::wstring& image)
+    {
         const std::wstring lowered = ImageBaseName(image);
         return lowered == L"csrss.exe" ||
             lowered == L"smss.exe" ||
@@ -160,6 +399,119 @@ namespace
             lowered == L"services.exe" ||
             lowered == L"svchost.exe" ||
             lowered == L"wininit.exe";
+    }
+
+    bool IsWindowsHostHandleStem(const std::wstring& stem)
+    {
+        return stem == L"csrss" ||
+            stem == L"smss" ||
+            stem == L"lsass" ||
+            stem == L"services" ||
+            stem == L"svchost" ||
+            stem == L"wininit" ||
+            stem == L"winlogon" ||
+            stem == L"conhost" ||
+            stem == L"openconsole" ||
+            stem == L"windowsterminal" ||
+            stem == L"windowstermina" ||
+            stem == L"runtimebroker" ||
+            stem == L"explorer" ||
+            stem == L"searchindexer";
+    }
+
+    bool PathLooksLikeWindowsAppsHost(const std::wstring& path)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (path.empty())
+            {
+                break;
+            }
+
+            const std::wstring normalized = NormalizeKernelImagePath(path);
+            const std::wstring needle = L"\\program files\\windowsapps\\";
+            const std::wstring needleX86 = L"\\program files (x86)\\windowsapps\\";
+            if (normalized.size() >= 2 && normalized[1] == L':')
+            {
+                matched = normalized.compare(2, needle.size(), needle) == 0 ||
+                    normalized.compare(2, needleX86.size(), needleX86) == 0;
+                break;
+            }
+
+            matched = normalized.compare(0, needle.size(), needle) == 0 ||
+                normalized.compare(0, needleX86.size(), needleX86) == 0;
+        } while (false);
+
+        return matched;
+    }
+
+    bool OwnerPathAllowsWindowsHandlePair(const std::wstring& stem, const std::wstring& path)
+    {
+        bool allowed = true;
+
+        do
+        {
+            if (!IsWindowsHostHandleStem(stem) || !PathHasDirectorySeparator(path))
+            {
+                break;
+            }
+
+            if (stem == L"explorer")
+            {
+                allowed = PathLooksLikeWindowsRootImage(path, L"explorer.exe");
+                break;
+            }
+
+            if (stem == L"openconsole" ||
+                stem == L"windowsterminal" ||
+                stem == L"windowstermina")
+            {
+                allowed = PathLooksLikeWindowsAppsHost(path) ||
+                    PathLooksLikeInboxSystem32(path);
+                break;
+            }
+
+            allowed = PathLooksLikeInboxSystem32(path);
+        } while (false);
+
+        return allowed;
+    }
+
+    bool IsSystemOwnerImage(
+        const std::wstring& image,
+        uint32_t pid,
+        const std::wstring& imagePath = std::wstring())
+    {
+        bool systemOwner = false;
+
+        do
+        {
+            if (pid == 0 || pid == 4)
+            {
+                systemOwner = true;
+                break;
+            }
+
+            if (!IsSystemOwnerName(image))
+            {
+                break;
+            }
+
+            const std::wstring& pathToCheck = imagePath.empty() ? image : imagePath;
+            if (!PathHasDirectorySeparator(pathToCheck))
+            {
+                // Name-only identity (15-byte ImageFileName). Do not treat that
+                // as proof of a fake path; WRITE/DUP is still gated below.
+                systemOwner = true;
+                break;
+            }
+
+            systemOwner = PathLooksLikeInboxSystem32(pathToCheck);
+        } while (false);
+
+        return systemOwner;
     }
 
     std::wstring ImageStem(const std::wstring& image)
@@ -274,11 +626,16 @@ namespace
     bool IsKnownOsHandlePair(
         const std::wstring& owner,
         const std::wstring& target,
-        uint32_t grantedAccess)
+        uint32_t grantedAccess,
+        const std::wstring& ownerPath = std::wstring())
     {
         const std::wstring ownerStem = ImageStem(owner);
         const std::wstring targetStem = ImageStem(target);
         if (ownerStem.empty() || targetStem.empty())
+        {
+            return false;
+        }
+        if (!OwnerPathAllowsWindowsHandlePair(ownerStem, ownerPath.empty() ? owner : ownerPath))
         {
             return false;
         }
@@ -340,25 +697,38 @@ namespace
         return false;
     }
 
+    bool IsWriteOrDupAccess(uint32_t grantedAccess)
+    {
+        return (grantedAccess & (kProcessVmWrite | kProcessVmOperation | kProcessDupHandle)) != 0;
+    }
+
+    bool SystemOwnerWriteIsUnexpected(const std::wstring& ownerImage)
+    {
+        const std::wstring stem = ImageStem(ownerImage);
+        // csrss attaches to the session with VM/DUP on a clean host. The
+        // remaining service hosts should not VM_WRITE a game or cheat target.
+        return stem == L"svchost" ||
+            stem == L"lsass" ||
+            stem == L"services" ||
+            stem == L"wininit" ||
+            stem == L"smss";
+    }
+
     bool IsExpectedVmDupHandle(
         const std::wstring& ownerImage,
         uint32_t ownerPid,
         const std::wstring& targetImage,
         uint32_t targetPid,
-        uint32_t grantedAccess = kProcessVmRead)
+        uint32_t grantedAccess = kProcessVmRead,
+        const std::wstring& ownerPath = std::wstring())
     {
         if (ownerPid == targetPid)
         {
             return true;
         }
-        if (IsSystemOwnerImage(ownerImage, ownerPid))
+        if (IsSystemOwnerImage(ownerImage, ownerPid, ownerPath))
         {
-            const std::wstring ownerStem = ImageStem(ownerImage);
-            const bool writeOrDup =
-                (grantedAccess & (kProcessVmWrite | kProcessVmOperation | kProcessDupHandle)) != 0;
-            // svchost.exe is the usual impersonation name. QUERY/VM_READ from
-            // real hosts is expected; VM_WRITE/DUP is not.
-            if (!(ownerStem == L"svchost" && writeOrDup))
+            if (!(IsWriteOrDupAccess(grantedAccess) && SystemOwnerWriteIsUnexpected(ownerImage)))
             {
                 return true;
             }
@@ -367,7 +737,7 @@ namespace
         {
             return true;
         }
-        return IsKnownOsHandlePair(ownerImage, targetImage, grantedAccess);
+        return IsKnownOsHandlePair(ownerImage, targetImage, grantedAccess, ownerPath);
     }
 
     bool EnumerateKernelProcesses(
@@ -500,6 +870,7 @@ namespace
                     }
                 }
 
+                ReadProcessImagePath(device, symbols, eprocess, &identity.ImagePath);
                 processes->push_back(identity);
 
                 uint64_t next = 0;
@@ -679,10 +1050,12 @@ bool HandleTableScanner::Scan(
             record.VmOperation = (record.GrantedAccess & kProcessVmOperation) != 0;
             record.DupHandle = (record.GrantedAccess & kProcessDupHandle) != 0;
 
+            std::wstring ownerPath;
             auto ownerIt = byPid.find(record.OwnerPid);
             if (ownerIt != byPid.end())
             {
                 record.OwnerImage = ownerIt->second.Image;
+                ownerPath = ownerIt->second.ImagePath;
             }
 
             auto objectIt = byEprocess.find(record.Object);
@@ -714,16 +1087,35 @@ bool HandleTableScanner::Scan(
 
             if (record.PointsToProcess &&
                 record.OwnerPid != record.TargetPid &&
-                (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle) &&
-                !IsExpectedVmDupHandle(
-                    record.OwnerImage,
-                    record.OwnerPid,
-                    record.TargetImage,
-                    record.TargetPid,
-                    record.GrantedAccess))
+                (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle))
             {
-                record.Suspicious = true;
-                record.Notes = L"non-system process holds VM/DUP access to another process";
+                if (!IsExpectedVmDupHandle(
+                        record.OwnerImage,
+                        record.OwnerPid,
+                        record.TargetImage,
+                        record.TargetPid,
+                        record.GrantedAccess,
+                        ownerPath))
+                {
+                    record.Suspicious = true;
+                    if (IsSystemOwnerName(record.OwnerImage) &&
+                        PathHasDirectorySeparator(ownerPath.empty() ? record.OwnerImage : ownerPath) &&
+                        !PathLooksLikeInboxSystem32(ownerPath.empty() ? record.OwnerImage : ownerPath))
+                    {
+                        record.Notes =
+                            L"system-named process from a non-system path holds VM/DUP access to another process";
+                    }
+                    else if (IsSystemOwnerName(record.OwnerImage) &&
+                        IsWriteOrDupAccess(record.GrantedAccess))
+                    {
+                        record.Notes =
+                            L"system process holds VM_WRITE/DUP access to another process";
+                    }
+                    else
+                    {
+                        record.Notes = L"non-system process holds VM/DUP access to another process";
+                    }
+                }
             }
 
             if (options.SuspiciousOnly && !record.Suspicious)
@@ -830,6 +1222,12 @@ bool HandleTableAccessMaskSelfTest()
         }
         if (!IsSystemOwnerImage(L"csrss.exe", 500) ||
             !IsSystemOwnerImage(L"C:\\Windows\\System32\\lsass.exe", 500) ||
+            IsSystemOwnerImage(L"C:\\Temp\\lsass.exe", 500) ||
+            IsSystemOwnerImage(L"csrss.exe", 500, L"C:\\Temp\\csrss.exe") ||
+            !IsSystemOwnerImage(
+                L"csrss.exe",
+                500,
+                L"C:\\Windows\\System32\\csrss.exe") ||
             IsSystemOwnerImage(L"winlogon.exe", 500) ||
             IsSystemOwnerImage(L"conhost.exe", 500) ||
             IsSystemOwnerImage(L"OpenConsole.exe", 500))
@@ -838,7 +1236,19 @@ bool HandleTableAccessMaskSelfTest()
         }
         if (IsSystemOwnerImage(L"cheat.exe", 1234) ||
             IsSystemOwnerImage(L"System", 1234) ||
-            !IsSystemOwnerImage(L"System", 4))
+            !IsSystemOwnerImage(L"System", 4) ||
+            IsSystemOwnerImage(
+                L"svchost.exe",
+                500,
+                L"C:\\cheat\\Windows\\System32\\svchost.exe") ||
+            !IsSystemOwnerImage(
+                L"svchost.exe",
+                500,
+                L"\\\\?\\C:\\Windows\\System32\\svchost.exe") ||
+            !IsSystemOwnerImage(
+                L"lsass.exe",
+                500,
+                L"\\\\.\\C:\\Windows\\System32\\lsass.exe"))
         {
             break;
         }
@@ -862,6 +1272,20 @@ bool HandleTableAccessMaskSelfTest()
             !IsExpectedVmDupHandle(L"SearchIndexer.exe", 10, L"SearchFilterHos", 11) ||
             !IsExpectedVmDupHandle(L"SearchIndexer.exe", 10, L"SearchProtocolH", 11) ||
             !IsExpectedVmDupHandle(L"OpenConsole.exe", 10, L"pwsh.exe", 11) ||
+            !IsExpectedVmDupHandle(
+                L"OpenConsole.exe",
+                10,
+                L"pwsh.exe",
+                11,
+                kProcessVmRead,
+                L"C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\\OpenConsole.exe") ||
+            IsExpectedVmDupHandle(
+                L"OpenConsole.exe",
+                10,
+                L"pwsh.exe",
+                11,
+                kProcessVmRead,
+                L"C:\\Temp\\OpenConsole.exe") ||
             !IsExpectedVmDupHandle(L"steam.exe", 10, L"steamwebhelper.exe", 11) ||
             !IsExpectedVmDupHandle(L"ProtonVPN.exe", 10, L"ProtonVPN Service.exe", 11) ||
             IsExpectedVmDupHandle(L"protonvp-hook.exe", 10, L"ProtonVPN.exe", 11) ||
@@ -896,7 +1320,56 @@ bool HandleTableAccessMaskSelfTest()
                 11,
                 kProcessVmWrite | kProcessDupHandle) ||
             IsExpectedVmDupHandle(L"nvidiacheat.exe", 10, L"rundll32.exe", 11) ||
-            IsExpectedVmDupHandle(L"nvcontainercheat.exe", 10, L"rundll32.exe", 11))
+            IsExpectedVmDupHandle(L"nvcontainercheat.exe", 10, L"rundll32.exe", 11) ||
+            IsExpectedVmDupHandle(
+                L"csrss.exe",
+                10,
+                L"game.exe",
+                11,
+                kProcessVmRead,
+                L"C:\\Temp\\csrss.exe") ||
+            !IsExpectedVmDupHandle(
+                L"csrss.exe",
+                10,
+                L"game.exe",
+                11,
+                kProcessVmRead,
+                L"C:\\Windows\\System32\\csrss.exe") ||
+            IsExpectedVmDupHandle(
+                L"lsass.exe",
+                10,
+                L"game.exe",
+                11,
+                kProcessVmWrite,
+                L"C:\\Windows\\System32\\lsass.exe") ||
+            IsExpectedVmDupHandle(
+                L"services.exe",
+                10,
+                L"game.exe",
+                11,
+                kProcessDupHandle,
+                L"C:\\Windows\\System32\\services.exe") ||
+            IsExpectedVmDupHandle(
+                L"winlogon.exe",
+                10,
+                L"dwm.exe",
+                11,
+                kProcessVmRead,
+                L"C:\\Temp\\winlogon.exe") ||
+            !IsExpectedVmDupHandle(
+                L"winlogon.exe",
+                10,
+                L"dwm.exe",
+                11,
+                kProcessVmRead,
+                L"C:\\Windows\\System32\\winlogon.exe") ||
+            !IsExpectedVmDupHandle(
+                L"svchost.exe",
+                10,
+                L"notepad.exe",
+                11,
+                kProcessVmRead,
+                L"C:\\Windows\\System32\\svchost.exe"))
         {
             break;
         }
