@@ -5314,6 +5314,15 @@ namespace
             diskEntry != liveEntry;
     }
 
+    bool PeIdentityLayoutDiffers(
+        uint32_t diskSize,
+        uint32_t diskEntry,
+        uint32_t liveSize,
+        uint32_t liveEntry)
+    {
+        return diskSize != liveSize || diskEntry != liveEntry;
+    }
+
     bool ProcessLooksLikeJitHost(const HuntProcessRecord& process)
     {
         bool jit = false;
@@ -5386,7 +5395,8 @@ namespace
         size_t length,
         uint64_t ip,
         uint64_t* target,
-        uint64_t* indirectSlot)
+        uint64_t* indirectSlot,
+        size_t addressSize = 8)
     {
         bool ok = false;
 
@@ -5413,12 +5423,24 @@ namespace
 
             if (length >= 6 && bytes[0] == 0xFF && bytes[1] == 0x25)
             {
-                int32_t disp = 0;
-                std::memcpy(&disp, bytes + 2, sizeof(disp));
-                const uint64_t slot = ip + 6 + static_cast<int64_t>(disp);
-                if (indirectSlot != nullptr)
+                if (addressSize == 4)
                 {
-                    *indirectSlot = slot;
+                    uint32_t slot32 = 0;
+                    std::memcpy(&slot32, bytes + 2, sizeof(slot32));
+                    if (indirectSlot != nullptr)
+                    {
+                        *indirectSlot = slot32;
+                    }
+                }
+                else
+                {
+                    int32_t disp = 0;
+                    std::memcpy(&disp, bytes + 2, sizeof(disp));
+                    const uint64_t slot = ip + 6 + static_cast<int64_t>(disp);
+                    if (indirectSlot != nullptr)
+                    {
+                        *indirectSlot = slot;
+                    }
                 }
                 ok = true;
                 break;
@@ -5484,6 +5506,118 @@ namespace
                 if (hasMovR10Rcx)
                 {
                     matched = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool IsSyscallGadgetModuleLeaf(const std::wstring& leaf)
+    {
+        return leaf == L"ntdll.dll" ||
+            leaf == L"win32u.dll" ||
+            leaf == L"wow64.dll" ||
+            leaf == L"wow64cpu.dll";
+    }
+
+    bool LooksLikeIndirectSyscallStub(
+        const uint8_t* bytes,
+        size_t length,
+        uint64_t ip,
+        uint64_t* trampolineTarget,
+        uint64_t* indirectSlot)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (bytes == nullptr ||
+                trampolineTarget == nullptr ||
+                length < 8)
+            {
+                break;
+            }
+            if (indirectSlot != nullptr)
+            {
+                *indirectSlot = 0;
+            }
+            *trampolineTarget = 0;
+
+            for (size_t look = 0; look + 5 < length; ++look)
+            {
+                if (bytes[look] != 0x4C ||
+                    bytes[look + 1] != 0x8B ||
+                    bytes[look + 2] != 0xD1)
+                {
+                    continue;
+                }
+
+                size_t after = look + 3;
+                if (after + 5 <= length && bytes[after] == 0xB8)
+                {
+                    after += 5;
+                }
+                if (after >= length)
+                {
+                    continue;
+                }
+
+                uint64_t target = 0;
+                uint64_t slot = 0;
+                if (!DecodeUserTrampolineTarget(
+                        bytes + after,
+                        length - after,
+                        ip + after,
+                        &target,
+                        &slot))
+                {
+                    continue;
+                }
+
+                *trampolineTarget = target;
+                if (indirectSlot != nullptr)
+                {
+                    *indirectSlot = slot;
+                }
+                matched = true;
+                break;
+            }
+        } while (false);
+
+        return matched;
+    }
+
+    bool LooksLikeWow64SysenterStub(const uint8_t* bytes, size_t length)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (bytes == nullptr || length < 2)
+            {
+                break;
+            }
+
+            for (size_t index = 0; index + 1 < length; ++index)
+            {
+                if (bytes[index] != 0x0F || bytes[index + 1] != 0x34)
+                {
+                    continue;
+                }
+
+                const size_t windowStart = index > 16 ? index - 16 : 0;
+                for (size_t look = windowStart; look < index; ++look)
+                {
+                    if (bytes[look] == 0xB8)
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched)
+                {
                     break;
                 }
             }
@@ -18783,9 +18917,9 @@ namespace
         } while (false);
     }
 
-    bool CanOpenDiskImagePath(const std::wstring& rawPath)
+    DWORD ProbeDiskImageOpenStatus(const std::wstring& rawPath)
     {
-        bool openable = false;
+        DWORD status = ERROR_INVALID_PARAMETER;
         HANDLE file = INVALID_HANDLE_VALUE;
 
         do
@@ -18796,6 +18930,12 @@ namespace
             }
 
             std::wstring openPath = DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(rawPath));
+            if (openPath.empty())
+            {
+                status = ERROR_PATH_NOT_FOUND;
+                break;
+            }
+
             file = CreateFileW(
                 openPath.c_str(),
                 GENERIC_READ,
@@ -18806,10 +18946,15 @@ namespace
                 nullptr);
             if (file == INVALID_HANDLE_VALUE)
             {
+                status = GetLastError();
+                if (status == ERROR_SUCCESS)
+                {
+                    status = ERROR_FILE_NOT_FOUND;
+                }
                 break;
             }
 
-            openable = true;
+            status = ERROR_SUCCESS;
         } while (false);
 
         if (file != INVALID_HANDLE_VALUE)
@@ -18817,7 +18962,17 @@ namespace
             CloseHandle(file);
         }
 
-        return openable;
+        return status;
+    }
+
+    bool DiskOpenErrorLooksLikeMissingImage(DWORD status)
+    {
+        return status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND;
+    }
+
+    bool CanOpenDiskImagePath(const std::wstring& rawPath)
+    {
+        return ProbeDiskImageOpenStatus(rawPath) == ERROR_SUCCESS;
     }
 
     bool ResolveHuntProcessProtectionField(
@@ -21118,33 +21273,93 @@ namespace
         } while (false);
     }
 
-    void AddKernelCallbackTableFindings(
+    bool ResolveWow64Peb32(
         DeviceClient& device,
-        HuntResult* result,
-        const HuntProcessRecord& process)
+        SymbolEngine& symbols,
+        const HuntProcessRecord& process,
+        uint64_t* peb32)
     {
+        bool ok = false;
+
         do
         {
-            if (result == nullptr ||
-                process.ProcessId <= 4 ||
-                !process.Kernel.HasPeb ||
-                process.Kernel.Peb == 0 ||
-                process.Modules.empty() ||
-                IsConsoleSubsystemHost(process) ||
-                !(process.PebLdrEnumerated || process.ToolhelpModuleEnumerated))
+            if (peb32 == nullptr || process.Kernel.Eprocess == 0)
             {
                 break;
             }
 
-            uint64_t table = 0;
-            if (!ReadProcessU64(device, process.Kernel, process.Kernel.Peb + 0x58, &table) ||
-                table == 0)
+            *peb32 = 0;
+            TypeFieldInfo field = {};
+            if (!symbols.FindField(L"nt!_EPROCESS", L"Wow64Process", &field, nullptr) &&
+                !FindFieldRecursive(
+                    symbols,
+                    {L"nt!_EPROCESS", L"_EPROCESS"},
+                    L"Wow64Process",
+                    &field))
+            {
+                break;
+            }
+            if (field.Offset > (~0ull - process.Kernel.Eprocess))
+            {
+                break;
+            }
+
+            uint64_t wow64 = 0;
+            if (!ReadKernelU64(device, process.Kernel.Eprocess + field.Offset, &wow64) ||
+                wow64 == 0)
+            {
+                break;
+            }
+
+            uint64_t candidate = 0;
+            if (IsUserAddress(wow64))
+            {
+                candidate = wow64;
+            }
+            else if (IsKernelAddress(wow64))
+            {
+                uint64_t nestedPeb = 0;
+                if (ReadKernelU64(device, wow64, &nestedPeb) && IsUserAddress(nestedPeb))
+                {
+                    candidate = nestedPeb;
+                }
+            }
+            if (candidate == 0 || candidate == process.Kernel.Peb)
+            {
+                break;
+            }
+
+            *peb32 = candidate;
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
+    void InspectKernelCallbackTable(
+        DeviceClient& device,
+        HuntResult* result,
+        const HuntProcessRecord& process,
+        uint64_t table,
+        size_t pointerSize,
+        const wchar_t* viewName)
+    {
+        do
+        {
+            if (result == nullptr ||
+                table == 0 ||
+                (pointerSize != 4 && pointerSize != 8))
             {
                 break;
             }
 
             std::map<std::wstring, std::wstring> evidence;
             evidence[L"kernel_callback_table"] = HuntHex(table, 16);
+            if (viewName != nullptr && *viewName != L'\0')
+            {
+                evidence[L"peb_view"] = viewName;
+            }
+            evidence[L"pointer_size"] = std::to_wstring(static_cast<uint32_t>(pointerSize));
 
             if (!IsUserAddress(table))
             {
@@ -21192,10 +21407,10 @@ namespace
             std::wstring ignored;
             bool slotsRead = false;
             const uint32_t slotReadSizes[] = {
-                static_cast<uint32_t>(128 * sizeof(uint64_t)),
-                static_cast<uint32_t>(32 * sizeof(uint64_t)),
-                static_cast<uint32_t>(8 * sizeof(uint64_t)),
-                static_cast<uint32_t>(4 * sizeof(uint64_t))
+                static_cast<uint32_t>(128 * pointerSize),
+                static_cast<uint32_t>(32 * pointerSize),
+                static_cast<uint32_t>(8 * pointerSize),
+                static_cast<uint32_t>(4 * pointerSize)
             };
             for (uint32_t slotBytes : slotReadSizes)
             {
@@ -21208,7 +21423,7 @@ namespace
                         slotBytes,
                         &slots,
                         &ignored) &&
-                    slots.size() >= sizeof(uint64_t))
+                    slots.size() >= pointerSize)
                 {
                     slotsRead = true;
                     break;
@@ -21220,11 +21435,11 @@ namespace
             }
 
             size_t hooked = 0;
-            const size_t count = slots.size() / sizeof(uint64_t);
+            const size_t count = slots.size() / pointerSize;
             for (size_t index = 0; index < count && hooked < 4; ++index)
             {
                 uint64_t entry = 0;
-                std::memcpy(&entry, slots.data() + (index * sizeof(uint64_t)), sizeof(entry));
+                std::memcpy(&entry, slots.data() + (index * pointerSize), pointerSize);
                 if (entry == 0)
                 {
                     continue;
@@ -21253,15 +21468,31 @@ namespace
                                 prologue.size(),
                                 entry,
                                 &trampolineTarget,
-                                &indirectSlot))
+                                &indirectSlot,
+                                pointerSize))
                         {
                             if (indirectSlot != 0 && IsUserAddress(indirectSlot))
                             {
-                                ReadProcessU64(
-                                    device,
-                                    process.Kernel,
-                                    indirectSlot,
-                                    &trampolineTarget);
+                                if (pointerSize == 4)
+                                {
+                                    uint32_t target32 = 0;
+                                    if (ReadProcessU32(
+                                            device,
+                                            process.Kernel,
+                                            indirectSlot,
+                                            &target32))
+                                    {
+                                        trampolineTarget = target32;
+                                    }
+                                }
+                                else
+                                {
+                                    ReadProcessU64(
+                                        device,
+                                        process.Kernel,
+                                        indirectSlot,
+                                        &trampolineTarget);
+                                }
                             }
                             if (trampolineTarget != 0 &&
                                 IsUserAddress(trampolineTarget) &&
@@ -21312,6 +21543,65 @@ namespace
                     reasons,
                     evidence);
                 ++hooked;
+            }
+        } while (false);
+    }
+
+    void AddKernelCallbackTableFindings(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                !process.Kernel.HasPeb ||
+                process.Kernel.Peb == 0 ||
+                process.Modules.empty() ||
+                IsConsoleSubsystemHost(process) ||
+                !(process.PebLdrEnumerated || process.ToolhelpModuleEnumerated))
+            {
+                break;
+            }
+
+            uint64_t table64 = 0;
+            if (ReadProcessU64(
+                    device,
+                    process.Kernel,
+                    process.Kernel.Peb + 0x58,
+                    &table64) &&
+                table64 != 0)
+            {
+                InspectKernelCallbackTable(
+                    device,
+                    result,
+                    process,
+                    table64,
+                    sizeof(uint64_t),
+                    L"peb64");
+            }
+
+            uint64_t peb32 = 0;
+            if (ResolveWow64Peb32(device, symbols, process, &peb32) && peb32 != 0)
+            {
+                uint32_t table32 = 0;
+                if (ReadProcessU32(
+                        device,
+                        process.Kernel,
+                        peb32 + 0x2C,
+                        &table32) &&
+                    table32 != 0)
+                {
+                    InspectKernelCallbackTable(
+                        device,
+                        result,
+                        process,
+                        table32,
+                        sizeof(uint32_t),
+                        L"peb32");
+                }
             }
         } while (false);
     }
@@ -21529,7 +21819,41 @@ namespace
                 {
                     continue;
                 }
-                if (!LooksLikeDirectSyscallStub(bytes.data(), bytes.size()))
+                uint64_t indirectTarget = 0;
+                uint64_t indirectSlot = 0;
+                const bool directStub = LooksLikeDirectSyscallStub(bytes.data(), bytes.size());
+                const bool wow64Sysenter =
+                    ProcessNativePebShowsWow64(process) &&
+                    LooksLikeWow64SysenterStub(bytes.data(), bytes.size());
+                const bool indirectStub = LooksLikeIndirectSyscallStub(
+                    bytes.data(),
+                    bytes.size(),
+                    vad.StartAddress,
+                    &indirectTarget,
+                    &indirectSlot);
+                bool indirectHitsSyscallGadget = false;
+                if (indirectStub)
+                {
+                    if (indirectSlot != 0 && IsUserAddress(indirectSlot))
+                    {
+                        ReadProcessU64(
+                            device,
+                            process.Kernel,
+                            indirectSlot,
+                            &indirectTarget);
+                    }
+                    if (indirectTarget != 0 && IsUserAddress(indirectTarget))
+                    {
+                        const HuntModuleRecord* gadget =
+                            FindLoaderModuleContainingAddress(process, indirectTarget);
+                        if (gadget != nullptr)
+                        {
+                            indirectHitsSyscallGadget = IsSyscallGadgetModuleLeaf(
+                                LeafName(gadget->Name.empty() ? gadget->Path : gadget->Name));
+                        }
+                    }
+                }
+                if (!directStub && !wow64Sysenter && !indirectHitsSyscallGadget)
                 {
                     continue;
                 }
@@ -21538,16 +21862,36 @@ namespace
                 evidence[L"vad"] = HuntHex(vad.VadAddress, 16);
                 evidence[L"start"] = HuntHex(vad.StartAddress, 16);
                 evidence[L"size"] = std::to_wstring(vad.Size);
+                std::vector<std::wstring> reasons = {L"private_executable_vad"};
+                std::wstring title =
+                    L"private executable VAD contains a direct syscall stub (Hell's Gate / Tartarus)";
+                if (directStub)
+                {
+                    AddUnique(&reasons, L"direct_syscall_stub");
+                }
+                if (wow64Sysenter)
+                {
+                    AddUnique(&reasons, L"wow64_sysenter_stub");
+                    title =
+                        L"private executable VAD contains a WOW64 sysenter stub";
+                }
+                if (indirectHitsSyscallGadget)
+                {
+                    AddUnique(&reasons, L"indirect_syscall_stub");
+                    evidence[L"gadget"] = HuntHex(indirectTarget, 16);
+                    title =
+                        L"private executable VAD jumps to an ntdll/win32u syscall gadget";
+                }
                 AddFinding(
                     result,
                     process,
                     L"high",
                     L"medium",
                     L"process_injection",
-                    L"private executable VAD contains a direct syscall stub (Hell's Gate / Tartarus)",
+                    title,
                     vad.StartAddress,
                     L"",
-                    {L"direct_syscall_stub", L"private_executable_vad"},
+                    reasons,
                     evidence);
                 ++findings;
             }
@@ -21849,7 +22193,31 @@ namespace
             }
 
             const std::wstring diskPath = BestProcessImagePath(process);
-            if (diskPath.empty() || !CanOpenDiskImagePath(diskPath))
+            if (diskPath.empty())
+            {
+                break;
+            }
+
+            const DWORD openStatus = ProbeDiskImageOpenStatus(diskPath);
+            if (DiskOpenErrorLooksLikeMissingImage(openStatus))
+            {
+                std::map<std::wstring, std::wstring> evidence;
+                evidence[L"disk_path"] = diskPath;
+                evidence[L"open_status"] = std::to_wstring(openStatus);
+                AddFinding(
+                    result,
+                    process,
+                    L"high",
+                    L"medium",
+                    L"process_image_integrity",
+                    L"process image path does not exist on disk while the image is still mapped (ghosting)",
+                    process.PebImageBase,
+                    BestProcessImageName(process),
+                    {L"process_ghosting_evidence", L"main_image_disk_missing"},
+                    evidence);
+                break;
+            }
+            if (openStatus != ERROR_SUCCESS)
             {
                 break;
             }
@@ -21883,11 +22251,9 @@ namespace
                 break;
             }
 
-            if (!PeIdentityStampsDiffer(
-                    disk.TimeDateStamp,
+            if (!PeIdentityLayoutDiffers(
                     disk.SizeOfImage,
                     disk.EntryPointRva,
-                    liveStamp,
                     liveSize,
                     liveEntry))
             {
@@ -24789,6 +25155,45 @@ bool HuntInjectedModuleSelfTest()
             !svchostKeepHasCommandMismatch ||
             !svchostK.BuiltinProfileMatched ||
             svchostKHasCommandMismatch)
+        {
+            break;
+        }
+
+        uint8_t indirectStub[] = {
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x01, 0x00, 0x00, 0x00,
+            0xE9, 0x00, 0x10, 0x00, 0x00
+        };
+        uint64_t indirectTarget = 0;
+        uint64_t indirectSlot = 0;
+        uint8_t sysenterStub[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x34 };
+        uint8_t x86Ff25[] = { 0xFF, 0x25, 0x00, 0x30, 0x00, 0x00 };
+        uint64_t x86Slot = 0;
+        uint64_t x86FfTarget = 0;
+        if (PeIdentityLayoutDiffers(0x2000, 0x1000, 0x2000, 0x1000) ||
+            !PeIdentityLayoutDiffers(0x2000, 0x1000, 0x3000, 0x1000) ||
+            !PeIdentityLayoutDiffers(0x2000, 0x1000, 0x2000, 0x2000) ||
+            !DiskOpenErrorLooksLikeMissingImage(ERROR_FILE_NOT_FOUND) ||
+            DiskOpenErrorLooksLikeMissingImage(ERROR_ACCESS_DENIED) ||
+            !LooksLikeIndirectSyscallStub(
+                indirectStub,
+                sizeof(indirectStub),
+                0x1000,
+                &indirectTarget,
+                &indirectSlot) ||
+            indirectTarget != 0x200Dull ||
+            !LooksLikeWow64SysenterStub(sysenterStub, sizeof(sysenterStub)) ||
+            LooksLikeDirectSyscallStub(sysenterStub, sizeof(sysenterStub)) ||
+            !DecodeUserTrampolineTarget(
+                x86Ff25,
+                sizeof(x86Ff25),
+                0x1000,
+                &x86FfTarget,
+                &x86Slot,
+                4) ||
+            x86Slot != 0x3000ull ||
+            !IsSyscallGadgetModuleLeaf(L"ntdll.dll") ||
+            IsSyscallGadgetModuleLeaf(L"kernel32.dll"))
         {
             break;
         }
@@ -28303,7 +28708,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 AddInjectedModuleFindings(result, process);
                 AddSideloadModuleFindings(result, process);
                 AddCoreOsDllPathFindings(result, process);
-                AddKernelCallbackTableFindings(device_, result, process);
+                AddKernelCallbackTableFindings(device_, symbols_, result, process);
                 AddInstrumentationCallbackFinding(device_, symbols_, result, process);
                 AddTrapFrameRipFindings(device_, symbols_, result, process);
                 AddDirectSyscallStubFindings(device_, result, process);
