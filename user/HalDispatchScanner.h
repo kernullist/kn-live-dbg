@@ -74,3 +74,4 @@ private:
 };
 
 std::wstring BuildHalDispatchJson(const HalDispatchScanResult& result);
+bool HalDispatchOwnershipSelfTest();

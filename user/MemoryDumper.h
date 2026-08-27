@@ -86,6 +86,12 @@ bool ProbeForPeHeader(const uint8_t* buffer, size_t length, PeHeaderProbe* resul
 // mapped image. dump-pe / !pool pe keep the looser ProbeForPeHeader.
 bool ProbeForPageStartPeHeader(const uint8_t* buffer, size_t length, PeHeaderProbe* result);
 
+// True when a PE probe has a page-aligned SizeOfImage that can actually live
+// in containingSize bytes (0 skips the fit check). Random ETW/console pool
+// bytes and coincidental FILE_HEADERs fail this even when ProbeForPeHeader
+// returned IsPe.
+bool PeProbeLooksLikeImage(const PeHeaderProbe& probe, uint64_t containingSize);
+
 // Dumps [address, address+length) verbatim to <path>. On read failure the
 // current chunk is zero-filled (if zeroFillOnFailure is true) and the dump
 // continues; otherwise the function returns false.

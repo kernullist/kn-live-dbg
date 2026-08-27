@@ -675,6 +675,40 @@ bool ProbeForPageStartPeHeader(const uint8_t* buffer, size_t length, PeHeaderPro
     return true;
 }
 
+bool PeProbeLooksLikeImage(const PeHeaderProbe& probe, uint64_t containingSize)
+{
+    bool ok = false;
+
+    do
+    {
+        if (!probe.IsPe)
+        {
+            break;
+        }
+        if (probe.Machine != IMAGE_FILE_MACHINE_AMD64 &&
+            probe.Machine != IMAGE_FILE_MACHINE_I386)
+        {
+            break;
+        }
+        if (probe.NumberOfSections == 0 || probe.NumberOfSections > 96)
+        {
+            break;
+        }
+        if (probe.SizeOfImage < 0x1000ull ||
+            (probe.SizeOfImage & 0xfffull) != 0)
+        {
+            break;
+        }
+        if (containingSize != 0 && probe.SizeOfImage > containingSize)
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DumpKernelRangeToFile(
     DeviceClient& device,
     uint64_t address,

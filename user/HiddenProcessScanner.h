@@ -17,6 +17,12 @@ struct HiddenProcessRecord
     bool InToolhelp = false;
     bool InHandleOwners = false;
     bool Suspicious = false;
+    bool Auxiliary = false;
+    bool Terminating = false;
+    bool HasActiveThreads = false;
+    bool HasExitTime = false;
+    uint32_t ActiveThreads = 0;
+    uint64_t ExitTime = 0;
     std::wstring Notes;
 };
 
@@ -29,6 +35,10 @@ struct HiddenProcessScanResult
     uint32_t ToolhelpCount = 0;
     uint32_t HandleOwnerCount = 0;
     uint32_t SuspiciousCount = 0;
+    uint32_t IgnoredCount = 0;
+    uint32_t IgnoredAuxiliaryCount = 0;
+    uint32_t IgnoredTerminatingCount = 0;
+    uint32_t IgnoredRaceCount = 0;
     bool CoverageComplete = false;
 };
 

@@ -594,6 +594,16 @@ namespace
         return ok;
     }
 
+    bool IsBrokenCircularFlink(uint64_t next, uint64_t current)
+    {
+        return next == 0 || next == current;
+    }
+
+    bool LooksLikeInlineUnloadedArrayHead(uint16_t length, uint16_t maximum, uint64_t buffer)
+    {
+        return length > 0 && LeftoverLooksLikeUnicodeString(length, maximum, buffer);
+    }
+
     bool NameInRecordList(
         const std::vector<MapperUnloadedRecord>& unloaded,
         const std::wstring& name)
@@ -751,9 +761,19 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
         if (!LeftoverIsKernelCanonical(array))
         {
             // Some builds store the array at the symbol instead of a pointer.
+            // Probe the real UNICODE_STRING Buffer; do not pass a dummy kernel
+            // VA that would accept any even Length.
             uint16_t length = 0;
+            uint16_t maximum = 0;
+            uint64_t buffer = 0;
+            uint64_t maxAddr = 0;
+            uint64_t bufAddr = 0;
             if (LeftoverReadU16(device_, symbol, &length, nullptr) &&
-                LeftoverLooksLikeUnicodeString(length, length, 0xFFFF800000000000ull))
+                LeftoverTryAdd(symbol, 2, &maxAddr) &&
+                LeftoverReadU16(device_, maxAddr, &maximum, nullptr) &&
+                LeftoverTryAdd(symbol, 8, &bufAddr) &&
+                LeftoverReadU64(device_, bufAddr, &buffer, nullptr) &&
+                LooksLikeInlineUnloadedArrayHead(length, maximum, buffer))
             {
                 array = symbol;
             }
@@ -980,24 +1000,31 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
                     uint64_t current = flink;
                     uint32_t steps = 0;
                     complete = true;
+                    std::set<uint64_t> visited;
+                    visited.insert(listHead);
+                    if (flink == 0)
+                    {
+                        complete = false;
+                    }
                     while (current != 0 && current != listHead && steps < kMaxPiddbListEntries)
                     {
                         ++steps;
-                        if (!LeftoverIsKernelCanonical(current))
+                        if (!LeftoverIsKernelCanonical(current) || !visited.insert(current).second)
                         {
                             complete = false;
                             break;
                         }
                         nodes.push_back(current);
                         uint64_t next = 0;
-                        if (!LeftoverReadU64(device_, current, &next, nullptr) || next == current)
+                        if (!LeftoverReadU64(device_, current, &next, nullptr) ||
+                            IsBrokenCircularFlink(next, current))
                         {
                             complete = false;
                             break;
                         }
                         current = next;
                     }
-                    if (steps >= kMaxPiddbListEntries)
+                    if (current != 0 && current != listHead)
                     {
                         complete = false;
                     }
@@ -1250,7 +1277,7 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
             }
 
             uint64_t next = 0;
-            LeftoverReadU64(device_, current, &next, nullptr);
+            const bool readNext = LeftoverReadU64(device_, current, &next, nullptr);
 
             if (named)
             {
@@ -1282,8 +1309,19 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
                 result->HashEntries.push_back(record);
             }
 
+            if (!readNext)
+            {
+                truncated = true;
+                break;
+            }
+
             if (listHeadAtSymbol)
             {
+                if (IsBrokenCircularFlink(next, current))
+                {
+                    truncated = true;
+                    break;
+                }
                 current = next;
             }
             else
@@ -1667,6 +1705,17 @@ bool MapperRemnantSelfTest()
         if (repeats.size() != 1 ||
             repeats[0].RepeatCount != 2 ||
             repeats[0].EndAddress != 0xFFFFF80010001400ull)
+        {
+            ok = false;
+            break;
+        }
+
+        if (!IsBrokenCircularFlink(0, 0xFFFFF80000001000ull) ||
+            !IsBrokenCircularFlink(0xFFFFF80000001000ull, 0xFFFFF80000001000ull) ||
+            IsBrokenCircularFlink(0xFFFFF80000002000ull, 0xFFFFF80000001000ull) ||
+            LooksLikeInlineUnloadedArrayHead(0, 0, 0xFFFFF80000001000ull) ||
+            LooksLikeInlineUnloadedArrayHead(8, 8, 0x10) ||
+            !LooksLikeInlineUnloadedArrayHead(8, 16, 0xFFFFF80000001000ull))
         {
             ok = false;
             break;

@@ -410,7 +410,8 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
             ++result->Scanned;
 
             PeHeaderProbe probe;
-            if (!ProbeForPeHeader(head.data(), head.size(), &probe))
+            if (!ProbeForPeHeader(head.data(), head.size(), &probe) ||
+                !PeProbeLooksLikeImage(probe, entrySize))
             {
                 continue;
             }

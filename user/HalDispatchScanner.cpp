@@ -81,20 +81,29 @@ namespace
                 ch = static_cast<wchar_t>(ch - L'A' + L'a');
             }
         }
+        const size_t slash = lower.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && slash + 1 < lower.size())
+        {
+            lower = lower.substr(slash + 1);
+        }
 
-        if (lower.find(L"ntoskrnl") != std::wstring::npos ||
-            lower.find(L"ntkrnl") != std::wstring::npos ||
-            lower == L"ntoskrnl.exe" ||
-            lower.find(L"hal.dll") != std::wstring::npos ||
-            lower.find(L"hal.") == 0 ||
-            lower.find(L"hala") != std::wstring::npos)
+        if (lower.find(L"ntoskrnl") == 0 ||
+            lower.find(L"ntkrnl") == 0 ||
+            lower == L"hal.dll" ||
+            (lower.size() >= 4 && lower.compare(0, 4, L"hal.") == 0) ||
+            (lower.size() >= 4 && lower.compare(0, 4, L"hala") == 0) ||
+            lower.find(L"halmacpi") == 0 ||
+            lower == L"pci.sys" ||
+            lower == L"acpi.sys" ||
+            lower == L"pciide.sys" ||
+            lower == L"pciidex.sys")
         {
             return true;
         }
 
-        // Some builds fold HAL into ntoskrnl. Loaded third-party ownership is
-        // still unexpected for these tables and is classified separately from
-        // a callback that is outside every loaded image.
+        // Some builds fold HAL into ntoskrnl. Inbox PCI/ACPI register HAL
+        // private-dispatch overrides (PciTranslateBusAddress, ACPILateRestore).
+        // Loaded third-party ownership is still unexpected.
         return false;
     }
 
@@ -556,4 +565,17 @@ std::wstring BuildHalDispatchJson(const HalDispatchScanResult& result)
 
     out += L"]}";
     return out;
+}
+
+bool HalDispatchOwnershipSelfTest()
+{
+    return ModuleLooksLikeNtOrHal(L"pci.sys") &&
+        ModuleLooksLikeNtOrHal(L"ACPI.sys") &&
+        ModuleLooksLikeNtOrHal(L"pciide.sys") &&
+        ModuleLooksLikeNtOrHal(L"ntoskrnl.exe") &&
+        ModuleLooksLikeNtOrHal(L"hal.dll") &&
+        ModuleLooksLikeNtOrHal(L"halaacpi.dll") &&
+        !ModuleLooksLikeNtOrHal(L"capcom.sys") &&
+        !ModuleLooksLikeNtOrHal(L"notahalaware.sys") &&
+        !ModuleLooksLikeNtOrHal(L"");
 }
