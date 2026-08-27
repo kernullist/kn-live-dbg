@@ -47,7 +47,7 @@ struct PoolScanResult
     uint64_t TotalEntries = 0;        // raw count from kernel before any filtering
     uint64_t NonPagedCount = 0;
     uint64_t PagedCount = 0;
-    uint64_t MatchingCount = 0;       // entries kept after filtering
+    uint64_t MatchingCount = 0;       // entries that passed filters, including those elided by /limit
     uint64_t QueryBufferBytes = 0;
     uint32_t QueryRetries = 0;
     uint64_t TagStatCount = 0;           // kernel Count from SystemPoolTagInformation

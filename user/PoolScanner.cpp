@@ -737,6 +737,7 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
 
         result->AttributesAttempted = options.AnnotateAttributes;
         bool limitNoted = false;
+        uint64_t matchingCount = 0;
 
         for (ULONG i = 0; i < safeCount; ++i)
         {
@@ -788,6 +789,10 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
                 }
             }
 
+            if (!options.WxOnly)
+            {
+                ++matchingCount;
+            }
             if (options.LimitEntries != 0 && result->Entries.size() >= options.LimitEntries)
             {
                 if (!limitNoted)
@@ -893,12 +898,13 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
                 {
                     continue;
                 }
+                ++matchingCount;
             }
 
             result->Entries.push_back(std::move(rec));
         }
 
-        result->MatchingCount = result->Entries.size();
+        result->MatchingCount = matchingCount;
         ok = true;
     } while (false);
 

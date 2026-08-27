@@ -20854,15 +20854,69 @@ static std::wstring DriverLeafName(const std::wstring& value)
     return value.substr(slash + 1);
 }
 
+static std::wstring DriverCompareKey(const std::wstring& value)
+{
+    std::wstring leaf = ToLower(DriverLeafName(value));
+    const size_t dot = leaf.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot > 0)
+    {
+        const std::wstring ext = leaf.substr(dot);
+        if (ext == L".sys" || ext == L".dll" || ext == L".exe")
+        {
+            leaf.resize(dot);
+        }
+    }
+    return leaf;
+}
+
+static bool DevstackDriverNameEquals(const DriverIntegrityRecord& driver, const std::wstring& target)
+{
+    const std::wstring want = DriverCompareKey(target);
+    if (want.empty())
+    {
+        return false;
+    }
+    if (DriverCompareKey(driver.Name) == want)
+    {
+        return true;
+    }
+    return !driver.OwningModule.empty() && DriverCompareKey(driver.OwningModule) == want;
+}
+
+static bool DevstackDriverNameSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        DriverIntegrityRecord pci = {};
+        pci.Name = L"pci";
+        pci.OwningModule = L"pci.sys";
+        DriverIntegrityRecord kbd = {};
+        kbd.Name = L"KbdClass";
+        if (!DevstackDriverNameEquals(pci, L"pci") ||
+            !DevstackDriverNameEquals(pci, L"pci.sys") ||
+            !DevstackDriverNameEquals(pci, L"\\Driver\\PCI") ||
+            !DevstackDriverNameEquals(kbd, L"kbdclass") ||
+            DevstackDriverNameEquals(pci, L"pciide") ||
+            DevstackDriverNameEquals(kbd, L"class"))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 static uint64_t DevstackAddressFromInspect(
     const std::wstring& target,
     const DriverObjectInspectResult& inspect)
 {
-    const std::wstring want = ToLower(DriverLeafName(target));
     const DriverIntegrityRecord* chosen = nullptr;
     for (const DriverIntegrityRecord& driver : inspect.Drivers)
     {
-        if (ToLower(DriverLeafName(driver.Name)) == want)
+        if (DevstackDriverNameEquals(driver, target))
         {
             chosen = &driver;
             break;
@@ -20957,7 +21011,7 @@ static void HandleDevstackCommand(
         {
             DriverObjectInspectResult inspect = {};
             std::wstring inspectError;
-            if (!scanner.InspectDriverObject(target, false, true, &inspect, &inspectError) ||
+            if (!scanner.InspectDriverObject(target, false, true, &inspect, &inspectError, true) ||
                 inspect.Drivers.empty())
             {
                 std::wcerr << L"!devstack: target must be a kernel DEVICE_OBJECT address or driver name";
@@ -20971,11 +21025,10 @@ static void HandleDevstackCommand(
             address = DevstackAddressFromInspect(target, inspect);
             if (address < 0xffff800000000000ull)
             {
-                const std::wstring want = ToLower(DriverLeafName(target));
                 bool exactName = false;
                 for (const DriverIntegrityRecord& driver : inspect.Drivers)
                 {
-                    if (ToLower(DriverLeafName(driver.Name)) == want)
+                    if (DevstackDriverNameEquals(driver, target))
                     {
                         exactName = true;
                         break;
@@ -21276,8 +21329,9 @@ static void PrintHiddenProcHelp()
     std::wcout << L"cross-views ActiveProcessLinks, SystemProcessInformation, Toolhelp, and handle\n";
     std::wcout << L"owners. Live processes in the kernel list but missing from both user snapshots,\n";
     std::wcout << L"or stably visible to user APIs but missing from ActiveProcessLinks, are marked\n";
-    std::wcout << L"suspicious. Threadless clones, exiting processes, and auxiliary snapshot processes\n";
-    std::wcout << L"are ignored. Full PspCidTable coverage stays on !hunt /deep.\n";
+    std::wcout << L"suspicious. Auxiliary snapshot clones and exiting processes are ignored.\n";
+    std::wcout << L"A live kernel-only process with ActiveThreads==0 is still suspicious.\n";
+    std::wcout << L"Full PspCidTable coverage stays on !hunt /deep.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /json <path>  write kn-live-dbg.hidden-process.v1.\n";
@@ -21359,9 +21413,19 @@ static void HandleHiddenProcCommand(
         }
         for (const HiddenProcessRecord& record : result.Records)
         {
-            PrintColoredText(
-                record.Suspicious ? L"[hiddenproc.suspicious]" : L"[hiddenproc]",
-                record.Suspicious ? KNDBG_COLOR_WARN : KNDBG_COLOR_TITLE);
+            const wchar_t* tag = L"[hiddenproc]";
+            WORD color = KNDBG_COLOR_TITLE;
+            if (record.Suspicious)
+            {
+                tag = L"[hiddenproc.suspicious]";
+                color = KNDBG_COLOR_WARN;
+            }
+            else if (record.Auxiliary || record.Terminating)
+            {
+                tag = L"[hiddenproc.ignored]";
+                color = KNDBG_COLOR_WARN;
+            }
+            PrintColoredText(tag, color);
             std::wcout << L" pid=" << record.ProcessId
                        << L" " << record.ImageName
                        << L" kernel=" << (record.InKernelList ? L"y" : L"n")
@@ -29965,6 +30029,10 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             DeviceStackWalkSelfTest(),
             L"device-stack-cycle-guard");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            DevstackDriverNameSelfTest(),
+            L"devstack-exact-driver-name");
         CheckConsoleSurfaceSelfTest(
             &context,
             InputStackKnownDriverSelfTest(),

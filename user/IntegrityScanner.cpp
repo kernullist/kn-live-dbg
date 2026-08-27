@@ -74,11 +74,39 @@ namespace
         return _wcsicmp(a.c_str(), b.c_str()) == 0;
     }
 
-    bool SectionLooksDiscarded(const std::wstring& name, uint32_t characteristics)
+    bool ImageAllowsDiscardedInit(const std::wstring& imageName)
     {
-        return (characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0 ||
-            EqualsNoCaseLocal(name, L"INIT") ||
-            EqualsNoCaseLocal(name, L"INITKDBG");
+        std::wstring image = ToLowerCopy(imageName);
+        const size_t slash = image.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && slash + 1 < image.size())
+        {
+            image = image.substr(slash + 1);
+        }
+        return image == L"ntoskrnl.exe" ||
+            image == L"ntkrnlmp.exe" ||
+            image == L"ntkrnlpa.exe" ||
+            image == L"ntkrnlup.exe" ||
+            image == L"hal.dll" ||
+            image == L"halaacpi.dll" ||
+            image == L"halacpi.dll" ||
+            image == L"halmacpi.dll";
+    }
+
+    bool SectionLooksDiscarded(
+        const std::wstring& name,
+        uint32_t characteristics,
+        const std::wstring& imageName)
+    {
+        (void)characteristics;
+        // Live Characteristics and section names are attacker-controlled on a
+        // mapped third-party image. Only inbox NT/HAL INIT* names skip
+        // query-failed evidence.
+        if (!EqualsNoCaseLocal(name, L"INIT") &&
+            !EqualsNoCaseLocal(name, L"INITKDBG"))
+        {
+            return false;
+        }
+        return ImageAllowsDiscardedInit(imageName);
     }
 
     bool IsKernelAddress(uint64_t value)
@@ -1018,13 +1046,47 @@ namespace
         return ok;
     }
 
-    bool DriverMatches(const std::wstring& name, const std::wstring& path, const std::wstring& filter)
+    std::wstring DriverLeafKey(const std::wstring& value)
+    {
+        std::wstring leaf = ToLowerCopy(value);
+        const size_t slash = leaf.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && slash + 1 < leaf.size())
+        {
+            leaf = leaf.substr(slash + 1);
+        }
+        const size_t dot = leaf.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot > 0)
+        {
+            const std::wstring ext = leaf.substr(dot);
+            if (ext == L".sys" || ext == L".dll" || ext == L".exe")
+            {
+                leaf.resize(dot);
+            }
+        }
+        return leaf;
+    }
+
+    bool DriverMatches(
+        const std::wstring& name,
+        const std::wstring& path,
+        const std::wstring& filter,
+        bool exactName)
     {
         bool matched = false;
 
         do
         {
             std::wstring lowered = ToLowerCopy(filter);
+            if (exactName)
+            {
+                const std::wstring want = DriverLeafKey(filter);
+                if (want.empty() || want == L"all")
+                {
+                    break;
+                }
+                matched = DriverLeafKey(name) == want || DriverLeafKey(path) == want;
+                break;
+            }
             if (lowered.empty() || lowered == L"all")
             {
                 matched = true;
@@ -3150,7 +3212,10 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                 section.PageAttributeQueryFailed = true;
                                                 section.PageAttributeError = firstProbe.Error;
                                                 if (section.Executable &&
-                                                    !SectionLooksDiscarded(section.Name, section.Characteristics))
+                                                    !SectionLooksDiscarded(
+                                                        section.Name,
+                                                        section.Characteristics,
+                                                        record.ImageName))
                                                 {
                                                     section.MismatchEvidence = true;
                                                     AddSectionReason(&section, L"exec_first_page_query_failed", L"first executable page translation failed");
@@ -3195,7 +3260,10 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                             section.PageAttributeError = lastProbe.Error;
                                                         }
                                                         if (section.Executable &&
-                                                            !SectionLooksDiscarded(section.Name, section.Characteristics))
+                                                            !SectionLooksDiscarded(
+                                                                section.Name,
+                                                                section.Characteristics,
+                                                                record.ImageName))
                                                         {
                                                             section.MismatchEvidence = true;
                                                             AddSectionReason(&section, L"exec_last_page_query_failed", L"last executable page translation failed");
@@ -3274,7 +3342,10 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                                 section.PageAttributeError = midProbe.Error;
                                                             }
                                                             if (section.Executable &&
-                                                                !SectionLooksDiscarded(section.Name, section.Characteristics))
+                                                                !SectionLooksDiscarded(
+                                                                    section.Name,
+                                                                    section.Characteristics,
+                                                                    record.ImageName))
                                                             {
                                                                 section.MismatchEvidence = true;
                                                                 AddSectionReason(
@@ -3802,7 +3873,7 @@ bool IntegrityScanner::ScanDrivers(const DriverIntegrityOptions& options, Driver
             }
 
             ++result->DriversScanned;
-            if (!DriverMatches(object.Name, object.Path, options.DriverFilter))
+            if (!DriverMatches(object.Name, object.Path, options.DriverFilter, options.ExactName))
             {
                 continue;
             }
@@ -3910,7 +3981,8 @@ bool IntegrityScanner::InspectDriverObject(
     bool includeDispatch,
     bool includeDevices,
     DriverObjectInspectResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    bool exactName)
 {
     bool ok = false;
     (void)includeDispatch;
@@ -4001,6 +4073,7 @@ bool IntegrityScanner::InspectDriverObject(
         {
             DriverIntegrityOptions options = {};
             options.DriverFilter = filter;
+            options.ExactName = exactName;
             DriverIntegrityResult drivers = {};
             if (!ScanDrivers(options, &drivers, error))
             {
@@ -4372,9 +4445,11 @@ std::wstring BuildDriverObjectJson(const DriverObjectInspectResult& result)
 
 bool IntegrityDiscardedSectionSelfTest()
 {
-    return SectionLooksDiscarded(L"INIT", 0) &&
-        SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_DISCARDABLE) &&
-        !SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_EXECUTE);
+    return SectionLooksDiscarded(L"INIT", 0, L"ntoskrnl.exe") &&
+        SectionLooksDiscarded(L"INITKDBG", IMAGE_SCN_MEM_EXECUTE, L"ntkrnlmp.exe") &&
+        !SectionLooksDiscarded(L"INIT", 0, L"cheat.sys") &&
+        !SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_DISCARDABLE, L"ntoskrnl.exe") &&
+        !SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_EXECUTE, L"ntoskrnl.exe");
 }
 
 bool IntegrityIatOwnerSelfTest()
