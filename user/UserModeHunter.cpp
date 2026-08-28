@@ -25298,6 +25298,89 @@ bool HuntInjectedModuleSelfTest()
     return ok;
 }
 
+bool EnumerateCidProcessIds(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::vector<uint32_t>* processIds,
+    std::wstring* warning,
+    bool* complete)
+{
+    bool ok = false;
+
+    do
+    {
+        if (complete != nullptr)
+        {
+            *complete = false;
+        }
+        if (processIds == nullptr)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"CID process enumeration requires an output vector";
+            }
+            break;
+        }
+        processIds->clear();
+
+        TypeFieldInfo dtbField = {};
+        std::wstring ignored;
+        if (!symbols.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
+            !symbols.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
+            !symbols.FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"CID process enumeration: DirectoryTableBase was not resolved";
+            }
+            break;
+        }
+
+        uint32_t userDtbOffset = 0;
+        TypeFieldInfo userDtbField = {};
+        if (symbols.FindField(L"nt!_KPROCESS", L"UserDirectoryTableBase", &userDtbField, &ignored) ||
+            symbols.FindField(L"nt!_EPROCESS", L"UserDirectoryTableBase", &userDtbField, &ignored))
+        {
+            if (userDtbField.Offset <= 0x4000)
+            {
+                userDtbOffset = static_cast<uint32_t>(userDtbField.Offset);
+            }
+        }
+
+        CidDirectEnumerationResult direct = {};
+        const bool walkComplete = ApplyCidTableDirectObjectView(
+            device,
+            symbols,
+            static_cast<uint32_t>(dtbField.Offset),
+            userDtbOffset,
+            4,
+            &direct);
+        if (warning != nullptr && !direct.Summary.empty())
+        {
+            *warning = direct.Summary;
+        }
+        processIds->reserve(direct.Processes.size());
+        for (const auto& item : direct.Processes)
+        {
+            if (item.first > 4)
+            {
+                processIds->push_back(item.first);
+            }
+        }
+        if (complete != nullptr)
+        {
+            *complete = walkComplete;
+        }
+        ok = walkComplete || !processIds->empty();
+        if (!ok && warning != nullptr && warning->empty())
+        {
+            *warning = L"CID process enumeration returned no process CIDs";
+        }
+    } while (false);
+
+    return ok;
+}
+
 bool HuntCidTableAnchorSelfTest()
 {
     const uint64_t processBase =

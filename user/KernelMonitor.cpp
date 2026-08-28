@@ -15,6 +15,7 @@
 #include "NmiScanner.h"
 #include "OrphanKernelPageScanner.h"
 #include "PoolPeHunter.h"
+#include "ProcessTriageScanner.h"
 #include "SsdtScanner.h"
 #include "VbsScanner.h"
 #include "WfpCalloutScanner.h"
@@ -1246,6 +1247,218 @@ namespace
                 *imageBase = base;
                 ok = true;
             }
+        } while (false);
+        return ok;
+    }
+
+    bool KmonExeRegionLooksPrivate(
+        bool queried,
+        bool committed,
+        DWORD mbiType,
+        bool kernelPrivate)
+    {
+        bool looksPrivate = false;
+        do
+        {
+            if (kernelPrivate)
+            {
+                looksPrivate = true;
+                break;
+            }
+            // VirtualQueryEx did not run. MEMORY_BASIC_INFORMATION is zeroed
+            // and Type==0 is not MEM_IMAGE, so treating it as private would
+            // hollow-flag every PPL / no-handle process.
+            if (!queried)
+            {
+                break;
+            }
+            if (committed && mbiType != MEM_IMAGE)
+            {
+                looksPrivate = true;
+            }
+        } while (false);
+        return looksPrivate;
+    }
+
+    bool KmonProtectIsRwx(DWORD protect)
+    {
+        return (protect & 0xffu) == PAGE_EXECUTE_READWRITE;
+    }
+
+    bool VadCoversUserAddress(const ProcessVadRecord& record, uint64_t address)
+    {
+        bool covers = false;
+        do
+        {
+            if (address == 0 ||
+                record.StartAddress == 0 ||
+                record.EndAddress < record.StartAddress)
+            {
+                break;
+            }
+            if (address >= record.StartAddress && address <= record.EndAddress)
+            {
+                covers = true;
+            }
+        } while (false);
+        return covers;
+    }
+
+    bool QueryKernelVadScan(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        ProcessVadScanResult* vadResult,
+        bool* scanned,
+        bool scanHiddenPtes)
+    {
+        bool ok = false;
+        do
+        {
+            if (scanned != nullptr)
+            {
+                *scanned = false;
+            }
+            if (vadResult != nullptr)
+            {
+                *vadResult = ProcessVadScanResult{};
+            }
+            if (vadResult == nullptr ||
+                device == nullptr ||
+                symbols == nullptr ||
+                pid <= 4 ||
+                !device->IsOpen())
+            {
+                break;
+            }
+
+            TypeFieldInfo dtbField = {};
+            std::wstring ignored;
+            if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            {
+                break;
+            }
+
+            ProcessAddressContext ctx = {};
+            if (!device->ResolveProcess(
+                    pid,
+                    static_cast<uint32_t>(dtbField.Offset),
+                    0,
+                    &ctx,
+                    &ignored) ||
+                ctx.Eprocess == 0)
+            {
+                break;
+            }
+
+            ProcessVadScanOptions options;
+            options.Target.ProcessId = pid;
+            options.Target.Eprocess = ctx.Eprocess;
+            options.Target.DirectoryTableBase = ctx.DirectoryTableBase;
+            options.Target.UserDirectoryTableBase = ctx.UserDirectoryTableBase;
+            options.Target.CreateTime =
+                QueryEprocessCreateTime(device, symbols, nullptr, ctx.Eprocess);
+            options.Target.HasCreateTime = options.Target.CreateTime != 0;
+            // Probe private VADs for MZ so header-intact manual maps still
+            // classify when VirtualQueryEx is denied (PPL / ObCallback).
+            options.ProbePe = true;
+            // Full user page-table walks are expensive. Only watched game
+            // targets get hidden-PTE coverage; builtin PPL hosts stay on
+            // VAD + PE probe.
+            options.ScanHiddenPtes = scanHiddenPtes;
+            options.HiddenPteExecutableOnly = scanHiddenPtes;
+            options.HiddenPteLimit = scanHiddenPtes ? 32u : 0u;
+
+            ProcessTriageScanner scanner(*device, *symbols);
+            if (!scanner.ScanVad(options, vadResult, &ignored))
+            {
+                break;
+            }
+            if (scanned != nullptr)
+            {
+                *scanned = true;
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool QueryInstrumentationCallback(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        uint64_t* callback)
+    {
+        bool ok = false;
+        do
+        {
+            if (callback != nullptr)
+            {
+                *callback = 0;
+            }
+            if (callback == nullptr ||
+                device == nullptr ||
+                symbols == nullptr ||
+                pid <= 4 ||
+                !device->IsOpen())
+            {
+                break;
+            }
+
+            TypeFieldInfo dtbField = {};
+            TypeFieldInfo icField = {};
+            std::wstring ignored;
+            if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            {
+                break;
+            }
+            if (!symbols->FindField(L"nt!_KPROCESS", L"InstrumentationCallback", &icField, &ignored))
+            {
+                break;
+            }
+            if (icField.Offset > (std::numeric_limits<uint64_t>::max)() - sizeof(uint64_t))
+            {
+                break;
+            }
+
+            ProcessAddressContext ctx = {};
+            if (!device->ResolveProcess(
+                    pid,
+                    static_cast<uint32_t>(dtbField.Offset),
+                    0,
+                    &ctx,
+                    &ignored) ||
+                ctx.Eprocess == 0)
+            {
+                break;
+            }
+            if (icField.Offset > (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!device->ReadMemory(
+                    ctx.Eprocess + static_cast<uint64_t>(icField.Offset),
+                    sizeof(uint64_t),
+                    &bytes,
+                    &ignored) ||
+                bytes.size() < sizeof(uint64_t))
+            {
+                break;
+            }
+            uint64_t value = 0;
+            std::memcpy(&value, bytes.data(), sizeof(value));
+            if (value == 0 || !IsUserModeImageBase(value))
+            {
+                break;
+            }
+            *callback = value;
+            ok = true;
         } while (false);
         return ok;
     }
@@ -4873,23 +5086,56 @@ void KernelMonitor::ScanUserModeHostility()
                     L"peb=" + HexU64(pebImageBase) + L" ldr=" + HexU64(moduleBase),
                     pid);
             }
+            MEMORY_BASIC_INFORMATION mbi = {};
+            bool queried = false;
+            if (exeRegion != 0 &&
+                processHandle != nullptr &&
+                VirtualQueryEx(
+                    processHandle,
+                    reinterpret_cast<LPCVOID>(exeRegion),
+                    &mbi,
+                    sizeof(mbi)) == sizeof(mbi))
+            {
+                queried = true;
+            }
+            ProcessVadScanResult kernelVad = {};
+            ProcessVadRecord exeVad = {};
+            bool kernelVadScanned = false;
+            const bool hasKernelVadScan =
+                !queried &&
+                (watched || builtin) &&
+                QueryKernelVadScan(
+                    device,
+                    symbols,
+                    pid,
+                    &kernelVad,
+                    &kernelVadScanned,
+                    watched);
+            bool hasKernelVad = false;
+            if (hasKernelVadScan && exeRegion != 0)
+            {
+                for (const ProcessVadRecord& record : kernelVad.Records)
+                {
+                    if (VadCoversUserAddress(record, exeRegion))
+                    {
+                        exeVad = record;
+                        hasKernelVad = true;
+                        break;
+                    }
+                }
+            }
             if (exeRegion != 0)
             {
-                MEMORY_BASIC_INFORMATION mbi = {};
-                bool queried = false;
-                if (processHandle != nullptr &&
-                    VirtualQueryEx(
-                        processHandle,
-                        reinterpret_cast<LPCVOID>(exeRegion),
-                        &mbi,
-                        sizeof(mbi)) == sizeof(mbi))
-                {
-                    queried = true;
-                }
-                const bool committed = queried && mbi.State == MEM_COMMIT;
-                const bool privateExe =
+                bool committed = queried && mbi.State == MEM_COMMIT;
+                bool privateExe =
                     committed &&
                     (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED);
+                if (hasKernelVad)
+                {
+                    committed = true;
+                    privateExe =
+                        exeVad.HasPrivateMemory && exeVad.PrivateMemory;
+                }
 
                 bool wxExe = false;
                 DWORD wxProtect = 0;
@@ -4927,6 +5173,15 @@ void KernelMonitor::ScanUserModeHostility()
                     }
                 }
 
+                if (!wxExe &&
+                    hasKernelVad &&
+                    (builtin || watched) &&
+                    exeVad.WritableExecutable)
+                {
+                    wxExe = true;
+                    wxProtect = exeVad.Protection;
+                }
+
                 std::wstring mappedPath;
                 bool mappedQueryOk = false;
                 if (hasVmRead && processHandle != nullptr)
@@ -4934,7 +5189,8 @@ void KernelMonitor::ScanUserModeHostility()
                     mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath);
                 }
 
-                if (queried && !committed)
+                if ((queried && !committed) ||
+                    (!queried && kernelVadScanned && !hasKernelVad))
                 {
                     EmitUnique(
                         L"process.hollow",
@@ -4946,7 +5202,11 @@ void KernelMonitor::ScanUserModeHostility()
                         L"state=" + std::to_wstring(mbi.State),
                         pid);
                 }
-                else if (privateExe || (committed && mbi.Type != MEM_IMAGE))
+                else if (KmonExeRegionLooksPrivate(
+                    queried,
+                    committed,
+                    mbi.Type,
+                    privateExe && hasKernelVad))
                 {
                     EmitUnique(
                         L"process.hollow",
@@ -4955,7 +5215,10 @@ void KernelMonitor::ScanUserModeHostility()
                         L"exe_private",
                         L"main EXE region is not a file-backed image mapping pid=" +
                             std::to_wstring(pid) + L" " + leaf,
-                        L"type=" + std::to_wstring(mbi.Type),
+                        queried
+                            ? (L"type=" + std::to_wstring(mbi.Type))
+                            : (L"vad_private=" +
+                                std::to_wstring(exeVad.PrivateMemory ? 1 : 0)),
                         pid);
                 }
                 else if (!mappedPath.empty())
@@ -5338,7 +5601,7 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 uint64_t cursor = 0;
                 uint32_t orphans = 0;
-                for (int step = 0; step < 4096 && orphans < 2; ++step)
+                for (int step = 0; step < 4096 && orphans < 4; ++step)
                 {
                     MEMORY_BASIC_INFORMATION region = {};
                     if (VirtualQueryEx(
@@ -5352,52 +5615,83 @@ void KernelMonitor::ScanUserModeHostility()
                     const uint64_t alloc = reinterpret_cast<uint64_t>(region.AllocationBase);
                     const uint64_t next =
                         reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize;
+                    const bool mappedOrPrivate =
+                        region.Type == MEM_PRIVATE ||
+                        region.Type == MEM_IMAGE ||
+                        region.Type == MEM_MAPPED;
                     const bool interesting =
                         region.State == MEM_COMMIT &&
                         region.RegionSize >= 0x1000 &&
                         alloc != 0 &&
                         alloc != exeRegion &&
                         !AddressInModuleRanges(alloc, moduleRanges) &&
-                        (region.Type == MEM_PRIVATE || region.Type == MEM_IMAGE) &&
+                        mappedOrPrivate &&
                         (ProtectHasExecute(region.Protect) || region.Type == MEM_IMAGE);
                     if (interesting)
                     {
                         std::vector<uint8_t> head;
-                        if (ReadProcessBytes(
-                                device,
-                                symbols,
-                                processHandle,
-                                pid,
-                                alloc,
-                                2,
-                                &head) &&
+                        const bool gotHead = ReadProcessBytes(
+                            device,
+                            symbols,
+                            processHandle,
+                            pid,
+                            alloc,
+                            2,
+                            &head);
+                        const bool mz =
+                            gotHead &&
                             head.size() >= 2 &&
                             head[0] == 'M' &&
-                            head[1] == 'Z')
+                            head[1] == 'Z';
+                        const bool rwx =
+                            (watched || builtin) &&
+                            KmonProtectIsRwx(region.Protect);
+                        if (mz)
                         {
                             std::wstring mappedOrphan;
-                            if (region.Type == MEM_IMAGE)
+                            if (region.Type == MEM_IMAGE || region.Type == MEM_MAPPED)
                             {
                                 QueryMappedImagePath(processHandle, alloc, &mappedOrphan);
                             }
-                            if (region.Type == MEM_PRIVATE ||
-                                region.Type == MEM_IMAGE)
+                            const wchar_t* layer = L"exe_orphan_private";
+                            if (region.Type == MEM_IMAGE)
                             {
-                                EmitUnique(
-                                    L"process.hollow",
-                                    L"exe_orphan:" + std::to_wstring(pid) + L":" + HexU64(alloc),
-                                    imagePath,
-                                    region.Type == MEM_IMAGE ? L"exe_orphan_image" : L"exe_orphan_private",
-                                    L"extra PE mapping is not in the module list pid=" +
-                                        std::to_wstring(pid) + L" " + leaf,
-                                    L"base=" + HexU64(alloc) +
-                                        L" type=" + std::to_wstring(region.Type) +
-                                        (mappedOrphan.empty()
-                                            ? std::wstring()
-                                            : (L" mapped=" + mappedOrphan)),
-                                    pid);
-                                ++orphans;
+                                layer = L"exe_orphan_image";
                             }
+                            else if (region.Type == MEM_MAPPED)
+                            {
+                                layer = L"exe_orphan_mapped";
+                            }
+                            EmitUnique(
+                                L"process.hollow",
+                                L"exe_orphan:" + std::to_wstring(pid) + L":" + HexU64(alloc),
+                                imagePath,
+                                layer,
+                                L"extra PE mapping is not in the module list pid=" +
+                                    std::to_wstring(pid) + L" " + leaf,
+                                L"base=" + HexU64(alloc) +
+                                    L" type=" + std::to_wstring(region.Type) +
+                                    (mappedOrphan.empty()
+                                        ? std::wstring()
+                                        : (L" mapped=" + mappedOrphan)),
+                                pid);
+                            ++orphans;
+                        }
+                        else if (rwx)
+                        {
+                            EmitUnique(
+                                L"process.implant",
+                                L"private_wx:" + std::to_wstring(pid) + L":" + HexU64(alloc),
+                                imagePath,
+                                L"private_wx",
+                                L"private W+X region is not in the module list pid=" +
+                                    std::to_wstring(pid) + L" " + leaf,
+                                L"base=" + HexU64(alloc) +
+                                    L" size=" + std::to_wstring(
+                                        static_cast<unsigned long long>(region.RegionSize)) +
+                                    L" type=" + std::to_wstring(region.Type),
+                                pid);
+                            ++orphans;
                         }
                     }
                     if (next <= cursor)
@@ -5414,6 +5708,142 @@ void KernelMonitor::ScanUserModeHostility()
             if (processHandle != nullptr)
             {
                 CloseHandle(processHandle);
+            }
+
+            if (hasKernelVadScan && (watched || builtin))
+            {
+                uint32_t vadImplants = 0;
+                for (const ProcessVadRecord& record : kernelVad.Records)
+                {
+                    if (vadImplants >= 4)
+                    {
+                        break;
+                    }
+                    if (!record.HasPrivateMemory ||
+                        !record.PrivateMemory ||
+                        record.Size < 0x1000 ||
+                        VadCoversUserAddress(record, exeRegion))
+                    {
+                        continue;
+                    }
+                    const bool rwx = record.WritableExecutable;
+                    const bool pe = record.PeHeaderFound;
+                    const bool wiped = record.PeHeaderSuspicious;
+                    // VAD Protection can stay RW after VirtualProtect to RX.
+                    // Do not require record.Executable when the PE probe hit.
+                    if (!record.Executable && !pe && !wiped)
+                    {
+                        continue;
+                    }
+                    if (!rwx && !pe && !wiped)
+                    {
+                        // Headerless private RX on games is dominated by JIT.
+                        // Builtin hosts should not have it.
+                        if (!builtin)
+                        {
+                            continue;
+                        }
+                    }
+                    const wchar_t* layer = wiped
+                        ? L"private_exec_wiped"
+                        : (pe
+                            ? L"private_exec_pe"
+                            : (rwx ? L"private_wx_vad" : L"private_exec_vad"));
+                    EmitUnique(
+                        L"process.implant",
+                        std::wstring(layer) + L":" + std::to_wstring(pid) + L":" +
+                            HexU64(record.StartAddress),
+                        imagePath,
+                        layer,
+                        L"kernel VAD private executable region pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"base=" + HexU64(record.StartAddress) +
+                            L" size=" + std::to_wstring(
+                                static_cast<unsigned long long>(record.Size)) +
+                            L" rwx=" + std::to_wstring(rwx ? 1 : 0) +
+                            L" pe=" + std::to_wstring(pe ? 1 : 0) +
+                            L" wiped=" + std::to_wstring(wiped ? 1 : 0),
+                        pid);
+                    ++vadImplants;
+                }
+                for (const ProcessHiddenVadPteRecord& pte : kernelVad.HiddenPteRecords)
+                {
+                    if (vadImplants >= 4)
+                    {
+                        break;
+                    }
+                    if (!pte.Executable || pte.Size < 0x1000)
+                    {
+                        continue;
+                    }
+                    if (exeRegion != 0 &&
+                        exeRegion >= pte.StartAddress &&
+                        exeRegion <= pte.EndAddress)
+                    {
+                        continue;
+                    }
+                    EmitUnique(
+                        L"process.implant",
+                        L"hidden_exec_pte:" + std::to_wstring(pid) + L":" +
+                            HexU64(pte.StartAddress),
+                        imagePath,
+                        L"hidden_exec_pte",
+                        L"executable PTE is not covered by a VAD pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"base=" + HexU64(pte.StartAddress) +
+                            L" size=" + std::to_wstring(
+                                static_cast<unsigned long long>(pte.Size)),
+                        pid);
+                    ++vadImplants;
+                }
+            }
+
+            if (watched || builtin)
+            {
+                uint64_t ic = 0;
+                if (QueryInstrumentationCallback(device, symbols, pid, &ic) &&
+                    ic != 0)
+                {
+                    bool haveOwnershipView = false;
+                    bool owned = true;
+                    if (moduleInventoryComplete && !moduleRanges.empty())
+                    {
+                        haveOwnershipView = true;
+                        owned = AddressInModuleRanges(ic, moduleRanges);
+                    }
+                    else if (hasKernelVadScan && !kernelVad.Records.empty())
+                    {
+                        haveOwnershipView = true;
+                        owned = false;
+                        bool covered = false;
+                        for (const ProcessVadRecord& record : kernelVad.Records)
+                        {
+                            if (!VadCoversUserAddress(record, ic))
+                            {
+                                continue;
+                            }
+                            covered = true;
+                            owned = !(record.HasPrivateMemory && record.PrivateMemory);
+                            break;
+                        }
+                        if (!covered)
+                        {
+                            owned = false;
+                        }
+                    }
+                    if (haveOwnershipView && !owned)
+                    {
+                        EmitUnique(
+                            L"hook.unbacked",
+                            L"instrumentation:" + std::to_wstring(pid),
+                            imagePath,
+                            L"instrumentation_callback",
+                            L"InstrumentationCallback is outside loaded modules pid=" +
+                                std::to_wstring(pid) + L" " + leaf,
+                            L"callback=" + HexU64(ic),
+                            pid);
+                    }
+                }
             }
 
             uint32_t implants = 0;
@@ -6535,6 +6965,26 @@ bool KernelMonitorSelfTest()
             break;
         }
         if (!AddressOwnedByLoadedModule(nullptr, 0xFFFFF80000000000ull))
+        {
+            break;
+        }
+        if (KmonExeRegionLooksPrivate(false, true, 0, false) ||
+            KmonExeRegionLooksPrivate(false, true, MEM_PRIVATE, false) ||
+            !KmonExeRegionLooksPrivate(true, true, MEM_PRIVATE, false) ||
+            KmonExeRegionLooksPrivate(true, true, MEM_IMAGE, false) ||
+            !KmonExeRegionLooksPrivate(false, true, 0, true) ||
+            !KmonProtectIsRwx(PAGE_EXECUTE_READWRITE) ||
+            KmonProtectIsRwx(PAGE_EXECUTE_READ))
+        {
+            break;
+        }
+        ProcessVadRecord cover = {};
+        cover.StartAddress = 0x140000000ull;
+        cover.EndAddress = 0x140001fffull;
+        if (!VadCoversUserAddress(cover, 0x140000000ull) ||
+            !VadCoversUserAddress(cover, 0x140001fffull) ||
+            VadCoversUserAddress(cover, 0x140002000ull) ||
+            VadCoversUserAddress(cover, 0))
         {
             break;
         }
