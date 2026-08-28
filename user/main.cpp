@@ -24617,7 +24617,7 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
 static void PrintKmonHelp()
 {
     std::wcout << L"!kmon command (unknown kernel drop / map / hidden monitor):\n";
-    std::wcout << L"  !kmon [start] [/name <game.exe>] [/verbose] [/background] [/log <dir>]\n";
+    std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/throttle N]\n";
     std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
     std::wcout << L"  !kmon add /pid|/name|/driver <v>     while collecting; later start extends watches\n";
     std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
@@ -24654,7 +24654,8 @@ static void PrintKmonHelp()
     std::wcout << L"  process.hollow          EXE replace at PEB ImageBase: unmapped/private/unbacked,\n";
     std::wcout << L"                          mapped-path mismatch, W+X (builtin), no MZ, stamp/arch,\n";
     std::wcout << L"                          COW/.text/EP vs disk (Windows builtins), extra PE, ghosting\n";
-    std::wcout << L"  process.implant         drop-dir module, or extra module in a Windows builtin\n";
+    std::wcout << L"  process.implant         drop-dir module in a builtin or /name|/pid target,\n";
+    std::wcout << L"                          or extra non-inbox module in a Windows builtin\n";
     std::wcout << L"  inject.remote           drop/unknown-path any remote inject; builtin WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView; ReadVM/suspend stay off\n";
     std::wcout << L"  integrity.ci / .cr      DSE off, CR0.WP=0 (test-signing is not a finding)\n";
@@ -24884,23 +24885,40 @@ static void HandleKmonCommand(
                     !extra.WatchPids.empty() ||
                     !extra.WatchNames.empty() ||
                     !extra.WatchDrivers.empty();
-                if (extra.VerboseDrivers ||
+                const bool firstStartOnly =
+                    extra.VerboseDrivers ||
                     !extra.LogDirectory.empty() ||
-                    extra.ThrottlePerSecond != 50)
+                    extra.ThrottlePerSecond != KmonOptions{}.ThrottlePerSecond;
+                if (firstStartOnly)
                 {
-                    std::wcerr << L"!kmon: /verbose, /log, and /throttle apply only on the first start; "
-                                  L"watches were updated.\n";
+                    std::wcerr << L"!kmon: /verbose, /log, and /throttle apply only on the first start";
+                    if (addedWatch)
+                    {
+                        std::wcerr << L"; watches were updated";
+                    }
+                    std::wcerr << L".\n";
                 }
                 if (!extra.AttachLiveTail)
                 {
                     PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
-                    std::wcout << L" already collecting. JSONL is filling; '!kmon' attaches the tail.\n";
+                    if (addedWatch)
+                    {
+                        std::wcout << L" watches updated. JSONL is filling; '!kmon' attaches the tail.\n";
+                    }
+                    else
+                    {
+                        std::wcout << L" already collecting. JSONL is filling; '!kmon' attaches the tail.\n";
+                    }
                     break;
                 }
                 if (addedWatch)
                 {
                     PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
                     std::wcout << L" watches updated. '!kmon' attaches the tail.\n";
+                    break;
+                }
+                if (firstStartOnly)
+                {
                     break;
                 }
                 PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);

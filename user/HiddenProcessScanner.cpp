@@ -366,7 +366,8 @@ namespace
         // process still owns handles and still has a CID slot.
         if (!input.Kernel && userViews == 0 && input.Pid > 4)
         {
-            if (IsTerminatingView(input))
+            const bool independentlyVisible = input.HandleOwner || input.CidTable;
+            if (IsTerminatingView(input) && !independentlyVisible)
             {
                 result.Ignored = true;
                 result.IgnoredTerminating = true;
@@ -1094,24 +1095,10 @@ bool HiddenProcessScanner::Scan(
 
         for (uint32_t pid : handleResult.OwnerPids)
         {
-            auto it = views.find(pid);
-            if (it == views.end())
-            {
-                continue;
-            }
-            if (!it->second.Kernel && !it->second.Spi && !it->second.Toolhelp)
-            {
-                confirmIfMissingFromLists(pid);
-            }
+            confirmIfMissingFromLists(pid);
         }
         for (uint32_t pid : extraCandidatePids)
         {
-            auto it = views.find(pid);
-            if (it != views.end() &&
-                (it->second.Kernel || it->second.Spi || it->second.Toolhelp))
-            {
-                continue;
-            }
             confirmIfMissingFromLists(pid);
         }
 
@@ -1423,6 +1410,24 @@ bool HiddenProcessViewSelfTest()
         cidOnly.KernelInventoryComplete = true;
         const HiddenProcessClassifyResult cidOnlyResult = ClassifyHiddenProcess(cidOnly);
         if (!cidOnlyResult.Suspicious || cidOnlyResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput cidExiting = cidOnly;
+        cidExiting.ProcessExiting = true;
+        cidExiting.HasLifecycle = true;
+        const HiddenProcessClassifyResult cidExitingResult = ClassifyHiddenProcess(cidExiting);
+        if (!cidExitingResult.Suspicious || cidExitingResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput cidFakeExit = cidOnly;
+        cidFakeExit.HasExitTime = true;
+        cidFakeExit.ExitTime = 1;
+        const HiddenProcessClassifyResult cidFakeExitResult = ClassifyHiddenProcess(cidFakeExit);
+        if (!cidFakeExitResult.Suspicious || cidFakeExitResult.Ignored)
         {
             break;
         }
