@@ -5026,12 +5026,16 @@ void KernelMonitor::ScanUserModeHostility()
                     !imageDir.empty() && ToLowerCopy(modulePath).find(imageDir) == 0;
                 const bool dropImplant =
                     moduleClass == L"drop" && (builtin || watched);
+                const bool watchedUnknown = watched &&
+                    !windowsModule &&
+                    !inImageDir &&
+                    moduleClass == L"unknown";
                 const bool builtinForeign = builtin &&
                     !windowsModule &&
                     !inImageDir &&
                     moduleClass != L"inbox" &&
                     moduleClass != L"third_party";
-                if (!dropImplant && !builtinForeign)
+                if (!dropImplant && !builtinForeign && !watchedUnknown)
                 {
                     continue;
                 }
@@ -5039,7 +5043,9 @@ void KernelMonitor::ScanUserModeHostility()
                     L"process.implant",
                     L"implant:" + std::to_wstring(pid) + L":" + KmonBasenameLower(modulePath),
                     imagePath,
-                    dropImplant ? L"drop_module" : L"builtin_foreign_module",
+                    dropImplant
+                        ? L"drop_module"
+                        : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module"),
                     L"foreign module in pid=" + std::to_wstring(pid) + L" " + leaf +
                         L" module=" + KmonBasenameLower(modulePath),
                     modulePath,
@@ -5609,6 +5615,7 @@ void KernelMonitor::Clear()
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         EmittedMapperKeys.clear();
         EmittedUnnamedPids.clear();
+        RecentLoads.clear();
     }
 }
 
@@ -6270,6 +6277,7 @@ bool KernelMonitorSelfTest()
                 L"\\Device\\HarddiskVolume3\\cheat.sys") != L"drop" ||
             KmonClassifyDriverPath(
                 L"\\Device\\HarddiskVolume3\\Games\\game.exe") != L"unknown" ||
+            KmonClassifyDriverPath(L"C:\\Cheats\\x.dll") != L"unknown" ||
             KmonClassifyDriverPath(L"C:\\Windows\\SysWOW64\\ntdll.dll") != L"inbox" ||
             KmonClassifyDriverPath(
                 L"C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clr.dll") != L"inbox" ||
