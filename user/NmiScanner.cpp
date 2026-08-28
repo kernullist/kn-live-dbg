@@ -376,6 +376,13 @@ bool NmiScanner::Scan(NmiScanResult* result, std::wstring* error)
             current = next;
         }
 
+        if (current != 0)
+        {
+            result->Incomplete = true;
+            result->Warnings.push_back(
+                L"NMI callback walk did not reach a NULL terminator; extra callbacks may be missed");
+        }
+
         ok = true;
     } while (false);
 

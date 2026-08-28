@@ -4883,8 +4883,15 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:msr");
+            bool msrCoverageHole = false;
             for (const MsrReading& reading : result.Readings)
             {
+                const uint32_t sampled = static_cast<uint32_t>(reading.PerCpuValues.size());
+                if (reading.ReadFailed ||
+                    (result.ProcessorCount != 0 && sampled < result.ProcessorCount))
+                {
+                    msrCoverageHole = true;
+                }
                 if (!reading.Suspicious)
                 {
                     continue;
@@ -4896,6 +4903,20 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     L"msr",
                     L"SYSCALL MSR " + reading.MsrName + L" is hooked or divergent",
                     reading.Notes);
+            }
+            if (msrCoverageHole)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:msr:coverage",
+                    std::wstring(),
+                    L"msr",
+                    L"SYSCALL MSR sample missed one or more processors",
+                    L"cpus=" + std::to_wstring(result.ProcessorCount));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:msr:coverage");
             }
         }
         else
@@ -5044,6 +5065,22 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:nmi");
+            if (result.Incomplete)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:nmi:coverage",
+                    std::wstring(),
+                    L"nmi",
+                    L"NMI callback walk was incomplete; extra unbacked callbacks may be missed",
+                    result.Warnings.empty()
+                        ? L"Incomplete is true"
+                        : result.Warnings.front());
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:nmi:coverage");
+            }
             for (const NmiCallbackRecord& record : result.Callbacks)
             {
                 if (!record.Suspicious)
@@ -5309,10 +5346,6 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
             for (const MinifilterFilterRecord& filter : result.Filters)
             {
-                if (filter.WellKnownInbox)
-                {
-                    continue;
-                }
                 if (filter.DriverStart == 0 ||
                     AddressOwnedByLoadedModule(symbols, filter.DriverStart))
                 {
@@ -6066,6 +6099,24 @@ void KernelMonitor::ScanUserModeHostility()
                         const bool compareText = builtin ||
                             watched ||
                             KmonWindowsBuiltinPathLooksInbox(imagePath);
+                        if (compareText &&
+                            parsedDisk &&
+                            diskLayout.PreferredBase != 0 &&
+                            exeRegion != diskLayout.PreferredBase &&
+                            diskLayout.RelocRva == 0 &&
+                            diskLayout.RelocSize == 0)
+                        {
+                            EmitUnique(
+                                L"process.hollow",
+                                L"exe_rebased_no_reloc:" + std::to_wstring(pid),
+                                imagePath,
+                                L"exe_rebased_no_reloc",
+                                L"main EXE is rebased with no reloc directory pid=" +
+                                    std::to_wstring(pid) + L" " + leaf,
+                                L"preferred=" + HexU64(diskLayout.PreferredBase) +
+                                    L" live=" + HexU64(exeRegion),
+                                pid);
+                        }
                         const bool identityMismatch = parsedDisk && parsedLive &&
                             (diskLayout.SizeOfImage != liveId.SizeOfImage ||
                                 diskLayout.EntryPointRva != liveId.EntryPointRva ||
