@@ -732,6 +732,49 @@ namespace
         return value;
     }
 
+    uint64_t QueryPidCreateTime(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        HANDLE process,
+        uint32_t pid)
+    {
+        if (process != nullptr)
+        {
+            const uint64_t fromHandle = QueryProcessCreateTicks(process);
+            if (fromHandle != 0)
+            {
+                return fromHandle;
+            }
+        }
+        if (device == nullptr || symbols == nullptr || pid <= 4 || !device->IsOpen())
+        {
+            return 0;
+        }
+
+        TypeFieldInfo dtbField = {};
+        std::wstring ignored;
+        if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
+            !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
+            !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+        {
+            return 0;
+        }
+
+        ProcessAddressContext ctx = {};
+        if (!device->ResolveProcess(
+                pid,
+                static_cast<uint32_t>(dtbField.Offset),
+                0,
+                &ctx,
+                &ignored) ||
+            ctx.Eprocess == 0)
+        {
+            return 0;
+        }
+
+        return QueryEprocessCreateTime(device, symbols, nullptr, ctx.Eprocess);
+    }
+
     bool ReadProcessVirtualChecked(
         DeviceClient* device,
         SymbolEngine* symbols,
@@ -2281,24 +2324,33 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             {
                 break;
             }
-            if (!KmonTaskLooksLikeRemoteInjectMaterial(event.Task))
-            {
-                break;
-            }
+            bool watchCaller = NameEqualsWatch(caller, options.WatchNames);
+            bool watchTarget = NameEqualsWatch(target, options.WatchNames);
             for (uint32_t pid : options.WatchPids)
             {
-                if (pid == event.ProcessId || pid == event.TargetProcessId)
+                if (pid == event.ProcessId)
                 {
-                    matched = true;
-                    break;
+                    watchCaller = true;
+                }
+                if (pid == event.TargetProcessId)
+                {
+                    watchTarget = true;
                 }
             }
-            if (matched)
+            if (!watchCaller && !watchTarget)
             {
                 break;
             }
-            if (NameEqualsWatch(caller, options.WatchNames) ||
-                NameEqualsWatch(target, options.WatchNames))
+            if (KmonTaskLooksLikeRemoteInjectMaterial(event.Task))
+            {
+                matched = true;
+                break;
+            }
+            // ReadVM/suspend against a watched non-inbox process. Builtin
+            // endpoints stay excluded; they are a firehose.
+            const bool callerOk = watchCaller && !KmonIsWindowsBuiltinLeaf(caller);
+            const bool targetOk = watchTarget && !KmonIsWindowsBuiltinLeaf(target);
+            if ((callerOk || targetOk) && KmonTaskLooksLikeRemoteInject(event.Task))
             {
                 matched = true;
             }
@@ -2902,7 +2954,8 @@ void KernelMonitor::IngestLiveTimeline()
             bool nameWatch = false;
             {
                 std::lock_guard<std::mutex> watchLock(WatchMutex);
-                nameWatch = NameEqualsWatch(base, WatchNamesLower);
+                nameWatch = NameEqualsWatch(base, WatchNamesLower) &&
+                    classified.ProcessId > 4;
                 if (nameWatch)
                 {
                     WatchPromotedPids.insert(classified.ProcessId);
@@ -3191,14 +3244,24 @@ void KernelMonitor::EmitUnique(
         std::wstring uniqueKey = key;
         if (processId > 4)
         {
+            DeviceClient* device = nullptr;
+            SymbolEngine* symbols = nullptr;
+            {
+                std::lock_guard<std::mutex> stateLock(StateMutex);
+                device = Device;
+                symbols = Symbols;
+            }
             HANDLE process = OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION,
                 FALSE,
                 processId);
+            const uint64_t created = QueryPidCreateTime(device, symbols, process, processId);
             if (process != nullptr)
             {
-                const uint64_t created = QueryProcessCreateTicks(process);
                 CloseHandle(process);
+            }
+            if (created != 0)
+            {
                 uniqueKey += L":" + std::to_wstring(created);
             }
             else
@@ -4172,12 +4235,62 @@ void KernelMonitor::ScanUserModeHostility()
     const uint32_t selfPid = GetCurrentProcessId();
     PROCESSENTRY32W entry = {};
     entry.dwSize = sizeof(entry);
+    BOOL more = FALSE;
     if (Process32FirstW(snap, &entry))
     {
+        more = TRUE;
         do
         {
             const uint32_t pid = entry.th32ProcessID;
-            if (pid <= 4 || pid == selfPid)
+            if (pid > 4 && pid != selfPid && targets.size() < 4096)
+            {
+                KmonUserTarget target;
+                target.Pid = pid;
+                HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (process != nullptr)
+                {
+                    std::vector<wchar_t> pathBuf(32768, L'\0');
+                    DWORD pathLen = static_cast<DWORD>(pathBuf.size());
+                    if (QueryFullProcessImageNameW(process, 0, pathBuf.data(), &pathLen) && pathLen > 0)
+                    {
+                        target.ImagePath.assign(pathBuf.data(), pathLen);
+                    }
+                    CloseHandle(process);
+                }
+                if (target.ImagePath.empty())
+                {
+                    target.ImagePath = entry.szExeFile;
+                }
+                target.Leaf = KmonBasenameLower(target.ImagePath);
+                const std::wstring pathClass = KmonClassifyDriverPath(target.ImagePath);
+                const bool watched =
+                    NameEqualsWatch(target.Leaf, watchNames) ||
+                    watchPids.count(pid) != 0;
+                target.HighPriority =
+                    KmonIsWindowsBuiltinLeaf(target.Leaf) ||
+                    watched ||
+                    pathClass == L"drop";
+                target.Interesting =
+                    target.HighPriority ||
+                    pathClass == L"third_party" ||
+                    pathClass == L"unknown";
+                targets.push_back(std::move(target));
+            }
+            more = Process32NextW(snap, &entry);
+        } while (more);
+    }
+    CloseHandle(snap);
+
+    {
+        std::unordered_set<uint32_t> have;
+        have.reserve(targets.size());
+        for (const KmonUserTarget& item : targets)
+        {
+            have.insert(item.Pid);
+        }
+        for (uint32_t pid : watchPids)
+        {
+            if (pid <= 4 || pid == selfPid || have.count(pid) != 0)
             {
                 continue;
             }
@@ -4198,27 +4311,12 @@ void KernelMonitor::ScanUserModeHostility()
                 }
                 CloseHandle(process);
             }
-            if (target.ImagePath.empty())
-            {
-                target.ImagePath = entry.szExeFile;
-            }
             target.Leaf = KmonBasenameLower(target.ImagePath);
-            const std::wstring pathClass = KmonClassifyDriverPath(target.ImagePath);
-            const bool watched =
-                NameEqualsWatch(target.Leaf, watchNames) ||
-                watchPids.count(pid) != 0;
-            target.HighPriority =
-                KmonIsWindowsBuiltinLeaf(target.Leaf) ||
-                watched ||
-                pathClass == L"drop";
-            target.Interesting =
-                target.HighPriority ||
-                pathClass == L"third_party" ||
-                pathClass == L"unknown";
+            target.HighPriority = true;
+            target.Interesting = true;
             targets.push_back(std::move(target));
-        } while (Process32NextW(snap, &entry));
+        }
     }
-    CloseHandle(snap);
 
     auto highEnd = std::stable_partition(
         targets.begin(),
@@ -4561,6 +4659,7 @@ void KernelMonitor::ScanUserModeHostility()
                             ParseKmonPeLayout(diskHeaders, &diskLayout);
                         const bool parsedLive = ParseKmonPeIdentity(live, &liveId);
                         const bool compareText = builtin ||
+                            watched ||
                             KmonWindowsBuiltinPathLooksInbox(imagePath);
                         const bool identityMismatch = parsedDisk && parsedLive &&
                             (diskLayout.SizeOfImage != liveId.SizeOfImage ||
@@ -4905,34 +5004,36 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
         return;
     }
 
-    uint64_t created = 0;
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+
     HANDLE query = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    const uint64_t created = QueryPidCreateTime(device, symbols, query, pid);
     if (query != nullptr)
     {
-        created = QueryProcessCreateTicks(query);
         CloseHandle(query);
     }
 
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         auto it = LoggingEnabledPids.find(pid);
-        if (it != LoggingEnabledPids.end())
+        if (it != LoggingEnabledPids.end() &&
+            created != 0 &&
+            it->second == created)
         {
-            if (created != 0 && it->second == created)
-            {
-                return;
-            }
-            if (created == 0 && it->second == 0)
-            {
-                return;
-            }
+            return;
         }
     }
 
     bool enabled = TryEnableLoggingUsermode(pid, KNDBG_PROCESS_LOG_DEFAULT);
     if (!enabled)
     {
-        DeviceClient* device = nullptr;
+        if (device == nullptr)
         {
             std::lock_guard<std::mutex> lock(StateMutex);
             device = Device;
@@ -5853,6 +5954,10 @@ bool KernelMonitorSelfTest()
         {
             break;
         }
+        if (QueryPidCreateTime(nullptr, nullptr, nullptr, 0) != 0)
+        {
+            break;
+        }
         if (!KmonPathLooksLikeSys(L"\\SystemRoot\\cheat.sys"))
         {
             break;
@@ -6020,6 +6125,16 @@ bool KernelMonitorSelfTest()
         KmonOptions gameWatch;
         gameWatch.WatchNames.push_back(L"game.exe");
         if (!KmonWatchMatches(injectEvent, gameWatch))
+        {
+            break;
+        }
+        KmonEvent gameRead = injectEvent;
+        gameRead.Task = L"ReadVM";
+        if (!KmonWatchMatches(gameRead, gameWatch))
+        {
+            break;
+        }
+        if (KmonWatchMatches(gameRead, emptyWatch))
         {
             break;
         }

@@ -857,7 +857,9 @@ namespace
                 {
                     view->Image = AsciiToWide(
                         reinterpret_cast<const char*>(nameBytes.data()),
-                        nameBytes.size());
+                        strnlen(
+                            reinterpret_cast<const char*>(nameBytes.data()),
+                            nameBytes.size()));
                 }
             }
             ReadProcessLifecycle(device, lifecycle, view);
