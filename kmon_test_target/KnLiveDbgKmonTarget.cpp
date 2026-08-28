@@ -754,6 +754,18 @@ int wmain(int argc, wchar_t** argv)
             }
             return 1;
         }
+        HANDLE live = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        const bool stillLive =
+            live != nullptr && WaitForSingleObject(live, 0) == WAIT_TIMEOUT;
+        if (live != nullptr)
+        {
+            CloseHandle(live);
+        }
+        if (!stillLive)
+        {
+            std::fwprintf(stderr, L"ghost: child exited before unlink completed\n");
+            return 1;
+        }
         WritePidFile(pid);
         std::wprintf(L"KMON_FIXTURE pid=%u scenario=ghost image=%s\n", pid, image.c_str());
         std::fflush(stdout);

@@ -24929,6 +24929,11 @@ static void HandleKmonCommand(
                 {
                     break;
                 }
+                if (g_RemoteOriginActive.load())
+                {
+                    RunKmonLiveTail(kmon);
+                    break;
+                }
                 PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
                 std::wcout << L" already collecting; attaching live tail. Esc/q detaches.\n";
                 RunKmonLiveTail(kmon);
@@ -24995,6 +25000,7 @@ static void HandleKmonCommand(
                 std::wcout << L"[kmon] TI ETW already active\n";
             }
 
+            const bool liveWasActive = TimelineLiveIsActive(&device, nullptr);
             if (!TryEnableTimelineLive(state, &device))
             {
                 if (startedTiHere)
@@ -25005,6 +25011,11 @@ static void HandleKmonCommand(
                 }
                 std::wcerr << L"!kmon start: kernel live callbacks were not enabled\n";
                 break;
+            }
+
+            if (g_RemoteOriginActive.load())
+            {
+                options.AttachLiveTail = false;
             }
 
             g_KmonForShutdown.store(&kmon);
@@ -25019,14 +25030,14 @@ static void HandleKmonCommand(
                     ti.Stop(&stopError);
                     g_TiSubscriberForShutdown.store(nullptr);
                 }
+                if (!liveWasActive)
+                {
+                    std::wstring liveError;
+                    ControlTimelineLive(&device, KNDBG_TIMELINE_CONTROL_STOP, 0, &liveError);
+                    StopTimelineAutoDrainWorker();
+                }
                 std::wcerr << L"!kmon start failed: " << startError << L"\n";
                 break;
-            }
-
-            if (g_RemoteOriginActive.load())
-            {
-                options.AttachLiveTail = false;
-                kmon.SetLiveOutput(false);
             }
 
             PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
