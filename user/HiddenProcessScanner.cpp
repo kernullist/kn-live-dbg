@@ -685,6 +685,7 @@ namespace
         if (Process32FirstW(snap, &entry))
         {
             BOOL more = TRUE;
+            DWORD nextError = ERROR_SUCCESS;
             do
             {
                 parsed.Images[entry.th32ProcessID] = entry.szExeFile;
@@ -694,9 +695,12 @@ namespace
                     break;
                 }
                 more = Process32NextW(snap, &entry);
+                if (!more)
+                {
+                    nextError = GetLastError();
+                }
             } while (more);
             parsed.Count = static_cast<uint32_t>(parsed.Images.size());
-            const DWORD nextError = GetLastError();
             if (parsed.Count >= kMaxProcesses)
             {
                 if (warning != nullptr)
