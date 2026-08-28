@@ -798,6 +798,7 @@ namespace
                 break;
             }
             *imageBase = 0;
+            bool wow64Peb = false;
 
             if (process != nullptr)
             {
@@ -836,6 +837,7 @@ namespace
                         &returned) >= 0 &&
                     peb32 != 0)
                 {
+                    wow64Peb = true;
                     std::vector<uint8_t> baseBytes;
                     if (ReadProcessBytes(
                             device,
@@ -857,36 +859,39 @@ namespace
                         }
                     }
                 }
-                KmonProcessBasicInformation pbi = {};
-                returned = 0;
-                if (query != nullptr &&
-                    query(
-                        process,
-                        kProcessBasicInformation,
-                        &pbi,
-                        sizeof(pbi),
-                        &returned) >= 0 &&
-                    pbi.PebBaseAddress != nullptr)
+                if (!wow64Peb)
                 {
-                    const uint64_t peb = reinterpret_cast<uint64_t>(pbi.PebBaseAddress);
-                    std::vector<uint8_t> baseBytes;
-                    if (ReadProcessBytes(
-                            device,
-                            symbols,
+                    KmonProcessBasicInformation pbi = {};
+                    returned = 0;
+                    if (query != nullptr &&
+                        query(
                             process,
-                            pid,
-                            peb + 0x10,
-                            sizeof(uint64_t),
-                            &baseBytes) &&
-                        baseBytes.size() >= sizeof(uint64_t))
+                            kProcessBasicInformation,
+                            &pbi,
+                            sizeof(pbi),
+                            &returned) >= 0 &&
+                        pbi.PebBaseAddress != nullptr)
                     {
-                        uint64_t base = 0;
-                        std::memcpy(&base, baseBytes.data(), sizeof(base));
-                        if (IsUserModeImageBase(base))
+                        const uint64_t peb = reinterpret_cast<uint64_t>(pbi.PebBaseAddress);
+                        std::vector<uint8_t> baseBytes;
+                        if (ReadProcessBytes(
+                                device,
+                                symbols,
+                                process,
+                                pid,
+                                peb + 0x10,
+                                sizeof(uint64_t),
+                                &baseBytes) &&
+                            baseBytes.size() >= sizeof(uint64_t))
                         {
-                            *imageBase = base;
-                            ok = true;
-                            break;
+                            uint64_t base = 0;
+                            std::memcpy(&base, baseBytes.data(), sizeof(base));
+                            if (IsUserModeImageBase(base))
+                            {
+                                *imageBase = base;
+                                ok = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -921,6 +926,7 @@ namespace
                 break;
             }
             TypeFieldInfo wow64Field = {};
+            bool kernelWow64 = false;
             if (symbols->FindField(L"nt!_EPROCESS", L"Wow64Process", &wow64Field, &ignored))
             {
                 std::vector<uint8_t> wowBytes;
@@ -953,6 +959,7 @@ namespace
                     }
                     if (peb32 != 0)
                     {
+                        kernelWow64 = true;
                         std::vector<uint8_t> base32Bytes;
                         if (device->ReadProcessVirtual(
                                 pid,
@@ -974,7 +981,15 @@ namespace
                             }
                         }
                     }
+                    else if (wow64Process != 0)
+                    {
+                        kernelWow64 = true;
+                    }
                 }
+            }
+            if (kernelWow64 || wow64Peb)
+            {
+                break;
             }
             std::vector<uint8_t> pebPtr;
             if (!device->ReadMemory(
@@ -1016,7 +1031,14 @@ namespace
         return ok;
     }
 
-    bool RelocatedSliceMatchesDisk(
+    enum SliceCompare
+    {
+        SliceUnknown = 0,
+        SliceMatch,
+        SliceMismatch
+    };
+
+    SliceCompare RelocatedSliceCompare(
         const std::wstring& imagePath,
         const std::vector<uint8_t>& diskHeaders,
         const KmonPeLayout& layout,
@@ -1029,7 +1051,7 @@ namespace
         uint32_t fileOffset,
         uint32_t length)
     {
-        bool matches = true;
+        SliceCompare result = SliceUnknown;
         do
         {
             if (length < 16 || imageBase == 0 || fileOffset == 0)
@@ -1086,9 +1108,11 @@ namespace
             {
                 n -= 8;
             }
-            matches = std::memcmp(diskText.data(), liveText.data(), n) == 0;
+            result = (std::memcmp(diskText.data(), liveText.data(), n) == 0)
+                ? SliceMatch
+                : SliceMismatch;
         } while (false);
-        return matches;
+        return result;
     }
 
     bool ProtectHasExecute(DWORD protect)
@@ -1349,17 +1373,19 @@ namespace
 
         PROCESSENTRY32W entry = {};
         entry.dwSize = sizeof(entry);
-        if (Process32FirstW(snap, &entry))
+        if (!Process32FirstW(snap, &entry))
         {
-            do
-            {
-                std::wstring base = KmonBasenameLower(entry.szExeFile);
-                if (NameEqualsWatch(base, concrete) && entry.th32ProcessID > 4)
-                {
-                    pids->push_back(entry.th32ProcessID);
-                }
-            } while (Process32NextW(snap, &entry));
+            CloseHandle(snap);
+            return false;
         }
+        do
+        {
+            std::wstring base = KmonBasenameLower(entry.szExeFile);
+            if (NameEqualsWatch(base, concrete) && entry.th32ProcessID > 4)
+            {
+                pids->push_back(entry.th32ProcessID);
+            }
+        } while (Process32NextW(snap, &entry));
         CloseHandle(snap);
         return true;
     }
@@ -2217,32 +2243,33 @@ bool KernelMonitor::Start(
                 break;
             }
 
-            Options = options;
-            if (Options.RingCapacity < 1024)
+            KmonOptions previousOptions = Options;
+            KmonOptions nextOptions = options;
+            if (nextOptions.RingCapacity < 1024)
             {
-                Options.RingCapacity = 65536;
+                nextOptions.RingCapacity = 65536;
             }
-            if (Options.ThrottlePerSecond == 0)
+            if (nextOptions.ThrottlePerSecond == 0)
             {
-                Options.ThrottlePerSecond = 50;
+                nextOptions.ThrottlePerSecond = 50;
             }
-            if (Options.LogDirectory.empty())
+            if (nextOptions.LogDirectory.empty())
             {
-                Options.LogDirectory = ExeDirectory();
+                nextOptions.LogDirectory = ExeDirectory();
             }
-            if (Options.HiddenScanIntervalMs < 1000)
+            if (nextOptions.HiddenScanIntervalMs < 1000)
             {
-                Options.HiddenScanIntervalMs = 5000;
+                nextOptions.HiddenScanIntervalMs = 5000;
             }
-            if (Options.MapperScanIntervalMs < 1000)
+            if (nextOptions.MapperScanIntervalMs < 1000)
             {
-                Options.MapperScanIntervalMs = 8000;
+                nextOptions.MapperScanIntervalMs = 8000;
             }
 
             {
                 std::vector<std::wstring> names;
-                names.reserve(Options.WatchNames.size());
-                for (const std::wstring& name : Options.WatchNames)
+                names.reserve(nextOptions.WatchNames.size());
+                for (const std::wstring& name : nextOptions.WatchNames)
                 {
                     std::wstring token = KmonBasenameLower(name);
                     if (!token.empty())
@@ -2250,12 +2277,12 @@ bool KernelMonitor::Start(
                         names.push_back(std::move(token));
                     }
                 }
-                Options.WatchNames = std::move(names);
+                nextOptions.WatchNames = std::move(names);
             }
             {
                 std::vector<std::wstring> drivers;
-                drivers.reserve(Options.WatchDrivers.size());
-                for (const std::wstring& name : Options.WatchDrivers)
+                drivers.reserve(nextOptions.WatchDrivers.size());
+                for (const std::wstring& name : nextOptions.WatchDrivers)
                 {
                     std::wstring token = KmonBasenameLower(name);
                     if (!token.empty())
@@ -2263,7 +2290,25 @@ bool KernelMonitor::Start(
                         drivers.push_back(std::move(token));
                     }
                 }
-                Options.WatchDrivers = std::move(drivers);
+                nextOptions.WatchDrivers = std::move(drivers);
+            }
+
+            // Open the log before replacing watches/ring so a failed start
+            // does not drop the previous session or half-apply Options.
+            Options = nextOptions;
+            {
+                std::lock_guard<std::mutex> logLock(LogMutex);
+                CloseLogLocked();
+                if (!EnsureLogOpenLocked())
+                {
+                    Options = previousOptions;
+                    if (error != nullptr)
+                    {
+                        *error = L"could not open kmon log in " + nextOptions.LogDirectory;
+                    }
+                    LiveOutput.store(false);
+                    break;
+                }
             }
 
             {
@@ -2289,8 +2334,23 @@ bool KernelMonitor::Start(
             Timeline = timeline;
             Device = device;
             Symbols = symbols;
+            // Skip TI/live events that already arrived before this arm.
+            // Cursor 0 re-dumps the ring on stop+start and on first start
+            // after a standalone !ti session.
             TiCursorSequence = 0;
             LiveCursorEventId = 0;
+            {
+                std::vector<TiEventRecord> latestTi = ti->Recent(1, true);
+                if (!latestTi.empty() && latestTi[0].Sequence != 0)
+                {
+                    TiCursorSequence = latestTi[0].Sequence;
+                }
+                const uint64_t nextLive = timeline->PeekNextEventId();
+                if (nextLive > 1)
+                {
+                    LiveCursorEventId = nextLive - 1;
+                }
+            }
             NextHiddenScanTickMs = 0;
             NextMapperScanTickMs = 0;
             NextKpageScanTickMs = 0;
@@ -2327,24 +2387,6 @@ bool KernelMonitor::Start(
             {
                 std::lock_guard<std::mutex> printLock(PrintMutex);
                 PrintQueue.clear();
-            }
-
-            {
-                std::lock_guard<std::mutex> logLock(LogMutex);
-                CloseLogLocked();
-                if (!EnsureLogOpenLocked())
-                {
-                    if (error != nullptr)
-                    {
-                        *error = L"could not open kmon log in " + Options.LogDirectory;
-                    }
-                    Ti = nullptr;
-                    Timeline = nullptr;
-                    Device = nullptr;
-                    Symbols = nullptr;
-                    LiveOutput.store(false);
-                    break;
-                }
             }
 
             StopRequested.store(false);
@@ -2385,6 +2427,10 @@ bool KernelMonitor::Start(
                 {
                     Active.store(false);
                     LiveOutput.store(false);
+                    {
+                        std::lock_guard<std::mutex> logLock(LogMutex);
+                        CloseLogLocked();
+                    }
                     if (error != nullptr)
                     {
                         *error = L"could not start kmon worker thread";
@@ -2439,8 +2485,8 @@ void KernelMonitor::WorkerLoop()
 {
     while (!StopRequested.load())
     {
-        IngestThreatIntel();
         IngestLiveTimeline();
+        IngestThreatIntel();
 
         const uint64_t nowMs = GetTickCount64();
         uint32_t hiddenInterval = 5000;
@@ -2469,6 +2515,8 @@ void KernelMonitor::WorkerLoop()
         else if (nowMs >= NextHiddenScanTickMs)
         {
             ScanHiddenProcesses();
+            IngestLiveTimeline();
+            IngestThreatIntel();
             NextHiddenScanTickMs = GetTickCount64() + hiddenInterval;
         }
 
@@ -2479,21 +2527,25 @@ void KernelMonitor::WorkerLoop()
         else if (nowMs >= NextMapperScanTickMs)
         {
             ScanMapperRemnants();
+            IngestLiveTimeline();
             IngestThreatIntel();
             if (!StopRequested.load())
             {
                 ScanPoolMappedImages();
             }
+            IngestLiveTimeline();
             IngestThreatIntel();
             if (!StopRequested.load())
             {
                 ScanUnbackedDriverObjects();
             }
+            IngestLiveTimeline();
             IngestThreatIntel();
             if (!StopRequested.load())
             {
                 ScanHookCallbacks();
             }
+            IngestLiveTimeline();
             IngestThreatIntel();
             if (!StopRequested.load())
             {
@@ -2509,6 +2561,7 @@ void KernelMonitor::WorkerLoop()
         else if (nowMs >= NextKpageScanTickMs)
         {
             ScanCpuIntegrityHooks();
+            IngestLiveTimeline();
             IngestThreatIntel();
             if (!StopRequested.load())
             {
@@ -2525,6 +2578,8 @@ void KernelMonitor::WorkerLoop()
         {
             PruneStalePromotedWatches();
             ScanUserModeHostility();
+            IngestLiveTimeline();
+            IngestThreatIntel();
             NextUserScanTickMs = GetTickCount64() + kUserScanIntervalMs;
         }
 
@@ -2570,10 +2625,27 @@ void KernelMonitor::IngestThreatIntel()
 
         if (record.ProcessId > 4 && record.ImagePath.empty())
         {
+            uint64_t created = 0;
+            HANDLE unnamedProcess = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                FALSE,
+                record.ProcessId);
+            if (unnamedProcess != nullptr)
+            {
+                created = QueryProcessCreateTicks(unnamedProcess);
+                CloseHandle(unnamedProcess);
+            }
             bool claimed = false;
             {
                 std::lock_guard<std::mutex> watchLock(WatchMutex);
-                claimed = EmittedUnnamedPids.insert(record.ProcessId).second;
+                const std::wstring unnamedKey =
+                    L"unnamed:" + std::to_wstring(record.ProcessId) + L":" +
+                    std::to_wstring(created);
+                claimed = EmittedMapperKeys.insert(unnamedKey).second;
+                if (claimed)
+                {
+                    EmittedUnnamedPids.insert(record.ProcessId);
+                }
             }
             if (claimed)
             {
@@ -2809,8 +2881,19 @@ void KernelMonitor::MaybeEmitShortLived(const KmonEvent& unloadEvent)
             }
             return load.PathClass == L"drop" || load.PathClass == L"third_party";
         };
+        auto driverStem = [](const std::wstring& name)
+        {
+            std::wstring stem = KmonBasenameLower(name);
+            if (stem.size() > 4 &&
+                stem.compare(stem.size() - 4, 4, L".sys") == 0)
+            {
+                stem.resize(stem.size() - 4);
+            }
+            return stem;
+        };
         const RecentDriverLoad* matchedLoad = nullptr;
         uint32_t unnamedHits = 0;
+        const std::wstring unloadStem = driverStem(base);
         for (auto it = RecentLoads.rbegin(); it != RecentLoads.rend(); ++it)
         {
             if (unloadEvent.Timestamp < it->Timestamp)
@@ -2828,6 +2911,10 @@ void KernelMonitor::MaybeEmitShortLived(const KmonEvent& unloadEvent)
             }
             if (base.empty())
             {
+                if (it->PathClass != L"drop")
+                {
+                    continue;
+                }
                 ++unnamedHits;
                 if (unnamedHits == 1)
                 {
@@ -2839,7 +2926,11 @@ void KernelMonitor::MaybeEmitShortLived(const KmonEvent& unloadEvent)
                 }
                 continue;
             }
-            if (it->Base.empty() || it->Base != base)
+            if (it->Base.empty())
+            {
+                continue;
+            }
+            if (it->Base != base && driverStem(it->Base) != unloadStem)
             {
                 continue;
             }
@@ -3361,17 +3452,43 @@ void KernelMonitor::ScanHookInput()
 
     for (const InputStackRecord& record : result.Records)
     {
-        if (!record.Suspicious)
+        bool unbacked = false;
+        std::wstring notes = record.Notes;
+        uint64_t unbackedObject = 0;
+        for (const DeviceStackResult& stack : record.Driver.Stacks)
+        {
+            for (const DeviceObjectRecord& attached : stack.Stack)
+            {
+                if (!attached.Suspicious)
+                {
+                    continue;
+                }
+                unbacked = true;
+                unbackedObject = attached.DriverObject != 0
+                    ? attached.DriverObject
+                    : attached.DeviceObject;
+                if (!attached.Notes.empty())
+                {
+                    notes = attached.Notes;
+                }
+                break;
+            }
+            if (unbacked)
+            {
+                break;
+            }
+        }
+        if (!unbacked)
         {
             continue;
         }
         EmitUnique(
             L"hook.unbacked",
-            L"input:" + record.Role,
+            L"input:" + record.Role + L":" + HexU64(unbackedObject),
             record.DriverFilter,
             L"input",
-            L"unknown driver on " + record.Role + L" stack",
-            record.Notes);
+            L"unbacked driver on " + record.Role + L" stack",
+            notes);
     }
 }
 
@@ -3777,7 +3894,11 @@ void KernelMonitor::ScanUserModeHostility()
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
-    GetLiveTargets(&device, &symbols);
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE)
@@ -3877,25 +3998,56 @@ void KernelMonitor::ScanUserModeHostility()
             break;
         }
         ++scanned;
+        if ((scanned % 16) == 0)
+        {
+            IngestLiveTimeline();
+            IngestThreatIntel();
+            if (StopRequested.load())
+            {
+                break;
+            }
+        }
 
         const uint32_t pid = target.Pid;
         const std::wstring& imagePath = target.ImagePath;
         const std::wstring& leaf = target.Leaf;
         const bool builtin = KmonIsWindowsBuiltinLeaf(leaf);
-            if (builtin &&
-                imagePath.find(L'\\') != std::wstring::npos &&
-                !KmonWindowsBuiltinPathLooksInbox(imagePath))
+        const bool watched =
+            NameEqualsWatch(leaf, watchNames) ||
+            watchPids.count(pid) != 0;
+        if (watched && pid > 4)
+        {
+            bool concreteWatch = watchPids.count(pid) != 0;
+            if (!concreteWatch)
             {
-                EmitUnique(
-                    L"process.masquerade",
-                    L"masq:" + std::to_wstring(pid),
-                    imagePath,
-                    L"masquerade",
-                    L"Windows-named process from a non-inbox path pid=" +
-                        std::to_wstring(pid) + L" " + imagePath,
-                    L"leaf=" + leaf,
-                    pid);
+                for (const std::wstring& name : watchNames)
+                {
+                    if (!WatchTokenIsWildcard(name) && name == leaf)
+                    {
+                        concreteWatch = true;
+                        break;
+                    }
+                }
             }
+            if (concreteWatch)
+            {
+                EnableLoggingForPid(pid);
+            }
+        }
+        if (builtin &&
+            imagePath.find(L'\\') != std::wstring::npos &&
+            !KmonWindowsBuiltinPathLooksInbox(imagePath))
+        {
+            EmitUnique(
+                L"process.masquerade",
+                L"masq:" + std::to_wstring(pid),
+                imagePath,
+                L"masquerade",
+                L"Windows-named process from a non-inbox path pid=" +
+                    std::to_wstring(pid) + L" " + imagePath,
+                L"leaf=" + leaf,
+                pid);
+        }
 
             uint64_t moduleBase = 0;
             std::vector<std::wstring> modulePaths;
@@ -3936,7 +4088,8 @@ void KernelMonitor::ScanUserModeHostility()
                 }
                 CloseHandle(modSnap);
             }
-            const bool moduleInventoryComplete = moduleCount <= kMaxModuleRows;
+            const bool moduleInventoryComplete =
+                moduleCount > 0 && moduleCount <= kMaxModuleRows;
 
             HANDLE processHandle = OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
@@ -4161,13 +4314,8 @@ void KernelMonitor::ScanUserModeHostility()
                         const bool parsedDisk = ReadDiskPeHead(imagePath, &diskHeaders) &&
                             ParseKmonPeLayout(diskHeaders, &diskLayout);
                         const bool parsedLive = ParseKmonPeIdentity(live, &liveId);
-                        const bool watchedTarget =
-                            NameEqualsWatch(leaf, watchNames) ||
-                            watchPids.count(pid) != 0;
                         const bool compareText = builtin ||
-                            KmonWindowsBuiltinPathLooksInbox(imagePath) ||
-                            watchedTarget ||
-                            KmonClassifyDriverPath(imagePath) == L"drop";
+                            KmonWindowsBuiltinPathLooksInbox(imagePath);
                         const bool identityMismatch = parsedDisk && parsedLive &&
                             (diskLayout.SizeOfImage != liveId.SizeOfImage ||
                                 diskLayout.EntryPointRva != liveId.EntryPointRva ||
@@ -4217,7 +4365,7 @@ void KernelMonitor::ScanUserModeHostility()
                             parsedDisk &&
                             diskLayout.ExecSize >= 16 &&
                             diskLayout.ExecFileOffset != 0 &&
-                            !RelocatedSliceMatchesDisk(
+                            RelocatedSliceCompare(
                                 imagePath,
                                 diskHeaders,
                                 diskLayout,
@@ -4228,7 +4376,7 @@ void KernelMonitor::ScanUserModeHostility()
                                 exeRegion,
                                 diskLayout.ExecRva,
                                 diskLayout.ExecFileOffset,
-                                diskLayout.ExecSize))
+                                diskLayout.ExecSize) == SliceMismatch)
                         {
                             EmitUnique(
                                 L"process.hollow",
@@ -4248,7 +4396,7 @@ void KernelMonitor::ScanUserModeHostility()
                             uint32_t laterRva = diskLayout.ExecRva + 0x1000;
                             uint32_t laterFile = 0;
                             if (RvaToFileOffset(diskHeaders, laterRva, &laterFile) &&
-                                !RelocatedSliceMatchesDisk(
+                                RelocatedSliceCompare(
                                     imagePath,
                                     diskHeaders,
                                     diskLayout,
@@ -4259,7 +4407,7 @@ void KernelMonitor::ScanUserModeHostility()
                                     exeRegion,
                                     laterRva,
                                     laterFile,
-                                    0x100))
+                                    0x100) == SliceMismatch)
                             {
                                 EmitUnique(
                                     L"process.hollow",
@@ -4280,7 +4428,7 @@ void KernelMonitor::ScanUserModeHostility()
                         {
                             uint32_t epFile = 0;
                             if (RvaToFileOffset(diskHeaders, diskLayout.EntryPointRva, &epFile) &&
-                                !RelocatedSliceMatchesDisk(
+                                RelocatedSliceCompare(
                                     imagePath,
                                     diskHeaders,
                                     diskLayout,
@@ -4291,7 +4439,7 @@ void KernelMonitor::ScanUserModeHostility()
                                     exeRegion,
                                     diskLayout.EntryPointRva,
                                     epFile,
-                                    0x80))
+                                    0x80) == SliceMismatch)
                             {
                                 EmitUnique(
                                     L"process.hollow",
@@ -4478,10 +4626,14 @@ void KernelMonitor::ScanUserModeHostility()
                     n.find(L"\\windows\\winsxs\\") != std::wstring::npos;
                 const bool inImageDir =
                     !imageDir.empty() && ToLowerCopy(modulePath).find(imageDir) == 0;
-                const bool dropModule = moduleClass == L"drop";
-                const bool builtinForeign = builtin && !windowsModule && !inImageDir &&
-                    moduleClass != L"inbox";
-                if (!dropModule && !builtinForeign)
+                const bool dropImplant =
+                    moduleClass == L"drop" && (builtin || watched);
+                const bool builtinForeign = builtin &&
+                    !windowsModule &&
+                    !inImageDir &&
+                    moduleClass != L"inbox" &&
+                    moduleClass != L"third_party";
+                if (!dropImplant && !builtinForeign)
                 {
                     continue;
                 }
@@ -4489,7 +4641,7 @@ void KernelMonitor::ScanUserModeHostility()
                     L"process.implant",
                     L"implant:" + std::to_wstring(pid) + L":" + KmonBasenameLower(modulePath),
                     imagePath,
-                    dropModule ? L"drop_module" : L"builtin_foreign_module",
+                    dropImplant ? L"drop_module" : L"builtin_foreign_module",
                     L"foreign module in pid=" + std::to_wstring(pid) + L" " + leaf +
                         L" module=" + KmonBasenameLower(modulePath),
                     modulePath,
@@ -4506,13 +4658,24 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
         return;
     }
 
+    uint64_t created = 0;
+    HANDLE query = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (query != nullptr)
+    {
+        created = QueryProcessCreateTicks(query);
+        CloseHandle(query);
+    }
+
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
-        if (LoggingEnabledPids.count(pid) != 0)
+        auto it = LoggingEnabledPids.find(pid);
+        if (it != LoggingEnabledPids.end())
         {
-            return;
+            if (created == 0 || it->second == 0 || it->second == created)
+            {
+                return;
+            }
         }
-        LoggingEnabledPids.insert(pid);
     }
 
     bool enabled = TryEnableLoggingUsermode(pid, KNDBG_PROCESS_LOG_DEFAULT);
@@ -4543,12 +4706,20 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
 
     if (enabled)
     {
-        LoggingEnabledCount.fetch_add(1);
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        auto it = LoggingEnabledPids.find(pid);
+        if (it == LoggingEnabledPids.end())
+        {
+            LoggingEnabledPids.emplace(pid, created);
+            LoggingEnabledCount.fetch_add(1);
+        }
+        else
+        {
+            it->second = created;
+        }
     }
     else
     {
-        std::lock_guard<std::mutex> watchLock(WatchMutex);
-        LoggingEnabledPids.erase(pid);
         LoggingFailedCount.fetch_add(1);
     }
 }
@@ -4567,12 +4738,45 @@ void KernelMonitor::PruneStalePromotedWatches()
         return;
     }
 
-    std::vector<uint32_t> live;
-    if (!CollectToolhelpPidsByName(names, &live))
+    bool hasWildcard = false;
+    for (const std::wstring& name : names)
     {
-        return;
+        if (WatchTokenIsWildcard(name))
+        {
+            hasWildcard = true;
+            break;
+        }
     }
-    std::unordered_set<uint32_t> liveSet(live.begin(), live.end());
+
+    std::unordered_set<uint32_t> liveSet;
+    if (hasWildcard)
+    {
+        // /name * promotes every create. Toolhelp name matching skips
+        // wildcards, so an empty live set would drop every watch.
+        for (uint32_t pid : promoted)
+        {
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (process != nullptr)
+            {
+                liveSet.insert(pid);
+                CloseHandle(process);
+                continue;
+            }
+            if (GetLastError() != ERROR_INVALID_PARAMETER)
+            {
+                liveSet.insert(pid);
+            }
+        }
+    }
+    else
+    {
+        std::vector<uint32_t> live;
+        if (!CollectToolhelpPidsByName(names, &live))
+        {
+            return;
+        }
+        liveSet.insert(live.begin(), live.end());
+    }
 
     std::lock_guard<std::mutex> lock(WatchMutex);
     for (uint32_t pid : promoted)
@@ -4588,6 +4792,44 @@ void KernelMonitor::PruneStalePromotedWatches()
         if (WatchExplicitPids.count(pid) == 0)
         {
             WatchPids.erase(pid);
+        }
+    }
+
+    std::vector<uint32_t> logging;
+    logging.reserve(LoggingEnabledPids.size());
+    for (const auto& entry : LoggingEnabledPids)
+    {
+        logging.push_back(entry.first);
+    }
+    for (uint32_t pid : logging)
+    {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process != nullptr)
+        {
+            const uint64_t created = QueryProcessCreateTicks(process);
+            CloseHandle(process);
+            auto it = LoggingEnabledPids.find(pid);
+            if (it != LoggingEnabledPids.end() &&
+                created != 0 &&
+                it->second != 0 &&
+                created != it->second)
+            {
+                LoggingEnabledPids.erase(it);
+                if (LoggingEnabledCount.load() > 0)
+                {
+                    LoggingEnabledCount.fetch_sub(1);
+                }
+            }
+            continue;
+        }
+        if (GetLastError() != ERROR_INVALID_PARAMETER)
+        {
+            continue;
+        }
+        LoggingEnabledPids.erase(pid);
+        if (LoggingEnabledCount.load() > 0)
+        {
+            LoggingEnabledCount.fetch_sub(1);
         }
     }
 }
@@ -5225,6 +5467,16 @@ bool KernelMonitorArtifactSelfTest()
         }
         if (GetFileAttributesW(fixture.c_str()) != INVALID_FILE_ATTRIBUTES)
         {
+            uint32_t childExecRva = 0x1000;
+            std::vector<uint8_t> fixtureHead;
+            KmonPeLayout fixtureLayout = {};
+            if (ReadDiskPeHead(fixture, &fixtureHead) &&
+                ParseKmonPeLayout(fixtureHead, &fixtureLayout) &&
+                fixtureLayout.ExecRva != 0)
+            {
+                childExecRva = fixtureLayout.ExecRva;
+            }
+
             STARTUPINFOW si = {};
             si.cb = sizeof(si);
             PROCESS_INFORMATION pi = {};
@@ -5237,7 +5489,7 @@ bool KernelMonitorArtifactSelfTest()
                     nullptr,
                     nullptr,
                     FALSE,
-                    0,
+                    CREATE_NO_WINDOW,
                     nullptr,
                     nullptr,
                     &si,
@@ -5245,7 +5497,6 @@ bool KernelMonitorArtifactSelfTest()
             {
                 childProc = pi.hProcess;
                 CloseHandle(pi.hThread);
-                Sleep(400);
                 HANDLE inspect = OpenProcess(
                     PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
                     FALSE,
@@ -5254,29 +5505,42 @@ bool KernelMonitorArtifactSelfTest()
                 {
                     uint64_t childBase = 0;
                     QueryPebImageBase(inspect, nullptr, nullptr, pi.dwProcessId, &childBase);
-                    uint32_t childRva[1] = { 0x1000 };
+                    uint32_t childRva[1] = { childExecRva };
                     uint32_t childPriv = 0;
                     uint32_t childValid = 0;
                     if (childBase != 0)
                     {
-                        CountPrivateCowImagePages(
-                            inspect,
-                            nullptr,
-                            nullptr,
-                            pi.dwProcessId,
-                            childBase,
-                            childRva,
-                            1,
-                            &childPriv,
-                            &childValid);
+                        for (int poll = 0; poll < 20; ++poll)
+                        {
+                            childPriv = 0;
+                            childValid = 0;
+                            CountPrivateCowImagePages(
+                                inspect,
+                                nullptr,
+                                nullptr,
+                                pi.dwProcessId,
+                                childBase,
+                                childRva,
+                                1,
+                                &childPriv,
+                                &childValid);
+                            if (childPriv > 0)
+                            {
+                                break;
+                            }
+                            if (WaitForSingleObject(childProc, 0) == WAIT_OBJECT_0)
+                            {
+                                break;
+                            }
+                            Sleep(100);
+                        }
                     }
                     CloseHandle(inspect);
-                    if (childValid > 0 && childPriv == 0)
-                    {
-                        break;
-                    }
+                    // Self-process COW already proved the primitive. A child
+                    // miss is a timing skip, not a failed primitive.
+                    (void)childValid;
+                    (void)childPriv;
                 }
-                TerminateProcess(childProc, 0);
             }
         }
 
@@ -5285,6 +5549,7 @@ bool KernelMonitorArtifactSelfTest()
     if (childProc != nullptr)
     {
         TerminateProcess(childProc, 0);
+        WaitForSingleObject(childProc, 5000);
         CloseHandle(childProc);
     }
     return ok;

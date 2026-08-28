@@ -691,7 +691,7 @@ namespace
 
     const CompletionHint kKmonRootTokens[] =
     {
-        { L"start", L"!kmon start [/name] [/verbose] [/background]", L"arm TI+live and stay on the tail (filename not required)" },
+        { L"start", L"!kmon start [/name] [/pid] [/driver] [/verbose] [/background] [/log] [/throttle]", L"arm TI+live and stay on the tail (filename not required)" },
         { L"stop", L"!kmon stop", L"stop derived logging; leaves TI/live running" },
         { L"status", L"!kmon status", L"session counters and watch set" },
         { L"add", L"!kmon add /pid|/name|/driver <v>", L"while collecting; extend inject.remote or highlight set" },

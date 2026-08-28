@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -165,7 +166,7 @@ private:
     std::vector<std::wstring> WatchNamesLower;
     std::vector<std::wstring> WatchDriversLower;
     std::unordered_set<uint32_t> WatchPromotedPids;
-    std::unordered_set<uint32_t> LoggingEnabledPids;
+    std::unordered_map<uint32_t, uint64_t> LoggingEnabledPids;
     std::map<uint32_t, uint64_t> RecentCreatePids;
     std::unordered_set<uint32_t> EmittedUnnamedPids;
     std::unordered_set<std::wstring> EmittedMapperKeys;

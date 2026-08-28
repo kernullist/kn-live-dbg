@@ -4,6 +4,9 @@
 
 #include <Windows.h>
 #include <Psapi.h>
+#ifndef FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE
+#define FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE 0x00000010
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -81,7 +84,9 @@ namespace
         if (file != INVALID_HANDLE_VALUE)
         {
             FILE_DISPOSITION_INFO_EX disp = {};
-            disp.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+            disp.Flags = FILE_DISPOSITION_FLAG_DELETE |
+                FILE_DISPOSITION_FLAG_POSIX_SEMANTICS |
+                FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
             const BOOL posix = SetFileInformationByHandle(
                 file,
                 FileDispositionInfoEx,
@@ -161,7 +166,7 @@ namespace
         return reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     }
 
-    bool ParseSelfExec(uint32_t* execRva, uint32_t* stampRva)
+    bool ParseSelfExec(uint32_t* execRva, uint32_t* stampRva, uint32_t* execVirtSize = nullptr)
     {
         bool ok = false;
         do
@@ -174,6 +179,10 @@ namespace
             if (stampRva != nullptr)
             {
                 *stampRva = 0;
+            }
+            if (execVirtSize != nullptr)
+            {
+                *execVirtSize = 0;
             }
             uint8_t* base = ImageBase();
             if (base == nullptr || base[0] != 'M' || base[1] != 'Z')
@@ -202,6 +211,12 @@ namespace
                 if ((section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0)
                 {
                     *execRva = section[i].VirtualAddress;
+                    if (execVirtSize != nullptr)
+                    {
+                        uint32_t virt = section[i].Misc.VirtualSize;
+                        uint32_t raw = section[i].SizeOfRawData;
+                        *execVirtSize = (virt > raw) ? virt : raw;
+                    }
                     ok = true;
                     break;
                 }
@@ -236,7 +251,11 @@ namespace
     bool ApplyOverwrite()
     {
         uint32_t execRva = 0x1000;
-        ParseSelfExec(&execRva, nullptr);
+        uint32_t execVirt = 0;
+        if (!ParseSelfExec(&execRva, nullptr, &execVirt))
+        {
+            return false;
+        }
         uint8_t* text = ImageBase() + execRva;
         uint8_t patch[64];
         std::memset(patch, 0x90, sizeof(patch));
@@ -244,7 +263,13 @@ namespace
         {
             return false;
         }
-        PatchCurrentProcessBytes(text + 0x1000, patch, sizeof(patch));
+        if (execVirt > 0x1000)
+        {
+            if (!PatchCurrentProcessBytes(text + 0x1000, patch, sizeof(patch)))
+            {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -464,11 +489,19 @@ namespace
             {
                 break;
             }
+            CloseHandle(pi.hThread);
+            // Child applies the scenario then holds. A fast exit means the
+            // scenario failed and the parent must not report success.
+            const DWORD wait = WaitForSingleObject(pi.hProcess, 1000);
+            if (wait == WAIT_OBJECT_0)
+            {
+                CloseHandle(pi.hProcess);
+                break;
+            }
             if (pid != nullptr)
             {
                 *pid = pi.dwProcessId;
             }
-            CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
             ok = true;
         } while (false);
@@ -500,7 +533,7 @@ namespace
                     nullptr,
                     nullptr,
                     FALSE,
-                    CREATE_SUSPENDED,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW,
                     nullptr,
                     nullptr,
                     &si,
@@ -571,17 +604,17 @@ namespace
                 image.c_str());
             std::fflush(stdout);
             HoldSeconds(seconds);
-            TerminateProcess(process, 0);
-            WaitForSingleObject(process, 5000);
             ok = true;
         } while (false);
+        if (process != nullptr)
+        {
+            TerminateProcess(process, 0);
+            WaitForSingleObject(process, 5000);
+            CloseHandle(process);
+        }
         if (thread != nullptr)
         {
             CloseHandle(thread);
-        }
-        if (process != nullptr)
-        {
-            CloseHandle(process);
         }
         return ok;
     }
@@ -687,8 +720,17 @@ int wmain(int argc, wchar_t** argv)
             std::fwprintf(stderr, L"spawn failed\n");
             return 1;
         }
-        Sleep(200);
-        if (!UnlinkPathNow(image))
+        bool unlinked = false;
+        for (int attempt = 0; attempt < 25; ++attempt)
+        {
+            if (UnlinkPathNow(image))
+            {
+                unlinked = true;
+                break;
+            }
+            Sleep(100);
+        }
+        if (!unlinked)
         {
             std::fwprintf(
                 stderr,
