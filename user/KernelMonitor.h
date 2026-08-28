@@ -135,7 +135,9 @@ private:
         const std::wstring& layer,
         const std::wstring& summary,
         const std::wstring& notes);
+    std::wstring MakeEmittedKey(const std::wstring& key, uint32_t processId) const;
     void ClearEmittedKey(const std::wstring& key);
+    void ClearEmittedKeyForPid(const std::wstring& key, uint32_t processId);
     void NoteDriverLoad(const KmonEvent& event);
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
