@@ -4508,6 +4508,23 @@ void KernelMonitor::ScanHookCallbacks()
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || !device->IsOpen())
+    {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:callbacks:device",
+            std::wstring(),
+            L"callback",
+            L"callback scan skipped; kernel device is not open",
+            L"Device is null or closed");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:callbacks:device");
     if (!GetLiveTargets(&device, &symbols) || symbols->CopyModules().empty())
     {
         EmitUnique(
@@ -4610,6 +4627,23 @@ void KernelMonitor::ScanHookInput()
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || !device->IsOpen())
+    {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:input:device",
+            std::wstring(),
+            L"input",
+            L"input stack scan skipped; kernel device is not open",
+            L"Device is null or closed");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:input:device");
     if (!GetLiveTargets(&device, &symbols) || symbols->CopyModules().empty())
     {
         EmitUnique(
@@ -4704,6 +4738,23 @@ void KernelMonitor::ScanCpuIntegrityHooks()
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || !device->IsOpen())
+    {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:cpu:device",
+            std::wstring(),
+            L"cpu",
+            L"cpu/integrity scan skipped; kernel device is not open",
+            L"Device is null or closed");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:cpu:device");
     if (!GetLiveTargets(&device, &symbols) || symbols->CopyModules().empty())
     {
         EmitUnique(
@@ -4789,6 +4840,29 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             else
             {
                 ClearEmittedKey(L"scan_failed:ssdt:shadow");
+            }
+            bool tableReadFailed = false;
+            for (const SsdtTable& table : result.Tables)
+            {
+                if (!table.Warning.empty() && table.Entries.empty())
+                {
+                    tableReadFailed = true;
+                    break;
+                }
+            }
+            if (tableReadFailed)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:ssdt:table",
+                    std::wstring(),
+                    L"ssdt",
+                    L"an SSDT table could not be read; hooked slots in that table may be missed",
+                    L"table Warning set with empty Entries");
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:ssdt:table");
             }
         }
         else
@@ -5656,6 +5730,8 @@ void KernelMonitor::ScanUserModeHostility()
         const bool builtin = KmonIsWindowsBuiltinLeaf(leaf);
         const bool nameWatched = NameEqualsWatch(leaf, watchNames);
         const bool watched = nameWatched || watchPids.count(pid) != 0;
+        const bool dropHost = KmonClassifyDriverPath(imagePath) == L"drop";
+        const bool hostileHost = watched || builtin || dropHost;
         if (watched && pid > 4)
         {
             if (nameWatched)
@@ -5807,9 +5883,9 @@ void KernelMonitor::ScanUserModeHostility()
             // PE probes. Hidden PTEs follow the same kernel-VAD gate so PPL
             // builtin hosts are covered when usermode walks cannot run.
             const bool needKernelPrivateImplants =
-                (watched || builtin) &&
+                (hostileHost) &&
                 (!queried || !moduleInventoryComplete);
-            const bool wantKernelVad = watched || needKernelPrivateImplants;
+            const bool wantKernelVad = watched || dropHost || needKernelPrivateImplants;
             const bool hasKernelVadScan =
                 wantKernelVad &&
                 QueryKernelVadScan(
@@ -5885,7 +5961,7 @@ void KernelMonitor::ScanUserModeHostility()
 
                 bool wxExe = false;
                 DWORD wxProtect = 0;
-                if (queried && (builtin || watched) && processHandle != nullptr)
+                if (queried && hostileHost && processHandle != nullptr)
                 {
                     MEMORY_BASIC_INFORMATION walk = mbi;
                     const uint64_t allocBase = reinterpret_cast<uint64_t>(walk.AllocationBase);
@@ -5921,7 +5997,7 @@ void KernelMonitor::ScanUserModeHostility()
 
                 if (!wxExe &&
                     hasKernelVad &&
-                    (builtin || watched) &&
+                    hostileHost &&
                     exeVad.WritableExecutable)
                 {
                     wxExe = true;
@@ -6087,7 +6163,7 @@ void KernelMonitor::ScanUserModeHostility()
                         KmonPeIdentity liveId = {};
                         const bool parsedDisk = ReadDiskPeHead(imagePath, &diskHeaders) &&
                             ParseKmonPeLayout(diskHeaders, &diskLayout);
-                        if (parsedDisk && watched)
+                        if (parsedDisk && (watched || dropHost))
                         {
                             CollectImportedDllNames(
                                 imagePath,
@@ -6096,8 +6172,7 @@ void KernelMonitor::ScanUserModeHostility()
                                 &importedDlls);
                         }
                         const bool parsedLive = ParseKmonPeIdentity(live, &liveId);
-                        const bool compareText = builtin ||
-                            watched ||
+                        const bool compareText = hostileHost ||
                             KmonWindowsBuiltinPathLooksInbox(imagePath);
                         if (compareText &&
                             parsedDisk &&
@@ -6165,8 +6240,9 @@ void KernelMonitor::ScanUserModeHostility()
                         else if (compareText &&
                             parsedDisk &&
                             diskLayout.ExecSize >= 16 &&
-                            diskLayout.ExecFileOffset != 0 &&
-                            RelocatedSliceCompare(
+                            diskLayout.ExecFileOffset != 0)
+                        {
+                            const SliceCompare textCmp = RelocatedSliceCompare(
                                 imagePath,
                                 diskHeaders,
                                 diskLayout,
@@ -6177,18 +6253,45 @@ void KernelMonitor::ScanUserModeHostility()
                                 exeRegion,
                                 diskLayout.ExecRva,
                                 diskLayout.ExecFileOffset,
-                                diskLayout.ExecSize) == SliceMismatch)
-                        {
-                            EmitUnique(
-                                L"process.hollow",
-                                L"exe_text:" + std::to_wstring(pid),
-                                imagePath,
-                                L"exe_text",
-                                L"main EXE code bytes differ from disk pid=" +
-                                    std::to_wstring(pid) + L" " + leaf,
-                                L"rva=" + std::to_wstring(diskLayout.ExecRva) +
-                                    L" compared=" + std::to_wstring(diskLayout.ExecSize),
-                                pid);
+                                diskLayout.ExecSize);
+                            if (textCmp == SliceMismatch)
+                            {
+                                EmitUnique(
+                                    L"process.hollow",
+                                    L"exe_text:" + std::to_wstring(pid),
+                                    imagePath,
+                                    L"exe_text",
+                                    L"main EXE code bytes differ from disk pid=" +
+                                        std::to_wstring(pid) + L" " + leaf,
+                                    L"rva=" + std::to_wstring(diskLayout.ExecRva) +
+                                        L" compared=" + std::to_wstring(diskLayout.ExecSize),
+                                    pid);
+                            }
+                            else if (
+                                textCmp == SliceUnknown &&
+                                diskLayout.PreferredBase != 0 &&
+                                exeRegion != diskLayout.PreferredBase &&
+                                diskLayout.RelocRva != 0 &&
+                                diskLayout.RelocSize != 0)
+                            {
+                                EmitUnique(
+                                    L"process.implant",
+                                    L"scan_failed:userhostility:reloc:" +
+                                        std::to_wstring(pid),
+                                    imagePath,
+                                    L"user",
+                                    L"relocated EXE text compare could not run pid=" +
+                                        std::to_wstring(pid) + L" " + leaf,
+                                    L"reloc bytes were not readable",
+                                    pid);
+                            }
+                            else
+                            {
+                                ClearEmittedKeyForPid(
+                                    L"scan_failed:userhostility:reloc:" +
+                                        std::to_wstring(pid),
+                                    pid);
+                            }
                         }
                         else if (compareText &&
                             parsedDisk &&
@@ -6379,7 +6482,8 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 uint64_t cursor = 0;
                 uint32_t orphans = 0;
-                for (int step = 0; step < 4096 && orphans < 4; ++step)
+                int step = 0;
+                for (; step < 4096 && orphans < 4; ++step)
                 {
                     MEMORY_BASIC_INFORMATION region = {};
                     if (VirtualQueryEx(
@@ -6422,7 +6526,7 @@ void KernelMonitor::ScanUserModeHostility()
                             head[0] == 'M' &&
                             head[1] == 'Z';
                         const bool rwx =
-                            (watched || builtin) &&
+                            hostileHost &&
                             KmonProtectIsRwx(region.Protect);
                         if (mz)
                         {
@@ -6482,13 +6586,25 @@ void KernelMonitor::ScanUserModeHostility()
                         break;
                     }
                 }
+                if (hostileHost && step >= 4096)
+                {
+                    EmitUnique(
+                        L"process.implant",
+                        L"scan_failed:userhostility:vmwalk:" + std::to_wstring(pid),
+                        imagePath,
+                        L"user",
+                        L"usermode VAD walk hit the region cap pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"VirtualQueryEx stopped at 4096 regions",
+                        pid);
+                }
             }
             if (processHandle != nullptr)
             {
                 CloseHandle(processHandle);
             }
 
-            if (hasKernelVadScan && (watched || builtin))
+            if (hasKernelVadScan && hostileHost)
             {
                 uint32_t vadImplants = 0;
                 // Usermode VirtualQueryEx already reported MZ/RWX orphans
@@ -6608,7 +6724,7 @@ void KernelMonitor::ScanUserModeHostility()
                 }
             }
 
-            if (watched || builtin)
+            if (hostileHost)
             {
                 uint64_t ic = 0;
                 const std::wstring icFailKey =
@@ -6718,18 +6834,20 @@ void KernelMonitor::ScanUserModeHostility()
                 const bool inImageDir =
                     imageDir.size() > 3 &&
                     moduleLower.find(imageDir) == 0;
-                const bool dropImplant =
-                    moduleClass == L"drop" && (builtin || watched);
                 const std::wstring moduleLeaf = KmonBasenameLower(modulePath);
+                const bool dropImplant =
+                    moduleClass == L"drop" &&
+                    moduleLeaf != leaf &&
+                    hostileHost;
                 const bool watchedUnimported =
-                    watched &&
+                    (watched || dropHost) &&
                     !importedDlls.empty() &&
                     !windowsModule &&
                     inImageDir &&
                     moduleClass == L"unknown" &&
                     moduleLeaf != leaf &&
                     importedDlls.find(moduleLeaf) == importedDlls.end();
-                const bool watchedUnknown = watched &&
+                const bool watchedUnknown = (watched || dropHost) &&
                     !windowsModule &&
                     !inImageDir &&
                     moduleClass == L"unknown";
