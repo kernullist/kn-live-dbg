@@ -594,8 +594,16 @@ namespace
                     sizeof(entry));
                 const uint16_t type = static_cast<uint16_t>(entry >> 12);
                 const uint16_t offset = static_cast<uint16_t>(entry & 0x0fff);
+                if (offset > (std::numeric_limits<uint32_t>::max)() - block.VirtualAddress)
+                {
+                    continue;
+                }
                 const uint32_t rva = block.VirtualAddress + offset;
-                if (rva < sliceRva || rva >= sliceRva + static_cast<uint32_t>(slice->size()))
+                if (slice->size() > (std::numeric_limits<uint32_t>::max)() ||
+                    sliceRva > (std::numeric_limits<uint32_t>::max)() -
+                        static_cast<uint32_t>(slice->size()) ||
+                    rva < sliceRva ||
+                    rva >= sliceRva + static_cast<uint32_t>(slice->size()))
                 {
                     continue;
                 }
@@ -986,6 +994,84 @@ namespace
     bool IsUserModeImageBase(uint64_t address)
     {
         return address >= 0x10000ull && address <= 0x00007FFFFFFEFFFFull;
+    }
+
+    bool QueryProcessIsWow64(
+        HANDLE process,
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        bool* wow64)
+    {
+        bool ok = false;
+        do
+        {
+            if (wow64 == nullptr)
+            {
+                break;
+            }
+            *wow64 = false;
+            if (process != nullptr)
+            {
+                BOOL flag = FALSE;
+                if (IsWow64Process(process, &flag))
+                {
+                    *wow64 = flag != FALSE;
+                    ok = true;
+                    break;
+                }
+            }
+            if (device == nullptr ||
+                symbols == nullptr ||
+                pid <= 4 ||
+                !device->IsOpen())
+            {
+                break;
+            }
+            TypeFieldInfo dtbField = {};
+            TypeFieldInfo wow64Field = {};
+            std::wstring ignored;
+            if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            {
+                break;
+            }
+            if (!symbols->FindField(L"nt!_EPROCESS", L"Wow64Process", &wow64Field, &ignored))
+            {
+                break;
+            }
+            ProcessAddressContext ctx = {};
+            if (!device->ResolveProcess(
+                    pid,
+                    static_cast<uint32_t>(dtbField.Offset),
+                    0,
+                    &ctx,
+                    &ignored) ||
+                ctx.Eprocess == 0)
+            {
+                break;
+            }
+            if (wow64Field.Offset > (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess)
+            {
+                break;
+            }
+            std::vector<uint8_t> wowBytes;
+            if (!device->ReadMemory(
+                    ctx.Eprocess + static_cast<uint64_t>(wow64Field.Offset),
+                    sizeof(uint64_t),
+                    &wowBytes,
+                    &ignored) ||
+                wowBytes.size() < sizeof(uint64_t))
+            {
+                break;
+            }
+            uint64_t wow64Process = 0;
+            std::memcpy(&wow64Process, wowBytes.data(), sizeof(wow64Process));
+            *wow64 = wow64Process != 0;
+            ok = true;
+        } while (false);
+        return ok;
     }
 
     bool QueryPebImageBase(
@@ -4455,6 +4541,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(&result, &error))
         {
+            ClearEmittedKey(L"scan_failed:msr");
             for (const MsrReading& reading : result.Readings)
             {
                 if (!reading.Suspicious)
@@ -4470,6 +4557,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     reading.Notes);
             }
         }
+        else
+        {
+            EmitUnique(
+                L"hook.unbacked",
+                L"scan_failed:msr",
+                std::wstring(),
+                L"msr",
+                L"MSR scan failed",
+                error.empty() ? L"Scan returned false" : error);
+        }
     }
     IngestLiveTimeline();
     IngestThreatIntel();
@@ -4484,6 +4581,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(&result, &error))
         {
+            ClearEmittedKey(L"scan_failed:cr");
             for (const CrReading& reading : result.Readings)
             {
                 if (!reading.Suspicious)
@@ -4498,6 +4596,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     L"control register " + reading.Name + L" integrity anomaly",
                     reading.Notes);
             }
+        }
+        else
+        {
+            EmitUnique(
+                L"integrity.cr",
+                L"scan_failed:cr",
+                std::wstring(),
+                L"cr",
+                L"CR scan failed",
+                error.empty() ? L"Scan returned false" : error);
         }
     }
     IngestLiveTimeline();
@@ -4514,6 +4622,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(options, &result, &error))
         {
+            ClearEmittedKey(L"scan_failed:hal");
             for (const HalDispatchTable& table : result.Tables)
             {
                 for (const HalDispatchSlot& slot : table.Slots)
@@ -4537,6 +4646,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 }
             }
         }
+        else
+        {
+            EmitUnique(
+                L"hook.unbacked",
+                L"scan_failed:hal",
+                std::wstring(),
+                L"hal",
+                L"HAL dispatch scan failed",
+                error.empty() ? L"Scan returned false" : error);
+        }
     }
     IngestLiveTimeline();
     IngestThreatIntel();
@@ -4551,6 +4670,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(&result, &error))
         {
+            ClearEmittedKey(L"scan_failed:nmi");
             for (const NmiCallbackRecord& record : result.Callbacks)
             {
                 if (!record.Suspicious)
@@ -4570,6 +4690,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     record.Notes);
             }
         }
+        else
+        {
+            EmitUnique(
+                L"hook.unbacked",
+                L"scan_failed:nmi",
+                std::wstring(),
+                L"nmi",
+                L"NMI callback scan failed",
+                error.empty() ? L"Scan returned false" : error);
+        }
     }
     IngestLiveTimeline();
     IngestThreatIntel();
@@ -4587,6 +4717,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(options, &result, &error))
         {
+            ClearEmittedKey(L"scan_failed:dpc");
             for (const DpcRoutineRecord& record : result.Dpcs)
             {
                 if (!record.Suspicious)
@@ -4642,6 +4773,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     record.Notes);
             }
         }
+        else
+        {
+            EmitUnique(
+                L"hook.unbacked",
+                L"scan_failed:dpc",
+                std::wstring(),
+                L"dpc",
+                L"DPC/timer/work-item scan failed",
+                error.empty() ? L"Scan returned false" : error);
+        }
     }
     IngestLiveTimeline();
     IngestThreatIntel();
@@ -4656,6 +4797,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(&result, &error))
         {
+            ClearEmittedKey(L"scan_failed:wfp");
             uint32_t emitted = 0;
             for (const WfpKernelCallout& callout : result.Callouts)
             {
@@ -4686,6 +4828,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 ++emitted;
             }
         }
+        else
+        {
+            EmitUnique(
+                L"hook.unbacked",
+                L"scan_failed:wfp",
+                std::wstring(),
+                L"wfp",
+                L"WFP callout scan failed",
+                error.empty() ? L"Scan returned false" : error);
+        }
     }
     IngestLiveTimeline();
     IngestThreatIntel();
@@ -4700,6 +4852,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(&result, &error))
         {
+            ClearEmittedKey(L"scan_failed:minifilter");
             for (const MinifilterFilterRecord& filter : result.Filters)
             {
                 if (filter.WellKnownInbox)
@@ -4720,6 +4873,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     filter.Notes);
             }
         }
+        else
+        {
+            EmitUnique(
+                L"hook.unbacked",
+                L"scan_failed:minifilter",
+                std::wstring(),
+                L"minifilter",
+                L"minifilter scan failed",
+                error.empty() ? L"Scan returned false" : error);
+        }
     }
     IngestLiveTimeline();
     IngestThreatIntel();
@@ -4736,6 +4899,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(options, &result, &error) && result.CiOptions.Resolved)
         {
+            ClearEmittedKey(L"scan_failed:ci");
             if (!result.CiOptions.CodeIntegrityEnabled)
             {
                 EmitUnique(
@@ -4746,6 +4910,16 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     L"kernel code integrity is disabled (DSE off)",
                     result.CiOptions.SymbolSource);
             }
+        }
+        else
+        {
+            EmitUnique(
+                L"integrity.ci",
+                L"scan_failed:ci",
+                std::wstring(),
+                L"ci",
+                L"CI options scan failed or unresolved",
+                error.empty() ? L"CiOptions not resolved" : error);
         }
     }
     IngestLiveTimeline();
@@ -4765,6 +4939,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(options, &result, &error))
         {
+            ClearEmittedKey(L"scan_failed:byovd");
             for (const ByovdModuleRecord& record : result.Records)
             {
                 if (record.Matches.empty())
@@ -4779,6 +4954,15 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     L"known-vulnerable driver loaded " + record.ImageName,
                     notes);
             }
+        }
+        else
+        {
+            EmitMappedResidue(
+                L"scan_failed:byovd",
+                std::wstring(),
+                L"byovd",
+                L"BYOVD catalog scan failed",
+                error.empty() ? L"Scan returned false" : error);
         }
     }
 }
@@ -5070,12 +5254,13 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
             }
-            BOOL wow64 = FALSE;
-            bool wow64Known = false;
-            if (processHandle != nullptr)
-            {
-                wow64Known = IsWow64Process(processHandle, &wow64) != FALSE;
-            }
+            bool wow64 = false;
+            const bool wow64Known = QueryProcessIsWow64(
+                processHandle,
+                device,
+                symbols,
+                pid,
+                &wow64);
             uint64_t pebImageBase = 0;
             QueryPebImageBase(processHandle, device, symbols, pid, &pebImageBase);
             const uint64_t exeRegion = pebImageBase != 0 ? pebImageBase : moduleBase;
@@ -6045,6 +6230,10 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
                 &ntStatus,
                 &eprocess,
                 &error);
+            if (enabled && (ntStatus & 0x80000000u) != 0)
+            {
+                enabled = false;
+            }
         }
     }
 
@@ -7084,6 +7273,13 @@ bool KernelMonitorSelfTest()
             !VadCoversUserAddress(cover, 0x140001fffull) ||
             VadCoversUserAddress(cover, 0x140002000ull) ||
             VadCoversUserAddress(cover, 0))
+        {
+            break;
+        }
+        bool wow64Unknown = true;
+        if (QueryProcessIsWow64(nullptr, nullptr, nullptr, 0, &wow64Unknown) ||
+            wow64Unknown ||
+            QueryProcessIsWow64(nullptr, nullptr, nullptr, 8, &wow64Unknown))
         {
             break;
         }
