@@ -24657,11 +24657,13 @@ static void PrintKmonHelp()
     std::wcout << L"  process.masquerade      Windows-named image from a non-inbox path\n";
     std::wcout << L"  process.hollow          EXE replace at PEB ImageBase: unmapped/private/unbacked,\n";
     std::wcout << L"                          mapped-path mismatch, W+X (builtin), no MZ, stamp/arch,\n";
-    std::wcout << L"                          COW/.text/EP vs disk (Windows builtins), extra PE, ghosting\n";
+    std::wcout << L"                          COW/.text/EP vs disk (Windows builtins and /name|/pid targets),\n";
+    std::wcout << L"                          extra PE, ghosting\n";
     std::wcout << L"  process.implant         drop-dir module in a builtin or /name|/pid target,\n";
     std::wcout << L"                          or extra non-inbox module in a Windows builtin\n";
     std::wcout << L"  inject.remote           drop/unknown-path any remote inject; builtin WriteVM/APC/SetThreadContext;\n";
-    std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView; ReadVM/suspend stay off\n";
+    std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView and ReadVM/suspend\n";
+    std::wcout << L"                          on non-inbox watch targets (builtin ReadVM stays off)\n";
     std::wcout << L"  integrity.ci / .cr      DSE off, CR0.WP=0 (test-signing is not a finding)\n";
     std::wcout << L"  kernel MmCopyVirtualMemory is not on TI; hooks and pool PE are the substitute.\n";
     std::wcout << L"  lab fixture: KnLiveDbgKmonTarget.exe (docs/KMON_TEST_TARGET.md)\n";
