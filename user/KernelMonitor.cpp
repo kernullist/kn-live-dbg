@@ -62,12 +62,17 @@ namespace
                 break;
             }
             // Empty module inventory must not mark every pointer unbacked.
-            if (symbols == nullptr || symbols->Modules().empty())
+            std::vector<KernelModuleInfo> modules;
+            if (symbols != nullptr)
+            {
+                modules = symbols->CopyModules();
+            }
+            if (modules.empty())
             {
                 owned = true;
                 break;
             }
-            for (const KernelModuleInfo& module : symbols->Modules())
+            for (const KernelModuleInfo& module : modules)
             {
                 if (module.Base == 0 || module.Size == 0)
                 {
@@ -100,7 +105,7 @@ namespace
             {
                 break;
             }
-            if (!symbols->Modules().empty())
+            if (!symbols->CopyModules().empty())
             {
                 if (!forceReload)
                 {
@@ -117,7 +122,7 @@ namespace
                 }
             }
             std::wstring ignored;
-            if (!symbols->LoadKernelModules(&ignored) || symbols->Modules().empty())
+            if (!symbols->LoadKernelModules(&ignored) || symbols->CopyModules().empty())
             {
                 break;
             }
@@ -664,6 +669,113 @@ namespace
         return ok;
     }
 
+    uint64_t QueryProcessCreateTicks(HANDLE process)
+    {
+        FILETIME created = {};
+        FILETIME exited = {};
+        FILETIME kernelTime = {};
+        FILETIME userTime = {};
+        if (process == nullptr ||
+            !GetProcessTimes(process, &created, &exited, &kernelTime, &userTime))
+        {
+            return 0;
+        }
+        return (static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    }
+
+    uint64_t QueryEprocessCreateTime(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        HANDLE process,
+        uint64_t eprocess)
+    {
+        if (process != nullptr)
+        {
+            const uint64_t fromHandle = QueryProcessCreateTicks(process);
+            if (fromHandle != 0)
+            {
+                return fromHandle;
+            }
+        }
+        if (device == nullptr || symbols == nullptr || eprocess == 0 || !device->IsOpen())
+        {
+            return 0;
+        }
+
+        TypeFieldInfo createField = {};
+        std::wstring ignored;
+        if (!symbols->FindField(L"nt!_EPROCESS", L"CreateTime", &createField, &ignored) &&
+            !symbols->FindField(L"_EPROCESS", L"CreateTime", &createField, &ignored))
+        {
+            return 0;
+        }
+
+        uint32_t length = sizeof(uint64_t);
+        if (createField.Length != 0 && createField.Length <= 8)
+        {
+            length = static_cast<uint32_t>(createField.Length);
+        }
+
+        std::vector<uint8_t> bytes;
+        if (!device->ReadMemory(
+                eprocess + static_cast<uint64_t>(createField.Offset),
+                length,
+                &bytes,
+                &ignored) ||
+            bytes.size() < length)
+        {
+            return 0;
+        }
+
+        uint64_t value = 0;
+        std::memcpy(&value, bytes.data(), length);
+        return value;
+    }
+
+    bool ReadProcessVirtualChecked(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        HANDLE process,
+        uint32_t pid,
+        uint64_t eprocess,
+        uint64_t address,
+        uint32_t length,
+        std::vector<uint8_t>* bytes)
+    {
+        bool ok = false;
+        do
+        {
+            if (bytes == nullptr ||
+                device == nullptr ||
+                pid <= 4 ||
+                eprocess == 0 ||
+                address == 0 ||
+                length == 0)
+            {
+                break;
+            }
+            const uint64_t createTime = QueryEprocessCreateTime(
+                device,
+                symbols,
+                process,
+                eprocess);
+            if (createTime == 0)
+            {
+                break;
+            }
+            std::wstring ignored;
+            ok = device->ReadProcessVirtual(
+                pid,
+                eprocess,
+                createTime,
+                address,
+                length,
+                bytes,
+                &ignored);
+        } while (false);
+        return ok;
+    }
+
     bool ReadProcessBytes(
         DeviceClient* device,
         SymbolEngine* symbols,
@@ -720,14 +832,15 @@ namespace
             {
                 break;
             }
-            ok = device->ReadProcessVirtual(
+            ok = ReadProcessVirtualChecked(
+                device,
+                symbols,
+                process,
                 pid,
                 ctx.Eprocess,
-                0,
                 address,
                 length,
-                bytes,
-                &ignored);
+                bytes);
         } while (false);
         return ok;
     }
@@ -976,14 +1089,15 @@ namespace
                     {
                         kernelWow64 = true;
                         std::vector<uint8_t> base32Bytes;
-                        if (device->ReadProcessVirtual(
+                        if (ReadProcessVirtualChecked(
+                                device,
+                                symbols,
+                                process,
                                 pid,
                                 ctx.Eprocess,
-                                0,
                                 peb32 + 0x08,
                                 sizeof(uint32_t),
-                                &base32Bytes,
-                                &ignored) &&
+                                &base32Bytes) &&
                             base32Bytes.size() >= sizeof(uint32_t))
                         {
                             uint32_t base32 = 0;
@@ -1023,14 +1137,15 @@ namespace
                 break;
             }
             std::vector<uint8_t> baseBytes;
-            if (!device->ReadProcessVirtual(
+            if (!ReadProcessVirtualChecked(
+                    device,
+                    symbols,
+                    process,
                     pid,
                     ctx.Eprocess,
-                    0,
                     peb + 0x10,
                     sizeof(uint64_t),
-                    &baseBytes,
-                    &ignored) ||
+                    &baseBytes) ||
                 baseBytes.size() < sizeof(uint64_t))
             {
                 break;
@@ -1218,20 +1333,6 @@ namespace
             ok = valid > 0;
         } while (false);
         return ok;
-    }
-
-    uint64_t QueryProcessCreateTicks(HANDLE process)
-    {
-        FILETIME created = {};
-        FILETIME exited = {};
-        FILETIME kernelTime = {};
-        FILETIME userTime = {};
-        if (process == nullptr ||
-            !GetProcessTimes(process, &created, &exited, &kernelTime, &userTime))
-        {
-            return 0;
-        }
-        return (static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
     }
 
     struct KmonUserTarget
@@ -1446,6 +1547,8 @@ namespace
             CloseHandle(snap);
             return false;
         }
+        BOOL more = TRUE;
+        DWORD nextError = ERROR_SUCCESS;
         do
         {
             std::wstring base = KmonBasenameLower(entry.szExeFile);
@@ -1453,8 +1556,18 @@ namespace
             {
                 pids->push_back(entry.th32ProcessID);
             }
-        } while (Process32NextW(snap, &entry));
+            more = Process32NextW(snap, &entry);
+            if (!more)
+            {
+                nextError = GetLastError();
+            }
+        } while (more);
         CloseHandle(snap);
+        if (nextError != ERROR_NO_MORE_FILES &&
+            nextError != ERROR_SUCCESS)
+        {
+            return false;
+        }
         return true;
     }
 }
@@ -3055,7 +3168,7 @@ bool KernelMonitor::GetLiveTargets(DeviceClient** device, SymbolEngine** symbols
             break;
         }
         if (!EnsureLoadedKernelModules(*symbols, true) ||
-            (*symbols)->Modules().empty())
+            (*symbols)->CopyModules().empty())
         {
             break;
         }
@@ -3467,7 +3580,7 @@ void KernelMonitor::ScanHookCallbacks()
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
-    if (!GetLiveTargets(&device, &symbols) || symbols->Modules().empty())
+    if (!GetLiveTargets(&device, &symbols) || symbols->CopyModules().empty())
     {
         EmitUnique(
             L"hook.unbacked",
@@ -3531,7 +3644,7 @@ void KernelMonitor::ScanHookInput()
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
-    if (!GetLiveTargets(&device, &symbols) || symbols->Modules().empty())
+    if (!GetLiveTargets(&device, &symbols) || symbols->CopyModules().empty())
     {
         EmitUnique(
             L"hook.unbacked",
@@ -3600,7 +3713,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
-    if (!GetLiveTargets(&device, &symbols) || symbols->Modules().empty())
+    if (!GetLiveTargets(&device, &symbols) || symbols->CopyModules().empty())
     {
         EmitUnique(
             L"hook.unbacked",
@@ -4145,12 +4258,18 @@ void KernelMonitor::ScanUserModeHostility()
         const std::wstring& imagePath = target.ImagePath;
         const std::wstring& leaf = target.Leaf;
         const bool builtin = KmonIsWindowsBuiltinLeaf(leaf);
-        const bool watched =
-            NameEqualsWatch(leaf, watchNames) ||
-            watchPids.count(pid) != 0;
+        const bool nameWatched = NameEqualsWatch(leaf, watchNames);
+        const bool watched = nameWatched || watchPids.count(pid) != 0;
         if (watched && pid > 4)
         {
-            EnableLoggingForPid(pid);
+            if (nameWatched)
+            {
+                PromoteNamedWatchPid(pid);
+            }
+            else
+            {
+                EnableLoggingForPid(pid);
+            }
         }
         if (builtin &&
             imagePath.find(L'\\') != std::wstring::npos &&
@@ -4966,6 +5085,20 @@ void KernelMonitor::PruneStalePromotedWatches()
     }
 }
 
+void KernelMonitor::PromoteNamedWatchPid(uint32_t pid)
+{
+    if (pid <= 4)
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        WatchPids.insert(pid);
+        WatchPromotedPids.insert(pid);
+    }
+    EnableLoggingForPid(pid);
+}
+
 void KernelMonitor::EnableLoggingForWatchTargets()
 {
     std::vector<uint32_t> pids;
@@ -4977,8 +5110,14 @@ void KernelMonitor::EnableLoggingForWatchTargets()
     }
 
     std::vector<uint32_t> namedPids;
-    CollectToolhelpPidsByName(names, &namedPids);
-    pids.insert(pids.end(), namedPids.begin(), namedPids.end());
+    if (!CollectToolhelpPidsByName(names, &namedPids))
+    {
+        namedPids.clear();
+    }
+    for (uint32_t pid : namedPids)
+    {
+        PromoteNamedWatchPid(pid);
+    }
 
     for (uint32_t pid : pids)
     {
@@ -5010,7 +5149,7 @@ bool KernelMonitor::ResolveKernelImageName(uint32_t pid, std::wstring* name)
             break;
         }
 
-        if (symbols->Modules().empty())
+        if (symbols->CopyModules().empty())
         {
             std::wstring ignored;
             if (!symbols->LoadKernelModules(&ignored))
@@ -5365,12 +5504,7 @@ bool KernelMonitor::AddWatchName(const std::wstring& imageBase)
         CollectToolhelpPidsByName({ lower }, &pids);
         for (uint32_t pid : pids)
         {
-            {
-                std::lock_guard<std::mutex> lock(WatchMutex);
-                WatchPids.insert(pid);
-                WatchPromotedPids.insert(pid);
-            }
-            EnableLoggingForPid(pid);
+            PromoteNamedWatchPid(pid);
         }
     } while (false);
 
@@ -5712,6 +5846,10 @@ bool KernelMonitorSelfTest()
             break;
         }
         if (!AddressOwnedByLoadedModule(nullptr, 0xFFFFF80000000000ull))
+        {
+            break;
+        }
+        if (QueryEprocessCreateTime(nullptr, nullptr, nullptr, 0) != 0)
         {
             break;
         }

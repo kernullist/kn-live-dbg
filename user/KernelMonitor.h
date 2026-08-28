@@ -138,6 +138,7 @@ private:
     void NoteDriverLoad(const KmonEvent& event);
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
+    void PromoteNamedWatchPid(uint32_t pid);
     void EnableLoggingForWatchTargets();
     void PruneStalePromotedWatches();
     bool ResolveKernelImageName(uint32_t pid, std::wstring* name);

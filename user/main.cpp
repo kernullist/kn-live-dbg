@@ -24881,6 +24881,7 @@ static void HandleKmonCommand(
                     std::wcerr << L"!kmon: " << extraError << L"\n";
                     break;
                 }
+                StartTimelineAutoDrainWorker(state, &device);
                 for (uint32_t pid : extra.WatchPids)
                 {
                     kmon.AddWatchPid(pid);
@@ -25071,9 +25072,12 @@ static void HandleKmonCommand(
             }
             std::wcout << L"\n";
 
+            if (!StartTimelineAutoDrainWorker(state, &device))
+            {
+                std::wcerr << L"[kmon] warning: timeline live drain worker did not start\n";
+            }
             if (options.AttachLiveTail)
             {
-                StartTimelineAutoDrainWorker(state, &device);
                 RunKmonLiveTail(kmon);
             }
             else
