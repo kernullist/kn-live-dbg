@@ -2060,7 +2060,12 @@ namespace
                 frameLink = nextFrame;
             }
 
-            result->CoverageComplete = true;
+            result->CoverageComplete = (frameLink == frameHead);
+            if (!result->CoverageComplete)
+            {
+                result->Warnings.push_back(
+                    L"minifilter frame list walk did not return to the list head");
+            }
             ok = true;
         } while (false);
         return ok;
