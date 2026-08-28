@@ -1237,6 +1237,10 @@ namespace
             {
                 break;
             }
+            if (rva > (std::numeric_limits<uint64_t>::max)() - imageBase)
+            {
+                break;
+            }
             std::vector<uint8_t> diskText;
             std::vector<uint8_t> liveText;
             if (!ReadDiskRange(imagePath, fileOffset, length, &diskText) ||
@@ -1349,12 +1353,22 @@ namespace
                 break;
             }
             PSAPI_WORKING_SET_EX_INFORMATION info[8] = {};
+            bool overflow = false;
             for (uint32_t i = 0; i < rvaCount; ++i)
             {
+                if (rvas[i] > (std::numeric_limits<uint64_t>::max)() - imageBase)
+                {
+                    overflow = true;
+                    break;
+                }
                 const uint64_t page = (imageBase + rvas[i]) & ~0xFFFull;
                 info[i].VirtualAddress = reinterpret_cast<PVOID>(page);
                 std::vector<uint8_t> touch;
                 ReadProcessBytes(device, symbols, process, pid, page, 8, &touch);
+            }
+            if (overflow)
+            {
+                break;
             }
             if (!QueryWorkingSetEx(
                     process,
@@ -5778,11 +5792,19 @@ bool KernelMonitor::EnsureLogOpenLocked()
         {
             break;
         }
+        LogCurrentBytes = 0;
         LARGE_INTEGER size = {};
-        if (GetFileSizeEx(LogHandle, &size))
+        if (GetFileSizeEx(LogHandle, &size) && size.QuadPart > 0)
         {
             LogCurrentBytes = static_cast<uint64_t>(size.QuadPart);
-            SetFilePointer(LogHandle, 0, nullptr, FILE_END);
+        }
+        LARGE_INTEGER zero = {};
+        if (!SetFilePointerEx(LogHandle, zero, nullptr, FILE_END))
+        {
+            CloseHandle(LogHandle);
+            LogHandle = INVALID_HANDLE_VALUE;
+            LogCurrentBytes = 0;
+            break;
         }
         ok = true;
     } while (false);
@@ -5797,6 +5819,7 @@ void KernelMonitor::CloseLogLocked()
         CloseHandle(LogHandle);
         LogHandle = INVALID_HANDLE_VALUE;
     }
+    LogCurrentBytes = 0;
 }
 
 void KernelMonitor::RotateLogLocked()
