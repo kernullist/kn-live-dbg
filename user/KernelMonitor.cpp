@@ -382,6 +382,10 @@ namespace
         uint32_t ExecVirtSize = 0;
         uint32_t RelocRva = 0;
         uint32_t RelocSize = 0;
+        uint32_t ImportRva = 0;
+        uint32_t ImportSize = 0;
+        uint32_t DelayImportRva = 0;
+        uint32_t DelayImportSize = 0;
         bool Is64 = false;
     };
 
@@ -489,6 +493,12 @@ namespace
                 layout->Is64 = true;
                 relocRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
                 relocSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                layout->ImportRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                layout->ImportSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+                layout->DelayImportRva =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
+                layout->DelayImportSize =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size;
             }
             else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC &&
                 optionalOffset + sizeof(IMAGE_OPTIONAL_HEADER32) <= headers.size())
@@ -498,6 +508,12 @@ namespace
                 layout->PreferredBase = optional.ImageBase;
                 relocRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
                 relocSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+                layout->ImportRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                layout->ImportSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+                layout->DelayImportRva =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
+                layout->DelayImportSize =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size;
             }
             else
             {
@@ -1288,12 +1304,23 @@ namespace
             {
                 uint32_t relocFile = 0;
                 std::vector<uint8_t> relocs;
-                if (RvaToFileOffset(diskHeaders, layout.RelocRva, &relocFile) &&
-                    ReadDiskRange(
-                        imagePath,
-                        relocFile,
-                        (std::min)(layout.RelocSize, 0x10000u),
-                        &relocs))
+                const uint32_t relocRead = (std::min)(layout.RelocSize, 0x10000u);
+                bool gotRelocs =
+                    RvaToFileOffset(diskHeaders, layout.RelocRva, &relocFile) &&
+                    ReadDiskRange(imagePath, relocFile, relocRead, &relocs);
+                if (!gotRelocs &&
+                    layout.RelocRva <= (std::numeric_limits<uint64_t>::max)() - imageBase)
+                {
+                    gotRelocs = ReadProcessBytes(
+                        device,
+                        symbols,
+                        processHandle,
+                        pid,
+                        imageBase + layout.RelocRva,
+                        relocRead,
+                        &relocs);
+                }
+                if (gotRelocs)
                 {
                     ApplyRelocsToSlice(
                         &diskText,
@@ -1326,6 +1353,104 @@ namespace
                 : SliceMismatch;
         } while (false);
         return result;
+    }
+
+    void CollectPeDllNameDirectory(
+        const std::wstring& imagePath,
+        const std::vector<uint8_t>& headers,
+        uint32_t dirRva,
+        uint32_t dirSize,
+        uint32_t nameFieldOffset,
+        uint32_t descriptorSize,
+        std::unordered_set<std::wstring>* names)
+    {
+        if (names == nullptr ||
+            dirRva == 0 ||
+            descriptorSize < 8 ||
+            nameFieldOffset + 4 > descriptorSize ||
+            dirSize < descriptorSize)
+        {
+            return;
+        }
+        uint32_t fileOff = 0;
+        if (!RvaToFileOffset(headers, dirRva, &fileOff))
+        {
+            return;
+        }
+        std::vector<uint8_t> table;
+        if (!ReadDiskRange(
+                imagePath,
+                fileOff,
+                (std::min)(dirSize, 0x2000u),
+                &table) ||
+            table.size() < descriptorSize)
+        {
+            return;
+        }
+        const uint32_t count = static_cast<uint32_t>(table.size() / descriptorSize);
+        for (uint32_t i = 0; i < count && i < 256; ++i)
+        {
+            uint32_t nameRva = 0;
+            std::memcpy(
+                &nameRva,
+                table.data() + (i * descriptorSize) + nameFieldOffset,
+                sizeof(nameRva));
+            if (nameRva == 0)
+            {
+                break;
+            }
+            uint32_t nameFile = 0;
+            if (!RvaToFileOffset(headers, nameRva, &nameFile))
+            {
+                continue;
+            }
+            std::vector<uint8_t> nameBytes;
+            if (!ReadDiskRange(imagePath, nameFile, 256, &nameBytes) || nameBytes.empty())
+            {
+                continue;
+            }
+            std::wstring wide;
+            for (uint8_t byte : nameBytes)
+            {
+                if (byte == 0)
+                {
+                    break;
+                }
+                if (byte >= 0x20 && byte < 0x7f)
+                {
+                    wide.push_back(static_cast<wchar_t>(byte));
+                }
+            }
+            std::wstring base = KmonBasenameLower(wide);
+            if (!base.empty())
+            {
+                names->insert(std::move(base));
+            }
+        }
+    }
+
+    void CollectImportedDllNames(
+        const std::wstring& imagePath,
+        const std::vector<uint8_t>& headers,
+        const KmonPeLayout& layout,
+        std::unordered_set<std::wstring>* names)
+    {
+        CollectPeDllNameDirectory(
+            imagePath,
+            headers,
+            layout.ImportRva,
+            layout.ImportSize,
+            12,
+            20,
+            names);
+        CollectPeDllNameDirectory(
+            imagePath,
+            headers,
+            layout.DelayImportRva,
+            layout.DelayImportSize,
+            4,
+            32,
+            names);
     }
 
     bool ProtectHasExecute(DWORD protect)
@@ -1624,6 +1749,33 @@ namespace
         }
 
         return ok;
+    }
+
+    void DisableProcessLogging(DeviceClient* device, uint32_t pid)
+    {
+        if (pid <= 4)
+        {
+            return;
+        }
+        TryEnableLoggingUsermode(pid, 0);
+        if (device == nullptr || !device->IsOpen())
+        {
+            return;
+        }
+        uint32_t applied = 0;
+        uint32_t infoClass = 0;
+        uint32_t ntStatus = 0;
+        uint64_t eprocess = 0;
+        std::wstring error;
+        device->SetProcessLogging(
+            pid,
+            0,
+            &applied,
+            &infoClass,
+            &ntStatus,
+            &eprocess,
+            &error,
+            true);
     }
 
     bool CollectToolhelpPidsByName(
@@ -2763,11 +2915,14 @@ bool KernelMonitor::Start(
 bool KernelMonitor::Stop(std::wstring* error)
 {
     std::thread worker;
+    DeviceClient* device = nullptr;
+    std::vector<uint32_t> loggingPids;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
         StopRequested.store(true);
         Active.store(false);
         LiveOutput.store(false);
+        device = Device;
         if (Worker.joinable())
         {
             worker = std::move(Worker);
@@ -2777,10 +2932,26 @@ bool KernelMonitor::Stop(std::wstring* error)
         Device = nullptr;
         Symbols = nullptr;
     }
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        loggingPids.reserve(LoggingEnabledPids.size());
+        for (const auto& entry : LoggingEnabledPids)
+        {
+            loggingPids.push_back(entry.first);
+        }
+        LoggingEnabledPids.clear();
+        LoggingFailedPids.clear();
+        LoggingEnabledCount.store(0);
+    }
 
     if (worker.joinable())
     {
         worker.join();
+    }
+
+    for (uint32_t pid : loggingPids)
+    {
+        DisableProcessLogging(device, pid);
     }
 
     {
@@ -3900,7 +4071,14 @@ void KernelMonitor::ScanHookInput()
         {
             for (const DeviceObjectRecord& attached : stack.Stack)
             {
-                if (!attached.Suspicious)
+                const std::wstring ownerPath =
+                    !attached.DriverModule.empty() ? attached.DriverModule : attached.DriverName;
+                const std::wstring ownerClass = KmonClassifyDriverPath(ownerPath);
+                const bool dropAttached =
+                    ownerClass == L"drop" ||
+                    (ownerClass == L"unknown" &&
+                        KmonDriverPathHasFileDirectory(ownerPath));
+                if (!attached.Suspicious && !dropAttached)
                 {
                     continue;
                 }
@@ -3917,9 +4095,11 @@ void KernelMonitor::ScanHookInput()
                 EmitUnique(
                     L"hook.unbacked",
                     L"input:" + record.Role + L":" + HexU64(unbackedObject),
-                    record.DriverFilter,
+                    ownerPath.empty() ? record.DriverFilter : ownerPath,
                     L"input",
-                    L"unbacked driver on " + record.Role + L" stack",
+                    attached.Suspicious
+                        ? (L"unbacked driver on " + record.Role + L" stack")
+                        : (L"non-inbox driver on " + record.Role + L" stack"),
                     notes);
                 ++emitted;
             }
@@ -4651,6 +4831,7 @@ void KernelMonitor::ScanUserModeHostility()
                 CloseHandle(modSnap);
             }
             const bool moduleInventoryComplete = moduleWalkOk;
+            std::unordered_set<std::wstring> importedDlls;
 
             HANDLE processHandle = OpenProcess(
                 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
@@ -4712,7 +4893,7 @@ void KernelMonitor::ScanUserModeHostility()
 
                 bool wxExe = false;
                 DWORD wxProtect = 0;
-                if (queried && builtin && processHandle != nullptr)
+                if (queried && (builtin || watched) && processHandle != nullptr)
                 {
                     MEMORY_BASIC_INFORMATION walk = mbi;
                     const uint64_t allocBase = reinterpret_cast<uint64_t>(walk.AllocationBase);
@@ -4829,7 +5010,7 @@ void KernelMonitor::ScanUserModeHostility()
                         L"exe_wx:" + std::to_wstring(pid),
                         imagePath,
                         L"exe_wx",
-                        L"Windows builtin main EXE is W+X pid=" +
+                        L"main EXE is W+X pid=" +
                             std::to_wstring(pid) + L" " + leaf,
                         L"protect=" + std::to_wstring(wxProtect),
                         pid);
@@ -4882,6 +5063,14 @@ void KernelMonitor::ScanUserModeHostility()
                         KmonPeIdentity liveId = {};
                         const bool parsedDisk = ReadDiskPeHead(imagePath, &diskHeaders) &&
                             ParseKmonPeLayout(diskHeaders, &diskLayout);
+                        if (parsedDisk && watched)
+                        {
+                            CollectImportedDllNames(
+                                imagePath,
+                                diskHeaders,
+                                diskLayout,
+                                &importedDlls);
+                        }
                         const bool parsedLive = ParseKmonPeIdentity(live, &liveId);
                         const bool compareText = builtin ||
                             watched ||
@@ -4961,35 +5150,84 @@ void KernelMonitor::ScanUserModeHostility()
                         }
                         else if (compareText &&
                             parsedDisk &&
-                            diskLayout.ExecVirtSize > 0x1000 &&
-                            diskLayout.ExecRva <=
-                                (std::numeric_limits<uint32_t>::max)() - 0x1000)
+                            diskLayout.ExecVirtSize > 0x1000)
                         {
-                            uint32_t laterRva = diskLayout.ExecRva + 0x1000;
-                            uint32_t laterFile = 0;
-                            if (RvaToFileOffset(diskHeaders, laterRva, &laterFile) &&
-                                RelocatedSliceCompare(
-                                    imagePath,
-                                    diskHeaders,
-                                    diskLayout,
-                                    processHandle,
-                                    device,
-                                    symbols,
-                                    pid,
-                                    exeRegion,
-                                    laterRva,
-                                    laterFile,
-                                    0x100) == SliceMismatch)
+                            uint32_t samples[3] = {};
+                            uint32_t sampleCount = 0;
+                            auto addSample = [&](uint32_t pageRva)
                             {
+                                if (pageRva <= diskLayout.ExecRva ||
+                                    sampleCount >= 3)
+                                {
+                                    return;
+                                }
+                                for (uint32_t i = 0; i < sampleCount; ++i)
+                                {
+                                    if (samples[i] == pageRva)
+                                    {
+                                        return;
+                                    }
+                                }
+                                samples[sampleCount++] = pageRva;
+                            };
+                            if (diskLayout.ExecRva <=
+                                (std::numeric_limits<uint32_t>::max)() - 0x1000)
+                            {
+                                addSample(diskLayout.ExecRva + 0x1000);
+                            }
+                            if (diskLayout.ExecVirtSize > 0x2000)
+                            {
+                                const uint32_t midOff =
+                                    (diskLayout.ExecVirtSize / 2) & ~0xFFFu;
+                                if (diskLayout.ExecRva <=
+                                    (std::numeric_limits<uint32_t>::max)() - midOff)
+                                {
+                                    addSample(diskLayout.ExecRva + midOff);
+                                }
+                                if (diskLayout.ExecVirtSize >= 0x100)
+                                {
+                                    const uint32_t lastOff =
+                                        (diskLayout.ExecVirtSize - 0x100) & ~0xFFFu;
+                                    if (diskLayout.ExecRva <=
+                                        (std::numeric_limits<uint32_t>::max)() - lastOff)
+                                    {
+                                        addSample(diskLayout.ExecRva + lastOff);
+                                    }
+                                }
+                            }
+                            for (uint32_t i = 0; i < sampleCount; ++i)
+                            {
+                                uint32_t laterFile = 0;
+                                if (!RvaToFileOffset(
+                                        diskHeaders,
+                                        samples[i],
+                                        &laterFile) ||
+                                    RelocatedSliceCompare(
+                                        imagePath,
+                                        diskHeaders,
+                                        diskLayout,
+                                        processHandle,
+                                        device,
+                                        symbols,
+                                        pid,
+                                        exeRegion,
+                                        samples[i],
+                                        laterFile,
+                                        0x100) != SliceMismatch)
+                                {
+                                    continue;
+                                }
                                 EmitUnique(
                                     L"process.hollow",
-                                    L"exe_text_page:" + std::to_wstring(pid),
+                                    L"exe_text_page:" + std::to_wstring(pid) + L":" +
+                                        std::to_wstring(samples[i]),
                                     imagePath,
                                     L"exe_text_page",
                                     L"main EXE later code page differs from disk pid=" +
                                         std::to_wstring(pid) + L" " + leaf,
-                                    L"rva=" + std::to_wstring(laterRva),
+                                    L"rva=" + std::to_wstring(samples[i]),
                                     pid);
+                                break;
                             }
                         }
                         if (compareText &&
@@ -5216,6 +5454,14 @@ void KernelMonitor::ScanUserModeHostility()
                     moduleLower.find(imageDir) == 0;
                 const bool dropImplant =
                     moduleClass == L"drop" && (builtin || watched);
+                const std::wstring moduleLeaf = KmonBasenameLower(modulePath);
+                const bool watchedUnimported =
+                    watched &&
+                    !windowsModule &&
+                    inImageDir &&
+                    moduleClass == L"unknown" &&
+                    moduleLeaf != leaf &&
+                    importedDlls.find(moduleLeaf) == importedDlls.end();
                 const bool watchedUnknown = watched &&
                     !windowsModule &&
                     !inImageDir &&
@@ -5225,7 +5471,7 @@ void KernelMonitor::ScanUserModeHostility()
                     !inImageDir &&
                     moduleClass != L"inbox" &&
                     moduleClass != L"third_party";
-                if (!dropImplant && !builtinForeign && !watchedUnknown)
+                if (!dropImplant && !builtinForeign && !watchedUnknown && !watchedUnimported)
                 {
                     continue;
                 }
@@ -5235,7 +5481,9 @@ void KernelMonitor::ScanUserModeHostility()
                     imagePath,
                     dropImplant
                         ? L"drop_module"
-                        : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module"),
+                        : (watchedUnimported
+                            ? L"watched_dir_unimported"
+                            : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module")),
                     L"foreign module in pid=" + std::to_wstring(pid) + L" " + leaf +
                         L" module=" + KmonBasenameLower(modulePath),
                     modulePath,
@@ -6739,6 +6987,14 @@ bool KernelMonitorSelfTest()
         slashInject.TargetImage = L"game.exe";
         slashInject.Task = L"WriteVM";
         if (!KmonWatchMatches(slashInject, emptyWatch))
+        {
+            break;
+        }
+
+        std::unordered_set<std::wstring> imported;
+        KmonPeLayout importLayout = {};
+        CollectImportedDllNames(L"", std::vector<uint8_t>(), importLayout, &imported);
+        if (!imported.empty())
         {
             break;
         }

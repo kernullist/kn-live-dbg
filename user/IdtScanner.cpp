@@ -17,7 +17,8 @@ namespace
 
     std::wstring FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
-        for (const KernelModuleInfo& module : symbols.Modules())
+        const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+        for (const KernelModuleInfo& module : modules)
         {
             uint64_t end = module.Base + module.Size;
             if (end < module.Base)

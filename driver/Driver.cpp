@@ -2655,8 +2655,18 @@ static NTSTATUS KnDbgHandleSetProcessLogging(PIRP Irp, PIO_STACK_LOCATION Stack,
             break;
         }
 
+        if ((request.Flags & ~KNDBG_SET_PROCESS_LOGGING_FLAG_DISABLE) != 0)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
         ULONG loggingFlags = request.LoggingFlags;
-        if (loggingFlags == 0)
+        if ((request.Flags & KNDBG_SET_PROCESS_LOGGING_FLAG_DISABLE) != 0)
+        {
+            loggingFlags = 0;
+        }
+        else if (loggingFlags == 0)
         {
             loggingFlags = KNDBG_PROCESS_LOG_DEFAULT;
         }

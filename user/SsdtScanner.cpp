@@ -72,7 +72,8 @@ namespace
 
     std::wstring FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
-        for (const KernelModuleInfo& module : symbols.Modules())
+        const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+        for (const KernelModuleInfo& module : modules)
         {
             uint64_t end = module.Base + module.Size;
             if (end < module.Base)
@@ -107,7 +108,8 @@ namespace
 
     bool AnyWin32kModuleLoaded(SymbolEngine& symbols)
     {
-        for (const KernelModuleInfo& module : symbols.Modules())
+        const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+        for (const KernelModuleInfo& module : modules)
         {
             if (StartsWithCI(module.ImageName, L"win32k"))
             {
