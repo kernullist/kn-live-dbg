@@ -622,12 +622,12 @@ namespace
             }
             bytes->assign(length, 0);
             DWORD read = 0;
-            if (!ReadFile(handle, bytes->data(), length, &read, nullptr) || read == 0)
+            if (!ReadFile(handle, bytes->data(), length, &read, nullptr) ||
+                read != length)
             {
                 bytes->clear();
                 break;
             }
-            bytes->resize(read);
             ok = true;
         } while (false);
         if (handle != INVALID_HANDLE_VALUE)
@@ -856,9 +856,8 @@ namespace
                         bytes->data(),
                         length,
                         &read) &&
-                    read > 0)
+                    read == length)
                 {
-                    bytes->resize(read);
                     ok = true;
                     break;
                 }
@@ -1300,8 +1299,14 @@ namespace
             size_t n = (std::min)(diskText.size(), liveText.size());
             // A DIR64/HIGHLOW reloc that straddles the window end cannot be
             // applied; comparing those tail bytes FPs every ASLR'd image.
-            if (aslr && n >= 24)
+            // A slice smaller than 24 bytes cannot drop an 8-byte tail and
+            // still compare 16 bytes, so ASLR'd tiny slices stay unknown.
+            if (aslr)
             {
+                if (n < 24)
+                {
+                    break;
+                }
                 n -= 8;
             }
             result = (std::memcmp(diskText.data(), liveText.data(), n) == 0)
@@ -3065,6 +3070,17 @@ void KernelMonitor::ScanHiddenProcesses()
     {
         return;
     }
+    if (!EnsureLoadedKernelModules(symbols, true))
+    {
+        EmitUnique(
+            L"process.hidden",
+            L"scan_failed:hidden:inventory",
+            std::wstring(),
+            L"hiddenproc",
+            L"hidden-process scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
+        return;
+    }
 
     HiddenProcessScanner scanner(*device, *symbols);
     HiddenProcessScanResult result = {};
@@ -3097,6 +3113,33 @@ void KernelMonitor::ScanHiddenProcesses()
         return;
     }
     HiddenScans.fetch_add(1);
+    if (!result.CoverageComplete)
+    {
+        std::wstring notes;
+        for (const std::wstring& warning : result.Warnings)
+        {
+            if (!notes.empty())
+            {
+                notes += L"; ";
+            }
+            notes += warning;
+            if (notes.size() > 768)
+            {
+                break;
+            }
+        }
+        if (notes.empty())
+        {
+            notes = L"kernel, SPI, or Toolhelp inventory was incomplete";
+        }
+        EmitUnique(
+            L"process.hidden",
+            L"scan_failed:hidden:coverage",
+            std::wstring(),
+            L"hiddenproc",
+            L"hidden-process coverage was incomplete; kernel-only and API-only findings stay fail-closed",
+            notes);
+    }
 
     FILETIME now = {};
     GetSystemTimeAsFileTime(&now);
@@ -3395,6 +3438,16 @@ void KernelMonitor::ScanMapperRemnants()
     }
     if (device == nullptr || symbols == nullptr || !device->IsOpen())
     {
+        return;
+    }
+    if (!EnsureLoadedKernelModules(symbols, true))
+    {
+        EmitMappedResidue(
+            L"scan_failed:mapper:inventory",
+            std::wstring(),
+            L"mapper_scan",
+            L"mapper remnant scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
         return;
     }
 
