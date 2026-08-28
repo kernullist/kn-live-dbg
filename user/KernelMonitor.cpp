@@ -4444,12 +4444,16 @@ void KernelMonitor::ScanUserModeHostility()
                 pid);
             size_t moduleCount = 0;
             constexpr size_t kMaxModuleRows = 1024;
+            bool moduleWalkOk = false;
             if (modSnap != INVALID_HANDLE_VALUE)
             {
                 MODULEENTRY32W moduleEntry = {};
                 moduleEntry.dwSize = sizeof(moduleEntry);
+                BOOL moreMod = FALSE;
+                DWORD modError = ERROR_SUCCESS;
                 if (Module32FirstW(modSnap, &moduleEntry))
                 {
+                    moreMod = TRUE;
                     do
                     {
                         ++moduleCount;
@@ -4471,12 +4475,21 @@ void KernelMonitor::ScanUserModeHostility()
                                 reinterpret_cast<uint64_t>(moduleEntry.modBaseAddr),
                                 moduleEntry.modBaseSize));
                         }
-                    } while (Module32NextW(modSnap, &moduleEntry));
+                        moreMod = Module32NextW(modSnap, &moduleEntry);
+                        if (!moreMod)
+                        {
+                            modError = GetLastError();
+                        }
+                    } while (moreMod);
+                    moduleWalkOk =
+                        moduleCount > 0 &&
+                        moduleCount <= kMaxModuleRows &&
+                        (modError == ERROR_NO_MORE_FILES ||
+                            modError == ERROR_SUCCESS);
                 }
                 CloseHandle(modSnap);
             }
-            const bool moduleInventoryComplete =
-                moduleCount > 0 && moduleCount <= kMaxModuleRows;
+            const bool moduleInventoryComplete = moduleWalkOk;
 
             HANDLE processHandle = OpenProcess(
                 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
@@ -5023,7 +5036,8 @@ void KernelMonitor::ScanUserModeHostility()
                     n.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
                     n.find(L"\\windows\\winsxs\\") != std::wstring::npos;
                 const bool inImageDir =
-                    !imageDir.empty() && ToLowerCopy(modulePath).find(imageDir) == 0;
+                    imageDir.size() > 3 &&
+                    ToLowerCopy(modulePath).find(imageDir) == 0;
                 const bool dropImplant =
                     moduleClass == L"drop" && (builtin || watched);
                 const bool watchedUnknown = watched &&
