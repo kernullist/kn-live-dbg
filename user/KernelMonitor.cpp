@@ -124,6 +124,13 @@ namespace
             std::wstring ignored;
             if (!symbols->LoadKernelModules(&ignored) || symbols->CopyModules().empty())
             {
+                // EnumKernelModules failure does not clear modules_. Keep
+                // the last good inventory instead of skipping every kmon
+                // kernel scan until the next successful reload.
+                if (!symbols->CopyModules().empty())
+                {
+                    ok = true;
+                }
                 break;
             }
             gLastKernelModuleReloadMs = GetTickCount64();
@@ -2705,6 +2712,10 @@ bool KernelMonitor::Start(
 
         if (!Active.load() || StopRequested.load())
         {
+            {
+                std::lock_guard<std::mutex> logLock(LogMutex);
+                CloseLogLocked();
+            }
             if (error != nullptr && error->empty())
             {
                 *error = L"kmon became inactive during start";
@@ -2727,6 +2738,10 @@ bool KernelMonitor::Start(
 
         if (!Active.load() || StopRequested.load())
         {
+            {
+                std::lock_guard<std::mutex> logLock(LogMutex);
+                CloseLogLocked();
+            }
             if (error != nullptr)
             {
                 *error = L"kmon became inactive during start";
@@ -5290,74 +5305,83 @@ void KernelMonitor::PruneStalePromotedWatches()
         names = WatchNamesLower;
         promoted = WatchPromotedPids;
     }
-    if (promoted.empty())
-    {
-        return;
-    }
-
-    bool hasWildcard = false;
-    for (const std::wstring& name : names)
-    {
-        if (WatchTokenIsWildcard(name))
-        {
-            hasWildcard = true;
-            break;
-        }
-    }
-
+    bool prunePromoted = false;
     std::unordered_set<uint32_t> liveSet;
-    if (hasWildcard)
+    if (!promoted.empty())
     {
-        // /name * promotes every create. Keep promoted PIDs that are still
-        // alive instead of re-enumerating the whole system.
-        for (uint32_t pid : promoted)
+        bool hasWildcard = false;
+        for (const std::wstring& name : names)
         {
-            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (process != nullptr)
+            if (WatchTokenIsWildcard(name))
             {
-                liveSet.insert(pid);
-                CloseHandle(process);
-                continue;
-            }
-            if (GetLastError() != ERROR_INVALID_PARAMETER)
-            {
-                liveSet.insert(pid);
+                hasWildcard = true;
+                break;
             }
         }
-    }
-    else
-    {
-        std::vector<uint32_t> live;
-        if (!CollectToolhelpPidsByName(names, &live))
+
+        if (hasWildcard)
         {
-            return;
+            // /name * promotes every create. Keep promoted PIDs that are still
+            // alive instead of re-enumerating the whole system.
+            for (uint32_t pid : promoted)
+            {
+                HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (process != nullptr)
+                {
+                    liveSet.insert(pid);
+                    CloseHandle(process);
+                    continue;
+                }
+                if (GetLastError() != ERROR_INVALID_PARAMETER)
+                {
+                    liveSet.insert(pid);
+                }
+            }
+            prunePromoted = true;
         }
-        liveSet.insert(live.begin(), live.end());
+        else
+        {
+            std::vector<uint32_t> live;
+            if (CollectToolhelpPidsByName(names, &live))
+            {
+                liveSet.insert(live.begin(), live.end());
+                prunePromoted = true;
+            }
+        }
     }
 
     std::vector<uint32_t> logging;
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
-        for (uint32_t pid : promoted)
+        if (prunePromoted)
         {
-            if (liveSet.count(pid) != 0)
+            for (uint32_t pid : promoted)
             {
-                continue;
-            }
-            if (WatchPromotedPids.erase(pid) == 0)
-            {
-                continue;
-            }
-            if (WatchExplicitPids.count(pid) == 0)
-            {
-                WatchPids.erase(pid);
+                if (liveSet.count(pid) != 0)
+                {
+                    continue;
+                }
+                if (WatchPromotedPids.erase(pid) == 0)
+                {
+                    continue;
+                }
+                if (WatchExplicitPids.count(pid) == 0)
+                {
+                    WatchPids.erase(pid);
+                }
             }
         }
-        logging.reserve(LoggingEnabledPids.size());
+        std::unordered_set<uint32_t> ids;
+        ids.reserve(LoggingEnabledPids.size() + LoggingFailedPids.size());
         for (const auto& entry : LoggingEnabledPids)
         {
-            logging.push_back(entry.first);
+            ids.insert(entry.first);
         }
+        for (const auto& entry : LoggingFailedPids)
+        {
+            ids.insert(entry.first);
+        }
+        logging.assign(ids.begin(), ids.end());
     }
 
     DeviceClient* device = nullptr;
@@ -5380,13 +5404,20 @@ void KernelMonitor::PruneStalePromotedWatches()
 
         std::lock_guard<std::mutex> lock(WatchMutex);
         auto it = LoggingEnabledPids.find(pid);
-        if (it == LoggingEnabledPids.end())
+        if (it != LoggingEnabledPids.end())
         {
-            continue;
-        }
-        if (created != 0)
-        {
-            if (it->second != 0 && created != it->second)
+            if (created != 0)
+            {
+                if (it->second != 0 && created != it->second)
+                {
+                    LoggingEnabledPids.erase(it);
+                    if (LoggingEnabledCount.load() > 0)
+                    {
+                        LoggingEnabledCount.fetch_sub(1);
+                    }
+                }
+            }
+            else if (process == nullptr && openError == ERROR_INVALID_PARAMETER)
             {
                 LoggingEnabledPids.erase(it);
                 if (LoggingEnabledCount.load() > 0)
@@ -5394,17 +5425,25 @@ void KernelMonitor::PruneStalePromotedWatches()
                     LoggingEnabledCount.fetch_sub(1);
                 }
             }
+        }
+        auto failedIt = LoggingFailedPids.find(pid);
+        if (failedIt == LoggingFailedPids.end())
+        {
+            continue;
+        }
+        if (created != 0)
+        {
+            if (failedIt->second != 0 && created != failedIt->second)
+            {
+                LoggingFailedPids.erase(failedIt);
+            }
             continue;
         }
         if (process != nullptr || openError != ERROR_INVALID_PARAMETER)
         {
             continue;
         }
-        LoggingEnabledPids.erase(pid);
-        if (LoggingEnabledCount.load() > 0)
-        {
-            LoggingEnabledCount.fetch_sub(1);
-        }
+        LoggingFailedPids.erase(failedIt);
     }
 }
 
@@ -5598,6 +5637,11 @@ bool KernelMonitor::WriteLogLine(const KmonEvent& event)
     {
         std::string utf8 = WideToUtf8(FormatKmonJsonLine(event));
         std::lock_guard<std::mutex> logLock(LogMutex);
+        if (LogHandle == INVALID_HANDLE_VALUE &&
+            (!Active.load() || StopRequested.load()))
+        {
+            break;
+        }
         if (!EnsureLogOpenLocked())
         {
             break;
