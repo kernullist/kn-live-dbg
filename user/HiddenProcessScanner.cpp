@@ -367,6 +367,14 @@ namespace
         // process still owns handles and still has a CID slot.
         if (!input.Kernel && userViews == 0 && input.Pid > 4)
         {
+            if (!input.KernelInventoryComplete)
+            {
+                result.Ignored = true;
+                result.IgnoredRace = true;
+                result.Notes =
+                    L"ActiveProcessLinks walk was incomplete; CID/handle-only process was not escalated";
+                return result;
+            }
             const bool independentlyVisible = input.HandleOwner || input.CidTable;
             if (IsTerminatingView(input) && !independentlyVisible)
             {
@@ -646,15 +654,28 @@ namespace
             do
             {
                 parsed.Images[entry.th32ProcessID] = entry.szExeFile;
-            } while (Process32NextW(snap, &entry) &&
-                parsed.Images.size() < kMaxProcesses);
+                if (parsed.Images.size() >= kMaxProcesses)
+                {
+                    break;
+                }
+            } while (Process32NextW(snap, &entry));
             parsed.Count = static_cast<uint32_t>(parsed.Images.size());
-            ok = parsed.Count > 0;
+            if (parsed.Count >= kMaxProcesses)
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"CreateToolhelp32Snapshot was truncated";
+                }
+            }
+            else
+            {
+                ok = parsed.Count > 0;
+            }
         }
         CloseHandle(snap);
         if (!ok)
         {
-            if (warning != nullptr)
+            if (warning != nullptr && warning->empty())
             {
                 *warning = L"CreateToolhelp32Snapshot returned no processes";
             }
@@ -1010,9 +1031,13 @@ bool HiddenProcessScanner::Scan(
         std::wstring handleError;
         if (handles.Scan(handleOptions, &handleResult, &handleError))
         {
-            if (handleResult.Truncated)
+            if (handleResult.Truncated || !handleResult.CoverageComplete)
             {
                 result->Warnings.push_back(L"handle-owner view used a truncated handle snapshot");
+            }
+            for (const std::wstring& warning : handleResult.Warnings)
+            {
+                result->Warnings.push_back(L"handle-owner view: " + warning);
             }
             for (uint32_t pid : handleResult.OwnerPids)
             {
@@ -1406,6 +1431,18 @@ bool HiddenProcessViewSelfTest()
         incompleteWalk.KernelInventoryComplete = false;
         const HiddenProcessClassifyResult incompleteWalkResult = ClassifyHiddenProcess(incompleteWalk);
         if (incompleteWalkResult.Suspicious || !incompleteWalkResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput incompleteCid = {};
+        incompleteCid.Pid = 3333;
+        incompleteCid.CidTable = true;
+        incompleteCid.KernelWalkOk = true;
+        incompleteCid.UserWalkOk = true;
+        incompleteCid.KernelInventoryComplete = false;
+        const HiddenProcessClassifyResult incompleteCidResult = ClassifyHiddenProcess(incompleteCid);
+        if (incompleteCidResult.Suspicious || !incompleteCidResult.IgnoredRace)
         {
             break;
         }

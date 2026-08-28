@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <cwctype>
 #include <iomanip>
 #include <sstream>
@@ -72,7 +73,12 @@ namespace
                 {
                     continue;
                 }
-                const uint64_t end = module.Base + static_cast<uint64_t>(module.Size);
+                const uint64_t size = static_cast<uint64_t>(module.Size);
+                if (module.Base > (std::numeric_limits<uint64_t>::max)() - size)
+                {
+                    continue;
+                }
+                const uint64_t end = module.Base + size;
                 if (address >= module.Base && address < end)
                 {
                     owned = true;
@@ -1314,7 +1320,8 @@ namespace
 
     std::wstring KmonImageForClassify(uint32_t pid, const std::wstring& maybePath)
     {
-        if (maybePath.find(L'\\') != std::wstring::npos)
+        if (maybePath.find(L'\\') != std::wstring::npos ||
+            maybePath.find(L'/') != std::wstring::npos)
         {
             return maybePath;
         }
@@ -1883,8 +1890,8 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
         out->Timestamp = record.Timestamp;
         out->ProcessId = record.ProcessId;
         out->TargetProcessId = record.TargetProcessId;
-        out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
-        out->TargetImage = KmonImageForClassify(record.TargetProcessId, record.TargetImageBase);
+        out->Image = record.ImagePath;
+        out->TargetImage = record.TargetImageBase;
         out->Task = record.TaskName.empty()
             ? (L"Task" + std::to_wstring(record.TaskId))
             : record.TaskName;
@@ -1955,6 +1962,10 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
             record.TargetProcessId != 0 &&
             record.TargetProcessId != record.ProcessId)
         {
+            out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
+            out->TargetImage = KmonImageForClassify(
+                record.TargetProcessId,
+                record.TargetImageBase);
             out->Kind = L"inject.remote";
             out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId) +
                 L" -> pid=" + std::to_wstring(record.TargetProcessId);
@@ -3042,7 +3053,7 @@ bool KernelMonitor::GetLiveTargets(DeviceClient** device, SymbolEngine** symbols
         {
             break;
         }
-        if (!EnsureLoadedKernelModules(*symbols, true) &&
+        if (!EnsureLoadedKernelModules(*symbols, true) ||
             (*symbols)->Modules().empty())
         {
             break;
@@ -3457,6 +3468,13 @@ void KernelMonitor::ScanHookCallbacks()
     SymbolEngine* symbols = nullptr;
     if (!GetLiveTargets(&device, &symbols) || symbols->Modules().empty())
     {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:callbacks",
+            std::wstring(),
+            L"callback",
+            L"callback scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
         return;
     }
 
@@ -3514,6 +3532,13 @@ void KernelMonitor::ScanHookInput()
     SymbolEngine* symbols = nullptr;
     if (!GetLiveTargets(&device, &symbols) || symbols->Modules().empty())
     {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:input",
+            std::wstring(),
+            L"input",
+            L"input stack scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
         return;
     }
 
@@ -3576,6 +3601,13 @@ void KernelMonitor::ScanCpuIntegrityHooks()
     SymbolEngine* symbols = nullptr;
     if (!GetLiveTargets(&device, &symbols) || symbols->Modules().empty())
     {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:cpu",
+            std::wstring(),
+            L"cpu",
+            L"cpu/integrity scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
         return;
     }
     CpuHookScans.fetch_add(1);
@@ -3622,6 +3654,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 error.empty() ? L"Scan returned false" : error);
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3666,6 +3700,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 error.empty() ? L"Scan returned false" : error);
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3693,6 +3729,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3720,6 +3758,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3757,6 +3797,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3784,6 +3826,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3842,6 +3886,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3880,6 +3926,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3897,11 +3945,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 {
                     continue;
                 }
-                const bool unbackedModule = filter.DriverModule.empty();
-                const bool unbackedStart =
-                    filter.DriverStart != 0 &&
-                    !AddressOwnedByLoadedModule(symbols, filter.DriverStart);
-                if (!unbackedModule && !unbackedStart)
+                if (filter.DriverStart == 0 ||
+                    AddressOwnedByLoadedModule(symbols, filter.DriverStart))
                 {
                     continue;
                 }
@@ -3915,6 +3960,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -3940,6 +3987,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
         }
     }
+    IngestLiveTimeline();
+    IngestThreatIntel();
     if (StopRequested.load())
     {
         return;
@@ -4163,6 +4212,7 @@ void KernelMonitor::ScanUserModeHostility()
                 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                 FALSE,
                 pid);
+            const bool hasQueryInfo = processHandle != nullptr;
             if (processHandle == nullptr)
             {
                 processHandle = OpenProcess(
@@ -4254,7 +4304,7 @@ void KernelMonitor::ScanUserModeHostility()
 
                 std::wstring mappedPath;
                 bool mappedQueryOk = false;
-                if (hasVmRead && processHandle != nullptr)
+                if (hasQueryInfo && hasVmRead && processHandle != nullptr)
                 {
                     mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath);
                 }
@@ -4307,7 +4357,8 @@ void KernelMonitor::ScanUserModeHostility()
                             pid);
                     }
                 }
-                else if (hasVmRead &&
+                else if (hasQueryInfo &&
+                    hasVmRead &&
                     committed &&
                     mbi.Type == MEM_IMAGE &&
                     !mappedQueryOk)
@@ -4528,6 +4579,7 @@ void KernelMonitor::ScanUserModeHostility()
                             }
                         }
                         if (compareText &&
+                            hasQueryInfo &&
                             hasVmRead &&
                             committed &&
                             mbi.Type == MEM_IMAGE &&
@@ -4744,11 +4796,16 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         auto it = LoggingEnabledPids.find(pid);
-        if (it != LoggingEnabledPids.end() &&
-            created != 0 &&
-            it->second == created)
+        if (it != LoggingEnabledPids.end())
         {
-            return;
+            if (created != 0 && it->second == created)
+            {
+                return;
+            }
+            if (created == 0 && it->second == 0)
+            {
+                return;
+            }
         }
     }
 
@@ -4825,8 +4882,8 @@ void KernelMonitor::PruneStalePromotedWatches()
     std::unordered_set<uint32_t> liveSet;
     if (hasWildcard)
     {
-        // /name * promotes every create. Toolhelp name matching skips
-        // wildcards, so an empty live set would drop every watch.
+        // /name * promotes every create. Keep promoted PIDs that are still
+        // alive instead of re-enumerating the whole system.
         for (uint32_t pid : promoted)
         {
             HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
