@@ -1051,7 +1051,8 @@ namespace
                     {
                         const uint64_t peb = reinterpret_cast<uint64_t>(pbi.PebBaseAddress);
                         std::vector<uint8_t> baseBytes;
-                        if (ReadProcessBytes(
+                        if (IsUserModeImageBase(peb) &&
+                            ReadProcessBytes(
                                 device,
                                 symbols,
                                 process,
@@ -1188,7 +1189,7 @@ namespace
             }
             uint64_t peb = 0;
             std::memcpy(&peb, pebPtr.data(), sizeof(peb));
-            if (peb == 0)
+            if (peb == 0 || !IsUserModeImageBase(peb))
             {
                 break;
             }
@@ -1322,6 +1323,10 @@ namespace
         for (const auto& range : ranges)
         {
             if (range.first == 0 || range.second == 0)
+            {
+                continue;
+            }
+            if (range.first > (std::numeric_limits<uint64_t>::max)() - range.second)
             {
                 continue;
             }
