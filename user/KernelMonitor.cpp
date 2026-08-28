@@ -2816,6 +2816,7 @@ void KernelMonitor::WorkerLoop()
         else if (nowMs >= NextUserScanTickMs)
         {
             PruneStalePromotedWatches();
+            EnableLoggingForWatchTargets();
             ScanUserModeHostility();
             IngestLiveTimeline();
             IngestThreatIntel();
@@ -3999,6 +4000,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 {
                     continue;
                 }
+                if (AddressOwnedByLoadedModule(symbols, record.Callback))
+                {
+                    continue;
+                }
                 EmitUnique(
                     L"hook.unbacked",
                     L"nmi:" + HexU64(record.Callback),
@@ -4031,6 +4036,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 {
                     continue;
                 }
+                if (AddressOwnedByLoadedModule(symbols, record.Routine))
+                {
+                    continue;
+                }
                 EmitUnique(
                     L"hook.unbacked",
                     L"dpc:" + HexU64(record.Routine),
@@ -4045,6 +4054,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 {
                     continue;
                 }
+                if (AddressOwnedByLoadedModule(symbols, record.Routine))
+                {
+                    continue;
+                }
                 EmitUnique(
                     L"hook.unbacked",
                     L"timer:" + HexU64(record.Routine),
@@ -4056,6 +4069,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             for (const WorkItemRecord& record : result.WorkItems)
             {
                 if (!record.Suspicious)
+                {
+                    continue;
+                }
+                if (AddressOwnedByLoadedModule(symbols, record.Routine))
                 {
                     continue;
                 }
@@ -4098,6 +4115,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 const uint64_t fn = callout.ClassifySuspicious
                     ? callout.ClassifyFn
                     : (callout.NotifySuspicious ? callout.NotifyFn : callout.FlowDeleteFn);
+                if (AddressOwnedByLoadedModule(symbols, fn))
+                {
+                    continue;
+                }
                 EmitUnique(
                     L"hook.unbacked",
                     L"wfp:" + std::to_wstring(callout.CalloutId),
@@ -5136,41 +5157,58 @@ void KernelMonitor::PruneStalePromotedWatches()
         liveSet.insert(live.begin(), live.end());
     }
 
-    std::lock_guard<std::mutex> lock(WatchMutex);
-    for (uint32_t pid : promoted)
+    std::vector<uint32_t> logging;
     {
-        if (liveSet.count(pid) != 0)
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        for (uint32_t pid : promoted)
         {
-            continue;
+            if (liveSet.count(pid) != 0)
+            {
+                continue;
+            }
+            if (WatchPromotedPids.erase(pid) == 0)
+            {
+                continue;
+            }
+            if (WatchExplicitPids.count(pid) == 0)
+            {
+                WatchPids.erase(pid);
+            }
         }
-        if (WatchPromotedPids.erase(pid) == 0)
+        logging.reserve(LoggingEnabledPids.size());
+        for (const auto& entry : LoggingEnabledPids)
         {
-            continue;
-        }
-        if (WatchExplicitPids.count(pid) == 0)
-        {
-            WatchPids.erase(pid);
+            logging.push_back(entry.first);
         }
     }
 
-    std::vector<uint32_t> logging;
-    logging.reserve(LoggingEnabledPids.size());
-    for (const auto& entry : LoggingEnabledPids)
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
     {
-        logging.push_back(entry.first);
+        std::lock_guard<std::mutex> stateLock(StateMutex);
+        device = Device;
+        symbols = Symbols;
     }
+
     for (uint32_t pid : logging)
     {
         HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        const DWORD openError = (process == nullptr) ? GetLastError() : ERROR_SUCCESS;
+        const uint64_t created = QueryPidCreateTime(device, symbols, process, pid);
         if (process != nullptr)
         {
-            const uint64_t created = QueryProcessCreateTicks(process);
             CloseHandle(process);
-            auto it = LoggingEnabledPids.find(pid);
-            if (it != LoggingEnabledPids.end() &&
-                created != 0 &&
-                it->second != 0 &&
-                created != it->second)
+        }
+
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        auto it = LoggingEnabledPids.find(pid);
+        if (it == LoggingEnabledPids.end())
+        {
+            continue;
+        }
+        if (created != 0)
+        {
+            if (it->second != 0 && created != it->second)
             {
                 LoggingEnabledPids.erase(it);
                 if (LoggingEnabledCount.load() > 0)
@@ -5180,7 +5218,7 @@ void KernelMonitor::PruneStalePromotedWatches()
             }
             continue;
         }
-        if (GetLastError() != ERROR_INVALID_PARAMETER)
+        if (process != nullptr || openError != ERROR_INVALID_PARAMETER)
         {
             continue;
         }
