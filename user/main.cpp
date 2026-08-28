@@ -24660,6 +24660,7 @@ static void PrintKmonHelp()
     std::wcout << L"                          COW/.text/EP vs disk (Windows builtins and /name|/pid targets),\n";
     std::wcout << L"                          extra PE, ghosting\n";
     std::wcout << L"  process.implant         drop-dir module in a builtin or /name|/pid target,\n";
+    std::wcout << L"                          unknown module outside the image dir on a watch target,\n";
     std::wcout << L"                          or extra non-inbox module in a Windows builtin\n";
     std::wcout << L"  inject.remote           drop/unknown-path any remote inject; builtin WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView and ReadVM/suspend\n";
