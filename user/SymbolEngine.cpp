@@ -995,6 +995,7 @@ void SymbolEngine::Shutdown()
         ready_ = false;
     }
 
+    std::lock_guard<std::mutex> lock(modulesMutex_);
     modules_.clear();
 }
 
@@ -1020,6 +1021,12 @@ void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
 
 const std::vector<KernelModuleInfo>& SymbolEngine::Modules() const
 {
+    return modules_;
+}
+
+std::vector<KernelModuleInfo> SymbolEngine::CopyModules() const
+{
+    std::lock_guard<std::mutex> lock(modulesMutex_);
     return modules_;
 }
 
@@ -1402,7 +1409,10 @@ bool SymbolEngine::LoadKernelModules(std::wstring* error)
             EnsureModuleLoaded(module, nullptr);
         }
 
-        modules_ = std::move(modules);
+        {
+            std::lock_guard<std::mutex> lock(modulesMutex_);
+            modules_ = std::move(modules);
+        }
         ok = true;
     } while (false);
 

@@ -4,6 +4,7 @@
 #include <DbgHelp.h>
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -80,6 +81,7 @@ public:
     bool LoadKernelModules(std::wstring* error);
     bool PreloadKernelSymbols(size_t* loadedCount, std::wstring* error);
     const std::vector<KernelModuleInfo>& Modules() const;
+    std::vector<KernelModuleInfo> CopyModules() const;
 
     bool ResolveSymbol(const std::wstring& name, uint64_t* address, std::wstring* error);
     bool FindNearestSymbol(uint64_t address, std::wstring* name, uint64_t* displacement, std::wstring* error);
@@ -110,5 +112,6 @@ private:
     HANDLE process_;
     bool ready_;
     std::wstring symbolPath_;
+    mutable std::mutex modulesMutex_;
     std::vector<KernelModuleInfo> modules_;
 };

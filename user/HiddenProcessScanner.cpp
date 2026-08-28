@@ -1232,8 +1232,8 @@ bool HiddenProcessScanner::Scan(
                     kernelWalkOk,
                     kernelInventoryComplete,
                     userWalkOk,
-                    spiBeforeOk || spiAfterOk,
-                    toolhelpBeforeOk || toolhelpAfterOk,
+                    spiBeforeOk && spiAfterOk,
+                    toolhelpBeforeOk && toolhelpAfterOk,
                     hasDtb,
                     requireStableUserPresence,
                     lifecycleLayoutAvailable);
