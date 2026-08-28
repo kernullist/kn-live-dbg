@@ -514,9 +514,11 @@ namespace
                 {
                     n = virt;
                 }
-                if (n > 0x400)
+                // First executable page. 0x400 left a hole at +0x400..+0xFFF
+                // that exe_text_page (next page) does not cover.
+                if (n > 0x1000)
                 {
-                    n = 0x400;
+                    n = 0x1000;
                 }
                 layout->ExecSize = n;
                 break;
@@ -1277,7 +1279,7 @@ namespace
             size_t n = (std::min)(diskText.size(), liveText.size());
             // A DIR64/HIGHLOW reloc that straddles the window end cannot be
             // applied; comparing those tail bytes FPs every ASLR'd image.
-            if (n >= 24)
+            if (aslr && n >= 24)
             {
                 n -= 8;
             }
@@ -3957,8 +3959,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     {
                         continue;
                     }
-                    if (!slot.Module.empty() &&
-                        AddressOwnedByLoadedModule(symbols, slot.Routine))
+                    if (AddressOwnedByLoadedModule(symbols, slot.Routine))
                     {
                         continue;
                     }
