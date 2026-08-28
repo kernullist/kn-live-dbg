@@ -23562,8 +23562,16 @@ public:
 
             StopRequested = false;
             Running = true;
-            Thread = std::thread(&TimelineAutoDrainWorker::WorkerLoop, this, state, device);
-            ok = true;
+            try
+            {
+                Thread = std::thread(&TimelineAutoDrainWorker::WorkerLoop, this, state, device);
+                ok = true;
+            }
+            catch (...)
+            {
+                Running = false;
+                StopRequested = true;
+            }
         } while (false);
 
         return ok;

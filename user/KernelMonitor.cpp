@@ -420,6 +420,11 @@ namespace
                     {
                         break;
                     }
+                    if (section.PointerToRawData >
+                        (std::numeric_limits<uint32_t>::max)() - delta)
+                    {
+                        break;
+                    }
                     *fileOffset = section.PointerToRawData + delta;
                     ok = true;
                     break;
@@ -1494,10 +1499,14 @@ namespace
         return ok;
     }
 
+    bool PathHasDirectorySeparator(const std::wstring& path)
+    {
+        return path.find_first_of(L"\\/") != std::wstring::npos;
+    }
+
     std::wstring KmonImageForClassify(uint32_t pid, const std::wstring& maybePath)
     {
-        if (maybePath.find(L'\\') != std::wstring::npos ||
-            maybePath.find(L'/') != std::wstring::npos)
+        if (PathHasDirectorySeparator(maybePath))
         {
             return maybePath;
         }
@@ -2227,7 +2236,7 @@ bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
             const std::wstring leaf = KmonBasenameLower(event.Entity);
             if (KmonIsWindowsBuiltinLeaf(leaf) &&
                 !event.Entity.empty() &&
-                event.Entity.find(L'\\') != std::wstring::npos &&
+                PathHasDirectorySeparator(event.Entity) &&
                 !KmonWindowsBuiltinPathLooksInbox(event.Entity))
             {
                 out->Kind = L"process.masquerade";
@@ -2340,8 +2349,10 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             const std::wstring targetClass = KmonClassifyDriverPath(event.TargetImage);
             const bool dropSide = callerClass == L"drop" || targetClass == L"drop";
             const bool unknownFileSide =
-                (callerClass == L"unknown" && event.Image.find(L'\\') != std::wstring::npos) ||
-                (targetClass == L"unknown" && event.TargetImage.find(L'\\') != std::wstring::npos);
+                (callerClass == L"unknown" &&
+                    PathHasDirectorySeparator(event.Image)) ||
+                (targetClass == L"unknown" &&
+                    PathHasDirectorySeparator(event.TargetImage));
             const bool builtinSide =
                 KmonIsWindowsBuiltinLeaf(caller) || KmonIsWindowsBuiltinLeaf(target);
             if (dropSide || unknownFileSide)
@@ -2590,6 +2601,7 @@ bool KernelMonitor::Start(
                 WatchDriversLower = Options.WatchDrivers;
                 WatchPromotedPids.clear();
                 LoggingEnabledPids.clear();
+                LoggingFailedPids.clear();
                 RecentCreatePids.clear();
                 EmittedUnnamedPids.clear();
                 EmittedMapperKeys.clear();
@@ -2663,31 +2675,6 @@ bool KernelMonitor::Start(
             StopRequested.store(false);
             LiveOutput.store(Options.AttachLiveTail);
             Active.store(true);
-        }
-
-        EnableLoggingForWatchTargets();
-
-        KmonEvent gap = {};
-        FILETIME now = {};
-        GetSystemTimeAsFileTime(&now);
-        gap.Timestamp = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
-        gap.Kind = L"gap.kernel_rw";
-        gap.Summary =
-            L"kernel MmCopyVirtualMemory / DeviceIoControl is not on ETW-TI; kmon samples callbacks, input stacks, SSDT/IDT, pool PE, and kpage";
-        gap.Evidence[L"followup"] =
-            L"!callbacks; !inputstack; !ssdt; !idt; !msrcheck; !driver integrity; !pool pe; !kpage /pe";
-        RecordEvent(std::move(gap));
-
-        {
-            std::lock_guard<std::mutex> lock(StateMutex);
-            if (!Active.load())
-            {
-                if (error != nullptr)
-                {
-                    *error = L"kmon became inactive during start";
-                }
-                break;
-            }
             if (!Worker.joinable())
             {
                 try
@@ -2709,6 +2696,37 @@ bool KernelMonitor::Start(
                     break;
                 }
             }
+        }
+
+        if (!Active.load() || StopRequested.load())
+        {
+            if (error != nullptr && error->empty())
+            {
+                *error = L"kmon became inactive during start";
+            }
+            break;
+        }
+
+        EnableLoggingForWatchTargets();
+
+        KmonEvent gap = {};
+        FILETIME now = {};
+        GetSystemTimeAsFileTime(&now);
+        gap.Timestamp = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+        gap.Kind = L"gap.kernel_rw";
+        gap.Summary =
+            L"kernel MmCopyVirtualMemory / DeviceIoControl is not on ETW-TI; kmon samples callbacks, input stacks, SSDT/IDT, pool PE, and kpage";
+        gap.Evidence[L"followup"] =
+            L"!callbacks; !inputstack; !ssdt; !idt; !msrcheck; !driver integrity; !pool pe; !kpage /pe";
+        RecordEvent(std::move(gap));
+
+        if (!Active.load() || StopRequested.load())
+        {
+            if (error != nullptr)
+            {
+                *error = L"kmon became inactive during start";
+            }
+            break;
         }
 
         ok = true;
@@ -4303,6 +4321,7 @@ void KernelMonitor::ScanUserModeHostility()
     PROCESSENTRY32W entry = {};
     entry.dwSize = sizeof(entry);
     BOOL more = FALSE;
+    DWORD nextError = ERROR_SUCCESS;
     const bool firstOk = Process32FirstW(snap, &entry) != FALSE;
     if (firstOk)
     {
@@ -4345,9 +4364,16 @@ void KernelMonitor::ScanUserModeHostility()
                 targets.push_back(std::move(target));
             }
             more = Process32NextW(snap, &entry);
+            if (!more)
+            {
+                nextError = GetLastError();
+            }
         } while (more);
     }
     CloseHandle(snap);
+    const bool walkIncomplete =
+        !firstOk ||
+        (nextError != ERROR_NO_MORE_FILES && nextError != ERROR_SUCCESS);
 
     {
         std::unordered_set<uint32_t> have;
@@ -4386,7 +4412,7 @@ void KernelMonitor::ScanUserModeHostility()
         }
     }
 
-    if (!firstOk && targets.empty())
+    if (walkIncomplete)
     {
         EmitUnique(
             L"process.implant",
@@ -4395,7 +4421,10 @@ void KernelMonitor::ScanUserModeHostility()
             L"user",
             L"user-mode hostility scan failed to enumerate processes",
             std::wstring());
-        return;
+        if (targets.empty())
+        {
+            return;
+        }
     }
 
     auto highEnd = std::stable_partition(
@@ -4450,7 +4479,7 @@ void KernelMonitor::ScanUserModeHostility()
             }
         }
         if (builtin &&
-            imagePath.find(L'\\') != std::wstring::npos &&
+            PathHasDirectorySeparator(imagePath) &&
             !KmonWindowsBuiltinPathLooksInbox(imagePath))
         {
             EmitUnique(
@@ -4713,7 +4742,7 @@ void KernelMonitor::ScanUserModeHostility()
                     0x400,
                     &live);
                 const bool diskExists = !imagePath.empty() &&
-                    imagePath.find(L'\\') != std::wstring::npos &&
+                    PathHasDirectorySeparator(imagePath) &&
                     GetFileAttributesW(imagePath.c_str()) != INVALID_FILE_ATTRIBUTES;
                 const bool liveMz =
                     liveOk && live.size() >= 2 && live[0] == 'M' && live[1] == 'Z';
@@ -4731,7 +4760,7 @@ void KernelMonitor::ScanUserModeHostility()
                 }
                 else if (liveMz)
                 {
-                    if (!diskExists && imagePath.find(L'\\') != std::wstring::npos)
+                    if (!diskExists && PathHasDirectorySeparator(imagePath))
                     {
                         EmitUnique(
                             L"process.hollow",
@@ -4829,7 +4858,9 @@ void KernelMonitor::ScanUserModeHostility()
                         }
                         else if (compareText &&
                             parsedDisk &&
-                            diskLayout.ExecVirtSize > 0x1000)
+                            diskLayout.ExecVirtSize > 0x1000 &&
+                            diskLayout.ExecRva <=
+                                (std::numeric_limits<uint32_t>::max)() - 0x1000)
                         {
                             uint32_t laterRva = diskLayout.ExecRva + 0x1000;
                             uint32_t laterFile = 0;
@@ -4862,7 +4893,11 @@ void KernelMonitor::ScanUserModeHostility()
                             parsedDisk &&
                             diskLayout.EntryPointRva != 0 &&
                             (diskLayout.EntryPointRva < diskLayout.ExecRva ||
-                                diskLayout.EntryPointRva >= diskLayout.ExecRva + diskLayout.ExecSize))
+                                diskLayout.ExecSize >
+                                    (std::numeric_limits<uint32_t>::max)() -
+                                        diskLayout.ExecRva ||
+                                diskLayout.EntryPointRva >=
+                                    diskLayout.ExecRva + diskLayout.ExecSize))
                         {
                             uint32_t epFile = 0;
                             if (RvaToFileOffset(diskHeaders, diskLayout.EntryPointRva, &epFile) &&
@@ -4904,7 +4939,9 @@ void KernelMonitor::ScanUserModeHostility()
                             {
                                 cowRvas[cowN++] = diskLayout.ExecRva;
                             }
-                            if (diskLayout.ExecVirtSize > 0x1000)
+                            if (diskLayout.ExecVirtSize > 0x1000 &&
+                                diskLayout.ExecRva <=
+                                    (std::numeric_limits<uint32_t>::max)() - 0x1000)
                             {
                                 cowRvas[cowN++] = diskLayout.ExecRva + 0x1000;
                             }
@@ -5107,7 +5144,7 @@ void KernelMonitor::ScanUserModeHostility()
 
 void KernelMonitor::EnableLoggingForPid(uint32_t pid)
 {
-    if (pid <= 4)
+    if (pid <= 4 || !Active.load() || StopRequested.load())
     {
         return;
     }
@@ -5167,6 +5204,7 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     if (enabled)
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
+        LoggingFailedPids.erase(pid);
         auto it = LoggingEnabledPids.find(pid);
         if (it == LoggingEnabledPids.end())
         {
@@ -5180,7 +5218,13 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     }
     else
     {
-        LoggingFailedCount.fetch_add(1);
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        auto it = LoggingFailedPids.find(pid);
+        if (it == LoggingFailedPids.end() || it->second != created)
+        {
+            LoggingFailedPids[pid] = created;
+            LoggingFailedCount.fetch_add(1);
+        }
     }
 }
 
@@ -5327,6 +5371,11 @@ void KernelMonitor::PromoteNamedWatchPid(uint32_t pid)
 
 void KernelMonitor::EnableLoggingForWatchTargets()
 {
+    if (!Active.load() || StopRequested.load())
+    {
+        return;
+    }
+
     std::vector<uint32_t> pids;
     std::vector<std::wstring> names;
     {
@@ -5638,8 +5687,19 @@ bool KernelMonitor::SaveTo(const std::wstring& path, std::wstring* error) const
         for (const KmonEvent& event : snapshot)
         {
             std::string utf8 = WideToUtf8(FormatKmonJsonLine(event));
+            if (utf8.size() > (std::numeric_limits<DWORD>::max)())
+            {
+                writeOk = false;
+                break;
+            }
             DWORD written = 0;
-            if (!WriteFile(handle, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr))
+            if (!WriteFile(
+                    handle,
+                    utf8.data(),
+                    static_cast<DWORD>(utf8.size()),
+                    &written,
+                    nullptr) ||
+                written != utf8.size())
             {
                 writeOk = false;
                 break;
@@ -6513,6 +6573,36 @@ bool KernelMonitorSelfTest()
         KmonOptions pathWatch;
         pathWatch.WatchNames.push_back(KmonBasenameLower(L"C:\\games\\game.exe"));
         if (!KmonWatchMatches(injectEvent, pathWatch))
+        {
+            break;
+        }
+
+        TimelineEvent slashMasq = {};
+        slashMasq.Action = L"process-create";
+        slashMasq.ProcessId = 4321;
+        slashMasq.Entity = L"C:/Temp/svchost.exe";
+        slashMasq.Source = L"kernel-live";
+        if (!KmonClassifyLiveEvent(slashMasq, &classified) ||
+            classified.Kind != L"process.masquerade")
+        {
+            break;
+        }
+        TimelineEvent slashInboxCreate = {};
+        slashInboxCreate.Action = L"process-create";
+        slashInboxCreate.ProcessId = 4322;
+        slashInboxCreate.Entity = L"C:/Windows/System32/svchost.exe";
+        slashInboxCreate.Source = L"kernel-live";
+        if (!KmonClassifyLiveEvent(slashInboxCreate, &classified) ||
+            classified.Kind != L"process.create")
+        {
+            break;
+        }
+
+        KmonEvent slashInject = injectEvent;
+        slashInject.Image = L"C:/cheats/x.exe";
+        slashInject.TargetImage = L"game.exe";
+        slashInject.Task = L"WriteVM";
+        if (!KmonWatchMatches(slashInject, emptyWatch))
         {
             break;
         }
