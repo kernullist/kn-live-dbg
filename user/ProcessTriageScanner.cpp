@@ -4202,10 +4202,45 @@ bool ProcessTriageVadFilterSelfTest()
         execPte,
         &mismatchCursor,
         &mismatchResult);
-    return mismatchResult.HiddenPteRecords.size() == 1 &&
-        mismatchResult.HiddenPteRecords[0].Notes == L"pte_exec_vad_rw" &&
-        mismatchResult.HiddenPteRecords[0].StartAddress == 0x10000 &&
-        mismatchResult.HiddenPteRecords[0].EndAddress == 0x10fff;
+    if (mismatchResult.HiddenPteRecords.size() != 1 ||
+        mismatchResult.HiddenPteRecords[0].Notes != L"pte_exec_vad_rw" ||
+        mismatchResult.HiddenPteRecords[0].StartAddress != 0x10000 ||
+        mismatchResult.HiddenPteRecords[0].EndAddress != 0x10fff)
+    {
+        return false;
+    }
+
+    ProcessVadScanResult mixedResult = {};
+    std::vector<VadInterval> mixedIntervals;
+    VadInterval rxRange = {};
+    rxRange.StartAddress = 0x20000;
+    rxRange.EndAddress = 0x20fff;
+    rxRange.EffectiveProtectionComplete = true;
+    rxRange.EffectiveExecutable = true;
+    VadInterval rwRange = {};
+    rwRange.StartAddress = 0x21000;
+    rwRange.EndAddress = 0x21fff;
+    rwRange.EffectiveProtectionComplete = true;
+    rwRange.EffectiveExecutable = false;
+    mixedIntervals.push_back(rxRange);
+    mixedIntervals.push_back(rwRange);
+    PteLeafMapping mixedPte = {};
+    mixedPte.StartAddress = 0x20000;
+    mixedPte.EndAddress = 0x21fff;
+    mixedPte.PageSize = kPageSize;
+    mixedPte.Executable = true;
+    mixedPte.UserAccessible = true;
+    size_t mixedCursor = 0;
+    ReportHiddenPteGaps(
+        mismatchOptions,
+        mixedIntervals,
+        mixedPte,
+        &mixedCursor,
+        &mixedResult);
+    return mixedResult.HiddenPteRecords.size() == 1 &&
+        mixedResult.HiddenPteRecords[0].Notes == L"pte_exec_vad_rw" &&
+        mixedResult.HiddenPteRecords[0].StartAddress == 0x21000 &&
+        mixedResult.HiddenPteRecords[0].EndAddress == 0x21fff;
 }
 
 bool ProcessTriageMappedPeSelfTest()
@@ -4553,12 +4588,35 @@ bool ProcessTriageScanner::ScanVad(
                     result->EffectiveProtectionCoverageComplete =
                         false;
                 }
-                VadInterval interval = {};
-                interval.StartAddress = record.StartAddress;
-                interval.EndAddress = record.EndAddress;
-                interval.EffectiveProtectionComplete = record.EffectiveProtectionComplete;
-                interval.EffectiveExecutable = record.EffectiveExecutableBytes > 0;
-                vadIntervals.push_back(interval);
+                if (record.EffectiveProtectionComplete &&
+                    !record.EffectiveProtectionRanges.empty())
+                {
+                    // Split mixed RX/RW VADs so PTE-X under an RW subrange
+                    // is visible. A whole-VAD EffectiveExecutableBytes>0
+                    // flag would hide those pages.
+                    for (const ProcessVadProtectionRange& range :
+                         record.EffectiveProtectionRanges)
+                    {
+                        VadInterval interval = {};
+                        interval.StartAddress = range.StartAddress;
+                        interval.EndAddress = range.EndAddress;
+                        interval.EffectiveProtectionComplete = true;
+                        interval.EffectiveExecutable =
+                            range.Committed && range.Executable;
+                        vadIntervals.push_back(interval);
+                    }
+                }
+                else
+                {
+                    VadInterval interval = {};
+                    interval.StartAddress = record.StartAddress;
+                    interval.EndAddress = record.EndAddress;
+                    interval.EffectiveProtectionComplete =
+                        record.EffectiveProtectionComplete;
+                    interval.EffectiveExecutable =
+                        record.EffectiveExecutableBytes > 0;
+                    vadIntervals.push_back(interval);
+                }
 
                 if (record.Executable)
                 {
