@@ -193,7 +193,8 @@ namespace
 
     std::string WideToUtf8(const std::wstring& w)
     {
-        if (w.empty())
+        if (w.empty() ||
+            w.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
         {
             return std::string();
         }
@@ -211,7 +212,7 @@ namespace
             return std::string();
         }
         std::string s(static_cast<size_t>(needed), '\0');
-        WideCharToMultiByte(
+        const int converted = WideCharToMultiByte(
             CP_UTF8,
             0,
             w.c_str(),
@@ -220,6 +221,10 @@ namespace
             needed,
             nullptr,
             nullptr);
+        if (converted != needed)
+        {
+            return std::string();
+        }
         return s;
     }
 
@@ -3096,6 +3101,10 @@ void KernelMonitor::ScanHiddenProcesses()
             L"LoadKernelModules failed or empty");
         return;
     }
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        EmittedMapperKeys.erase(L"scan_failed:hidden:inventory");
+    }
 
     HiddenProcessScanner scanner(*device, *symbols);
     HiddenProcessScanResult result = {};
@@ -3128,7 +3137,12 @@ void KernelMonitor::ScanHiddenProcesses()
         return;
     }
     HiddenScans.fetch_add(1);
-    if (!result.CoverageComplete)
+    if (result.CoverageComplete)
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        EmittedMapperKeys.erase(L"scan_failed:hidden:coverage");
+    }
+    else
     {
         std::wstring notes;
         for (const std::wstring& warning : result.Warnings)
@@ -4494,6 +4508,11 @@ void KernelMonitor::ScanUserModeHostility()
             return;
         }
     }
+    else
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        EmittedMapperKeys.erase(L"scan_failed:userhostility");
+    }
 
     auto highEnd = std::stable_partition(
         targets.begin(),
@@ -5636,6 +5655,10 @@ bool KernelMonitor::WriteLogLine(const KmonEvent& event)
     do
     {
         std::string utf8 = WideToUtf8(FormatKmonJsonLine(event));
+        if (utf8.empty())
+        {
+            break;
+        }
         std::lock_guard<std::mutex> logLock(LogMutex);
         if (LogHandle == INVALID_HANDLE_VALUE &&
             (!Active.load() || StopRequested.load()))
@@ -5784,7 +5807,7 @@ bool KernelMonitor::SaveTo(const std::wstring& path, std::wstring* error) const
         for (const KmonEvent& event : snapshot)
         {
             std::string utf8 = WideToUtf8(FormatKmonJsonLine(event));
-            if (utf8.size() > (std::numeric_limits<DWORD>::max)())
+            if (utf8.empty() || utf8.size() > (std::numeric_limits<DWORD>::max)())
             {
                 writeOk = false;
                 break;
