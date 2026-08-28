@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace
 {
@@ -763,11 +764,15 @@ namespace
             }
 
             view->Pid = pid;
-            view->CidTable = true;
+            if (view->Eprocess != 0 && view->Eprocess != ctx.Eprocess)
+            {
+                break;
+            }
             if (view->Eprocess == 0)
             {
                 view->Eprocess = ctx.Eprocess;
             }
+            view->CidTable = true;
             if (view->Image.empty() && imageField.Offset != 0)
             {
                 std::vector<uint8_t> nameBytes;
@@ -1102,6 +1107,22 @@ bool HiddenProcessScanner::Scan(
             confirmIfMissingFromLists(pid);
         }
 
+        std::vector<uint32_t> kernelOnlyPids;
+        for (const auto& pair : views)
+        {
+            if (pair.second.Kernel &&
+                !pair.second.Spi &&
+                !pair.second.Toolhelp &&
+                pair.first > 4)
+            {
+                kernelOnlyPids.push_back(pair.first);
+            }
+        }
+        for (uint32_t pid : kernelOnlyPids)
+        {
+            confirmIfMissingFromLists(pid);
+        }
+
         for (auto& pair : views)
         {
             ProcessView& view = pair.second;
@@ -1284,6 +1305,14 @@ bool HiddenProcessViewSelfTest()
         clone.Auxiliary = true;
         const HiddenProcessClassifyResult cloneResult = ClassifyHiddenProcess(clone);
         if (cloneResult.Suspicious || !cloneResult.IgnoredAuxiliary)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput cloneCid = clone;
+        cloneCid.CidTable = true;
+        const HiddenProcessClassifyResult cloneCidResult = ClassifyHiddenProcess(cloneCid);
+        if (!cloneCidResult.Suspicious || cloneCidResult.Ignored)
         {
             break;
         }

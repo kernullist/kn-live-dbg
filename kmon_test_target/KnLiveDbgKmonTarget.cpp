@@ -215,7 +215,12 @@ namespace
                     {
                         uint32_t virt = section[i].Misc.VirtualSize;
                         uint32_t raw = section[i].SizeOfRawData;
-                        *execVirtSize = (virt > raw) ? virt : raw;
+                        uint32_t committed = virt;
+                        if (committed == 0 || (raw != 0 && raw < committed))
+                        {
+                            committed = raw;
+                        }
+                        *execVirtSize = committed;
                     }
                     ok = true;
                     break;
@@ -265,7 +270,11 @@ namespace
         }
         if (execVirt > 0x1000)
         {
-            if (!PatchCurrentProcessBytes(text + 0x1000, patch, sizeof(patch)))
+            const uint32_t remain = execVirt - 0x1000;
+            const size_t n = (remain < sizeof(patch)) ? remain : sizeof(patch);
+            if (n > 0 &&
+                !PatchCurrentProcessBytes(text + 0x1000, patch, n) &&
+                n == sizeof(patch))
             {
                 return false;
             }
@@ -491,8 +500,9 @@ namespace
             }
             CloseHandle(pi.hThread);
             // Child applies the scenario then holds. A fast exit means the
-            // scenario failed and the parent must not report success.
-            const DWORD wait = WaitForSingleObject(pi.hProcess, 1000);
+            // scenario failed. Keep this wait short so /seconds 1 is not
+            // mistaken for a failed child.
+            const DWORD wait = WaitForSingleObject(pi.hProcess, 200);
             if (wait == WAIT_OBJECT_0)
             {
                 CloseHandle(pi.hProcess);

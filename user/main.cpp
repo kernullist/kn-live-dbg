@@ -24690,6 +24690,14 @@ static void PrintKmonEventLine(const KmonEvent& event)
 
 static void RunKmonLiveTail(KernelMonitor& kmon)
 {
+    if (g_RemoteOriginActive.load())
+    {
+        kmon.SetLiveOutput(false);
+        PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
+        std::wcout << L" remote origin: tail not attached. JSONL is filling; use '!kmon recent'.\n";
+        return;
+    }
+
     kmon.SetLiveOutput(true);
     PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
     std::wcout << L" live tail. Esc/q returns to the prompt; collection stays up.\n";
@@ -24965,6 +24973,7 @@ static void HandleKmonCommand(
             }
 
             TiSubscriber& ti = GetTiSubscriberInstance();
+            bool startedTiHere = false;
             if (!ti.IsActive())
             {
                 g_TiSubscriberForShutdown.store(&ti);
@@ -24978,6 +24987,7 @@ static void HandleKmonCommand(
                     std::wcerr << L"!kmon start: TI subscribe failed: " << startError << L"\n";
                     break;
                 }
+                startedTiHere = true;
                 std::wcout << L"[kmon] TI ETW started (silent forensic)\n";
             }
             else
@@ -24987,6 +24997,12 @@ static void HandleKmonCommand(
 
             if (!TryEnableTimelineLive(state, &device))
             {
+                if (startedTiHere)
+                {
+                    std::wstring stopError;
+                    ti.Stop(&stopError);
+                    g_TiSubscriberForShutdown.store(nullptr);
+                }
                 std::wcerr << L"!kmon start: kernel live callbacks were not enabled\n";
                 break;
             }
@@ -24997,8 +25013,20 @@ static void HandleKmonCommand(
             {
                 g_KmonForShutdown.store(nullptr);
                 kmon.SetLiveOutput(false);
+                if (startedTiHere)
+                {
+                    std::wstring stopError;
+                    ti.Stop(&stopError);
+                    g_TiSubscriberForShutdown.store(nullptr);
+                }
                 std::wcerr << L"!kmon start failed: " << startError << L"\n";
                 break;
+            }
+
+            if (g_RemoteOriginActive.load())
+            {
+                options.AttachLiveTail = false;
+                kmon.SetLiveOutput(false);
             }
 
             PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
