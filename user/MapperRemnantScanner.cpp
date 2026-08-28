@@ -84,7 +84,8 @@ namespace
             return false;
         }
 
-        for (const KernelModuleInfo& module : symbols.Modules())
+        const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+        for (const KernelModuleInfo& module : modules)
         {
             uint64_t end = 0;
             if (!LeftoverTryAdd(module.Base, module.Size, &end))

@@ -927,7 +927,8 @@ namespace
                 break;
             }
 
-            const KernelModuleInfo* module = FindModuleForAddress(symbols.Modules(), address);
+            const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+            const KernelModuleInfo* module = FindModuleForAddress(modules, address);
             if (module != nullptr && moduleName != nullptr)
             {
                 *moduleName = module->ImageName;
@@ -1772,10 +1773,11 @@ namespace
             ReadFieldInteger(device, object.Body, fastIoField, sizeof(uint64_t), &record->FastIoDispatch, nullptr);
             ReadFieldInteger(device, object.Body, unloadField, sizeof(uint64_t), &record->DriverUnload, nullptr);
 
+            const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
             const KernelModuleInfo* owner = nullptr;
             if (record->DriverStart != 0)
             {
-                owner = FindModuleForAddress(symbols.Modules(), record->DriverStart);
+                owner = FindModuleForAddress(modules, record->DriverStart);
                 if (owner != nullptr)
                 {
                     record->OwningModule = owner->ImageName;
@@ -1818,7 +1820,7 @@ namespace
                 dispatch.Name = MajorFunctionName(index);
                 dispatch.Function = function;
                 AnnotatePointer(symbols, function, &dispatch.ModuleName, &dispatch.SymbolName);
-                dispatch.InLoadedModule = FindModuleForAddress(symbols.Modules(), function) != nullptr;
+                dispatch.InLoadedModule = FindModuleForAddress(modules, function) != nullptr;
 
                 uint64_t ownerStart = record->DriverStart;
                 uint64_t ownerSize = record->DriverSize;
@@ -2078,6 +2080,7 @@ namespace
                 descriptorCount = kMaxIatDescriptors;
             }
 
+            const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
             for (uint32_t descriptorIndex = 0; descriptorIndex < descriptorCount; ++descriptorIndex)
             {
                 uint64_t descriptorAddress = 0;
@@ -2184,7 +2187,7 @@ namespace
                     }
 
                     AnnotatePointer(symbols, target, &entry.TargetModule, &entry.TargetSymbol);
-                    const KernelModuleInfo* owner = FindModuleForAddress(symbols.Modules(), target);
+                    const KernelModuleInfo* owner = FindModuleForAddress(modules, target);
                     if (owner == nullptr)
                     {
                         entry.Suspicious = true;
@@ -2262,6 +2265,7 @@ namespace
                 break;
             }
 
+            const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
             uint64_t entryAddress = 0;
             if (!TryAdd(module.Base, entryRva, &entryAddress))
             {
@@ -2306,12 +2310,12 @@ namespace
                 break;
             }
 
-            const KernelModuleInfo* owner = FindModuleForAddress(symbols.Modules(), entryAddress);
+            const KernelModuleInfo* owner = FindModuleForAddress(modules, entryAddress);
             auto targetOutsideOwner = [&](uint64_t target) -> bool
             {
                 if (owner == nullptr)
                 {
-                    return FindModuleForAddress(symbols.Modules(), target) == nullptr;
+                    return FindModuleForAddress(modules, target) == nullptr;
                 }
                 uint64_t end = 0;
                 return !TryAdd(owner->Base, owner->Size, &end) ||
@@ -2565,7 +2569,8 @@ namespace
                     ReadFieldInteger(device, record->DriverObject, startField, sizeof(uint64_t), &driverStart, nullptr) &&
                     driverStart != 0)
                 {
-                    const KernelModuleInfo* owner = FindModuleForAddress(symbols.Modules(), driverStart);
+                    const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+                    const KernelModuleInfo* owner = FindModuleForAddress(modules, driverStart);
                     if (owner != nullptr)
                     {
                         record->DriverModule = owner->ImageName;

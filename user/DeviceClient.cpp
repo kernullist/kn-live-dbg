@@ -1212,7 +1212,8 @@ bool DeviceClient::SetProcessLogging(
     uint32_t* informationClassUsed,
     uint32_t* ntStatus,
     uint64_t* eprocessAddress,
-    std::wstring* error)
+    std::wstring* error,
+    bool disable)
 {
     bool ok = false;
 
@@ -1239,7 +1240,10 @@ bool DeviceClient::SetProcessLogging(
 
         buffer.Request.Size = sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST);
         buffer.Request.ProcessId = processId;
-        buffer.Request.LoggingFlags = (loggingFlags == 0) ? KNDBG_PROCESS_LOG_DEFAULT : loggingFlags;
+        buffer.Request.Flags = disable ? KNDBG_SET_PROCESS_LOGGING_FLAG_DISABLE : 0;
+        buffer.Request.LoggingFlags = disable
+            ? 0
+            : ((loggingFlags == 0) ? KNDBG_PROCESS_LOG_DEFAULT : loggingFlags);
         buffer.Request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
 
         DWORD returned = 0;

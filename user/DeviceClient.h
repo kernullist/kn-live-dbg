@@ -190,7 +190,8 @@ public:
         uint32_t* informationClassUsed,
         uint32_t* ntStatus,
         uint64_t* eprocessAddress,
-        std::wstring* error);
+        std::wstring* error,
+        bool disable = false);
 
     // Reads one architectural MSR (must be a KNDBG_MSR_* whitelist value) on
     // the requested logical processor. Read-only; does not require write mode.
