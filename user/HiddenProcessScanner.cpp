@@ -695,6 +695,7 @@ namespace
                     more = TRUE;
                     break;
                 }
+                entry.dwSize = sizeof(entry);
                 more = Process32NextW(snap, &entry);
                 if (!more)
                 {

@@ -1310,7 +1310,8 @@ namespace
         uint32_t pid,
         ProcessVadScanResult* vadResult,
         bool* scanned,
-        bool scanHiddenPtes)
+        bool scanHiddenPtes,
+        bool probePe)
     {
         bool ok = false;
         do
@@ -1363,7 +1364,9 @@ namespace
             options.Target.HasCreateTime = options.Target.CreateTime != 0;
             // Probe private VADs for MZ so header-intact manual maps still
             // classify when VirtualQueryEx is denied (PPL / ObCallback).
-            options.ProbePe = true;
+            // Watched games that already have a usermode walk skip this; the
+            // extra RPM per private VAD stalls TI ingest.
+            options.ProbePe = probePe;
             // Full user page-table walks are expensive. Only watched game
             // targets get hidden-PTE coverage; builtin PPL hosts stay on
             // VAD + PE probe.
@@ -2024,6 +2027,7 @@ namespace
             {
                 pids->push_back(entry.th32ProcessID);
             }
+            entry.dwSize = sizeof(entry);
             more = Process32NextW(snap, &entry);
             if (!more)
             {
@@ -4858,6 +4862,7 @@ void KernelMonitor::ScanUserModeHostility()
                     pathClass == L"unknown";
                 targets.push_back(std::move(target));
             }
+            entry.dwSize = sizeof(entry);
             more = Process32NextW(snap, &entry);
             if (!more)
             {
@@ -5031,6 +5036,7 @@ void KernelMonitor::ScanUserModeHostility()
                                 reinterpret_cast<uint64_t>(moduleEntry.modBaseAddr),
                                 moduleEntry.modBaseSize));
                         }
+                        moduleEntry.dwSize = sizeof(moduleEntry);
                         moreMod = Module32NextW(modSnap, &moduleEntry);
                         if (!moreMod)
                         {
@@ -5116,7 +5122,8 @@ void KernelMonitor::ScanUserModeHostility()
                     pid,
                     &kernelVad,
                     &kernelVadScanned,
-                    watched);
+                    watched,
+                    !queried);
             if ((watched || builtin) && !queried && !kernelVadScanned)
             {
                 EmitUnique(
@@ -5207,8 +5214,7 @@ void KernelMonitor::ScanUserModeHostility()
                     mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath);
                 }
 
-                if ((queried && !committed) ||
-                    (!queried && kernelVadScanned && !hasKernelVad))
+                if (queried && !committed)
                 {
                     EmitUnique(
                         L"process.hollow",
@@ -5218,6 +5224,39 @@ void KernelMonitor::ScanUserModeHostility()
                         L"main EXE ImageBase is not committed pid=" +
                             std::to_wstring(pid) + L" " + leaf,
                         L"state=" + std::to_wstring(mbi.State),
+                        pid);
+                }
+                else if (!queried &&
+                    kernelVadScanned &&
+                    !hasKernelVad &&
+                    !kernelVad.Truncated &&
+                    !kernelVad.Incomplete)
+                {
+                    EmitUnique(
+                        L"process.hollow",
+                        L"exe_unmapped:" + std::to_wstring(pid),
+                        imagePath,
+                        L"exe_unmapped",
+                        L"main EXE ImageBase is not committed pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"kernel_vad_no_cover",
+                        pid);
+                }
+                else if (!queried &&
+                    kernelVadScanned &&
+                    !hasKernelVad &&
+                    (kernelVad.Truncated || kernelVad.Incomplete))
+                {
+                    EmitUnique(
+                        L"process.implant",
+                        L"scan_failed:userhostility:vad:" + std::to_wstring(pid),
+                        imagePath,
+                        L"user",
+                        L"kernel VAD coverage was incomplete for pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        kernelVad.Truncated
+                            ? L"VAD traversal truncated"
+                            : L"VAD/PTE coverage incomplete",
                         pid);
                 }
                 else if (KmonExeRegionLooksPrivate(
@@ -6598,10 +6637,30 @@ bool KernelMonitor::AddWatchPid(uint32_t pid)
 
 bool KernelMonitor::RemoveWatchPid(uint32_t pid)
 {
-    std::lock_guard<std::mutex> lock(WatchMutex);
-    WatchExplicitPids.erase(pid);
-    WatchPromotedPids.erase(pid);
-    return WatchPids.erase(pid) != 0;
+    bool removed = false;
+    bool wasLogging = false;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        WatchExplicitPids.erase(pid);
+        WatchPromotedPids.erase(pid);
+        removed = WatchPids.erase(pid) != 0;
+        wasLogging = LoggingEnabledPids.erase(pid) != 0;
+        LoggingFailedPids.erase(pid);
+        if (wasLogging && LoggingEnabledCount.load() > 0)
+        {
+            LoggingEnabledCount.fetch_sub(1);
+        }
+    }
+    if (wasLogging)
+    {
+        DeviceClient* device = nullptr;
+        {
+            std::lock_guard<std::mutex> stateLock(StateMutex);
+            device = Device;
+        }
+        DisableProcessLogging(device, pid);
+    }
+    return removed;
 }
 
 bool KernelMonitor::AddWatchName(const std::wstring& imageBase)
