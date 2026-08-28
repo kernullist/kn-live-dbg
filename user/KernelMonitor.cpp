@@ -2214,7 +2214,9 @@ bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
             else
             {
                 out->Kind = L"driver.image_only";
-                out->Summary = L"inbox kernel image load " + KmonBasenameLower(event.Entity);
+                out->Summary = (pathClass == L"inbox")
+                    ? (L"inbox kernel image load " + KmonBasenameLower(event.Entity))
+                    : (L"kernel image load " + KmonBasenameLower(event.Entity));
             }
             classified = true;
             break;
@@ -5061,9 +5063,17 @@ void KernelMonitor::ScanUserModeHostility()
                     n.find(L"\\windows\\system32\\") != std::wstring::npos ||
                     n.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
                     n.find(L"\\windows\\winsxs\\") != std::wstring::npos;
+                std::wstring moduleLower = ToLowerCopy(modulePath);
+                for (wchar_t& ch : moduleLower)
+                {
+                    if (ch == L'/')
+                    {
+                        ch = L'\\';
+                    }
+                }
                 const bool inImageDir =
                     imageDir.size() > 3 &&
-                    ToLowerCopy(modulePath).find(imageDir) == 0;
+                    moduleLower.find(imageDir) == 0;
                 const bool dropImplant =
                     moduleClass == L"drop" && (builtin || watched);
                 const bool watchedUnknown = watched &&
@@ -6171,7 +6181,21 @@ bool KernelMonitorSelfTest()
         liveInbox.ProcessId = 0;
         liveInbox.Entity = L"\\SystemRoot\\System32\\drivers\\mapped.sys";
         liveInbox.Source = L"kernel-live";
-        if (!KmonClassifyLiveEvent(liveInbox, &classified) || classified.Kind != L"driver.image_only")
+        if (!KmonClassifyLiveEvent(liveInbox, &classified) ||
+            classified.Kind != L"driver.image_only" ||
+            classified.Summary.find(L"inbox") == std::wstring::npos)
+        {
+            break;
+        }
+
+        TimelineEvent liveBareSys = {};
+        liveBareSys.Action = L"image-load";
+        liveBareSys.ProcessId = 0;
+        liveBareSys.Entity = L"cheat.sys";
+        liveBareSys.Source = L"kernel-live";
+        if (!KmonClassifyLiveEvent(liveBareSys, &classified) ||
+            classified.Kind != L"driver.image_only" ||
+            classified.Summary.find(L"inbox") != std::wstring::npos)
         {
             break;
         }
