@@ -23612,7 +23612,7 @@ private:
     {
         do
         {
-            while (!StopRequested.load() && !g_StopRequested.load())
+            while (!StopRequested.load())
             {
                 std::vector<TimelineLiveEvent> liveEvents;
                 TimelineLiveStatus drainStatus = {};
@@ -23620,7 +23620,11 @@ private:
                 if (!DrainTimelineLiveEvents(device, 256, &liveEvents, &drainStatus, &error))
                 {
                     RecordError(error);
-                    break;
+                    for (size_t i = 0; i < 10 && !StopRequested.load(); ++i)
+                    {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                    continue;
                 }
 
                 std::vector<TimelineEvent> events;
@@ -23635,7 +23639,7 @@ private:
 
                 for (size_t i = 0; i < 5; ++i)
                 {
-                    if (StopRequested.load() || g_StopRequested.load())
+                    if (StopRequested.load())
                     {
                         break;
                     }
@@ -24844,7 +24848,7 @@ static void HandleKmonCommand(
 
     do
     {
-        if (HasHelpToken(args, 1))
+        if (args.size() >= 2 && IsHelpToken(args[1]))
         {
             PrintKmonHelp();
             break;
@@ -24936,6 +24940,7 @@ static void HandleKmonCommand(
                 }
                 PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
                 std::wcout << L" already collecting; attaching live tail. Esc/q detaches.\n";
+                StartTimelineAutoDrainWorker(state, &device);
                 RunKmonLiveTail(kmon);
                 break;
             }
@@ -25068,6 +25073,7 @@ static void HandleKmonCommand(
 
             if (options.AttachLiveTail)
             {
+                StartTimelineAutoDrainWorker(state, &device);
                 RunKmonLiveTail(kmon);
             }
             else
@@ -25200,6 +25206,7 @@ static void HandleKmonCommand(
                 std::wcerr << L"!kmon watch: not active. run '!kmon' first.\n";
                 break;
             }
+            StartTimelineAutoDrainWorker(state, &device);
             RunKmonLiveTail(kmon);
             break;
         }

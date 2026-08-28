@@ -2859,6 +2859,7 @@ void KernelMonitor::ScanHiddenProcesses()
             extraPids.push_back(it->first);
             ++it;
         }
+        extraPids.insert(extraPids.end(), WatchPids.begin(), WatchPids.end());
     }
     if (!scanner.Scan(&result, extraPids, &error))
     {
@@ -3233,7 +3234,7 @@ void KernelMonitor::ScanPoolMappedImages()
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitMappedResidue(
-            L"scan_failed:pool_pe",
+            L"scan_failed:pool_pe:inventory",
             std::wstring(),
             L"pool_pe",
             L"pool PE scan skipped; kernel module inventory unavailable",
@@ -3315,7 +3316,7 @@ void KernelMonitor::ScanUnbackedDriverObjects()
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitMappedResidue(
-            L"scan_failed:drvobj",
+            L"scan_failed:drvobj:inventory",
             std::wstring(),
             L"driver_object",
             L"unbacked DRIVER_OBJECT scan skipped; kernel module inventory unavailable",
@@ -3392,7 +3393,7 @@ void KernelMonitor::ScanOrphanMappedPages()
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitMappedResidue(
-            L"scan_failed:kpage",
+            L"scan_failed:kpage:inventory",
             std::wstring(),
             L"orphan_page",
             L"orphan kpage scan skipped; kernel module inventory unavailable",
@@ -3470,7 +3471,7 @@ void KernelMonitor::ScanHookCallbacks()
     {
         EmitUnique(
             L"hook.unbacked",
-            L"scan_failed:callbacks",
+            L"scan_failed:callbacks:inventory",
             std::wstring(),
             L"callback",
             L"callback scan skipped; kernel module inventory unavailable",
@@ -3534,7 +3535,7 @@ void KernelMonitor::ScanHookInput()
     {
         EmitUnique(
             L"hook.unbacked",
-            L"scan_failed:input",
+            L"scan_failed:input:inventory",
             std::wstring(),
             L"input",
             L"input stack scan skipped; kernel module inventory unavailable",
@@ -3603,7 +3604,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
     {
         EmitUnique(
             L"hook.unbacked",
-            L"scan_failed:cpu",
+            L"scan_failed:cpu:inventory",
             std::wstring(),
             L"cpu",
             L"cpu/integrity scan skipped; kernel module inventory unavailable",
@@ -5677,7 +5678,7 @@ bool KernelMonitorArtifactSelfTest()
                 }
                 CloseHandle(inspect);
                 // Working-set query can miss on a just-spawned child. Fail
-                // only when pages were visible and still shared after patch.
+                // when pages were visible and still shared after patch.
                 if (childValid > 0 && childPriv == 0)
                 {
                     break;

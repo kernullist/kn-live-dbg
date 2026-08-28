@@ -95,6 +95,9 @@ namespace
         bool KernelWalkOk = false;
         bool KernelInventoryComplete = false;
         bool UserWalkOk = false;
+        bool SpiWalkOk = false;
+        bool ToolhelpWalkOk = false;
+        bool CidConfirmAvailable = false;
         bool RequireStableUserPresence = false;
         bool LifecycleLayoutAvailable = false;
         bool HasLifecycle = false;
@@ -308,6 +311,14 @@ namespace
 
         if (input.Kernel && userViews == 0)
         {
+            if (!input.SpiWalkOk || !input.ToolhelpWalkOk)
+            {
+                result.Ignored = true;
+                result.IgnoredRace = true;
+                result.Notes =
+                    L"SPI or Toolhelp inventory was incomplete; kernel-only process was not escalated";
+                return result;
+            }
             // Handle/CID confirmation means the object is still a live
             // process. Cheats set AuxiliaryProcess or fake ExitTime to ride
             // the clone/zombie filters.
@@ -375,6 +386,14 @@ namespace
                     L"ActiveProcessLinks walk was incomplete; CID/handle-only process was not escalated";
                 return result;
             }
+            if (!input.SpiWalkOk || !input.ToolhelpWalkOk)
+            {
+                result.Ignored = true;
+                result.IgnoredRace = true;
+                result.Notes =
+                    L"SPI or Toolhelp inventory was incomplete; CID/handle-only process was not escalated";
+                return result;
+            }
             const bool independentlyVisible = input.HandleOwner || input.CidTable;
             if (IsTerminatingView(input) && !independentlyVisible)
             {
@@ -392,6 +411,14 @@ namespace
             }
             if (input.HandleOwner)
             {
+                if (input.CidConfirmAvailable && !input.CidTable)
+                {
+                    result.Ignored = true;
+                    result.IgnoredRace = true;
+                    result.Notes =
+                        L"handle owner disappeared before CID revalidation";
+                    return result;
+                }
                 result.Suspicious = true;
                 result.Notes =
                     L"handle-table owner missing from ActiveProcessLinks, SPI, and Toolhelp";
@@ -407,6 +434,9 @@ namespace
         bool kernelWalkOk,
         bool kernelInventoryComplete,
         bool userWalkOk,
+        bool spiWalkOk,
+        bool toolhelpWalkOk,
+        bool cidConfirmAvailable,
         bool requireStableUserPresence,
         bool lifecycleLayoutAvailable)
     {
@@ -422,6 +452,9 @@ namespace
         input.KernelWalkOk = kernelWalkOk;
         input.KernelInventoryComplete = kernelInventoryComplete;
         input.UserWalkOk = userWalkOk;
+        input.SpiWalkOk = spiWalkOk;
+        input.ToolhelpWalkOk = toolhelpWalkOk;
+        input.CidConfirmAvailable = cidConfirmAvailable;
         input.RequireStableUserPresence = requireStableUserPresence;
         input.LifecycleLayoutAvailable = lifecycleLayoutAvailable;
         input.HasLifecycle = view.HasLifecycle;
@@ -651,20 +684,33 @@ namespace
         bool ok = false;
         if (Process32FirstW(snap, &entry))
         {
+            BOOL more = TRUE;
             do
             {
                 parsed.Images[entry.th32ProcessID] = entry.szExeFile;
                 if (parsed.Images.size() >= kMaxProcesses)
                 {
+                    more = TRUE;
                     break;
                 }
-            } while (Process32NextW(snap, &entry));
+                more = Process32NextW(snap, &entry);
+            } while (more);
             parsed.Count = static_cast<uint32_t>(parsed.Images.size());
+            const DWORD nextError = GetLastError();
             if (parsed.Count >= kMaxProcesses)
             {
                 if (warning != nullptr)
                 {
                     *warning = L"CreateToolhelp32Snapshot was truncated";
+                }
+            }
+            else if (!more &&
+                nextError != ERROR_NO_MORE_FILES &&
+                nextError != ERROR_SUCCESS)
+            {
+                if (warning != nullptr)
+                {
+                    *warning = L"CreateToolhelp32Snapshot enumeration failed";
                 }
             }
             else
@@ -1186,6 +1232,9 @@ bool HiddenProcessScanner::Scan(
                     kernelWalkOk,
                     kernelInventoryComplete,
                     userWalkOk,
+                    spiBeforeOk || spiAfterOk,
+                    toolhelpBeforeOk || toolhelpAfterOk,
+                    hasDtb,
                     requireStableUserPresence,
                     lifecycleLayoutAvailable);
             const HiddenProcessClassifyResult classified = ClassifyHiddenProcess(classifiedInput);
@@ -1313,6 +1362,8 @@ bool HiddenProcessViewSelfTest()
         hidden.Kernel = true;
         hidden.KernelWalkOk = true;
         hidden.UserWalkOk = true;
+        hidden.SpiWalkOk = true;
+        hidden.ToolhelpWalkOk = true;
         hidden.HasLifecycle = true;
         hidden.HasAuxiliaryResolved = true;
         hidden.HasActiveThreads = true;
@@ -1427,6 +1478,14 @@ bool HiddenProcessViewSelfTest()
             break;
         }
 
+        HiddenProcessClassifyInput kernelNoSpi = hidden;
+        kernelNoSpi.SpiWalkOk = false;
+        const HiddenProcessClassifyResult kernelNoSpiResult = ClassifyHiddenProcess(kernelNoSpi);
+        if (kernelNoSpiResult.Suspicious || !kernelNoSpiResult.IgnoredRace)
+        {
+            break;
+        }
+
         HiddenProcessClassifyInput incompleteWalk = visible;
         incompleteWalk.KernelInventoryComplete = false;
         const HiddenProcessClassifyResult incompleteWalkResult = ClassifyHiddenProcess(incompleteWalk);
@@ -1454,8 +1513,19 @@ bool HiddenProcessViewSelfTest()
         handleOnly.KernelWalkOk = true;
         handleOnly.UserWalkOk = true;
         handleOnly.KernelInventoryComplete = true;
+        handleOnly.SpiWalkOk = true;
+        handleOnly.ToolhelpWalkOk = true;
         const HiddenProcessClassifyResult handleOnlyResult = ClassifyHiddenProcess(handleOnly);
         if (!handleOnlyResult.Suspicious || handleOnlyResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput handleNoCid = handleOnly;
+        handleNoCid.CidTable = false;
+        handleNoCid.CidConfirmAvailable = true;
+        const HiddenProcessClassifyResult handleNoCidResult = ClassifyHiddenProcess(handleNoCid);
+        if (handleNoCidResult.Suspicious || !handleNoCidResult.IgnoredRace)
         {
             break;
         }
@@ -1474,6 +1544,8 @@ bool HiddenProcessViewSelfTest()
         cidOnly.KernelWalkOk = true;
         cidOnly.UserWalkOk = true;
         cidOnly.KernelInventoryComplete = true;
+        cidOnly.SpiWalkOk = true;
+        cidOnly.ToolhelpWalkOk = true;
         const HiddenProcessClassifyResult cidOnlyResult = ClassifyHiddenProcess(cidOnly);
         if (!cidOnlyResult.Suspicious || cidOnlyResult.Ignored)
         {
