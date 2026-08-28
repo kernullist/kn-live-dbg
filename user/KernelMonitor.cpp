@@ -3101,10 +3101,7 @@ void KernelMonitor::ScanHiddenProcesses()
             L"LoadKernelModules failed or empty");
         return;
     }
-    {
-        std::lock_guard<std::mutex> watchLock(WatchMutex);
-        EmittedMapperKeys.erase(L"scan_failed:hidden:inventory");
-    }
+    ClearEmittedKey(L"scan_failed:hidden:inventory");
 
     HiddenProcessScanner scanner(*device, *symbols);
     HiddenProcessScanResult result = {};
@@ -3137,10 +3134,10 @@ void KernelMonitor::ScanHiddenProcesses()
         return;
     }
     HiddenScans.fetch_add(1);
+    ClearEmittedKey(L"scan_failed:hidden");
     if (result.CoverageComplete)
     {
-        std::lock_guard<std::mutex> watchLock(WatchMutex);
-        EmittedMapperKeys.erase(L"scan_failed:hidden:coverage");
+        ClearEmittedKey(L"scan_failed:hidden:coverage");
     }
     else
     {
@@ -3456,6 +3453,12 @@ void KernelMonitor::EmitMappedResidue(
     EmitUnique(L"driver.mapped_residue", key, driver, layer, summary, notes);
 }
 
+void KernelMonitor::ClearEmittedKey(const std::wstring& key)
+{
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    EmittedMapperKeys.erase(key);
+}
+
 void KernelMonitor::ScanMapperRemnants()
 {
     DeviceClient* device = nullptr;
@@ -3479,6 +3482,7 @@ void KernelMonitor::ScanMapperRemnants()
             L"LoadKernelModules failed or empty");
         return;
     }
+    ClearEmittedKey(L"scan_failed:mapper:inventory");
 
     MapperRemnantScanner scanner(*device, *symbols);
     MapperScanOptions options;
@@ -3496,6 +3500,7 @@ void KernelMonitor::ScanMapperRemnants()
         return;
     }
     MapperScans.fetch_add(1);
+    ClearEmittedKey(L"scan_failed:mapper");
 
     for (const MapperUnloadedRecord& record : result.Unloaded)
     {
@@ -3561,6 +3566,7 @@ void KernelMonitor::ScanPoolMappedImages()
             L"LoadKernelModules failed or empty");
         return;
     }
+    ClearEmittedKey(L"scan_failed:pool_pe:inventory");
 
     PoolPeHunter hunter(*device);
     PoolPeHunter::Options options;
@@ -3579,6 +3585,7 @@ void KernelMonitor::ScanPoolMappedImages()
         return;
     }
     PoolPeScans.fetch_add(1);
+    ClearEmittedKey(L"scan_failed:pool_pe");
 
     for (const PoolPeHit& hit : result.Hits)
     {
@@ -3643,6 +3650,7 @@ void KernelMonitor::ScanUnbackedDriverObjects()
             L"LoadKernelModules failed or empty");
         return;
     }
+    ClearEmittedKey(L"scan_failed:drvobj:inventory");
 
     IntegrityScanner scanner(*device, *symbols);
     DriverIntegrityOptions options;
@@ -3658,6 +3666,7 @@ void KernelMonitor::ScanUnbackedDriverObjects()
             error.empty() ? L"Scan returned false" : error);
         return;
     }
+    ClearEmittedKey(L"scan_failed:drvobj");
 
     for (const DriverIntegrityRecord& record : result.Records)
     {
@@ -3720,6 +3729,7 @@ void KernelMonitor::ScanOrphanMappedPages()
             L"LoadKernelModules failed or empty");
         return;
     }
+    ClearEmittedKey(L"scan_failed:kpage:inventory");
 
     OrphanKernelPageScanner scanner(*device, *symbols);
     OrphanKernelPageOptions options;
@@ -3741,6 +3751,7 @@ void KernelMonitor::ScanOrphanMappedPages()
         return;
     }
     KpageScans.fetch_add(1);
+    ClearEmittedKey(L"scan_failed:kpage");
 
     for (const OrphanKernelPageRegion& region : result.Regions)
     {
@@ -3798,6 +3809,7 @@ void KernelMonitor::ScanHookCallbacks()
             L"LoadKernelModules failed or empty");
         return;
     }
+    ClearEmittedKey(L"scan_failed:callbacks:inventory");
 
     KernelCallbackScanner scanner(*device, *symbols);
     KernelCallbackScanResult result = {};
@@ -3814,6 +3826,7 @@ void KernelMonitor::ScanHookCallbacks()
         return;
     }
     HookScans.fetch_add(1);
+    ClearEmittedKey(L"scan_failed:callbacks");
 
     for (const KernelCallbackRecord& record : result.Records)
     {
@@ -3862,6 +3875,7 @@ void KernelMonitor::ScanHookInput()
             L"LoadKernelModules failed or empty");
         return;
     }
+    ClearEmittedKey(L"scan_failed:input:inventory");
 
     InputStackScanner scanner(*device, *symbols);
     InputStackScanResult result = {};
@@ -3877,6 +3891,7 @@ void KernelMonitor::ScanHookInput()
             error.empty() ? L"Scan returned false" : error);
         return;
     }
+    ClearEmittedKey(L"scan_failed:input");
 
     for (const InputStackRecord& record : result.Records)
     {
@@ -3932,6 +3947,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         return;
     }
     CpuHookScans.fetch_add(1);
+    ClearEmittedKey(L"scan_failed:cpu:inventory");
 
     {
         SsdtScanner scanner(*device, *symbols);
@@ -3939,6 +3955,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(&result, &error))
         {
+            ClearEmittedKey(L"scan_failed:ssdt");
             uint32_t emitted = 0;
             for (const SsdtTable& table : result.Tables)
             {
@@ -3988,6 +4005,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         std::wstring error;
         if (scanner.Scan(&result, &error))
         {
+            ClearEmittedKey(L"scan_failed:idt");
             uint32_t emitted = 0;
             for (const IdtEntry& entry : result.Entries)
             {
@@ -4510,8 +4528,7 @@ void KernelMonitor::ScanUserModeHostility()
     }
     else
     {
-        std::lock_guard<std::mutex> watchLock(WatchMutex);
-        EmittedMapperKeys.erase(L"scan_failed:userhostility");
+        ClearEmittedKey(L"scan_failed:userhostility");
     }
 
     auto highEnd = std::stable_partition(
@@ -4731,7 +4748,7 @@ void KernelMonitor::ScanUserModeHostility()
 
                 std::wstring mappedPath;
                 bool mappedQueryOk = false;
-                if (hasQueryInfo && hasVmRead && processHandle != nullptr)
+                if (hasVmRead && processHandle != nullptr)
                 {
                     mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath);
                 }
@@ -4784,8 +4801,7 @@ void KernelMonitor::ScanUserModeHostility()
                             pid);
                     }
                 }
-                else if (hasQueryInfo &&
-                    hasVmRead &&
+                else if (hasVmRead &&
                     committed &&
                     mbi.Type == MEM_IMAGE &&
                     !mappedQueryOk)
