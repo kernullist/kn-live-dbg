@@ -89,7 +89,8 @@ kn-live-dbg/
 48. Captures Filter Manager volume and instance attachment state in every `!snapshot` through the documented `FltLib` enumeration APIs. Each bounded, strictly parsed record preserves filter, instance, altitude, volume, frame, filesystem, supported-feature, and raw attachment flags, including `FLTFL_IASIM_DETACHED_VOLUME`; failed or partial enumeration leaves explicit incomplete coverage instead of a clean result. Same-boot `!diff` promotes a stable attachment's attached-to-detached transition. It also reports a missing attachment only when attachment and callback coverage are complete, the same volume remains enumerated, and the same minifilter remains registered in the independent kernel callback view. A clean attachment for the same filter, volume, and altitude suppresses the removal signal even when the instance name changes; when altitude is unavailable, the instance name is the fallback discriminator. A different-altitude decoy attachment no longer masks removal. Static detached state, cross-boot comparison, filter unload, volume removal, and incomplete coverage remain non-findings. Imported snapshot JSON must keep attachment/volume/detached counters, coverage state, record tags, and evidence mutually consistent before removal logic can use it. The bundled no-op minifilter fixture and `tools\run-minifilter-detach-e2e.ps1` exercise the supported attach/detach/reattach path and independently validate the raw snapshots plus positive and recovery diffs. This closes the documented Filter Manager view of ABYSSWORKER-style detach behavior; it does not claim full arbitrary device-stack topology or causal attribution.
 49. Quiet kernel surfaces (Phase 2): `!hal` checks PDB-described HalDispatchTable pointer fields; `!hive` walks PDB-described registry hive GetCellRoutine ownership with list-link validation; `!token` inspects process privilege Present/Enabled masks plus TokenType/SessionId/integrity SID and propagates incomplete coverage into `!hunt`; `!etw providers` emits unclassified heuristic diagnostics while `!etw ti-cross` treats silence alone as inconclusive; `!dpc` / `!timer` require PDB-bounded deferred-execution layouts, and `!workitem` explicitly remains incomplete. Snapshot domains include `hal`, `hive`, `dpc-timer`, and token fingerprints under `process-security`.
 50. P0-P2 investigation scanners (no driver ABI change): `!drvobj` / `!devstack` walk DRIVER_OBJECT device stacks; `!module integrity` adds `/disk` `/iat` `/prologue`; `!handles` triages VM/DUP cross-process handles; `!hiddenproc` cross-views ActiveProcessLinks vs SPI vs Toolhelp vs handle owners; `!wdfilter` lists WdFilter RuntimeDriver leftovers; `!inputstack` flags unknown kbd/mou attached drivers; `!vad` annotates ControlArea/FILE_OBJECT section names; `!dma` reports IOMMU firmware and Kernel DMA Protection; `!hv` reports hypervisor presence without `IA32_FEATURE_CONTROL`; `dump-analyze` walks dump DTB with PML4 or PML5; `!byovd` Authenticode is on by default (`/no-sign` skips it).
-51. Optional LAN remote operator session: PC A runs `remote on` (default `0.0.0.0:51767`, session password 5-128 printable ASCII, process-managed firewall rule `knlivedbg-remote`); PC B runs `KnLiveDbg.exe --connect <ipv4>:51767` as a thin `knkd>` with the same Tab tables as the local TUI. Command output uses the same console colors as A; if B's stdout is a pipe or file, VT sequences are stripped. Engine, driver, symbols, and dumps stay on A. This is not `kdinit /remote`. See `docs/REMOTE_SETUP.md`.
+51. `!kmon` (bare command or `!kmon start`) arms silent TI plus kernel live callbacks and stays on a live tail of unknown kernel drops/maps/hidden processes. A driver filename is not required. Default output is not a TI firehose: it prints `driver.drop_load` (non-`System32\\drivers`, including Program Files anti-cheat), `driver.short_lived`, `driver.mapped_residue`, and `process.hidden`. Inbox `System32\\drivers` loads stay off unless `/verbose`. `/name game.exe` adds `inject.remote`. `/background` arms without occupying the prompt. Esc/q detaches; `!kmon` again reattaches. Kernel `MmCopyVirtualMemory` remains `gap.kernel_rw`.
+52. Optional LAN remote operator session: PC A runs `remote on` (default `0.0.0.0:51767`, session password 5-128 printable ASCII, process-managed firewall rule `knlivedbg-remote`); PC B runs `KnLiveDbg.exe --connect <ipv4>:51767` as a thin `knkd>` with the same Tab tables as the local TUI. Command output uses the same console colors as A; if B's stdout is a pipe or file, VT sequences are stripped. Engine, driver, symbols, and dumps stay on A. This is not `kdinit /remote`. See `docs/REMOTE_SETUP.md`.
 
 ## Design Notes
 
@@ -359,6 +360,8 @@ dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]
 set-ppl-antimalware [on|off|status]
 !ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]
 !ti stop | status | watch | recent [N] | stats | by pid <PID> | by task <name> | grep <pattern> | save <path> | clear | add /pid|/name <v> | remove /pid|/name <v>
+!kmon [start] [/name <image>] [/verbose] [/background] [/log <dir>]
+!kmon stop | status | watch | recent [N] | save <path> | clear | add /pid|/name|/driver <v> | remove /pid|/name|/driver <v>
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 ai <goal> [/verbose]
 ai chat <goal> [/verbose]
@@ -1860,7 +1863,7 @@ Default behaviour is **silent forensic mode**: the in-memory ring (1M events, ~2
 
 Architecture:
 
-1. The subscriber creates an own ETW session via `StartTraceW` and enables the TI provider with `EnableTraceEx2(EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, 0xFFFFFFFFFFFFFFFF)` so every task ID surfaces.
+1. The subscriber creates an own ETW session via `StartTraceW` and enables the TI provider with `EnableTraceEx2(EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, MatchAnyKeyword=0)` so every task ID surfaces, including keyword-0 `AllocVM` events. Do not use `~0` / `0xFFFFFFFFFFFFFFFF` here: that mask skips keyword-0 tasks.
 2. A worker thread runs `ProcessTrace` and receives events through `EventRecordCallback`. Per-PID image resolution is cached (16K-entry bounded) so the hot path does not churn `OpenProcess`/`QueryFullProcessImageNameW`.
 3. Each event is decoded via TDH (`TdhGetEventInformation` + `TdhGetProperty`) with array indexing and struct-property guarding. Properties TDH cannot decode fall back to a raw-hex prefix in the JSONL `raw` field.
 4. Events are pushed into the ring buffer (oldest-evicted-first when full) and written to the JSONL log. The log rotates by file size with index wrap and oldest-file deletion -- it never grows past `LogRotateBytes * LogRotateCount` on disk.
@@ -2192,6 +2195,26 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 - **`/name not.exe` does not match `notepad.exe`**: name matching is exact basename, not substring. Use `!ti grep not` for substring search over the ring.
 - **`!ti watch` with no filter floods the TUI**: empty watch set means "match everything", so on a busy system the throttle (50/s by default) is constantly engaged and the `[ti.throttle] suppressed N events` banner dominates. Add `/pid` or `/name` filters before watching, or raise the throttle with `/throttle`.
 - **Forgot `!ti stop`?** The subscriber's destructor calls Stop on normal exit (`exit`, Ctrl+C), and the console control handler calls Stop on hard exit (window close, logoff, shutdown). A clean teardown happens in every path except `TerminateProcess`. After a TerminateProcess, recover with `logman stop KnLiveDbg-Ti -ets`.
+
+## Kernel-cheat monitor (`!kmon`)
+
+`!kmon` is a session on top of `!ti` and `!timeline live`. It does not open a second TI provider. The cheat `.sys` name is not an input. Bare `!kmon` arms collectors and stays on the live tail.
+
+```text
+knkd> write on
+knkd> !kmon
+```
+
+Esc/q returns to `knkd>`; collection keeps running. `!kmon` again reattaches. `!kmon watch` is only a reattach alias. `/background` arms without occupying the prompt.
+
+Default output is not every normal action and not the TI firehose:
+
+- Shown: `driver.drop_load` (Temp/Users/Program Files/volume-root `.sys`), `driver.short_lived` (load then unload within 30s), `driver.mapped_residue` (MmUnloadedDrivers / PiDDB / ci-hash, sampled ~8s), `process.hidden` (sampled ~5s), `gap.kernel_rw` once.
+- Hidden: inbox `System32\drivers` loads, process create, local AllocVM, kernel `MmCopyVirtualMemory` / `DeviceIoControl`.
+- A quiet idle host is mostly silent after the start line. Game launch can print a handful of Program Files anti-cheat drivers (EAC/BE/Vanguard); that is expected.
+- `/name game.exe` adds `inject.remote` (overlays/AC can be noisy). `/driver` is highlight-only and never hides unknown names. `/verbose` also keeps inbox driver loads.
+
+`!kmon stop` leaves TI and timeline live running.
 
 ## Positive-Control Probe
 

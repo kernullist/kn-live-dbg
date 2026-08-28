@@ -180,6 +180,18 @@ public:
         uint64_t* eprocessAddress,
         std::wstring* error);
 
+    // Enables EPROCESS VM/suspend logging flags used by ETW-TI
+    // (PsIsProcessLoggingEnabled). Requires write mode. loggingFlags is a
+    // KNDBG_PROCESS_LOG_* mask; 0 means KNDBG_PROCESS_LOG_DEFAULT.
+    bool SetProcessLogging(
+        uint32_t processId,
+        uint32_t loggingFlags,
+        uint32_t* appliedFlags,
+        uint32_t* informationClassUsed,
+        uint32_t* ntStatus,
+        uint64_t* eprocessAddress,
+        std::wstring* error);
+
     // Reads one architectural MSR (must be a KNDBG_MSR_* whitelist value) on
     // the requested logical processor. Read-only; does not require write mode.
     // On success, value receives the MSR value and actualProcessor (optional)

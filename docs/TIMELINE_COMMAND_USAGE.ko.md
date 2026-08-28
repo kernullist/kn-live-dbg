@@ -81,6 +81,11 @@ TI ring 자체를 지우려면 `!ti clear`를 별도로 사용한다.
 command-line JSONL export도 주요 표면에서 숨긴다. 분석가 주도 export는 dashboard
 버튼을 사용하고, script에서는 advanced `!timeline export`를 사용한다.
 
+드라이버 파일명을 모르는 게임 핵 커널 드랍/맵/은닉은 `!timeline` 파이어호스 대신
+`!kmon`을 쓴다. `write on` 다음 `!kmon`이면 TI + live collector를 켜고 non-inbox
+드랍, 짧은 생존, mapper 잔여, 은닉 프로세스만 테일한다. Esc는 프롬프트만 돌리고
+수집은 유지한다. `!timeline`은 증거 그래프/대시보드용으로 남는다.
+
 ## Scenario: 빠른 triage
 
 ```text

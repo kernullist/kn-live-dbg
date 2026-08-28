@@ -689,6 +689,34 @@ namespace
         { L"help", nullptr, L"show !wnf usage" },
     };
 
+    const CompletionHint kKmonRootTokens[] =
+    {
+        { L"start", L"!kmon start [/name] [/verbose] [/background]", L"arm TI+live and stay on the tail (filename not required)" },
+        { L"stop", L"!kmon stop", L"stop derived logging; leaves TI/live running" },
+        { L"status", L"!kmon status", L"session counters and watch set" },
+        { L"add", L"!kmon add /pid|/name|/driver <v>", L"extend inject.remote or highlight set" },
+        { L"remove", L"!kmon remove /pid|/name|/driver <v>", L"drop a watch target" },
+        { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
+        { L"recent", L"!kmon recent [N]", L"print last N derived events" },
+        { L"save", L"!kmon save <path>", L"export derived ring as JSONL" },
+        { L"clear", L"!kmon clear", L"empty the derived ring" },
+        { L"help", nullptr, L"show !kmon usage" },
+    };
+
+    const CompletionHint kKmonOptTokens[] =
+    {
+        { L"/pid", L"/pid <PID>", L"optional; add inject.remote for this PID" },
+        { L"/name", L"/name <image>", L"optional; add inject.remote for this image" },
+        { L"/driver", L"/driver <sys>", L"highlight only; does not hide unknown drop names" },
+        { L"/verbose", L"/verbose", L"also keep inbox System32\\drivers loads" },
+        { L"/all-drivers", L"/all-drivers", L"alias for /verbose" },
+        { L"/background", L"/background", L"arm only; do not occupy the prompt" },
+        { L"/nowatch", L"/nowatch", L"alias for /background" },
+        { L"/throttle", L"/throttle <N>", L"max TUI events per second" },
+        { L"/log", L"/log <dir>", L"derived JSONL directory" },
+        { L"help", nullptr, L"show !kmon option usage" },
+    };
+
     const CompletionHint kTiRootTokens[] =
     {
         { L"start", L"!ti start [/pid] [/name] [/throttle] [/ring] [/log]", L"subscribe to TI ETW (needs PPL Antimalware)" },
@@ -966,6 +994,7 @@ namespace
         { L"!wnf", L"ai explain|analyze !wnf", L"WNF state names" },
         { L"!handles", L"ai explain|analyze !handles", L"process handle VM/DUP triage" },
         { L"!hiddenproc", L"ai explain|analyze !hiddenproc", L"hidden process cross-view" },
+        { L"!kmon", L"ai explain|analyze !kmon", L"unknown kernel drop/map/hidden tail" },
         { L"!wdfilter", L"ai explain|analyze !wdfilter", L"WdFilter RuntimeDriver leftovers" },
         { L"!inputstack", L"ai explain|analyze !inputstack", L"kbd/mou attached-device stacks" },
         { L"!dma", L"ai explain|analyze !dma", L"IOMMU and Kernel DMA Protection" },
@@ -1448,6 +1477,12 @@ namespace
         SCOPE(L"", L"!wnf [decode|instances|instance|data|candidates|lists]", L"WNF state names and live instances", kWnfTokens),
     };
 
+    const CompletionScopeTable kKmonScopes[] =
+    {
+        SCOPE(L"", L"!kmon [start] | stop | status | recent | save", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
+        SCOPE(L"opts", L"!kmon [/name] [/verbose] [/background] [/driver] [/pid] [/log]", L"kmon start options", kKmonOptTokens),
+    };
+
     const CompletionScopeTable kTiScopes[] =
     {
         SCOPE(L"", L"!ti start|stop|status|watch|recent|stats|by|grep|save|clear", L"Microsoft-Windows-Threat-Intelligence ETW", kTiRootTokens),
@@ -1793,6 +1828,7 @@ namespace
         CMD(L"!minifilter", kMinifilterScopes),
         CMD(L"!wnf", kWnfScopes),
         CMD(L"!ti", kTiScopes),
+        CMD(L"!kmon", kKmonScopes),
         CMD(L"!timeline", kTimelineScopes),
         CMD(L"ai", kAiScopes),
     };
@@ -1864,6 +1900,13 @@ namespace
             else if (!first.empty() && first != L"help")
             {
                 // watch/recent/stats/grep/save/clear also complete /pid /name /...
+                scope = L"opts";
+            }
+        }
+        else if (command == L"!kmon")
+        {
+            if (!first.empty() && first != L"help")
+            {
                 scope = L"opts";
             }
         }

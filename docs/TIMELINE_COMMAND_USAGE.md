@@ -88,6 +88,11 @@ Command-line JSONL export is also kept out of the main surface. Use the
 dashboard export button for analyst-driven export, or advanced `!timeline export`
 for scripts.
 
+For unknown kernel cheat drops (no driver filename), use `!kmon` instead of
+staring at the TI firehose. Bare `!kmon` arms the same TI + live collectors and
+tails only non-inbox drops, short-lived loads, mapper leftovers, and hidden
+processes. `!timeline` remains the evidence graph/dashboard.
+
 ## Scenario: Fast Triage
 
 ```text

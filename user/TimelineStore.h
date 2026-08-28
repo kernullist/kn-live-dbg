@@ -46,6 +46,11 @@ public:
 
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
     std::vector<TimelineEvent> AllEvents() const;
+    // Chronological events with EventId > minExclusive. maxCount 0 = unlimited.
+    std::vector<TimelineEvent> RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const;
+    // Cheap cursor helper for live consumers. Clear() resets this to 1, so a
+    // stale minExclusive would otherwise skip every new event forever.
+    uint64_t PeekNextEventId() const;
     TimelineGraphResult BuildGraph(const TimelineGraphQueryOptions& options) const;
     TimelineReconcileResult ReconcileSnapshot(
         const SnapshotDocument& document,

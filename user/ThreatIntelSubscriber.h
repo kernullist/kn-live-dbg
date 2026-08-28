@@ -61,6 +61,7 @@ struct TiSubscriberStats
     uint64_t EventsLogged = 0;
     uint64_t LogBytesWritten = 0;
     uint32_t LogRotations = 0;
+    uint64_t EventsLost = 0;          // ETW session lost-event counter
     uint64_t MatchAnyKeyword = 0;
     uint64_t MatchAllKeyword = 0;
     uint64_t StartTickMs = 0;          // GetTickCount64 at Start
@@ -79,6 +80,7 @@ struct TiSubscriberStatsAtomic
     std::atomic<uint64_t> EventsLogged{0};
     std::atomic<uint64_t> LogBytesWritten{0};
     std::atomic<uint32_t> LogRotations{0};
+    std::atomic<uint64_t> EventsLost{0};
     std::atomic<uint64_t> StartTickMs{0};
     std::atomic<uint64_t> LastEventTickMs{0};
 };
@@ -225,7 +227,16 @@ private:
     int LogActiveRotation = 0;
 
     // PID -> image path cache to avoid OpenProcess on every ETW event.
+    struct ImageCacheEntry
+    {
+        std::wstring Path;
+        uint64_t TickMs = 0;
+        bool Failed = false;
+    };
     mutable std::mutex ImageCacheMutex;
-    std::unordered_map<uint32_t, std::wstring> ImageCache;
+    std::unordered_map<uint32_t, ImageCacheEntry> ImageCache;
     std::wstring GetCachedImageOrResolve(uint32_t pid);
+    static bool PayloadBasenameMatchesWatch(
+        const TiEventRecord& record,
+        const std::vector<std::wstring>& watchNamesLower);
 };
