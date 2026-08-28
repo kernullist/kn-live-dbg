@@ -43,6 +43,8 @@ namespace
     {
         uint64_t StartAddress = 0;
         uint64_t EndAddress = 0;
+        bool EffectiveProtectionComplete = false;
+        bool EffectiveExecutable = false;
     };
 
     struct PteLeafMapping
@@ -1039,12 +1041,19 @@ namespace
             left.Notes == right.Notes;
     }
 
+    bool SameVadIntervalShape(const VadInterval& left, const VadInterval& right)
+    {
+        return left.EffectiveProtectionComplete == right.EffectiveProtectionComplete &&
+            left.EffectiveExecutable == right.EffectiveExecutable;
+    }
+
     void AppendHiddenPteRecord(
         const ProcessVadScanOptions& options,
         const PteLeafMapping& mapping,
         uint64_t startAddress,
         uint64_t endAddress,
-        ProcessVadScanResult* result)
+        ProcessVadScanResult* result,
+        const wchar_t* notes = nullptr)
     {
         do
         {
@@ -1090,7 +1099,9 @@ namespace
             record.Executable = mapping.Executable;
             record.UserAccessible = mapping.UserAccessible;
             record.LargePage = mapping.LargePage;
-            record.Notes = L"present_pte_without_vad";
+            record.Notes = (notes != nullptr && notes[0] != L'\0')
+                ? notes
+                : L"present_pte_without_vad";
 
             if (!result->HiddenPteRecords.empty())
             {
@@ -1160,13 +1171,40 @@ namespace
                    vadIntervals[index].StartAddress <= mapping.EndAddress)
             {
                 const VadInterval& interval = vadIntervals[index];
+                if (mapping.Executable &&
+                    interval.EffectiveProtectionComplete &&
+                    !interval.EffectiveExecutable)
+                {
+                    const uint64_t overlapStart =
+                        (mapping.StartAddress > interval.StartAddress)
+                            ? mapping.StartAddress
+                            : interval.StartAddress;
+                    const uint64_t overlapEnd =
+                        (mapping.EndAddress < interval.EndAddress)
+                            ? mapping.EndAddress
+                            : interval.EndAddress;
+                    if (overlapStart <= overlapEnd)
+                    {
+                        AppendHiddenPteRecord(
+                            options,
+                            mapping,
+                            overlapStart,
+                            overlapEnd,
+                            result,
+                            L"pte_exec_vad_rw");
+                        if (result->HiddenPteTruncated)
+                        {
+                            break;
+                        }
+                    }
+                }
                 if (interval.StartAddress > uncoveredStart)
                 {
                     AppendHiddenPteRecord(
                         options,
                         mapping,
                         uncoveredStart,
-                        std::min(mapping.EndAddress, interval.StartAddress - 1ull),
+                        (std::min)(mapping.EndAddress, interval.StartAddress - 1ull),
                         result);
                     if (result->HiddenPteTruncated)
                     {
@@ -1503,6 +1541,7 @@ namespace
                 }
 
                 bool touchesPrevious = !merged.empty() &&
+                    SameVadIntervalShape(merged.back(), interval) &&
                     (merged.back().EndAddress == std::numeric_limits<uint64_t>::max() ||
                      interval.StartAddress <= merged.back().EndAddress + 1ull);
                 if (touchesPrevious)
@@ -4132,10 +4171,41 @@ bool ProcessTriageVadFilterSelfTest()
     ApplyHiddenPteOutputLimit(
         hiddenOptions,
         &hiddenResult);
-    return hiddenResult.HiddenPteRanges == 2 &&
-        hiddenResult.HiddenPteRecords.size() == 1 &&
-        !hiddenResult.HiddenPteTruncated &&
-        hiddenResult.Truncated;
+    if (hiddenResult.HiddenPteRanges != 2 ||
+        hiddenResult.HiddenPteRecords.size() != 1 ||
+        hiddenResult.HiddenPteTruncated ||
+        !hiddenResult.Truncated)
+    {
+        return false;
+    }
+
+    ProcessVadScanOptions mismatchOptions = {};
+    mismatchOptions.HiddenPteExecutableOnly = true;
+    ProcessVadScanResult mismatchResult = {};
+    std::vector<VadInterval> rwIntervals;
+    VadInterval rwVad = {};
+    rwVad.StartAddress = 0x10000;
+    rwVad.EndAddress = 0x11fff;
+    rwVad.EffectiveProtectionComplete = true;
+    rwVad.EffectiveExecutable = false;
+    rwIntervals.push_back(rwVad);
+    PteLeafMapping execPte = {};
+    execPte.StartAddress = 0x10000;
+    execPte.EndAddress = 0x10fff;
+    execPte.PageSize = kPageSize;
+    execPte.Executable = true;
+    execPte.UserAccessible = true;
+    size_t mismatchCursor = 0;
+    ReportHiddenPteGaps(
+        mismatchOptions,
+        rwIntervals,
+        execPte,
+        &mismatchCursor,
+        &mismatchResult);
+    return mismatchResult.HiddenPteRecords.size() == 1 &&
+        mismatchResult.HiddenPteRecords[0].Notes == L"pte_exec_vad_rw" &&
+        mismatchResult.HiddenPteRecords[0].StartAddress == 0x10000 &&
+        mismatchResult.HiddenPteRecords[0].EndAddress == 0x10fff;
 }
 
 bool ProcessTriageMappedPeSelfTest()
@@ -4483,8 +4553,12 @@ bool ProcessTriageScanner::ScanVad(
                     result->EffectiveProtectionCoverageComplete =
                         false;
                 }
-                vadIntervals.push_back(
-                    {record.StartAddress, record.EndAddress});
+                VadInterval interval = {};
+                interval.StartAddress = record.StartAddress;
+                interval.EndAddress = record.EndAddress;
+                interval.EffectiveProtectionComplete = record.EffectiveProtectionComplete;
+                interval.EffectiveExecutable = record.EffectiveExecutableBytes > 0;
+                vadIntervals.push_back(interval);
 
                 if (record.Executable)
                 {

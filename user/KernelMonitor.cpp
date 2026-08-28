@@ -1534,9 +1534,9 @@ namespace
             // Watched games that already have a usermode walk skip this; the
             // extra RPM per private VAD stalls TI ingest.
             options.ProbePe = probePe;
-            // Full user page-table walks are expensive. Only watched game
-            // targets get hidden-PTE coverage; builtin PPL hosts stay on
-            // VAD + PE probe.
+            // Full user page-table walks are expensive. Hidden PTEs follow
+            // the caller's kernel-VAD gate (watched games, or builtin/PPL
+            // hosts whose usermode walks already failed).
             options.ScanHiddenPtes = scanHiddenPtes;
             options.HiddenPteExecutableOnly = scanHiddenPtes;
             options.HiddenPteLimit = scanHiddenPtes ? 32u : 0u;
@@ -1625,10 +1625,6 @@ namespace
             }
             uint64_t value = 0;
             std::memcpy(&value, bytes.data(), sizeof(value));
-            if (value == 0)
-            {
-                break;
-            }
             *callback = value;
             ok = true;
         } while (false);
@@ -4541,6 +4537,22 @@ void KernelMonitor::ScanHookCallbacks()
     }
     HookScans.fetch_add(1);
     ClearEmittedKey(L"scan_failed:callbacks");
+    if (result.Incomplete)
+    {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:callbacks:coverage",
+            std::wstring(),
+            L"callback",
+            L"callback walk was incomplete; extra unbacked callbacks may be missed",
+            result.Warnings.empty()
+                ? L"Incomplete is true"
+                : result.Warnings.front());
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:callbacks:coverage");
+    }
 
     for (const KernelCallbackRecord& record : result.Records)
     {
@@ -4680,6 +4692,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         {
             ClearEmittedKey(L"scan_failed:ssdt");
             uint32_t emitted = 0;
+            uint32_t suspicious = 0;
             for (const SsdtTable& table : result.Tables)
             {
                 for (const SsdtEntry& entry : table.Entries)
@@ -4688,9 +4701,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     {
                         continue;
                     }
+                    ++suspicious;
                     if (emitted >= 16)
                     {
-                        break;
+                        continue;
                     }
                     EmitUnique(
                         L"hook.unbacked",
@@ -4702,6 +4716,20 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                         entry.Notes);
                     ++emitted;
                 }
+            }
+            if (suspicious > 16)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:ssdt:truncated",
+                    std::wstring(),
+                    L"ssdt",
+                    L"SSDT scan hit the emit cap; extra hooked slots may be missed",
+                    L"suspicious=" + std::to_wstring(suspicious));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:ssdt:truncated");
             }
         }
         else
@@ -4861,6 +4889,20 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(options, &result, &error))
         {
             ClearEmittedKey(L"scan_failed:hal");
+            if (!result.CoverageComplete)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:hal:coverage",
+                    std::wstring(),
+                    L"hal",
+                    L"HAL dispatch walk was incomplete; extra unbacked slots may be missed",
+                    L"CoverageComplete is false");
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:hal:coverage");
+            }
             for (const HalDispatchTable& table : result.Tables)
             {
                 for (const HalDispatchSlot& slot : table.Slots)
@@ -5126,6 +5168,20 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:minifilter");
+            if (!result.CoverageComplete)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:minifilter:coverage",
+                    std::wstring(),
+                    L"minifilter",
+                    L"minifilter walk was incomplete; extra unbacked filters may be missed",
+                    L"CoverageComplete is false");
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:minifilter:coverage");
+            }
             for (const MinifilterFilterRecord& filter : result.Filters)
             {
                 if (filter.WellKnownInbox)
@@ -5576,7 +5632,8 @@ void KernelMonitor::ScanUserModeHostility()
             // VirtualQueryEx can succeed while Toolhelp module enumeration
             // fails (ObCallback / PPL). The usermode orphan walk needs a
             // module list, so those targets still need kernel private-VAD
-            // PE probes. Hidden PTEs are always collected for watches.
+            // PE probes. Hidden PTEs follow the same kernel-VAD gate so PPL
+            // builtin hosts are covered when usermode walks cannot run.
             const bool needKernelPrivateImplants =
                 (watched || builtin) &&
                 (!queried || !moduleInventoryComplete);
@@ -5589,7 +5646,7 @@ void KernelMonitor::ScanUserModeHostility()
                     pid,
                     &kernelVad,
                     &kernelVadScanned,
-                    watched,
+                    wantKernelVad,
                     needKernelPrivateImplants);
             const std::wstring vadFailKey =
                 L"scan_failed:userhostility:vad:" + std::to_wstring(pid);
@@ -6322,14 +6379,22 @@ void KernelMonitor::ScanUserModeHostility()
                     {
                         continue;
                     }
+                    const bool vadRwPte =
+                        pte.Notes.find(L"pte_exec_vad_rw") != std::wstring::npos;
+                    const wchar_t* layer = vadRwPte
+                        ? L"pte_exec_vad_rw"
+                        : L"hidden_exec_pte";
                     EmitUnique(
                         L"process.implant",
-                        L"hidden_exec_pte:" + std::to_wstring(pid) + L":" +
+                        std::wstring(layer) + L":" + std::to_wstring(pid) + L":" +
                             HexU64(pte.StartAddress),
                         imagePath,
-                        L"hidden_exec_pte",
-                        L"executable PTE is not covered by a VAD pid=" +
-                            std::to_wstring(pid) + L" " + leaf,
+                        layer,
+                        vadRwPte
+                            ? (L"executable PTE is under a non-executable VAD pid=" +
+                                std::to_wstring(pid) + L" " + leaf)
+                            : (L"executable PTE is not covered by a VAD pid=" +
+                                std::to_wstring(pid) + L" " + leaf),
                         L"base=" + HexU64(pte.StartAddress) +
                             L" size=" + std::to_wstring(
                                 static_cast<unsigned long long>(pte.Size)),
@@ -6341,56 +6406,73 @@ void KernelMonitor::ScanUserModeHostility()
             if (watched || builtin)
             {
                 uint64_t ic = 0;
-                if (QueryInstrumentationCallback(device, symbols, pid, &ic) &&
-                    ic != 0)
+                const std::wstring icFailKey =
+                    L"scan_failed:instrumentation:" + std::to_wstring(pid);
+                if (!QueryInstrumentationCallback(device, symbols, pid, &ic))
                 {
-                    bool haveOwnershipView = false;
-                    bool owned = true;
-                    const bool kernelIc = !IsUserModeImageBase(ic);
-                    if (kernelIc)
+                    EmitUnique(
+                        L"hook.unbacked",
+                        icFailKey,
+                        imagePath,
+                        L"instrumentation_callback",
+                        L"InstrumentationCallback query failed for pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"KPROCESS field read failed",
+                        pid);
+                }
+                else
+                {
+                    ClearEmittedKeyForPid(icFailKey, pid);
+                    if (ic != 0)
                     {
-                        haveOwnershipView = true;
-                        owned = false;
-                    }
-                    else if (moduleInventoryComplete && !moduleRanges.empty())
-                    {
-                        haveOwnershipView = true;
-                        owned = AddressInModuleRanges(ic, moduleRanges);
-                    }
-                    else if (hasKernelVadScan && !kernelVad.Records.empty())
-                    {
-                        haveOwnershipView = true;
-                        owned = false;
-                        bool covered = false;
-                        for (const ProcessVadRecord& record : kernelVad.Records)
+                        bool haveOwnershipView = false;
+                        bool owned = true;
+                        const bool kernelIc = !IsUserModeImageBase(ic);
+                        if (kernelIc)
                         {
-                            if (!VadCoversUserAddress(record, ic))
-                            {
-                                continue;
-                            }
-                            covered = true;
-                            owned = !(record.HasPrivateMemory && record.PrivateMemory);
-                            break;
-                        }
-                        if (!covered)
-                        {
+                            haveOwnershipView = true;
                             owned = false;
                         }
-                    }
-                    if (haveOwnershipView && !owned)
-                    {
-                        EmitUnique(
-                            L"hook.unbacked",
-                            L"instrumentation:" + std::to_wstring(pid),
-                            imagePath,
-                            L"instrumentation_callback",
-                            kernelIc
-                                ? (L"InstrumentationCallback is a kernel address pid=" +
-                                    std::to_wstring(pid) + L" " + leaf)
-                                : (L"InstrumentationCallback is outside loaded modules pid=" +
-                                    std::to_wstring(pid) + L" " + leaf),
-                            L"callback=" + HexU64(ic),
-                            pid);
+                        else if (moduleInventoryComplete && !moduleRanges.empty())
+                        {
+                            haveOwnershipView = true;
+                            owned = AddressInModuleRanges(ic, moduleRanges);
+                        }
+                        else if (hasKernelVadScan && !kernelVad.Records.empty())
+                        {
+                            haveOwnershipView = true;
+                            owned = false;
+                            bool covered = false;
+                            for (const ProcessVadRecord& record : kernelVad.Records)
+                            {
+                                if (!VadCoversUserAddress(record, ic))
+                                {
+                                    continue;
+                                }
+                                covered = true;
+                                owned = !(record.HasPrivateMemory && record.PrivateMemory);
+                                break;
+                            }
+                            if (!covered)
+                            {
+                                owned = false;
+                            }
+                        }
+                        if (haveOwnershipView && !owned)
+                        {
+                            EmitUnique(
+                                L"hook.unbacked",
+                                L"instrumentation:" + std::to_wstring(pid),
+                                imagePath,
+                                L"instrumentation_callback",
+                                kernelIc
+                                    ? (L"InstrumentationCallback is a kernel address pid=" +
+                                        std::to_wstring(pid) + L" " + leaf)
+                                    : (L"InstrumentationCallback is outside loaded modules pid=" +
+                                        std::to_wstring(pid) + L" " + leaf),
+                                L"callback=" + HexU64(ic),
+                                pid);
+                        }
                     }
                 }
             }
