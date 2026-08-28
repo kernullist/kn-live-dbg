@@ -83,8 +83,15 @@ command-line JSONL export도 주요 표면에서 숨긴다. 분석가 주도 exp
 
 드라이버 파일명을 모르는 게임 핵 커널 드랍/맵/은닉은 `!timeline` 파이어호스 대신
 `!kmon`을 쓴다. `write on` 다음 `!kmon`이면 TI + live collector를 켜고 non-inbox
-드랍, 짧은 생존, mapper 잔여, 은닉 프로세스만 테일한다. Esc는 프롬프트만 돌리고
-수집은 유지한다. `!timeline`은 증거 그래프/대시보드용으로 남는다.
+드랍, 짧은 생존, 살아 있는 mapped payload(pool PE / unbacked DRIVER_OBJECT /
+kpage PE), unbacked 콜백/입력스택/SSDT 훅, mapper 잔여, 은닉 프로세스,
+Windows 이름 위장(`process.masquerade`), EXE 이미지 영역 바꿔치기
+(`process.hollow`: private/unbacked MEM_IMAGE, mapped-path, stamp/arch,
+builtin COW/.text vs disk, extra PE, ghosting), implant, builtin/drop
+`inject.remote`만 테일한다. `/name`은 게임 overlay inject를 추가한다.
+`/background`는 프롬프트를 점유하지 않고 수집만 켠다. `add`/`remove`는
+수집 중에만 된다. Esc는 프롬프트만 돌리고 수집은 유지한다. `!timeline`은
+증거 그래프/대시보드용으로 남는다. 랩 픽스처는 `docs/KMON_TEST_TARGET.md`.
 
 ## Scenario: 빠른 triage
 

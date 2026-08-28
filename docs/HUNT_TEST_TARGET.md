@@ -390,10 +390,10 @@ absence, backing-path accessibility, and live-vs-disk executable page mismatch.
 
 ## Known Fixture Gap
 
-The target does not currently include a main-image live-vs-disk mismatch or
-process-image replacement fixture. That scenario is intentionally left out
-because safely replacing or mutating the process main image without resembling
-an offensive hollowing/doppelganging sample needs a separate benign harness.
+The hunt target does not include a main-image live-vs-disk mismatch or
+process-image replacement fixture. That lab harness is `KnLiveDbgKmonTarget.exe`
+(`docs/KMON_TEST_TARGET.md`): it only mutates copies of itself, never injects
+into inbox `notepad.exe` / `svchost.exe`, and never resumes a replaced image.
 `!hunt` still emits `section_path_mismatch`, `section_backing_inaccessible`,
 `disk_live_image_mismatch`, and `process_doppelganging_evidence` when live
 system evidence supports those invariants. It also cross-checks the EPROCESS

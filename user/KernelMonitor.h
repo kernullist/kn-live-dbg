@@ -54,6 +54,11 @@ struct KmonStats
     uint64_t LiveIngested = 0;
     uint64_t HiddenScans = 0;
     uint64_t MapperScans = 0;
+    uint64_t PoolPeScans = 0;
+    uint64_t KpageScans = 0;
+    uint64_t HookScans = 0;
+    uint64_t CpuHookScans = 0;
+    uint64_t UserHostilityScans = 0;
     uint64_t LoggingEnabled = 0;
     uint64_t LoggingFailed = 0;
     uint64_t LogBytesWritten = 0;
@@ -107,10 +112,33 @@ private:
     void IngestLiveTimeline();
     void ScanHiddenProcesses();
     void ScanMapperRemnants();
+    void ScanPoolMappedImages();
+    void ScanUnbackedDriverObjects();
+    void ScanOrphanMappedPages();
+    void ScanHookCallbacks();
+    void ScanHookInput();
+    void ScanCpuIntegrityHooks();
+    void ScanUserModeHostility();
+    bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
+    void EmitUnique(
+        const std::wstring& kind,
+        const std::wstring& key,
+        const std::wstring& driver,
+        const std::wstring& layer,
+        const std::wstring& summary,
+        const std::wstring& notes,
+        uint32_t processId = 0);
+    void EmitMappedResidue(
+        const std::wstring& key,
+        const std::wstring& driver,
+        const std::wstring& layer,
+        const std::wstring& summary,
+        const std::wstring& notes);
     void NoteDriverLoad(const KmonEvent& event);
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
     void EnableLoggingForWatchTargets();
+    void PruneStalePromotedWatches();
     bool ResolveKernelImageName(uint32_t pid, std::wstring* name);
     void RecordEvent(KmonEvent&& event);
     bool WriteLogLine(const KmonEvent& event);
@@ -133,11 +161,12 @@ private:
 
     mutable std::mutex WatchMutex;
     std::unordered_set<uint32_t> WatchPids;
+    std::unordered_set<uint32_t> WatchExplicitPids;
     std::vector<std::wstring> WatchNamesLower;
     std::vector<std::wstring> WatchDriversLower;
     std::unordered_set<uint32_t> WatchPromotedPids;
     std::unordered_set<uint32_t> LoggingEnabledPids;
-    std::unordered_set<uint32_t> EmittedHiddenPids;
+    std::map<uint32_t, uint64_t> RecentCreatePids;
     std::unordered_set<uint32_t> EmittedUnnamedPids;
     std::unordered_set<std::wstring> EmittedMapperKeys;
     struct RecentDriverLoad
@@ -176,6 +205,11 @@ private:
     std::atomic<uint64_t> LiveIngested{0};
     std::atomic<uint64_t> HiddenScans{0};
     std::atomic<uint64_t> MapperScans{0};
+    std::atomic<uint64_t> PoolPeScans{0};
+    std::atomic<uint64_t> KpageScans{0};
+    std::atomic<uint64_t> HookScans{0};
+    std::atomic<uint64_t> CpuHookScans{0};
+    std::atomic<uint64_t> UserHostilityScans{0};
     std::atomic<uint64_t> LoggingEnabledCount{0};
     std::atomic<uint64_t> LoggingFailedCount{0};
     std::atomic<uint64_t> LogBytesWritten{0};
@@ -187,6 +221,8 @@ private:
     uint64_t LiveCursorEventId = 0;
     uint64_t NextHiddenScanTickMs = 0;
     uint64_t NextMapperScanTickMs = 0;
+    uint64_t NextKpageScanTickMs = 0;
+    uint64_t NextUserScanTickMs = 0;
 };
 
 std::wstring KmonBasenameLower(const std::wstring& path);
@@ -195,6 +231,8 @@ std::wstring KmonClassifyDriverPath(const std::wstring& path);
 bool KmonDriverPathIsInbox(const std::wstring& path);
 bool KmonDriverPathHasFileDirectory(const std::wstring& path);
 bool KmonPathLooksLikeSys(const std::wstring& path);
+bool KmonIsWindowsBuiltinLeaf(const std::wstring& leaf);
+bool KmonWindowsBuiltinPathLooksInbox(const std::wstring& path);
 bool KmonTaskLooksLikeDriverObjectLoad(const std::wstring& task);
 bool KmonTaskLooksLikeDriverObjectUnload(const std::wstring& task);
 bool KmonTaskLooksLikeDeviceObject(const std::wstring& task);
@@ -204,3 +242,4 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out);
 bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out);
 bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options);
 bool KernelMonitorSelfTest();
+bool KernelMonitorArtifactSelfTest();

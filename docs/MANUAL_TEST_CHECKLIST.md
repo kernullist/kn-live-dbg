@@ -19,7 +19,7 @@ before the feature is trusted.
    .\KnLiveDbg.exe
    ```
 3. Confirm startup reaches the `knkd>` prompt with the driver loaded, the device
-   open, ABI verified (version 15), and `nt` kernel symbols resolved (the
+   open, ABI verified (version 16), and `nt` kernel symbols resolved (the
    dashboard shows symbol state; if `symType=0 (SymNone)`, fix the symbol path
    before running symbol-dependent checks).
 
@@ -215,6 +215,57 @@ clean bill on the others:
 - `!nmi callbacks` still lists NMI handlers with module/symbol annotation.
 - On public PDBs (which omit `KNMI_HANDLER_CALLBACK`) expect the one-time
   warning `KNMI_HANDLER_CALLBACK layout resolved from guarded fallback offsets`.
+
+## Kernel-cheat monitor (`!kmon`)
+
+Requires `write on`, an open driver device, and PPL Antimalware (the command
+flips it if needed). Bare `!kmon` arms silent TI + kernel live callbacks and
+stays on the live tail.
+
+### Clean-box idle
+
+1. `write on` then `!kmon /background`.
+2. Wait ~20s (kpage/CPU scan cadence). `!kmon recent 20` should show
+   `gap.kernel_rw` once and otherwise stay quiet on a clean idle host.
+   Inbox `System32\drivers` loads must not print unless `/verbose`.
+3. Esc/q is not needed in background mode. `!kmon` attaches the tail;
+   Esc detaches and collection keeps running. `!kmon stop` ends derived
+   logging and leaves TI / timeline live up.
+4. `!kmon add /name game.exe` before start must be refused. After start,
+   `add` / `remove` work; a later `!kmon /name notepad.exe` extends watches.
+   `/verbose` on a second start must warn that it applies only on first start.
+
+### User-mode hostility fixture
+
+Build `x64\Release\tools\KnLiveDbgKmonTarget.exe` from the solution, then in a
+second console:
+
+```powershell
+.\x64\Release\tools\KnLiveDbgKmonTarget.exe /overwrite /seconds 60
+```
+
+Attach `!kmon` and expect `process.hollow` with `exe_cow` and/or `exe_text`
+within ~8s (`image=notepad.exe` under `%TEMP%\kn-live-dbg-kmon\`). Repeat with
+`/masquerade`, `/stamp`, `/nomz`, `/orphan-private`, `/orphan-image`,
+`/replace-main`, `/ghost`. Operator steps: `docs/KMON_TEST_TARGET.md`.
+
+The fixture must not touch inbox `notepad.exe` / `svchost.exe`. `/replace-main`
+must stay suspended.
+
+### Driver-free gate
+
+```powershell
+.\x64\Release\KnLiveDbg.exe --self-test console
+```
+
+`kmon-artifact-primitives` must pass. That does not replace the live `!kmon`
+pass.
+
+### Still manual
+
+- Game + anti-cheat idle FP soak (Program Files EAC/BE/Vanguard `drop_load` is
+  expected; overlay `inject.remote` should stay off until `/name game.exe`).
+- Live DKOM `ActiveProcessLinks` unlink (no kernel hide fixture yet).
 
 ## Positive controls (optional)
 

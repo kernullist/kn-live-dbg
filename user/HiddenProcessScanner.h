@@ -16,6 +16,7 @@ struct HiddenProcessRecord
     bool InSystemProcessInfo = false;
     bool InToolhelp = false;
     bool InHandleOwners = false;
+    bool InCidTable = false;
     bool Suspicious = false;
     bool Auxiliary = false;
     bool Terminating = false;
@@ -34,6 +35,7 @@ struct HiddenProcessScanResult
     uint32_t SystemProcessInfoCount = 0;
     uint32_t ToolhelpCount = 0;
     uint32_t HandleOwnerCount = 0;
+    uint32_t CidTableCount = 0;
     uint32_t SuspiciousCount = 0;
     uint32_t IgnoredCount = 0;
     uint32_t IgnoredAuxiliaryCount = 0;
@@ -48,6 +50,10 @@ public:
     HiddenProcessScanner(DeviceClient& device, SymbolEngine& symbols);
 
     bool Scan(HiddenProcessScanResult* result, std::wstring* error);
+    bool Scan(
+        HiddenProcessScanResult* result,
+        const std::vector<uint32_t>& extraCandidatePids,
+        std::wstring* error);
 
 private:
     DeviceClient& device_;
