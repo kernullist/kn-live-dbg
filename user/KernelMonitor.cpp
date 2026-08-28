@@ -497,12 +497,12 @@ namespace
                 layout->ExecFileOffset = section.PointerToRawData;
                 uint32_t raw = section.SizeOfRawData;
                 uint32_t virt = section.Misc.VirtualSize;
+                layout->ExecVirtSize = (virt != 0) ? virt : raw;
                 uint32_t n = raw;
                 if (virt != 0 && virt < n)
                 {
                     n = virt;
                 }
-                layout->ExecVirtSize = n;
                 if (n > 0x400)
                 {
                     n = 0x400;
@@ -749,6 +749,10 @@ namespace
                     capacity);
                 if (copied == 0)
                 {
+                    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+                    {
+                        continue;
+                    }
                     break;
                 }
                 if (copied < capacity - 1)
@@ -802,6 +806,11 @@ namespace
 
             if (process != nullptr)
             {
+                BOOL wow64Flag = FALSE;
+                if (IsWow64Process(process, &wow64Flag) && wow64Flag)
+                {
+                    wow64Peb = true;
+                }
                 using NtQueryInformationProcessFn =
                     LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
                 static NtQueryInformationProcessFn query = nullptr;
@@ -1233,9 +1242,29 @@ namespace
         bool matched = false;
         for (const std::wstring& item : watchLower)
         {
-            if (WatchTokenIsWildcard(item))
+            if (item == L"*")
             {
                 if (!baseLower.empty())
+                {
+                    matched = true;
+                    break;
+                }
+                continue;
+            }
+            if (item == L"*.exe")
+            {
+                if (baseLower.size() >= 4 &&
+                    baseLower.compare(baseLower.size() - 4, 4, L".exe") == 0)
+                {
+                    matched = true;
+                    break;
+                }
+                continue;
+            }
+            if (item == L"*.sys")
+            {
+                if (baseLower.size() >= 4 &&
+                    baseLower.compare(baseLower.size() - 4, 4, L".sys") == 0)
                 {
                     matched = true;
                     break;
@@ -1249,6 +1278,52 @@ namespace
             }
         }
         return matched;
+    }
+
+    bool QueryProcessImagePathByPid(uint32_t pid, std::wstring* path)
+    {
+        bool ok = false;
+        HANDLE process = nullptr;
+        do
+        {
+            if (path == nullptr || pid <= 4)
+            {
+                break;
+            }
+            path->clear();
+            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (process == nullptr)
+            {
+                break;
+            }
+            wchar_t buf[32768] = {};
+            DWORD n = ARRAYSIZE(buf);
+            if (!QueryFullProcessImageNameW(process, 0, buf, &n) || n == 0)
+            {
+                break;
+            }
+            path->assign(buf, n);
+            ok = true;
+        } while (false);
+        if (process != nullptr)
+        {
+            CloseHandle(process);
+        }
+        return ok;
+    }
+
+    std::wstring KmonImageForClassify(uint32_t pid, const std::wstring& maybePath)
+    {
+        if (maybePath.find(L'\\') != std::wstring::npos)
+        {
+            return maybePath;
+        }
+        std::wstring resolved;
+        if (QueryProcessImagePathByPid(pid, &resolved) && !resolved.empty())
+        {
+            return resolved;
+        }
+        return maybePath;
     }
 
     std::wstring FormatKmonJsonLine(const KmonEvent& event)
@@ -1351,20 +1426,6 @@ namespace
             return true;
         }
 
-        std::vector<std::wstring> concrete;
-        concrete.reserve(namesLower.size());
-        for (const std::wstring& item : namesLower)
-        {
-            if (!WatchTokenIsWildcard(item) && !item.empty())
-            {
-                concrete.push_back(item);
-            }
-        }
-        if (concrete.empty())
-        {
-            return true;
-        }
-
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap == INVALID_HANDLE_VALUE)
         {
@@ -1381,7 +1442,7 @@ namespace
         do
         {
             std::wstring base = KmonBasenameLower(entry.szExeFile);
-            if (NameEqualsWatch(base, concrete) && entry.th32ProcessID > 4)
+            if (NameEqualsWatch(base, namesLower) && entry.th32ProcessID > 4)
             {
                 pids->push_back(entry.th32ProcessID);
             }
@@ -1822,8 +1883,8 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
         out->Timestamp = record.Timestamp;
         out->ProcessId = record.ProcessId;
         out->TargetProcessId = record.TargetProcessId;
-        out->Image = record.ImagePath;
-        out->TargetImage = record.TargetImageBase;
+        out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
+        out->TargetImage = KmonImageForClassify(record.TargetProcessId, record.TargetImageBase);
         out->Task = record.TaskName.empty()
             ? (L"Task" + std::to_wstring(record.TaskId))
             : record.TaskName;
@@ -2626,12 +2687,14 @@ void KernelMonitor::IngestThreatIntel()
         if (record.ProcessId > 4 && record.ImagePath.empty())
         {
             uint64_t created = 0;
+            bool unnamedLive = false;
             HANDLE unnamedProcess = OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION,
                 FALSE,
                 record.ProcessId);
             if (unnamedProcess != nullptr)
             {
+                unnamedLive = true;
                 created = QueryProcessCreateTicks(unnamedProcess);
                 CloseHandle(unnamedProcess);
             }
@@ -2640,7 +2703,7 @@ void KernelMonitor::IngestThreatIntel()
                 std::lock_guard<std::mutex> watchLock(WatchMutex);
                 const std::wstring unnamedKey =
                     L"unnamed:" + std::to_wstring(record.ProcessId) + L":" +
-                    std::to_wstring(created);
+                    (unnamedLive ? std::to_wstring(created) : std::wstring(L"gone"));
                 claimed = EmittedMapperKeys.insert(unnamedKey).second;
                 if (claimed)
                 {
@@ -3011,10 +3074,11 @@ void KernelMonitor::EmitUnique(
             {
                 const uint64_t created = QueryProcessCreateTicks(process);
                 CloseHandle(process);
-                if (created != 0)
-                {
-                    uniqueKey += L":" + std::to_wstring(created);
-                }
+                uniqueKey += L":" + std::to_wstring(created);
+            }
+            else
+            {
+                uniqueKey += L":gone";
             }
         }
         std::lock_guard<std::mutex> lock(WatchMutex);
@@ -3157,6 +3221,12 @@ void KernelMonitor::ScanPoolMappedImages()
     }
     if (!EnsureLoadedKernelModules(symbols, true))
     {
+        EmitMappedResidue(
+            L"scan_failed:pool_pe",
+            std::wstring(),
+            L"pool_pe",
+            L"pool PE scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
         return;
     }
 
@@ -3233,6 +3303,12 @@ void KernelMonitor::ScanUnbackedDriverObjects()
     }
     if (!EnsureLoadedKernelModules(symbols, true))
     {
+        EmitMappedResidue(
+            L"scan_failed:drvobj",
+            std::wstring(),
+            L"driver_object",
+            L"unbacked DRIVER_OBJECT scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
         return;
     }
 
@@ -3304,6 +3380,12 @@ void KernelMonitor::ScanOrphanMappedPages()
     }
     if (!EnsureLoadedKernelModules(symbols, true))
     {
+        EmitMappedResidue(
+            L"scan_failed:kpage",
+            std::wstring(),
+            L"orphan_page",
+            L"orphan kpage scan skipped; kernel module inventory unavailable",
+            L"LoadKernelModules failed or empty");
         return;
     }
 
@@ -3452,9 +3534,7 @@ void KernelMonitor::ScanHookInput()
 
     for (const InputStackRecord& record : result.Records)
     {
-        bool unbacked = false;
-        std::wstring notes = record.Notes;
-        uint64_t unbackedObject = 0;
+        uint32_t emitted = 0;
         for (const DeviceStackResult& stack : record.Driver.Stacks)
         {
             for (const DeviceObjectRecord& attached : stack.Stack)
@@ -3463,32 +3543,30 @@ void KernelMonitor::ScanHookInput()
                 {
                     continue;
                 }
-                unbacked = true;
-                unbackedObject = attached.DriverObject != 0
+                if (emitted >= 8)
+                {
+                    break;
+                }
+                const uint64_t unbackedObject = attached.DriverObject != 0
                     ? attached.DriverObject
                     : attached.DeviceObject;
-                if (!attached.Notes.empty())
-                {
-                    notes = attached.Notes;
-                }
-                break;
+                const std::wstring notes = attached.Notes.empty()
+                    ? record.Notes
+                    : attached.Notes;
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"input:" + record.Role + L":" + HexU64(unbackedObject),
+                    record.DriverFilter,
+                    L"input",
+                    L"unbacked driver on " + record.Role + L" stack",
+                    notes);
+                ++emitted;
             }
-            if (unbacked)
+            if (emitted >= 8)
             {
                 break;
             }
         }
-        if (!unbacked)
-        {
-            continue;
-        }
-        EmitUnique(
-            L"hook.unbacked",
-            L"input:" + record.Role + L":" + HexU64(unbackedObject),
-            record.DriverFilter,
-            L"input",
-            L"unbacked driver on " + record.Role + L" stack",
-            notes);
     }
 }
 
@@ -3658,7 +3736,12 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             {
                 for (const HalDispatchSlot& slot : table.Slots)
                 {
-                    if (!slot.Suspicious || !slot.Module.empty())
+                    if (!slot.Suspicious)
+                    {
+                        continue;
+                    }
+                    if (!slot.Module.empty() &&
+                        AddressOwnedByLoadedModule(symbols, slot.Routine))
                     {
                         continue;
                     }
@@ -4017,22 +4100,7 @@ void KernelMonitor::ScanUserModeHostility()
             watchPids.count(pid) != 0;
         if (watched && pid > 4)
         {
-            bool concreteWatch = watchPids.count(pid) != 0;
-            if (!concreteWatch)
-            {
-                for (const std::wstring& name : watchNames)
-                {
-                    if (!WatchTokenIsWildcard(name) && name == leaf)
-                    {
-                        concreteWatch = true;
-                        break;
-                    }
-                }
-            }
-            if (concreteWatch)
-            {
-                EnableLoggingForPid(pid);
-            }
+            EnableLoggingForPid(pid);
         }
         if (builtin &&
             imagePath.find(L'\\') != std::wstring::npos &&
@@ -4092,9 +4160,16 @@ void KernelMonitor::ScanUserModeHostility()
                 moduleCount > 0 && moduleCount <= kMaxModuleRows;
 
             HANDLE processHandle = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                 FALSE,
                 pid);
+            if (processHandle == nullptr)
+            {
+                processHandle = OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                    FALSE,
+                    pid);
+            }
             const bool hasVmRead = processHandle != nullptr;
             if (processHandle == nullptr)
             {
@@ -4669,12 +4744,11 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         auto it = LoggingEnabledPids.find(pid);
-        if (it != LoggingEnabledPids.end())
+        if (it != LoggingEnabledPids.end() &&
+            created != 0 &&
+            it->second == created)
         {
-            if (created == 0 || it->second == 0 || it->second == created)
-            {
-                return;
-            }
+            return;
         }
     }
 
@@ -5498,49 +5572,63 @@ bool KernelMonitorArtifactSelfTest()
                 childProc = pi.hProcess;
                 CloseHandle(pi.hThread);
                 HANDLE inspect = OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                     FALSE,
                     pi.dwProcessId);
-                if (inspect != nullptr)
+                if (inspect == nullptr)
                 {
-                    uint64_t childBase = 0;
-                    QueryPebImageBase(inspect, nullptr, nullptr, pi.dwProcessId, &childBase);
-                    uint32_t childRva[1] = { childExecRva };
-                    uint32_t childPriv = 0;
-                    uint32_t childValid = 0;
-                    if (childBase != 0)
-                    {
-                        for (int poll = 0; poll < 20; ++poll)
-                        {
-                            childPriv = 0;
-                            childValid = 0;
-                            CountPrivateCowImagePages(
-                                inspect,
-                                nullptr,
-                                nullptr,
-                                pi.dwProcessId,
-                                childBase,
-                                childRva,
-                                1,
-                                &childPriv,
-                                &childValid);
-                            if (childPriv > 0)
-                            {
-                                break;
-                            }
-                            if (WaitForSingleObject(childProc, 0) == WAIT_OBJECT_0)
-                            {
-                                break;
-                            }
-                            Sleep(100);
-                        }
-                    }
-                    CloseHandle(inspect);
-                    // Self-process COW already proved the primitive. A child
-                    // miss is a timing skip, not a failed primitive.
-                    (void)childValid;
-                    (void)childPriv;
+                    inspect = OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                        FALSE,
+                        pi.dwProcessId);
                 }
+                if (inspect == nullptr)
+                {
+                    break;
+                }
+                uint64_t childBase = 0;
+                QueryPebImageBase(inspect, nullptr, nullptr, pi.dwProcessId, &childBase);
+                uint32_t childRva[1] = { childExecRva };
+                uint32_t childPriv = 0;
+                uint32_t childValid = 0;
+                if (childBase != 0)
+                {
+                    for (int poll = 0; poll < 50; ++poll)
+                    {
+                        childPriv = 0;
+                        childValid = 0;
+                        CountPrivateCowImagePages(
+                            inspect,
+                            nullptr,
+                            nullptr,
+                            pi.dwProcessId,
+                            childBase,
+                            childRva,
+                            1,
+                            &childPriv,
+                            &childValid);
+                        if (childPriv > 0)
+                        {
+                            break;
+                        }
+                        if (WaitForSingleObject(childProc, 0) == WAIT_OBJECT_0)
+                        {
+                            break;
+                        }
+                        Sleep(100);
+                    }
+                }
+                CloseHandle(inspect);
+                // Working-set query can miss on a just-spawned child. Fail
+                // only when pages were visible and still shared after patch.
+                if (childValid > 0 && childPriv == 0)
+                {
+                    break;
+                }
+            }
+            else
+            {
+                break;
             }
         }
 
@@ -5680,6 +5768,21 @@ bool KernelMonitorSelfTest()
         liveUserPidDrop.Source = L"kernel-live";
         if (!KmonClassifyLiveEvent(liveUserPidDrop, &classified) ||
             classified.Kind != L"driver.drop_load")
+        {
+            break;
+        }
+
+        KmonOptions exeWatch;
+        exeWatch.WatchNames.push_back(L"*.exe");
+        KmonEvent createExe = {};
+        createExe.Kind = L"process.create";
+        createExe.Image = L"game.exe";
+        if (!KmonWatchMatches(createExe, exeWatch))
+        {
+            break;
+        }
+        createExe.Image = L"cheat.sys";
+        if (KmonWatchMatches(createExe, exeWatch))
         {
             break;
         }
