@@ -5499,13 +5499,18 @@ bool KernelMonitor::WriteLogLine(const KmonEvent& event)
             }
         }
 
+        if (utf8.size() > (std::numeric_limits<DWORD>::max)())
+        {
+            break;
+        }
         DWORD written = 0;
         if (!WriteFile(
                 LogHandle,
                 utf8.data(),
                 static_cast<DWORD>(utf8.size()),
                 &written,
-                nullptr))
+                nullptr) ||
+            written != utf8.size())
         {
             break;
         }

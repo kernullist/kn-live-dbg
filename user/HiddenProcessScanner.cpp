@@ -852,8 +852,10 @@ namespace
                 {
                     nameLen = static_cast<uint32_t>(imageField.Length);
                 }
-                if (device.ReadMemory(
-                        ctx.Eprocess + imageField.Offset,
+                uint64_t imageAddress = 0;
+                if (TryAddOffset(ctx.Eprocess, imageField.Offset, &imageAddress) &&
+                    device.ReadMemory(
+                        imageAddress,
                         nameLen,
                         &nameBytes,
                         nullptr) &&
