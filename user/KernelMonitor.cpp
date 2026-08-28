@@ -1107,7 +1107,9 @@ namespace
             if (symbols->FindField(L"nt!_EPROCESS", L"Wow64Process", &wow64Field, &ignored))
             {
                 std::vector<uint8_t> wowBytes;
-                if (device->ReadMemory(
+                if (wow64Field.Offset <=
+                        (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess &&
+                    device->ReadMemory(
                         ctx.Eprocess + static_cast<uint64_t>(wow64Field.Offset),
                         sizeof(uint64_t),
                         &wowBytes,
@@ -1133,6 +1135,10 @@ namespace
                         {
                             std::memcpy(&peb32, peb32Ptr.data(), sizeof(peb32));
                         }
+                    }
+                    if (peb32 != 0 && !IsUserModeImageBase(peb32))
+                    {
+                        peb32 = 0;
                     }
                     if (peb32 != 0)
                     {
@@ -1170,7 +1176,8 @@ namespace
                 break;
             }
             std::vector<uint8_t> pebPtr;
-            if (!device->ReadMemory(
+            if (pebField.Offset > (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess ||
+                !device->ReadMemory(
                     ctx.Eprocess + static_cast<uint64_t>(pebField.Offset),
                     sizeof(uint64_t),
                     &pebPtr,
@@ -5382,6 +5389,10 @@ bool KernelMonitor::ResolveKernelImageName(uint32_t pid, std::wstring* name)
             break;
         }
 
+        if (imageField.Offset > (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess)
+        {
+            break;
+        }
         uint64_t fieldAddr = ctx.Eprocess + static_cast<uint64_t>(imageField.Offset);
         uint32_t length = 16;
         if (imageField.Length != 0 && imageField.Length <= 16)
