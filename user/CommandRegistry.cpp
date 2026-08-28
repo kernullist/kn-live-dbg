@@ -348,7 +348,7 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!address", L"!address", L"memory", L"report canonicality, page-table walk (PML5..PTE), effective R/W/X/U, physical address, owning module and nearest symbol for a virtual address", CommandSupport::Native),
         Make(L"set-ppl-antimalware", L"set-ppl-antimalware", L"session", L"flip _EPROCESS.Protection on KnLiveDbg.exe so it runs as PPL Antimalware (prerequisite for Microsoft-Windows-Threat-Intelligence ETW)", CommandSupport::Native),
         Make(L"!ti", L"!ti", L"kernel", L"subscribe to Microsoft-Windows-Threat-Intelligence ETW; ring + JSONL log + watch filter (start/stop/status/watch/recent/stats/by/grep/save/clear/add/remove)", CommandSupport::Native),
-        Make(L"!kmon", L"!kmon", L"kernel", L"arm TI+live and tail unknown kernel drops/maps/hidden processes; no driver filename; Esc detaches", CommandSupport::Native),
+        Make(L"!kmon", L"!kmon", L"kernel", L"arm TI+live and tail unknown kernel drops/maps/hidden/masquerade/hollow processes; no driver filename; Esc detaches", CommandSupport::Native),
         Make(L"!timeline", L"!timeline", L"session", L"ingest TI and snapshot evidence into a queryable user-mode timeline/graph store", CommandSupport::Native),
         Make(L"!pool", L"!pool", L"kernel", L"enumerate big pool allocations, or !pool pe to hunt intact/signature-wiped PE images in those allocations", CommandSupport::Native),
         Make(L"dump-raw", L"dump-raw", L"memory", L"dump a kernel virtual range to file verbatim via the driver ReadMemory IOCTL", CommandSupport::Native),

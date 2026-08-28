@@ -28,6 +28,8 @@ kn-live-dbg/
   probe_driver/ProbeDriver.cpp  WDM positive-control test buffer driver
   minifilter_fixture_driver/    no-op minifilter detach/reattach positive control
   bind_fixture_controller/      temp-only QoS/Bind positive-control controller
+  hunt_test_target/             lab-only !hunt positive-control process
+  kmon_test_target/             lab-only !kmon user-mode hostility fixture
   user/*.cpp                    elevated TUI, SCM lifecycle, DbgHelp symbols
   tools/build.ps1               Release/Debug x64 build helper
   tools/release.ps1             build and zip release package helper
@@ -89,7 +91,7 @@ kn-live-dbg/
 48. Captures Filter Manager volume and instance attachment state in every `!snapshot` through the documented `FltLib` enumeration APIs. Each bounded, strictly parsed record preserves filter, instance, altitude, volume, frame, filesystem, supported-feature, and raw attachment flags, including `FLTFL_IASIM_DETACHED_VOLUME`; failed or partial enumeration leaves explicit incomplete coverage instead of a clean result. Same-boot `!diff` promotes a stable attachment's attached-to-detached transition. It also reports a missing attachment only when attachment and callback coverage are complete, the same volume remains enumerated, and the same minifilter remains registered in the independent kernel callback view. A clean attachment for the same filter, volume, and altitude suppresses the removal signal even when the instance name changes; when altitude is unavailable, the instance name is the fallback discriminator. A different-altitude decoy attachment no longer masks removal. Static detached state, cross-boot comparison, filter unload, volume removal, and incomplete coverage remain non-findings. Imported snapshot JSON must keep attachment/volume/detached counters, coverage state, record tags, and evidence mutually consistent before removal logic can use it. The bundled no-op minifilter fixture and `tools\run-minifilter-detach-e2e.ps1` exercise the supported attach/detach/reattach path and independently validate the raw snapshots plus positive and recovery diffs. This closes the documented Filter Manager view of ABYSSWORKER-style detach behavior; it does not claim full arbitrary device-stack topology or causal attribution.
 49. Quiet kernel surfaces (Phase 2): `!hal` checks PDB-described HalDispatchTable pointer fields; `!hive` walks PDB-described registry hive GetCellRoutine ownership with list-link validation; `!token` inspects process privilege Present/Enabled masks plus TokenType/SessionId/integrity SID and propagates incomplete coverage into `!hunt`; `!etw providers` emits unclassified heuristic diagnostics while `!etw ti-cross` treats silence alone as inconclusive; `!dpc` / `!timer` require PDB-bounded deferred-execution layouts, and `!workitem` explicitly remains incomplete. Snapshot domains include `hal`, `hive`, `dpc-timer`, and token fingerprints under `process-security`.
 50. P0-P2 investigation scanners (no driver ABI change): `!drvobj` / `!devstack` walk DRIVER_OBJECT device stacks; `!module integrity` adds `/disk` `/iat` `/prologue`; `!handles` triages VM/DUP cross-process handles; `!hiddenproc` cross-views ActiveProcessLinks vs SPI vs Toolhelp vs handle owners; `!wdfilter` lists WdFilter RuntimeDriver leftovers; `!inputstack` flags unknown kbd/mou attached drivers; `!vad` annotates ControlArea/FILE_OBJECT section names; `!dma` reports IOMMU firmware and Kernel DMA Protection; `!hv` reports hypervisor presence without `IA32_FEATURE_CONTROL`; `dump-analyze` walks dump DTB with PML4 or PML5; `!byovd` Authenticode is on by default (`/no-sign` skips it).
-51. `!kmon` (bare command or `!kmon start`) arms silent TI plus kernel live callbacks and stays on a live tail of unknown kernel drops/maps/hidden processes. A driver filename is not required. Default output is not a TI firehose: it prints `driver.drop_load` (non-`System32\\drivers`, including Program Files anti-cheat), `driver.short_lived`, `driver.mapped_residue`, and `process.hidden`. Inbox `System32\\drivers` loads stay off unless `/verbose`. `/name game.exe` adds `inject.remote`. `/background` arms without occupying the prompt. Esc/q detaches; `!kmon` again reattaches. Kernel `MmCopyVirtualMemory` remains `gap.kernel_rw`.
+51. `!kmon` (bare command or `!kmon start`) arms silent TI plus kernel live callbacks and stays on a live tail of unknown kernel drops/maps/hidden processes. A driver filename is not required. Default output is not a TI firehose: it prints `driver.drop_load` (non-`System32\\drivers`, including Program Files anti-cheat), `driver.short_lived`, `driver.mapped_residue` (live pool PE, unbacked `DRIVER_OBJECT`, orphan kpage PE/W+X, BYOVD vehicle, plus `!mapper` leftovers), `hook.unbacked` (callback/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter routines outside `PsLoadedModuleList`; empty module inventory is fail-closed), `process.hidden` (ActiveProcessLinks vs SPI/Toolhelp vs handle owners vs CID), `process.masquerade` / `process.hollow` (PEB ImageBase EXE replace: unmapped/private/unbacked MEM_IMAGE, mapped-path, stamp/arch, builtin W+X, COW and reloc-aware `.text` vs disk for Windows builtins, extra PE, ghosting) / `process.implant`, `inject.remote` into/from Windows builtins or drop-path callers, and DSE-off / CR0.WP=0. Inbox `System32\\drivers` loads stay off unless `/verbose`. `/name game.exe` adds overlay-style `inject.remote`. `/background` (alias `/nowatch`) arms without occupying the prompt. `add`/`remove` require an already-collecting session. Esc/q detaches; `!kmon` again reattaches. Kernel `MmCopyVirtualMemory` is not on ETW-TI; the hook and pool-PE samples are the substitute. Lab fixture: `KnLiveDbgKmonTarget.exe` (`docs/KMON_TEST_TARGET.md`).
 52. Optional LAN remote operator session: PC A runs `remote on` (default `0.0.0.0:51767`, session password 5-128 printable ASCII, process-managed firewall rule `knlivedbg-remote`); PC B runs `KnLiveDbg.exe --connect <ipv4>:51767` as a thin `knkd>` with the same Tab tables as the local TUI. Command output uses the same console colors as A; if B's stdout is a pipe or file, VT sequences are stripped. Engine, driver, symbols, and dumps stay on A. This is not `kdinit /remote`. See `docs/REMOTE_SETUP.md`.
 
 ## Design Notes
@@ -101,6 +103,7 @@ kn-live-dbg/
 - `docs/MCP_SERVER_DESIGN.md` covers the in-process MCP server design and security rationale; `docs/MCP_SETUP.md` is the operator guide for starting the server (`mcp on`, all-interface bind, session password) and connecting Claude Code/Desktop. Docs are English-first; Korean translations are the sibling `*.ko.md` files.
 - `docs/REMOTE_SETUP.md` is the operator guide for the LAN `knkd>` session (`remote on` / `KnLiveDbg.exe --connect`). `docs/REMOTE_OPERATOR_SESSION.md` is the design. This is not `kdinit /remote`. `mcp on` and `remote on` cannot run at the same time.
 - `docs/TIMELINE_COMMAND_USAGE.md` documents scenario-based `!timeline` usage for TI, snapshot reconciliation, kernel live callback collection, graphing, JSONL export, and reset workflows. The Korean mirror is `docs/TIMELINE_COMMAND_USAGE.ko.md`.
+- `docs/KMON_TEST_TARGET.md` documents `KnLiveDbgKmonTarget.exe`, the lab-only `!kmon` user-mode hostility fixture. `docs/HUNT_TEST_TARGET.md` is the separate `!hunt` fixture.
 
 ## Build
 
@@ -360,7 +363,7 @@ dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]
 set-ppl-antimalware [on|off|status]
 !ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]
 !ti stop | status | watch | recent [N] | stats | by pid <PID> | by task <name> | grep <pattern> | save <path> | clear | add /pid|/name <v> | remove /pid|/name <v>
-!kmon [start] [/name <image>] [/verbose] [/background] [/log <dir>]
+!kmon [start] [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose] [/background|/nowatch] [/log <dir>]
 !kmon stop | status | watch | recent [N] | save <path> | clear | add /pid|/name|/driver <v> | remove /pid|/name|/driver <v>
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 ai <goal> [/verbose]
@@ -2198,23 +2201,31 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 
 ## Kernel-cheat monitor (`!kmon`)
 
-`!kmon` is a session on top of `!ti` and `!timeline live`. It does not open a second TI provider. The cheat `.sys` name is not an input. Bare `!kmon` arms collectors and stays on the live tail.
+`!kmon` is a session on top of `!ti` and `!timeline live`. It does not open a second TI provider. The cheat `.sys` name is not an input. Bare `!kmon` (or `!kmon start`) arms collectors and stays on the live tail.
 
 ```text
 knkd> write on
 knkd> !kmon
 ```
 
-Esc/q returns to `knkd>`; collection keeps running. `!kmon` again reattaches. `!kmon watch` is only a reattach alias. `/background` arms without occupying the prompt.
+Esc/q returns to `knkd>`; collection keeps running. `!kmon` again reattaches. `!kmon watch` is only a reattach alias. `/background` (alias `/nowatch`) arms without occupying the prompt. `!kmon stop` leaves TI and timeline live running.
+
+Watch set:
+
+- `add` / `remove` `/pid` `/name` `/driver` only while collecting. A pre-start `add` is refused.
+- A later `!kmon` / `!kmon start` with `/pid` `/name` `/driver` extends watches rather than replacing the collector. `/verbose` and `/log` apply only on the first start.
+- `/driver` is highlight-only and never hides unknown drop names.
+- `/name game.exe` / `/pid` add overlay-style `inject.remote` (overlays/AC can be noisy). Builtin-to-builtin and drop-path inject already match without those flags.
 
 Default output is not every normal action and not the TI firehose:
 
-- Shown: `driver.drop_load` (Temp/Users/Program Files/volume-root `.sys`), `driver.short_lived` (load then unload within 30s), `driver.mapped_residue` (MmUnloadedDrivers / PiDDB / ci-hash, sampled ~8s), `process.hidden` (sampled ~5s), `gap.kernel_rw` once.
-- Hidden: inbox `System32\drivers` loads, process create, local AllocVM, kernel `MmCopyVirtualMemory` / `DeviceIoControl`.
+- Shown: `driver.drop_load`, `driver.short_lived`, `driver.mapped_residue` (`layer=pool_pe` / `driver_object` / `orphan_page` / `orphan_wx` / `byovd` plus leftovers), `hook.unbacked` (`layer=callback` / `input` / `dispatch` / `ssdt` / `idt` / `msr` / `hal` / `wfp` / `dpc` / `minifilter`), `process.hidden` (ActiveProcessLinks vs SPI/Toolhelp vs handle owners vs CID), `process.masquerade` (Windows-named image from a non-inbox path), `process.hollow` (PEB ImageBase EXE replace: `exe_unmapped` / `exe_private` / `exe_unbacked` / `exe_mapped_path` / `exe_wx` / `exe_no_mz` / `exe_arch` / `hollow` stamp-section, `exe_cow` / `exe_text` / `exe_text_page` / `exe_ep` for Windows builtins, `exe_peb_base`, extra PE `exe_orphan_private` / `exe_orphan_image`, `ghost`), `process.implant` (`drop_module` or `builtin_foreign_module`), `inject.remote` into/from Windows builtins or drop-path callers, `integrity.ci` (DSE off only), `integrity.cr`, `process.syscall_unnamed`, `gap.kernel_rw` once.
+- Hidden: inbox `System32\drivers` loads, process create, local AllocVM, kernel `MmCopyVirtualMemory` / `DeviceIoControl`. Test-signing is not `integrity.ci`.
+- Reloc-aware `.text`/EP vs disk and COW overwrite run only for Windows builtin leaves, because third-party games/AC packers otherwise firehose `exe_text`. Empty `PsLoadedModuleList` is fail-closed so hook/pool scans do not treat every pointer as unbacked.
+- Scan cadence: hidden ~5s, mapper/hooks/pool PE ~8s, kpage/CPU hooks ~20s, user-mode hostility ~8s. The first ticks are delayed so TI ingest is not stalled at start.
 - A quiet idle host is mostly silent after the start line. Game launch can print a handful of Program Files anti-cheat drivers (EAC/BE/Vanguard); that is expected.
-- `/name game.exe` adds `inject.remote` (overlays/AC can be noisy). `/driver` is highlight-only and never hides unknown names. `/verbose` also keeps inbox driver loads.
 
-`!kmon stop` leaves TI and timeline live running.
+Lab fixture `KnLiveDbgKmonTarget.exe` (`docs/KMON_TEST_TARGET.md`) only mutates copies of itself under `%TEMP%\kn-live-dbg-kmon\` (named `notepad.exe` so builtin layers fire). It does not inject into inbox `notepad.exe` / `svchost.exe` and never resumes a replaced image. `KnLiveDbg.exe --self-test console` includes `kmon-artifact-primitives` (no driver).
 
 ## Positive-Control Probe
 

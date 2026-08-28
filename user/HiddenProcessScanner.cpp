@@ -59,6 +59,7 @@ namespace
         bool Spi = false;
         bool Toolhelp = false;
         bool HandleOwner = false;
+        bool CidTable = false;
         bool UserBefore = false;
         bool UserAfter = false;
         bool Auxiliary = false;
@@ -86,6 +87,8 @@ namespace
         bool Kernel = false;
         bool Spi = false;
         bool Toolhelp = false;
+        bool HandleOwner = false;
+        bool CidTable = false;
         bool UserBefore = false;
         bool UserAfter = false;
         bool KernelWalkOk = false;
@@ -304,14 +307,18 @@ namespace
 
         if (input.Kernel && userViews == 0)
         {
-            if (input.Auxiliary)
+            // Handle/CID confirmation means the object is still a live
+            // process. Cheats set AuxiliaryProcess or fake ExitTime to ride
+            // the clone/zombie filters.
+            const bool independentlyVisible = input.HandleOwner || input.CidTable;
+            if (input.Auxiliary && !independentlyVisible)
             {
                 result.Ignored = true;
                 result.IgnoredAuxiliary = true;
                 result.Notes = L"ActiveProcessLinks auxiliary/snapshot clone omitted from SPI";
                 return result;
             }
-            if (IsTerminatingView(input))
+            if (IsTerminatingView(input) && !independentlyVisible)
             {
                 result.Ignored = true;
                 result.IgnoredTerminating = true;
@@ -354,6 +361,34 @@ namespace
             return result;
         }
 
+        // DKOM unlink from ActiveProcessLinks hides the process from the
+        // kernel walk AND from SPI/Toolhelp (both consume that list). The
+        // process still owns handles and still has a CID slot.
+        if (!input.Kernel && userViews == 0 && input.Pid > 4)
+        {
+            if (IsTerminatingView(input))
+            {
+                result.Ignored = true;
+                result.IgnoredTerminating = true;
+                result.Notes = L"exiting CID/handle process omitted from lists";
+                return result;
+            }
+            if (input.CidTable)
+            {
+                result.Suspicious = true;
+                result.Notes =
+                    L"live CID process missing from ActiveProcessLinks, SPI, and Toolhelp";
+                return result;
+            }
+            if (input.HandleOwner)
+            {
+                result.Suspicious = true;
+                result.Notes =
+                    L"handle-table owner missing from ActiveProcessLinks, SPI, and Toolhelp";
+                return result;
+            }
+        }
+
         return result;
     }
 
@@ -370,6 +405,8 @@ namespace
         input.Kernel = view.Kernel;
         input.Spi = view.Spi;
         input.Toolhelp = view.Toolhelp;
+        input.HandleOwner = view.HandleOwner;
+        input.CidTable = view.CidTable;
         input.UserBefore = view.UserBefore;
         input.UserAfter = view.UserAfter;
         input.KernelWalkOk = kernelWalkOk;
@@ -694,6 +731,67 @@ namespace
         view->HasLifecycle = view->HasActiveThreads || view->HasExitTime;
         return view->HasLifecycle;
     }
+
+    bool ConfirmCidProcess(
+        DeviceClient& device,
+        uint32_t pid,
+        const TypeFieldInfo& dtbField,
+        const TypeFieldInfo& imageField,
+        const LifecycleLayout& lifecycle,
+        ProcessView* view)
+    {
+        bool ok = false;
+        do
+        {
+            if (view == nullptr || pid <= 4 || dtbField.Offset == 0)
+            {
+                break;
+            }
+
+            ProcessAddressContext ctx = {};
+            std::wstring ignored;
+            if (!device.ResolveProcess(
+                    pid,
+                    static_cast<uint32_t>(dtbField.Offset),
+                    0,
+                    &ctx,
+                    &ignored) ||
+                ctx.Eprocess == 0)
+            {
+                break;
+            }
+
+            view->Pid = pid;
+            view->CidTable = true;
+            if (view->Eprocess == 0)
+            {
+                view->Eprocess = ctx.Eprocess;
+            }
+            if (view->Image.empty() && imageField.Offset != 0)
+            {
+                std::vector<uint8_t> nameBytes;
+                uint32_t nameLen = 16;
+                if (imageField.Length >= 1 && imageField.Length <= 16)
+                {
+                    nameLen = static_cast<uint32_t>(imageField.Length);
+                }
+                if (device.ReadMemory(
+                        ctx.Eprocess + imageField.Offset,
+                        nameLen,
+                        &nameBytes,
+                        nullptr) &&
+                    !nameBytes.empty())
+                {
+                    view->Image = AsciiToWide(
+                        reinterpret_cast<const char*>(nameBytes.data()),
+                        nameBytes.size());
+                }
+            }
+            ReadProcessLifecycle(device, lifecycle, view);
+            ok = true;
+        } while (false);
+        return ok;
+    }
 }
 
 HiddenProcessScanner::HiddenProcessScanner(DeviceClient& device, SymbolEngine& symbols) :
@@ -703,6 +801,15 @@ HiddenProcessScanner::HiddenProcessScanner(DeviceClient& device, SymbolEngine& s
 }
 
 bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* error)
+{
+    std::vector<uint32_t> none;
+    return Scan(result, none, error);
+}
+
+bool HiddenProcessScanner::Scan(
+    HiddenProcessScanResult* result,
+    const std::vector<uint32_t>& extraCandidatePids,
+    std::wstring* error)
 {
     bool ok = false;
 
@@ -946,6 +1053,68 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
         const bool lifecycleLayoutAvailable =
             lifecycle.HasExitTime || lifecycle.HasActiveThreads;
 
+        TypeFieldInfo dtbField = {};
+        const bool hasDtb =
+            symbols_.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) ||
+            symbols_.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) ||
+            symbols_.FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored);
+        if (!hasDtb)
+        {
+            result->Warnings.push_back(
+                L"DirectoryTableBase was not resolved; CID confirmation is unavailable");
+        }
+
+        auto confirmIfMissingFromLists = [&](uint32_t pid)
+        {
+            if (pid <= 4 || !hasDtb)
+            {
+                return;
+            }
+            ProcessView& view = views[pid];
+            view.Pid = pid;
+            if (view.Kernel && view.Spi && view.Toolhelp)
+            {
+                return;
+            }
+            if (view.CidTable)
+            {
+                return;
+            }
+            if (ConfirmCidProcess(
+                    device_,
+                    pid,
+                    dtbField,
+                    imageField,
+                    lifecycle,
+                    &view))
+            {
+                ++result->CidTableCount;
+            }
+        };
+
+        for (uint32_t pid : handleResult.OwnerPids)
+        {
+            auto it = views.find(pid);
+            if (it == views.end())
+            {
+                continue;
+            }
+            if (!it->second.Kernel && !it->second.Spi && !it->second.Toolhelp)
+            {
+                confirmIfMissingFromLists(pid);
+            }
+        }
+        for (uint32_t pid : extraCandidatePids)
+        {
+            auto it = views.find(pid);
+            if (it != views.end() &&
+                (it->second.Kernel || it->second.Spi || it->second.Toolhelp))
+            {
+                continue;
+            }
+            confirmIfMissingFromLists(pid);
+        }
+
         for (auto& pair : views)
         {
             ProcessView& view = pair.second;
@@ -996,6 +1165,7 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
             record.InSystemProcessInfo = view.Spi;
             record.InToolhelp = view.Toolhelp;
             record.InHandleOwners = view.HandleOwner;
+            record.InCidTable = view.CidTable;
             record.Auxiliary = view.Auxiliary;
             record.Terminating = IsTerminatingView(classifiedInput);
             record.HasActiveThreads = view.HasActiveThreads;
@@ -1038,7 +1208,11 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* e
             }
 
             // Keep non-suspicious records only when they disagree across views.
-            if (record.Suspicious || (view.Kernel != view.Spi) || (view.Kernel != view.Toolhelp))
+            if (record.Suspicious ||
+                (view.Kernel != view.Spi) ||
+                (view.Kernel != view.Toolhelp) ||
+                (view.HandleOwner && !view.Kernel && !view.Spi && !view.Toolhelp) ||
+                (view.CidTable && !view.Kernel && !view.Spi && !view.Toolhelp))
             {
                 result->Records.push_back(record);
             }
@@ -1058,6 +1232,7 @@ std::wstring BuildHiddenProcessJson(const HiddenProcessScanResult& result)
     json << L",\"spi\":" << result.SystemProcessInfoCount;
     json << L",\"toolhelp\":" << result.ToolhelpCount;
     json << L",\"handle_owners\":" << result.HandleOwnerCount;
+    json << L",\"cid_table\":" << result.CidTableCount;
     json << L",\"suspicious\":" << result.SuspiciousCount;
     json << L",\"ignored\":" << result.IgnoredCount;
     json << L",\"ignored_auxiliary\":" << result.IgnoredAuxiliaryCount;
@@ -1080,6 +1255,7 @@ std::wstring BuildHiddenProcessJson(const HiddenProcessScanResult& result)
         json << L",\"spi\":" << (record.InSystemProcessInfo ? L"true" : L"false");
         json << L",\"toolhelp\":" << (record.InToolhelp ? L"true" : L"false");
         json << L",\"handle_owner\":" << (record.InHandleOwners ? L"true" : L"false");
+        json << L",\"cid_table\":" << (record.InCidTable ? L"true" : L"false");
         json << L",\"auxiliary\":" << (record.Auxiliary ? L"true" : L"false");
         json << L",\"terminating\":" << (record.Terminating ? L"true" : L"false");
         json << L",\"has_active_threads\":" << (record.HasActiveThreads ? L"true" : L"false");
@@ -1214,6 +1390,39 @@ bool HiddenProcessViewSelfTest()
         incompleteWalk.KernelInventoryComplete = false;
         const HiddenProcessClassifyResult incompleteWalkResult = ClassifyHiddenProcess(incompleteWalk);
         if (incompleteWalkResult.Suspicious || !incompleteWalkResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput handleOnly = {};
+        handleOnly.Pid = 2222;
+        handleOnly.HandleOwner = true;
+        handleOnly.CidTable = true;
+        handleOnly.KernelWalkOk = true;
+        handleOnly.UserWalkOk = true;
+        handleOnly.KernelInventoryComplete = true;
+        const HiddenProcessClassifyResult handleOnlyResult = ClassifyHiddenProcess(handleOnly);
+        if (!handleOnlyResult.Suspicious || handleOnlyResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput handleAux = handleOnly;
+        handleAux.Auxiliary = true;
+        const HiddenProcessClassifyResult handleAuxResult = ClassifyHiddenProcess(handleAux);
+        if (!handleAuxResult.Suspicious || handleAuxResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput cidOnly = {};
+        cidOnly.Pid = 3333;
+        cidOnly.CidTable = true;
+        cidOnly.KernelWalkOk = true;
+        cidOnly.UserWalkOk = true;
+        cidOnly.KernelInventoryComplete = true;
+        const HiddenProcessClassifyResult cidOnlyResult = ClassifyHiddenProcess(cidOnly);
+        if (!cidOnlyResult.Suspicious || cidOnlyResult.Ignored)
         {
             break;
         }

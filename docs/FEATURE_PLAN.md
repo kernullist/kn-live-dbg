@@ -43,10 +43,21 @@ Completed core slices:
     `docs/REMOTE_OPERATOR_SESSION.md`.
 11. Unknown kernel-drop monitor (`!kmon`): implemented. Bare `!kmon`
     arms silent TI plus kernel live callbacks and stays on a live tail
-    of non-inbox driver drops, short-lived loads, mapper leftovers, and
-    hidden processes. A driver filename is not required. Inbox
+    of non-inbox driver drops, short-lived loads, live mapped payloads
+    (pool PE / unbacked DRIVER_OBJECT / kpage PE), unbacked callbacks and
+    input/SSDT/IDT hooks, mapper leftovers, hidden processes (CID/handle
+    confirm for DKOM unlink), Windows-named masquerade, user-mode
+    EXE-region replace (`process.hollow`: private/unbacked MEM_IMAGE,
+    mapped-path, process-overwriting COW and reloc-aware `.text` vs disk
+    for Windows builtins, extra PE, stamp/arch, ghosting), implants, and
+    builtin/drop `inject.remote` (game overlay inject still needs `/name`).
+    Lab positive control: `KnLiveDbgKmonTarget.exe`
+    (`docs/KMON_TEST_TARGET.md`). A driver filename is not required. Inbox
     `System32\drivers` stays off unless `/verbose`. Esc detaches;
-    `/background` arms without occupying the prompt. ABI 16 adds
+    `/background` (alias `/nowatch`) arms without occupying the prompt.
+    `add`/`remove` require an already-collecting session; `/verbose` and
+    `/log` apply only on the first start. Empty `PsLoadedModuleList` is
+    fail-closed for hook/pool scans. ABI 16 adds
     `IOCTL_KNDBG_SET_PROCESS_LOGGING` so watched `/name` targets emit
     TI ReadVM/WriteVM.
 

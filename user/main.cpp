@@ -1851,7 +1851,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !pool           big-pool triage, W+X annotation, and staged PE hunt\n";
     std::wcout << L"  help !byovd          loaded BYOVD catalog scan and fixture\n";
     std::wcout << L"  help !timeline       time-ordered TI/snapshot/live evidence store\n";
-    std::wcout << L"  help !kmon           unknown kernel drop/map/hidden monitor (no filename)\n";
+    std::wcout << L"  help !kmon           unknown kernel drop/map/hidden/hollow monitor (no filename)\n";
     std::wcout << L"  help !address        canonicality, page-table walk, effective permissions, owner symbol\n";
     std::wcout << L"  help !hal            HAL dispatch table ownership\n";
     std::wcout << L"  help !hive           registry hive GetCellRoutine ownership\n";
@@ -21377,12 +21377,11 @@ static void PrintHiddenProcHelp()
     std::wcout << L"!hiddenproc command:\n";
     std::wcout << L"  !hiddenproc [/json <path>]\n";
     std::wcout << L"\n";
-    std::wcout << L"cross-views ActiveProcessLinks, SystemProcessInformation, Toolhelp, and handle\n";
-    std::wcout << L"owners. Live processes in the kernel list but missing from both user snapshots,\n";
-    std::wcout << L"or stably visible to user APIs but missing from ActiveProcessLinks, are marked\n";
-    std::wcout << L"suspicious. Auxiliary snapshot clones and exiting processes are ignored.\n";
+    std::wcout << L"cross-views ActiveProcessLinks, SystemProcessInformation, Toolhelp, handle-table\n";
+    std::wcout << L"owners, and PsLookupProcessByProcessId (CID). DKOM unlink hides a process from the\n";
+    std::wcout << L"kernel list AND SPI/Toolhelp; those still show up as handle owners and CID hits.\n";
+    std::wcout << L"Auxiliary/ExitTime fakes are not ignored when CID or handles still see the process.\n";
     std::wcout << L"A live kernel-only process with ActiveThreads==0 is still suspicious.\n";
-    std::wcout << L"Full PspCidTable coverage stays on !hunt /deep.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /json <path>  write kn-live-dbg.hidden-process.v1.\n";
@@ -21482,7 +21481,8 @@ static void HandleHiddenProcCommand(
                        << L" kernel=" << (record.InKernelList ? L"y" : L"n")
                        << L" spi=" << (record.InSystemProcessInfo ? L"y" : L"n")
                        << L" toolhelp=" << (record.InToolhelp ? L"y" : L"n")
-                       << L" handles=" << (record.InHandleOwners ? L"y" : L"n");
+                       << L" handles=" << (record.InHandleOwners ? L"y" : L"n")
+                       << L" cid=" << (record.InCidTable ? L"y" : L"n");
             if (!record.Notes.empty())
             {
                 std::wcout << L" " << record.Notes;
@@ -21494,6 +21494,7 @@ static void HandleHiddenProcCommand(
                    << L" spi=" << result.SystemProcessInfoCount
                    << L" toolhelp=" << result.ToolhelpCount
                    << L" handle_owners=" << result.HandleOwnerCount
+                   << L" cid=" << result.CidTableCount
                    << L" suspicious=" << result.SuspiciousCount
                    << L" ignored=" << result.IgnoredCount
                    << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete") << L"\n";
@@ -24618,7 +24619,7 @@ static void PrintKmonHelp()
     std::wcout << L"!kmon command (unknown kernel drop / map / hidden monitor):\n";
     std::wcout << L"  !kmon [start] [/name <game.exe>] [/verbose] [/background] [/log <dir>]\n";
     std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
-    std::wcout << L"  !kmon add /pid|/name|/driver <v>\n";
+    std::wcout << L"  !kmon add /pid|/name|/driver <v>     while collecting; later start extends watches\n";
     std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
     std::wcout << L"  !kmon watch            reattach live tail after Esc (optional)\n";
     std::wcout << L"\n";
@@ -24628,13 +24629,15 @@ static void PrintKmonHelp()
     std::wcout << L"\n";
     std::wcout << L"bare !kmon (or !kmon start) arms TI + kernel live callbacks and stays on the\n";
     std::wcout << L"live tail. Esc/q returns to knkd>; collection keeps running. !kmon again reattaches.\n";
-    std::wcout << L"  /background     arm only, return to the prompt (JSONL still fills)\n";
-    std::wcout << L"  /name game.exe  add inject.remote against that image (overlays/AC can be noisy)\n";
+    std::wcout << L"  /background     arm only, return to the prompt (JSONL still fills); /nowatch alias\n";
+    std::wcout << L"  /name game.exe  add overlay inject.remote (overlays/AC can be noisy)\n";
     std::wcout << L"  /driver name    highlight only; never hides unknown drop names\n";
-    std::wcout << L"  /verbose        also keep inbox System32\\drivers loads\n";
+    std::wcout << L"  /verbose        also keep inbox System32\\drivers loads (first start only)\n";
+    std::wcout << L"  /log /verbose /throttle apply only on the first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
-    std::wcout << L"  shown:  drop_load, short_lived, mapped_residue, hidden, gap.kernel_rw (once)\n";
+    std::wcout << L"  shown:  drop_load, short_lived, mapped_residue, hook.unbacked, hidden,\n";
+    std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw\n";
     std::wcout << L"  hidden: inbox System32\\drivers, process create, local AllocVM, kernel R/W\n";
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
     std::wcout << L"  a quiet idle host is mostly silent after the start line.\n";
@@ -24642,10 +24645,21 @@ static void PrintKmonHelp()
     std::wcout << L"logged kinds:\n";
     std::wcout << L"  driver.drop_load        .sys outside System32\\drivers (Temp/Users/Program Files/root)\n";
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
-    std::wcout << L"  driver.mapped_residue   MmUnloadedDrivers / PiDDB / ci-hash leftovers (~8s sample)\n";
-    std::wcout << L"  process.hidden          DKOM / view mismatch (~5s sample)\n";
-    std::wcout << L"  inject.remote           only with /name or /pid\n";
-    std::wcout << L"  kernel MmCopyVirtualMemory / DeviceIoControl are not in TI; gap.kernel_rw once.\n";
+    std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
+    std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
+    std::wcout << L"  hook.unbacked           callback/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter\n";
+    std::wcout << L"                          whose routine is outside PsLoadedModuleList (empty list is fail-closed)\n";
+    std::wcout << L"  process.hidden          DKOM unlink / SPI hide / handle+CID-only (~5s)\n";
+    std::wcout << L"  process.masquerade      Windows-named image from a non-inbox path\n";
+    std::wcout << L"  process.hollow          EXE replace at PEB ImageBase: unmapped/private/unbacked,\n";
+    std::wcout << L"                          mapped-path mismatch, W+X (builtin), no MZ, stamp/arch,\n";
+    std::wcout << L"                          COW/.text/EP vs disk (Windows builtins), extra PE, ghosting\n";
+    std::wcout << L"  process.implant         drop-dir module, or extra module in a Windows builtin\n";
+    std::wcout << L"  inject.remote           drop/unknown-path any remote inject; builtin WriteVM/APC/SetThreadContext;\n";
+    std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView; ReadVM/suspend stay off\n";
+    std::wcout << L"  integrity.ci / .cr      DSE off, CR0.WP=0 (test-signing is not a finding)\n";
+    std::wcout << L"  kernel MmCopyVirtualMemory is not on TI; hooks and pool PE are the substitute.\n";
+    std::wcout << L"  lab fixture: KnLiveDbgKmonTarget.exe (docs/KMON_TEST_TARGET.md)\n";
 }
 
 static void PrintKmonEventLine(const KmonEvent& event)
@@ -24847,20 +24861,46 @@ static void HandleKmonCommand(
         {
             if (kmon.IsActive())
             {
-                bool background = false;
-                for (size_t i = 1; i < args.size(); ++i)
+                KmonOptions extra;
+                std::wstring extraError;
+                if (!ParseKmonStartArgs(args, startArgIndex, &extra, &extraError))
                 {
-                    std::wstring opt = ToLower(args[i]);
-                    if (opt == L"/background" || opt == L"/nowatch")
-                    {
-                        background = true;
-                        break;
-                    }
+                    std::wcerr << L"!kmon: " << extraError << L"\n";
+                    break;
                 }
-                if (background)
+                for (uint32_t pid : extra.WatchPids)
+                {
+                    kmon.AddWatchPid(pid);
+                }
+                for (const std::wstring& name : extra.WatchNames)
+                {
+                    kmon.AddWatchName(name);
+                }
+                for (const std::wstring& driver : extra.WatchDrivers)
+                {
+                    kmon.AddWatchDriver(driver);
+                }
+                const bool addedWatch =
+                    !extra.WatchPids.empty() ||
+                    !extra.WatchNames.empty() ||
+                    !extra.WatchDrivers.empty();
+                if (extra.VerboseDrivers ||
+                    !extra.LogDirectory.empty() ||
+                    extra.ThrottlePerSecond != 50)
+                {
+                    std::wcerr << L"!kmon: /verbose, /log, and /throttle apply only on the first start; "
+                                  L"watches were updated.\n";
+                }
+                if (!extra.AttachLiveTail)
                 {
                     PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
                     std::wcout << L" already collecting. JSONL is filling; '!kmon' attaches the tail.\n";
+                    break;
+                }
+                if (addedWatch)
+                {
+                    PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
+                    std::wcout << L" watches updated. '!kmon' attaches the tail.\n";
                     break;
                 }
                 PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
@@ -25009,7 +25049,12 @@ static void HandleKmonCommand(
             std::wcout << L"  ti_ingested=" << stats.TiIngested
                        << L" live_ingested=" << stats.LiveIngested
                        << L" hidden_scans=" << stats.HiddenScans
-                       << L" mapper_scans=" << stats.MapperScans << L"\n";
+                       << L" mapper_scans=" << stats.MapperScans
+                       << L" pool_pe_scans=" << stats.PoolPeScans
+                       << L" kpage_scans=" << stats.KpageScans
+                       << L" hook_scans=" << stats.HookScans
+                       << L" cpu_hook_scans=" << stats.CpuHookScans
+                       << L" user_scans=" << stats.UserHostilityScans << L"\n";
             std::wcout << L"  logging_enabled=" << stats.LoggingEnabled
                        << L" logging_failed=" << stats.LoggingFailed << L"\n";
             std::wcout << L"  watch:";
@@ -25035,6 +25080,13 @@ static void HandleKmonCommand(
 
         if (action == L"add" || action == L"remove")
         {
+            if (!kmon.IsActive())
+            {
+                std::wcerr << L"!kmon " << action
+                           << L": start kmon first; pass /name|/pid on the first start, "
+                              L"or add after collection is running.\n";
+                break;
+            }
             if (args.size() < 4)
             {
                 std::wcerr << L"!kmon " << action
@@ -25141,7 +25193,7 @@ static void HandleKmonCommand(
         if (action == L"clear")
         {
             kmon.Clear();
-            std::wcout << L"[kmon.clear] ring drained.\n";
+            std::wcout << L"[kmon.clear] ring drained; uniqueness keys reset.\n";
             break;
         }
 
@@ -30811,6 +30863,10 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             KernelMonitorSelfTest(),
             L"kmon-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KernelMonitorArtifactSelfTest(),
+            L"kmon-artifact-primitives");
         CheckConsoleSurfaceSelfTest(
             &context,
             IsNativeOwnedCommand(L"!kmon"),

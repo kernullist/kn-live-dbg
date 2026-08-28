@@ -18,6 +18,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgHuntTarget", "hunt
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgHuntTargetDll", "hunt_test_target\KnLiveDbgHuntTargetDll.vcxproj", "{A2C36B8C-C53F-4E35-A8F5-B2E2AB5BDE61}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KnLiveDbgKmonTarget", "kmon_test_target\KnLiveDbgKmonTarget.vcxproj", "{C91D4E27-6B8A-4F11-9E3C-77A1B2C3D4E5}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -56,6 +58,10 @@ Global
 		{A2C36B8C-C53F-4E35-A8F5-B2E2AB5BDE61}.Debug|x64.Build.0 = Debug|x64
 		{A2C36B8C-C53F-4E35-A8F5-B2E2AB5BDE61}.Release|x64.ActiveCfg = Release|x64
 		{A2C36B8C-C53F-4E35-A8F5-B2E2AB5BDE61}.Release|x64.Build.0 = Release|x64
+		{C91D4E27-6B8A-4F11-9E3C-77A1B2C3D4E5}.Debug|x64.ActiveCfg = Debug|x64
+		{C91D4E27-6B8A-4F11-9E3C-77A1B2C3D4E5}.Debug|x64.Build.0 = Debug|x64
+		{C91D4E27-6B8A-4F11-9E3C-77A1B2C3D4E5}.Release|x64.ActiveCfg = Release|x64
+		{C91D4E27-6B8A-4F11-9E3C-77A1B2C3D4E5}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

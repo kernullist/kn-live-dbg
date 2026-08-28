@@ -90,8 +90,15 @@ for scripts.
 
 For unknown kernel cheat drops (no driver filename), use `!kmon` instead of
 staring at the TI firehose. Bare `!kmon` arms the same TI + live collectors and
-tails only non-inbox drops, short-lived loads, mapper leftovers, and hidden
-processes. `!timeline` remains the evidence graph/dashboard.
+tails only non-inbox drops, short-lived loads, live mapped payloads (pool PE /
+unbacked DRIVER_OBJECT / kpage PE), unbacked callbacks/input/SSDT hooks,
+mapper leftovers, hidden processes, Windows-named masquerade, EXE-region
+replace (`process.hollow`: private/unbacked MEM_IMAGE, mapped-path, stamp/arch,
+builtin COW/.text vs disk, extra PE, ghosting), implants, and builtin/drop
+`inject.remote`. `/name` adds overlay-style inject. `/background` arms without
+occupying the prompt. `add`/`remove` only while collecting. Esc detaches the
+tail; collection keeps running. `!timeline` remains the evidence graph/dashboard.
+Lab fixture: `docs/KMON_TEST_TARGET.md`.
 
 ## Scenario: Fast Triage
 
