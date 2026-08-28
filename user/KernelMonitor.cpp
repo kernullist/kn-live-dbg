@@ -1416,7 +1416,9 @@ namespace
             {
                 break;
             }
-            if (!symbols->FindField(L"nt!_KPROCESS", L"InstrumentationCallback", &icField, &ignored))
+            if (!symbols->FindField(L"nt!_KPROCESS", L"InstrumentationCallback", &icField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"InstrumentationCallback", &icField, &ignored) &&
+                !symbols->FindField(L"_KPROCESS", L"InstrumentationCallback", &icField, &ignored))
             {
                 break;
             }
@@ -5050,7 +5052,6 @@ void KernelMonitor::ScanUserModeHostility()
                 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                 FALSE,
                 pid);
-            const bool hasQueryInfo = processHandle != nullptr;
             if (processHandle == nullptr)
             {
                 processHandle = OpenProcess(
@@ -5101,9 +5102,14 @@ void KernelMonitor::ScanUserModeHostility()
             ProcessVadScanResult kernelVad = {};
             ProcessVadRecord exeVad = {};
             bool kernelVadScanned = false;
-            const bool hasKernelVadScan =
-                !queried &&
+            // Watched games always get a kernel VAD/PTE view: VirtualQueryEx
+            // cannot see executable PTEs that have no covering VAD. Builtin
+            // PPL hosts only pay for that walk when usermode query failed.
+            const bool wantKernelVad =
                 (watched || builtin) &&
+                (!queried || watched);
+            const bool hasKernelVadScan =
+                wantKernelVad &&
                 QueryKernelVadScan(
                     device,
                     symbols,
@@ -5111,6 +5117,18 @@ void KernelMonitor::ScanUserModeHostility()
                     &kernelVad,
                     &kernelVadScanned,
                     watched);
+            if ((watched || builtin) && !queried && !kernelVadScanned)
+            {
+                EmitUnique(
+                    L"process.implant",
+                    L"scan_failed:userhostility:vad:" + std::to_wstring(pid),
+                    imagePath,
+                    L"user",
+                    L"kernel VAD scan failed for pid=" + std::to_wstring(pid) +
+                        L" " + leaf,
+                    L"PPL/no-handle EXE and private-exec coverage is absent",
+                    pid);
+            }
             bool hasKernelVad = false;
             if (hasKernelVadScan && exeRegion != 0)
             {
@@ -5130,7 +5148,7 @@ void KernelMonitor::ScanUserModeHostility()
                 bool privateExe =
                     committed &&
                     (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED);
-                if (hasKernelVad)
+                if (!queried && hasKernelVad)
                 {
                     committed = true;
                     privateExe =
@@ -5530,7 +5548,6 @@ void KernelMonitor::ScanUserModeHostility()
                             }
                         }
                         if (compareText &&
-                            hasQueryInfo &&
                             hasVmRead &&
                             committed &&
                             mbi.Type == MEM_IMAGE &&
@@ -5713,8 +5730,15 @@ void KernelMonitor::ScanUserModeHostility()
             if (hasKernelVadScan && (watched || builtin))
             {
                 uint32_t vadImplants = 0;
+                // Usermode VirtualQueryEx already reported MZ/RWX orphans.
+                // Keep kernel private-VAD implants for the no-handle path.
+                const bool emitPrivateVadImplants = !queried;
                 for (const ProcessVadRecord& record : kernelVad.Records)
                 {
+                    if (!emitPrivateVadImplants)
+                    {
+                        break;
+                    }
                     if (vadImplants >= 4)
                     {
                         break;
@@ -5887,6 +5911,7 @@ void KernelMonitor::ScanUserModeHostility()
                 const std::wstring moduleLeaf = KmonBasenameLower(modulePath);
                 const bool watchedUnimported =
                     watched &&
+                    !importedDlls.empty() &&
                     !windowsModule &&
                     inImageDir &&
                     moduleClass == L"unknown" &&
@@ -5948,9 +5973,7 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         auto it = LoggingEnabledPids.find(pid);
-        if (it != LoggingEnabledPids.end() &&
-            created != 0 &&
-            it->second == created)
+        if (it != LoggingEnabledPids.end() && it->second == created)
         {
             return;
         }
