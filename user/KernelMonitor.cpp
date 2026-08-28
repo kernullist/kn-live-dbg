@@ -717,6 +717,10 @@ namespace
         {
             length = static_cast<uint32_t>(createField.Length);
         }
+        if (createField.Offset > (std::numeric_limits<uint64_t>::max)() - eprocess)
+        {
+            return 0;
+        }
 
         std::vector<uint8_t> bytes;
         if (!device->ReadMemory(
@@ -3059,11 +3063,15 @@ void KernelMonitor::ScanHiddenProcesses()
             continue;
         }
 
+        const uint64_t created = (record.Eprocess != 0)
+            ? QueryEprocessCreateTime(device, symbols, nullptr, record.Eprocess)
+            : 0;
         bool already = false;
         {
             std::lock_guard<std::mutex> watchLock(WatchMutex);
             const std::wstring hideKey =
-                L"hidden:" + std::to_wstring(record.ProcessId) + L":" + HexU64(record.Eprocess);
+                L"hidden:" + std::to_wstring(record.ProcessId) + L":" +
+                HexU64(record.Eprocess) + L":" + std::to_wstring(created);
             already = !EmittedMapperKeys.insert(hideKey).second;
         }
         if (already)
@@ -3859,6 +3867,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 {
                     continue;
                 }
+                if (AddressOwnedByLoadedModule(symbols, entry.Handler))
+                {
+                    continue;
+                }
                 if (emitted >= 16)
                 {
                     break;
@@ -4263,7 +4275,8 @@ void KernelMonitor::ScanUserModeHostility()
     PROCESSENTRY32W entry = {};
     entry.dwSize = sizeof(entry);
     BOOL more = FALSE;
-    if (Process32FirstW(snap, &entry))
+    const bool firstOk = Process32FirstW(snap, &entry) != FALSE;
+    if (firstOk)
     {
         more = TRUE;
         do
@@ -4343,6 +4356,18 @@ void KernelMonitor::ScanUserModeHostility()
             target.Interesting = true;
             targets.push_back(std::move(target));
         }
+    }
+
+    if (!firstOk && targets.empty())
+    {
+        EmitUnique(
+            L"process.implant",
+            L"scan_failed:userhostility",
+            std::wstring(),
+            L"user",
+            L"user-mode hostility scan failed to enumerate processes",
+            std::wstring());
+        return;
     }
 
     auto highEnd = std::stable_partition(
