@@ -1019,9 +1019,9 @@ void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
     }
 }
 
-const std::vector<KernelModuleInfo>& SymbolEngine::Modules() const
+std::vector<KernelModuleInfo> SymbolEngine::Modules() const
 {
-    return modules_;
+    return CopyModules();
 }
 
 std::vector<KernelModuleInfo> SymbolEngine::CopyModules() const

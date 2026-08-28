@@ -612,7 +612,8 @@ namespace
                 break;
             }
 
-            const KernelModuleInfo* module = FindModuleForAddress(symbols.Modules(), address);
+            const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+            const KernelModuleInfo* module = FindModuleForAddress(modules, address);
             if (module != nullptr && moduleName != nullptr)
             {
                 *moduleName = module->ImageName;
@@ -1163,7 +1164,8 @@ namespace
             if (ReadFieldInteger(device, driverObject, driverStartField, sizeof(uint64_t), &value, nullptr))
             {
                 record->DriverStart = value;
-                const KernelModuleInfo* module = FindModuleForAddress(symbols.Modules(), value);
+                const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+                const KernelModuleInfo* module = FindModuleForAddress(modules, value);
                 if (module != nullptr)
                 {
                     record->DriverModule = module->ImageName;

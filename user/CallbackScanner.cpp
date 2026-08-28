@@ -753,10 +753,10 @@ public:
                 break;
             }
 
-            const KernelModuleInfo* module = FindModuleForAddress(address);
-            if (module != nullptr && moduleName != nullptr)
+            std::wstring owned;
+            if (FindModuleNameForAddress(address, &owned) && moduleName != nullptr)
             {
-                *moduleName = module->ImageName;
+                *moduleName = owned;
             }
 
             std::wstring nearest;
@@ -794,7 +794,7 @@ public:
                 break;
             }
 
-            result = FindModuleForAddress(value) != nullptr;
+            result = FindModuleNameForAddress(value, nullptr);
         } while (false);
 
         return result;
@@ -1004,11 +1004,11 @@ private:
         return ok;
     }
 
-    const KernelModuleInfo* FindModuleForAddress(uint64_t address) const
+    bool FindModuleNameForAddress(uint64_t address, std::wstring* name) const
     {
-        const KernelModuleInfo* found = nullptr;
-
-        for (const KernelModuleInfo& module : symbols_.Modules())
+        bool found = false;
+        const std::vector<KernelModuleInfo> modules = symbols_.CopyModules();
+        for (const KernelModuleInfo& module : modules)
         {
             uint64_t end = module.Base + module.Size;
             if (end < module.Base)
@@ -1018,7 +1018,11 @@ private:
 
             if (address >= module.Base && address < end)
             {
-                found = &module;
+                if (name != nullptr)
+                {
+                    *name = module.ImageName;
+                }
+                found = true;
                 break;
             }
         }

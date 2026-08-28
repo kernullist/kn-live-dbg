@@ -80,7 +80,7 @@ public:
 
     bool LoadKernelModules(std::wstring* error);
     bool PreloadKernelSymbols(size_t* loadedCount, std::wstring* error);
-    const std::vector<KernelModuleInfo>& Modules() const;
+    std::vector<KernelModuleInfo> Modules() const;
     std::vector<KernelModuleInfo> CopyModules() const;
 
     bool ResolveSymbol(const std::wstring& name, uint64_t* address, std::wstring* error);

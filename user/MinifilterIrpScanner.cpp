@@ -1083,12 +1083,13 @@ namespace
 
             uint64_t fallbackPost = 0;
             uint64_t fallbackLegacy = 0;
-            const size_t moduleCount = symbols.Modules().size();
+            const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+            const size_t moduleCount = modules.size();
             for (int pass = 0; pass < 2 && !ok; ++pass)
             {
                 for (size_t index = 0; index < moduleCount; ++index)
                 {
-                    const KernelModuleInfo& module = symbols.Modules()[index];
+                    const KernelModuleInfo& module = modules[index];
                     const bool nameHit =
                         ModuleLooksLikeKnLiveDbg(module.ImageName) ||
                         LeftoverNamesMatch(module.ImageName, L"KnLiveDbg.sys");

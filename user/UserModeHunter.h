@@ -351,6 +351,12 @@ std::wstring HuntFirstCommandLineImage(const std::wstring& commandLine);
 bool HuntProcessLifecycleSelfTest();
 bool HuntInjectedModuleSelfTest();
 bool HuntCidTableAnchorSelfTest();
+bool EnumerateCidProcessIds(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    std::vector<uint32_t>* processIds,
+    std::wstring* warning,
+    bool* complete);
 bool HuntDiskPeBoundsSelfTest();
 bool HuntBaseRelocationMaskSelfTest();
 bool HuntDynamicRelocationMaskSelfTest();

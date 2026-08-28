@@ -2,6 +2,7 @@
 
 #include "HandleTableScanner.h"
 #include "McpJson.h"
+#include "UserModeHunter.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -1123,8 +1124,7 @@ bool HiddenProcessScanner::Scan(
             result->Warnings.push_back(L"kernel process lifecycle fields were not fully resolved");
         }
 
-        result->CoverageComplete =
-            kernelInventoryComplete &&
+        const bool userInventoryComplete =
             result->SystemProcessInfoCount > 0 &&
             result->ToolhelpCount > 0;
 
@@ -1185,6 +1185,40 @@ bool HiddenProcessScanner::Scan(
         {
             confirmIfMissingFromLists(pid);
         }
+
+        std::vector<uint32_t> cidPids;
+        std::wstring cidWarning;
+        bool cidWalkComplete = false;
+        if (EnumerateCidProcessIds(
+                device_,
+                symbols_,
+                &cidPids,
+                &cidWarning,
+                &cidWalkComplete))
+        {
+            for (uint32_t pid : cidPids)
+            {
+                confirmIfMissingFromLists(pid);
+            }
+        }
+        else
+        {
+            cidWalkComplete = false;
+            if (!cidWarning.empty())
+            {
+                result->Warnings.push_back(cidWarning);
+            }
+        }
+        if (!cidWalkComplete)
+        {
+            result->Warnings.push_back(
+                L"PspCidTable process walk was incomplete; CID-only hidden processes may be missed");
+        }
+
+        result->CoverageComplete =
+            kernelInventoryComplete &&
+            userInventoryComplete &&
+            cidWalkComplete;
 
         std::vector<uint32_t> kernelOnlyPids;
         for (const auto& pair : views)
