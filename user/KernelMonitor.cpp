@@ -4556,33 +4556,53 @@ void KernelMonitor::ScanHookCallbacks()
 
     for (const KernelCallbackRecord& record : result.Records)
     {
-        const bool preOutside =
-            record.Function != 0 &&
-            record.FunctionModule.empty() &&
-            !AddressOwnedByLoadedModule(symbols, record.Function);
-        const bool postOutside =
-            record.PostFunction != 0 &&
-            record.PostFunctionModule.empty() &&
-            !AddressOwnedByLoadedModule(symbols, record.PostFunction);
-        if (!preOutside && !postOutside && !record.Poisoned)
+        bool emittedUnbacked = false;
+        auto emitCallbackIfUnbacked = [&](
+            uint64_t fn,
+            const std::wstring& moduleName,
+            const wchar_t* which)
         {
-            continue;
-        }
-
-        const uint64_t fn = preOutside ? record.Function : record.PostFunction;
-        std::wstring summary = L"unbacked " + record.Kind;
-        if (!record.Target.empty())
+            if (fn == 0 || AddressOwnedByLoadedModule(symbols, fn))
+            {
+                return;
+            }
+            std::wstring summary = L"unbacked " + record.Kind;
+            if (which != nullptr && which[0] != L'\0')
+            {
+                summary += L" ";
+                summary += which;
+            }
+            if (!record.Target.empty())
+            {
+                summary += L" ";
+                summary += record.Target;
+            }
+            summary += L" callback ";
+            summary += HexU64(fn);
+            EmitUnique(
+                L"hook.unbacked",
+                L"cb:" + record.Kind + L":" + which + HexU64(fn),
+                moduleName.empty() ? record.Kind : moduleName,
+                L"callback",
+                summary,
+                record.Notes);
+            emittedUnbacked = true;
+        };
+        emitCallbackIfUnbacked(record.Function, record.FunctionModule, L"");
+        emitCallbackIfUnbacked(
+            record.PostFunction,
+            record.PostFunctionModule,
+            L"post:");
+        if (record.Poisoned && !emittedUnbacked)
         {
-            summary += L" " + record.Target;
+            EmitUnique(
+                L"hook.unbacked",
+                L"cb:" + record.Kind + L":poison:" + HexU64(record.Entry),
+                record.FunctionModule.empty() ? record.Kind : record.FunctionModule,
+                L"callback",
+                L"poisoned " + record.Kind + L" callback entry " + HexU64(record.Entry),
+                record.Notes);
         }
-        summary += L" callback " + HexU64(fn != 0 ? fn : record.Function);
-        EmitUnique(
-            L"hook.unbacked",
-            L"cb:" + record.Kind + L":" + HexU64(fn != 0 ? fn : record.Entry),
-            record.FunctionModule.empty() ? record.Kind : record.FunctionModule,
-            L"callback",
-            summary,
-            record.Notes);
     }
 }
 
@@ -4745,6 +4765,31 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             {
                 ClearEmittedKey(L"scan_failed:ssdt:truncated");
             }
+            bool haveWin32k = false;
+            for (const SsdtTable& table : result.Tables)
+            {
+                if (table.ExpectedModule.find(L"win32k") != std::wstring::npos)
+                {
+                    haveWin32k = true;
+                    break;
+                }
+            }
+            if (!haveWin32k)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:ssdt:shadow",
+                    std::wstring(),
+                    L"ssdt",
+                    L"win32k SSDT was not resolved; shadow syscall hooks may be missed",
+                    result.Warnings.empty()
+                        ? L"KeServiceDescriptorTableShadow missing"
+                        : result.Warnings.front());
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:ssdt:shadow");
+            }
         }
         else
         {
@@ -4878,6 +4923,24 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:cr");
+            const uint32_t sampled = result.Readings.empty()
+                ? 0u
+                : static_cast<uint32_t>(result.Readings.front().PerCpuValues.size());
+            if (result.ProcessorCount != 0 && sampled < result.ProcessorCount)
+            {
+                EmitUnique(
+                    L"integrity.cr",
+                    L"scan_failed:cr:coverage",
+                    std::wstring(),
+                    L"cr",
+                    L"control register sample missed one or more processors",
+                    L"sampled=" + std::to_wstring(sampled) +
+                        L" cpus=" + std::to_wstring(result.ProcessorCount));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:cr:coverage");
+            }
             for (const CrReading& reading : result.Readings)
             {
                 if (!reading.Suspicious)
@@ -5396,6 +5459,7 @@ void KernelMonitor::ScanUserModeHostility()
     entry.dwSize = sizeof(entry);
     BOOL more = FALSE;
     DWORD nextError = ERROR_SUCCESS;
+    bool snapshotCapped = false;
     const bool firstOk = Process32FirstW(snap, &entry) != FALSE;
     if (firstOk)
     {
@@ -5403,8 +5467,14 @@ void KernelMonitor::ScanUserModeHostility()
         do
         {
             const uint32_t pid = entry.th32ProcessID;
-            if (pid > 4 && pid != selfPid && targets.size() < 4096)
+            if (pid > 4 && pid != selfPid)
             {
+                if (targets.size() >= 4096)
+                {
+                    snapshotCapped = true;
+                }
+                else
+                {
                 KmonUserTarget target;
                 target.Pid = pid;
                 HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -5436,6 +5506,7 @@ void KernelMonitor::ScanUserModeHostility()
                     pathClass == L"third_party" ||
                     pathClass == L"unknown";
                 targets.push_back(std::move(target));
+                }
             }
             entry.dwSize = sizeof(entry);
             more = Process32NextW(snap, &entry);
@@ -5523,10 +5594,16 @@ void KernelMonitor::ScanUserModeHostility()
 
     constexpr uint32_t kMaxDeepScans = 1024;
     uint32_t scanned = 0;
+    bool deepCapped = false;
     for (const KmonUserTarget& target : targets)
     {
-        if (StopRequested.load() || scanned >= kMaxDeepScans)
+        if (StopRequested.load())
         {
+            break;
+        }
+        if (scanned >= kMaxDeepScans)
+        {
+            deepCapped = true;
             break;
         }
         ++scanned;
@@ -6630,6 +6707,23 @@ void KernelMonitor::ScanUserModeHostility()
                 ++implants;
             }
     }
+
+    if (!StopRequested.load() && (snapshotCapped || deepCapped))
+    {
+        EmitUnique(
+            L"process.implant",
+            L"scan_failed:userhostility:truncated",
+            std::wstring(),
+            L"user",
+            L"user-mode hostility scan hit a process cap; extra hosts may be missed",
+            snapshotCapped
+                ? L"toolhelp snapshot capped at 4096"
+                : L"deep scan capped at 1024");
+    }
+    else if (!StopRequested.load())
+    {
+        ClearEmittedKey(L"scan_failed:userhostility:truncated");
+    }
 }
 
 void KernelMonitor::EnableLoggingForPid(uint32_t pid)
@@ -6914,9 +7008,20 @@ void KernelMonitor::EnableLoggingForWatchTargets()
     }
 
     std::vector<uint32_t> namedPids;
-    if (!CollectToolhelpPidsByName(names, &namedPids))
+    if (!names.empty() && !CollectToolhelpPidsByName(names, &namedPids))
     {
         namedPids.clear();
+        EmitUnique(
+            L"process.implant",
+            L"scan_failed:userhostility:watchenum",
+            std::wstring(),
+            L"user",
+            L"watch-name process enumeration failed; newly started watches may lack logging",
+            L"CollectToolhelpPidsByName returned false");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:userhostility:watchenum");
     }
     for (uint32_t pid : namedPids)
     {
