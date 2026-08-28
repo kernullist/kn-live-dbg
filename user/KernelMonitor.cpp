@@ -5108,12 +5108,14 @@ void KernelMonitor::ScanUserModeHostility()
             ProcessVadScanResult kernelVad = {};
             ProcessVadRecord exeVad = {};
             bool kernelVadScanned = false;
-            // Watched games always get a kernel VAD/PTE view: VirtualQueryEx
-            // cannot see executable PTEs that have no covering VAD. Builtin
-            // PPL hosts only pay for that walk when usermode query failed.
-            const bool wantKernelVad =
+            // VirtualQueryEx can succeed while Toolhelp module enumeration
+            // fails (ObCallback / PPL). The usermode orphan walk needs a
+            // module list, so those targets still need kernel private-VAD
+            // PE probes. Hidden PTEs are always collected for watches.
+            const bool needKernelPrivateImplants =
                 (watched || builtin) &&
-                (!queried || watched);
+                (!queried || !moduleInventoryComplete);
+            const bool wantKernelVad = watched || needKernelPrivateImplants;
             const bool hasKernelVadScan =
                 wantKernelVad &&
                 QueryKernelVadScan(
@@ -5123,8 +5125,8 @@ void KernelMonitor::ScanUserModeHostility()
                     &kernelVad,
                     &kernelVadScanned,
                     watched,
-                    !queried);
-            if ((watched || builtin) && !queried && !kernelVadScanned)
+                    needKernelPrivateImplants);
+            if (wantKernelVad && !kernelVadScanned)
             {
                 EmitUnique(
                     L"process.implant",
@@ -5769,9 +5771,10 @@ void KernelMonitor::ScanUserModeHostility()
             if (hasKernelVadScan && (watched || builtin))
             {
                 uint32_t vadImplants = 0;
-                // Usermode VirtualQueryEx already reported MZ/RWX orphans.
-                // Keep kernel private-VAD implants for the no-handle path.
-                const bool emitPrivateVadImplants = !queried;
+                // Usermode VirtualQueryEx already reported MZ/RWX orphans
+                // when the module list is complete. Keep kernel private-VAD
+                // implants when that walk cannot run.
+                const bool emitPrivateVadImplants = needKernelPrivateImplants;
                 for (const ProcessVadRecord& record : kernelVad.Records)
                 {
                     if (!emitPrivateVadImplants)
@@ -5829,9 +5832,10 @@ void KernelMonitor::ScanUserModeHostility()
                         pid);
                     ++vadImplants;
                 }
+                uint32_t pteImplants = 0;
                 for (const ProcessHiddenVadPteRecord& pte : kernelVad.HiddenPteRecords)
                 {
-                    if (vadImplants >= 4)
+                    if (pteImplants >= 4)
                     {
                         break;
                     }
@@ -5857,7 +5861,7 @@ void KernelMonitor::ScanUserModeHostility()
                             L" size=" + std::to_wstring(
                                 static_cast<unsigned long long>(pte.Size)),
                         pid);
-                    ++vadImplants;
+                    ++pteImplants;
                 }
             }
 
@@ -6126,6 +6130,7 @@ void KernelMonitor::PruneStalePromotedWatches()
     }
 
     std::vector<uint32_t> logging;
+    std::vector<uint32_t> droppedWatch;
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
         if (prunePromoted)
@@ -6143,6 +6148,13 @@ void KernelMonitor::PruneStalePromotedWatches()
                 if (WatchExplicitPids.count(pid) == 0)
                 {
                     WatchPids.erase(pid);
+                    droppedWatch.push_back(pid);
+                    if (LoggingEnabledPids.erase(pid) != 0 &&
+                        LoggingEnabledCount.load() > 0)
+                    {
+                        LoggingEnabledCount.fetch_sub(1);
+                    }
+                    LoggingFailedPids.erase(pid);
                 }
             }
         }
@@ -6165,6 +6177,11 @@ void KernelMonitor::PruneStalePromotedWatches()
         std::lock_guard<std::mutex> stateLock(StateMutex);
         device = Device;
         symbols = Symbols;
+    }
+
+    for (uint32_t pid : droppedWatch)
+    {
+        DisableProcessLogging(device, pid);
     }
 
     for (uint32_t pid : logging)
