@@ -28,6 +28,7 @@ struct NmiScanResult
     uint64_t FirstNodeAddress = 0;
     std::wstring ListHeadSymbol;
     bool     ListHeadResolved = false;
+    bool     Incomplete = false;
 };
 
 class NmiScanner
