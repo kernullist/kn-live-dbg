@@ -996,6 +996,87 @@ namespace
         return address >= 0x10000ull && address <= 0x00007FFFFFFEFFFFull;
     }
 
+    bool QuerySectionBaseAddress(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        uint64_t* imageBase)
+    {
+        bool ok = false;
+        do
+        {
+            if (imageBase != nullptr)
+            {
+                *imageBase = 0;
+            }
+            if (imageBase == nullptr ||
+                device == nullptr ||
+                symbols == nullptr ||
+                pid <= 4 ||
+                !device->IsOpen())
+            {
+                break;
+            }
+
+            TypeFieldInfo dtbField = {};
+            TypeFieldInfo sectionField = {};
+            std::wstring ignored;
+            if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            {
+                break;
+            }
+            if (!symbols->FindField(L"nt!_EPROCESS", L"SectionBaseAddress", &sectionField, &ignored) &&
+                !symbols->FindField(L"_EPROCESS", L"SectionBaseAddress", &sectionField, &ignored))
+            {
+                break;
+            }
+
+            ProcessAddressContext ctx = {};
+            if (!device->ResolveProcess(
+                    pid,
+                    static_cast<uint32_t>(dtbField.Offset),
+                    0,
+                    &ctx,
+                    &ignored) ||
+                ctx.Eprocess == 0)
+            {
+                break;
+            }
+            if (sectionField.Offset > (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess)
+            {
+                break;
+            }
+
+            uint32_t length = sizeof(uint64_t);
+            if (sectionField.Length != 0 && sectionField.Length <= 8)
+            {
+                length = static_cast<uint32_t>(sectionField.Length);
+            }
+            std::vector<uint8_t> bytes;
+            if (!device->ReadMemory(
+                    ctx.Eprocess + static_cast<uint64_t>(sectionField.Offset),
+                    length,
+                    &bytes,
+                    &ignored) ||
+                bytes.size() < length)
+            {
+                break;
+            }
+
+            uint64_t value = 0;
+            std::memcpy(&value, bytes.data(), length);
+            if (!IsUserModeImageBase(value))
+            {
+                break;
+            }
+            *imageBase = value;
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
     bool QueryProcessIsWow64(
         HANDLE process,
         DeviceClient* device,
@@ -1544,7 +1625,7 @@ namespace
             }
             uint64_t value = 0;
             std::memcpy(&value, bytes.data(), sizeof(value));
-            if (value == 0 || !IsUserModeImageBase(value))
+            if (value == 0)
             {
                 break;
             }
@@ -1716,13 +1797,13 @@ namespace
                 uint32_t nameFile = 0;
                 if (!RvaToFileOffset(headers, nameRva, &nameFile))
                 {
-                    continue;
+                    break;
                 }
                 std::vector<uint8_t> nameBytes;
                 if (!ReadDiskRange(imagePath, nameFile, 256, &nameBytes) ||
                     nameBytes.empty())
                 {
-                    continue;
+                    break;
                 }
                 std::wstring wide;
                 for (uint8_t byte : nameBytes)
@@ -1737,10 +1818,11 @@ namespace
                     }
                 }
                 std::wstring base = KmonBasenameLower(wide);
-                if (!base.empty())
+                if (base.empty())
                 {
-                    names->insert(std::move(base));
+                    break;
                 }
+                names->insert(std::move(base));
             }
         } while (false);
         return terminated;
@@ -3587,8 +3669,16 @@ void KernelMonitor::ScanHiddenProcesses()
     }
     if (device == nullptr || symbols == nullptr || !device->IsOpen())
     {
+        EmitUnique(
+            L"process.hidden",
+            L"scan_failed:hidden:device",
+            std::wstring(),
+            L"hiddenproc",
+            L"hidden-process scan skipped; kernel device is not open",
+            L"Device is null or closed");
         return;
     }
+    ClearEmittedKey(L"scan_failed:hidden:device");
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitUnique(
@@ -3860,6 +3950,41 @@ bool KernelMonitor::GetLiveTargets(DeviceClient** device, SymbolEngine** symbols
     return ok;
 }
 
+std::wstring KernelMonitor::MakeEmittedKey(const std::wstring& key, uint32_t processId) const
+{
+    std::wstring uniqueKey = key;
+    if (processId <= 4)
+    {
+        return uniqueKey;
+    }
+
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> stateLock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    HANDLE process = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        FALSE,
+        processId);
+    const uint64_t created = QueryPidCreateTime(device, symbols, process, processId);
+    if (process != nullptr)
+    {
+        CloseHandle(process);
+    }
+    if (created != 0)
+    {
+        uniqueKey += L":" + std::to_wstring(created);
+    }
+    else
+    {
+        uniqueKey += L":gone";
+    }
+    return uniqueKey;
+}
+
 void KernelMonitor::EmitUnique(
     const std::wstring& kind,
     const std::wstring& key,
@@ -3871,34 +3996,7 @@ void KernelMonitor::EmitUnique(
 {
     bool claimed = false;
     {
-        std::wstring uniqueKey = key;
-        if (processId > 4)
-        {
-            DeviceClient* device = nullptr;
-            SymbolEngine* symbols = nullptr;
-            {
-                std::lock_guard<std::mutex> stateLock(StateMutex);
-                device = Device;
-                symbols = Symbols;
-            }
-            HANDLE process = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE,
-                processId);
-            const uint64_t created = QueryPidCreateTime(device, symbols, process, processId);
-            if (process != nullptr)
-            {
-                CloseHandle(process);
-            }
-            if (created != 0)
-            {
-                uniqueKey += L":" + std::to_wstring(created);
-            }
-            else
-            {
-                uniqueKey += L":gone";
-            }
-        }
+        const std::wstring uniqueKey = MakeEmittedKey(key, processId);
         std::lock_guard<std::mutex> lock(WatchMutex);
         claimed = EmittedMapperKeys.insert(uniqueKey).second;
     }
@@ -3958,6 +4056,11 @@ void KernelMonitor::ClearEmittedKey(const std::wstring& key)
     EmittedMapperKeys.erase(key);
 }
 
+void KernelMonitor::ClearEmittedKeyForPid(const std::wstring& key, uint32_t processId)
+{
+    ClearEmittedKey(MakeEmittedKey(key, processId));
+}
+
 void KernelMonitor::ScanMapperRemnants()
 {
     DeviceClient* device = nullptr;
@@ -3969,8 +4072,15 @@ void KernelMonitor::ScanMapperRemnants()
     }
     if (device == nullptr || symbols == nullptr || !device->IsOpen())
     {
+        EmitMappedResidue(
+            L"scan_failed:mapper:device",
+            std::wstring(),
+            L"mapper_scan",
+            L"mapper remnant scan skipped; kernel device is not open",
+            L"Device is null or closed");
         return;
     }
+    ClearEmittedKey(L"scan_failed:mapper:device");
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitMappedResidue(
@@ -4000,6 +4110,47 @@ void KernelMonitor::ScanMapperRemnants()
     }
     MapperScans.fetch_add(1);
     ClearEmittedKey(L"scan_failed:mapper");
+    if (!result.UnloadedComplete)
+    {
+        EmitMappedResidue(
+            L"scan_failed:mapper:unloaded",
+            std::wstring(),
+            L"mapper_scan",
+            L"MmUnloadedDrivers walk was incomplete",
+            result.Warnings.empty()
+                ? L"UnloadedComplete is false"
+                : result.Warnings.front());
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:mapper:unloaded");
+    }
+    if (!result.PiddbComplete)
+    {
+        EmitMappedResidue(
+            L"scan_failed:mapper:piddb",
+            std::wstring(),
+            L"mapper_scan",
+            L"PiDDBCache walk was incomplete",
+            L"PiddbComplete is false");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:mapper:piddb");
+    }
+    if (!result.HashComplete)
+    {
+        EmitMappedResidue(
+            L"scan_failed:mapper:hash",
+            std::wstring(),
+            L"mapper_scan",
+            L"ci-hash walk was incomplete",
+            L"HashComplete is false");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:mapper:hash");
+    }
 
     for (const MapperUnloadedRecord& record : result.Unloaded)
     {
@@ -4053,8 +4204,15 @@ void KernelMonitor::ScanPoolMappedImages()
     }
     if (device == nullptr || !device->IsOpen())
     {
+        EmitMappedResidue(
+            L"scan_failed:pool_pe:device",
+            std::wstring(),
+            L"pool_pe",
+            L"pool PE scan skipped; kernel device is not open",
+            L"Device is null or closed");
         return;
     }
+    ClearEmittedKey(L"scan_failed:pool_pe:device");
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitMappedResidue(
@@ -4085,6 +4243,19 @@ void KernelMonitor::ScanPoolMappedImages()
     }
     PoolPeScans.fetch_add(1);
     ClearEmittedKey(L"scan_failed:pool_pe");
+    if (options.LimitHits != 0 && result.Hits.size() >= options.LimitHits)
+    {
+        EmitMappedResidue(
+            L"scan_failed:pool_pe:truncated",
+            std::wstring(),
+            L"pool_pe",
+            L"pool PE scan hit the hit cap; extra mapped images may be missed",
+            L"LimitHits=" + std::to_wstring(options.LimitHits));
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:pool_pe:truncated");
+    }
 
     for (const PoolPeHit& hit : result.Hits)
     {
@@ -4137,8 +4308,15 @@ void KernelMonitor::ScanUnbackedDriverObjects()
     }
     if (device == nullptr || symbols == nullptr || !device->IsOpen())
     {
+        EmitMappedResidue(
+            L"scan_failed:drvobj:device",
+            std::wstring(),
+            L"driver_object",
+            L"unbacked DRIVER_OBJECT scan skipped; kernel device is not open",
+            L"Device is null or closed");
         return;
     }
+    ClearEmittedKey(L"scan_failed:drvobj:device");
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitMappedResidue(
@@ -4166,6 +4344,19 @@ void KernelMonitor::ScanUnbackedDriverObjects()
         return;
     }
     ClearEmittedKey(L"scan_failed:drvobj");
+    if (result.Truncated)
+    {
+        EmitMappedResidue(
+            L"scan_failed:drvobj:truncated",
+            std::wstring(),
+            L"driver_object",
+            L"DRIVER_OBJECT walk was truncated; extra unbacked starts may be missed",
+            L"Truncated is true");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:drvobj:truncated");
+    }
 
     for (const DriverIntegrityRecord& record : result.Records)
     {
@@ -4220,8 +4411,15 @@ void KernelMonitor::ScanOrphanMappedPages()
     }
     if (device == nullptr || symbols == nullptr || !device->IsOpen())
     {
+        EmitMappedResidue(
+            L"scan_failed:kpage:device",
+            std::wstring(),
+            L"orphan_page",
+            L"orphan kpage scan skipped; kernel device is not open",
+            L"Device is null or closed");
         return;
     }
+    ClearEmittedKey(L"scan_failed:kpage:device");
     if (!EnsureLoadedKernelModules(symbols, true))
     {
         EmitMappedResidue(
@@ -4255,6 +4453,19 @@ void KernelMonitor::ScanOrphanMappedPages()
     }
     KpageScans.fetch_add(1);
     ClearEmittedKey(L"scan_failed:kpage");
+    if (!result.PageWalkComplete)
+    {
+        EmitMappedResidue(
+            L"scan_failed:kpage:coverage",
+            std::wstring(),
+            L"orphan_page",
+            L"orphan kpage walk was incomplete; extra mapped PE / W+X may be missed",
+            L"PageWalkComplete is false");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:kpage:coverage");
+    }
 
     for (const OrphanKernelPageRegion& region : result.Regions)
     {
@@ -4745,6 +4956,23 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(options, &result, &error))
         {
             ClearEmittedKey(L"scan_failed:dpc");
+            if (!result.DpcCoverageComplete || !result.TimerCoverageComplete)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:dpc:coverage",
+                    std::wstring(),
+                    L"dpc",
+                    L"DPC/timer walk was incomplete; extra unbacked routines may be missed",
+                    L"dpc_complete=" +
+                        std::to_wstring(result.DpcCoverageComplete ? 1 : 0) +
+                        L" timer_complete=" +
+                        std::to_wstring(result.TimerCoverageComplete ? 1 : 0));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:dpc:coverage");
+            }
             for (const DpcRoutineRecord& record : result.Dpcs)
             {
                 if (!record.Suspicious)
@@ -4826,33 +5054,51 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         {
             ClearEmittedKey(L"scan_failed:wfp");
             uint32_t emitted = 0;
+            auto emitWfpIfUnbacked = [&](
+                bool suspicious,
+                uint64_t fn,
+                const WfpKernelCallout& callout,
+                const wchar_t* which)
+            {
+                if (!suspicious || fn == 0 || emitted >= 16)
+                {
+                    return;
+                }
+                if (AddressOwnedByLoadedModule(symbols, fn))
+                {
+                    return;
+                }
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"wfp:" + std::to_wstring(callout.CalloutId) + L":" + which,
+                    callout.Name,
+                    L"wfp",
+                    L"WFP callout " + callout.Name + L" " + which +
+                        L" outside modules " + HexU64(fn),
+                    callout.Notes);
+                ++emitted;
+            };
             for (const WfpKernelCallout& callout : result.Callouts)
             {
-                if (!callout.ClassifySuspicious &&
-                    !callout.NotifySuspicious &&
-                    !callout.FlowDeleteSuspicious)
-                {
-                    continue;
-                }
                 if (emitted >= 16)
                 {
                     break;
                 }
-                const uint64_t fn = callout.ClassifySuspicious
-                    ? callout.ClassifyFn
-                    : (callout.NotifySuspicious ? callout.NotifyFn : callout.FlowDeleteFn);
-                if (AddressOwnedByLoadedModule(symbols, fn))
-                {
-                    continue;
-                }
-                EmitUnique(
-                    L"hook.unbacked",
-                    L"wfp:" + std::to_wstring(callout.CalloutId),
-                    callout.Name,
-                    L"wfp",
-                    L"WFP callout " + callout.Name + L" function outside modules " + HexU64(fn),
-                    callout.Notes);
-                ++emitted;
+                emitWfpIfUnbacked(
+                    callout.ClassifySuspicious,
+                    callout.ClassifyFn,
+                    callout,
+                    L"classify");
+                emitWfpIfUnbacked(
+                    callout.NotifySuspicious,
+                    callout.NotifyFn,
+                    callout,
+                    L"notify");
+                emitWfpIfUnbacked(
+                    callout.FlowDeleteSuspicious,
+                    callout.FlowDeleteFn,
+                    callout,
+                    L"flowdelete");
             }
         }
         else
@@ -5290,7 +5536,14 @@ void KernelMonitor::ScanUserModeHostility()
                 &wow64);
             uint64_t pebImageBase = 0;
             QueryPebImageBase(processHandle, device, symbols, pid, &pebImageBase);
-            const uint64_t exeRegion = pebImageBase != 0 ? pebImageBase : moduleBase;
+            uint64_t sectionBase = 0;
+            if (pebImageBase == 0 && moduleBase == 0)
+            {
+                QuerySectionBaseAddress(device, symbols, pid, &sectionBase);
+            }
+            const uint64_t exeRegion = pebImageBase != 0
+                ? pebImageBase
+                : (moduleBase != 0 ? moduleBase : sectionBase);
             if (pebImageBase != 0 &&
                 moduleBase != 0 &&
                 pebImageBase != moduleBase)
@@ -5338,17 +5591,42 @@ void KernelMonitor::ScanUserModeHostility()
                     &kernelVadScanned,
                     watched,
                     needKernelPrivateImplants);
+            const std::wstring vadFailKey =
+                L"scan_failed:userhostility:vad:" + std::to_wstring(pid);
             if (wantKernelVad && !kernelVadScanned)
             {
                 EmitUnique(
                     L"process.implant",
-                    L"scan_failed:userhostility:vad:" + std::to_wstring(pid),
+                    vadFailKey,
                     imagePath,
                     L"user",
                     L"kernel VAD scan failed for pid=" + std::to_wstring(pid) +
                         L" " + leaf,
                     L"PPL/no-handle EXE and private-exec coverage is absent",
                     pid);
+            }
+            else if (wantKernelVad &&
+                (kernelVad.Incomplete ||
+                    kernelVad.Truncated ||
+                    kernelVad.HiddenPteTruncated))
+            {
+                EmitUnique(
+                    L"process.implant",
+                    vadFailKey,
+                    imagePath,
+                    L"user",
+                    L"kernel VAD coverage was incomplete for pid=" +
+                        std::to_wstring(pid) + L" " + leaf,
+                    kernelVad.HiddenPteTruncated
+                        ? L"hidden PTE walk truncated"
+                        : (kernelVad.Truncated
+                            ? L"VAD traversal truncated"
+                            : L"VAD/PTE coverage incomplete"),
+                    pid);
+            }
+            else if (wantKernelVad)
+            {
+                ClearEmittedKeyForPid(vadFailKey, pid);
             }
             bool hasKernelVad = false;
             if (hasKernelVadScan && exeRegion != 0)
@@ -5454,23 +5732,6 @@ void KernelMonitor::ScanUserModeHostility()
                         L"main EXE ImageBase is not committed pid=" +
                             std::to_wstring(pid) + L" " + leaf,
                         L"kernel_vad_no_cover",
-                        pid);
-                }
-                else if (!queried &&
-                    kernelVadScanned &&
-                    !hasKernelVad &&
-                    (kernelVad.Truncated || kernelVad.Incomplete))
-                {
-                    EmitUnique(
-                        L"process.implant",
-                        L"scan_failed:userhostility:vad:" + std::to_wstring(pid),
-                        imagePath,
-                        L"user",
-                        L"kernel VAD coverage was incomplete for pid=" +
-                            std::to_wstring(pid) + L" " + leaf,
-                        kernelVad.Truncated
-                            ? L"VAD traversal truncated"
-                            : L"VAD/PTE coverage incomplete",
                         pid);
                 }
                 else if (KmonExeRegionLooksPrivate(
@@ -6085,7 +6346,13 @@ void KernelMonitor::ScanUserModeHostility()
                 {
                     bool haveOwnershipView = false;
                     bool owned = true;
-                    if (moduleInventoryComplete && !moduleRanges.empty())
+                    const bool kernelIc = !IsUserModeImageBase(ic);
+                    if (kernelIc)
+                    {
+                        haveOwnershipView = true;
+                        owned = false;
+                    }
+                    else if (moduleInventoryComplete && !moduleRanges.empty())
                     {
                         haveOwnershipView = true;
                         owned = AddressInModuleRanges(ic, moduleRanges);
@@ -6117,8 +6384,11 @@ void KernelMonitor::ScanUserModeHostility()
                             L"instrumentation:" + std::to_wstring(pid),
                             imagePath,
                             L"instrumentation_callback",
-                            L"InstrumentationCallback is outside loaded modules pid=" +
-                                std::to_wstring(pid) + L" " + leaf,
+                            kernelIc
+                                ? (L"InstrumentationCallback is a kernel address pid=" +
+                                    std::to_wstring(pid) + L" " + leaf)
+                                : (L"InstrumentationCallback is outside loaded modules pid=" +
+                                    std::to_wstring(pid) + L" " + leaf),
                             L"callback=" + HexU64(ic),
                             pid);
                     }
@@ -7767,6 +8037,38 @@ bool KernelMonitorSelfTest()
         KmonPeLayout importLayout = {};
         CollectImportedDllNames(L"", std::vector<uint8_t>(), importLayout, &imported);
         if (!imported.empty())
+        {
+            break;
+        }
+        std::unordered_set<std::wstring> emptyDirNames;
+        if (!CollectPeDllNameDirectory(
+                L"",
+                std::vector<uint8_t>(),
+                0,
+                0,
+                12,
+                20,
+                &emptyDirNames) ||
+            CollectPeDllNameDirectory(
+                L"",
+                std::vector<uint8_t>(),
+                0x1000,
+                4,
+                12,
+                20,
+                &emptyDirNames))
+        {
+            break;
+        }
+        uint64_t sectionBaseUnknown = 1;
+        if (QuerySectionBaseAddress(nullptr, nullptr, 8, &sectionBaseUnknown) ||
+            sectionBaseUnknown != 0)
+        {
+            break;
+        }
+        uint64_t icUnknown = 1;
+        if (QueryInstrumentationCallback(nullptr, nullptr, 8, &icUnknown) ||
+            icUnknown != 0)
         {
             break;
         }
