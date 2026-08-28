@@ -1659,7 +1659,7 @@ namespace
         return result;
     }
 
-    void CollectPeDllNameDirectory(
+    bool CollectPeDllNameDirectory(
         const std::wstring& imagePath,
         const std::vector<uint8_t>& headers,
         uint32_t dirRva,
@@ -1668,69 +1668,82 @@ namespace
         uint32_t descriptorSize,
         std::unordered_set<std::wstring>* names)
     {
-        if (names == nullptr ||
-            dirRva == 0 ||
-            descriptorSize < 8 ||
-            nameFieldOffset + 4 > descriptorSize ||
-            dirSize < descriptorSize)
+        bool terminated = false;
+        do
         {
-            return;
-        }
-        uint32_t fileOff = 0;
-        if (!RvaToFileOffset(headers, dirRva, &fileOff))
-        {
-            return;
-        }
-        std::vector<uint8_t> table;
-        if (!ReadDiskRange(
-                imagePath,
-                fileOff,
-                (std::min)(dirSize, 0x2000u),
-                &table) ||
-            table.size() < descriptorSize)
-        {
-            return;
-        }
-        const uint32_t count = static_cast<uint32_t>(table.size() / descriptorSize);
-        for (uint32_t i = 0; i < count && i < 256; ++i)
-        {
-            uint32_t nameRva = 0;
-            std::memcpy(
-                &nameRva,
-                table.data() + (i * descriptorSize) + nameFieldOffset,
-                sizeof(nameRva));
-            if (nameRva == 0)
+            if (names == nullptr)
             {
                 break;
             }
-            uint32_t nameFile = 0;
-            if (!RvaToFileOffset(headers, nameRva, &nameFile))
+            if (dirRva == 0 || dirSize == 0)
             {
-                continue;
+                terminated = true;
+                break;
             }
-            std::vector<uint8_t> nameBytes;
-            if (!ReadDiskRange(imagePath, nameFile, 256, &nameBytes) || nameBytes.empty())
+            if (descriptorSize < 8 ||
+                nameFieldOffset + 4 > descriptorSize ||
+                dirSize < descriptorSize)
             {
-                continue;
+                break;
             }
-            std::wstring wide;
-            for (uint8_t byte : nameBytes)
+            uint32_t fileOff = 0;
+            if (!RvaToFileOffset(headers, dirRva, &fileOff))
             {
-                if (byte == 0)
+                break;
+            }
+            constexpr uint32_t kMaxDirBytes = 64u * 1024u;
+            const uint32_t toRead = (std::min)(dirSize, kMaxDirBytes);
+            std::vector<uint8_t> table;
+            if (!ReadDiskRange(imagePath, fileOff, toRead, &table) ||
+                table.size() < descriptorSize)
+            {
+                break;
+            }
+            const uint32_t count = static_cast<uint32_t>(table.size() / descriptorSize);
+            constexpr uint32_t kMaxDescriptors = 2048;
+            for (uint32_t i = 0; i < count && i < kMaxDescriptors; ++i)
+            {
+                uint32_t nameRva = 0;
+                std::memcpy(
+                    &nameRva,
+                    table.data() + (i * descriptorSize) + nameFieldOffset,
+                    sizeof(nameRva));
+                if (nameRva == 0)
                 {
+                    terminated = true;
                     break;
                 }
-                if (byte >= 0x20 && byte < 0x7f)
+                uint32_t nameFile = 0;
+                if (!RvaToFileOffset(headers, nameRva, &nameFile))
                 {
-                    wide.push_back(static_cast<wchar_t>(byte));
+                    continue;
+                }
+                std::vector<uint8_t> nameBytes;
+                if (!ReadDiskRange(imagePath, nameFile, 256, &nameBytes) ||
+                    nameBytes.empty())
+                {
+                    continue;
+                }
+                std::wstring wide;
+                for (uint8_t byte : nameBytes)
+                {
+                    if (byte == 0)
+                    {
+                        break;
+                    }
+                    if (byte >= 0x20 && byte < 0x7f)
+                    {
+                        wide.push_back(static_cast<wchar_t>(byte));
+                    }
+                }
+                std::wstring base = KmonBasenameLower(wide);
+                if (!base.empty())
+                {
+                    names->insert(std::move(base));
                 }
             }
-            std::wstring base = KmonBasenameLower(wide);
-            if (!base.empty())
-            {
-                names->insert(std::move(base));
-            }
-        }
+        } while (false);
+        return terminated;
     }
 
     void CollectImportedDllNames(
@@ -1739,7 +1752,11 @@ namespace
         const KmonPeLayout& layout,
         std::unordered_set<std::wstring>* names)
     {
-        CollectPeDllNameDirectory(
+        if (names == nullptr)
+        {
+            return;
+        }
+        const bool importOk = CollectPeDllNameDirectory(
             imagePath,
             headers,
             layout.ImportRva,
@@ -1747,7 +1764,7 @@ namespace
             12,
             20,
             names);
-        CollectPeDllNameDirectory(
+        const bool delayOk = CollectPeDllNameDirectory(
             imagePath,
             headers,
             layout.DelayImportRva,
@@ -1755,6 +1772,12 @@ namespace
             4,
             32,
             names);
+        if (!importOk || !delayOk)
+        {
+            // A truncated IAT/delay-import walk must not be used for
+            // watched_dir_unimported; missing names would look like implants.
+            names->clear();
+        }
     }
 
     bool ProtectHasExecute(DWORD protect)
@@ -4166,6 +4189,10 @@ void KernelMonitor::ScanUnbackedDriverObjects()
         for (const DriverDispatchRecord& dispatch : record.Dispatch)
         {
             if (!dispatch.Suspicious || dispatch.Function == 0)
+            {
+                continue;
+            }
+            if (AddressOwnedByLoadedModule(symbols, dispatch.Function))
             {
                 continue;
             }
