@@ -2829,9 +2829,13 @@ void KernelMonitor::WorkerLoop()
 void KernelMonitor::IngestThreatIntel()
 {
     TiSubscriber* ti = nullptr;
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
         ti = Ti;
+        device = Device;
+        symbols = Symbols;
     }
     if (ti == nullptr || !ti->IsActive())
     {
@@ -2864,16 +2868,17 @@ void KernelMonitor::IngestThreatIntel()
 
         if (record.ProcessId > 4 && record.ImagePath.empty())
         {
-            uint64_t created = 0;
-            bool unnamedLive = false;
             HANDLE unnamedProcess = OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION,
                 FALSE,
                 record.ProcessId);
+            const uint64_t created = QueryPidCreateTime(
+                device,
+                symbols,
+                unnamedProcess,
+                record.ProcessId);
             if (unnamedProcess != nullptr)
             {
-                unnamedLive = true;
-                created = QueryProcessCreateTicks(unnamedProcess);
                 CloseHandle(unnamedProcess);
             }
             bool claimed = false;
@@ -2881,7 +2886,7 @@ void KernelMonitor::IngestThreatIntel()
                 std::lock_guard<std::mutex> watchLock(WatchMutex);
                 const std::wstring unnamedKey =
                     L"unnamed:" + std::to_wstring(record.ProcessId) + L":" +
-                    (unnamedLive ? std::to_wstring(created) : std::wstring(L"gone"));
+                    (created != 0 ? std::to_wstring(created) : std::wstring(L"gone"));
                 claimed = EmittedMapperKeys.insert(unnamedKey).second;
                 if (claimed)
                 {
