@@ -4619,6 +4619,8 @@ void KernelMonitor::ScanHookInput()
     }
     ClearEmittedKey(L"scan_failed:input");
 
+    bool hitCap = false;
+    uint32_t suspicious = 0;
     for (const InputStackRecord& record : result.Records)
     {
         uint32_t emitted = 0;
@@ -4637,9 +4639,11 @@ void KernelMonitor::ScanHookInput()
                 {
                     continue;
                 }
+                ++suspicious;
                 if (emitted >= 8)
                 {
-                    break;
+                    hitCap = true;
+                    continue;
                 }
                 const uint64_t unbackedObject = attached.DriverObject != 0
                     ? attached.DriverObject
@@ -4658,11 +4662,21 @@ void KernelMonitor::ScanHookInput()
                     notes);
                 ++emitted;
             }
-            if (emitted >= 8)
-            {
-                break;
-            }
         }
+    }
+    if (hitCap)
+    {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:input:truncated",
+            std::wstring(),
+            L"input",
+            L"input stack scan hit the emit cap; extra attached drivers may be missed",
+            L"suspicious=" + std::to_wstring(suspicious));
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:input:truncated");
     }
 }
 
@@ -4758,6 +4772,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         {
             ClearEmittedKey(L"scan_failed:idt");
             uint32_t emitted = 0;
+            uint32_t suspicious = 0;
             for (const IdtEntry& entry : result.Entries)
             {
                 if (!entry.Suspicious || !entry.Present)
@@ -4768,9 +4783,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 {
                     continue;
                 }
+                ++suspicious;
                 if (emitted >= 16)
                 {
-                    break;
+                    continue;
                 }
                 EmitUnique(
                     L"hook.unbacked",
@@ -4781,6 +4797,20 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                         L" handler outside modules " + HexU64(entry.Handler),
                     entry.Notes);
                 ++emitted;
+            }
+            if (suspicious > 16)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:idt:truncated",
+                    std::wstring(),
+                    L"idt",
+                    L"IDT scan hit the emit cap; extra hooked vectors may be missed",
+                    L"suspicious=" + std::to_wstring(suspicious));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:idt:truncated");
             }
         }
         else
@@ -5095,18 +5125,40 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:wfp");
+            if (!result.CoverageComplete || result.Incomplete)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:wfp:coverage",
+                    std::wstring(),
+                    L"wfp",
+                    L"WFP callout walk was incomplete; extra unbacked callouts may be missed",
+                    result.Warnings.empty()
+                        ? L"CoverageComplete is false"
+                        : result.Warnings.front());
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:wfp:coverage");
+            }
             uint32_t emitted = 0;
+            uint32_t suspicious = 0;
             auto emitWfpIfUnbacked = [&](
-                bool suspicious,
+                bool hookSuspicious,
                 uint64_t fn,
                 const WfpKernelCallout& callout,
                 const wchar_t* which)
             {
-                if (!suspicious || fn == 0 || emitted >= 16)
+                if (!hookSuspicious || fn == 0)
                 {
                     return;
                 }
                 if (AddressOwnedByLoadedModule(symbols, fn))
+                {
+                    return;
+                }
+                ++suspicious;
+                if (emitted >= 16)
                 {
                     return;
                 }
@@ -5122,10 +5174,6 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             };
             for (const WfpKernelCallout& callout : result.Callouts)
             {
-                if (emitted >= 16)
-                {
-                    break;
-                }
                 emitWfpIfUnbacked(
                     callout.ClassifySuspicious,
                     callout.ClassifyFn,
@@ -5141,6 +5189,20 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     callout.FlowDeleteFn,
                     callout,
                     L"flowdelete");
+            }
+            if (suspicious > 16)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:wfp:truncated",
+                    std::wstring(),
+                    L"wfp",
+                    L"WFP scan hit the emit cap; extra unbacked callouts may be missed",
+                    L"suspicious=" + std::to_wstring(suspicious));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:wfp:truncated");
             }
         }
         else
@@ -6362,13 +6424,10 @@ void KernelMonitor::ScanUserModeHostility()
                         pid);
                     ++vadImplants;
                 }
-                uint32_t pteImplants = 0;
+                uint32_t hiddenPtes = 0;
+                uint32_t vadRwPtes = 0;
                 for (const ProcessHiddenVadPteRecord& pte : kernelVad.HiddenPteRecords)
                 {
-                    if (pteImplants >= 4)
-                    {
-                        break;
-                    }
                     if (!pte.Executable || pte.Size < 0x1000)
                     {
                         continue;
@@ -6381,6 +6440,17 @@ void KernelMonitor::ScanUserModeHostility()
                     }
                     const bool vadRwPte =
                         pte.Notes.find(L"pte_exec_vad_rw") != std::wstring::npos;
+                    if (vadRwPte)
+                    {
+                        if (vadRwPtes >= 4)
+                        {
+                            continue;
+                        }
+                    }
+                    else if (hiddenPtes >= 4)
+                    {
+                        continue;
+                    }
                     const wchar_t* layer = vadRwPte
                         ? L"pte_exec_vad_rw"
                         : L"hidden_exec_pte";
@@ -6399,7 +6469,14 @@ void KernelMonitor::ScanUserModeHostility()
                             L" size=" + std::to_wstring(
                                 static_cast<unsigned long long>(pte.Size)),
                         pid);
-                    ++pteImplants;
+                    if (vadRwPte)
+                    {
+                        ++vadRwPtes;
+                    }
+                    else
+                    {
+                        ++hiddenPtes;
+                    }
                 }
             }
 
