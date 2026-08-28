@@ -2550,6 +2550,161 @@ static NTSTATUS KnDbgHandleSetProcessProtection(PIRP Irp, PIO_STACK_LOCATION Sta
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+#ifndef PROCESS_SET_INFORMATION
+#define PROCESS_SET_INFORMATION 0x0200
+#endif
+
+typedef NTSTATUS (NTAPI *KNDBG_ZW_SET_INFORMATION_PROCESS)(
+    HANDLE ProcessHandle,
+    ULONG ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength);
+
+static KNDBG_ZW_SET_INFORMATION_PROCESS KnDbgResolveZwSetInformationProcess()
+{
+    static KNDBG_ZW_SET_INFORMATION_PROCESS routine = nullptr;
+    static BOOLEAN resolved = FALSE;
+
+    if (resolved == FALSE)
+    {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"ZwSetInformationProcess");
+        routine = reinterpret_cast<KNDBG_ZW_SET_INFORMATION_PROCESS>(
+            MmGetSystemRoutineAddress(&name));
+        resolved = TRUE;
+    }
+
+    return routine;
+}
+
+static NTSTATUS KnDbgHandleSetProcessLogging(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+    PEPROCESS process = nullptr;
+    BOOLEAN dereference = FALSE;
+    HANDLE processHandle = nullptr;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (outputLength < sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        KNDBG_SET_PROCESS_LOGGING_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+
+        if (request.Acknowledge != KNDBG_WRITE_ACK_MAGIC)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        if (request.ProcessId == 0)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        KNDBG_ZW_SET_INFORMATION_PROCESS setInfo = KnDbgResolveZwSetInformationProcess();
+        if (setInfo == nullptr)
+        {
+            status = STATUS_NOT_SUPPORTED;
+            break;
+        }
+
+        status = PsLookupProcessByProcessId(ULongToHandle(request.ProcessId), &process);
+        if (!NT_SUCCESS(status))
+        {
+            break;
+        }
+        dereference = TRUE;
+
+        status = ObOpenObjectByPointer(
+            process,
+            OBJ_KERNEL_HANDLE,
+            nullptr,
+            PROCESS_SET_INFORMATION,
+            nullptr,
+            KernelMode,
+            &processHandle);
+        if (!NT_SUCCESS(status) || processHandle == nullptr)
+        {
+            if (NT_SUCCESS(status))
+            {
+                status = STATUS_UNSUCCESSFUL;
+            }
+            break;
+        }
+
+        ULONG loggingFlags = request.LoggingFlags;
+        if (loggingFlags == 0)
+        {
+            loggingFlags = KNDBG_PROCESS_LOG_DEFAULT;
+        }
+
+        ULONG classUsed = KNDBG_PROCESS_INFO_ENABLE_LOGGING;
+        NTSTATUS setStatus = setInfo(
+            processHandle,
+            KNDBG_PROCESS_INFO_ENABLE_LOGGING,
+            &loggingFlags,
+            sizeof(loggingFlags));
+        if (!NT_SUCCESS(setStatus))
+        {
+            UCHAR smallFlags = static_cast<UCHAR>(loggingFlags & 0x3u);
+            classUsed = KNDBG_PROCESS_INFO_ENABLE_READWRITEVM_LOGGING;
+            setStatus = setInfo(
+                processHandle,
+                KNDBG_PROCESS_INFO_ENABLE_READWRITEVM_LOGGING,
+                &smallFlags,
+                sizeof(smallFlags));
+        }
+
+        KNDBG_SET_PROCESS_LOGGING_RESPONSE* response =
+            reinterpret_cast<KNDBG_SET_PROCESS_LOGGING_RESPONSE*>(Buffer);
+        RtlZeroMemory(response, sizeof(*response));
+        response->Size = sizeof(*response);
+        response->ProcessId = request.ProcessId;
+        response->LoggingFlagsApplied = loggingFlags;
+        response->InformationClassUsed = classUsed;
+        response->NtStatus = static_cast<KNDBG_UINT32>(setStatus);
+        response->EprocessAddress = reinterpret_cast<KNDBG_UINT64>(process);
+
+        information = sizeof(*response);
+        status = setStatus;
+    } while (false);
+
+    if (processHandle != nullptr)
+    {
+        ZwClose(processHandle);
+    }
+
+    if (dereference && process != nullptr)
+    {
+        ObDereferenceObject(process);
+    }
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static bool KnDbgIsValidNameLeaf(const WCHAR* Leaf)
 {
     bool ok = false;
@@ -3319,6 +3474,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_GET_PHYSICAL_RANGES:
         status = KnDbgHandleGetPhysicalRanges(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_SET_PROCESS_LOGGING:
+        status = KnDbgHandleSetProcessLogging(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

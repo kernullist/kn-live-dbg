@@ -41,6 +41,14 @@ Completed core slices:
     values on the command line. This is not `kdinit /remote`. Operator
     guide: `docs/REMOTE_SETUP.md`. Design:
     `docs/REMOTE_OPERATOR_SESSION.md`.
+11. Unknown kernel-drop monitor (`!kmon`): implemented. Bare `!kmon`
+    arms silent TI plus kernel live callbacks and stays on a live tail
+    of non-inbox driver drops, short-lived loads, mapper leftovers, and
+    hidden processes. A driver filename is not required. Inbox
+    `System32\drivers` stays off unless `/verbose`. Esc detaches;
+    `/background` arms without occupying the prompt. ABI 16 adds
+    `IOCTL_KNDBG_SET_PROCESS_LOGGING` so watched `/name` targets emit
+    TI ReadVM/WriteVM.
 
 Remaining priority order:
 

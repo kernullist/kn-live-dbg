@@ -23,6 +23,7 @@
 #include "DmaPostureScanner.h"
 #include "InputStackScanner.h"
 #include "IntegrityScanner.h"
+#include "KernelMonitor.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -101,6 +102,8 @@ static HANDLE g_CloakMutexHandle = nullptr;
 // singleton's destructor.
 class TiSubscriber;
 static std::atomic<TiSubscriber*> g_TiSubscriberForShutdown{nullptr};
+class KernelMonitor;
+static std::atomic<KernelMonitor*> g_KmonForShutdown{nullptr};
 static bool g_InstanceMutexOwned = false;
 static std::recursive_mutex g_ConsoleOutputMutex;
 static std::atomic_uint64_t g_CommandStreamOutputSerial = 0;
@@ -807,6 +810,13 @@ static BOOL WINAPI ConsoleHandler(DWORD controlType)
         // first; the call is bounded by IOCTL latencies and well under
         // the OS-imposed handler budget (5 s for CTRL_CLOSE_EVENT, 20 s
         // for CTRL_LOGOFF/SHUTDOWN_EVENT by default).
+        KernelMonitor* kmon = g_KmonForShutdown.load();
+        if (kmon != nullptr)
+        {
+            std::wstring stopError;
+            kmon->Stop(&stopError);
+            g_KmonForShutdown.store(nullptr);
+        }
         TiSubscriber* sub = g_TiSubscriberForShutdown.load();
         if (sub != nullptr)
         {
@@ -1841,6 +1851,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !pool           big-pool triage, W+X annotation, and staged PE hunt\n";
     std::wcout << L"  help !byovd          loaded BYOVD catalog scan and fixture\n";
     std::wcout << L"  help !timeline       time-ordered TI/snapshot/live evidence store\n";
+    std::wcout << L"  help !kmon           unknown kernel drop/map/hidden monitor (no filename)\n";
     std::wcout << L"  help !address        canonicality, page-table walk, effective permissions, owner symbol\n";
     std::wcout << L"  help !hal            HAL dispatch table ownership\n";
     std::wcout << L"  help !hive           registry hive GetCellRoutine ownership\n";
@@ -1895,6 +1906,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  dumping       dump-raw <addr> <len> <path> | dump-pe <addr> <path> | dump-kernel <path> | dump-live <path> | dump-analyze <path>\n";
     std::wcout << L"  writes        write off | ed <address> <value> | peq <physical-address> <value>\n";
     std::wcout << L"  ti            set-ppl-antimalware status | !ti status | !ti start /name a.exe | !ti watch\n";
+    std::wcout << L"  kmon          write on | !kmon\n";
     std::wcout << L"  timeline      !timeline | !timeline dashboard | !timeline help advanced\n";
     std::wcout << L"  ai            ai chat object callbacks | ai a.exe eprocess | ai explain !callbacks all\n";
     std::wcout << L"\n";
@@ -2307,6 +2319,7 @@ static bool IsNativeBangCommand(const std::wstring& command)
         command == L"!wnf" ||
         command == L"!address" ||
         command == L"!ti" ||
+        command == L"!kmon" ||
         command == L"!timeline")
     {
         result = true;
@@ -4058,6 +4071,7 @@ static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* 
         L"!wnf",
         L"!handles",
         L"!hiddenproc",
+        L"!kmon",
         L"!wdfilter",
         L"!inputstack",
         L"!dma",
@@ -4958,6 +4972,43 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 L"help"
             };
             AddCompletionCandidates(&candidates, values);
+        }
+        else if (command == L"!kmon")
+        {
+            if (argsBefore.size() <= 1)
+            {
+                static const wchar_t* values[] =
+                {
+                    L"start",
+                    L"stop",
+                    L"status",
+                    L"add",
+                    L"remove",
+                    L"watch",
+                    L"recent",
+                    L"save",
+                    L"clear",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
+            else
+            {
+                static const wchar_t* values[] =
+                {
+                    L"/pid",
+                    L"/name",
+                    L"/driver",
+                    L"/verbose",
+                    L"/all-drivers",
+                    L"/background",
+                    L"/nowatch",
+                    L"/throttle",
+                    L"/log",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
         }
         else if (command == L"!ti")
         {
@@ -22245,6 +22296,12 @@ static TiSubscriber& GetTiSubscriberInstance()
     return s_instance;
 }
 
+static KernelMonitor& GetKmonInstance()
+{
+    static KernelMonitor s_instance;
+    return s_instance;
+}
+
 static void PrintTiHelp()
 {
     std::wcout << L"!ti command (Microsoft-Windows-Threat-Intelligence ETW):\n";
@@ -22692,7 +22749,8 @@ static void HandleTiCommand(
                        << L" watch_matched=" << s.EventsWatchMatched << L"\n";
             std::wcout << L"  logged=" << s.EventsLogged
                        << L" log_bytes=" << s.LogBytesWritten
-                       << L" rotations=" << s.LogRotations << L"\n";
+                       << L" rotations=" << s.LogRotations
+                       << L" etw_lost=" << s.EventsLost << L"\n";
             std::wcout << L"  provider keywords=all match_any=0x"
                        << std::hex << s.MatchAnyKeyword
                        << L" match_all=0x" << s.MatchAllKeyword
@@ -24553,6 +24611,543 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
     } while (false);
 
     return active;
+}
+
+static void PrintKmonHelp()
+{
+    std::wcout << L"!kmon command (unknown kernel drop / map / hidden monitor):\n";
+    std::wcout << L"  !kmon [start] [/name <game.exe>] [/verbose] [/background] [/log <dir>]\n";
+    std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
+    std::wcout << L"  !kmon add /pid|/name|/driver <v>\n";
+    std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
+    std::wcout << L"  !kmon watch            reattach live tail after Esc (optional)\n";
+    std::wcout << L"\n";
+    std::wcout << L"typical hunt (driver filename is not an input):\n";
+    std::wcout << L"  write on\n";
+    std::wcout << L"  !kmon\n";
+    std::wcout << L"\n";
+    std::wcout << L"bare !kmon (or !kmon start) arms TI + kernel live callbacks and stays on the\n";
+    std::wcout << L"live tail. Esc/q returns to knkd>; collection keeps running. !kmon again reattaches.\n";
+    std::wcout << L"  /background     arm only, return to the prompt (JSONL still fills)\n";
+    std::wcout << L"  /name game.exe  add inject.remote against that image (overlays/AC can be noisy)\n";
+    std::wcout << L"  /driver name    highlight only; never hides unknown drop names\n";
+    std::wcout << L"  /verbose        also keep inbox System32\\drivers loads\n";
+    std::wcout << L"\n";
+    std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
+    std::wcout << L"  shown:  drop_load, short_lived, mapped_residue, hidden, gap.kernel_rw (once)\n";
+    std::wcout << L"  hidden: inbox System32\\drivers, process create, local AllocVM, kernel R/W\n";
+    std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
+    std::wcout << L"  a quiet idle host is mostly silent after the start line.\n";
+    std::wcout << L"\n";
+    std::wcout << L"logged kinds:\n";
+    std::wcout << L"  driver.drop_load        .sys outside System32\\drivers (Temp/Users/Program Files/root)\n";
+    std::wcout << L"  driver.short_lived      load then unload within 30s\n";
+    std::wcout << L"  driver.mapped_residue   MmUnloadedDrivers / PiDDB / ci-hash leftovers (~8s sample)\n";
+    std::wcout << L"  process.hidden          DKOM / view mismatch (~5s sample)\n";
+    std::wcout << L"  inject.remote           only with /name or /pid\n";
+    std::wcout << L"  kernel MmCopyVirtualMemory / DeviceIoControl are not in TI; gap.kernel_rw once.\n";
+}
+
+static void PrintKmonEventLine(const KmonEvent& event)
+{
+    std::wcout << L"[" << FormatTimestampLocal(event.Timestamp) << L"] ";
+    PrintColoredText(event.Kind, KNDBG_COLOR_TITLE);
+    std::wcout << L" pid=" << event.ProcessId;
+    if (event.TargetProcessId != 0)
+    {
+        std::wcout << L" -> " << event.TargetProcessId;
+    }
+    if (!event.Driver.empty())
+    {
+        std::wcout << L" driver=";
+        PrintColoredText(KmonBasenameLower(event.Driver), KNDBG_COLOR_FAIL);
+    }
+    if (!event.Image.empty())
+    {
+        std::wcout << L" image=" << KmonBasenameLower(event.Image);
+    }
+    if (!event.Summary.empty())
+    {
+        std::wcout << L" " << event.Summary;
+    }
+    std::wcout << L"\n";
+}
+
+static void RunKmonLiveTail(KernelMonitor& kmon)
+{
+    kmon.SetLiveOutput(true);
+    PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
+    std::wcout << L" live tail. Esc/q returns to the prompt; collection stays up.\n";
+    const bool savedStop = g_StopRequested.load();
+    g_StopRequested = false;
+    for (;;)
+    {
+        if (g_StopRequested.load())
+        {
+            g_StopRequested = false;
+            break;
+        }
+        if (_kbhit())
+        {
+            int ch = _getch();
+            if (ch == 0x1B || ch == L'q' || ch == L'Q')
+            {
+                break;
+            }
+        }
+        std::vector<KmonEvent> batch = kmon.DrainPrintQueue(64);
+        for (const KmonEvent& event : batch)
+        {
+            PrintKmonEventLine(event);
+        }
+        uint64_t suppressed = kmon.ConsumeThrottleSuppressedCount();
+        if (suppressed > 0)
+        {
+            PrintColoredText(L"[kmon.throttle]", KNDBG_COLOR_WARN);
+            std::wcout << L" suppressed " << suppressed << L" events\n";
+        }
+        if (batch.empty())
+        {
+            Sleep(50);
+        }
+    }
+    kmon.SetLiveOutput(false);
+    g_StopRequested.store(savedStop);
+    std::wcout << L"[kmon] detached. collection still running; '!kmon' reattaches, '!kmon stop' ends it.\n";
+}
+
+static bool ParseKmonStartArgs(
+    const std::vector<std::wstring>& args,
+    size_t startIndex,
+    KmonOptions* options,
+    std::wstring* error)
+{
+    size_t i = startIndex;
+    while (i < args.size())
+    {
+        std::wstring opt = ToLower(args[i]);
+        if (opt == L"/pid")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/pid requires a value";
+                return false;
+            }
+            uint64_t v = 0;
+            if (!ParseUnsigned(args[i + 1], 0, &v) || v == 0 || v > 0xFFFFFFFFull)
+            {
+                *error = L"invalid PID: " + args[i + 1];
+                return false;
+            }
+            options->WatchPids.push_back(static_cast<uint32_t>(v));
+            i += 2;
+            continue;
+        }
+        if (opt == L"/name")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/name requires a value";
+                return false;
+            }
+            options->WatchNames.push_back(args[i + 1]);
+            i += 2;
+            continue;
+        }
+        if (opt == L"/driver")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/driver requires a value";
+                return false;
+            }
+            options->WatchDrivers.push_back(args[i + 1]);
+            i += 2;
+            continue;
+        }
+        if (opt == L"/throttle")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/throttle requires a value";
+                return false;
+            }
+            uint64_t v = 0;
+            if (!ParseUnsigned(args[i + 1], 0, &v) || v == 0 || v > 100000)
+            {
+                *error = L"invalid throttle: " + args[i + 1];
+                return false;
+            }
+            options->ThrottlePerSecond = static_cast<uint32_t>(v);
+            i += 2;
+            continue;
+        }
+        if (opt == L"/log")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/log requires a path";
+                return false;
+            }
+            options->LogDirectory = args[i + 1];
+            i += 2;
+            continue;
+        }
+        if (opt == L"/verbose" || opt == L"/all-drivers")
+        {
+            options->VerboseDrivers = true;
+            ++i;
+            continue;
+        }
+        if (opt == L"/background" || opt == L"/nowatch")
+        {
+            options->AttachLiveTail = false;
+            ++i;
+            continue;
+        }
+        *error = L"unrecognised start option: " + args[i];
+        return false;
+    }
+    return true;
+}
+
+static void HandleKmonCommand(
+    const std::vector<std::wstring>& args,
+    DebuggerState& state,
+    DeviceClient& device,
+    SymbolEngine& symbols)
+{
+    KernelMonitor& kmon = GetKmonInstance();
+
+    do
+    {
+        if (HasHelpToken(args, 1))
+        {
+            PrintKmonHelp();
+            break;
+        }
+
+        std::wstring action;
+        size_t startArgIndex = 2;
+        if (args.size() < 2)
+        {
+            action = L"start";
+        }
+        else if (!args[1].empty() && args[1][0] == L'/')
+        {
+            action = L"start";
+            startArgIndex = 1;
+        }
+        else
+        {
+            action = ToLower(args[1]);
+        }
+
+        if (action == L"start")
+        {
+            if (kmon.IsActive())
+            {
+                bool background = false;
+                for (size_t i = 1; i < args.size(); ++i)
+                {
+                    std::wstring opt = ToLower(args[i]);
+                    if (opt == L"/background" || opt == L"/nowatch")
+                    {
+                        background = true;
+                        break;
+                    }
+                }
+                if (background)
+                {
+                    PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
+                    std::wcout << L" already collecting. JSONL is filling; '!kmon' attaches the tail.\n";
+                    break;
+                }
+                PrintColoredText(L"[kmon]", KNDBG_COLOR_DIM);
+                std::wcout << L" already collecting; attaching live tail. Esc/q detaches.\n";
+                RunKmonLiveTail(kmon);
+                break;
+            }
+            if (!device.IsOpen())
+            {
+                std::wcerr << L"!kmon start requires the KnLiveDbg.sys driver device to be open\n";
+                break;
+            }
+
+            DriverSessionStatus session = {};
+            std::wstring sessionError;
+            if (!device.QuerySessionStatus(&session, &sessionError) ||
+                (session.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) == 0)
+            {
+                std::wcerr << L"!kmon start requires write mode. run 'write on' first.\n";
+                break;
+            }
+
+            KmonOptions options;
+            std::wstring parseError;
+            if (!ParseKmonStartArgs(args, startArgIndex, &options, &parseError))
+            {
+                std::wcerr << L"!kmon start: " << parseError << L"\n";
+                PrintKmonHelp();
+                break;
+            }
+
+            uint8_t protByte = 0;
+            std::wstring gateError;
+            bool isPpl = CheckSelfIsPplAntimalware(device, symbols, &protByte, &gateError);
+            if (!isPpl && gateError.empty())
+            {
+                std::wcout << L"[kmon] enabling PPL Antimalware for TI ETW\n";
+                HandleSetPplAntimalwareCommand({ L"set-ppl-antimalware", L"on" }, state, device, symbols);
+            }
+            else if (!isPpl)
+            {
+                std::wcerr << L"!kmon start: warning, could not pre-check PPL (" << gateError
+                           << L"); continuing.\n";
+            }
+
+            TiSubscriber& ti = GetTiSubscriberInstance();
+            if (!ti.IsActive())
+            {
+                g_TiSubscriberForShutdown.store(&ti);
+                std::wstring startError;
+                TiOptions tiOptions;
+                tiOptions.SelfPid = GetCurrentProcessId();
+                tiOptions.ExcludeSelf = true;
+                if (!ti.Start(tiOptions, &startError))
+                {
+                    g_TiSubscriberForShutdown.store(nullptr);
+                    std::wcerr << L"!kmon start: TI subscribe failed: " << startError << L"\n";
+                    break;
+                }
+                std::wcout << L"[kmon] TI ETW started (silent forensic)\n";
+            }
+            else
+            {
+                std::wcout << L"[kmon] TI ETW already active\n";
+            }
+
+            if (!TryEnableTimelineLive(state, &device))
+            {
+                std::wcerr << L"!kmon start: kernel live callbacks were not enabled\n";
+                break;
+            }
+
+            g_KmonForShutdown.store(&kmon);
+            std::wstring startError;
+            if (!kmon.Start(options, &ti, &state.Timeline, &device, &symbols, &startError))
+            {
+                g_KmonForShutdown.store(nullptr);
+                kmon.SetLiveOutput(false);
+                std::wcerr << L"!kmon start failed: " << startError << L"\n";
+                break;
+            }
+
+            PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
+            std::wcout << L" started. logging unknown drop/map/hidden events.\n";
+            KmonOptions current = kmon.CurrentOptions();
+            std::wcout << L"     log directory=" << current.LogDirectory
+                       << L" verbose_inbox=" << (current.VerboseDrivers ? L"yes" : L"no") << L"\n";
+            std::wcout << L"     watch:";
+            if (current.WatchPids.empty() &&
+                current.WatchNames.empty() &&
+                current.WatchDrivers.empty())
+            {
+                std::wcout << L" <none> (all non-inbox driver drops + mapper residue + hidden)";
+            }
+            for (uint32_t pid : current.WatchPids)
+            {
+                std::wcout << L" pid=" << pid;
+            }
+            for (const std::wstring& name : current.WatchNames)
+            {
+                std::wcout << L" name=" << name;
+            }
+            for (const std::wstring& driver : current.WatchDrivers)
+            {
+                std::wcout << L" driver=" << driver;
+            }
+            std::wcout << L"\n";
+
+            if (options.AttachLiveTail)
+            {
+                RunKmonLiveTail(kmon);
+            }
+            else
+            {
+                std::wcout << L"     background mode: JSONL is filling; '!kmon' attaches the tail.\n";
+            }
+            break;
+        }
+
+        if (action == L"stop")
+        {
+            if (!kmon.IsActive())
+            {
+                std::wcerr << L"!kmon: not active.\n";
+                break;
+            }
+            std::wstring stopError;
+            kmon.Stop(&stopError);
+            g_KmonForShutdown.store(nullptr);
+            PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
+            std::wcout << L" stopped. TI and timeline live are left running.\n";
+            break;
+        }
+
+        if (action == L"status")
+        {
+            KmonStats stats = kmon.SnapshotStats();
+            KmonOptions opt = kmon.CurrentOptions();
+            PrintColoredText(L"[kmon.status]", KNDBG_COLOR_TITLE);
+            std::wcout << L" active=" << (kmon.IsActive() ? L"yes" : L"no")
+                       << L" live=" << (kmon.IsLiveOutputEnabled() ? L"yes" : L"no") << L"\n";
+            std::wcout << L"  kept=" << stats.EventsKept
+                       << L" dropped=" << stats.EventsDropped
+                       << L" logged=" << stats.EventsLogged
+                       << L" matched=" << stats.EventsWatchMatched << L"\n";
+            std::wcout << L"  ti_ingested=" << stats.TiIngested
+                       << L" live_ingested=" << stats.LiveIngested
+                       << L" hidden_scans=" << stats.HiddenScans
+                       << L" mapper_scans=" << stats.MapperScans << L"\n";
+            std::wcout << L"  logging_enabled=" << stats.LoggingEnabled
+                       << L" logging_failed=" << stats.LoggingFailed << L"\n";
+            std::wcout << L"  watch:";
+            for (uint32_t pid : opt.WatchPids)
+            {
+                std::wcout << L" pid=" << pid;
+            }
+            for (const std::wstring& name : opt.WatchNames)
+            {
+                std::wcout << L" name=" << name;
+            }
+            for (const std::wstring& driver : opt.WatchDrivers)
+            {
+                std::wcout << L" driver=" << driver;
+            }
+            if (opt.WatchPids.empty() && opt.WatchNames.empty() && opt.WatchDrivers.empty())
+            {
+                std::wcout << L" <none>";
+            }
+            std::wcout << L"\n";
+            break;
+        }
+
+        if (action == L"add" || action == L"remove")
+        {
+            if (args.size() < 4)
+            {
+                std::wcerr << L"!kmon " << action
+                           << L": usage: !kmon " << action << L" /pid|/name|/driver <v>\n";
+                break;
+            }
+            std::wstring kind = ToLower(args[2]);
+            const std::wstring& value = args[3];
+            bool changed = false;
+            if (kind == L"/pid")
+            {
+                uint64_t v = 0;
+                if (!ParseUnsigned(value, 0, &v) || v == 0 || v > 0xFFFFFFFFull)
+                {
+                    std::wcerr << L"!kmon " << action << L": invalid PID: " << value << L"\n";
+                    break;
+                }
+                changed = (action == L"add")
+                    ? kmon.AddWatchPid(static_cast<uint32_t>(v))
+                    : kmon.RemoveWatchPid(static_cast<uint32_t>(v));
+                std::wcout << L"[kmon] pid " << v
+                           << (action == L"add" ? L" added" : L" removed")
+                           << (changed ? L"\n" : L" (no change)\n");
+            }
+            else if (kind == L"/name")
+            {
+                changed = (action == L"add")
+                    ? kmon.AddWatchName(value)
+                    : kmon.RemoveWatchName(value);
+                std::wcout << L"[kmon] name " << value
+                           << (action == L"add" ? L" added" : L" removed")
+                           << (changed ? L"\n" : L" (no change)\n");
+            }
+            else if (kind == L"/driver")
+            {
+                changed = (action == L"add")
+                    ? kmon.AddWatchDriver(value)
+                    : kmon.RemoveWatchDriver(value);
+                std::wcout << L"[kmon] driver " << value
+                           << (action == L"add" ? L" added" : L" removed")
+                           << (changed ? L"\n" : L" (no change)\n");
+            }
+            else
+            {
+                std::wcerr << L"!kmon " << action << L": unknown kind \"" << args[2] << L"\"\n";
+            }
+            break;
+        }
+
+        if (action == L"watch")
+        {
+            if (!kmon.IsActive())
+            {
+                std::wcerr << L"!kmon watch: not active. run '!kmon' first.\n";
+                break;
+            }
+            RunKmonLiveTail(kmon);
+            break;
+        }
+
+        if (action == L"recent")
+        {
+            size_t n = 50;
+            if (args.size() >= 3)
+            {
+                uint64_t v = 0;
+                if (!ParseUnsigned(args[2], 10, &v) || v == 0)
+                {
+                    std::wcerr << L"!kmon recent: invalid count: " << args[2] << L"\n";
+                    break;
+                }
+                if (v > 10000)
+                {
+                    v = 10000;
+                }
+                n = static_cast<size_t>(v);
+            }
+            std::vector<KmonEvent> recent = kmon.Recent(n, false);
+            for (const KmonEvent& event : recent)
+            {
+                PrintKmonEventLine(event);
+            }
+            std::wcout << L"[kmon.recent] returned=" << recent.size() << L"\n";
+            break;
+        }
+
+        if (action == L"save")
+        {
+            if (args.size() < 3)
+            {
+                std::wcerr << L"!kmon save: usage: !kmon save <path>\n";
+                break;
+            }
+            std::wstring saveError;
+            if (!kmon.SaveTo(args[2], &saveError))
+            {
+                std::wcerr << L"!kmon save failed: " << saveError << L"\n";
+                break;
+            }
+            std::wcout << L"[kmon.save] wrote " << args[2] << L"\n";
+            break;
+        }
+
+        if (action == L"clear")
+        {
+            kmon.Clear();
+            std::wcout << L"[kmon.clear] ring drained.\n";
+            break;
+        }
+
+        std::wcerr << L"!kmon: unknown subcommand \"" << args[1] << L"\"\n";
+        PrintKmonHelp();
+    } while (false);
 }
 
 static void HandleTimelineCommand(
@@ -29027,6 +29622,10 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintTiHelp();
         }
+        else if (command == L"!kmon")
+        {
+            PrintKmonHelp();
+        }
         else if (command == L"!timeline")
         {
             if (detailIndex < args.size() && ToLower(args[detailIndex]) == L"advanced")
@@ -29275,6 +29874,9 @@ static std::wstring FirstTokenMissingCompletionHint()
         {L"!ti"},
         {L"!ti", L"by"},
         {L"!ti", L"start"},
+        {L"!kmon"},
+        {L"!kmon", L"start"},
+        {L"!kmon", L"add"},
         {L"!timeline"},
         {L"!timeline", L"ingest"},
         {L"!timeline", L"ingest", L"ti"},
@@ -30198,6 +30800,33 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"!db"}, L"help", L"physical-db-help-completion");
         CheckCompletionCandidate(&context, {L"!ti", L"by"}, L"pid", L"ti-by-pid-completion");
         CheckCompletionCandidate(&context, {L"help", L"!ti"}, L"start", L"help-ti-start-completion");
+        CheckCompletionCandidate(&context, {}, L"!kmon", L"kmon-root-completion");
+        CheckCompletionCandidate(&context, {L"!kmon"}, L"start", L"kmon-start-completion");
+        CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/driver", L"kmon-start-driver-completion");
+        CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/verbose", L"kmon-start-verbose-completion");
+        CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/background", L"kmon-start-background-completion");
+        CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/nowatch", L"kmon-start-nowatch-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!kmon"}, L"watch", L"help-kmon-watch-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KernelMonitorSelfTest(),
+            L"kmon-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IsNativeOwnedCommand(L"!kmon"),
+            L"kmon-is-native-owned");
+        {
+            const std::wstring kmonHelp = CaptureDetailedHelpOutput({L"help", L"!kmon"}, 1);
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                kmonHelp.find(L"driver.drop_load") != std::wstring::npos &&
+                    kmonHelp.find(L"/background") != std::wstring::npos &&
+                    kmonHelp.find(L"write on") != std::wstring::npos &&
+                    kmonHelp.find(L"filename is not an input") != std::wstring::npos &&
+                    kmonHelp.find(L"not a TI firehose") != std::wstring::npos &&
+                    kmonHelp.find(L"!kmon watch") != std::wstring::npos,
+                L"kmon-help-covers-drop-load-and-live-tail");
+        }
         CheckCompletionCandidate(&context, {L"help", L"!byovd"}, L"fixture", L"help-byovd-fixture-completion");
         CheckCompletionCandidate(&context, {L"help", L"!hunt"}, L"/details", L"help-hunt-details-completion");
         CheckConsoleSurfaceSelfTest(
@@ -49570,6 +50199,10 @@ static bool HandleCommand(
         else if (command == L"!ti")
         {
             HandleTiCommand(args, state, device, symbols);
+        }
+        else if (command == L"!kmon")
+        {
+            HandleKmonCommand(args, state, device, symbols);
         }
         else if (command == L"!timeline")
         {

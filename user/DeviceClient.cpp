@@ -1205,6 +1205,87 @@ bool DeviceClient::SetProcessProtection(
     return ok;
 }
 
+bool DeviceClient::SetProcessLogging(
+    uint32_t processId,
+    uint32_t loggingFlags,
+    uint32_t* appliedFlags,
+    uint32_t* informationClassUsed,
+    uint32_t* ntStatus,
+    uint64_t* eprocessAddress,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (processId == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid SetProcessLogging request";
+            }
+            break;
+        }
+
+        union
+        {
+            KNDBG_SET_PROCESS_LOGGING_REQUEST Request;
+            KNDBG_SET_PROCESS_LOGGING_RESPONSE Response;
+            unsigned char Padding[
+                sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST) >= sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE)
+                    ? sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST)
+                    : sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE)];
+        } buffer = {};
+
+        buffer.Request.Size = sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST);
+        buffer.Request.ProcessId = processId;
+        buffer.Request.LoggingFlags = (loggingFlags == 0) ? KNDBG_PROCESS_LOG_DEFAULT : loggingFlags;
+        buffer.Request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_SET_PROCESS_LOGGING,
+                &buffer,
+                sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST),
+                sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE),
+                &returned,
+                error))
+        {
+            break;
+        }
+
+        if (returned < sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short SetProcessLogging response";
+            }
+            break;
+        }
+
+        if (appliedFlags != nullptr)
+        {
+            *appliedFlags = buffer.Response.LoggingFlagsApplied;
+        }
+        if (informationClassUsed != nullptr)
+        {
+            *informationClassUsed = buffer.Response.InformationClassUsed;
+        }
+        if (ntStatus != nullptr)
+        {
+            *ntStatus = buffer.Response.NtStatus;
+        }
+        if (eprocessAddress != nullptr)
+        {
+            *eprocessAddress = buffer.Response.EprocessAddress;
+        }
+
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::ReadPhysical(uint64_t physicalAddress, uint32_t length, std::vector<uint8_t>* bytes, std::wstring* error)
 {
     bool ok = false;

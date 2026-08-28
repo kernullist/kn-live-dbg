@@ -152,6 +152,7 @@
     <ClCompile Include="QosPolicyScanner.cpp" />
     <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
+    <ClCompile Include="KernelMonitor.cpp" />
     <ClCompile Include="TimelineDashboard.cpp" />
     <ClCompile Include="TimelineModel.cpp" />
     <ClCompile Include="TimelineSelfTest.cpp" />
@@ -231,6 +232,7 @@
     <ClInclude Include="QosPolicyScanner.h" />
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
+    <ClInclude Include="KernelMonitor.h" />
     <ClInclude Include="TimelineDashboard.h" />
     <ClInclude Include="TimelineModel.h" />
     <ClInclude Include="TimelineSelfTest.h" />

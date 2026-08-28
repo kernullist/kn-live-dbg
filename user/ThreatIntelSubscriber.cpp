@@ -241,15 +241,31 @@ std::wstring TiSubscriber::GetCachedImageOrResolve(uint32_t pid)
     {
         return L"<idle>";
     }
+
+    const uint64_t nowMs = GetTickCount64();
+    constexpr uint64_t kNegativeTtlMs = 1000;
     {
         std::lock_guard<std::mutex> lock(ImageCacheMutex);
         auto it = ImageCache.find(pid);
         if (it != ImageCache.end())
         {
-            return it->second;
+            if (!it->second.Failed)
+            {
+                return it->second.Path;
+            }
+            if ((nowMs - it->second.TickMs) < kNegativeTtlMs)
+            {
+                return it->second.Path;
+            }
         }
     }
+
     std::wstring resolved = ResolveProcessImage(pid);
+    ImageCacheEntry entry;
+    entry.Path = resolved;
+    entry.TickMs = nowMs;
+    entry.Failed = resolved.empty();
+
     std::lock_guard<std::mutex> lock(ImageCacheMutex);
     // Cheap, bounded cache: when oversized, drop everything. PIDs are
     // recycled by the kernel anyway so a stale entry is acceptable
@@ -258,7 +274,7 @@ std::wstring TiSubscriber::GetCachedImageOrResolve(uint32_t pid)
     {
         ImageCache.clear();
     }
-    ImageCache.emplace(pid, resolved);
+    ImageCache[pid] = std::move(entry);
     return resolved;
 }
 
@@ -339,6 +355,7 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     Stats.EventsLogged.store(0);
     Stats.LogBytesWritten.store(0);
     Stats.LogRotations.store(0);
+    Stats.EventsLost.store(0);
     Stats.StartTickMs.store(GetTickCount64());
     Stats.LastEventTickMs.store(0);
 
@@ -543,6 +560,7 @@ ULONG WINAPI TiSubscriber::BufferCallbackThunk(PEVENT_TRACE_LOGFILEW buffer)
         return TRUE;
     }
     TiSubscriber* self = reinterpret_cast<TiSubscriber*>(buffer->Context);
+    self->Stats.EventsLost.store(buffer->EventsLost, std::memory_order_relaxed);
     return self->ProcessTraceShouldExit.load() ? FALSE : TRUE;
 }
 
@@ -1085,7 +1103,74 @@ bool TiSubscriber::MatchesWatch(const TiEventRecord& record)
         }
     }
 
+    // DriverObjectLoad/DeviceObjectLoad usually fire as System (pid 4).
+    // Match payload driver/device/file names against /name without promoting
+    // pid 4 into the hot path (that would live-print every System event).
+    if (!WatchNamesLower.empty() &&
+        PayloadBasenameMatchesWatch(record, WatchNamesLower))
+    {
+        return true;
+    }
+
     return false;
+}
+
+bool TiSubscriber::PayloadBasenameMatchesWatch(
+    const TiEventRecord& record,
+    const std::vector<std::wstring>& watchNamesLower)
+{
+    bool matched = false;
+
+    do
+    {
+        if (watchNamesLower.empty())
+        {
+            break;
+        }
+
+        for (const TiPayloadField& field : record.Payload)
+        {
+            if (field.Value.empty() || field.Value[0] == L'<')
+            {
+                continue;
+            }
+
+            std::wstring nameLower = ToLowerInPlace(field.Name);
+            std::wstring valueLower = ToLowerInPlace(field.Value);
+            const bool driverishName =
+                nameLower.find(L"driver") != std::wstring::npos ||
+                nameLower.find(L"imagefilename") != std::wstring::npos ||
+                nameLower.find(L"filename") != std::wstring::npos ||
+                nameLower.find(L"device") != std::wstring::npos;
+            const bool sysValue =
+                valueLower.size() >= 4 &&
+                valueLower.compare(valueLower.size() - 4, 4, L".sys") == 0;
+            if (!driverishName && !sysValue)
+            {
+                continue;
+            }
+
+            std::wstring base = BasenameLower(field.Value);
+            if (base.empty())
+            {
+                continue;
+            }
+            for (const std::wstring& watch : watchNamesLower)
+            {
+                if (base == watch)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched)
+            {
+                break;
+            }
+        }
+    } while (false);
+
+    return matched;
 }
 
 std::wstring TiSubscriber::BasenameLower(const std::wstring& path)
@@ -1435,6 +1520,7 @@ TiSubscriberStats TiSubscriber::SnapshotStats() const
     s.EventsLogged = Stats.EventsLogged.load(std::memory_order_relaxed);
     s.LogBytesWritten = Stats.LogBytesWritten.load(std::memory_order_relaxed);
     s.LogRotations = Stats.LogRotations.load(std::memory_order_relaxed);
+    s.EventsLost = Stats.EventsLost.load(std::memory_order_relaxed);
     s.MatchAnyKeyword = kThreatIntelMatchAnyKeyword;
     s.MatchAllKeyword = kThreatIntelMatchAllKeyword;
     s.StartTickMs = Stats.StartTickMs.load(std::memory_order_relaxed);

@@ -3031,6 +3031,25 @@ std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& opti
     return out;
 }
 
+std::vector<TimelineEvent> TimelineStore::RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const
+{
+    std::vector<TimelineEvent> out;
+    std::lock_guard<std::mutex> lock(Mutex);
+    for (const TimelineEvent& event : Events)
+    {
+        if (event.EventId <= minExclusive)
+        {
+            continue;
+        }
+        out.push_back(event);
+        if (maxCount != 0 && out.size() >= maxCount)
+        {
+            break;
+        }
+    }
+    return out;
+}
+
 std::vector<TimelineEvent> TimelineStore::AllEvents() const
 {
     std::lock_guard<std::mutex> lock(Mutex);
@@ -3584,6 +3603,12 @@ TimelineAnalysisResult TimelineStore::AnalyzeLiveSignals(size_t limit) const
     }
 
     return result;
+}
+
+uint64_t TimelineStore::PeekNextEventId() const
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    return NextEventId;
 }
 
 TimelineStats TimelineStore::GetStats() const
