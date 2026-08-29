@@ -2098,6 +2098,115 @@ namespace
         return result;
     }
 
+    SliceCompare CompareLoadedModuleText(
+        const std::wstring& imagePath,
+        HANDLE processHandle,
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        uint64_t imageBase)
+    {
+        SliceCompare result = SliceUnknown;
+        do
+        {
+            if (imageBase == 0 || !PathLooksLikeWin32File(imagePath))
+            {
+                break;
+            }
+            std::vector<uint8_t> headers;
+            KmonPeLayout layout = {};
+            if (!ReadDiskPeHead(imagePath, &headers) ||
+                !ParseKmonPeLayout(headers, &layout) ||
+                layout.ExecSize < 16 ||
+                layout.ExecFileOffset == 0)
+            {
+                break;
+            }
+            result = RelocatedSliceCompare(
+                imagePath,
+                headers,
+                layout,
+                processHandle,
+                device,
+                symbols,
+                pid,
+                imageBase,
+                layout.ExecRva,
+                layout.ExecFileOffset,
+                layout.ExecSize);
+            if (result == SliceMismatch || result == SliceUnknown)
+            {
+                break;
+            }
+            if (layout.ExecVirtSize <= 0x1000)
+            {
+                break;
+            }
+            uint32_t samples[3] = {};
+            uint32_t sampleCount = 0;
+            auto addSample = [&](uint32_t pageRva)
+            {
+                if (pageRva <= layout.ExecRva || sampleCount >= 3)
+                {
+                    return;
+                }
+                for (uint32_t i = 0; i < sampleCount; ++i)
+                {
+                    if (samples[i] == pageRva)
+                    {
+                        return;
+                    }
+                }
+                samples[sampleCount++] = pageRva;
+            };
+            if (layout.ExecRva <= (std::numeric_limits<uint32_t>::max)() - 0x1000)
+            {
+                addSample(layout.ExecRva + 0x1000);
+            }
+            if (layout.ExecVirtSize > 0x2000)
+            {
+                const uint32_t midOff = (layout.ExecVirtSize / 2) & ~0xFFFu;
+                if (layout.ExecRva <= (std::numeric_limits<uint32_t>::max)() - midOff)
+                {
+                    addSample(layout.ExecRva + midOff);
+                }
+                if (layout.ExecVirtSize >= 0x100)
+                {
+                    const uint32_t lastOff = (layout.ExecVirtSize - 0x100) & ~0xFFFu;
+                    if (layout.ExecRva <= (std::numeric_limits<uint32_t>::max)() - lastOff)
+                    {
+                        addSample(layout.ExecRva + lastOff);
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < sampleCount; ++i)
+            {
+                uint32_t laterFile = 0;
+                if (!RvaToFileOffset(headers, samples[i], &laterFile))
+                {
+                    continue;
+                }
+                if (RelocatedSliceCompare(
+                        imagePath,
+                        headers,
+                        layout,
+                        processHandle,
+                        device,
+                        symbols,
+                        pid,
+                        imageBase,
+                        samples[i],
+                        laterFile,
+                        0x100) == SliceMismatch)
+                {
+                    result = SliceMismatch;
+                    break;
+                }
+            }
+        } while (false);
+        return result;
+    }
+
     bool CollectPeDllNameDirectory(
         const std::wstring& imagePath,
         const std::vector<uint8_t>& headers,
@@ -2449,6 +2558,39 @@ namespace
             L"userenv.dll",
             L"wsock32.dll",
             L"ws2_32.dll"
+        };
+        for (const wchar_t* name : names)
+        {
+            if (leaf == name)
+            {
+                matched = true;
+                break;
+            }
+        }
+        return matched;
+    }
+
+    bool KmonLooksLikeHookableSystemDll(const std::wstring& leaf)
+    {
+        bool matched = false;
+        static const wchar_t* names[] =
+        {
+            L"ntdll.dll",
+            L"kernel32.dll",
+            L"kernelbase.dll",
+            L"user32.dll",
+            L"win32u.dll",
+            L"gdi32.dll",
+            L"gdi32full.dll",
+            L"ws2_32.dll",
+            L"advapi32.dll",
+            L"sechost.dll",
+            L"rpcrt4.dll",
+            L"bcrypt.dll",
+            L"bcryptprimitives.dll",
+            L"wow64.dll",
+            L"wow64cpu.dll",
+            L"wow64win.dll"
         };
         for (const wchar_t* name : names)
         {
@@ -7554,7 +7696,8 @@ void KernelMonitor::ScanUserModeHostility()
             }
 
             uint32_t implants = 0;
-            uint32_t moduleTextHits = 0;
+            uint32_t gameTextHits = 0;
+            uint32_t systemTextHits = 0;
             const std::wstring imageDir = [&imagePath]() {
                 std::wstring dir = ToLowerCopy(imagePath);
                 for (wchar_t& ch : dir)
@@ -7626,34 +7769,41 @@ void KernelMonitor::ScanUserModeHostility()
                     (moduleIndex < moduleRanges.size())
                         ? moduleRanges[moduleIndex].first
                         : 0;
-                const bool compareModuleText =
+                const bool compareGameText =
                     (watched || dropHost) &&
                     !windowsModule &&
                     moduleLeaf != leaf &&
-                    moduleTextHits < 8 &&
+                    gameTextHits < 8 &&
                     loadedModuleBase != 0 &&
                     PathLooksLikeWin32File(modulePath);
-                if (compareModuleText)
+                const bool compareSystemText =
+                    (watched || dropHost) &&
+                    windowsModule &&
+                    KmonLooksLikeHookableSystemDll(moduleLeaf) &&
+                    systemTextHits < 8 &&
+                    loadedModuleBase != 0 &&
+                    PathLooksLikeWin32File(modulePath);
+                if (compareGameText || compareSystemText)
                 {
-                    ++moduleTextHits;
-                    std::vector<uint8_t> moduleHeaders;
-                    KmonPeLayout moduleLayout = {};
-                    if (ReadDiskPeHead(modulePath, &moduleHeaders) &&
-                        ParseKmonPeLayout(moduleHeaders, &moduleLayout) &&
-                        moduleLayout.ExecSize >= 16 &&
-                        moduleLayout.ExecFileOffset != 0 &&
-                        RelocatedSliceCompare(
-                            modulePath,
-                            moduleHeaders,
-                            moduleLayout,
-                            processHandle,
-                            device,
-                            symbols,
-                            pid,
-                            loadedModuleBase,
-                            moduleLayout.ExecRva,
-                            moduleLayout.ExecFileOffset,
-                            moduleLayout.ExecSize) == SliceMismatch)
+                    if (compareGameText)
+                    {
+                        ++gameTextHits;
+                    }
+                    else
+                    {
+                        ++systemTextHits;
+                    }
+                    const std::wstring textFailKey =
+                        L"scan_failed:userhostility:module_text:" +
+                        std::to_wstring(pid) + L":" + moduleLeaf;
+                    const SliceCompare textCmp = CompareLoadedModuleText(
+                        modulePath,
+                        processHandle,
+                        device,
+                        symbols,
+                        pid,
+                        loadedModuleBase);
+                    if (textCmp == SliceMismatch)
                     {
                         EmitUnique(
                             L"process.implant",
@@ -7666,6 +7816,23 @@ void KernelMonitor::ScanUserModeHostility()
                                 L" module=" + moduleLeaf,
                             modulePath,
                             pid);
+                    }
+                    else if (textCmp == SliceUnknown)
+                    {
+                        EmitUnique(
+                            L"process.implant",
+                            textFailKey,
+                            imagePath,
+                            L"user",
+                            L"module text compare could not run pid=" +
+                                std::to_wstring(pid) + L" " + leaf +
+                                L" module=" + moduleLeaf,
+                            L"disk or relocated bytes were not readable",
+                            pid);
+                    }
+                    else
+                    {
+                        ClearEmittedKeyForPid(textFailKey, pid);
                     }
                 }
                 if (implants >= 8)
@@ -9325,6 +9492,13 @@ bool KernelMonitorSelfTest()
             !KmonLooksLikeHijackDll(L"winmm.dll") ||
             KmonLooksLikeHijackDll(L"game.dll") ||
             KmonLooksLikeHijackDll(L"vcruntime140.dll"))
+        {
+            break;
+        }
+        if (!KmonLooksLikeHookableSystemDll(L"ntdll.dll") ||
+            !KmonLooksLikeHookableSystemDll(L"win32u.dll") ||
+            KmonLooksLikeHookableSystemDll(L"game.dll") ||
+            KmonLooksLikeHookableSystemDll(L"version.dll"))
         {
             break;
         }

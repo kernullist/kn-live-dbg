@@ -4462,7 +4462,9 @@ bool ProcessTriageScanner::ScanVad(
             (options.ExecOnly ||
              options.WxOnly ||
              options.InjectionScan ||
-             options.ProbeAllPe);
+             options.ProbeAllPe ||
+             options.ProbePe ||
+             options.ScanHiddenPtes);
 
         VadLayout layout = {};
         if (!ResolveVadLayout(symbols_, &layout, error))
