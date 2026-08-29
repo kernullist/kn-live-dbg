@@ -45,6 +45,8 @@ namespace
         uint64_t EndAddress = 0;
         bool EffectiveProtectionComplete = false;
         bool EffectiveExecutable = false;
+        bool HasVadProtection = false;
+        bool VadProtectionExecutable = false;
     };
 
     struct PteLeafMapping
@@ -1044,7 +1046,9 @@ namespace
     bool SameVadIntervalShape(const VadInterval& left, const VadInterval& right)
     {
         return left.EffectiveProtectionComplete == right.EffectiveProtectionComplete &&
-            left.EffectiveExecutable == right.EffectiveExecutable;
+            left.EffectiveExecutable == right.EffectiveExecutable &&
+            left.HasVadProtection == right.HasVadProtection &&
+            left.VadProtectionExecutable == right.VadProtectionExecutable;
     }
 
     void AppendHiddenPteRecord(
@@ -1171,9 +1175,16 @@ namespace
                    vadIntervals[index].StartAddress <= mapping.EndAddress)
             {
                 const VadInterval& interval = vadIntervals[index];
-                if (mapping.Executable &&
-                    interval.EffectiveProtectionComplete &&
-                    !interval.EffectiveExecutable)
+                bool vadLooksNonExec = false;
+                if (interval.EffectiveProtectionComplete)
+                {
+                    vadLooksNonExec = !interval.EffectiveExecutable;
+                }
+                else if (interval.HasVadProtection)
+                {
+                    vadLooksNonExec = !interval.VadProtectionExecutable;
+                }
+                if (mapping.Executable && vadLooksNonExec)
                 {
                     const uint64_t overlapStart =
                         (mapping.StartAddress > interval.StartAddress)
@@ -4237,10 +4248,41 @@ bool ProcessTriageVadFilterSelfTest()
         mixedPte,
         &mixedCursor,
         &mixedResult);
-    return mixedResult.HiddenPteRecords.size() == 1 &&
-        mixedResult.HiddenPteRecords[0].Notes == L"pte_exec_vad_rw" &&
-        mixedResult.HiddenPteRecords[0].StartAddress == 0x21000 &&
-        mixedResult.HiddenPteRecords[0].EndAddress == 0x21fff;
+    if (mixedResult.HiddenPteRecords.size() != 1 ||
+        mixedResult.HiddenPteRecords[0].Notes != L"pte_exec_vad_rw" ||
+        mixedResult.HiddenPteRecords[0].StartAddress != 0x21000 ||
+        mixedResult.HiddenPteRecords[0].EndAddress != 0x21fff)
+    {
+        return false;
+    }
+
+    ProcessVadScanResult pplResult = {};
+    std::vector<VadInterval> pplIntervals;
+    VadInterval pplRw = {};
+    pplRw.StartAddress = 0x30000;
+    pplRw.EndAddress = 0x30fff;
+    pplRw.EffectiveProtectionComplete = false;
+    pplRw.EffectiveExecutable = false;
+    pplRw.HasVadProtection = true;
+    pplRw.VadProtectionExecutable = false;
+    pplIntervals.push_back(pplRw);
+    PteLeafMapping pplPte = {};
+    pplPte.StartAddress = 0x30000;
+    pplPte.EndAddress = 0x30fff;
+    pplPte.PageSize = kPageSize;
+    pplPte.Executable = true;
+    pplPte.UserAccessible = true;
+    size_t pplCursor = 0;
+    ReportHiddenPteGaps(
+        mismatchOptions,
+        pplIntervals,
+        pplPte,
+        &pplCursor,
+        &pplResult);
+    return pplResult.HiddenPteRecords.size() == 1 &&
+        pplResult.HiddenPteRecords[0].Notes == L"pte_exec_vad_rw" &&
+        pplResult.HiddenPteRecords[0].StartAddress == 0x30000 &&
+        pplResult.HiddenPteRecords[0].EndAddress == 0x30fff;
 }
 
 bool ProcessTriageMappedPeSelfTest()
@@ -4581,6 +4623,9 @@ bool ProcessTriageScanner::ScanVad(
                     return false;
                 }
 
+                const bool vadProtectKnown = record.HasProtection;
+                const bool vadProtectExec =
+                    record.HasProtection && record.Executable;
                 EnrichVadEffectiveProtection(processQuery, &record);
                 if (!kernelOnly &&
                     !record.EffectiveProtectionComplete)
@@ -4603,6 +4648,8 @@ bool ProcessTriageScanner::ScanVad(
                         interval.EffectiveProtectionComplete = true;
                         interval.EffectiveExecutable =
                             range.Committed && range.Executable;
+                        interval.HasVadProtection = vadProtectKnown;
+                        interval.VadProtectionExecutable = vadProtectExec;
                         vadIntervals.push_back(interval);
                     }
                 }
@@ -4615,6 +4662,8 @@ bool ProcessTriageScanner::ScanVad(
                         record.EffectiveProtectionComplete;
                     interval.EffectiveExecutable =
                         record.EffectiveExecutableBytes > 0;
+                    interval.HasVadProtection = vadProtectKnown;
+                    interval.VadProtectionExecutable = vadProtectExec;
                     vadIntervals.push_back(interval);
                 }
 

@@ -1663,7 +1663,7 @@ namespace
         return ok;
     }
 
-    bool FindDriverDirectory(
+    bool FindRootChildDirectory(
         ObjectWalkContext& ctx,
         const ObjectHeaderLayout& headerLayout,
         const DirectoryLayout& dirLayout,
@@ -1671,14 +1671,15 @@ namespace
         uint8_t directoryTypeIndex,
         uint8_t cookie,
         bool hasCookie,
-        uint64_t* driverDirectory,
+        const wchar_t* childName,
+        uint64_t* directory,
         std::wstring* error)
     {
         bool ok = false;
 
         do
         {
-            if (driverDirectory == nullptr)
+            if (directory == nullptr || childName == nullptr || childName[0] == L'\0')
             {
                 break;
             }
@@ -1714,9 +1715,10 @@ namespace
 
             for (const DirectoryObjectRecord& record : rootRecords)
             {
-                if (record.TypeIndex == directoryTypeIndex && EqualsNoCaseLocal(record.Name, L"Driver"))
+                if (record.TypeIndex == directoryTypeIndex &&
+                    EqualsNoCaseLocal(record.Name, childName))
                 {
-                    *driverDirectory = record.Body;
+                    *directory = record.Body;
                     ok = true;
                     break;
                 }
@@ -1724,7 +1726,7 @@ namespace
 
             if (!ok && error != nullptr)
             {
-                *error = L"\\Driver directory was not found";
+                *error = std::wstring(L"\\") + childName + L" directory was not found";
             }
         } while (false);
 
@@ -1865,6 +1867,151 @@ namespace
                 }
 
                 record->Dispatch.push_back(dispatch);
+            }
+
+            if (record->FastIoDispatch != 0 && IsKernelAddress(record->FastIoDispatch))
+            {
+                const KernelModuleInfo* fastIoOwner =
+                    FindModuleForAddress(modules, record->FastIoDispatch);
+                if (fastIoOwner == nullptr)
+                {
+                    DriverDispatchRecord table = {};
+                    table.Index = 99;
+                    table.Name = L"FastIoDispatch";
+                    table.Function = record->FastIoDispatch;
+                    table.Suspicious = true;
+                    table.Notes =
+                        L"FastIoDispatch table is outside loaded kernel modules";
+                    ++record->SuspiciousDispatchCount;
+                    record->Suspicious = true;
+                    record->Dispatch.push_back(table);
+                }
+                else
+                {
+                    uint64_t sizeValue = 0;
+                    if (ReadKernelInteger(
+                            device,
+                            record->FastIoDispatch,
+                            sizeof(uint32_t),
+                            &sizeValue,
+                            nullptr))
+                    {
+                        uint32_t tableSize = static_cast<uint32_t>(sizeValue);
+                        if (tableSize >= 16 && tableSize <= 0x200)
+                        {
+                            std::vector<uint8_t> table;
+                            std::wstring ignored;
+                            if (ReadKernelBytes(
+                                    device,
+                                    record->FastIoDispatch,
+                                    tableSize,
+                                    &table,
+                                    &ignored) &&
+                                table.size() >= 16)
+                            {
+                                static const wchar_t* fastIoNames[] =
+                                {
+                                    L"FastIoCheckIfPossible",
+                                    L"FastIoRead",
+                                    L"FastIoWrite",
+                                    L"FastIoQueryBasicInfo",
+                                    L"FastIoQueryStandardInfo",
+                                    L"FastIoLock",
+                                    L"FastIoUnlockSingle",
+                                    L"FastIoUnlockAll",
+                                    L"FastIoUnlockAllByKey",
+                                    L"FastIoDeviceControl",
+                                    L"AcquireFileForNtCreateSection",
+                                    L"ReleaseFileForNtCreateSection",
+                                    L"FastIoDetachDevice",
+                                    L"FastIoQueryNetworkOpenInfo",
+                                    L"AcquireForModWrite",
+                                    L"MdlRead",
+                                    L"MdlReadComplete",
+                                    L"PrepareMdlWrite",
+                                    L"MdlWriteComplete",
+                                    L"FastIoReadCompressed",
+                                    L"FastIoWriteCompressed",
+                                    L"MdlReadCompleteCompressed",
+                                    L"MdlWriteCompleteCompressed",
+                                    L"FastIoQueryOpen",
+                                    L"ReleaseForModWrite",
+                                    L"AcquireForCcFlush",
+                                    L"ReleaseForCcFlush"
+                                };
+                                uint32_t ptrCount =
+                                    (tableSize - 8u) / static_cast<uint32_t>(sizeof(uint64_t));
+                                if (ptrCount > _countof(fastIoNames))
+                                {
+                                    ptrCount = static_cast<uint32_t>(_countof(fastIoNames));
+                                }
+                                uint64_t ownerStart = record->DriverStart;
+                                uint64_t ownerSize = record->DriverSize;
+                                if ((ownerStart == 0 || ownerSize == 0) && owner != nullptr)
+                                {
+                                    ownerStart = owner->Base;
+                                    ownerSize = owner->Size;
+                                }
+                                uint64_t ownerEnd = 0;
+                                const bool haveOwnerEnd =
+                                    ownerStart != 0 &&
+                                    ownerSize != 0 &&
+                                    TryAdd(ownerStart, ownerSize, &ownerEnd);
+                                for (uint32_t index = 0; index < ptrCount; ++index)
+                                {
+                                    const size_t off =
+                                        8u + static_cast<size_t>(index) * sizeof(uint64_t);
+                                    if (off + sizeof(uint64_t) > table.size())
+                                    {
+                                        break;
+                                    }
+                                    uint64_t function = 0;
+                                    std::memcpy(&function, table.data() + off, sizeof(function));
+                                    if (function == 0)
+                                    {
+                                        continue;
+                                    }
+                                    DriverDispatchRecord dispatch = {};
+                                    dispatch.Index = 100 + index;
+                                    dispatch.Name = fastIoNames[index];
+                                    dispatch.Function = function;
+                                    AnnotatePointer(
+                                        symbols,
+                                        function,
+                                        &dispatch.ModuleName,
+                                        &dispatch.SymbolName);
+                                    dispatch.InLoadedModule =
+                                        FindModuleForAddress(modules, function) != nullptr;
+                                    dispatch.InOwningImage =
+                                        haveOwnerEnd &&
+                                        function >= ownerStart &&
+                                        function < ownerEnd;
+                                    if (!dispatch.InLoadedModule)
+                                    {
+                                        dispatch.Suspicious = true;
+                                        dispatch.Notes =
+                                            L"FastIo pointer is outside loaded kernel modules";
+                                    }
+                                    else if (
+                                        !dispatch.InOwningImage &&
+                                        !dispatch.ModuleName.empty() &&
+                                        !IsKernelModuleName(dispatch.ModuleName))
+                                    {
+                                        dispatch.DelegatedToLoadedModule = true;
+                                        dispatch.Notes =
+                                            L"FastIo pointer delegates to another loaded kernel module";
+                                    }
+                                    if (dispatch.Suspicious)
+                                    {
+                                        ++record->SuspiciousDispatchCount;
+                                        record->Suspicious = true;
+                                    }
+                                    record->Dispatch.push_back(dispatch);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if (record->HasDriverStart && owner == nullptr)
@@ -3814,39 +3961,80 @@ bool IntegrityScanner::ScanDrivers(const DriverIntegrityOptions& options, Driver
             result->Warnings.push_back(L"ObHeaderCookie not available; using raw object type indices");
         }
 
-        uint64_t driverDirectory = 0;
-        if (!FindDriverDirectory(
-                ctx,
-                headerLayout,
-                dirLayout,
-                entryLayout,
-                directoryType->Index,
-                cookie,
-                hasCookie,
-                &driverDirectory,
-                error))
-        {
-            break;
-        }
-
         std::vector<DirectoryObjectRecord> objects;
-        if (!EnumerateDirectory(
-                ctx,
-                headerLayout,
-                dirLayout,
-                entryLayout,
-                driverDirectory,
-                cookie,
-                hasCookie,
-                L"\\Driver",
-                &objects))
+        auto appendDriverDirectory = [&](const wchar_t* name, bool required) -> bool
         {
-            if (error != nullptr)
+            bool appended = false;
+            do
             {
-                *error = L"failed to enumerate \\Driver";
-            }
+                uint64_t directory = 0;
+                std::wstring findError;
+                if (!FindRootChildDirectory(
+                        ctx,
+                        headerLayout,
+                        dirLayout,
+                        entryLayout,
+                        directoryType->Index,
+                        cookie,
+                        hasCookie,
+                        name,
+                        &directory,
+                        &findError))
+                {
+                    if (required)
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = findError.empty()
+                                ? (std::wstring(L"\\") + name + L" directory was not found")
+                                : findError;
+                        }
+                        break;
+                    }
+                    result->Warnings.push_back(
+                        findError.empty()
+                            ? (std::wstring(L"\\") + name + L" directory was not found")
+                            : findError);
+                    result->Truncated = true;
+                    appended = true;
+                    break;
+                }
+                std::vector<DirectoryObjectRecord> more;
+                if (!EnumerateDirectory(
+                        ctx,
+                        headerLayout,
+                        dirLayout,
+                        entryLayout,
+                        directory,
+                        cookie,
+                        hasCookie,
+                        std::wstring(L"\\") + name,
+                        &more))
+                {
+                    if (required)
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = std::wstring(L"failed to enumerate \\") + name;
+                        }
+                        break;
+                    }
+                    result->Warnings.push_back(
+                        std::wstring(L"failed to enumerate \\") + name);
+                    result->Truncated = true;
+                    appended = true;
+                    break;
+                }
+                objects.insert(objects.end(), more.begin(), more.end());
+                appended = true;
+            } while (false);
+            return appended;
+        };
+        if (!appendDriverDirectory(L"Driver", true))
+        {
             break;
         }
+        appendDriverDirectory(L"FileSystem", false);
 
         TypeFieldInfo driverStart = {};
         TypeFieldInfo driverSize = {};

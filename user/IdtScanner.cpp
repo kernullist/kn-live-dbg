@@ -240,12 +240,9 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
             for (uint32_t vector = 0; vector < otherCount && vector < result->Entries.size(); ++vector)
             {
                 IdtEntry& base = result->Entries[vector];
-                if (!base.Present)
-                {
-                    continue;
-                }
-
                 const uint8_t* p = otherBytes.data() + (static_cast<size_t>(vector) * kIdtEntrySize);
+                uint8_t otherType = p[5];
+                bool otherPresent = (otherType & 0x80) != 0;
                 uint16_t offsetLow = ReadU16(p + 0);
                 uint16_t offsetMid = ReadU16(p + 6);
                 uint32_t offsetHigh = ReadU32(p + 8);
@@ -253,7 +250,17 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
                                    (static_cast<uint64_t>(offsetMid) << 16) |
                                    (static_cast<uint64_t>(offsetHigh) << 32);
 
-                if (handler == base.Handler)
+                if (!base.Present && !otherPresent)
+                {
+                    continue;
+                }
+                if (base.Present &&
+                    otherPresent &&
+                    handler == base.Handler)
+                {
+                    continue;
+                }
+                if (!base.Present && (!otherPresent || handler == 0))
                 {
                     continue;
                 }

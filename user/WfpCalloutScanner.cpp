@@ -11,8 +11,9 @@ namespace
     constexpr uint32_t kMaxCalloutCount = 0x4000;       // sanity bound on slot count
     constexpr uint32_t kMaxWalkBytes = 0x100000 - 0x1000; // keep a single read under the transfer cap
     constexpr uint32_t kSampleEntries = 64;              // entries sampled while scoring a layout
-    constexpr uint32_t kNotifyOffset = 0x18;             // notifyFn within a slot (informational)
-    constexpr uint32_t kFlowDeleteOffset = 0x20;         // flowDeleteFn within a slot (informational)
+    // notify/flowDelete sit immediately after classifyFn in the slot. The
+    // walk derives those offsets from the scored classify field so a
+    // drifted classify offset does not leave notify-only hooks unread.
 
     bool IsKernelAddress(uint64_t value)
     {
@@ -361,26 +362,41 @@ bool WfpCalloutScanner::Scan(WfpCalloutScanResult* result, std::wstring* error)
         {
             size_t entryOffset = static_cast<size_t>(i) * bestLayout.EntrySize;
             uint64_t classifyFn = ReadEntryU64(buffer, entryOffset, bestLayout.ClassifyOffset);
-            if (classifyFn == 0)
+            const uint32_t notifyOffset = bestLayout.ClassifyOffset + 8;
+            const uint32_t flowDeleteOffset = bestLayout.ClassifyOffset + 16;
+            uint64_t notifyFn = 0;
+            uint64_t flowDeleteFn = 0;
+            if (notifyOffset + sizeof(uint64_t) <= bestLayout.EntrySize)
             {
-                continue; // empty slot
+                notifyFn = ReadEntryU64(buffer, entryOffset, notifyOffset);
+            }
+            if (flowDeleteOffset + sizeof(uint64_t) <= bestLayout.EntrySize)
+            {
+                flowDeleteFn = ReadEntryU64(buffer, entryOffset, flowDeleteOffset);
+            }
+            if (classifyFn == 0 && notifyFn == 0 && flowDeleteFn == 0)
+            {
+                continue;
             }
 
             WfpKernelCallout callout = {};
             callout.CalloutId = i;
             callout.EntryAddress = bestArray + entryOffset;
             callout.ClassifyFn = classifyFn;
-            callout.NotifyFn = ReadEntryU64(buffer, entryOffset, kNotifyOffset);
-            callout.FlowDeleteFn = ReadEntryU64(buffer, entryOffset, kFlowDeleteOffset);
+            callout.NotifyFn = notifyFn;
+            callout.FlowDeleteFn = flowDeleteFn;
 
-            callout.ClassifyModule = FindOwningModule(symbols_, classifyFn);
-            callout.ClassifySymbol = NearestSymbolText(symbols_, classifyFn);
-            if (!IsKernelAddress(callout.ClassifyFn) || callout.ClassifyModule.empty())
+            if (classifyFn != 0)
             {
-                callout.ClassifySuspicious = true;
-                callout.Notes = L"classify function outside loaded kernel modules";
-                ++result->SuspiciousCount;
-                result->AnySuspicious = true;
+                callout.ClassifyModule = FindOwningModule(symbols_, classifyFn);
+                callout.ClassifySymbol = NearestSymbolText(symbols_, classifyFn);
+                if (!IsKernelAddress(callout.ClassifyFn) || callout.ClassifyModule.empty())
+                {
+                    callout.ClassifySuspicious = true;
+                    callout.Notes = L"classify function outside loaded kernel modules";
+                    ++result->SuspiciousCount;
+                    result->AnySuspicious = true;
+                }
             }
 
             if (callout.NotifyFn != 0)

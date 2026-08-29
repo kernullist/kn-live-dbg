@@ -2415,6 +2415,54 @@ namespace
         return path.find_first_of(L"\\/") != std::wstring::npos;
     }
 
+    bool KmonLooksLikeHijackDll(const std::wstring& leaf)
+    {
+        bool matched = false;
+        static const wchar_t* names[] =
+        {
+            L"version.dll",
+            L"winmm.dll",
+            L"dwmapi.dll",
+            L"d3d8.dll",
+            L"d3d9.dll",
+            L"d3d10.dll",
+            L"d3d11.dll",
+            L"d3d12.dll",
+            L"dxgi.dll",
+            L"msimg32.dll",
+            L"lpk.dll",
+            L"usp10.dll",
+            L"cryptsp.dll",
+            L"ntmarta.dll",
+            L"wininet.dll",
+            L"winhttp.dll",
+            L"iphlpapi.dll",
+            L"dbghelp.dll",
+            L"dbgcore.dll",
+            L"psapi.dll",
+            L"imagehlp.dll",
+            L"hid.dll",
+            L"xinput1_3.dll",
+            L"xinput1_4.dll",
+            L"xinput9_1_0.dll",
+            L"dinput8.dll",
+            L"dsound.dll",
+            L"wtsapi32.dll",
+            L"userenv.dll",
+            L"wsock32.dll",
+            L"ws2_32.dll"
+        };
+        for (const wchar_t* name : names)
+        {
+            if (leaf == name)
+            {
+                matched = true;
+                break;
+            }
+        }
+        return matched;
+    }
+
     void EnrichProcessImagePath(
         DeviceClient* device,
         SymbolEngine* symbols,
@@ -4826,13 +4874,16 @@ void KernelMonitor::ScanUnbackedDriverObjects()
             {
                 continue;
             }
+            const std::wstring slotName = (dispatch.Index < 32)
+                ? (L"MajorFunction[" + dispatch.Name + L"]")
+                : dispatch.Name;
             EmitUnique(
                 L"hook.unbacked",
                 L"dispatch:" + HexU64(record.DriverObject) + L":" +
                     std::to_wstring(dispatch.Index),
                 record.Name,
                 L"dispatch",
-                L"MajorFunction[" + dispatch.Name + L"] of " + record.Name +
+                slotName + L" of " + record.Name +
                     L" points outside loaded modules " + HexU64(dispatch.Function),
                 dispatch.Notes);
         }
@@ -7278,10 +7329,14 @@ void KernelMonitor::ScanUserModeHostility()
                     {
                         break;
                     }
-                    if (!record.HasPrivateMemory ||
-                        !record.PrivateMemory ||
-                        record.Size < 0x1000 ||
+                    if (record.Size < 0x1000 ||
                         VadCoversUserAddress(record, exeRegion))
+                    {
+                        continue;
+                    }
+                    const bool privateMem =
+                        record.HasPrivateMemory && record.PrivateMemory;
+                    if (!privateMem && !record.PeHeaderFound && !record.PeHeaderSuspicious)
                     {
                         continue;
                     }
@@ -7504,6 +7559,12 @@ void KernelMonitor::ScanUserModeHostility()
                     moduleClass == L"unknown" &&
                     moduleLeaf != leaf &&
                     importedDlls.find(moduleLeaf) == importedDlls.end();
+                const bool watchedDirHijack =
+                    (watched || dropHost) &&
+                    inImageDir &&
+                    !windowsModule &&
+                    moduleLeaf != leaf &&
+                    KmonLooksLikeHijackDll(moduleLeaf);
                 const bool watchedUnknown = (watched || dropHost) &&
                     !windowsModule &&
                     !inImageDir &&
@@ -7513,7 +7574,11 @@ void KernelMonitor::ScanUserModeHostility()
                     !inImageDir &&
                     moduleClass != L"inbox" &&
                     moduleClass != L"third_party";
-                if (!dropImplant && !builtinForeign && !watchedUnknown && !watchedUnimported)
+                if (!dropImplant &&
+                    !builtinForeign &&
+                    !watchedUnknown &&
+                    !watchedUnimported &&
+                    !watchedDirHijack)
                 {
                     continue;
                 }
@@ -7523,9 +7588,11 @@ void KernelMonitor::ScanUserModeHostility()
                     imagePath,
                     dropImplant
                         ? L"drop_module"
-                        : (watchedUnimported
-                            ? L"watched_dir_unimported"
-                            : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module")),
+                        : (watchedDirHijack
+                            ? L"watched_dir_hijack"
+                            : (watchedUnimported
+                                ? L"watched_dir_unimported"
+                                : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module"))),
                     L"foreign module in pid=" + std::to_wstring(pid) + L" " + leaf +
                         L" module=" + KmonBasenameLower(modulePath),
                     modulePath,
@@ -9146,6 +9213,13 @@ bool KernelMonitorSelfTest()
             KmonClassifyDriverPath(L"\\Driver\\ACPI") != L"unknown" ||
             KmonClassifyDriverPath(L"D:\\cheats\\a.sys") != L"unknown" ||
             KmonClassifyDriverPath(L"C:\\cheat.sys") != L"drop")
+        {
+            break;
+        }
+        if (!KmonLooksLikeHijackDll(L"version.dll") ||
+            !KmonLooksLikeHijackDll(L"winmm.dll") ||
+            KmonLooksLikeHijackDll(L"game.dll") ||
+            KmonLooksLikeHijackDll(L"vcruntime140.dll"))
         {
             break;
         }
