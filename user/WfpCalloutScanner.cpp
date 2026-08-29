@@ -139,13 +139,29 @@ namespace
         uint32_t valid = 0;
         for (uint32_t i = 0; i < sample; ++i)
         {
-            uint64_t classifyFn = ReadEntryU64(buffer, static_cast<size_t>(i) * layout.EntrySize, layout.ClassifyOffset);
-            if (classifyFn == 0)
+            const size_t entryOffset = static_cast<size_t>(i) * layout.EntrySize;
+            uint64_t classifyFn = ReadEntryU64(buffer, entryOffset, layout.ClassifyOffset);
+            const uint32_t notifyOffset = layout.ClassifyOffset + 8;
+            const uint32_t flowDeleteOffset = layout.ClassifyOffset + 16;
+            uint64_t notifyFn = 0;
+            uint64_t flowDeleteFn = 0;
+            if (notifyOffset + sizeof(uint64_t) <= layout.EntrySize)
+            {
+                notifyFn = ReadEntryU64(buffer, entryOffset, notifyOffset);
+            }
+            if (flowDeleteOffset + sizeof(uint64_t) <= layout.EntrySize)
+            {
+                flowDeleteFn = ReadEntryU64(buffer, entryOffset, flowDeleteOffset);
+            }
+            if (classifyFn == 0 && notifyFn == 0 && flowDeleteFn == 0)
             {
                 continue;
             }
             ++nonNull;
-            if (IsKernelAddress(classifyFn) && !FindOwningModule(symbols, classifyFn).empty())
+            const uint64_t ownedProbe = (classifyFn != 0)
+                ? classifyFn
+                : ((notifyFn != 0) ? notifyFn : flowDeleteFn);
+            if (IsKernelAddress(ownedProbe) && !FindOwningModule(symbols, ownedProbe).empty())
             {
                 ++valid;
             }

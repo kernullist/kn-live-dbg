@@ -5192,6 +5192,22 @@ void KernelMonitor::ScanHookInput()
         return;
     }
     ClearEmittedKey(L"scan_failed:input");
+    if (!result.CoverageComplete)
+    {
+        EmitUnique(
+            L"hook.unbacked",
+            L"scan_failed:input:coverage",
+            std::wstring(),
+            L"input",
+            L"input class driver walk was incomplete; attached filters may be missed",
+            result.Warnings.empty()
+                ? L"CoverageComplete is false"
+                : result.Warnings.front());
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:input:coverage");
+    }
 
     bool hitCap = false;
     uint32_t suspicious = 0;
@@ -7338,11 +7354,6 @@ void KernelMonitor::ScanUserModeHostility()
                         pid);
                 }
             }
-            if (processHandle != nullptr)
-            {
-                CloseHandle(processHandle);
-            }
-
             if (hasKernelVadScan && hostileHost)
             {
                 uint32_t vadImplants = 0;
@@ -7543,6 +7554,7 @@ void KernelMonitor::ScanUserModeHostility()
             }
 
             uint32_t implants = 0;
+            uint32_t moduleTextHits = 0;
             const std::wstring imageDir = [&imagePath]() {
                 std::wstring dir = ToLowerCopy(imagePath);
                 for (wchar_t& ch : dir)
@@ -7555,12 +7567,9 @@ void KernelMonitor::ScanUserModeHostility()
                 size_t slash = dir.find_last_of(L'\\');
                 return (slash == std::wstring::npos) ? std::wstring() : dir.substr(0, slash + 1);
             }();
-            for (const std::wstring& modulePath : modulePaths)
+            for (size_t moduleIndex = 0; moduleIndex < modulePaths.size(); ++moduleIndex)
             {
-                if (implants >= 8)
-                {
-                    break;
-                }
+                const std::wstring& modulePath = modulePaths[moduleIndex];
                 const std::wstring moduleClass = KmonClassifyDriverPath(modulePath);
                 const std::wstring n = KmonNormalizeDriverPath(modulePath);
                 const bool windowsModule =
@@ -7613,6 +7622,56 @@ void KernelMonitor::ScanUserModeHostility()
                     !inImageDir &&
                     moduleClass != L"inbox" &&
                     moduleClass != L"third_party";
+                const uint64_t loadedModuleBase =
+                    (moduleIndex < moduleRanges.size())
+                        ? moduleRanges[moduleIndex].first
+                        : 0;
+                const bool compareModuleText =
+                    (watched || dropHost) &&
+                    !windowsModule &&
+                    moduleLeaf != leaf &&
+                    moduleTextHits < 8 &&
+                    loadedModuleBase != 0 &&
+                    PathLooksLikeWin32File(modulePath);
+                if (compareModuleText)
+                {
+                    ++moduleTextHits;
+                    std::vector<uint8_t> moduleHeaders;
+                    KmonPeLayout moduleLayout = {};
+                    if (ReadDiskPeHead(modulePath, &moduleHeaders) &&
+                        ParseKmonPeLayout(moduleHeaders, &moduleLayout) &&
+                        moduleLayout.ExecSize >= 16 &&
+                        moduleLayout.ExecFileOffset != 0 &&
+                        RelocatedSliceCompare(
+                            modulePath,
+                            moduleHeaders,
+                            moduleLayout,
+                            processHandle,
+                            device,
+                            symbols,
+                            pid,
+                            loadedModuleBase,
+                            moduleLayout.ExecRva,
+                            moduleLayout.ExecFileOffset,
+                            moduleLayout.ExecSize) == SliceMismatch)
+                    {
+                        EmitUnique(
+                            L"process.implant",
+                            L"module_text:" + std::to_wstring(pid) + L":" +
+                                moduleLeaf,
+                            imagePath,
+                            L"module_text",
+                            L"module code bytes differ from disk pid=" +
+                                std::to_wstring(pid) + L" " + leaf +
+                                L" module=" + moduleLeaf,
+                            modulePath,
+                            pid);
+                    }
+                }
+                if (implants >= 8)
+                {
+                    continue;
+                }
                 if (!dropImplant &&
                     !builtinForeign &&
                     !watchedUnknown &&
@@ -7640,6 +7699,10 @@ void KernelMonitor::ScanUserModeHostility()
                     modulePath,
                     pid);
                 ++implants;
+            }
+            if (processHandle != nullptr)
+            {
+                CloseHandle(processHandle);
             }
     }
 

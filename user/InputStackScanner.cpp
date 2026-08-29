@@ -101,6 +101,7 @@ bool InputStackScanner::Scan(InputStackScanResult* result, std::wstring* error)
         };
 
         uint32_t found = 0;
+        bool inspectFailed = false;
         for (const auto& role : roles)
         {
             InputStackRecord record = {};
@@ -114,6 +115,7 @@ bool InputStackScanner::Scan(InputStackScanResult* result, std::wstring* error)
                     &record.Driver,
                     &inspectError))
             {
+                inspectFailed = true;
                 result->Warnings.push_back(
                     record.DriverFilter + L": " + inspectError);
                 result->Records.push_back(record);
@@ -152,10 +154,13 @@ bool InputStackScanner::Scan(InputStackScanResult* result, std::wstring* error)
             result->Records.push_back(record);
         }
 
-        result->CoverageComplete = found > 0;
-        if (!result->CoverageComplete && error != nullptr)
+        result->CoverageComplete = found > 0 && !inspectFailed;
+        if (found == 0)
         {
-            *error = L"no input class driver objects were found";
+            if (error != nullptr)
+            {
+                *error = L"no input class driver objects were found";
+            }
             break;
         }
         ok = true;
