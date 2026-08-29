@@ -1889,17 +1889,19 @@ namespace
                 else
                 {
                     uint64_t sizeValue = 0;
+                    uint32_t tableSize = 0xE0;
                     if (ReadKernelInteger(
                             device,
                             record->FastIoDispatch,
                             sizeof(uint32_t),
                             &sizeValue,
-                            nullptr))
+                            nullptr) &&
+                        sizeValue >= 16 &&
+                        sizeValue <= 0x200)
                     {
-                        uint32_t tableSize = static_cast<uint32_t>(sizeValue);
-                        if (tableSize >= 16 && tableSize <= 0x200)
-                        {
-                            std::vector<uint8_t> table;
+                        tableSize = static_cast<uint32_t>(sizeValue);
+                    }
+                    std::vector<uint8_t> table;
                             std::wstring ignored;
                             if (ReadKernelBytes(
                                     device,
@@ -2009,8 +2011,6 @@ namespace
                                     record->Dispatch.push_back(dispatch);
                                 }
                             }
-                        }
-                    }
                 }
             }
 
