@@ -2136,7 +2136,9 @@ namespace
         uint64_t imageBase,
         uint32_t rva,
         uint32_t fileOffset,
-        uint32_t length)
+        uint32_t length,
+        std::vector<uint8_t>* relocCache = nullptr,
+        bool* relocCacheComplete = nullptr)
     {
         SliceCompare result = SliceUnknown;
         do
@@ -2170,22 +2172,46 @@ namespace
             bool compared = !aslr;
             if (aslr && layout.RelocRva != 0 && layout.RelocSize != 0)
             {
-                std::vector<uint8_t> relocs;
+                std::vector<uint8_t> localRelocs;
+                const std::vector<uint8_t>* activeRelocs = nullptr;
                 bool relocComplete = false;
-                if (ReadRelocDirectory(
-                        imagePath,
-                        diskHeaders,
-                        layout,
-                        processHandle,
-                        device,
-                        symbols,
-                        pid,
-                        imageBase,
-                        &relocs,
-                        &relocComplete))
+                if (relocCache != nullptr && !relocCache->empty())
+                {
+                    // Reuse a reloc directory that the caller already loaded
+                    // for this same image. Export prologue loops would
+                    // otherwise reread the whole directory from disk for
+                    // every single 24-byte slice.
+                    activeRelocs = relocCache;
+                    relocComplete = (relocCacheComplete != nullptr)
+                        ? *relocCacheComplete
+                        : false;
+                }
+                else if (ReadRelocDirectory(
+                             imagePath,
+                             diskHeaders,
+                             layout,
+                             processHandle,
+                             device,
+                             symbols,
+                             pid,
+                             imageBase,
+                             &localRelocs,
+                             &relocComplete))
+                {
+                    if (relocCache != nullptr)
+                    {
+                        *relocCache = localRelocs;
+                        if (relocCacheComplete != nullptr)
+                        {
+                            *relocCacheComplete = relocComplete;
+                        }
+                    }
+                    activeRelocs = &localRelocs;
+                }
+                if (activeRelocs != nullptr)
                 {
                     uint32_t lastVa = 0;
-                    const bool haveBlock = LastRelocBlockVa(relocs, &lastVa);
+                    const bool haveBlock = LastRelocBlockVa(*activeRelocs, &lastVa);
                     uint32_t sliceLastPage = rva & ~0xFFFu;
                     if (length != 0 &&
                         rva <= (std::numeric_limits<uint32_t>::max)() - (length - 1u))
@@ -2201,7 +2227,7 @@ namespace
                             &diskText,
                             rva,
                             delta,
-                            relocs,
+                            *activeRelocs,
                             layout.Is64);
                         compared = true;
                     }
@@ -2426,6 +2452,67 @@ namespace
             {
                 break;
             }
+            // Export names are loaded for every index in two loops. Reading
+            // each 64-byte name window from disk per index turns one module
+            // scan into thousands of file open/close cycles. Load the span
+            // that covers every name string once and fall back to a single
+            // name read when a name sits outside that span.
+            std::vector<uint8_t> nameBlob;
+            uint32_t nameBlobFile = 0;
+            bool haveNameBlob = false;
+            do
+            {
+                uint32_t minRva = 0;
+                uint32_t maxRva = 0;
+                for (uint32_t i = 0; i < nameCount; ++i)
+                {
+                    uint32_t probeRva = 0;
+                    std::memcpy(
+                        &probeRva,
+                        namesTable.data() + (i * 4u),
+                        sizeof(probeRva));
+                    if (probeRva == 0)
+                    {
+                        continue;
+                    }
+                    if (minRva == 0 || probeRva < minRva)
+                    {
+                        minRva = probeRva;
+                    }
+                    if (probeRva > maxRva)
+                    {
+                        maxRva = probeRva;
+                    }
+                }
+                if (minRva == 0 || maxRva < minRva)
+                {
+                    break;
+                }
+                constexpr uint32_t kNameTail = 64;
+                if (maxRva > (std::numeric_limits<uint32_t>::max)() - kNameTail)
+                {
+                    break;
+                }
+                const uint32_t blobRva = minRva;
+                uint32_t blobSpan = (maxRva - minRva) + kNameTail;
+                if (blobSpan > 0x10000)
+                {
+                    blobSpan = 0x10000;
+                }
+                uint32_t blobFile = 0;
+                if (!RvaToFileOffset(headers, blobRva, &blobFile))
+                {
+                    break;
+                }
+                if (!ReadDiskRange(imagePath, blobFile, blobSpan, &nameBlob) ||
+                    nameBlob.size() < blobSpan)
+                {
+                    nameBlob.clear();
+                    break;
+                }
+                nameBlobFile = blobFile;
+                haveNameBlob = true;
+            } while (false);
             static const char* kPriority[] =
             {
                 "NtProtectVirtualMemory",
@@ -2472,6 +2559,10 @@ namespace
             constexpr uint32_t kMaxNtChecks = 128;
             constexpr uint32_t kPrologue = 24;
             uint32_t checked = 0;
+            // Every prologue check below targets the same image, so one
+            // reloc directory load is shared across all export checks.
+            std::vector<uint8_t> relocCache;
+            bool relocCacheComplete = false;
             const uint32_t exportBegin = layout.ExportRva;
             const uint32_t exportEnd = layout.ExportRva + layout.ExportSize;
             auto nameIsPriority = [&](const std::string& name) -> bool
@@ -2515,7 +2606,9 @@ namespace
                     imageBase,
                     funcRva,
                     funcFile,
-                    kPrologue);
+                    kPrologue,
+                    &relocCache,
+                    &relocCacheComplete);
                 if (cmp == SliceUnknown)
                 {
                     return false;
@@ -2542,8 +2635,24 @@ namespace
                     return false;
                 }
                 std::vector<uint8_t> nameBytes;
-                if (!ReadDiskRange(imagePath, nameFileOff, 64, &nameBytes) ||
-                    nameBytes.empty())
+                bool haveNameBytes = false;
+                if (haveNameBlob &&
+                    nameFileOff >= nameBlobFile &&
+                    nameFileOff - nameBlobFile + 64 <= nameBlob.size())
+                {
+                    const size_t blobLocal =
+                        static_cast<size_t>(nameFileOff - nameBlobFile);
+                    nameBytes.assign(
+                        nameBlob.begin() + blobLocal,
+                        nameBlob.begin() + blobLocal + 64);
+                    haveNameBytes = true;
+                }
+                if (!haveNameBytes &&
+                    !ReadDiskRange(imagePath, nameFileOff, 64, &nameBytes))
+                {
+                    return false;
+                }
+                if (nameBytes.empty())
                 {
                     return false;
                 }
@@ -3062,6 +3171,32 @@ namespace
         return found;
     }
 
+    bool KmonOrphanRegionInteresting(
+        const MEMORY_BASIC_INFORMATION& region,
+        uint64_t exeRegion,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges)
+    {
+        // LoadLibraryEx(LOAD_LIBRARY_AS_IMAGE_RESOURCE) maps a whole PE as one
+        // read-only MEM_IMAGE allocation. Such benign resource views are module
+        // list orphans with an MZ header, so only an executable region may
+        // trigger the orphan MZ probe. Unlinked or manually mapped images keep
+        // firing through their RX text sub-region at the same allocation base.
+        const uint64_t alloc = reinterpret_cast<uint64_t>(region.AllocationBase);
+        const bool mappedOrPrivate =
+            region.Type == MEM_PRIVATE ||
+            region.Type == MEM_IMAGE ||
+            region.Type == MEM_MAPPED;
+        return
+            region.State == MEM_COMMIT &&
+            region.RegionSize >= 0x1000 &&
+            alloc != 0 &&
+            alloc != exeRegion &&
+            !AddressInModuleRanges(
+                alloc,
+                moduleRanges) &&
+            mappedOrPrivate &&
+            ProtectHasExecute(region.Protect);
+    }
     bool CountPrivateCowImagePages(
         HANDLE process,
         DeviceClient* device,
@@ -8146,18 +8281,11 @@ void KernelMonitor::ScanUserModeHostility()
                     const uint64_t alloc = reinterpret_cast<uint64_t>(region.AllocationBase);
                     const uint64_t next =
                         reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize;
-                    const bool mappedOrPrivate =
-                        region.Type == MEM_PRIVATE ||
-                        region.Type == MEM_IMAGE ||
-                        region.Type == MEM_MAPPED;
                     const bool interesting =
-                        region.State == MEM_COMMIT &&
-                        region.RegionSize >= 0x1000 &&
-                        alloc != 0 &&
-                        alloc != exeRegion &&
-                        !AddressInModuleRanges(alloc, moduleRanges) &&
-                        mappedOrPrivate &&
-                        (ProtectHasExecute(region.Protect) || region.Type == MEM_IMAGE);
+                        KmonOrphanRegionInteresting(
+                            region,
+                            exeRegion,
+                            moduleRanges);
                     if (interesting)
                     {
                         std::vector<uint8_t> head;
@@ -9947,6 +10075,84 @@ bool KernelMonitorSelfTest()
             !KmonExeRegionLooksPrivate(false, true, 0, true) ||
             !KmonProtectIsRwx(PAGE_EXECUTE_READWRITE) ||
             KmonProtectIsRwx(PAGE_EXECUTE_READ))
+        {
+            break;
+        }
+        MEMORY_BASIC_INFORMATION orphanRegion = {};
+        orphanRegion.State = MEM_COMMIT;
+        orphanRegion.RegionSize = 0x2000;
+        orphanRegion.AllocationBase =
+            reinterpret_cast<PVOID>(0x7ff000010000ull);
+        orphanRegion.Type = MEM_IMAGE;
+        orphanRegion.Protect = PAGE_READONLY;
+        const std::vector<std::pair<uint64_t, uint32_t>> emptyRanges;
+        const uint64_t otherImage = 0x7ff000000000ull;
+        // LOAD_LIBRARY_AS_IMAGE_RESOURCE views are read-only orphan MEM_IMAGE
+        // regions and must not reach the orphan MZ probe any more.
+        if (KmonOrphanRegionInteresting(
+                orphanRegion,
+                otherImage,
+                emptyRanges))
+        {
+            break;
+        }
+        // Unlinked images keep firing through their RX text sub-region.
+        orphanRegion.Protect = PAGE_EXECUTE_READ;
+        if (!KmonOrphanRegionInteresting(
+                orphanRegion,
+                otherImage,
+                emptyRanges))
+        {
+            break;
+        }
+        // Manually mapped RWX image allocations keep firing.
+        orphanRegion.Type = MEM_PRIVATE;
+        orphanRegion.Protect = PAGE_EXECUTE_READWRITE;
+        if (!KmonOrphanRegionInteresting(
+                orphanRegion,
+                otherImage,
+                emptyRanges))
+        {
+            break;
+        }
+        // Module-listed bases and the main EXE allocation never fire.
+        std::vector<std::pair<uint64_t, uint32_t>> listedRanges;
+        listedRanges.emplace_back(0x7ff000010000ull, 0x10000);
+        if (KmonOrphanRegionInteresting(
+                orphanRegion,
+                otherImage,
+                listedRanges) ||
+            KmonOrphanRegionInteresting(
+                orphanRegion,
+                reinterpret_cast<uint64_t>(orphanRegion.AllocationBase),
+                emptyRanges))
+        {
+            break;
+        }
+        // Reserved, tiny, or unbased regions never fire.
+        orphanRegion.State = MEM_RESERVE;
+        if (KmonOrphanRegionInteresting(
+                orphanRegion,
+                otherImage,
+                emptyRanges))
+        {
+            break;
+        }
+        orphanRegion.State = MEM_COMMIT;
+        orphanRegion.RegionSize = 0xfff;
+        if (KmonOrphanRegionInteresting(
+                orphanRegion,
+                otherImage,
+                emptyRanges))
+        {
+            break;
+        }
+        orphanRegion.RegionSize = 0x2000;
+        orphanRegion.AllocationBase = nullptr;
+        if (KmonOrphanRegionInteresting(
+                orphanRegion,
+                otherImage,
+                emptyRanges))
         {
             break;
         }
