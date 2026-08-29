@@ -59,6 +59,7 @@ struct MinifilterFilterRecord
     bool WellKnownInbox = false;
     bool LiveLayoutAvailable = false;
     std::vector<MinifilterIrpSlot> OperationsTable;
+    std::vector<MinifilterIrpSlot> LiveCallbackTable;
 };
 
 struct MinifilterIrpChange

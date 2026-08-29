@@ -66,6 +66,12 @@ namespace
         DeviceClient& device,
         const MinifilterLayout& layout,
         const std::vector<uint64_t>& instances);
+    void CollectLiveCallbackSlots(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const MinifilterLayout& layout,
+        const std::vector<uint64_t>& instances,
+        std::vector<MinifilterIrpSlot>* slots);
     void InferCallbackNodeArray(SymbolEngine& symbols, MinifilterLayout* layout);
     bool IsNopThunk(uint64_t address);
 
@@ -2048,6 +2054,12 @@ namespace
                                 device,
                                 layout,
                                 instances);
+                            CollectLiveCallbackSlots(
+                                device,
+                                symbols,
+                                layout,
+                                instances,
+                                &filter.LiveCallbackTable);
                             if (filter.ActiveOperationCount == 0 &&
                                 filter.LiveCallbackCount > 0)
                             {
@@ -2059,6 +2071,7 @@ namespace
                         else if (!instanceError.empty())
                         {
                             LeftoverAppendNote(&filter.Notes, instanceError);
+                            walkIncomplete = true;
                         }
                     }
                     result->Filters.push_back(filter);
@@ -2510,6 +2523,64 @@ namespace
             }
         }
         return live;
+    }
+
+    void CollectLiveCallbackSlots(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        const MinifilterLayout& layout,
+        const std::vector<uint64_t>& instances,
+        std::vector<MinifilterIrpSlot>* slots)
+    {
+        if (slots == nullptr)
+        {
+            return;
+        }
+        slots->clear();
+        std::set<uint64_t> seenPre;
+        std::set<uint64_t> seenPost;
+        constexpr uint32_t kMaxLiveSlots = 32;
+        for (uint64_t instance : instances)
+        {
+            if (slots->size() >= kMaxLiveSlots)
+            {
+                break;
+            }
+            std::vector<uint64_t> nodes;
+            CollectInstanceCallbackNodes(device, layout, instance, &nodes);
+            for (uint64_t node : nodes)
+            {
+                if (slots->size() >= kMaxLiveSlots)
+                {
+                    break;
+                }
+                uint64_t pre = 0;
+                uint64_t post = 0;
+                if (!ReadCallbackNodePointers(device, layout, node, &pre, &post, nullptr))
+                {
+                    continue;
+                }
+                MinifilterIrpSlot slot = {};
+                slot.Entry = node;
+                slot.MajorName = L"CallbackNode";
+                if (IsOriginalCallback(pre) && seenPre.insert(pre).second)
+                {
+                    slot.Pre = pre;
+                    slot.PreActive = true;
+                    Annotate(symbols, pre, &slot.PreModule, &slot.PreSymbol);
+                }
+                if (IsOriginalCallback(post) && seenPost.insert(post).second)
+                {
+                    slot.Post = post;
+                    slot.PostActive = true;
+                    Annotate(symbols, post, &slot.PostModule, &slot.PostSymbol);
+                }
+                if (slot.Pre != 0 || slot.Post != 0)
+                {
+                    slots->push_back(slot);
+                }
+            }
+        }
     }
 
     void RememberLiveNode(
