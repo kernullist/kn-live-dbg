@@ -53,6 +53,11 @@ instead of leaving PEB ImageBase unmapped.
 that is still visible is not `layer=ghost`; the fixture prints a warning in
 that case.
 
+`/orphan-image` still fires through its RX text sub-region. The orphan image
+layer requires an executable region at the allocation base, so read-only
+`LoadLibraryEx(LOAD_LIBRARY_AS_IMAGE_RESOURCE)` views left by icon/version
+readers (single orphan `MEM_IMAGE` + `PAGE_READONLY` region) stay silent.
+
 Stdout line:
 
 ```text
