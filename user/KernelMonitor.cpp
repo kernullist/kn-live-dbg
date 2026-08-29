@@ -1077,6 +1077,370 @@ namespace
         return ok;
     }
 
+    bool ReadKernelUnicodeString(
+        DeviceClient* device,
+        uint64_t address,
+        std::wstring* value)
+    {
+        bool ok = false;
+        do
+        {
+            if (value != nullptr)
+            {
+                value->clear();
+            }
+            if (device == nullptr || address == 0 || value == nullptr || !device->IsOpen())
+            {
+                break;
+            }
+            if (address < 0xFFFF800000000000ull)
+            {
+                break;
+            }
+            std::vector<uint8_t> header;
+            std::wstring ignored;
+            if (!device->ReadMemory(address, 16, &header, &ignored) || header.size() < 16)
+            {
+                break;
+            }
+            uint16_t length = 0;
+            uint64_t buffer = 0;
+            std::memcpy(&length, header.data(), sizeof(length));
+            std::memcpy(&buffer, header.data() + 8, sizeof(buffer));
+            if (length == 0)
+            {
+                ok = true;
+                break;
+            }
+            if ((length & 1u) != 0)
+            {
+                --length;
+            }
+            if (length == 0 || length > 2048 ||
+                buffer < 0xFFFF800000000000ull)
+            {
+                break;
+            }
+            std::vector<uint8_t> bytes;
+            if (!device->ReadMemory(buffer, length, &bytes, &ignored) ||
+                bytes.size() < 2)
+            {
+                break;
+            }
+            value->assign(
+                reinterpret_cast<const wchar_t*>(bytes.data()),
+                bytes.size() / sizeof(wchar_t));
+            ok = !value->empty();
+        } while (false);
+        return ok;
+    }
+
+    bool PathLooksLikeWin32File(const std::wstring& path)
+    {
+        bool ok = false;
+        do
+        {
+            std::wstring n = path;
+            for (wchar_t& ch : n)
+            {
+                if (ch == L'/')
+                {
+                    ch = L'\\';
+                }
+            }
+            if (n.size() >= 7 &&
+                n.compare(0, 4, L"\\\\?\\") == 0 &&
+                ((n[4] >= L'A' && n[4] <= L'Z') ||
+                    (n[4] >= L'a' && n[4] <= L'z')) &&
+                n[5] == L':' &&
+                n[6] == L'\\')
+            {
+                ok = true;
+                break;
+            }
+            if (n.size() >= 3 &&
+                ((n[0] >= L'A' && n[0] <= L'Z') ||
+                    (n[0] >= L'a' && n[0] <= L'z')) &&
+                n[1] == L':' &&
+                n[2] == L'\\')
+            {
+                ok = true;
+            }
+        } while (false);
+        return ok;
+    }
+
+    std::wstring Win32PathFromKernelImagePath(const std::wstring& path)
+    {
+        std::wstring result = path;
+        do
+        {
+            if (path.empty())
+            {
+                break;
+            }
+
+            std::wstring n = path;
+            for (wchar_t& ch : n)
+            {
+                if (ch == L'/')
+                {
+                    ch = L'\\';
+                }
+            }
+            std::wstring lowered = ToLowerCopy(n);
+
+            bool stripped = true;
+            while (stripped)
+            {
+                stripped = false;
+                const std::wstring prefixes[] = {
+                    L"\\\\?\\",
+                    L"\\\\.\\",
+                    L"\\??\\",
+                    L"\\dosdevices\\"
+                };
+                for (const std::wstring& prefix : prefixes)
+                {
+                    if (lowered.size() >= prefix.size() &&
+                        lowered.compare(0, prefix.size(), prefix) == 0)
+                    {
+                        n.erase(0, prefix.size());
+                        lowered.erase(0, prefix.size());
+                        stripped = true;
+                        break;
+                    }
+                }
+            }
+
+            if (PathLooksLikeWin32File(n))
+            {
+                result = n;
+                break;
+            }
+
+            const std::wstring systemRootSlash = L"\\systemroot\\";
+            if (lowered.size() >= systemRootSlash.size() &&
+                lowered.compare(0, systemRootSlash.size(), systemRootSlash) == 0)
+            {
+                wchar_t windowsDirectory[MAX_PATH] = {};
+                if (GetWindowsDirectoryW(
+                        windowsDirectory,
+                        ARRAYSIZE(windowsDirectory)) != 0)
+                {
+                    result = std::wstring(windowsDirectory) +
+                        n.substr(systemRootSlash.size() - 1);
+                    break;
+                }
+            }
+
+            if (lowered.size() >= 8 &&
+                lowered.compare(0, 8, L"\\device\\") == 0)
+            {
+                wchar_t drive[] = L"A:";
+                for (wchar_t letter = L'A'; letter <= L'Z'; ++letter)
+                {
+                    drive[0] = letter;
+                    wchar_t target[1024] = {};
+                    const DWORD length = QueryDosDeviceW(
+                        drive,
+                        target,
+                        ARRAYSIZE(target));
+                    if (length == 0)
+                    {
+                        continue;
+                    }
+                    std::wstring deviceName = ToLowerCopy(target);
+                    for (wchar_t& ch : deviceName)
+                    {
+                        if (ch == L'/')
+                        {
+                            ch = L'\\';
+                        }
+                    }
+                    while (deviceName.size() > 1 && deviceName.back() == L'\\')
+                    {
+                        deviceName.pop_back();
+                    }
+                    if (deviceName.empty())
+                    {
+                        continue;
+                    }
+                    if (lowered.compare(0, deviceName.size(), deviceName) == 0 &&
+                        (lowered.size() == deviceName.size() ||
+                            lowered[deviceName.size()] == L'\\'))
+                    {
+                        result = std::wstring(drive) + n.substr(deviceName.size());
+                        break;
+                    }
+                }
+                break;
+            }
+
+            if (lowered.size() >= 9 &&
+                lowered.compare(0, 9, L"\\windows\\") == 0)
+            {
+                wchar_t windowsDirectory[MAX_PATH] = {};
+                if (GetWindowsDirectoryW(
+                        windowsDirectory,
+                        ARRAYSIZE(windowsDirectory)) != 0)
+                {
+                    std::wstring windowsPath = windowsDirectory;
+                    if (windowsPath.size() >= 2 && windowsPath[1] == L':')
+                    {
+                        result = windowsPath.substr(0, 2) + n;
+                    }
+                }
+                break;
+            }
+
+            const bool wellKnownRoot =
+                (lowered.size() >= 7 &&
+                    lowered.compare(0, 7, L"\\users\\") == 0) ||
+                (lowered.size() >= 14 &&
+                    lowered.compare(0, 14, L"\\program files") == 0) ||
+                (lowered.size() >= 13 &&
+                    lowered.compare(0, 13, L"\\programdata\\") == 0);
+            if (wellKnownRoot)
+            {
+                wchar_t drive[] = L"A:";
+                for (wchar_t letter = L'A'; letter <= L'Z'; ++letter)
+                {
+                    drive[0] = letter;
+                    std::wstring candidate = std::wstring(drive) + n;
+                    if (GetFileAttributesW(candidate.c_str()) !=
+                        INVALID_FILE_ATTRIBUTES)
+                    {
+                        result = std::move(candidate);
+                        break;
+                    }
+                }
+            }
+        } while (false);
+        return result;
+    }
+
+    bool QueryKernelImagePath(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        std::wstring* path)
+    {
+        bool ok = false;
+        do
+        {
+            if (path != nullptr)
+            {
+                path->clear();
+            }
+            if (path == nullptr ||
+                device == nullptr ||
+                symbols == nullptr ||
+                pid <= 4 ||
+                !device->IsOpen())
+            {
+                break;
+            }
+
+            TypeFieldInfo dtbField = {};
+            std::wstring ignored;
+            if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
+                !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            {
+                break;
+            }
+
+            ProcessAddressContext ctx = {};
+            if (!device->ResolveProcess(
+                    pid,
+                    static_cast<uint32_t>(dtbField.Offset),
+                    0,
+                    &ctx,
+                    &ignored) ||
+                ctx.Eprocess == 0)
+            {
+                break;
+            }
+
+            TypeFieldInfo nameField = {};
+            uint64_t nameInfo = 0;
+            if ((symbols->FindField(
+                    L"nt!_EPROCESS",
+                    L"SeAuditProcessCreationInfo.ImageFileName",
+                    &nameField,
+                    &ignored) ||
+                symbols->FindField(
+                    L"nt!_EPROCESS",
+                    L"SeAuditProcessCreationInfo",
+                    &nameField,
+                    &ignored)) &&
+                nameField.Offset <= (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess)
+            {
+                std::vector<uint8_t> pointerBytes;
+                if (device->ReadMemory(
+                        ctx.Eprocess + static_cast<uint64_t>(nameField.Offset),
+                        sizeof(uint64_t),
+                        &pointerBytes,
+                        &ignored) &&
+                    pointerBytes.size() >= sizeof(uint64_t))
+                {
+                    std::memcpy(&nameInfo, pointerBytes.data(), sizeof(nameInfo));
+                }
+            }
+            if (nameInfo >= 0xFFFF800000000000ull &&
+                ReadKernelUnicodeString(device, nameInfo, path) &&
+                !path->empty())
+            {
+                ok = true;
+                break;
+            }
+
+            TypeFieldInfo imageFile = {};
+            TypeFieldInfo fileName = {};
+            if (!symbols->FindField(L"nt!_EPROCESS", L"ImageFilePointer", &imageFile, &ignored) ||
+                !symbols->FindField(L"nt!_FILE_OBJECT", L"FileName", &fileName, &ignored))
+            {
+                break;
+            }
+            if (imageFile.Offset > (std::numeric_limits<uint64_t>::max)() - ctx.Eprocess)
+            {
+                break;
+            }
+            std::vector<uint8_t> fileBytes;
+            if (!device->ReadMemory(
+                    ctx.Eprocess + static_cast<uint64_t>(imageFile.Offset),
+                    sizeof(uint64_t),
+                    &fileBytes,
+                    &ignored) ||
+                fileBytes.size() < sizeof(uint64_t))
+            {
+                break;
+            }
+            uint64_t fileObject = 0;
+            std::memcpy(&fileObject, fileBytes.data(), sizeof(fileObject));
+            if (fileObject < 0xFFFF800000000000ull ||
+                fileName.Offset > (std::numeric_limits<uint64_t>::max)() - fileObject)
+            {
+                break;
+            }
+            ok = ReadKernelUnicodeString(
+                device,
+                fileObject + static_cast<uint64_t>(fileName.Offset),
+                path) &&
+                !path->empty();
+        } while (false);
+        if (ok && path != nullptr && !path->empty())
+        {
+            std::wstring win32 = Win32PathFromKernelImagePath(*path);
+            if (PathLooksLikeWin32File(win32))
+            {
+                *path = std::move(win32);
+            }
+        }
+        return ok;
+    }
+
     bool QueryProcessIsWow64(
         HANDLE process,
         DeviceClient* device,
@@ -2051,6 +2415,36 @@ namespace
         return path.find_first_of(L"\\/") != std::wstring::npos;
     }
 
+    void EnrichProcessImagePath(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        std::wstring* path)
+    {
+        if (path == nullptr || pid <= 4)
+        {
+            return;
+        }
+        if (!PathLooksLikeWin32File(*path) && PathHasDirectorySeparator(*path))
+        {
+            std::wstring win32 = Win32PathFromKernelImagePath(*path);
+            if (PathLooksLikeWin32File(win32))
+            {
+                *path = std::move(win32);
+            }
+        }
+        if (PathLooksLikeWin32File(*path))
+        {
+            return;
+        }
+        std::wstring kernelPath;
+        if (QueryKernelImagePath(device, symbols, pid, &kernelPath) &&
+            PathHasDirectorySeparator(kernelPath))
+        {
+            *path = std::move(kernelPath);
+        }
+    }
+
     std::wstring KmonImageForClassify(uint32_t pid, const std::wstring& maybePath)
     {
         if (PathHasDirectorySeparator(maybePath))
@@ -2101,13 +2495,20 @@ namespace
     typedef LONG NTSTATUS;
     typedef NTSTATUS(NTAPI* NtSetInformationProcessFn)(HANDLE, ULONG, PVOID, ULONG);
 
-    bool TryEnableLoggingUsermode(uint32_t pid, uint32_t loggingFlags)
+    bool TryEnableLoggingUsermode(
+        uint32_t pid,
+        uint32_t loggingFlags,
+        uint32_t* infoClass = nullptr)
     {
         bool ok = false;
         HANDLE process = nullptr;
 
         do
         {
+            if (infoClass != nullptr)
+            {
+                *infoClass = 0;
+            }
             process = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
             if (process == nullptr)
             {
@@ -2128,6 +2529,7 @@ namespace
             }
 
             ULONG flags = loggingFlags;
+            ULONG classUsed = kProcessEnableLogging;
             NTSTATUS status = setInfo(
                 process,
                 kProcessEnableLogging,
@@ -2136,6 +2538,7 @@ namespace
             if (status < 0)
             {
                 UCHAR smallFlags = static_cast<UCHAR>(loggingFlags & 0x3u);
+                classUsed = kProcessEnableReadWriteVmLogging;
                 status = setInfo(
                     process,
                     kProcessEnableReadWriteVmLogging,
@@ -2144,6 +2547,10 @@ namespace
             }
             if (status >= 0)
             {
+                if (infoClass != nullptr)
+                {
+                    *infoClass = classUsed;
+                }
                 ok = true;
             }
         } while (false);
@@ -3516,6 +3923,41 @@ void KernelMonitor::IngestThreatIntel()
             if (classified.Kind == L"driver.official_unload")
             {
                 MaybeEmitShortLived(classified);
+            }
+            if (classified.Kind == L"inject.remote")
+            {
+                auto resolveInjectImage = [&](uint32_t pid, std::wstring* image)
+                {
+                    if (image == nullptr || pid <= 4)
+                    {
+                        return;
+                    }
+                    if (PathLooksLikeWin32File(*image))
+                    {
+                        return;
+                    }
+                    if (PathHasDirectorySeparator(*image))
+                    {
+                        std::wstring win32 = Win32PathFromKernelImagePath(*image);
+                        if (PathLooksLikeWin32File(win32))
+                        {
+                            *image = std::move(win32);
+                            return;
+                        }
+                    }
+                    std::wstring resolved;
+                    if (QueryKernelImagePath(
+                            device,
+                            symbols,
+                            pid,
+                            &resolved) &&
+                        PathHasDirectorySeparator(resolved))
+                    {
+                        *image = std::move(resolved);
+                    }
+                };
+                resolveInjectImage(classified.TargetProcessId, &classified.TargetImage);
+                resolveInjectImage(classified.ProcessId, &classified.Image);
             }
             RecordEvent(std::move(classified));
         }
@@ -5455,20 +5897,72 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             {
                 ClearEmittedKey(L"scan_failed:minifilter:coverage");
             }
+            uint32_t minifilterHits = 0;
+            uint32_t minifilterEmitted = 0;
             for (const MinifilterFilterRecord& filter : result.Filters)
             {
-                if (filter.DriverStart == 0 ||
-                    AddressOwnedByLoadedModule(symbols, filter.DriverStart))
+                const bool startUnbacked =
+                    filter.DriverStart != 0 &&
+                    !AddressOwnedByLoadedModule(symbols, filter.DriverStart);
+                if (startUnbacked)
                 {
-                    continue;
+                    ++minifilterHits;
+                    if (minifilterEmitted < 16)
+                    {
+                        EmitUnique(
+                            L"hook.unbacked",
+                            L"minifilter:" + HexU64(filter.Filter),
+                            filter.Name,
+                            L"minifilter",
+                            L"minifilter " + filter.Name +
+                                L" is not backed by a loaded module",
+                            filter.Notes);
+                        ++minifilterEmitted;
+                    }
                 }
+                for (const MinifilterIrpSlot& slot : filter.OperationsTable)
+                {
+                    auto emitMinifilterFn = [&](uint64_t fn, const wchar_t* which)
+                    {
+                        if (fn == 0 || AddressOwnedByLoadedModule(symbols, fn))
+                        {
+                            return;
+                        }
+                        ++minifilterHits;
+                        if (minifilterEmitted >= 16)
+                        {
+                            return;
+                        }
+                        EmitUnique(
+                            L"hook.unbacked",
+                            L"minifilter:" + HexU64(filter.Filter) + L":" +
+                                which + L":" + HexU64(fn),
+                            filter.Name,
+                            L"minifilter",
+                            L"minifilter " + filter.Name + L" " + which +
+                                L" callback outside loaded modules " + HexU64(fn),
+                            slot.MajorName.empty()
+                                ? filter.Notes
+                                : (slot.MajorName + L" " + filter.Notes));
+                        ++minifilterEmitted;
+                    };
+                    emitMinifilterFn(slot.Pre, L"pre");
+                    emitMinifilterFn(slot.Post, L"post");
+                }
+            }
+            if (minifilterHits > 16)
+            {
                 EmitUnique(
                     L"hook.unbacked",
-                    L"minifilter:" + HexU64(filter.Filter),
-                    filter.Name,
+                    L"scan_failed:minifilter:truncated",
+                    std::wstring(),
                     L"minifilter",
-                    L"minifilter " + filter.Name + L" is not backed by a loaded module",
-                    filter.Notes);
+                    L"minifilter scan hit the emit cap; extra unbacked callbacks may be missed",
+                    L"hits=" + std::to_wstring(minifilterHits));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:minifilter:truncated");
             }
         }
         else
@@ -5654,6 +6148,7 @@ void KernelMonitor::ScanUserModeHostility()
                 {
                     target.ImagePath = entry.szExeFile;
                 }
+                EnrichProcessImagePath(device, symbols, pid, &target.ImagePath);
                 target.Leaf = KmonBasenameLower(target.ImagePath);
                 const std::wstring pathClass = KmonClassifyDriverPath(target.ImagePath);
                 const bool watched =
@@ -5713,6 +6208,7 @@ void KernelMonitor::ScanUserModeHostility()
                 }
                 CloseHandle(process);
             }
+            EnrichProcessImagePath(device, symbols, pid, &target.ImagePath);
             target.Leaf = KmonBasenameLower(target.ImagePath);
             target.HighPriority = true;
             target.Interesting = true;
@@ -5941,6 +6437,10 @@ void KernelMonitor::ScanUserModeHostility()
                 (hostileHost) &&
                 (!queried || !moduleInventoryComplete);
             const bool wantKernelVad = watched || dropHost || needKernelPrivateImplants;
+            // Watched/drop hosts still need private-VAD PE probes when the
+            // usermode module list is complete; header-intact and wiped
+            // manual maps would otherwise hide behind the JIT skip.
+            const bool probePrivatePe = wantKernelVad;
             const bool hasKernelVadScan =
                 wantKernelVad &&
                 QueryKernelVadScan(
@@ -5950,7 +6450,7 @@ void KernelMonitor::ScanUserModeHostility()
                     &kernelVad,
                     &kernelVadScanned,
                     wantKernelVad,
-                    needKernelPrivateImplants);
+                    probePrivatePe);
             const std::wstring vadFailKey =
                 L"scan_failed:userhostility:vad:" + std::to_wstring(pid);
             if (wantKernelVad && !kernelVadScanned)
@@ -6180,8 +6680,8 @@ void KernelMonitor::ScanUserModeHostility()
                     exeRegion,
                     0x400,
                     &live);
-                const bool diskExists = !imagePath.empty() &&
-                    PathHasDirectorySeparator(imagePath) &&
+                const bool diskPathUsable = PathLooksLikeWin32File(imagePath);
+                const bool diskExists = diskPathUsable &&
                     GetFileAttributesW(imagePath.c_str()) != INVALID_FILE_ATTRIBUTES;
                 const bool liveMz =
                     liveOk && live.size() >= 2 && live[0] == 'M' && live[1] == 'Z';
@@ -6199,7 +6699,7 @@ void KernelMonitor::ScanUserModeHostility()
                 }
                 else if (liveMz)
                 {
-                    if (!diskExists && PathHasDirectorySeparator(imagePath))
+                    if (!diskExists && diskPathUsable)
                     {
                         EmitUnique(
                             L"process.hollow",
@@ -6711,6 +7211,26 @@ void KernelMonitor::ScanUserModeHostility()
                                 pid);
                             ++orphans;
                         }
+                        else if (
+                            hostileHost &&
+                            region.Type == MEM_PRIVATE &&
+                            ProtectHasExecute(region.Protect) &&
+                            region.RegionSize <= 0x10000)
+                        {
+                            EmitUnique(
+                                L"process.implant",
+                                L"private_exec:" + std::to_wstring(pid) + L":" + HexU64(alloc),
+                                imagePath,
+                                L"private_exec",
+                                L"private executable region is not in the module list pid=" +
+                                    std::to_wstring(pid) + L" " + leaf,
+                                L"base=" + HexU64(alloc) +
+                                    L" size=" + std::to_wstring(
+                                        static_cast<unsigned long long>(region.RegionSize)) +
+                                    L" protect=" + std::to_wstring(region.Protect),
+                                pid);
+                            ++orphans;
+                        }
                     }
                     if (next <= cursor)
                     {
@@ -6743,10 +7263,11 @@ void KernelMonitor::ScanUserModeHostility()
             if (hasKernelVadScan && hostileHost)
             {
                 uint32_t vadImplants = 0;
-                // Usermode VirtualQueryEx already reported MZ/RWX orphans
-                // when the module list is complete. Keep kernel private-VAD
-                // implants when that walk cannot run.
-                const bool emitPrivateVadImplants = needKernelPrivateImplants;
+                // Usermode VirtualQueryEx reports MZ/RWX and small RX
+                // orphans. Kernel private-VAD PE probes still run on
+                // watched/drop hosts so wiped/header-intact maps are not
+                // dropped when the module list is complete.
+                const bool emitPrivateVadImplants = probePrivatePe;
                 for (const ProcessVadRecord& record : kernelVad.Records)
                 {
                     if (!emitPrivateVadImplants)
@@ -7056,13 +7577,19 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         auto it = LoggingEnabledPids.find(pid);
-        if (it != LoggingEnabledPids.end() && it->second == created)
+        if (it != LoggingEnabledPids.end() &&
+            created != 0 &&
+            it->second == created)
         {
             return;
         }
     }
 
-    bool enabled = TryEnableLoggingUsermode(pid, KNDBG_PROCESS_LOG_DEFAULT);
+    uint32_t infoClass = 0;
+    bool enabled = TryEnableLoggingUsermode(
+        pid,
+        KNDBG_PROCESS_LOG_DEFAULT,
+        &infoClass);
     if (!enabled)
     {
         if (device == nullptr)
@@ -7073,7 +7600,6 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
         if (device != nullptr && device->IsOpen())
         {
             uint32_t applied = 0;
-            uint32_t infoClass = 0;
             uint32_t ntStatus = 0;
             uint64_t eprocess = 0;
             std::wstring error;
@@ -7090,6 +7616,28 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
                 enabled = false;
             }
         }
+    }
+
+    const std::wstring loggingPartialKey =
+        L"scan_failed:logging:partial:" + std::to_wstring(pid);
+    const bool partialLogging =
+        enabled &&
+        infoClass == kProcessEnableReadWriteVmLogging;
+    if (partialLogging)
+    {
+        EmitUnique(
+            L"process.implant",
+            loggingPartialKey,
+            std::wstring(),
+            L"logging",
+            L"process logging fell back to ReadWriteVmLogging pid=" +
+                std::to_wstring(pid),
+            L"AllocVM/ProtectVM/APC/MapView may be silent",
+            pid);
+    }
+    else
+    {
+        ClearEmittedKeyForPid(loggingPartialKey, pid);
     }
 
     if (enabled)
@@ -8705,6 +9253,80 @@ bool KernelMonitorSelfTest()
             sectionBaseUnknown != 0)
         {
             break;
+        }
+        std::wstring kernelPathUnknown = L"x";
+        if (QueryKernelImagePath(nullptr, nullptr, 8, &kernelPathUnknown) ||
+            !kernelPathUnknown.empty())
+        {
+            break;
+        }
+        if (!PathLooksLikeWin32File(L"C:\\Windows\\System32\\svchost.exe") ||
+            !PathLooksLikeWin32File(L"c:/Windows/System32/svchost.exe") ||
+            PathLooksLikeWin32File(L"svchost.exe") ||
+            PathLooksLikeWin32File(
+                L"\\Device\\HarddiskVolume3\\Windows\\System32\\svchost.exe") ||
+            PathLooksLikeWin32File(L"\\Windows\\System32\\svchost.exe"))
+        {
+            break;
+        }
+        if (Win32PathFromKernelImagePath(L"\\??\\C:\\Windows\\System32\\svchost.exe") !=
+                L"C:\\Windows\\System32\\svchost.exe" ||
+            Win32PathFromKernelImagePath(L"\\\\?\\C:\\Temp\\x.exe") !=
+                L"C:\\Temp\\x.exe")
+        {
+            break;
+        }
+        {
+            wchar_t windowsDirectory[MAX_PATH] = {};
+            if (GetWindowsDirectoryW(
+                    windowsDirectory,
+                    ARRAYSIZE(windowsDirectory)) == 0)
+            {
+                break;
+            }
+            std::wstring windowsPath = windowsDirectory;
+            if (windowsPath.size() < 2 || windowsPath[1] != L':')
+            {
+                break;
+            }
+            const std::wstring drive = windowsPath.substr(0, 2);
+            if (Win32PathFromKernelImagePath(L"\\Windows\\System32\\svchost.exe") !=
+                    (drive + L"\\Windows\\System32\\svchost.exe") ||
+                Win32PathFromKernelImagePath(L"\\SystemRoot\\System32\\ntdll.dll") !=
+                    (windowsPath + L"\\System32\\ntdll.dll"))
+            {
+                break;
+            }
+            {
+                const std::wstring usersNt =
+                    L"\\Users\\a\\AppData\\Local\\Temp\\x.exe";
+                const std::wstring users = Win32PathFromKernelImagePath(usersNt);
+                const std::wstring gameNt = L"\\Program Files\\Game\\game.exe";
+                const std::wstring game = Win32PathFromKernelImagePath(gameNt);
+                if ((users != usersNt && !PathLooksLikeWin32File(users)) ||
+                    (game != gameNt && !PathLooksLikeWin32File(game)))
+                {
+                    break;
+                }
+            }
+            std::wstring enrichNt = L"\\Windows\\System32\\svchost.exe";
+            EnrichProcessImagePath(nullptr, nullptr, 8, &enrichNt);
+            std::wstring enrichWin32 = drive + L"\\Windows\\System32\\notepad.exe";
+            EnrichProcessImagePath(nullptr, nullptr, 8, &enrichWin32);
+            if (enrichNt != (drive + L"\\Windows\\System32\\svchost.exe") ||
+                enrichWin32 != (drive + L"\\Windows\\System32\\notepad.exe"))
+            {
+                break;
+            }
+        }
+        {
+            const std::wstring ntDevice =
+                L"\\Device\\HarddiskVolume3\\Windows\\System32\\svchost.exe";
+            const std::wstring converted = Win32PathFromKernelImagePath(ntDevice);
+            if (converted != ntDevice && !PathLooksLikeWin32File(converted))
+            {
+                break;
+            }
         }
         uint64_t icUnknown = 1;
         if (QueryInstrumentationCallback(nullptr, nullptr, 8, &icUnknown) ||
