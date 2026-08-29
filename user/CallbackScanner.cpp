@@ -3693,7 +3693,10 @@ bool KernelCallbackScanner::ScanObjectCallbacks(KernelCallbackScanResult* result
         {
             {L"Process", L"nt!PsProcessType"},
             {L"Thread", L"nt!PsThreadType"},
-            {L"Desktop", L"nt!ExDesktopObjectType"}
+            {L"Desktop", L"nt!ExDesktopObjectType"},
+            {L"Token", L"nt!SeTokenObjectType"},
+            {L"File", L"nt!IoFileObjectType"},
+            {L"WindowStation", L"nt!ExWindowStationObjectType"}
         };
 
         for (const KnownObjectType& knownType : knownTypes)
