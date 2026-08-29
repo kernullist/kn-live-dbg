@@ -3175,6 +3175,7 @@ bool KernelMonitor::Start(
                 WatchNamesLower = Options.WatchNames;
                 WatchDriversLower = Options.WatchDrivers;
                 WatchPromotedPids.clear();
+                WatchPromotedCreated.clear();
                 LoggingEnabledPids.clear();
                 LoggingFailedPids.clear();
                 RecentCreatePids.clear();
@@ -5507,6 +5508,24 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     L"kernel code integrity is disabled (DSE off)",
                     result.CiOptions.SymbolSource);
             }
+            else
+            {
+                ClearEmittedKey(L"integrity:ci_disabled");
+            }
+            if (result.CiOptions.TestSign)
+            {
+                EmitUnique(
+                    L"integrity.ci",
+                    L"integrity:ci_testsign",
+                    std::wstring(),
+                    L"ci",
+                    L"kernel test-signing is enabled (DSE test mode)",
+                    result.CiOptions.SymbolSource);
+            }
+            else
+            {
+                ClearEmittedKey(L"integrity:ci_testsign");
+            }
         }
         else
         {
@@ -6757,8 +6776,8 @@ void KernelMonitor::ScanUserModeHostility()
                     if (!rwx && !pe && !wiped)
                     {
                         // Headerless private RX on games is dominated by JIT.
-                        // Builtin hosts should not have it.
-                        if (!builtin)
+                        // Builtin and drop-path hosts should not have it.
+                        if (!builtin && !dropHost)
                         {
                             continue;
                         }
@@ -7087,6 +7106,10 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
         {
             it->second = created;
         }
+        if (created != 0 && WatchPromotedPids.count(pid) != 0)
+        {
+            WatchPromotedCreated[pid] = created;
+        }
     }
     else
     {
@@ -7151,6 +7174,62 @@ void KernelMonitor::PruneStalePromotedWatches()
                 liveSet.insert(live.begin(), live.end());
                 prunePromoted = true;
             }
+            else
+            {
+                for (uint32_t pid : promoted)
+                {
+                    HANDLE process = OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION,
+                        FALSE,
+                        pid);
+                    if (process != nullptr)
+                    {
+                        liveSet.insert(pid);
+                        CloseHandle(process);
+                        continue;
+                    }
+                    if (GetLastError() != ERROR_INVALID_PARAMETER)
+                    {
+                        liveSet.insert(pid);
+                    }
+                }
+                prunePromoted = true;
+            }
+        }
+    }
+
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> stateLock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    std::unordered_map<uint32_t, uint64_t> promotedCreated;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        promotedCreated = WatchPromotedCreated;
+    }
+    for (uint32_t pid : promoted)
+    {
+        if (liveSet.count(pid) == 0)
+        {
+            continue;
+        }
+        auto createdIt = promotedCreated.find(pid);
+        if (createdIt == promotedCreated.end() || createdIt->second == 0)
+        {
+            continue;
+        }
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        const uint64_t created = QueryPidCreateTime(device, symbols, process, pid);
+        if (process != nullptr)
+        {
+            CloseHandle(process);
+        }
+        if (created != 0 && created != createdIt->second)
+        {
+            liveSet.erase(pid);
         }
     }
 
@@ -7170,6 +7249,7 @@ void KernelMonitor::PruneStalePromotedWatches()
                 {
                     continue;
                 }
+                WatchPromotedCreated.erase(pid);
                 if (WatchExplicitPids.count(pid) == 0)
                 {
                     WatchPids.erase(pid);
@@ -7194,14 +7274,6 @@ void KernelMonitor::PruneStalePromotedWatches()
             ids.insert(entry.first);
         }
         logging.assign(ids.begin(), ids.end());
-    }
-
-    DeviceClient* device = nullptr;
-    SymbolEngine* symbols = nullptr;
-    {
-        std::lock_guard<std::mutex> stateLock(StateMutex);
-        device = Device;
-        symbols = Symbols;
     }
 
     for (uint32_t pid : droppedWatch)
@@ -7270,10 +7342,27 @@ void KernelMonitor::PromoteNamedWatchPid(uint32_t pid)
     {
         return;
     }
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> stateLock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    const uint64_t created = QueryPidCreateTime(device, symbols, process, pid);
+    if (process != nullptr)
+    {
+        CloseHandle(process);
+    }
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
         WatchPids.insert(pid);
         WatchPromotedPids.insert(pid);
+        if (created != 0)
+        {
+            WatchPromotedCreated[pid] = created;
+        }
     }
     EnableLoggingForPid(pid);
 }
@@ -7696,6 +7785,7 @@ bool KernelMonitor::RemoveWatchPid(uint32_t pid)
         std::lock_guard<std::mutex> lock(WatchMutex);
         WatchExplicitPids.erase(pid);
         WatchPromotedPids.erase(pid);
+        WatchPromotedCreated.erase(pid);
         removed = WatchPids.erase(pid) != 0;
         wasLogging = LoggingEnabledPids.erase(pid) != 0;
         LoggingFailedPids.erase(pid);

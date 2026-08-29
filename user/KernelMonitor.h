@@ -170,6 +170,7 @@ private:
     std::vector<std::wstring> WatchNamesLower;
     std::vector<std::wstring> WatchDriversLower;
     std::unordered_set<uint32_t> WatchPromotedPids;
+    std::unordered_map<uint32_t, uint64_t> WatchPromotedCreated;
     std::unordered_map<uint32_t, uint64_t> LoggingEnabledPids;
     std::unordered_map<uint32_t, uint64_t> LoggingFailedPids;
     std::map<uint32_t, uint64_t> RecentCreatePids;
