@@ -4686,6 +4686,17 @@ bool ProcessTriageScanner::ScanVad(
                     (options.ProbePe || options.PeOnly) &&
                     record.HasPrivateMemory &&
                     record.PrivateMemory;
+                // NtMapViewOfSection / SEC_IMAGE implants are not
+                // PrivateMemory. Probe executable or subsection VADs when
+                // kmon already asked for PE probes, without walking every
+                // committed mapping (ProbeAllPe).
+                const bool sectionPeProbe =
+                    (options.ProbePe || options.PeOnly) &&
+                    (!record.HasPrivateMemory || !record.PrivateMemory) &&
+                    (record.Executable ||
+                        record.WritableExecutable ||
+                        record.HasSubsection) &&
+                    VadBasePageCommitted(record);
                 // A manual mapper may initially leave an image RW or even R;
                 // include committed VADs as well as executable and subsection-
                 // backed mappings. Pure reservations cannot contain a mapped
@@ -4693,7 +4704,7 @@ bool ProcessTriageScanner::ScanVad(
                 const bool mappedPeProbe =
                     options.ProbeAllPe &&
                     VadBasePageCommitted(record);
-                if ((legacyPrivatePeProbe || mappedPeProbe) &&
+                if ((legacyPrivatePeProbe || sectionPeProbe || mappedPeProbe) &&
                     record.StartAddress != 0 &&
                     record.Size >= kPageSize &&
                     (dtb != 0 ||

@@ -1893,10 +1893,8 @@ namespace
             options.Target.CreateTime =
                 QueryEprocessCreateTime(device, symbols, nullptr, ctx.Eprocess);
             options.Target.HasCreateTime = options.Target.CreateTime != 0;
-            // Probe private VADs for MZ so header-intact manual maps still
-            // classify when VirtualQueryEx is denied (PPL / ObCallback).
-            // Watched games that already have a usermode walk skip this; the
-            // extra RPM per private VAD stalls TI ingest.
+            // Probe private and section-mapped VADs for MZ so header-intact
+            // manual maps still classify when VirtualQueryEx is denied.
             options.ProbePe = probePe;
             // Full user page-table walks are expensive. Hidden PTEs follow
             // the caller's kernel-VAD gate (watched games, or builtin/PPL
@@ -2455,6 +2453,34 @@ namespace
         for (const wchar_t* name : names)
         {
             if (leaf == name)
+            {
+                matched = true;
+                break;
+            }
+        }
+        return matched;
+    }
+
+    bool KmonLooksLikeKnownRuntimePath(const std::wstring& normalized)
+    {
+        bool matched = false;
+        static const wchar_t* fragments[] =
+        {
+            L"\\gameoverlayrenderer",
+            L"\\discord\\",
+            L"\\obs-studio\\",
+            L"\\graphics-hook",
+            L"\\nvidia corporation\\",
+            L"\\easyanticheat",
+            L"\\easy anti-cheat",
+            L"\\battleye",
+            L"\\beclient",
+            L"\\faceit",
+            L"\\vanguard"
+        };
+        for (const wchar_t* fragment : fragments)
+        {
+            if (normalized.find(fragment) != std::wstring::npos)
             {
                 matched = true;
                 break;
@@ -5971,34 +5997,40 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                         ++minifilterEmitted;
                     }
                 }
+                auto emitMinifilterFn = [&](
+                    uint64_t fn,
+                    const wchar_t* which,
+                    const std::wstring& majorName)
+                {
+                    if (fn == 0 || AddressOwnedByLoadedModule(symbols, fn))
+                    {
+                        return;
+                    }
+                    ++minifilterHits;
+                    if (minifilterEmitted >= 16)
+                    {
+                        return;
+                    }
+                    EmitUnique(
+                        L"hook.unbacked",
+                        L"minifilter:" + HexU64(filter.Filter) + L":" +
+                            which + L":" + HexU64(fn),
+                        filter.Name,
+                        L"minifilter",
+                        L"minifilter " + filter.Name + L" " + which +
+                            L" callback outside loaded modules " + HexU64(fn),
+                        majorName.empty() ? filter.Notes : (majorName + L" " + filter.Notes));
+                    ++minifilterEmitted;
+                };
                 for (const MinifilterIrpSlot& slot : filter.OperationsTable)
                 {
-                    auto emitMinifilterFn = [&](uint64_t fn, const wchar_t* which)
-                    {
-                        if (fn == 0 || AddressOwnedByLoadedModule(symbols, fn))
-                        {
-                            return;
-                        }
-                        ++minifilterHits;
-                        if (minifilterEmitted >= 16)
-                        {
-                            return;
-                        }
-                        EmitUnique(
-                            L"hook.unbacked",
-                            L"minifilter:" + HexU64(filter.Filter) + L":" +
-                                which + L":" + HexU64(fn),
-                            filter.Name,
-                            L"minifilter",
-                            L"minifilter " + filter.Name + L" " + which +
-                                L" callback outside loaded modules " + HexU64(fn),
-                            slot.MajorName.empty()
-                                ? filter.Notes
-                                : (slot.MajorName + L" " + filter.Notes));
-                        ++minifilterEmitted;
-                    };
-                    emitMinifilterFn(slot.Pre, L"pre");
-                    emitMinifilterFn(slot.Post, L"post");
+                    emitMinifilterFn(slot.Pre, L"pre", slot.MajorName);
+                    emitMinifilterFn(slot.Post, L"post", slot.MajorName);
+                }
+                for (const MinifilterIrpSlot& slot : filter.LiveCallbackTable)
+                {
+                    emitMinifilterFn(slot.Pre, L"pre", slot.MajorName);
+                    emitMinifilterFn(slot.Post, L"post", slot.MajorName);
                 }
             }
             if (minifilterHits > 16)
@@ -7556,7 +7588,7 @@ void KernelMonitor::ScanUserModeHostility()
                     !importedDlls.empty() &&
                     !windowsModule &&
                     inImageDir &&
-                    moduleClass == L"unknown" &&
+                    (moduleClass == L"unknown" || moduleClass == L"third_party") &&
                     moduleLeaf != leaf &&
                     importedDlls.find(moduleLeaf) == importedDlls.end();
                 const bool watchedDirHijack =
@@ -7569,6 +7601,13 @@ void KernelMonitor::ScanUserModeHostility()
                     !windowsModule &&
                     !inImageDir &&
                     moduleClass == L"unknown";
+                const bool watchedForeignThirdParty =
+                    (watched || dropHost) &&
+                    !windowsModule &&
+                    !inImageDir &&
+                    moduleClass == L"third_party" &&
+                    moduleLeaf != leaf &&
+                    !KmonLooksLikeKnownRuntimePath(n);
                 const bool builtinForeign = builtin &&
                     !windowsModule &&
                     !inImageDir &&
@@ -7578,7 +7617,8 @@ void KernelMonitor::ScanUserModeHostility()
                     !builtinForeign &&
                     !watchedUnknown &&
                     !watchedUnimported &&
-                    !watchedDirHijack)
+                    !watchedDirHijack &&
+                    !watchedForeignThirdParty)
                 {
                     continue;
                 }
@@ -7592,7 +7632,9 @@ void KernelMonitor::ScanUserModeHostility()
                             ? L"watched_dir_hijack"
                             : (watchedUnimported
                                 ? L"watched_dir_unimported"
-                                : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module"))),
+                                : (watchedForeignThirdParty
+                                    ? L"watched_third_party_module"
+                                    : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module")))),
                     L"foreign module in pid=" + std::to_wstring(pid) + L" " + leaf +
                         L" module=" + KmonBasenameLower(modulePath),
                     modulePath,
@@ -9220,6 +9262,15 @@ bool KernelMonitorSelfTest()
             !KmonLooksLikeHijackDll(L"winmm.dll") ||
             KmonLooksLikeHijackDll(L"game.dll") ||
             KmonLooksLikeHijackDll(L"vcruntime140.dll"))
+        {
+            break;
+        }
+        if (!KmonLooksLikeKnownRuntimePath(
+                L"c:\\program files (x86)\\steam\\gameoverlayrenderer64.dll") ||
+            !KmonLooksLikeKnownRuntimePath(
+                L"c:\\program files\\obs-studio\\graphics-hook64.dll") ||
+            KmonLooksLikeKnownRuntimePath(
+                L"c:\\program files\\randomcheat\\inject.dll"))
         {
             break;
         }
