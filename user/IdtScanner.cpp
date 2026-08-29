@@ -200,6 +200,7 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
         {
             cpuCount = 256;
         }
+        result->ProcessorCount = cpuCount;
 
         for (uint32_t cpu = 1; cpu < cpuCount; ++cpu)
         {
