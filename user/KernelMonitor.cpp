@@ -5404,7 +5404,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             uint32_t suspicious = 0;
             for (const IdtEntry& entry : result.Entries)
             {
-                if (!entry.Present)
+                if (!entry.Present && !entry.Divergent)
                 {
                     continue;
                 }

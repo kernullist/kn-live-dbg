@@ -1891,6 +1891,7 @@ namespace
             std::set<uint64_t> seenFrames;
             std::set<uint64_t> seenFilters;
             uint64_t frameLink = frameFlink;
+            bool walkIncomplete = false;
             for (uint32_t frameIndex = 0;
                  frameIndex < kMaxFrames &&
                      frameLink != 0 &&
@@ -1900,6 +1901,7 @@ namespace
                 if (!LeftoverIsKernelCanonical(frameLink) || !seenFrames.insert(frameLink).second)
                 {
                     result->Warnings.push_back(L"minifilter frame list walk stopped (cycle or non-kernel link)");
+                    walkIncomplete = true;
                     break;
                 }
 
@@ -1907,6 +1909,7 @@ namespace
                 uint64_t ignoredBlink = 0;
                 if (!ReadListEntry(device, frameLink, &nextFrame, &ignoredBlink))
                 {
+                    walkIncomplete = true;
                     break;
                 }
 
@@ -1941,6 +1944,7 @@ namespace
                 if (!LeftoverTryAdd(frame, layout.FrameRegisteredFilters, &registered) ||
                     !LeftoverTryAdd(registered, layout.ResourceList, &filterHead))
                 {
+                    walkIncomplete = true;
                     frameLink = nextFrame;
                     continue;
                 }
@@ -1949,12 +1953,14 @@ namespace
                 uint64_t filterBlink = 0;
                 if (!ReadListEntry(device, filterHead, &filterFlink, &filterBlink))
                 {
+                    walkIncomplete = true;
                     frameLink = nextFrame;
                     continue;
                 }
 
                 uint64_t filterLink = filterFlink;
-                for (uint32_t filterIndex = 0;
+                uint32_t filterIndex = 0;
+                for (;
                      filterIndex < kMaxFilters &&
                          filterLink != 0 &&
                          filterLink != filterHead;
@@ -1963,6 +1969,7 @@ namespace
                     if (!LeftoverIsKernelCanonical(filterLink) || !seenFilters.insert(filterLink).second)
                     {
                         result->Warnings.push_back(L"minifilter filter list walk stopped (cycle or non-kernel link)");
+                        walkIncomplete = true;
                         break;
                     }
 
@@ -1970,6 +1977,7 @@ namespace
                     uint64_t filterBlink2 = 0;
                     if (!ReadListEntry(device, filterLink, &nextFilter, &filterBlink2))
                     {
+                        walkIncomplete = true;
                         break;
                     }
 
@@ -2056,11 +2064,18 @@ namespace
                     result->Filters.push_back(filter);
                     filterLink = nextFilter;
                 }
+                if (filterLink != filterHead)
+                {
+                    walkIncomplete = true;
+                    result->Warnings.push_back(
+                        L"minifilter filter list walk did not return to the list head");
+                }
 
                 frameLink = nextFrame;
             }
 
-            result->CoverageComplete = (frameLink == frameHead);
+            result->CoverageComplete =
+                (frameLink == frameHead) && !walkIncomplete;
             if (!result->CoverageComplete)
             {
                 result->Warnings.push_back(
