@@ -33,6 +33,7 @@ struct IdtScanResult
     uint64_t IdtBase = 0;
     uint32_t IdtLimit = 0;
     uint32_t EntryCount = 0;
+    uint32_t ProcessorCount = 0;
     uint32_t ProcessorsCompared = 0; // processors whose IDT was cross-checked against the BSP
     uint32_t DivergentCount = 0;     // vectors whose handler differs across processors
     std::vector<IdtEntry> Entries;

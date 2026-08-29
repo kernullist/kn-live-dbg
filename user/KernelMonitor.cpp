@@ -4890,11 +4890,47 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:idt");
+            if (result.ProcessorCount > 1 &&
+                result.ProcessorsCompared < result.ProcessorCount - 1)
+            {
+                EmitUnique(
+                    L"hook.unbacked",
+                    L"scan_failed:idt:coverage",
+                    std::wstring(),
+                    L"idt",
+                    L"IDT cross-check missed one or more processors",
+                    L"compared=" + std::to_wstring(result.ProcessorsCompared) +
+                        L" cpus=" + std::to_wstring(result.ProcessorCount));
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:idt:coverage");
+            }
             uint32_t emitted = 0;
             uint32_t suspicious = 0;
             for (const IdtEntry& entry : result.Entries)
             {
-                if (!entry.Suspicious || !entry.Present)
+                if (!entry.Present)
+                {
+                    continue;
+                }
+                if (entry.Divergent)
+                {
+                    ++suspicious;
+                    if (emitted < 16)
+                    {
+                        EmitUnique(
+                            L"hook.unbacked",
+                            L"idt:" + std::to_wstring(entry.Vector) + L":divergent",
+                            entry.Module,
+                            L"idt",
+                            L"IDT vector " + std::to_wstring(entry.Vector) +
+                                L" handler diverges across processors",
+                            entry.Notes);
+                        ++emitted;
+                    }
+                }
+                if (!entry.Suspicious)
                 {
                     continue;
                 }
@@ -6291,6 +6327,87 @@ void KernelMonitor::ScanUserModeHostility()
                                     L"scan_failed:userhostility:reloc:" +
                                         std::to_wstring(pid),
                                     pid);
+                            }
+                            if (textCmp != SliceMismatch &&
+                                diskLayout.ExecVirtSize > 0x1000)
+                            {
+                                uint32_t samples[3] = {};
+                                uint32_t sampleCount = 0;
+                                auto addSampleEarly = [&](uint32_t pageRva)
+                                {
+                                    if (pageRva <= diskLayout.ExecRva ||
+                                        sampleCount >= 3)
+                                    {
+                                        return;
+                                    }
+                                    for (uint32_t i = 0; i < sampleCount; ++i)
+                                    {
+                                        if (samples[i] == pageRva)
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    samples[sampleCount++] = pageRva;
+                                };
+                                if (diskLayout.ExecRva <=
+                                    (std::numeric_limits<uint32_t>::max)() - 0x1000)
+                                {
+                                    addSampleEarly(diskLayout.ExecRva + 0x1000);
+                                }
+                                if (diskLayout.ExecVirtSize > 0x2000)
+                                {
+                                    const uint32_t midOff =
+                                        (diskLayout.ExecVirtSize / 2) & ~0xFFFu;
+                                    if (diskLayout.ExecRva <=
+                                        (std::numeric_limits<uint32_t>::max)() - midOff)
+                                    {
+                                        addSampleEarly(diskLayout.ExecRva + midOff);
+                                    }
+                                    if (diskLayout.ExecVirtSize >= 0x100)
+                                    {
+                                        const uint32_t lastOff =
+                                            (diskLayout.ExecVirtSize - 0x100) & ~0xFFFu;
+                                        if (diskLayout.ExecRva <=
+                                            (std::numeric_limits<uint32_t>::max)() - lastOff)
+                                        {
+                                            addSampleEarly(diskLayout.ExecRva + lastOff);
+                                        }
+                                    }
+                                }
+                                for (uint32_t i = 0; i < sampleCount; ++i)
+                                {
+                                    uint32_t laterFile = 0;
+                                    if (!RvaToFileOffset(
+                                            diskHeaders,
+                                            samples[i],
+                                            &laterFile) ||
+                                        RelocatedSliceCompare(
+                                            imagePath,
+                                            diskHeaders,
+                                            diskLayout,
+                                            processHandle,
+                                            device,
+                                            symbols,
+                                            pid,
+                                            exeRegion,
+                                            samples[i],
+                                            laterFile,
+                                            0x100) != SliceMismatch)
+                                    {
+                                        continue;
+                                    }
+                                    EmitUnique(
+                                        L"process.hollow",
+                                        L"exe_text_page:" + std::to_wstring(pid) + L":" +
+                                            std::to_wstring(samples[i]),
+                                        imagePath,
+                                        L"exe_text_page",
+                                        L"main EXE later code page differs from disk pid=" +
+                                            std::to_wstring(pid) + L" " + leaf,
+                                        L"rva=" + std::to_wstring(samples[i]),
+                                        pid);
+                                    break;
+                                }
                             }
                         }
                         else if (compareText &&
