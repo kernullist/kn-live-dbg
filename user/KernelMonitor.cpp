@@ -2397,6 +2397,7 @@ namespace
         DeviceClient* device,
         SymbolEngine* symbols,
         uint32_t pid,
+        uint32_t sizeOfImage,
         const std::vector<std::wstring>& modulePaths,
         const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
         uint32_t* hits)
@@ -2409,7 +2410,9 @@ namespace
                 dirSize == 0 ||
                 descriptorSize < 20 ||
                 nameFieldOffset + 4 > descriptorSize ||
-                iatFieldOffset + 4 > descriptorSize)
+                iatFieldOffset + 4 > descriptorSize ||
+                modulePaths.empty() ||
+                moduleRanges.empty())
             {
                 break;
             }
@@ -2485,9 +2488,43 @@ namespace
                 const bool apiSet =
                     importLeaf.find(L"api-ms-") == 0 ||
                     importLeaf.find(L"ext-ms-") == 0;
-                if (iatRva > (std::numeric_limits<uint64_t>::max)() - imageBase)
+                bool importLoaded = apiSet;
+                bool importLoadedInbox = false;
+                const size_t moduleCount =
+                    (modulePaths.size() < moduleRanges.size())
+                        ? modulePaths.size()
+                        : moduleRanges.size();
+                for (size_t m = 0; m < moduleCount; ++m)
+                {
+                    if (KmonBasenameLower(modulePaths[m]) != importLeaf)
+                    {
+                        continue;
+                    }
+                    importLoaded = true;
+                    if (ModulePathLooksInboxWindows(modulePaths[m]))
+                    {
+                        importLoadedInbox = true;
+                    }
+                }
+                if (!importLoaded)
                 {
                     continue;
+                }
+                uint64_t iatTableVa = 0;
+                if (sizeOfImage != 0 &&
+                    iatRva >= sizeOfImage &&
+                    iatRva >= imageBase &&
+                    iatRva < imageBase + sizeOfImage)
+                {
+                    iatTableVa = iatRva;
+                }
+                else if (iatRva > (std::numeric_limits<uint64_t>::max)() - imageBase)
+                {
+                    continue;
+                }
+                else
+                {
+                    iatTableVa = imageBase + iatRva;
                 }
                 for (uint32_t t = 0; t < kMaxThunks; ++t)
                 {
@@ -2495,7 +2532,7 @@ namespace
                     {
                         break;
                     }
-                    const uint64_t thunkVa = imageBase + iatRva +
+                    const uint64_t thunkVa = iatTableVa +
                         (static_cast<uint64_t>(t) * thunkSize);
                     std::vector<uint8_t> live;
                     if (!ReadProcessBytes(
@@ -2525,6 +2562,23 @@ namespace
                     {
                         break;
                     }
+                    if ((is64 && (target & 0x8000000000000000ull) != 0) ||
+                        (!is64 && (target & 0x80000000u) != 0))
+                    {
+                        continue;
+                    }
+                    if (!IsUserModeImageBase(target))
+                    {
+                        ++(*hits);
+                        continue;
+                    }
+                    if (sizeOfImage != 0 &&
+                        ((target >= imageBase &&
+                            target < imageBase + sizeOfImage) ||
+                            target < sizeOfImage))
+                    {
+                        continue;
+                    }
                     std::wstring ownerPath;
                     if (!FindUserModuleForAddress(
                             target,
@@ -2543,20 +2597,6 @@ namespace
                     if (apiSet && ModulePathLooksInboxWindows(ownerPath))
                     {
                         continue;
-                    }
-                    bool importLoadedInbox = false;
-                    const size_t moduleCount =
-                        (modulePaths.size() < moduleRanges.size())
-                            ? modulePaths.size()
-                            : moduleRanges.size();
-                    for (size_t m = 0; m < moduleCount; ++m)
-                    {
-                        if (KmonBasenameLower(modulePaths[m]) == importLeaf &&
-                            ModulePathLooksInboxWindows(modulePaths[m]))
-                        {
-                            importLoadedInbox = true;
-                            break;
-                        }
                     }
                     if (ModulePathLooksInboxWindows(ownerPath) &&
                         (importLoadedInbox ||
@@ -7207,52 +7247,72 @@ void KernelMonitor::ScanUserModeHostility()
                                 diskHeaders,
                                 diskLayout,
                                 &importedDlls);
-                            uint32_t iatHits = 0;
-                            ScanLiveImportThunks(
-                                imagePath,
-                                diskHeaders,
-                                diskLayout.ImportRva,
-                                diskLayout.ImportSize,
-                                12,
-                                16,
-                                20,
-                                diskLayout.Is64,
-                                exeRegion,
-                                processHandle,
-                                device,
-                                symbols,
-                                pid,
-                                modulePaths,
-                                moduleRanges,
-                                &iatHits);
-                            ScanLiveImportThunks(
-                                imagePath,
-                                diskHeaders,
-                                diskLayout.DelayImportRva,
-                                diskLayout.DelayImportSize,
-                                4,
-                                12,
-                                32,
-                                diskLayout.Is64,
-                                exeRegion,
-                                processHandle,
-                                device,
-                                symbols,
-                                pid,
-                                modulePaths,
-                                moduleRanges,
-                                &iatHits);
-                            if (iatHits > 0)
+                            const std::wstring iatFailKey =
+                                L"scan_failed:userhostility:iat:" + std::to_wstring(pid);
+                            if (!moduleInventoryComplete || modulePaths.empty())
                             {
                                 EmitUnique(
                                     L"process.implant",
-                                    L"iat_hook:" + std::to_wstring(pid),
+                                    iatFailKey,
                                     imagePath,
-                                    L"iat_hook",
-                                    L"IAT thunks leave their imported modules pid=" +
+                                    L"user",
+                                    L"IAT thunk scan skipped; module list is incomplete pid=" +
                                         std::to_wstring(pid) + L" " + leaf,
-                                    L"hits=" + std::to_wstring(iatHits),
+                                    L"delay-load and PPL hosts would false-positive",
                                     pid);
+                            }
+                            else
+                            {
+                                ClearEmittedKeyForPid(iatFailKey, pid);
+                                uint32_t iatHits = 0;
+                                ScanLiveImportThunks(
+                                    imagePath,
+                                    diskHeaders,
+                                    diskLayout.ImportRva,
+                                    diskLayout.ImportSize,
+                                    12,
+                                    16,
+                                    20,
+                                    diskLayout.Is64,
+                                    exeRegion,
+                                    processHandle,
+                                    device,
+                                    symbols,
+                                    pid,
+                                    diskLayout.SizeOfImage,
+                                    modulePaths,
+                                    moduleRanges,
+                                    &iatHits);
+                                ScanLiveImportThunks(
+                                    imagePath,
+                                    diskHeaders,
+                                    diskLayout.DelayImportRva,
+                                    diskLayout.DelayImportSize,
+                                    4,
+                                    12,
+                                    32,
+                                    diskLayout.Is64,
+                                    exeRegion,
+                                    processHandle,
+                                    device,
+                                    symbols,
+                                    pid,
+                                    diskLayout.SizeOfImage,
+                                    modulePaths,
+                                    moduleRanges,
+                                    &iatHits);
+                                if (iatHits > 0)
+                                {
+                                    EmitUnique(
+                                        L"process.implant",
+                                        L"iat_hook:" + std::to_wstring(pid),
+                                        imagePath,
+                                        L"iat_hook",
+                                        L"IAT thunks leave their imported modules pid=" +
+                                            std::to_wstring(pid) + L" " + leaf,
+                                        L"hits=" + std::to_wstring(iatHits),
+                                        pid);
+                                }
                             }
                         }
                         const bool parsedLive = ParseKmonPeIdentity(live, &liveId);
@@ -9893,6 +9953,7 @@ bool KernelMonitorSelfTest()
             nullptr,
             nullptr,
             8,
+            0,
             std::vector<std::wstring>(),
             std::vector<std::pair<uint64_t, uint32_t>>(),
             &iatUnknown);
@@ -9915,6 +9976,7 @@ bool KernelMonitorSelfTest()
             nullptr,
             nullptr,
             8,
+            0,
             std::vector<std::wstring>(),
             std::vector<std::pair<uint64_t, uint32_t>>(),
             &iatUnknown);
