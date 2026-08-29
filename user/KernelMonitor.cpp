@@ -2010,6 +2010,121 @@ namespace
         SliceMismatch
     };
 
+    bool LastRelocBlockVa(const std::vector<uint8_t>& relocs, uint32_t* lastVa)
+    {
+        bool any = false;
+        if (lastVa != nullptr)
+        {
+            *lastVa = 0;
+        }
+        size_t cursor = 0;
+        while (cursor + sizeof(IMAGE_BASE_RELOCATION) <= relocs.size())
+        {
+            IMAGE_BASE_RELOCATION block = {};
+            std::memcpy(&block, relocs.data() + cursor, sizeof(block));
+            if (block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                cursor + block.SizeOfBlock > relocs.size())
+            {
+                break;
+            }
+            if (lastVa != nullptr)
+            {
+                *lastVa = block.VirtualAddress;
+            }
+            any = true;
+            cursor += block.SizeOfBlock;
+        }
+        return any;
+    }
+
+    bool ReadRelocDirectory(
+        const std::wstring& imagePath,
+        const std::vector<uint8_t>& diskHeaders,
+        const KmonPeLayout& layout,
+        HANDLE processHandle,
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        uint64_t imageBase,
+        std::vector<uint8_t>* relocs,
+        bool* complete)
+    {
+        bool ok = false;
+        if (relocs != nullptr)
+        {
+            relocs->clear();
+        }
+        if (complete != nullptr)
+        {
+            *complete = false;
+        }
+        do
+        {
+            if (relocs == nullptr || layout.RelocSize == 0 || layout.RelocRva == 0)
+            {
+                break;
+            }
+            constexpr uint32_t kMaxRelocBytes = 0x100000u;
+            constexpr uint32_t kChunk = 0x10000u;
+            const uint32_t toRead =
+                (layout.RelocSize < kMaxRelocBytes) ? layout.RelocSize : kMaxRelocBytes;
+            uint32_t relocFile = 0;
+            const bool haveFile = RvaToFileOffset(diskHeaders, layout.RelocRva, &relocFile);
+            relocs->reserve(toRead);
+            uint32_t offset = 0;
+            while (offset < toRead)
+            {
+                const uint32_t chunk = (std::min)(kChunk, toRead - offset);
+                std::vector<uint8_t> part;
+                bool got = false;
+                if (haveFile &&
+                    offset <= (std::numeric_limits<uint32_t>::max)() - relocFile)
+                {
+                    got = ReadDiskRange(imagePath, relocFile + offset, chunk, &part);
+                }
+                if (!got)
+                {
+                    if (imageBase == 0 ||
+                        layout.RelocRva >
+                            (std::numeric_limits<uint64_t>::max)() - imageBase)
+                    {
+                        break;
+                    }
+                    const uint64_t relocVa = imageBase + layout.RelocRva;
+                    if (static_cast<uint64_t>(offset) >
+                        (std::numeric_limits<uint64_t>::max)() - relocVa)
+                    {
+                        break;
+                    }
+                    got = ReadProcessBytes(
+                        device,
+                        symbols,
+                        processHandle,
+                        pid,
+                        relocVa + offset,
+                        chunk,
+                        &part);
+                }
+                if (!got || part.size() < chunk)
+                {
+                    break;
+                }
+                relocs->insert(relocs->end(), part.begin(), part.end());
+                offset += chunk;
+            }
+            if (relocs->empty())
+            {
+                break;
+            }
+            if (complete != nullptr)
+            {
+                *complete = (offset >= layout.RelocSize);
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
     SliceCompare RelocatedSliceCompare(
         const std::wstring& imagePath,
         const std::vector<uint8_t>& diskHeaders,
@@ -2055,33 +2170,41 @@ namespace
             bool compared = !aslr;
             if (aslr && layout.RelocRva != 0 && layout.RelocSize != 0)
             {
-                uint32_t relocFile = 0;
                 std::vector<uint8_t> relocs;
-                const uint32_t relocRead = (std::min)(layout.RelocSize, 0x10000u);
-                bool gotRelocs =
-                    RvaToFileOffset(diskHeaders, layout.RelocRva, &relocFile) &&
-                    ReadDiskRange(imagePath, relocFile, relocRead, &relocs);
-                if (!gotRelocs &&
-                    layout.RelocRva <= (std::numeric_limits<uint64_t>::max)() - imageBase)
-                {
-                    gotRelocs = ReadProcessBytes(
+                bool relocComplete = false;
+                if (ReadRelocDirectory(
+                        imagePath,
+                        diskHeaders,
+                        layout,
+                        processHandle,
                         device,
                         symbols,
-                        processHandle,
                         pid,
-                        imageBase + layout.RelocRva,
-                        relocRead,
-                        &relocs);
-                }
-                if (gotRelocs)
+                        imageBase,
+                        &relocs,
+                        &relocComplete))
                 {
-                    ApplyRelocsToSlice(
-                        &diskText,
-                        rva,
-                        delta,
-                        relocs,
-                        layout.Is64);
-                    compared = true;
+                    uint32_t lastVa = 0;
+                    const bool haveBlock = LastRelocBlockVa(relocs, &lastVa);
+                    uint32_t sliceLastPage = rva & ~0xFFFu;
+                    if (length != 0 &&
+                        rva <= (std::numeric_limits<uint32_t>::max)() - (length - 1u))
+                    {
+                        sliceLastPage = (rva + length - 1u) & ~0xFFFu;
+                    }
+                    // Reloc blocks are sorted. A truncated prefix is only
+                    // safe when it already extends past this slice, or the
+                    // directory was read in full (no relocs on this page).
+                    if (relocComplete || (haveBlock && lastVa >= sliceLastPage))
+                    {
+                        ApplyRelocsToSlice(
+                            &diskText,
+                            rva,
+                            delta,
+                            relocs,
+                            layout.Is64);
+                        compared = true;
+                    }
                 }
             }
             if (!compared)
@@ -2189,29 +2312,41 @@ namespace
                     }
                 }
             }
+            bool laterUnknown = false;
             for (uint32_t i = 0; i < sampleCount; ++i)
             {
                 uint32_t laterFile = 0;
                 if (!RvaToFileOffset(headers, samples[i], &laterFile))
                 {
+                    laterUnknown = true;
                     continue;
                 }
-                if (RelocatedSliceCompare(
-                        imagePath,
-                        headers,
-                        layout,
-                        processHandle,
-                        device,
-                        symbols,
-                        pid,
-                        imageBase,
-                        samples[i],
-                        laterFile,
-                        0x100) == SliceMismatch)
+                const SliceCompare laterCmp = RelocatedSliceCompare(
+                    imagePath,
+                    headers,
+                    layout,
+                    processHandle,
+                    device,
+                    symbols,
+                    pid,
+                    imageBase,
+                    samples[i],
+                    laterFile,
+                    0x100);
+                if (laterCmp == SliceMismatch)
                 {
                     result = SliceMismatch;
+                    laterUnknown = false;
                     break;
                 }
+                if (laterCmp == SliceUnknown)
+                {
+                    laterUnknown = true;
+                }
+            }
+            if (result == SliceMatch && laterUnknown)
+            {
+                result = SliceUnknown;
             }
         } while (false);
         return result;
@@ -2294,16 +2429,26 @@ namespace
             static const char* kPriority[] =
             {
                 "NtProtectVirtualMemory",
+                "NtProtectVirtualMemoryEx",
                 "NtAllocateVirtualMemory",
+                "NtAllocateVirtualMemoryEx",
                 "NtReadVirtualMemory",
                 "NtWriteVirtualMemory",
                 "NtQueryVirtualMemory",
+                "NtSetInformationVirtualMemory",
                 "NtMapViewOfSection",
+                "NtMapViewOfSectionEx",
                 "NtUnmapViewOfSection",
+                "NtUnmapViewOfSectionEx",
                 "NtOpenProcess",
                 "NtOpenThread",
                 "NtCreateThreadEx",
                 "NtCreateThread",
+                "NtQueueApcThread",
+                "NtQueueApcThreadEx",
+                "NtQueueApcThreadEx2",
+                "NtAlertResumeThread",
+                "NtContinueEx",
                 "NtSetContextThread",
                 "NtGetContextThread",
                 "NtSuspendThread",
@@ -2359,8 +2504,7 @@ namespace
                 {
                     return false;
                 }
-                ++checked;
-                return RelocatedSliceCompare(
+                const SliceCompare cmp = RelocatedSliceCompare(
                     imagePath,
                     headers,
                     layout,
@@ -2371,7 +2515,13 @@ namespace
                     imageBase,
                     funcRva,
                     funcFile,
-                    kPrologue) == SliceMismatch;
+                    kPrologue);
+                if (cmp == SliceUnknown)
+                {
+                    return false;
+                }
+                ++checked;
+                return cmp == SliceMismatch;
             };
             auto loadExportName = [&](uint32_t index, std::string* name) -> bool
             {
@@ -5431,7 +5581,7 @@ void KernelMonitor::ScanPoolMappedImages()
 
     PoolPeHunter hunter(*device);
     PoolPeHunter::Options options;
-    options.Paged = PoolPeHunter::PagedFilter::NonPagedOnly;
+    options.Paged = PoolPeHunter::PagedFilter::Any;
     options.LimitHits = 32;
     PoolPeHunterResult result = {};
     std::wstring error;
@@ -5496,7 +5646,7 @@ void KernelMonitor::ScanPoolMappedImages()
             L"poolpe:" + HexU64(hit.Address),
             hit.TagText,
             L"pool_pe",
-            L"mapped PE in nonpaged pool " + HexU64(hit.Address) + L" tag=" + hit.TagText,
+            L"mapped PE in pool " + HexU64(hit.Address) + L" tag=" + hit.TagText,
             notes);
     }
 }
@@ -5644,7 +5794,7 @@ void KernelMonitor::ScanOrphanMappedPages()
     options.DeepPfn = false;
     options.PeOnly = false;
     options.WxOnly = false;
-    options.IncludeSession = false;
+    options.IncludeSession = true;
     options.Limit = 32;
     OrphanKernelPageResult result = {};
     std::wstring error;
@@ -5692,6 +5842,12 @@ void KernelMonitor::ScanOrphanMappedPages()
             region.Executable &&
             region.Risk == L"high";
         if (!peHit && !wxStub)
+        {
+            continue;
+        }
+        // Session space is full of win32k scratch W+X; keep PE hits so a
+        // session-mapped image still shows, but drop the W+X noise.
+        if (region.SessionSpace && !peHit)
         {
             continue;
         }
@@ -8389,14 +8545,14 @@ void KernelMonitor::ScanUserModeHostility()
                     (watched || dropHost) &&
                     !windowsModule &&
                     moduleLeaf != leaf &&
-                    gameTextHits < 8 &&
+                    gameTextHits < 16 &&
                     loadedModuleBase != 0 &&
                     PathLooksLikeWin32File(modulePath);
                 const bool compareSystemText =
                     (watched || dropHost) &&
                     windowsModule &&
                     KmonLooksLikeHookableSystemDll(moduleLeaf) &&
-                    systemTextHits < 8 &&
+                    systemTextHits < 16 &&
                     loadedModuleBase != 0 &&
                     PathLooksLikeWin32File(modulePath);
                 if (compareGameText || compareSystemText)
@@ -10458,6 +10614,37 @@ bool KernelMonitorSelfTest()
             icUnknown != 0)
         {
             break;
+        }
+        {
+            uint32_t lastVa = 1;
+            if (LastRelocBlockVa(std::vector<uint8_t>(), &lastVa) || lastVa != 0)
+            {
+                break;
+            }
+            std::vector<uint8_t> relocBytes(
+                sizeof(IMAGE_BASE_RELOCATION) + sizeof(uint16_t),
+                0);
+            IMAGE_BASE_RELOCATION block = {};
+            block.VirtualAddress = 0x1000;
+            block.SizeOfBlock =
+                static_cast<DWORD>(sizeof(IMAGE_BASE_RELOCATION) + sizeof(uint16_t));
+            std::memcpy(relocBytes.data(), &block, sizeof(block));
+            uint16_t entry = static_cast<uint16_t>(IMAGE_REL_BASED_DIR64 << 12);
+            std::memcpy(
+                relocBytes.data() + sizeof(block),
+                &entry,
+                sizeof(entry));
+            lastVa = 0;
+            if (!LastRelocBlockVa(relocBytes, &lastVa) || lastVa != 0x1000)
+            {
+                break;
+            }
+            const uint32_t sliceLastEarly = 0x1000;
+            const uint32_t sliceLastLate = 0x1FF000;
+            if (lastVa < sliceLastEarly || lastVa >= sliceLastLate)
+            {
+                break;
+            }
         }
 
         ok = true;
