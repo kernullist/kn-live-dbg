@@ -2329,6 +2329,247 @@ namespace
         }
     }
 
+    bool FindUserModuleForAddress(
+        uint64_t address,
+        const std::vector<std::wstring>& paths,
+        const std::vector<std::pair<uint64_t, uint32_t>>& ranges,
+        std::wstring* path)
+    {
+        bool found = false;
+        do
+        {
+            if (path != nullptr)
+            {
+                path->clear();
+            }
+            if (address == 0)
+            {
+                break;
+            }
+            const size_t n = (paths.size() < ranges.size()) ? paths.size() : ranges.size();
+            for (size_t i = 0; i < n; ++i)
+            {
+                const uint64_t base = ranges[i].first;
+                const uint64_t size = ranges[i].second;
+                if (base == 0 || size == 0)
+                {
+                    continue;
+                }
+                if (base > (std::numeric_limits<uint64_t>::max)() - size)
+                {
+                    continue;
+                }
+                if (address >= base && address < base + size)
+                {
+                    if (path != nullptr)
+                    {
+                        *path = paths[i];
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        } while (false);
+        return found;
+    }
+
+    bool ModulePathLooksInboxWindows(const std::wstring& path)
+    {
+        const std::wstring n = KmonNormalizeDriverPath(path);
+        return n.find(L"\\windows\\system32\\") != std::wstring::npos ||
+            n.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
+            n.find(L"\\windows\\winsxs\\") != std::wstring::npos;
+    }
+
+    bool KmonLooksLikeHookableSystemDll(const std::wstring& leaf);
+
+    void ScanLiveImportThunks(
+        const std::wstring& imagePath,
+        const std::vector<uint8_t>& headers,
+        uint32_t dirRva,
+        uint32_t dirSize,
+        uint32_t nameFieldOffset,
+        uint32_t iatFieldOffset,
+        uint32_t descriptorSize,
+        bool is64,
+        uint64_t imageBase,
+        HANDLE processHandle,
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        const std::vector<std::wstring>& modulePaths,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
+        uint32_t* hits)
+    {
+        do
+        {
+            if (hits == nullptr ||
+                imageBase == 0 ||
+                dirRva == 0 ||
+                dirSize == 0 ||
+                descriptorSize < 20 ||
+                nameFieldOffset + 4 > descriptorSize ||
+                iatFieldOffset + 4 > descriptorSize)
+            {
+                break;
+            }
+            uint32_t fileOff = 0;
+            if (!RvaToFileOffset(headers, dirRva, &fileOff))
+            {
+                break;
+            }
+            constexpr uint32_t kMaxDirBytes = 64u * 1024u;
+            const uint32_t toRead = (std::min)(dirSize, kMaxDirBytes);
+            std::vector<uint8_t> table;
+            if (!ReadDiskRange(imagePath, fileOff, toRead, &table) ||
+                table.size() < descriptorSize)
+            {
+                break;
+            }
+            const uint32_t count = static_cast<uint32_t>(table.size() / descriptorSize);
+            constexpr uint32_t kMaxDescriptors = 64;
+            constexpr uint32_t kMaxThunks = 256;
+            const uint32_t thunkSize = is64 ? 8u : 4u;
+            for (uint32_t i = 0; i < count && i < kMaxDescriptors; ++i)
+            {
+                if (*hits >= 4)
+                {
+                    break;
+                }
+                uint32_t nameRva = 0;
+                uint32_t iatRva = 0;
+                std::memcpy(
+                    &nameRva,
+                    table.data() + (i * descriptorSize) + nameFieldOffset,
+                    sizeof(nameRva));
+                std::memcpy(
+                    &iatRva,
+                    table.data() + (i * descriptorSize) + iatFieldOffset,
+                    sizeof(iatRva));
+                if (nameRva == 0)
+                {
+                    break;
+                }
+                if (iatRva == 0)
+                {
+                    continue;
+                }
+                uint32_t nameFile = 0;
+                if (!RvaToFileOffset(headers, nameRva, &nameFile))
+                {
+                    continue;
+                }
+                std::vector<uint8_t> nameBytes;
+                if (!ReadDiskRange(imagePath, nameFile, 256, &nameBytes) ||
+                    nameBytes.empty())
+                {
+                    continue;
+                }
+                std::wstring wide;
+                for (uint8_t byte : nameBytes)
+                {
+                    if (byte == 0)
+                    {
+                        break;
+                    }
+                    if (byte >= 0x20 && byte < 0x7f)
+                    {
+                        wide.push_back(static_cast<wchar_t>(byte));
+                    }
+                }
+                const std::wstring importLeaf = KmonBasenameLower(wide);
+                if (importLeaf.empty())
+                {
+                    continue;
+                }
+                const bool apiSet =
+                    importLeaf.find(L"api-ms-") == 0 ||
+                    importLeaf.find(L"ext-ms-") == 0;
+                if (iatRva > (std::numeric_limits<uint64_t>::max)() - imageBase)
+                {
+                    continue;
+                }
+                for (uint32_t t = 0; t < kMaxThunks; ++t)
+                {
+                    if (*hits >= 4)
+                    {
+                        break;
+                    }
+                    const uint64_t thunkVa = imageBase + iatRva +
+                        (static_cast<uint64_t>(t) * thunkSize);
+                    std::vector<uint8_t> live;
+                    if (!ReadProcessBytes(
+                            device,
+                            symbols,
+                            processHandle,
+                            pid,
+                            thunkVa,
+                            thunkSize,
+                            &live) ||
+                        live.size() < thunkSize)
+                    {
+                        break;
+                    }
+                    uint64_t target = 0;
+                    if (is64)
+                    {
+                        std::memcpy(&target, live.data(), sizeof(uint64_t));
+                    }
+                    else
+                    {
+                        uint32_t target32 = 0;
+                        std::memcpy(&target32, live.data(), sizeof(target32));
+                        target = target32;
+                    }
+                    if (target == 0)
+                    {
+                        break;
+                    }
+                    std::wstring ownerPath;
+                    if (!FindUserModuleForAddress(
+                            target,
+                            modulePaths,
+                            moduleRanges,
+                            &ownerPath))
+                    {
+                        ++(*hits);
+                        continue;
+                    }
+                    const std::wstring ownerLeaf = KmonBasenameLower(ownerPath);
+                    if (ownerLeaf == importLeaf)
+                    {
+                        continue;
+                    }
+                    if (apiSet && ModulePathLooksInboxWindows(ownerPath))
+                    {
+                        continue;
+                    }
+                    bool importLoadedInbox = false;
+                    const size_t moduleCount =
+                        (modulePaths.size() < moduleRanges.size())
+                            ? modulePaths.size()
+                            : moduleRanges.size();
+                    for (size_t m = 0; m < moduleCount; ++m)
+                    {
+                        if (KmonBasenameLower(modulePaths[m]) == importLeaf &&
+                            ModulePathLooksInboxWindows(modulePaths[m]))
+                        {
+                            importLoadedInbox = true;
+                            break;
+                        }
+                    }
+                    if (ModulePathLooksInboxWindows(ownerPath) &&
+                        (importLoadedInbox ||
+                            KmonLooksLikeHookableSystemDll(importLeaf)))
+                    {
+                        continue;
+                    }
+                    ++(*hits);
+                }
+            }
+        } while (false);
+    }
+
     bool ProtectHasExecute(DWORD protect)
     {
         const DWORD p = protect & 0xff;
@@ -6966,6 +7207,53 @@ void KernelMonitor::ScanUserModeHostility()
                                 diskHeaders,
                                 diskLayout,
                                 &importedDlls);
+                            uint32_t iatHits = 0;
+                            ScanLiveImportThunks(
+                                imagePath,
+                                diskHeaders,
+                                diskLayout.ImportRva,
+                                diskLayout.ImportSize,
+                                12,
+                                16,
+                                20,
+                                diskLayout.Is64,
+                                exeRegion,
+                                processHandle,
+                                device,
+                                symbols,
+                                pid,
+                                modulePaths,
+                                moduleRanges,
+                                &iatHits);
+                            ScanLiveImportThunks(
+                                imagePath,
+                                diskHeaders,
+                                diskLayout.DelayImportRva,
+                                diskLayout.DelayImportSize,
+                                4,
+                                12,
+                                32,
+                                diskLayout.Is64,
+                                exeRegion,
+                                processHandle,
+                                device,
+                                symbols,
+                                pid,
+                                modulePaths,
+                                moduleRanges,
+                                &iatHits);
+                            if (iatHits > 0)
+                            {
+                                EmitUnique(
+                                    L"process.implant",
+                                    L"iat_hook:" + std::to_wstring(pid),
+                                    imagePath,
+                                    L"iat_hook",
+                                    L"IAT thunks leave their imported modules pid=" +
+                                        std::to_wstring(pid) + L" " + leaf,
+                                    L"hits=" + std::to_wstring(iatHits),
+                                    pid);
+                            }
                         }
                         const bool parsedLive = ParseKmonPeIdentity(live, &liveId);
                         const bool compareText = hostileHost ||
@@ -9587,6 +9875,50 @@ bool KernelMonitorSelfTest()
         KmonPeLayout importLayout = {};
         CollectImportedDllNames(L"", std::vector<uint8_t>(), importLayout, &imported);
         if (!imported.empty())
+        {
+            break;
+        }
+        uint32_t iatUnknown = 1;
+        ScanLiveImportThunks(
+            L"",
+            std::vector<uint8_t>(),
+            0,
+            0,
+            12,
+            16,
+            20,
+            true,
+            0,
+            nullptr,
+            nullptr,
+            nullptr,
+            8,
+            std::vector<std::wstring>(),
+            std::vector<std::pair<uint64_t, uint32_t>>(),
+            &iatUnknown);
+        if (iatUnknown != 1)
+        {
+            break;
+        }
+        iatUnknown = 0;
+        ScanLiveImportThunks(
+            L"",
+            std::vector<uint8_t>(),
+            0,
+            0,
+            12,
+            16,
+            20,
+            true,
+            0,
+            nullptr,
+            nullptr,
+            nullptr,
+            8,
+            std::vector<std::wstring>(),
+            std::vector<std::pair<uint64_t, uint32_t>>(),
+            &iatUnknown);
+        if (iatUnknown != 0)
         {
             break;
         }
