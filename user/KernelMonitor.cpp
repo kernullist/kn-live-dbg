@@ -387,6 +387,8 @@ namespace
         uint32_t ImportSize = 0;
         uint32_t DelayImportRva = 0;
         uint32_t DelayImportSize = 0;
+        uint32_t ExportRva = 0;
+        uint32_t ExportSize = 0;
         bool Is64 = false;
     };
 
@@ -500,6 +502,10 @@ namespace
                     optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
                 layout->DelayImportSize =
                     optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size;
+                layout->ExportRva =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                layout->ExportSize =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
             }
             else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC &&
                 optionalOffset + sizeof(IMAGE_OPTIONAL_HEADER32) <= headers.size())
@@ -515,6 +521,10 @@ namespace
                     optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
                 layout->DelayImportSize =
                     optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size;
+                layout->ExportRva =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                layout->ExportSize =
+                    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
             }
             else
             {
@@ -2205,6 +2215,164 @@ namespace
             }
         } while (false);
         return result;
+    }
+
+    uint32_t CountNtExportPrologueMismatches(
+        const std::wstring& imagePath,
+        const std::vector<uint8_t>& headers,
+        const KmonPeLayout& layout,
+        HANDLE processHandle,
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        uint64_t imageBase)
+    {
+        uint32_t mismatches = 0;
+        do
+        {
+            if (imageBase == 0 ||
+                headers.empty() ||
+                layout.ExportRva == 0 ||
+                layout.ExportSize < sizeof(IMAGE_EXPORT_DIRECTORY))
+            {
+                break;
+            }
+            uint32_t exportFile = 0;
+            if (!RvaToFileOffset(headers, layout.ExportRva, &exportFile))
+            {
+                break;
+            }
+            std::vector<uint8_t> exportDir;
+            if (!ReadDiskRange(
+                    imagePath,
+                    exportFile,
+                    sizeof(IMAGE_EXPORT_DIRECTORY),
+                    &exportDir) ||
+                exportDir.size() < sizeof(IMAGE_EXPORT_DIRECTORY))
+            {
+                break;
+            }
+            IMAGE_EXPORT_DIRECTORY exports = {};
+            std::memcpy(&exports, exportDir.data(), sizeof(exports));
+            if (exports.NumberOfNames == 0 ||
+                exports.NumberOfFunctions == 0 ||
+                exports.AddressOfNames == 0 ||
+                exports.AddressOfFunctions == 0 ||
+                exports.AddressOfNameOrdinals == 0)
+            {
+                break;
+            }
+            constexpr uint32_t kMaxNames = 1024;
+            const uint32_t nameCount =
+                (exports.NumberOfNames < kMaxNames) ? exports.NumberOfNames : kMaxNames;
+            uint32_t namesFile = 0;
+            uint32_t ordsFile = 0;
+            uint32_t funcsFile = 0;
+            if (!RvaToFileOffset(headers, exports.AddressOfNames, &namesFile) ||
+                !RvaToFileOffset(headers, exports.AddressOfNameOrdinals, &ordsFile) ||
+                !RvaToFileOffset(headers, exports.AddressOfFunctions, &funcsFile))
+            {
+                break;
+            }
+            std::vector<uint8_t> namesTable;
+            std::vector<uint8_t> ordsTable;
+            std::vector<uint8_t> funcsTable;
+            const uint32_t namesBytes = nameCount * 4u;
+            const uint32_t ordsBytes = nameCount * 2u;
+            const uint32_t funcCount =
+                (exports.NumberOfFunctions < kMaxNames) ? exports.NumberOfFunctions : kMaxNames;
+            const uint32_t funcsBytes = funcCount * 4u;
+            if (!ReadDiskRange(imagePath, namesFile, namesBytes, &namesTable) ||
+                namesTable.size() < namesBytes ||
+                !ReadDiskRange(imagePath, ordsFile, ordsBytes, &ordsTable) ||
+                ordsTable.size() < ordsBytes ||
+                !ReadDiskRange(imagePath, funcsFile, funcsBytes, &funcsTable) ||
+                funcsTable.size() < funcsBytes)
+            {
+                break;
+            }
+            constexpr uint32_t kMaxNtChecks = 64;
+            constexpr uint32_t kPrologue = 16;
+            uint32_t checked = 0;
+            const uint32_t exportBegin = layout.ExportRva;
+            const uint32_t exportEnd = layout.ExportRva + layout.ExportSize;
+            for (uint32_t i = 0; i < nameCount && checked < kMaxNtChecks; ++i)
+            {
+                uint32_t nameRva = 0;
+                uint16_t ordinal = 0;
+                std::memcpy(&nameRva, namesTable.data() + (i * 4u), sizeof(nameRva));
+                std::memcpy(&ordinal, ordsTable.data() + (i * 2u), sizeof(ordinal));
+                if (nameRva == 0)
+                {
+                    continue;
+                }
+                uint32_t nameFileOff = 0;
+                if (!RvaToFileOffset(headers, nameRva, &nameFileOff))
+                {
+                    continue;
+                }
+                std::vector<uint8_t> nameBytes;
+                if (!ReadDiskRange(imagePath, nameFileOff, 16, &nameBytes) ||
+                    nameBytes.size() < 2)
+                {
+                    continue;
+                }
+                if (!((nameBytes[0] == 'N' && nameBytes[1] == 't') ||
+                        (nameBytes[0] == 'Z' && nameBytes[1] == 'w')))
+                {
+                    continue;
+                }
+                if (ordinal >= funcCount)
+                {
+                    continue;
+                }
+                uint32_t funcRva = 0;
+                std::memcpy(&funcRva, funcsTable.data() + (ordinal * 4u), sizeof(funcRva));
+                if (funcRva == 0)
+                {
+                    continue;
+                }
+                if (funcRva >= exportBegin && funcRva < exportEnd)
+                {
+                    continue;
+                }
+                uint32_t funcFile = 0;
+                if (!RvaToFileOffset(headers, funcRva, &funcFile))
+                {
+                    continue;
+                }
+                if (funcRva > (std::numeric_limits<uint64_t>::max)() - imageBase)
+                {
+                    continue;
+                }
+                std::vector<uint8_t> diskPrologue;
+                std::vector<uint8_t> livePrologue;
+                if (!ReadDiskRange(imagePath, funcFile, kPrologue, &diskPrologue) ||
+                    diskPrologue.size() < kPrologue ||
+                    !ReadProcessBytes(
+                        device,
+                        symbols,
+                        processHandle,
+                        pid,
+                        imageBase + funcRva,
+                        kPrologue,
+                        &livePrologue) ||
+                    livePrologue.size() < kPrologue)
+                {
+                    continue;
+                }
+                ++checked;
+                if (std::memcmp(diskPrologue.data(), livePrologue.data(), kPrologue) != 0)
+                {
+                    ++mismatches;
+                    if (mismatches >= 4)
+                    {
+                        break;
+                    }
+                }
+            }
+        } while (false);
+        return mismatches;
     }
 
     bool CollectPeDllNameDirectory(
@@ -8182,6 +8350,94 @@ void KernelMonitor::ScanUserModeHostility()
                     {
                         ClearEmittedKeyForPid(textFailKey, pid);
                     }
+                    std::vector<uint8_t> moduleHeaders;
+                    KmonPeLayout moduleLayout = {};
+                    const bool parsedModule =
+                        ReadDiskPeHead(modulePath, &moduleHeaders) &&
+                        ParseKmonPeLayout(moduleHeaders, &moduleLayout);
+                    if (parsedModule && compareSystemText)
+                    {
+                        const uint32_t exportHits = CountNtExportPrologueMismatches(
+                            modulePath,
+                            moduleHeaders,
+                            moduleLayout,
+                            processHandle,
+                            device,
+                            symbols,
+                            pid,
+                            loadedModuleBase);
+                        if (exportHits > 0)
+                        {
+                            EmitUnique(
+                                L"process.implant",
+                                L"export_hook:" + std::to_wstring(pid) + L":" +
+                                    moduleLeaf,
+                                imagePath,
+                                L"export_hook",
+                                L"Nt/Zw export prologues differ from disk pid=" +
+                                    std::to_wstring(pid) + L" " + leaf +
+                                    L" module=" + moduleLeaf,
+                                L"hits=" + std::to_wstring(exportHits),
+                                pid);
+                        }
+                    }
+                    if (parsedModule &&
+                        compareGameText &&
+                        moduleInventoryComplete &&
+                        !modulePaths.empty())
+                    {
+                        uint32_t dllIatHits = 0;
+                        ScanLiveImportThunks(
+                            modulePath,
+                            moduleHeaders,
+                            moduleLayout.ImportRva,
+                            moduleLayout.ImportSize,
+                            12,
+                            16,
+                            20,
+                            moduleLayout.Is64,
+                            loadedModuleBase,
+                            processHandle,
+                            device,
+                            symbols,
+                            pid,
+                            moduleLayout.SizeOfImage,
+                            modulePaths,
+                            moduleRanges,
+                            &dllIatHits);
+                        ScanLiveImportThunks(
+                            modulePath,
+                            moduleHeaders,
+                            moduleLayout.DelayImportRva,
+                            moduleLayout.DelayImportSize,
+                            4,
+                            12,
+                            32,
+                            moduleLayout.Is64,
+                            loadedModuleBase,
+                            processHandle,
+                            device,
+                            symbols,
+                            pid,
+                            moduleLayout.SizeOfImage,
+                            modulePaths,
+                            moduleRanges,
+                            &dllIatHits);
+                        if (dllIatHits > 0)
+                        {
+                            EmitUnique(
+                                L"process.implant",
+                                L"iat_hook:" + std::to_wstring(pid) + L":" +
+                                    moduleLeaf,
+                                imagePath,
+                                L"iat_hook",
+                                L"module IAT thunks leave imported modules pid=" +
+                                    std::to_wstring(pid) + L" " + leaf +
+                                    L" module=" + moduleLeaf,
+                                L"hits=" + std::to_wstring(dllIatHits),
+                                pid);
+                        }
+                    }
                 }
                 if (implants >= 8)
                 {
@@ -9981,6 +10237,19 @@ bool KernelMonitorSelfTest()
             std::vector<std::pair<uint64_t, uint32_t>>(),
             &iatUnknown);
         if (iatUnknown != 0)
+        {
+            break;
+        }
+        KmonPeLayout emptyExportLayout = {};
+        if (CountNtExportPrologueMismatches(
+                L"",
+                std::vector<uint8_t>(),
+                emptyExportLayout,
+                nullptr,
+                nullptr,
+                nullptr,
+                8,
+                0) != 0)
         {
             break;
         }
