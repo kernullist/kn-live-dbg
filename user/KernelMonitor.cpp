@@ -2262,9 +2262,11 @@ namespace
             {
                 break;
             }
-            constexpr uint32_t kMaxNames = 1024;
+            constexpr uint32_t kMaxNames = 4096;
             const uint32_t nameCount =
                 (exports.NumberOfNames < kMaxNames) ? exports.NumberOfNames : kMaxNames;
+            const uint32_t funcCount =
+                (exports.NumberOfFunctions < kMaxNames) ? exports.NumberOfFunctions : kMaxNames;
             uint32_t namesFile = 0;
             uint32_t ordsFile = 0;
             uint32_t funcsFile = 0;
@@ -2279,8 +2281,6 @@ namespace
             std::vector<uint8_t> funcsTable;
             const uint32_t namesBytes = nameCount * 4u;
             const uint32_t ordsBytes = nameCount * 2u;
-            const uint32_t funcCount =
-                (exports.NumberOfFunctions < kMaxNames) ? exports.NumberOfFunctions : kMaxNames;
             const uint32_t funcsBytes = funcCount * 4u;
             if (!ReadDiskRange(imagePath, namesFile, namesBytes, &namesTable) ||
                 namesTable.size() < namesBytes ||
@@ -2291,84 +2291,184 @@ namespace
             {
                 break;
             }
-            constexpr uint32_t kMaxNtChecks = 64;
-            constexpr uint32_t kPrologue = 16;
+            static const char* kPriority[] =
+            {
+                "NtProtectVirtualMemory",
+                "NtAllocateVirtualMemory",
+                "NtReadVirtualMemory",
+                "NtWriteVirtualMemory",
+                "NtQueryVirtualMemory",
+                "NtMapViewOfSection",
+                "NtUnmapViewOfSection",
+                "NtOpenProcess",
+                "NtOpenThread",
+                "NtCreateThreadEx",
+                "NtCreateThread",
+                "NtSetContextThread",
+                "NtGetContextThread",
+                "NtSuspendThread",
+                "NtResumeThread",
+                "NtQueryInformationProcess",
+                "NtSetInformationProcess",
+                "NtQueryInformationThread",
+                "NtDuplicateObject",
+                "NtQuerySystemInformation",
+                "NtSystemDebugControl",
+                "NtCreateSection",
+                "NtOpenSection",
+                "NtCreateUserProcess",
+                "NtUserSendInput",
+                "NtUserGetAsyncKeyState",
+                "NtUserGetRawInputData",
+                "NtUserGetKeyState",
+                "NtUserFindWindowEx",
+                "NtGdiBitBlt"
+            };
+            constexpr uint32_t kMaxNtChecks = 128;
+            constexpr uint32_t kPrologue = 24;
             uint32_t checked = 0;
             const uint32_t exportBegin = layout.ExportRva;
             const uint32_t exportEnd = layout.ExportRva + layout.ExportSize;
-            for (uint32_t i = 0; i < nameCount && checked < kMaxNtChecks; ++i)
+            auto nameIsPriority = [&](const std::string& name) -> bool
             {
-                uint32_t nameRva = 0;
-                uint16_t ordinal = 0;
-                std::memcpy(&nameRva, namesTable.data() + (i * 4u), sizeof(nameRva));
-                std::memcpy(&ordinal, ordsTable.data() + (i * 2u), sizeof(ordinal));
-                if (nameRva == 0)
+                for (const char* item : kPriority)
                 {
-                    continue;
+                    if (name == item)
+                    {
+                        return true;
+                    }
                 }
-                uint32_t nameFileOff = 0;
-                if (!RvaToFileOffset(headers, nameRva, &nameFileOff))
-                {
-                    continue;
-                }
-                std::vector<uint8_t> nameBytes;
-                if (!ReadDiskRange(imagePath, nameFileOff, 16, &nameBytes) ||
-                    nameBytes.size() < 2)
-                {
-                    continue;
-                }
-                if (!((nameBytes[0] == 'N' && nameBytes[1] == 't') ||
-                        (nameBytes[0] == 'Z' && nameBytes[1] == 'w')))
-                {
-                    continue;
-                }
-                if (ordinal >= funcCount)
-                {
-                    continue;
-                }
-                uint32_t funcRva = 0;
-                std::memcpy(&funcRva, funcsTable.data() + (ordinal * 4u), sizeof(funcRva));
+                return false;
+            };
+            auto checkExport = [&](uint32_t funcRva) -> bool
+            {
                 if (funcRva == 0)
                 {
-                    continue;
+                    return false;
                 }
                 if (funcRva >= exportBegin && funcRva < exportEnd)
                 {
-                    continue;
+                    return false;
                 }
                 uint32_t funcFile = 0;
                 if (!RvaToFileOffset(headers, funcRva, &funcFile))
                 {
-                    continue;
+                    return false;
                 }
                 if (funcRva > (std::numeric_limits<uint64_t>::max)() - imageBase)
                 {
-                    continue;
-                }
-                std::vector<uint8_t> diskPrologue;
-                std::vector<uint8_t> livePrologue;
-                if (!ReadDiskRange(imagePath, funcFile, kPrologue, &diskPrologue) ||
-                    diskPrologue.size() < kPrologue ||
-                    !ReadProcessBytes(
-                        device,
-                        symbols,
-                        processHandle,
-                        pid,
-                        imageBase + funcRva,
-                        kPrologue,
-                        &livePrologue) ||
-                    livePrologue.size() < kPrologue)
-                {
-                    continue;
+                    return false;
                 }
                 ++checked;
-                if (std::memcmp(diskPrologue.data(), livePrologue.data(), kPrologue) != 0)
+                return RelocatedSliceCompare(
+                    imagePath,
+                    headers,
+                    layout,
+                    processHandle,
+                    device,
+                    symbols,
+                    pid,
+                    imageBase,
+                    funcRva,
+                    funcFile,
+                    kPrologue) == SliceMismatch;
+            };
+            auto loadExportName = [&](uint32_t index, std::string* name) -> bool
+            {
+                if (name == nullptr || index >= nameCount)
                 {
-                    ++mismatches;
-                    if (mismatches >= 4)
+                    return false;
+                }
+                name->clear();
+                uint32_t nameRva = 0;
+                std::memcpy(&nameRva, namesTable.data() + (index * 4u), sizeof(nameRva));
+                if (nameRva == 0)
+                {
+                    return false;
+                }
+                uint32_t nameFileOff = 0;
+                if (!RvaToFileOffset(headers, nameRva, &nameFileOff))
+                {
+                    return false;
+                }
+                std::vector<uint8_t> nameBytes;
+                if (!ReadDiskRange(imagePath, nameFileOff, 64, &nameBytes) ||
+                    nameBytes.empty())
+                {
+                    return false;
+                }
+                for (uint8_t byte : nameBytes)
+                {
+                    if (byte == 0)
                     {
                         break;
                     }
+                    if (byte >= 0x20 && byte < 0x7f)
+                    {
+                        name->push_back(static_cast<char>(byte));
+                    }
+                }
+                return !name->empty();
+            };
+            auto funcRvaAt = [&](uint32_t index, uint32_t* funcRva) -> bool
+            {
+                if (funcRva == nullptr || index >= nameCount)
+                {
+                    return false;
+                }
+                uint16_t ordinal = 0;
+                std::memcpy(&ordinal, ordsTable.data() + (index * 2u), sizeof(ordinal));
+                if (ordinal >= funcCount)
+                {
+                    return false;
+                }
+                std::memcpy(funcRva, funcsTable.data() + (ordinal * 4u), sizeof(uint32_t));
+                return true;
+            };
+            for (uint32_t i = 0; i < nameCount && mismatches < 4; ++i)
+            {
+                std::string name;
+                uint32_t funcRva = 0;
+                if (!loadExportName(i, &name) || !nameIsPriority(name))
+                {
+                    continue;
+                }
+                if (!funcRvaAt(i, &funcRva))
+                {
+                    continue;
+                }
+                if (checkExport(funcRva))
+                {
+                    ++mismatches;
+                }
+            }
+            for (uint32_t i = 0;
+                i < nameCount && mismatches < 4 && checked < kMaxNtChecks;
+                ++i)
+            {
+                std::string name;
+                uint32_t funcRva = 0;
+                if (!loadExportName(i, &name))
+                {
+                    continue;
+                }
+                if (name.size() < 2 ||
+                    !((name[0] == 'N' && name[1] == 't') ||
+                        (name[0] == 'Z' && name[1] == 'w')))
+                {
+                    continue;
+                }
+                if (nameIsPriority(name))
+                {
+                    continue;
+                }
+                if (!funcRvaAt(i, &funcRva))
+                {
+                    continue;
+                }
+                if (checkExport(funcRva))
+                {
+                    ++mismatches;
                 }
             }
         } while (false);
