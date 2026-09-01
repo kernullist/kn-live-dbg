@@ -114,6 +114,7 @@ public:
     bool IsMapperWatchActive() const;
     std::vector<uint32_t> SnapshotWatchPids() const;
     std::wstring SnapshotMapperWatchId() const;
+    std::vector<uint64_t> SnapshotResiduePfns() const;
 
 private:
     void WorkerLoop();
@@ -127,7 +128,10 @@ private:
     void ScanHookCallbacks();
     void ScanHookInput();
     void ScanCpuIntegrityHooks();
+    void ScanHookDataPointers();
     void ScanUserModeHostility();
+    void NoteMapperWatchResidue(const std::wstring& layer, uint64_t physicalAddress);
+    void NoteWatchTiWriteIfNeeded(const KmonEvent& event);
     bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
     void EmitUnique(
         const std::wstring& kind,
@@ -211,6 +215,18 @@ private:
     std::atomic<uint64_t> MapperWatchUntilMs{0};
     std::atomic<uint64_t> MapperWatchOriginMs{0};
     std::atomic<bool> MapperWatchDeepPfnPending{false};
+    bool MapperWatchHasResidue = false;
+    bool MapperWatchHasOverlaySlot = false;
+    std::unordered_set<uint32_t> MapperWatchTiWritePids;
+    std::unordered_set<uint64_t> MapperWatchResiduePfns;
+
+    struct CfgDataPtrSite
+    {
+        uint64_t SlotVa = 0;
+        std::wstring ModuleLeaf;
+    };
+    std::vector<CfgDataPtrSite> CfgDataPtrSites;
+    uint64_t CfgDataPtrNtosBase = 0;
 
     mutable std::mutex RingMutex;
     std::deque<KmonEvent> Ring;

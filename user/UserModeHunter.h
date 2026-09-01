@@ -56,6 +56,7 @@ struct HuntOptions
     // Hidden/CID inventory still covers the whole system.
     std::vector<uint32_t> FilterPids;
     std::wstring MapperWatchId;
+    std::vector<uint64_t> KernelResiduePfns;
 };
 
 struct HuntModuleRecord
@@ -243,6 +244,7 @@ struct HuntResult
     std::wstring TimestampUtc;
     std::wstring ModeText;
     std::wstring MapperWatchId;
+    std::vector<uint64_t> KernelResiduePfns;
     std::vector<HuntProcessRecord> Processes;
     std::vector<HuntFinding> Findings;
     std::vector<HuntCloudFileImageRecord> CloudFileImages;
