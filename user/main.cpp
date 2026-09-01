@@ -21381,8 +21381,9 @@ static void PrintHiddenProcHelp()
     std::wcout << L"cross-views ActiveProcessLinks, SystemProcessInformation, Toolhelp, handle-table\n";
     std::wcout << L"owners, and PsLookupProcessByProcessId (CID). DKOM unlink hides a process from the\n";
     std::wcout << L"kernel list AND SPI/Toolhelp; those still show up as handle owners and CID hits.\n";
-    std::wcout << L"Auxiliary/ExitTime fakes are not ignored when CID or handles still see the process.\n";
-    std::wcout << L"A live kernel-only process with ActiveThreads==0 is still suspicious.\n";
+    std::wcout << L"PssCaptureSnapshot clones and leftovers (ExitTime set or ActiveThreads==0) are\n";
+    std::wcout << L"ignored even when they still have CID slots. API-only findings need both SPI and\n";
+    std::wcout << L"Toolhelp sandwiches to succeed, and the same API to see the PID before and after.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /json <path>  write kn-live-dbg.hidden-process.v1.\n";
