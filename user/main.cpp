@@ -3645,6 +3645,7 @@ static void AddHuntOptionCompletionCandidates(std::vector<std::wstring>* candida
         L"/deep",
         L"/summary",
         L"/details",
+        L"/pid",
         L"/limit",
         L"/json",
         L"help"
@@ -24718,6 +24719,7 @@ static void PrintKmonHelp()
     std::wcout << L"                          prints path, image base, size, and CI signature level\n";
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
     std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
+    std::wcout << L"                          headerless kpage/pool import stubs (kpage_code/pool_code) during mapper.watch,\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
     std::wcout << L"  mapper.watch            30s burst after drop/third-party kernel load/unload (capped 90s);\n";
     std::wcout << L"                          inbox image-notify prints but does not arm; leftover+wipe diffs,\n";
@@ -24736,7 +24738,8 @@ static void PrintKmonHelp()
     std::wcout << L"                          extra non-inbox module in a Windows builtin,\n";
     std::wcout << L"                          private W+X / PE VAD / hidden executable PTEs on watch or PPL,\n";
     std::wcout << L"                          IAT thunks in the main image, game DLLs, or hookable system DLLs,\n";
-    std::wcout << L"                          plus dxgi/d3d*/opengl/vulkan .rdata slots, that point at private/mapped RX\n";
+    std::wcout << L"                          plus dxgi/d3d*/opengl/vulkan and overlay (Steam/OBS/Discord/RTSS) .rdata slots,\n";
+    std::wcout << L"                          that point at private/mapped RX\n";
     std::wcout << L"  inject.remote           drop/unknown-path remote AllocVM/ProtectVM/MapView/WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          builtin WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView\n";
@@ -25208,6 +25211,10 @@ static void HandleKmonCommand(
                            << L" driver=" << (stats.MapperWatchDriver.empty()
                                ? L"<none>"
                                : KmonBasenameLower(stats.MapperWatchDriver));
+                if (!stats.MapperWatchId.empty())
+                {
+                    std::wcout << L" watch_id=" << stats.MapperWatchId;
+                }
             }
             else
             {
@@ -28723,7 +28730,7 @@ static void PrintDmlProcHelp()
 static void PrintHuntHelp()
 {
     std::wcout << L"!hunt command:\n";
-    std::wcout << L"  !hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]\n";
+    std::wcout << L"  !hunt [/quick] [/deep] [/summary] [/details] [/pid <n>] [/limit <n>] [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /quick    skip hidden-PTE and disk-vs-live page comparison\n";
@@ -28732,13 +28739,16 @@ static void PrintHuntHelp()
     std::wcout << L"            driver-object integrity checks, and existing !ti ring correlation\n";
     std::wcout << L"  /summary  print conclusion, assessment, aggregate counts, and capped warnings only\n";
     std::wcout << L"  /details  render raw triage tables and per-finding detail after the assessment\n";
+    std::wcout << L"  /pid n    deep-triage this PID first and skip VAD/hook work on other processes;\n";
+    std::wcout << L"            hidden/CID inventory still covers the whole system. Repeatable.\n";
     std::wcout << L"  /limit n  render and cap per-finding detail (0 renders all); JSON keeps the full scan result\n";
     std::wcout << L"  /json p   write kn-live-dbg.hunt.v1 JSON output\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  No process target is accepted. The command scans the whole current system view.\n";
+    std::wcout << L"  Bare image names are not accepted. Without /pid the command scans the whole system view.\n";
+    std::wcout << L"  If !kmon is active, watched PIDs are deep-triaged first. mapper.watch stamps watch_id on findings.\n";
     std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, APC,\n";
-    std::wcout << L"  IAT/vtable call-table hooks (dxgi/d3d/main image), cloned graphics vtables, and kernel-driver evidence.\n";
+    std::wcout << L"  IAT/vtable call-table hooks (dxgi/d3d/overlay/main image), cloned graphics vtables, and kernel-driver evidence.\n";
     std::wcout << L"  The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
     std::wcout << L"  /deep reuses recent !ti events if the Threat-Intelligence subscriber has captured any.\n";
     std::wcout << L"  Console output is concise by default: conclusion, subject/what/why/next assessment, summary, and suppressed detail notice.\n";
@@ -30992,6 +31002,7 @@ static int RunConsoleSurfaceSelfTest()
                 !CompletionCandidateExists({L"u", L"nt!KiSystemCall64"}, L"/process"),
             L"help-only-completion-stays-on-first-token");
         CheckCompletionCandidate(&context, {L"!hunt"}, L"/details", L"hunt-details-completion");
+        CheckCompletionCandidate(&context, {L"!hunt"}, L"/pid", L"hunt-pid-completion");
         CheckCompletionCandidate(&context, {L"!module"}, L"/disk", L"module-disk-completion");
         CheckCompletionCandidate(&context, {L"!module"}, L"/iat", L"module-iat-completion");
         CheckCompletionCandidate(&context, {L"!module"}, L"/prologue", L"module-prologue-completion");
@@ -34561,7 +34572,7 @@ static bool ValidateHuntCommandArgumentShape(
                 continue;
             }
 
-            if (option == L"/limit" || option == L"/json")
+            if (option == L"/limit" || option == L"/json" || option == L"/pid")
             {
                 if (index + 1 >= args.size() || IsSwitchLikeToken(args[index + 1]))
                 {
@@ -34581,7 +34592,7 @@ static bool ValidateHuntCommandArgumentShape(
             {
                 if (reason != nullptr)
                 {
-                    *reason = L"!hunt does not accept a process target; run !hunt with no target";
+                    *reason = L"!hunt does not accept a bare process target; use /pid <n>";
                 }
                 shapeOk = false;
                 break;
@@ -34589,7 +34600,7 @@ static bool ValidateHuntCommandArgumentShape(
 
             if (reason != nullptr)
             {
-                *reason = L"!hunt supports /quick, /deep, /summary, /details, /limit, and /json options";
+                *reason = L"!hunt supports /quick, /deep, /summary, /details, /pid, /limit, and /json options";
             }
             shapeOk = false;
             break;
@@ -39526,6 +39537,10 @@ static std::wstring HuntConsoleReasonLabel(const std::wstring& reason)
     {
         label = L"vtable_hook_private_exec";
     }
+    else if (lowered == L"overlay_slot_hook")
+    {
+        label = L"overlay_slot_hook";
+    }
     else if (lowered == L"cloned_vtable_private_exec")
     {
         label = L"cloned_vtable_private_exec";
@@ -39652,6 +39667,7 @@ static uint32_t HuntConsoleSignalPriority(const std::wstring& signal)
              lowered == L"builtin_process_injection_context" ||
              lowered == L"iat_hook_private_exec" ||
              lowered == L"vtable_hook_private_exec" ||
+             lowered == L"overlay_slot_hook" ||
              lowered == L"cloned_vtable_private_exec" ||
              lowered == L"mapped_executable_without_loader")
     {
@@ -39860,6 +39876,7 @@ static std::wstring HuntAssessmentKindForFinding(
     else if (classLabel == L"process_injection" ||
              HuntLabelsContain(labels, L"iat_hook_private_exec") ||
              HuntLabelsContain(labels, L"vtable_hook_private_exec") ||
+             HuntLabelsContain(labels, L"overlay_slot_hook") ||
              HuntLabelsContain(labels, L"cloned_vtable_private_exec"))
     {
         kind = L"in_process_code_hook";
@@ -40407,6 +40424,10 @@ static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
     else if (lowered == L"vtable_hook_private_exec")
     {
         phrase = L"call-table slot points at unbacked executable memory";
+    }
+    else if (lowered == L"overlay_slot_hook")
+    {
+        phrase = L"overlay IAT or call-table slot points at unbacked executable memory";
     }
     else if (lowered == L"cloned_vtable_private_exec")
     {
@@ -41453,10 +41474,32 @@ static void HandleHuntCommand(
                 jsonPath = args[index + 1];
                 ++index;
             }
+            else if (option == L"/pid")
+            {
+                if (index + 1 >= args.size())
+                {
+                    std::wcerr << L"!hunt failed: /pid requires a decimal process id\n";
+                    parseOk = false;
+                    break;
+                }
+                uint64_t pid64 = 0;
+                if (!ParseUnsigned(args[index + 1], 10, &pid64) ||
+                    pid64 == 0 ||
+                    pid64 > 0xffffffffull)
+                {
+                    std::wcerr << L"!hunt failed: /pid requires a decimal process id\n";
+                    parseOk = false;
+                    break;
+                }
+                const uint32_t pid = static_cast<uint32_t>(pid64);
+                options.FilterPids.push_back(pid);
+                options.FocusPids.push_back(pid);
+                ++index;
+            }
             else
             {
                 std::wcerr << L"!hunt failed: unknown option or target " << args[index] << L"\n";
-                std::wcerr << L"!hunt scans the whole system and does not accept a process target\n";
+                std::wcerr << L"!hunt does not accept a bare process target; use /pid <n>\n";
                 parseOk = false;
                 break;
             }
@@ -41465,6 +41508,25 @@ static void HandleHuntCommand(
         if (!parseOk)
         {
             break;
+        }
+
+        {
+            KernelMonitor& kmon = GetKmonInstance();
+            if (kmon.IsActive())
+            {
+                if (options.FilterPids.empty())
+                {
+                    const std::vector<uint32_t> watchPids = kmon.SnapshotWatchPids();
+                    options.FocusPids.insert(
+                        options.FocusPids.end(),
+                        watchPids.begin(),
+                        watchPids.end());
+                }
+                if (kmon.IsMapperWatchActive())
+                {
+                    options.MapperWatchId = kmon.SnapshotMapperWatchId();
+                }
+            }
         }
 
         std::vector<SnapshotProcessRecord> processes;

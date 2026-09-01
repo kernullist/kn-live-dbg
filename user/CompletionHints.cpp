@@ -274,6 +274,7 @@ namespace
         { L"/deep", L"!hunt /deep", L"add hidden-PTE, stomping, BYOVD hash, driver integrity, TI ring" },
         { L"/summary", L"!hunt /summary", L"conclusion and assessment only" },
         { L"/details", L"!hunt /details", L"render raw triage tables after the assessment" },
+        { L"/pid", L"!hunt /pid <n>", L"deep-triage this PID first; skip VAD/hook work on other processes" },
         { L"/limit", L"!hunt /limit <n>", L"cap per-finding detail (JSON stays full)" },
         { L"/json", L"!hunt /json <path>", L"write kn-live-dbg.hunt.v1 JSON" },
         { L"help", nullptr, L"show !hunt usage" },
@@ -1253,7 +1254,7 @@ namespace
 
     const CompletionScopeTable kHuntScopes[] =
     {
-        SCOPE(L"", L"!hunt [/quick|/deep|/summary|/details] [/limit] [/json]", L"whole-system user-mode anomaly hunt", kHuntTokens),
+        SCOPE(L"", L"!hunt [/quick|/deep|/summary|/details] [/pid] [/limit] [/json]", L"whole-system user-mode anomaly hunt", kHuntTokens),
     };
 
     const CompletionScopeTable kVadScopes[] =
