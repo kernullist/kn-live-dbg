@@ -654,6 +654,33 @@ static VOID KnDbgTimelineImageNotify(
     {
         record.ImageBase = reinterpret_cast<KNDBG_UINT64>(ImageInfo->ImageBase);
         record.ImageSize = static_cast<KNDBG_UINT64>(ImageInfo->ImageSize);
+        if (ImageInfo->SystemModeImage != 0)
+        {
+            record.Flags |= KNDBG_TIMELINE_IMAGE_FLAG_SYSTEM_MODE;
+        }
+        if (ImageInfo->ImagePartialMap != 0)
+        {
+            record.Flags |= KNDBG_TIMELINE_IMAGE_FLAG_PARTIAL_MAP;
+        }
+        record.Flags |= (ImageInfo->ImageSignatureLevel & 0xFu) <<
+            KNDBG_TIMELINE_IMAGE_SIGLEVEL_SHIFT;
+        record.Flags |= (ImageInfo->ImageSignatureType & 0x7u) <<
+            KNDBG_TIMELINE_IMAGE_SIGTYPE_SHIFT;
+        if (ImageInfo->ExtendedInfoPresent != 0)
+        {
+            const IMAGE_INFO_EX* imageInfoEx =
+                CONTAINING_RECORD(ImageInfo, IMAGE_INFO_EX, ImageInfo);
+            if (imageInfoEx != nullptr &&
+                imageInfoEx->Size >= sizeof(IMAGE_INFO_EX))
+            {
+                record.Flags |= KNDBG_TIMELINE_IMAGE_FLAG_EXTENDED;
+                if (imageInfoEx->FileObject != nullptr)
+                {
+                    record.FileObject =
+                        reinterpret_cast<KNDBG_UINT64>(imageInfoEx->FileObject);
+                }
+            }
+        }
     }
     KnDbgTimelineCopyPath(&record, FullImageName);
 
