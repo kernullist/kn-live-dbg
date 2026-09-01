@@ -60,6 +60,10 @@ struct KmonStats
     uint64_t HookScans = 0;
     uint64_t CpuHookScans = 0;
     uint64_t UserHostilityScans = 0;
+    uint64_t MapperWatchArmed = 0;
+    uint64_t MapperWatchScans = 0;
+    uint64_t MapperWatchRemainMs = 0;
+    std::wstring MapperWatchDriver;
     uint64_t LoggingEnabled = 0;
     uint64_t LoggingFailed = 0;
     uint64_t LogBytesWritten = 0;
@@ -139,6 +143,8 @@ private:
     void ClearEmittedKey(const std::wstring& key);
     void ClearEmittedKeyForPid(const std::wstring& key, uint32_t processId);
     void NoteDriverLoad(const KmonEvent& event);
+    void ArmMapperWatch(const KmonEvent& event);
+    bool IsMapperWatchActive() const;
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
     void PromoteNamedWatchPid(uint32_t pid);
@@ -184,6 +190,20 @@ private:
         uint64_t Timestamp = 0;
     };
     std::deque<RecentDriverLoad> RecentLoads;
+    struct MapperWatchFingerprint
+    {
+        std::unordered_set<std::wstring> Unloaded;
+        std::unordered_set<std::wstring> Piddb;
+        std::unordered_set<std::wstring> Hash;
+        uint32_t PiddbElementCount = 0;
+        uint32_t UnloadedSlotCount = 0;
+        bool Complete = false;
+    };
+    MapperWatchFingerprint MapperWatchLast;
+    std::wstring MapperWatchDriver;
+    std::unordered_map<std::wstring, uint64_t> MapperWatchEmitTick;
+    std::atomic<uint64_t> MapperWatchUntilMs{0};
+    std::atomic<bool> MapperWatchDeepPfnPending{false};
 
     mutable std::mutex RingMutex;
     std::deque<KmonEvent> Ring;
@@ -217,6 +237,8 @@ private:
     std::atomic<uint64_t> HookScans{0};
     std::atomic<uint64_t> CpuHookScans{0};
     std::atomic<uint64_t> UserHostilityScans{0};
+    std::atomic<uint64_t> MapperWatchArmedCount{0};
+    std::atomic<uint64_t> MapperWatchScans{0};
     std::atomic<uint64_t> LoggingEnabledCount{0};
     std::atomic<uint64_t> LoggingFailedCount{0};
     std::atomic<uint64_t> LogBytesWritten{0};
@@ -248,5 +270,7 @@ std::wstring KmonExtractPayloadDriverName(const std::vector<TiPayloadField>& pay
 bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out);
 bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out);
 bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options);
+bool KmonDriverLoadArmsMapperWatch(const KmonEvent& event);
+bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event);
 bool KernelMonitorSelfTest();
 bool KernelMonitorArtifactSelfTest();

@@ -24701,7 +24701,7 @@ static void PrintKmonHelp()
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
     std::wcout << L"  shown:  drop_load, image_only (post-arm kernel image notify), short_lived,\n";
-    std::wcout << L"          mapped_residue, hook.unbacked, hidden,\n";
+    std::wcout << L"          mapped_residue, mapper.watch, hook.unbacked, hidden,\n";
     std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw\n";
     std::wcout << L"  hidden: inbox TI DriverObjectLoad, process create, local AllocVM, kernel R/W,\n";
     std::wcout << L"          ReadVM/suspend/resume alone\n";
@@ -24715,6 +24715,8 @@ static void PrintKmonHelp()
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
     std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
+    std::wcout << L"  mapper.watch            30s burst after a kernel driver load/unload: mapper/pool/kpage\n";
+    std::wcout << L"                          every 400ms, leftover+wipe diffs, one DeepPfn kpage pass\n";
     std::wcout << L"  hook.unbacked           callback/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter\n";
     std::wcout << L"                          whose routine is outside PsLoadedModuleList (empty list is fail-closed);\n";
     std::wcout << L"                          InstrumentationCallback outside modules (watch/builtin, PPL via VAD)\n";
@@ -25192,6 +25194,20 @@ static void HandleKmonCommand(
                        << L" hook_scans=" << stats.HookScans
                        << L" cpu_hook_scans=" << stats.CpuHookScans
                        << L" user_scans=" << stats.UserHostilityScans << L"\n";
+            std::wcout << L"  mapper_watch=";
+            if (stats.MapperWatchRemainMs > 0)
+            {
+                std::wcout << L"active remain_ms=" << stats.MapperWatchRemainMs
+                           << L" driver=" << (stats.MapperWatchDriver.empty()
+                               ? L"<none>"
+                               : KmonBasenameLower(stats.MapperWatchDriver));
+            }
+            else
+            {
+                std::wcout << L"idle";
+            }
+            std::wcout << L" armed=" << stats.MapperWatchArmed
+                       << L" burst_scans=" << stats.MapperWatchScans << L"\n";
             std::wcout << L"  logging_enabled=" << stats.LoggingEnabled
                        << L" logging_failed=" << stats.LoggingFailed << L"\n";
             std::wcout << L"  watch:";
@@ -31020,6 +31036,7 @@ static int RunConsoleSurfaceSelfTest()
                     kmonHelp.find(L"not a TI firehose") != std::wstring::npos &&
                     kmonHelp.find(L"!kmon watch") != std::wstring::npos &&
                     kmonHelp.find(L"driver.image_only") != std::wstring::npos &&
+                    kmonHelp.find(L"mapper.watch") != std::wstring::npos &&
                     kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos,
                 L"kmon-help-covers-drop-load-and-live-tail");
         }

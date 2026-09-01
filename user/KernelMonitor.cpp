@@ -42,6 +42,10 @@ namespace
     constexpr size_t kPrintQueueCap = 1024;
     constexpr uint32_t kKpageScanIntervalMs = 20000;
     constexpr uint32_t kUserScanIntervalMs = 8000;
+    constexpr uint32_t kMapperWatchWindowMs = 30000;
+    constexpr uint32_t kMapperWatchIntervalMs = 400;
+    constexpr uint32_t kMapperWatchKpageIntervalMs = 1500;
+    constexpr uint32_t kMapperWatchEmitDebounceMs = 2000;
     constexpr uint16_t kImageFileMachineAmd64 = 0x8664;
     constexpr ULONG kProcessEnableLogging = 96;
     constexpr ULONG kProcessEnableReadWriteVmLogging = 87;
@@ -150,6 +154,21 @@ namespace
             }
         }
         return value;
+    }
+
+    std::wstring MapperUnloadedFingerprint(const MapperUnloadedRecord& record)
+    {
+        return ToLowerCopy(record.Name) + L"@" + HexU64(record.StartAddress);
+    }
+
+    std::wstring MapperPiddbFingerprint(const MapperPiddbRecord& record)
+    {
+        return ToLowerCopy(record.DriverName) + L"@" + std::to_wstring(record.TimeDateStamp);
+    }
+
+    std::wstring MapperHashFingerprint(const MapperHashRecord& record)
+    {
+        return ToLowerCopy(record.DriverName);
     }
 
     std::wstring JsonEscape(const std::wstring& in)
@@ -4399,6 +4418,7 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"driver.image_only" ||
             event.Kind == L"driver.short_lived" ||
             event.Kind == L"driver.mapped_residue" ||
+            event.Kind == L"mapper.watch" ||
             event.Kind == L"hook.unbacked" ||
             event.Kind == L"integrity.ci" ||
             event.Kind == L"integrity.cr" ||
@@ -4547,6 +4567,51 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
     return matched;
 }
 
+static std::wstring KmonEventPathClass(const KmonEvent& event)
+{
+    auto it = event.Evidence.find(L"path_class");
+    if (it == event.Evidence.end())
+    {
+        return std::wstring();
+    }
+    return it->second;
+}
+
+static bool KmonPathClassLooksMapped(const std::wstring& pathClass, const std::wstring& driver)
+{
+    if (pathClass == L"drop" || pathClass == L"third_party")
+    {
+        return true;
+    }
+    if (pathClass != L"inbox" && KmonDriverPathHasFileDirectory(driver))
+    {
+        return true;
+    }
+    return false;
+}
+
+bool KmonDriverLoadArmsMapperWatch(const KmonEvent& event)
+{
+    if (event.Kind == L"driver.drop_load" || event.Kind == L"driver.image_only")
+    {
+        return true;
+    }
+    if (event.Kind == L"driver.official_load")
+    {
+        return KmonPathClassLooksMapped(KmonEventPathClass(event), event.Driver);
+    }
+    return false;
+}
+
+bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event)
+{
+    if (event.Kind != L"driver.official_unload" && event.Kind != L"driver.short_lived")
+    {
+        return false;
+    }
+    return KmonPathClassLooksMapped(KmonEventPathClass(event), event.Driver);
+}
+
 KernelMonitor::KernelMonitor() = default;
 
 KernelMonitor::~KernelMonitor()
@@ -4602,6 +4667,18 @@ KmonStats KernelMonitor::SnapshotStats() const
     stats.HookScans = HookScans.load();
     stats.CpuHookScans = CpuHookScans.load();
     stats.UserHostilityScans = UserHostilityScans.load();
+    stats.MapperWatchArmed = MapperWatchArmedCount.load();
+    stats.MapperWatchScans = MapperWatchScans.load();
+    {
+        const uint64_t nowMs = GetTickCount64();
+        const uint64_t until = MapperWatchUntilMs.load();
+        if (until > nowMs)
+        {
+            stats.MapperWatchRemainMs = until - nowMs;
+        }
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        stats.MapperWatchDriver = MapperWatchDriver;
+    }
     stats.LoggingEnabled = LoggingEnabledCount.load();
     stats.LoggingFailed = LoggingFailedCount.load();
     stats.LogBytesWritten = LogBytesWritten.load();
@@ -4725,6 +4802,9 @@ bool KernelMonitor::Start(
                 EmittedUnnamedPids.clear();
                 EmittedMapperKeys.clear();
                 RecentLoads.clear();
+                MapperWatchLast = MapperWatchFingerprint{};
+                MapperWatchDriver.clear();
+                MapperWatchEmitTick.clear();
                 for (uint32_t pid : Options.WatchPids)
                 {
                     WatchPids.insert(pid);
@@ -4757,6 +4837,8 @@ bool KernelMonitor::Start(
             NextMapperScanTickMs = 0;
             NextKpageScanTickMs = 0;
             NextUserScanTickMs = 0;
+            MapperWatchUntilMs.store(0);
+            MapperWatchDeepPfnPending.store(false);
 
             EventsKept.store(0);
             EventsDropped.store(0);
@@ -4771,6 +4853,8 @@ bool KernelMonitor::Start(
             HookScans.store(0);
             CpuHookScans.store(0);
             UserHostilityScans.store(0);
+            MapperWatchArmedCount.store(0);
+            MapperWatchScans.store(0);
             LoggingEnabledCount.store(0);
             LoggingFailedCount.store(0);
             LogBytesWritten.store(0);
@@ -4924,6 +5008,7 @@ void KernelMonitor::WorkerLoop()
         IngestThreatIntel();
 
         const uint64_t nowMs = GetTickCount64();
+        const bool mapperWatch = IsMapperWatchActive();
         uint32_t hiddenInterval = 5000;
         uint32_t mapperInterval = 8000;
         {
@@ -4939,6 +5024,13 @@ void KernelMonitor::WorkerLoop()
         {
             mapperInterval = 8000;
         }
+        if (mapperWatch)
+        {
+            mapperInterval = kMapperWatchIntervalMs;
+        }
+        const uint32_t kpageInterval = mapperWatch
+            ? kMapperWatchKpageIntervalMs
+            : kKpageScanIntervalMs;
 
         // First tick only schedules the scans. Walking PsActiveProcessHead
         // plus mapper leftovers stalls TI ingest at the exact moment a
@@ -4961,6 +5053,10 @@ void KernelMonitor::WorkerLoop()
         }
         else if (nowMs >= NextMapperScanTickMs)
         {
+            if (mapperWatch)
+            {
+                MapperWatchScans.fetch_add(1);
+            }
             ScanMapperRemnants();
             IngestLiveTimeline();
             IngestThreatIntel();
@@ -5002,7 +5098,7 @@ void KernelMonitor::WorkerLoop()
             {
                 ScanOrphanMappedPages();
             }
-            NextKpageScanTickMs = GetTickCount64() + kKpageScanIntervalMs;
+            NextKpageScanTickMs = GetTickCount64() + kpageInterval;
         }
 
         if (NextUserScanTickMs == 0)
@@ -5019,7 +5115,7 @@ void KernelMonitor::WorkerLoop()
             NextUserScanTickMs = GetTickCount64() + kUserScanIntervalMs;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(mapperWatch ? 50 : 200));
     }
 }
 
@@ -5059,6 +5155,10 @@ void KernelMonitor::IngestThreatIntel()
             if (classified.Kind == L"driver.official_unload")
             {
                 MaybeEmitShortLived(classified);
+                if (KmonDriverUnloadArmsMapperWatch(classified))
+                {
+                    ArmMapperWatch(classified);
+                }
             }
             if (classified.Kind == L"inject.remote")
             {
@@ -5382,21 +5482,88 @@ void KernelMonitor::ScanHiddenProcesses()
 
 void KernelMonitor::NoteDriverLoad(const KmonEvent& event)
 {
-    std::lock_guard<std::mutex> lock(WatchMutex);
-    RecentDriverLoad load = {};
-    load.Base = KmonBasenameLower(event.Driver);
-    load.Path = event.Driver;
-    auto it = event.Evidence.find(L"path_class");
-    if (it != event.Evidence.end())
     {
-        load.PathClass = it->second;
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        RecentDriverLoad load = {};
+        load.Base = KmonBasenameLower(event.Driver);
+        load.Path = event.Driver;
+        auto it = event.Evidence.find(L"path_class");
+        if (it != event.Evidence.end())
+        {
+            load.PathClass = it->second;
+        }
+        load.Timestamp = event.Timestamp;
+        RecentLoads.push_back(std::move(load));
+        while (RecentLoads.size() > 64)
+        {
+            RecentLoads.pop_front();
+        }
     }
-    load.Timestamp = event.Timestamp;
-    RecentLoads.push_back(std::move(load));
-    while (RecentLoads.size() > 64)
+    if (KmonDriverLoadArmsMapperWatch(event))
     {
-        RecentLoads.pop_front();
+        ArmMapperWatch(event);
     }
+}
+
+bool KernelMonitor::IsMapperWatchActive() const
+{
+    const uint64_t until = MapperWatchUntilMs.load();
+    return until != 0 && GetTickCount64() < until;
+}
+
+void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
+{
+    const uint64_t nowMs = GetTickCount64();
+    const uint64_t until = nowMs + kMapperWatchWindowMs;
+    const std::wstring base = KmonBasenameLower(event.Driver);
+    bool emit = false;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        const uint64_t previous = MapperWatchUntilMs.load();
+        if (until > previous)
+        {
+            MapperWatchUntilMs.store(until);
+        }
+        MapperWatchDriver = event.Driver.empty() ? base : event.Driver;
+        MapperWatchDeepPfnPending.store(true);
+        uint64_t& lastEmit = MapperWatchEmitTick[base.empty() ? L"<unnamed>" : base];
+        if (lastEmit == 0 || nowMs < lastEmit || (nowMs - lastEmit) >= kMapperWatchEmitDebounceMs)
+        {
+            lastEmit = nowMs;
+            emit = true;
+        }
+    }
+    NextMapperScanTickMs = 1;
+    NextKpageScanTickMs = 1;
+    MapperWatchArmedCount.fetch_add(1);
+
+    if (!emit)
+    {
+        return;
+    }
+
+    FILETIME now = {};
+    GetSystemTimeAsFileTime(&now);
+    KmonEvent watch = {};
+    watch.Timestamp = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    watch.Kind = L"mapper.watch";
+    watch.Driver = event.Driver;
+    watch.Task = event.Kind;
+    watch.Summary = L"mapper watch 30s after " + event.Kind;
+    if (!base.empty())
+    {
+        watch.Summary += L" " + base;
+    }
+    watch.Evidence[L"window_ms"] = std::to_wstring(kMapperWatchWindowMs);
+    watch.Evidence[L"scan_ms"] = std::to_wstring(kMapperWatchIntervalMs);
+    watch.Evidence[L"kpage_ms"] = std::to_wstring(kMapperWatchKpageIntervalMs);
+    watch.Evidence[L"followup"] = L"!mapper all; !pool pe /suspicious; !kpage /pe /deep";
+    auto pathIt = event.Evidence.find(L"path_class");
+    if (pathIt != event.Evidence.end())
+    {
+        watch.Evidence[L"path_class"] = pathIt->second;
+    }
+    RecordEvent(std::move(watch));
 }
 
 void KernelMonitor::MaybeEmitShortLived(const KmonEvent& unloadEvent)
@@ -5494,6 +5661,10 @@ void KernelMonitor::MaybeEmitShortLived(const KmonEvent& unloadEvent)
 
     if (emit)
     {
+        if (KmonDriverUnloadArmsMapperWatch(shortLived))
+        {
+            ArmMapperWatch(shortLived);
+        }
         RecordEvent(std::move(shortLived));
     }
 }
@@ -5671,7 +5842,8 @@ void KernelMonitor::ScanMapperRemnants()
 
     MapperRemnantScanner scanner(*device, *symbols);
     MapperScanOptions options;
-    options.Limit = 64;
+    const bool mapperWatch = IsMapperWatchActive();
+    options.Limit = mapperWatch ? 256 : 64;
     MapperScanResult result = {};
     std::wstring error;
     if (!scanner.Scan(options, &result, &error))
@@ -5730,7 +5902,8 @@ void KernelMonitor::ScanMapperRemnants()
 
     for (const MapperUnloadedRecord& record : result.Unloaded)
     {
-        if (!record.Suspicious)
+        if (!record.Suspicious &&
+            !(mapperWatch && record.StillExecutable && !record.OverlapsLoadedModule))
         {
             continue;
         }
@@ -5743,7 +5916,8 @@ void KernelMonitor::ScanMapperRemnants()
     }
     for (const MapperPiddbRecord& record : result.Piddb)
     {
-        if (!record.Suspicious)
+        if (!record.Suspicious &&
+            !(mapperWatch && !record.InLoadedModules && !record.Expected))
         {
             continue;
         }
@@ -5756,7 +5930,8 @@ void KernelMonitor::ScanMapperRemnants()
     }
     for (const MapperHashRecord& record : result.HashEntries)
     {
-        if (!record.Suspicious)
+        if (!record.Suspicious &&
+            !(mapperWatch && !record.InLoadedModules && !record.Expected))
         {
             continue;
         }
@@ -5766,6 +5941,87 @@ void KernelMonitor::ScanMapperRemnants()
             L"ci_hash",
             L"mapper leftover ci-hash " + record.DriverName,
             record.Notes);
+    }
+
+    if (mapperWatch &&
+        result.UnloadedComplete &&
+        result.PiddbComplete &&
+        result.HashComplete)
+    {
+        MapperWatchFingerprint current = {};
+        current.Complete = true;
+        current.PiddbElementCount = result.PiddbElementCount;
+        current.UnloadedSlotCount = result.UnloadedSlotCount;
+        for (const MapperUnloadedRecord& record : result.Unloaded)
+        {
+            current.Unloaded.insert(MapperUnloadedFingerprint(record));
+        }
+        for (const MapperPiddbRecord& record : result.Piddb)
+        {
+            current.Piddb.insert(MapperPiddbFingerprint(record));
+        }
+        for (const MapperHashRecord& record : result.HashEntries)
+        {
+            current.Hash.insert(MapperHashFingerprint(record));
+        }
+
+        MapperWatchFingerprint previous = {};
+        std::wstring watchDriver;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            previous = MapperWatchLast;
+            MapperWatchLast = current;
+            watchDriver = MapperWatchDriver;
+        }
+        if (previous.Complete)
+        {
+            auto emitCleared = [&](
+                const std::unordered_set<std::wstring>& before,
+                const std::unordered_set<std::wstring>& after,
+                const std::wstring& layer,
+                const std::wstring& keyPrefix)
+            {
+                for (const std::wstring& key : before)
+                {
+                    if (after.find(key) != after.end())
+                    {
+                        continue;
+                    }
+                    EmitMappedResidue(
+                        keyPrefix + key,
+                        key,
+                        layer,
+                        L"mapper watch: " + layer + L" entry vanished " + key,
+                        L"entry present on the previous burst scan is gone");
+                }
+            };
+            emitCleared(
+                previous.Unloaded,
+                current.Unloaded,
+                L"MmUnloadedDrivers_wipe",
+                L"unloaded_cleared:");
+            emitCleared(
+                previous.Piddb,
+                current.Piddb,
+                L"PiDDBCache_wipe",
+                L"piddb_cleared:");
+            emitCleared(
+                previous.Hash,
+                current.Hash,
+                L"ci_hash_wipe",
+                L"hash_cleared:");
+            if (previous.PiddbElementCount >= current.PiddbElementCount + 4)
+            {
+                EmitMappedResidue(
+                    L"piddb_bulk_wipe:" + std::to_wstring(previous.PiddbElementCount),
+                    watchDriver,
+                    L"PiDDBCache_wipe",
+                    L"mapper watch: PiDDB element count dropped " +
+                        std::to_wstring(previous.PiddbElementCount) + L" -> " +
+                        std::to_wstring(current.PiddbElementCount),
+                    L"bulk PiDDB shrink during post-load mapper watch");
+            }
+        }
     }
 }
 
@@ -5804,7 +6060,7 @@ void KernelMonitor::ScanPoolMappedImages()
     PoolPeHunter hunter(*device);
     PoolPeHunter::Options options;
     options.Paged = PoolPeHunter::PagedFilter::Any;
-    options.LimitHits = 32;
+    options.LimitHits = IsMapperWatchActive() ? 128 : 32;
     PoolPeHunterResult result = {};
     std::wstring error;
     if (!hunter.Scan(options, &result, &error))
@@ -6013,11 +6269,21 @@ void KernelMonitor::ScanOrphanMappedPages()
 
     OrphanKernelPageScanner scanner(*device, *symbols);
     OrphanKernelPageOptions options;
-    options.DeepPfn = false;
+    const bool mapperWatch = IsMapperWatchActive();
+    bool deepPfn = false;
+    if (mapperWatch && MapperWatchDeepPfnPending.exchange(false))
+    {
+        deepPfn = true;
+    }
+    options.DeepPfn = deepPfn;
     options.PeOnly = false;
     options.WxOnly = false;
     options.IncludeSession = true;
-    options.Limit = 32;
+    options.Limit = mapperWatch ? 96 : 32;
+    if (mapperWatch)
+    {
+        options.MaxTablePages = 65536;
+    }
     OrphanKernelPageResult result = {};
     std::wstring error;
     if (!scanner.Scan(options, &result, &error))
@@ -9715,7 +9981,12 @@ void KernelMonitor::Clear()
         EmittedMapperKeys.clear();
         EmittedUnnamedPids.clear();
         RecentLoads.clear();
+        MapperWatchLast = MapperWatchFingerprint{};
+        MapperWatchDriver.clear();
+        MapperWatchEmitTick.clear();
     }
+    MapperWatchUntilMs.store(0);
+    MapperWatchDeepPfnPending.store(false);
 }
 
 bool KernelMonitor::AddWatchPid(uint32_t pid)
@@ -10640,7 +10911,24 @@ bool KernelMonitorSelfTest()
         dropEvent.Kind = L"driver.drop_load";
         dropEvent.Driver = L"unknown-drop.sys";
         dropEvent.Evidence[L"path_class"] = L"drop";
-        if (!KmonWatchMatches(dropEvent, emptyWatch))
+        if (!KmonWatchMatches(dropEvent, emptyWatch) ||
+            !KmonDriverLoadArmsMapperWatch(dropEvent))
+        {
+            break;
+        }
+        KmonEvent inboxImage = {};
+        inboxImage.Kind = L"driver.image_only";
+        inboxImage.Driver = L"C:\\Windows\\System32\\drivers\\acpi.sys";
+        inboxImage.Evidence[L"path_class"] = L"inbox";
+        if (!KmonWatchMatches(inboxImage, emptyWatch) ||
+            !KmonDriverLoadArmsMapperWatch(inboxImage))
+        {
+            break;
+        }
+        KmonEvent mapperWatchEvent = {};
+        mapperWatchEvent.Kind = L"mapper.watch";
+        mapperWatchEvent.Driver = L"unknown-drop.sys";
+        if (!KmonWatchMatches(mapperWatchEvent, emptyWatch))
         {
             break;
         }
@@ -10656,7 +10944,19 @@ bool KernelMonitorSelfTest()
         inboxEvent.Kind = L"driver.official_load";
         inboxEvent.Driver = L"C:\\Windows\\System32\\drivers\\acpi.sys";
         inboxEvent.Evidence[L"path_class"] = L"inbox";
-        if (KmonWatchMatches(inboxEvent, emptyWatch))
+        if (KmonWatchMatches(inboxEvent, emptyWatch) ||
+            KmonDriverLoadArmsMapperWatch(inboxEvent))
+        {
+            break;
+        }
+        KmonEvent dropUnload = {};
+        dropUnload.Kind = L"driver.official_unload";
+        dropUnload.Driver = L"C:\\Users\\a\\AppData\\Local\\Temp\\x.sys";
+        dropUnload.Evidence[L"path_class"] = L"drop";
+        KmonEvent inboxUnload = inboxEvent;
+        inboxUnload.Kind = L"driver.official_unload";
+        if (!KmonDriverUnloadArmsMapperWatch(dropUnload) ||
+            KmonDriverUnloadArmsMapperWatch(inboxUnload))
         {
             break;
         }
