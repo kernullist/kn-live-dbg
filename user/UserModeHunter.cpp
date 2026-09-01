@@ -25,6 +25,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <unordered_set>
 
 namespace
 {
@@ -20107,6 +20108,7 @@ namespace
     bool ModuleLooksLikeKnownUserOverlay(const std::wstring& leaf)
     {
         return leaf.find(L"overlay") != std::wstring::npos ||
+            leaf.find(L"graphics-hook") != std::wstring::npos ||
             leaf.find(L"discordhook") != std::wstring::npos ||
             leaf.find(L"discord_hook") != std::wstring::npos ||
             leaf == L"rtsshooks.dll" ||
@@ -20895,7 +20897,8 @@ namespace
             }
             const std::wstring leaf =
                 LeafName(module.Name.empty() ? module.Path : module.Name);
-            if (ModuleLooksLikeGraphicsApiDll(leaf))
+            if (ModuleLooksLikeGraphicsApiDll(leaf) ||
+                ModuleLooksLikeKnownUserOverlay(leaf))
             {
                 scan = true;
             }
@@ -22176,8 +22179,10 @@ namespace
                 std::set<uint64_t> seenTargets;
                 const std::wstring leaf =
                     LeafName(module.Name.empty() ? module.Path : module.Name);
+                const bool overlayLeaf = ModuleLooksLikeKnownUserOverlay(leaf);
                 const bool scanRdata =
                     ModuleLooksLikeGraphicsApiDll(leaf) ||
+                    overlayLeaf ||
                     (IsMainImageModule(process, module) &&
                         !ProcessLooksLikeJitHost(process));
 
@@ -22245,8 +22250,12 @@ namespace
                                 thunkSize);
                             emitHook(
                                 thunk,
-                                L"iat_hook_private_exec",
-                                L"module IAT thunk points at unbacked executable memory",
+                                overlayLeaf
+                                    ? L"overlay_slot_hook"
+                                    : L"iat_hook_private_exec",
+                                overlayLeaf
+                                    ? L"overlay IAT thunk points at unbacked executable memory"
+                                    : L"module IAT thunk points at unbacked executable memory",
                                 L"iat_index",
                                 static_cast<uint32_t>(index));
                         }
@@ -22335,8 +22344,12 @@ namespace
                                 thunkSize);
                             emitHook(
                                 target,
-                                L"vtable_hook_private_exec",
-                                L"module call-table slot points at unbacked executable memory",
+                                overlayLeaf
+                                    ? L"overlay_slot_hook"
+                                    : L"vtable_hook_private_exec",
+                                overlayLeaf
+                                    ? L"overlay call-table slot points at unbacked executable memory"
+                                    : L"module call-table slot points at unbacked executable memory",
                                 L"table_index",
                                 static_cast<uint32_t>(slot));
                         }
@@ -25740,10 +25753,29 @@ bool HuntInProcessHookSelfTest()
         ntdll.ToolhelpSeen = true;
         ntdll.LdrLoadSeen = true;
 
+        HuntModuleRecord overlay = {};
+        overlay.Base = 0x7ff810000000ull;
+        overlay.Size = 0x200000;
+        overlay.Name = L"gameoverlayrenderer64.dll";
+        overlay.Path =
+            L"C:\\Program Files (x86)\\Steam\\gameoverlayrenderer64.dll";
+        overlay.ToolhelpSeen = true;
+        overlay.LdrLoadSeen = true;
+
+        HuntModuleRecord obsHook = {};
+        obsHook.Base = 0x7ff820000000ull;
+        obsHook.Size = 0x40000;
+        obsHook.Name = L"graphics-hook64.dll";
+        obsHook.Path = L"C:\\Program Files\\obs-studio\\graphics-hook64.dll";
+        obsHook.ToolhelpSeen = true;
+        obsHook.LdrLoadSeen = true;
+
         game.Modules.push_back(main);
         game.Modules.push_back(dxgi);
         game.Modules.push_back(engine);
         game.Modules.push_back(ntdll);
+        game.Modules.push_back(overlay);
+        game.Modules.push_back(obsHook);
 
         ProcessVadRecord privateRx = {};
         privateRx.StartAddress = 0x200000;
@@ -25762,8 +25794,13 @@ bool HuntInProcessHookSelfTest()
             ProcessHasGraphicsApiModule(noGraphics) ||
             !ModuleShouldScanForCallTableHooks(game, main) ||
             !ModuleShouldScanForCallTableHooks(game, dxgi) ||
+            !ModuleShouldScanForCallTableHooks(game, overlay) ||
+            !ModuleShouldScanForCallTableHooks(game, obsHook) ||
             ModuleShouldScanForCallTableHooks(game, engine) ||
             ModuleShouldScanForCallTableHooks(game, ntdll) ||
+            !ModuleLooksLikeKnownUserOverlay(L"gameoverlayrenderer64.dll") ||
+            !ModuleLooksLikeKnownUserOverlay(L"graphics-hook64.dll") ||
+            ModuleLooksLikeKnownUserOverlay(L"ntdll.dll") ||
             !AddressInPrivateExecutableVad(game, 0x200100) ||
             !AddressInUnbackedExecutableVad(game, 0x200100) ||
             AddressInUnbackedExecutableVad(game, dxgi.Base + 0x1000) ||
@@ -28578,6 +28615,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         result->Schema = L"kn-live-dbg.hunt.v1";
         result->TimestampUtc = SnapshotCurrentUtcTimestamp();
         result->ModeText = HuntModeToText(options.Mode);
+        result->MapperWatchId = options.MapperWatchId;
         result->ThreatIntelActive = options.ThreatIntelActive;
         result->ThreatIntelAvailable = options.ThreatIntelAvailable || !options.ThreatIntelEvents.empty();
         result->Warnings.push_back(L"builtin process signer verification is not implemented; publisher evidence unavailable");
@@ -28931,9 +28969,35 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 symbols_,
                 &protectionField);
 
-        for (auto& item : processes)
+        std::unordered_set<uint32_t> filterSet(
+            options.FilterPids.begin(),
+            options.FilterPids.end());
+        std::vector<uint32_t> scanOrder;
+        scanOrder.reserve(processes.size());
         {
-            HuntProcessRecord& process = item.second;
+            std::unordered_set<uint32_t> seen;
+            for (uint32_t pid : options.FocusPids)
+            {
+                if (processes.find(pid) == processes.end() ||
+                    !seen.insert(pid).second)
+                {
+                    continue;
+                }
+                scanOrder.push_back(pid);
+            }
+            for (const auto& item : processes)
+            {
+                if (!seen.insert(item.first).second)
+                {
+                    continue;
+                }
+                scanOrder.push_back(item.first);
+            }
+        }
+
+        for (uint32_t scanPid : scanOrder)
+        {
+            HuntProcessRecord& process = processes[scanPid];
             if (process.Kernel.ProcessId == 0)
             {
                 process.Kernel.ProcessId = process.ProcessId;
@@ -29187,6 +29251,12 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 result->CoverageComplete = false;
             }
             AddProcessViewFindings(result, process);
+
+            if (!options.FilterPids.empty() &&
+                filterSet.find(process.ProcessId) == filterSet.end())
+            {
+                continue;
+            }
 
             // Deep triage needs EPROCESS. Prefer ActiveProcessLinks inventory;
             // also accept CID-recovered EPROCESS for API-only / unlinked processes
@@ -29548,6 +29618,17 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
             result->Processes.push_back(std::move(item.second));
         }
 
+        if (!result->MapperWatchId.empty())
+        {
+            for (HuntFinding& finding : result->Findings)
+            {
+                if (finding.Evidence.find(L"watch_id") == finding.Evidence.end())
+                {
+                    finding.Evidence[L"watch_id"] = result->MapperWatchId;
+                }
+            }
+        }
+
         SortAndCountFindings(result);
         ok = true;
     } while (false);
@@ -29563,6 +29644,7 @@ std::wstring BuildHuntJson(const HuntResult& result)
     json << L"  \"schema\":\"" << HuntJsonEscape(result.Schema) << L"\",\n";
     json << L"  \"timestamp_utc\":\"" << HuntJsonEscape(result.TimestampUtc) << L"\",\n";
     json << L"  \"mode\":\"" << HuntJsonEscape(result.ModeText) << L"\",\n";
+    json << L"  \"mapper_watch_id\":\"" << HuntJsonEscape(result.MapperWatchId) << L"\",\n";
     json << L"  \"summary\":{";
     json << L"\"kernel_processes\":" << result.KernelProcessCount;
     json << L",\"system_process_information_processes\":" << result.SystemProcessInfoCount;

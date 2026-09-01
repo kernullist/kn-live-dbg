@@ -64,6 +64,7 @@ struct KmonStats
     uint64_t MapperWatchScans = 0;
     uint64_t MapperWatchRemainMs = 0;
     std::wstring MapperWatchDriver;
+    std::wstring MapperWatchId;
     uint64_t LoggingEnabled = 0;
     uint64_t LoggingFailed = 0;
     uint64_t LogBytesWritten = 0;
@@ -110,6 +111,9 @@ public:
 
     KmonStats SnapshotStats() const;
     KmonOptions CurrentOptions() const;
+    bool IsMapperWatchActive() const;
+    std::vector<uint32_t> SnapshotWatchPids() const;
+    std::wstring SnapshotMapperWatchId() const;
 
 private:
     void WorkerLoop();
@@ -144,7 +148,6 @@ private:
     void ClearEmittedKeyForPid(const std::wstring& key, uint32_t processId);
     void NoteDriverLoad(const KmonEvent& event);
     void ArmMapperWatch(const KmonEvent& event);
-    bool IsMapperWatchActive() const;
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
     void PromoteNamedWatchPid(uint32_t pid);
@@ -203,6 +206,7 @@ private:
     };
     MapperWatchFingerprint MapperWatchLast;
     std::wstring MapperWatchDriver;
+    std::wstring MapperWatchId;
     std::unordered_map<std::wstring, uint64_t> MapperWatchEmitTick;
     std::atomic<uint64_t> MapperWatchUntilMs{0};
     std::atomic<uint64_t> MapperWatchOriginMs{0};

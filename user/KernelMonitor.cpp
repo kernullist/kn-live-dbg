@@ -2930,6 +2930,13 @@ namespace
 
     bool KmonLooksLikeHookableSystemDll(const std::wstring& leaf);
     bool KmonLooksLikeGraphicsApiDll(const std::wstring& leaf);
+    bool KmonLooksLikeOverlayRuntimeDll(const std::wstring& leaf);
+    bool KmonLooksLikeKernelImportTarget(const std::wstring& leaf);
+    uint32_t CountKernelImportStubs(
+        const uint8_t* bytes,
+        size_t size,
+        uint64_t regionVa,
+        const std::vector<KernelModuleInfo>& modules);
     bool ProtectHasExecute(DWORD protect);
     bool AddressInModuleRanges(
         uint64_t address,
@@ -3683,6 +3690,105 @@ namespace
             }
         }
         return matched;
+    }
+
+    bool KmonLooksLikeOverlayRuntimeDll(const std::wstring& leaf)
+    {
+        return leaf.find(L"gameoverlayrenderer") != std::wstring::npos ||
+            leaf.find(L"graphics-hook") != std::wstring::npos ||
+            leaf.find(L"discordhook") != std::wstring::npos ||
+            leaf.find(L"discord_hook") != std::wstring::npos ||
+            leaf == L"rtsshooks.dll" ||
+            leaf == L"rtsshooks64.dll";
+    }
+
+    bool KmonLooksLikeKernelImportTarget(const std::wstring& leaf)
+    {
+        return leaf == L"ntoskrnl.exe" ||
+            leaf == L"ntkrnlmp.exe" ||
+            leaf == L"hal.dll" ||
+            (leaf.size() >= 3 && leaf.compare(0, 3, L"wdf") == 0);
+    }
+
+    uint32_t CountKernelImportStubs(
+        const uint8_t* bytes,
+        size_t size,
+        uint64_t regionVa,
+        const std::vector<KernelModuleInfo>& modules)
+    {
+        uint32_t hits = 0;
+        if (bytes == nullptr || size < 14)
+        {
+            return 0;
+        }
+
+        auto targetIsKernelImport = [&](uint64_t target) -> bool
+        {
+            if (target < 0xFFFF800000000000ull)
+            {
+                return false;
+            }
+            for (const KernelModuleInfo& module : modules)
+            {
+                if (module.Base == 0 || module.Size == 0)
+                {
+                    continue;
+                }
+                if (target < module.Base)
+                {
+                    continue;
+                }
+                const uint64_t end = module.Base + module.Size;
+                if (end < module.Base || target >= end)
+                {
+                    continue;
+                }
+                const std::wstring leaf = KmonBasenameLower(
+                    module.ImageName.empty() ? module.ImagePath : module.ImageName);
+                return KmonLooksLikeKernelImportTarget(leaf);
+            }
+            return false;
+        };
+
+        for (size_t i = 0; i + 6 <= size; ++i)
+        {
+            if (bytes[i] != 0xFF || bytes[i + 1] != 0x25)
+            {
+                continue;
+            }
+            int32_t disp = 0;
+            std::memcpy(&disp, bytes + i + 2, sizeof(disp));
+            const uint64_t insnEnd = regionVa + static_cast<uint64_t>(i) + 6ull;
+            const uint64_t slotVa = static_cast<uint64_t>(
+                static_cast<int64_t>(insnEnd) + static_cast<int64_t>(disp));
+            if (slotVa < regionVa)
+            {
+                continue;
+            }
+            const uint64_t slotOff = slotVa - regionVa;
+            if (slotOff > size - 8)
+            {
+                continue;
+            }
+            uint64_t target = 0;
+            std::memcpy(&target, bytes + slotOff, sizeof(target));
+            if (target == 0)
+            {
+                continue;
+            }
+            if (target >= regionVa &&
+                size > 0 &&
+                target < regionVa + size)
+            {
+                continue;
+            }
+            if (targetIsKernelImport(target))
+            {
+                ++hits;
+                i += 5;
+            }
+        }
+        return hits;
     }
 
     bool KmonLooksLikeKnownRuntimePath(const std::wstring& normalized)
@@ -4893,6 +4999,22 @@ KmonOptions KernelMonitor::CurrentOptions() const
     return options;
 }
 
+std::vector<uint32_t> KernelMonitor::SnapshotWatchPids() const
+{
+    std::vector<uint32_t> pids;
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        pids.assign(WatchPids.begin(), WatchPids.end());
+    }
+    return pids;
+}
+
+std::wstring KernelMonitor::SnapshotMapperWatchId() const
+{
+    std::lock_guard<std::mutex> watchLock(WatchMutex);
+    return MapperWatchId;
+}
+
 KmonStats KernelMonitor::SnapshotStats() const
 {
     KmonStats stats;
@@ -4920,6 +5042,7 @@ KmonStats KernelMonitor::SnapshotStats() const
         }
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         stats.MapperWatchDriver = MapperWatchDriver;
+        stats.MapperWatchId = MapperWatchId;
     }
     stats.LoggingEnabled = LoggingEnabledCount.load();
     stats.LoggingFailed = LoggingFailedCount.load();
@@ -5046,6 +5169,7 @@ bool KernelMonitor::Start(
                 RecentLoads.clear();
                 MapperWatchLast = MapperWatchFingerprint{};
                 MapperWatchDriver.clear();
+                MapperWatchId.clear();
                 MapperWatchEmitTick.clear();
                 for (uint32_t pid : Options.WatchPids)
                 {
@@ -5769,6 +5893,8 @@ void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
             MapperWatchOriginMs.store(origin);
             MapperWatchLast = MapperWatchFingerprint{};
             MapperWatchDeepPfnPending.store(true);
+            MapperWatchId = std::to_wstring(origin) + L":" +
+                (base.empty() ? L"<unnamed>" : base);
             for (auto it = EmittedMapperKeys.begin(); it != EmittedMapperKeys.end(); )
             {
                 if (it->compare(0, 9, L"unloaded:") == 0 ||
@@ -5827,6 +5953,11 @@ void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
     watch.Evidence[L"scan_ms"] = std::to_wstring(kMapperWatchIntervalMs);
     watch.Evidence[L"kpage_ms"] = std::to_wstring(kMapperWatchKpageIntervalMs);
     watch.Evidence[L"followup"] = L"!mapper all; !pool pe /suspicious; !kpage /pe /deep";
+    watch.Evidence[L"watch_id"] = {};
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        watch.Evidence[L"watch_id"] = MapperWatchId;
+    }
     auto pathIt = event.Evidence.find(L"path_class");
     if (pathIt != event.Evidence.end())
     {
@@ -6588,6 +6719,7 @@ void KernelMonitor::ScanOrphanMappedPages()
         ClearEmittedKey(L"scan_failed:kpage:coverage");
     }
 
+    const std::vector<KernelModuleInfo> kernelModules = symbols->CopyModules();
     for (const OrphanKernelPageRegion& region : result.Regions)
     {
         if (region.Classification == L"mmio")
@@ -6605,13 +6737,47 @@ void KernelMonitor::ScanOrphanMappedPages()
             region.Writable &&
             region.Executable &&
             region.Risk == L"high";
-        if (!peHit && !wxStub)
-        {
-            continue;
-        }
         // Session space is full of win32k scratch W+X; keep PE hits so a
         // session-mapped image still shows, but drop the W+X noise.
         if (region.SessionSpace && !peHit)
+        {
+            continue;
+        }
+
+        uint32_t stubHits = 0;
+        const bool stubCandidate =
+            mapperWatch &&
+            region.Executable &&
+            !region.SessionSpace &&
+            !peHit;
+        if (stubCandidate)
+        {
+            constexpr uint32_t kStubSample = 0x800;
+            const uint32_t sampleLen =
+                region.Size > kStubSample
+                    ? kStubSample
+                    : static_cast<uint32_t>(region.Size);
+            if (sampleLen >= 14)
+            {
+                std::vector<uint8_t> sample;
+                std::wstring ignored;
+                if (device->ReadMemory(
+                        region.Start,
+                        sampleLen,
+                        &sample,
+                        &ignored) &&
+                    sample.size() >= 14)
+                {
+                    stubHits = CountKernelImportStubs(
+                        sample.data(),
+                        sample.size(),
+                        region.Start,
+                        kernelModules);
+                }
+            }
+        }
+        const bool stubHit = stubHits >= 2;
+        if (!peHit && !wxStub && !stubHit)
         {
             continue;
         }
@@ -6622,6 +6788,25 @@ void KernelMonitor::ScanOrphanMappedPages()
         if (!region.Notes.empty())
         {
             notes += L" " + region.Notes;
+        }
+        if (stubHits != 0)
+        {
+            notes += L" import_stubs=" + std::to_wstring(stubHits);
+        }
+
+        if (stubHit)
+        {
+            const wchar_t* layer = region.InBigPool ? L"pool_code" : L"kpage_code";
+            EmitMappedResidue(
+                std::wstring(layer) + L":" + HexU64(region.Start),
+                region.Classification,
+                layer,
+                (region.InBigPool
+                    ? L"headerless pool executable import stubs "
+                    : L"headerless kpage executable import stubs ") +
+                    HexU64(region.Start),
+                notes);
+            continue;
         }
 
         EmitMappedResidue(
@@ -9401,9 +9586,10 @@ void KernelMonitor::ScanUserModeHostility()
                         (compareGameText ||
                             compareSystemText ||
                             ((watched || dropHost) && moduleLeaf == leaf));
+                    const bool overlayLeaf = KmonLooksLikeOverlayRuntimeDll(moduleLeaf);
                     const bool scanVtables =
                         scanIatTables &&
-                        KmonLooksLikeGraphicsApiDll(moduleLeaf);
+                        (KmonLooksLikeGraphicsApiDll(moduleLeaf) || overlayLeaf);
                     if (parsedModule && scanIatTables)
                     {
                         uint32_t dllIatHits = 0;
@@ -9473,11 +9659,14 @@ void KernelMonitor::ScanUserModeHostility()
                             {
                                 EmitUnique(
                                     L"process.implant",
-                                    L"vtable_hook:" + std::to_wstring(pid) + L":" +
+                                    (overlayLeaf ? L"overlay_slot:" : L"vtable_hook:") +
+                                        std::to_wstring(pid) + L":" +
                                         moduleLeaf,
                                     imagePath,
-                                    L"vtable_hook",
-                                    L"module call-table slots point at private executable memory pid=" +
+                                    overlayLeaf ? L"overlay_slot" : L"vtable_hook",
+                                    (overlayLeaf
+                                        ? L"overlay call-table slots point at private executable memory pid="
+                                        : L"module call-table slots point at private executable memory pid=") +
                                         std::to_wstring(pid) + L" " + leaf +
                                         L" module=" + moduleLeaf,
                                     L"hits=" + std::to_wstring(tableHits),
@@ -10057,6 +10246,16 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
     EventsWatchMatched.fetch_add(1);
     LastEventTickMs.store(GetTickCount64());
 
+    if (event.Evidence.find(L"watch_id") == event.Evidence.end() &&
+        IsMapperWatchActive())
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        if (!MapperWatchId.empty())
+        {
+            event.Evidence[L"watch_id"] = MapperWatchId;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> ringLock(RingMutex);
         if (event.Sequence == 0)
@@ -10293,6 +10492,7 @@ void KernelMonitor::Clear()
         RecentLoads.clear();
         MapperWatchLast = MapperWatchFingerprint{};
         MapperWatchDriver.clear();
+        MapperWatchId.clear();
         MapperWatchEmitTick.clear();
     }
     MapperWatchUntilMs.store(0);
@@ -11339,7 +11539,12 @@ bool KernelMonitorSelfTest()
             !KmonLooksLikeGraphicsApiDll(L"dxgi.dll") ||
             !KmonLooksLikeGraphicsApiDll(L"d3d11.dll") ||
             KmonLooksLikeGraphicsApiDll(L"ntdll.dll") ||
-            KmonLooksLikeGraphicsApiDll(L"game.dll"))
+            KmonLooksLikeGraphicsApiDll(L"game.dll") ||
+            !KmonLooksLikeOverlayRuntimeDll(L"gameoverlayrenderer64.dll") ||
+            !KmonLooksLikeOverlayRuntimeDll(L"graphics-hook64.dll") ||
+            !KmonLooksLikeOverlayRuntimeDll(L"rtsshooks64.dll") ||
+            KmonLooksLikeOverlayRuntimeDll(L"dxgi.dll") ||
+            KmonLooksLikeOverlayRuntimeDll(L"ntdll.dll"))
         {
             break;
         }
@@ -11623,6 +11828,61 @@ bool KernelMonitorSelfTest()
             const uint32_t sliceLastEarly = 0x1000;
             const uint32_t sliceLastLate = 0x1FF000;
             if (lastVa < sliceLastEarly || lastVa >= sliceLastLate)
+            {
+                break;
+            }
+        }
+        {
+            std::vector<uint8_t> stubBuf(0x80, 0xCC);
+            stubBuf[0] = 0xFF;
+            stubBuf[1] = 0x25;
+            const int32_t disp0 = 0x1A;
+            std::memcpy(stubBuf.data() + 2, &disp0, sizeof(disp0));
+            const uint64_t ntosTarget = 0xFFFFF80000001000ull;
+            std::memcpy(stubBuf.data() + 0x20, &ntosTarget, sizeof(ntosTarget));
+            stubBuf[0x10] = 0xFF;
+            stubBuf[0x11] = 0x25;
+            const int32_t disp1 = 0x12;
+            std::memcpy(stubBuf.data() + 0x12, &disp1, sizeof(disp1));
+            const uint64_t halTarget = 0xFFFFF80001000000ull;
+            std::memcpy(stubBuf.data() + 0x28, &halTarget, sizeof(halTarget));
+            KernelModuleInfo ntos = {};
+            ntos.Base = 0xFFFFF80000000000ull;
+            ntos.Size = 0x800000;
+            ntos.ImageName = L"ntoskrnl.exe";
+            KernelModuleInfo hal = {};
+            hal.Base = 0xFFFFF80001000000ull;
+            hal.Size = 0x100000;
+            hal.ImageName = L"hal.dll";
+            const std::vector<KernelModuleInfo> mods = { ntos, hal };
+            if (CountKernelImportStubs(
+                    stubBuf.data(),
+                    stubBuf.size(),
+                    0xFFFFFA8000000000ull,
+                    mods) < 2)
+            {
+                break;
+            }
+            stubBuf[0x10] = 0xCC;
+            stubBuf[0x11] = 0xCC;
+            if (CountKernelImportStubs(
+                    stubBuf.data(),
+                    stubBuf.size(),
+                    0xFFFFFA8000000000ull,
+                    mods) >= 2)
+            {
+                break;
+            }
+            KernelModuleInfo userMod = {};
+            userMod.Base = 0x140000000ull;
+            userMod.Size = 0x1000;
+            userMod.ImageName = L"game.exe";
+            std::memcpy(stubBuf.data() + 0x20, &userMod.Base, sizeof(userMod.Base));
+            if (CountKernelImportStubs(
+                    stubBuf.data(),
+                    stubBuf.size(),
+                    0xFFFFFA8000000000ull,
+                    std::vector<KernelModuleInfo>{ userMod }) != 0)
             {
                 break;
             }

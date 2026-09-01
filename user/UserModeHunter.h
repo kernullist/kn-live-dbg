@@ -50,6 +50,12 @@ struct HuntOptions
     std::vector<HuntTelemetryEvent> ThreatIntelEvents;
     // Ring overflow / eviction count from the TI subscriber for this scan window.
     uint64_t ThreatIntelEventsDropped = 0;
+    // Deep-triage these PIDs first (kmon watch set and/or !hunt /pid).
+    std::vector<uint32_t> FocusPids;
+    // When non-empty, skip VAD/module/hook deep triage for other PIDs.
+    // Hidden/CID inventory still covers the whole system.
+    std::vector<uint32_t> FilterPids;
+    std::wstring MapperWatchId;
 };
 
 struct HuntModuleRecord
@@ -236,6 +242,7 @@ struct HuntResult
     std::wstring Schema;
     std::wstring TimestampUtc;
     std::wstring ModeText;
+    std::wstring MapperWatchId;
     std::vector<HuntProcessRecord> Processes;
     std::vector<HuntFinding> Findings;
     std::vector<HuntCloudFileImageRecord> CloudFileImages;
