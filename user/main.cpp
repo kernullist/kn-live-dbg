@@ -24706,7 +24706,7 @@ static void PrintKmonHelp()
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
     std::wcout << L"  shown:  drop_load, image_only (post-arm kernel image notify), short_lived,\n";
-    std::wcout << L"          mapped_residue, mapper.watch, hook.unbacked, hidden,\n";
+    std::wcout << L"          mapped_residue, mapper.watch, hook.unbacked, hook.dataptr, hidden,\n";
     std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw\n";
     std::wcout << L"  hidden: inbox TI DriverObjectLoad, process create, local AllocVM, kernel R/W,\n";
     std::wcout << L"          ReadVM/suspend/resume alone\n";
@@ -24727,6 +24727,10 @@ static void PrintKmonHelp()
     std::wcout << L"  hook.unbacked           callback/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter\n";
     std::wcout << L"                          whose routine is outside PsLoadedModuleList (empty list is fail-closed);\n";
     std::wcout << L"                          InstrumentationCallback outside modules (watch/builtin, PPL via VAD)\n";
+    std::wcout << L"  hook.dataptr            ntoskrnl/win32k/dxgkrnl CFG mov rax,[rip]; call guard_dispatch_icall\n";
+    std::wcout << L"                          whose .data slot points outside loaded modules (firmware/PTE VAs skipped)\n";
+    std::wcout << L"  inject.kernel_phys      mapper.watch + hidden/protect-changed PTEs on a watch PID with\n";
+    std::wcout << L"                          kpage/pool/dataptr residue or overlay_slot and no TI WriteVM/ProtectVM\n";
     std::wcout << L"  process.hidden          DKOM unlink / SPI hide / handle+CID-only; full PspCidTable walk (~5s)\n";
     std::wcout << L"  process.masquerade      Windows-named image from a non-inbox path\n";
     std::wcout << L"  process.hollow          EXE replace at PEB ImageBase: unmapped/private/unbacked,\n";
@@ -24736,6 +24740,7 @@ static void PrintKmonHelp()
     std::wcout << L"  process.implant         drop-dir module in a builtin or /name|/pid target,\n";
     std::wcout << L"                          unknown module outside the image dir on a watch target,\n";
     std::wcout << L"                          extra non-inbox module in a Windows builtin,\n";
+    std::wcout << L"                          signed-host + hijack DLL in the image dir (dll_proxy_host),\n";
     std::wcout << L"                          private W+X / PE VAD / hidden executable PTEs on watch or PPL,\n";
     std::wcout << L"                          IAT thunks in the main image, game DLLs, or hookable system DLLs,\n";
     std::wcout << L"                          plus dxgi/d3d*/opengl/vulkan and overlay (Steam/OBS/Discord/RTSS) .rdata slots,\n";
@@ -39541,6 +39546,14 @@ static std::wstring HuntConsoleReasonLabel(const std::wstring& reason)
     {
         label = L"overlay_slot_hook";
     }
+    else if (lowered == L"kernel_backed_user_window")
+    {
+        label = L"kernel_backed_user_window";
+    }
+    else if (lowered == L"dll_proxy_host")
+    {
+        label = L"dll_proxy_host";
+    }
     else if (lowered == L"cloned_vtable_private_exec")
     {
         label = L"cloned_vtable_private_exec";
@@ -39668,6 +39681,8 @@ static uint32_t HuntConsoleSignalPriority(const std::wstring& signal)
              lowered == L"iat_hook_private_exec" ||
              lowered == L"vtable_hook_private_exec" ||
              lowered == L"overlay_slot_hook" ||
+             lowered == L"kernel_backed_user_window" ||
+             lowered == L"dll_proxy_host" ||
              lowered == L"cloned_vtable_private_exec" ||
              lowered == L"mapped_executable_without_loader")
     {
@@ -39873,6 +39888,14 @@ static std::wstring HuntAssessmentKindForFinding(
     {
         kind = L"process_tampering";
     }
+    else if (HuntLabelsContain(labels, L"kernel_backed_user_window"))
+    {
+        kind = L"kernel_backed_user_window";
+    }
+    else if (HuntLabelsContain(labels, L"dll_proxy_host"))
+    {
+        kind = L"dll_proxy_host";
+    }
     else if (classLabel == L"process_injection" ||
              HuntLabelsContain(labels, L"iat_hook_private_exec") ||
              HuntLabelsContain(labels, L"vtable_hook_private_exec") ||
@@ -39964,6 +39987,14 @@ static uint32_t HuntAssessmentPriority(const std::wstring& kind)
     else if (kind == L"in_process_code_hook")
     {
         priority = 55;
+    }
+    else if (kind == L"kernel_backed_user_window")
+    {
+        priority = 52;
+    }
+    else if (kind == L"dll_proxy_host")
+    {
+        priority = 56;
     }
     else if (kind == L"mapped_code_or_loader_evasion")
     {
@@ -40428,6 +40459,14 @@ static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
     else if (lowered == L"overlay_slot_hook")
     {
         phrase = L"overlay IAT or call-table slot points at unbacked executable memory";
+    }
+    else if (lowered == L"kernel_backed_user_window")
+    {
+        phrase = L"user executable PTE shares a PFN with headerless kernel mapper residue";
+    }
+    else if (lowered == L"dll_proxy_host")
+    {
+        phrase = L"signed host loaded a hijack DLL from its own directory";
     }
     else if (lowered == L"cloned_vtable_private_exec")
     {
@@ -41153,6 +41192,14 @@ static std::wstring HuntAssessmentWhatText(const std::wstring& kind)
     {
         text = L"IAT, vtable, or cloned graphics call-table slots point at unbacked executable memory";
     }
+    else if (kind == L"kernel_backed_user_window")
+    {
+        text = L"a user executable window is backed by the same PFN as kernel mapper residue";
+    }
+    else if (kind == L"dll_proxy_host")
+    {
+        text = L"a signed host process loaded a hijack DLL from its image directory";
+    }
     else if (kind == L"mapped_code_or_loader_evasion")
     {
         text = L"executable code is hidden, replaced, or inconsistent with normal loader views";
@@ -41212,6 +41259,14 @@ static std::wstring HuntAssessmentNextText(const HuntConsoleAssessmentSummary& s
     else if (summary.Kind == L"in_process_code_hook")
     {
         next = L"run !vad /exec /private and !dps on the hooked module, or !hunt /deep /details";
+    }
+    else if (summary.Kind == L"kernel_backed_user_window")
+    {
+        next = L"join the hunt pfn with !kpage residue and dump the shared physical page";
+    }
+    else if (summary.Kind == L"dll_proxy_host")
+    {
+        next = L"inspect the hijack DLL next to the signed host image";
     }
     else if (summary.Kind == L"mapped_code_or_loader_evasion")
     {
@@ -41512,21 +41567,22 @@ static void HandleHuntCommand(
 
         {
             KernelMonitor& kmon = GetKmonInstance();
-            if (kmon.IsActive())
-            {
-                if (options.FilterPids.empty())
+                if (kmon.IsActive())
                 {
-                    const std::vector<uint32_t> watchPids = kmon.SnapshotWatchPids();
-                    options.FocusPids.insert(
-                        options.FocusPids.end(),
-                        watchPids.begin(),
-                        watchPids.end());
+                    if (options.FilterPids.empty())
+                    {
+                        const std::vector<uint32_t> watchPids = kmon.SnapshotWatchPids();
+                        options.FocusPids.insert(
+                            options.FocusPids.end(),
+                            watchPids.begin(),
+                            watchPids.end());
+                    }
+                    options.KernelResiduePfns = kmon.SnapshotResiduePfns();
+                    if (kmon.IsMapperWatchActive())
+                    {
+                        options.MapperWatchId = kmon.SnapshotMapperWatchId();
+                    }
                 }
-                if (kmon.IsMapperWatchActive())
-                {
-                    options.MapperWatchId = kmon.SnapshotMapperWatchId();
-                }
-            }
         }
 
         std::vector<SnapshotProcessRecord> processes;

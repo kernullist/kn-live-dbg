@@ -20031,6 +20031,19 @@ namespace
                 evidence[L"writable"] = hidden.Writable ? L"true" : L"false";
                 evidence[L"executable"] = hidden.Executable ? L"true" : L"false";
                 evidence[L"user_accessible"] = hidden.UserAccessible ? L"true" : L"false";
+                if (hidden.PhysicalAddress >= 0x1000)
+                {
+                    const uint64_t pfn = hidden.PhysicalAddress >> 12;
+                    evidence[L"pfn"] = std::to_wstring(pfn);
+                    for (uint64_t residuePfn : result->KernelResiduePfns)
+                    {
+                        if (residuePfn == pfn)
+                        {
+                            reasons.push_back(L"kernel_backed_user_window");
+                            break;
+                        }
+                    }
+                }
                 AddBuiltinInjectionReasonIfNeeded(*process, &reasons, &evidence);
 
                 AddFinding(
@@ -21335,6 +21348,18 @@ namespace
                 evidence[L"signature_valid"] = L"false";
 
                 std::vector<std::wstring> reasons = {L"inbox_dll_sideload"};
+                const std::wstring hostPath =
+                    DosPathFromDevicePath(
+                        Win32FilePathFromMaybeNtPath(BestProcessImagePath(process)));
+                ImageMetadataRecord hostMetadata = {};
+                if (!hostPath.empty() &&
+                    VerifyImageAuthenticodeSignature(hostPath, &hostMetadata) &&
+                    hostMetadata.SignatureChecked &&
+                    hostMetadata.SignatureValid)
+                {
+                    reasons.push_back(L"dll_proxy_host");
+                    evidence[L"host_signature_valid"] = L"true";
+                }
                 AddBuiltinInjectionReasonIfNeeded(process, &reasons, &evidence, true);
                 AddFinding(
                     result,
@@ -21842,6 +21867,33 @@ namespace
         } while (false);
     }
 
+    bool HuntProcessHasCallTableHook(const HuntResult& result, uint32_t pid)
+    {
+        bool found = false;
+        for (const HuntFinding& finding : result.Findings)
+        {
+            if (finding.ProcessId != pid)
+            {
+                continue;
+            }
+            for (const std::wstring& reason : finding.ReasonCodes)
+            {
+                if (reason == L"iat_hook_private_exec" ||
+                    reason == L"vtable_hook_private_exec" ||
+                    reason == L"overlay_slot_hook")
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (found)
+            {
+                break;
+            }
+        }
+        return found;
+    }
+
     void AddTrapFrameRipFindings(
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -21857,6 +21909,11 @@ namespace
                 break;
             }
             if (ProcessLooksLikeJitHost(process))
+            {
+                break;
+            }
+            if (ProcessHasGraphicsApiModule(process) &&
+                !HuntProcessHasCallTableHook(*result, process.ProcessId))
             {
                 break;
             }
@@ -28616,6 +28673,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         result->TimestampUtc = SnapshotCurrentUtcTimestamp();
         result->ModeText = HuntModeToText(options.Mode);
         result->MapperWatchId = options.MapperWatchId;
+        result->KernelResiduePfns = options.KernelResiduePfns;
         result->ThreatIntelActive = options.ThreatIntelActive;
         result->ThreatIntelAvailable = options.ThreatIntelAvailable || !options.ThreatIntelEvents.empty();
         result->Warnings.push_back(L"builtin process signer verification is not implemented; publisher evidence unavailable");
@@ -29438,9 +29496,9 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 AddCoreOsDllPathFindings(result, process);
                 AddKernelCallbackTableFindings(device_, symbols_, result, process);
                 AddInstrumentationCallbackFinding(device_, symbols_, result, process);
+                AddCallTableHookFindings(device_, result, process);
                 AddTrapFrameRipFindings(device_, symbols_, result, process);
                 AddDirectSyscallStubFindings(device_, result, process);
-                AddCallTableHookFindings(device_, result, process);
                 AddClonedVtableFindings(device_, result, process);
                 AddHardwareBreakpointFindings(device_, result, process);
                 AddMainImageHerpaderpFinding(device_, result, process);

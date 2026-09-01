@@ -25,6 +25,8 @@
 #include <Windows.h>
 #include <Psapi.h>
 #include <TlHelp32.h>
+#include <WinTrust.h>
+#include <Softpub.h>
 
 #include <algorithm>
 #include <chrono>
@@ -592,6 +594,90 @@ namespace
         return ok;
     }
 
+    bool ParseFirstExecSection(
+        const std::vector<uint8_t>& headers,
+        uint32_t* rva,
+        uint32_t* fileOffset,
+        uint32_t* rawSize)
+    {
+        bool ok = false;
+        do
+        {
+            if (rva == nullptr || fileOffset == nullptr || rawSize == nullptr)
+            {
+                break;
+            }
+            *rva = 0;
+            *fileOffset = 0;
+            *rawSize = 0;
+            if (headers.size() < sizeof(IMAGE_DOS_HEADER))
+            {
+                break;
+            }
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, headers.data(), sizeof(dos));
+            const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
+            if (static_cast<uint64_t>(ntOffset) + 4 + sizeof(IMAGE_FILE_HEADER) >
+                headers.size())
+            {
+                break;
+            }
+            IMAGE_FILE_HEADER fileHeader = {};
+            std::memcpy(
+                &fileHeader,
+                headers.data() + ntOffset + 4,
+                sizeof(fileHeader));
+            const size_t optionalOffset =
+                static_cast<size_t>(ntOffset) + 4 + sizeof(IMAGE_FILE_HEADER);
+            uint16_t magic = 0;
+            if (optionalOffset + sizeof(magic) > headers.size())
+            {
+                break;
+            }
+            std::memcpy(&magic, headers.data() + optionalOffset, sizeof(magic));
+            if (magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            {
+                break;
+            }
+            const size_t sectionOffset = optionalOffset + fileHeader.SizeOfOptionalHeader;
+            for (uint16_t i = 0; i < fileHeader.NumberOfSections; ++i)
+            {
+                const size_t off =
+                    sectionOffset + static_cast<size_t>(i) * sizeof(IMAGE_SECTION_HEADER);
+                if (off + sizeof(IMAGE_SECTION_HEADER) > headers.size())
+                {
+                    break;
+                }
+                IMAGE_SECTION_HEADER section = {};
+                std::memcpy(&section, headers.data() + off, sizeof(section));
+                if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 &&
+                    (section.Characteristics & IMAGE_SCN_CNT_CODE) == 0)
+                {
+                    continue;
+                }
+                uint32_t n = section.SizeOfRawData;
+                if (section.Misc.VirtualSize != 0 && section.Misc.VirtualSize < n)
+                {
+                    n = section.Misc.VirtualSize;
+                }
+                if (n > 0x40000)
+                {
+                    n = 0x40000;
+                }
+                if (n < 16)
+                {
+                    break;
+                }
+                *rva = section.VirtualAddress;
+                *fileOffset = section.PointerToRawData;
+                *rawSize = n;
+                ok = true;
+                break;
+            }
+        } while (false);
+        return ok;
+    }
+
     void ApplyRelocsToSlice(
         std::vector<uint8_t>* slice,
         uint32_t sliceRva,
@@ -741,6 +827,202 @@ namespace
             CloseHandle(handle);
         }
         return ok;
+    }
+
+    bool ReadDiskFileRange(
+        const std::wstring& path,
+        uint32_t offset,
+        uint32_t length,
+        std::vector<uint8_t>* bytes)
+    {
+        bool ok = false;
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        do
+        {
+            if (bytes == nullptr || path.empty() || length == 0 || length > 0x40000)
+            {
+                break;
+            }
+            handle = CreateFileW(
+                path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                break;
+            }
+            LARGE_INTEGER pos = {};
+            pos.QuadPart = offset;
+            if (!SetFilePointerEx(handle, pos, nullptr, FILE_BEGIN))
+            {
+                break;
+            }
+            bytes->assign(length, 0);
+            DWORD read = 0;
+            if (!ReadFile(handle, bytes->data(), length, &read, nullptr) || read == 0)
+            {
+                bytes->clear();
+                break;
+            }
+            bytes->resize(read);
+            ok = true;
+        } while (false);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(handle);
+        }
+        return ok;
+    }
+
+    bool PathLooksLikeWin32File(const std::wstring& path);
+
+    bool KmonImageAuthenticodeValid(const std::wstring& path)
+    {
+        bool valid = false;
+        do
+        {
+            if (path.empty() || !PathLooksLikeWin32File(path))
+            {
+                break;
+            }
+            WINTRUST_FILE_INFO fileInfo = {};
+            fileInfo.cbStruct = sizeof(fileInfo);
+            fileInfo.pcwszFilePath = path.c_str();
+            WINTRUST_DATA data = {};
+            data.cbStruct = sizeof(data);
+            data.dwUIChoice = WTD_UI_NONE;
+            data.fdwRevocationChecks = WTD_REVOKE_NONE;
+            data.dwUnionChoice = WTD_CHOICE_FILE;
+            data.pFile = &fileInfo;
+            data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+            GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+            const LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+            data.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+            valid = status == ERROR_SUCCESS;
+        } while (false);
+        return valid;
+    }
+
+    bool ExportNameLooksLikeGuardDispatch(const char* name)
+    {
+        if (name == nullptr || name[0] == '\0')
+        {
+            return false;
+        }
+        if (name[0] == '_')
+        {
+            ++name;
+        }
+        return _stricmp(name, "guard_dispatch_icall") == 0 ||
+            _stricmp(name, "guard_dispatch_icall_nop") == 0;
+    }
+
+    uint32_t FindPeExportRvaByName(
+        const std::wstring& path,
+        const std::vector<uint8_t>& headers,
+        const char* exportName)
+    {
+        uint32_t found = 0;
+        do
+        {
+            KmonPeLayout layout = {};
+            if (exportName == nullptr || !ParseKmonPeLayout(headers, &layout))
+            {
+                break;
+            }
+            if (layout.ExportRva == 0 || layout.ExportSize < sizeof(IMAGE_EXPORT_DIRECTORY))
+            {
+                break;
+            }
+            uint32_t fileOff = 0;
+            if (!RvaToFileOffset(headers, layout.ExportRva, &fileOff))
+            {
+                break;
+            }
+            std::vector<uint8_t> expDir;
+            if (!ReadDiskFileRange(
+                    path,
+                    fileOff,
+                    (std::min)(layout.ExportSize, 0x10000u),
+                    &expDir) ||
+                expDir.size() < sizeof(IMAGE_EXPORT_DIRECTORY))
+            {
+                break;
+            }
+            IMAGE_EXPORT_DIRECTORY exports = {};
+            std::memcpy(&exports, expDir.data(), sizeof(exports));
+            if (exports.NumberOfNames == 0 || exports.NumberOfNames > 8192)
+            {
+                break;
+            }
+            uint32_t namesOff = 0;
+            uint32_t ordsOff = 0;
+            uint32_t funcsOff = 0;
+            if (!RvaToFileOffset(headers, exports.AddressOfNames, &namesOff) ||
+                !RvaToFileOffset(headers, exports.AddressOfNameOrdinals, &ordsOff) ||
+                !RvaToFileOffset(headers, exports.AddressOfFunctions, &funcsOff))
+            {
+                break;
+            }
+            std::vector<uint8_t> names;
+            std::vector<uint8_t> ords;
+            std::vector<uint8_t> funcs;
+            const uint32_t nameBytes = exports.NumberOfNames * 4;
+            const uint32_t ordBytes = exports.NumberOfNames * 2;
+            const uint32_t funcBytes = exports.NumberOfFunctions * 4;
+            if (!ReadDiskFileRange(path, namesOff, nameBytes, &names) ||
+                !ReadDiskFileRange(path, ordsOff, ordBytes, &ords) ||
+                !ReadDiskFileRange(path, funcsOff, funcBytes, &funcs) ||
+                names.size() < nameBytes ||
+                ords.size() < ordBytes ||
+                funcs.size() < funcBytes)
+            {
+                break;
+            }
+            for (uint32_t i = 0; i < exports.NumberOfNames; ++i)
+            {
+                uint32_t nameRva = 0;
+                uint16_t ordinal = 0;
+                std::memcpy(&nameRva, names.data() + i * 4, 4);
+                std::memcpy(&ordinal, ords.data() + i * 2, 2);
+                uint32_t nameFile = 0;
+                if (!RvaToFileOffset(headers, nameRva, &nameFile))
+                {
+                    continue;
+                }
+                std::vector<uint8_t> nameBytesRead;
+                if (!ReadDiskFileRange(path, nameFile, 64, &nameBytesRead) ||
+                    nameBytesRead.empty())
+                {
+                    continue;
+                }
+                nameBytesRead.back() = 0;
+                const char* name =
+                    reinterpret_cast<const char*>(nameBytesRead.data());
+                if (!ExportNameLooksLikeGuardDispatch(name) &&
+                    _stricmp(name, exportName) != 0)
+                {
+                    continue;
+                }
+                if (static_cast<uint32_t>(ordinal) >= exports.NumberOfFunctions)
+                {
+                    continue;
+                }
+                uint32_t rva = 0;
+                std::memcpy(&rva, funcs.data() + static_cast<size_t>(ordinal) * 4, 4);
+                if (rva != 0 && rva < layout.SizeOfImage)
+                {
+                    found = rva;
+                    break;
+                }
+            }
+        } while (false);
+        return found;
     }
 
     uint64_t QueryProcessCreateTicks(HANDLE process)
@@ -2937,6 +3219,17 @@ namespace
         size_t size,
         uint64_t regionVa,
         const std::vector<KernelModuleInfo>& modules);
+    uint32_t CollectCfgDataPtrSlotRvas(
+        const uint8_t* text,
+        size_t textSize,
+        uint32_t textRva,
+        uint32_t sizeOfImage,
+        const std::unordered_set<uint32_t>& guardCallRvas,
+        const std::unordered_set<uint32_t>& guardIatRvas,
+        std::vector<uint32_t>* slotRvas,
+        uint32_t maxSites);
+    bool KmonVaLooksLikePagingOrFirmware(uint64_t va);
+    bool KmonLooksLikeCfgHostModule(const std::wstring& leaf);
     bool ProtectHasExecute(DWORD protect);
     bool AddressInModuleRanges(
         uint64_t address,
@@ -3789,6 +4082,243 @@ namespace
             }
         }
         return hits;
+    }
+
+    bool KmonLooksLikeCfgHostModule(const std::wstring& leaf)
+    {
+        return leaf == L"ntoskrnl.exe" ||
+            leaf == L"ntkrnlmp.exe" ||
+            leaf == L"dxgkrnl.sys" ||
+            leaf.compare(0, 6, L"win32k") == 0;
+    }
+
+    bool KmonVaLooksLikePagingOrFirmware(uint64_t va)
+    {
+        if (va < 0xFFFF800000000000ull)
+        {
+            return true;
+        }
+        if (va >= 0xFFFFF68000000000ull && va < 0xFFFFF70000000000ull)
+        {
+            return true;
+        }
+        if (va >= 0xFFFFF78000000000ull && va < 0xFFFFF80000000000ull)
+        {
+            return true;
+        }
+        if (va >= 0xFFFFF90000000000ull && va < 0xFFFFF98000000000ull)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    uint32_t CollectCfgDataPtrSlotRvas(
+        const uint8_t* text,
+        size_t textSize,
+        uint32_t textRva,
+        uint32_t sizeOfImage,
+        const std::unordered_set<uint32_t>& guardCallRvas,
+        const std::unordered_set<uint32_t>& guardIatRvas,
+        std::vector<uint32_t>* slotRvas,
+        uint32_t maxSites)
+    {
+        uint32_t hits = 0;
+        if (text == nullptr ||
+            textSize < 12 ||
+            slotRvas == nullptr ||
+            maxSites == 0)
+        {
+            return 0;
+        }
+        slotRvas->clear();
+        for (size_t i = 0; i + 12 <= textSize && hits < maxSites; ++i)
+        {
+            if (text[i] != 0x48 || text[i + 1] != 0x8B || text[i + 2] != 0x05)
+            {
+                continue;
+            }
+            int32_t disp = 0;
+            std::memcpy(&disp, text + i + 3, sizeof(disp));
+            const uint32_t movEnd = textRva + static_cast<uint32_t>(i) + 7u;
+            const uint32_t slotRva = static_cast<uint32_t>(
+                static_cast<int64_t>(movEnd) + disp);
+            if (slotRva < 0x200 ||
+                slotRva >= sizeOfImage ||
+                (slotRva >= textRva &&
+                    slotRva < textRva + static_cast<uint32_t>(textSize)))
+            {
+                continue;
+            }
+            bool matched = false;
+            for (size_t k = 7; k + 5 <= 16 && i + k + 5 <= textSize; ++k)
+            {
+                const uint8_t op = text[i + k];
+                if (op == 0x90 || op == 0xCC)
+                {
+                    continue;
+                }
+                if (op == 0xE8)
+                {
+                    int32_t callDisp = 0;
+                    std::memcpy(&callDisp, text + i + k + 1, sizeof(callDisp));
+                    const uint32_t callEnd =
+                        textRva + static_cast<uint32_t>(i + k) + 5u;
+                    const uint32_t dest = static_cast<uint32_t>(
+                        static_cast<int64_t>(callEnd) + callDisp);
+                    if (guardCallRvas.find(dest) != guardCallRvas.end())
+                    {
+                        matched = true;
+                    }
+                    break;
+                }
+                if (op == 0xFF && text[i + k + 1] == 0x15)
+                {
+                    int32_t iatDisp = 0;
+                    std::memcpy(&iatDisp, text + i + k + 2, sizeof(iatDisp));
+                    const uint32_t callEnd =
+                        textRva + static_cast<uint32_t>(i + k) + 6u;
+                    const uint32_t iatRva = static_cast<uint32_t>(
+                        static_cast<int64_t>(callEnd) + iatDisp);
+                    if (guardIatRvas.find(iatRva) != guardIatRvas.end())
+                    {
+                        matched = true;
+                    }
+                    break;
+                }
+                break;
+            }
+            if (!matched)
+            {
+                continue;
+            }
+            slotRvas->push_back(slotRva);
+            ++hits;
+            i += 6;
+        }
+        return hits;
+    }
+
+    void CollectGuardDispatchIatRvas(
+        const std::wstring& path,
+        const std::vector<uint8_t>& headers,
+        const KmonPeLayout& layout,
+        std::unordered_set<uint32_t>* iatRvas)
+    {
+        do
+        {
+            if (iatRvas == nullptr ||
+                !layout.Is64 ||
+                layout.ImportRva == 0 ||
+                layout.ImportSize < sizeof(IMAGE_IMPORT_DESCRIPTOR))
+            {
+                break;
+            }
+            uint32_t fileOff = 0;
+            if (!RvaToFileOffset(headers, layout.ImportRva, &fileOff))
+            {
+                break;
+            }
+            std::vector<uint8_t> table;
+            const uint32_t toRead = (std::min)(layout.ImportSize, 0x10000u);
+            if (!ReadDiskFileRange(path, fileOff, toRead, &table) ||
+                table.size() < sizeof(IMAGE_IMPORT_DESCRIPTOR))
+            {
+                break;
+            }
+            const uint32_t count =
+                static_cast<uint32_t>(table.size() / sizeof(IMAGE_IMPORT_DESCRIPTOR));
+            for (uint32_t i = 0; i < count && i < 64; ++i)
+            {
+                IMAGE_IMPORT_DESCRIPTOR desc = {};
+                std::memcpy(
+                    &desc,
+                    table.data() + (i * sizeof(IMAGE_IMPORT_DESCRIPTOR)),
+                    sizeof(desc));
+                if (desc.Name == 0)
+                {
+                    break;
+                }
+                uint32_t nameFile = 0;
+                if (!RvaToFileOffset(headers, desc.Name, &nameFile))
+                {
+                    continue;
+                }
+                std::vector<uint8_t> nameBytes;
+                if (!ReadDiskFileRange(path, nameFile, 64, &nameBytes) ||
+                    nameBytes.empty())
+                {
+                    continue;
+                }
+                nameBytes.back() = 0;
+                std::wstring wide;
+                for (uint8_t byte : nameBytes)
+                {
+                    if (byte == 0)
+                    {
+                        break;
+                    }
+                    if (byte >= 0x20 && byte < 0x7f)
+                    {
+                        wide.push_back(static_cast<wchar_t>(byte));
+                    }
+                }
+                const std::wstring leaf = KmonBasenameLower(wide);
+                if (leaf != L"ntoskrnl.exe" && leaf != L"ntkrnlmp.exe")
+                {
+                    continue;
+                }
+                const uint32_t oft =
+                    desc.OriginalFirstThunk != 0 ? desc.OriginalFirstThunk : desc.FirstThunk;
+                const uint32_t ft = desc.FirstThunk;
+                if (oft == 0 || ft == 0)
+                {
+                    continue;
+                }
+                for (uint32_t t = 0; t < 512; ++t)
+                {
+                    uint32_t thunkFile = 0;
+                    if (!RvaToFileOffset(headers, oft + t * 8u, &thunkFile))
+                    {
+                        break;
+                    }
+                    std::vector<uint8_t> thunkBytes;
+                    if (!ReadDiskFileRange(path, thunkFile, 8, &thunkBytes) ||
+                        thunkBytes.size() < 8)
+                    {
+                        break;
+                    }
+                    uint64_t thunk = 0;
+                    std::memcpy(&thunk, thunkBytes.data(), sizeof(thunk));
+                    if (thunk == 0)
+                    {
+                        break;
+                    }
+                    if ((thunk & IMAGE_ORDINAL_FLAG64) != 0)
+                    {
+                        continue;
+                    }
+                    uint32_t hintFile = 0;
+                    if (!RvaToFileOffset(headers, static_cast<uint32_t>(thunk), &hintFile))
+                    {
+                        continue;
+                    }
+                    std::vector<uint8_t> hintName;
+                    if (!ReadDiskFileRange(path, hintFile, 64, &hintName) ||
+                        hintName.size() < 4)
+                    {
+                        continue;
+                    }
+                    hintName.back() = 0;
+                    const char* importName =
+                        reinterpret_cast<const char*>(hintName.data() + 2);
+                    if (ExportNameLooksLikeGuardDispatch(importName))
+                    {
+                        iatRvas->insert(ft + t * 8u);
+                    }
+                }
+            }
+        } while (false);
     }
 
     bool KmonLooksLikeKnownRuntimePath(const std::wstring& normalized)
@@ -4754,6 +5284,8 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"driver.mapped_residue" ||
             event.Kind == L"mapper.watch" ||
             event.Kind == L"hook.unbacked" ||
+            event.Kind == L"hook.dataptr" ||
+            event.Kind == L"inject.kernel_phys" ||
             event.Kind == L"integrity.ci" ||
             event.Kind == L"integrity.cr" ||
             event.Kind == L"process.masquerade" ||
@@ -5015,6 +5547,69 @@ std::wstring KernelMonitor::SnapshotMapperWatchId() const
     return MapperWatchId;
 }
 
+std::vector<uint64_t> KernelMonitor::SnapshotResiduePfns() const
+{
+    std::lock_guard<std::mutex> watchLock(WatchMutex);
+    return std::vector<uint64_t>(
+        MapperWatchResiduePfns.begin(),
+        MapperWatchResiduePfns.end());
+}
+
+void KernelMonitor::NoteMapperWatchResidue(
+    const std::wstring& layer,
+    uint64_t physicalAddress)
+{
+    if (!IsMapperWatchActive())
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    if (layer == L"kpage_code" ||
+        layer == L"pool_code" ||
+        layer == L"dataptr")
+    {
+        MapperWatchHasResidue = true;
+    }
+    if (layer == L"overlay_slot")
+    {
+        MapperWatchHasOverlaySlot = true;
+    }
+    if (physicalAddress >= 0x1000)
+    {
+        MapperWatchResiduePfns.insert(physicalAddress >> 12);
+    }
+}
+
+void KernelMonitor::NoteWatchTiWriteIfNeeded(const KmonEvent& event)
+{
+    if (!IsMapperWatchActive())
+    {
+        return;
+    }
+    std::wstring lower = ToLowerCopy(event.Task);
+    if (lower.find(L"writevm") == std::wstring::npos &&
+        lower.find(L"protectvm") == std::wstring::npos)
+    {
+        lower = ToLowerCopy(event.Kind);
+        if (lower.find(L"writevm") == std::wstring::npos &&
+            lower.find(L"protectvm") == std::wstring::npos)
+        {
+            return;
+        }
+    }
+    const uint32_t pid =
+        event.TargetProcessId != 0 ? event.TargetProcessId : event.ProcessId;
+    if (pid == 0)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    if (WatchPids.find(pid) != WatchPids.end())
+    {
+        MapperWatchTiWritePids.insert(pid);
+    }
+}
+
 KmonStats KernelMonitor::SnapshotStats() const
 {
     KmonStats stats;
@@ -5171,6 +5766,12 @@ bool KernelMonitor::Start(
                 MapperWatchDriver.clear();
                 MapperWatchId.clear();
                 MapperWatchEmitTick.clear();
+                MapperWatchHasResidue = false;
+                MapperWatchHasOverlaySlot = false;
+                MapperWatchTiWritePids.clear();
+                MapperWatchResiduePfns.clear();
+                CfgDataPtrSites.clear();
+                CfgDataPtrNtosBase = 0;
                 for (uint32_t pid : Options.WatchPids)
                 {
                     WatchPids.insert(pid);
@@ -5895,6 +6496,10 @@ void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
             MapperWatchDeepPfnPending.store(true);
             MapperWatchId = std::to_wstring(origin) + L":" +
                 (base.empty() ? L"<unnamed>" : base);
+            MapperWatchHasResidue = false;
+            MapperWatchHasOverlaySlot = false;
+            MapperWatchTiWritePids.clear();
+            MapperWatchResiduePfns.clear();
             for (auto it = EmittedMapperKeys.begin(); it != EmittedMapperKeys.end(); )
             {
                 if (it->compare(0, 9, L"unloaded:") == 0 ||
@@ -6793,10 +7398,15 @@ void KernelMonitor::ScanOrphanMappedPages()
         {
             notes += L" import_stubs=" + std::to_wstring(stubHits);
         }
+        if (region.PhysicalAddress != 0)
+        {
+            notes += L" pfn=" + std::to_wstring(region.PhysicalAddress >> 12);
+        }
 
         if (stubHit)
         {
             const wchar_t* layer = region.InBigPool ? L"pool_code" : L"kpage_code";
+            NoteMapperWatchResidue(layer, region.PhysicalAddress);
             EmitMappedResidue(
                 std::wstring(layer) + L":" + HexU64(region.Start),
                 region.Classification,
@@ -7969,6 +8579,188 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 L"BYOVD catalog scan failed",
                 error.empty() ? L"Scan returned false" : error);
         }
+    }
+
+    if (!StopRequested.load())
+    {
+        ScanHookDataPointers();
+    }
+}
+
+void KernelMonitor::ScanHookDataPointers()
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    if (!GetLiveTargets(&device, &symbols) ||
+        device == nullptr ||
+        symbols == nullptr ||
+        !device->IsOpen())
+    {
+        return;
+    }
+    const std::vector<KernelModuleInfo> modules = symbols->CopyModules();
+    if (modules.empty())
+    {
+        return;
+    }
+
+    uint64_t ntosBase = 0;
+    const KernelModuleInfo* ntosModule = nullptr;
+    for (const KernelModuleInfo& module : modules)
+    {
+        const std::wstring leaf = KmonBasenameLower(
+            module.ImageName.empty() ? module.ImagePath : module.ImageName);
+        if (leaf == L"ntoskrnl.exe" || leaf == L"ntkrnlmp.exe")
+        {
+            ntosBase = module.Base;
+            ntosModule = &module;
+            break;
+        }
+    }
+    if (ntosBase == 0 || ntosModule == nullptr)
+    {
+        return;
+    }
+
+    if (CfgDataPtrNtosBase != ntosBase)
+    {
+        CfgDataPtrSites.clear();
+        CfgDataPtrNtosBase = ntosBase;
+        std::unordered_set<uint32_t> ntosGuardRvas;
+        if (ntosModule != nullptr)
+        {
+            std::wstring ntosPath = ntosModule->ImagePath;
+            if (!PathLooksLikeWin32File(ntosPath))
+            {
+                ntosPath = Win32PathFromKernelImagePath(ntosPath);
+            }
+            std::vector<uint8_t> ntosHead;
+            if (PathLooksLikeWin32File(ntosPath) &&
+                ReadDiskPeHead(ntosPath, &ntosHead))
+            {
+                const uint32_t guardRva = FindPeExportRvaByName(
+                    ntosPath,
+                    ntosHead,
+                    "guard_dispatch_icall");
+                if (guardRva != 0)
+                {
+                    ntosGuardRvas.insert(guardRva);
+                }
+            }
+        }
+
+        for (const KernelModuleInfo& module : modules)
+        {
+            if (CfgDataPtrSites.size() >= 192)
+            {
+                break;
+            }
+            const std::wstring leaf = KmonBasenameLower(
+                module.ImageName.empty() ? module.ImagePath : module.ImageName);
+            if (!KmonLooksLikeCfgHostModule(leaf) ||
+                module.Base == 0 ||
+                module.Size == 0)
+            {
+                continue;
+            }
+            std::wstring diskPath = module.ImagePath;
+            if (!PathLooksLikeWin32File(diskPath))
+            {
+                diskPath = Win32PathFromKernelImagePath(diskPath);
+            }
+            if (!PathLooksLikeWin32File(diskPath))
+            {
+                continue;
+            }
+            std::vector<uint8_t> headers;
+            if (!ReadDiskPeHead(diskPath, &headers))
+            {
+                continue;
+            }
+            KmonPeLayout layout = {};
+            if (!ParseKmonPeLayout(headers, &layout) || !layout.Is64)
+            {
+                continue;
+            }
+            uint32_t textRva = 0;
+            uint32_t textFile = 0;
+            uint32_t textSize = 0;
+            if (!ParseFirstExecSection(headers, &textRva, &textFile, &textSize))
+            {
+                continue;
+            }
+            std::vector<uint8_t> text;
+            if (!ReadDiskFileRange(diskPath, textFile, textSize, &text) ||
+                text.size() < 16)
+            {
+                continue;
+            }
+            std::unordered_set<uint32_t> guardCall = ntosGuardRvas;
+            std::unordered_set<uint32_t> guardIat;
+            if (leaf != L"ntoskrnl.exe" && leaf != L"ntkrnlmp.exe")
+            {
+                CollectGuardDispatchIatRvas(diskPath, headers, layout, &guardIat);
+                guardCall.clear();
+            }
+            if (guardCall.empty() && guardIat.empty())
+            {
+                continue;
+            }
+            std::vector<uint32_t> slotRvas;
+            CollectCfgDataPtrSlotRvas(
+                text.data(),
+                text.size(),
+                textRva,
+                layout.SizeOfImage,
+                guardCall,
+                guardIat,
+                &slotRvas,
+                48);
+            for (uint32_t slotRva : slotRvas)
+            {
+                if (CfgDataPtrSites.size() >= 192)
+                {
+                    break;
+                }
+                CfgDataPtrSite site = {};
+                site.SlotVa = module.Base + slotRva;
+                site.ModuleLeaf = leaf;
+                CfgDataPtrSites.push_back(std::move(site));
+            }
+        }
+    }
+
+    uint32_t emitted = 0;
+    for (const CfgDataPtrSite& site : CfgDataPtrSites)
+    {
+        if (emitted >= 4 || StopRequested.load())
+        {
+            break;
+        }
+        std::vector<uint8_t> live;
+        std::wstring ignored;
+        if (!device->ReadMemory(site.SlotVa, 8, &live, &ignored) ||
+            live.size() < 8)
+        {
+            continue;
+        }
+        uint64_t target = 0;
+        std::memcpy(&target, live.data(), sizeof(target));
+        if (target == 0 ||
+            KmonVaLooksLikePagingOrFirmware(target) ||
+            AddressOwnedByLoadedModule(symbols, target))
+        {
+            continue;
+        }
+        NoteMapperWatchResidue(L"dataptr", 0);
+        EmitUnique(
+            L"hook.dataptr",
+            L"dataptr:" + site.ModuleLeaf + L":" + HexU64(site.SlotVa),
+            site.ModuleLeaf,
+            L"dataptr",
+            L"CFG dispatch slot outside loaded modules " + HexU64(target),
+            L"slot=" + HexU64(site.SlotVa) + L" module=" + site.ModuleLeaf);
+        ++emitted;
     }
 }
 
@@ -9333,6 +10125,36 @@ void KernelMonitor::ScanUserModeHostility()
                         ++hiddenPtes;
                     }
                 }
+                if (IsMapperWatchActive() &&
+                    watched &&
+                    (hiddenPtes != 0 || vadRwPtes != 0))
+                {
+                    bool residue = false;
+                    bool overlay = false;
+                    bool tiWrite = false;
+                    {
+                        std::lock_guard<std::mutex> watchLock(WatchMutex);
+                        residue = MapperWatchHasResidue;
+                        overlay = MapperWatchHasOverlaySlot;
+                        tiWrite = MapperWatchTiWritePids.find(pid) !=
+                            MapperWatchTiWritePids.end();
+                    }
+                    if ((residue || overlay) && !tiWrite)
+                    {
+                        EmitUnique(
+                            L"inject.kernel_phys",
+                            L"kernel_phys:" + std::to_wstring(pid),
+                            imagePath,
+                            L"kernel_phys",
+                            L"watched process gained hidden/protect-changed executable PTEs without TI WriteVM pid=" +
+                                std::to_wstring(pid) + L" " + leaf,
+                            L"hidden_ptes=" + std::to_wstring(hiddenPtes) +
+                                L" vad_rw_ptes=" + std::to_wstring(vadRwPtes) +
+                                L" residue=" + std::to_wstring(residue ? 1 : 0) +
+                                L" overlay_slot=" + std::to_wstring(overlay ? 1 : 0),
+                            pid);
+                    }
+                }
             }
 
             if (hostileHost)
@@ -9657,6 +10479,10 @@ void KernelMonitor::ScanUserModeHostility()
                                 &tableHits);
                             if (tableHits > 0)
                             {
+                                if (overlayLeaf)
+                                {
+                                    NoteMapperWatchResidue(L"overlay_slot", 0);
+                                }
                                 EmitUnique(
                                     L"process.implant",
                                     (overlayLeaf ? L"overlay_slot:" : L"vtable_hook:") +
@@ -9688,19 +10514,22 @@ void KernelMonitor::ScanUserModeHostility()
                 {
                     continue;
                 }
+                const wchar_t* implantLayer = dropImplant
+                    ? L"drop_module"
+                    : (watchedDirHijack
+                        ? (KmonImageAuthenticodeValid(imagePath)
+                            ? L"dll_proxy_host"
+                            : L"watched_dir_hijack")
+                        : (watchedUnimported
+                            ? L"watched_dir_unimported"
+                            : (watchedForeignThirdParty
+                                ? L"watched_third_party_module"
+                                : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module"))));
                 EmitUnique(
                     L"process.implant",
                     L"implant:" + std::to_wstring(pid) + L":" + KmonBasenameLower(modulePath),
                     imagePath,
-                    dropImplant
-                        ? L"drop_module"
-                        : (watchedDirHijack
-                            ? L"watched_dir_hijack"
-                            : (watchedUnimported
-                                ? L"watched_dir_unimported"
-                                : (watchedForeignThirdParty
-                                    ? L"watched_third_party_module"
-                                    : (watchedUnknown ? L"watched_unknown_module" : L"builtin_foreign_module")))),
+                    implantLayer,
                     L"foreign module in pid=" + std::to_wstring(pid) + L" " + leaf +
                         L" module=" + KmonBasenameLower(modulePath),
                     modulePath,
@@ -10226,6 +11055,8 @@ bool KernelMonitor::ResolveKernelImageName(uint32_t pid, std::wstring* name)
 
 void KernelMonitor::RecordEvent(KmonEvent&& event)
 {
+    NoteWatchTiWriteIfNeeded(event);
+
     KmonOptions options;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
@@ -10494,6 +11325,10 @@ void KernelMonitor::Clear()
         MapperWatchDriver.clear();
         MapperWatchId.clear();
         MapperWatchEmitTick.clear();
+        MapperWatchHasResidue = false;
+        MapperWatchHasOverlaySlot = false;
+        MapperWatchTiWritePids.clear();
+        MapperWatchResiduePfns.clear();
     }
     MapperWatchUntilMs.store(0);
     MapperWatchOriginMs.store(0);
@@ -11462,6 +12297,15 @@ bool KernelMonitorSelfTest()
         {
             break;
         }
+        KmonEvent dataptrEvent = {};
+        dataptrEvent.Kind = L"hook.dataptr";
+        KmonEvent kernelPhysEvent = {};
+        kernelPhysEvent.Kind = L"inject.kernel_phys";
+        if (!KmonWatchMatches(dataptrEvent, emptyWatch) ||
+            !KmonWatchMatches(kernelPhysEvent, emptyWatch))
+        {
+            break;
+        }
         KmonOptions driverWatch;
         driverWatch.WatchDrivers.push_back(L"other.sys");
         // /driver must not hide an unknown drop name.
@@ -11544,7 +12388,15 @@ bool KernelMonitorSelfTest()
             !KmonLooksLikeOverlayRuntimeDll(L"graphics-hook64.dll") ||
             !KmonLooksLikeOverlayRuntimeDll(L"rtsshooks64.dll") ||
             KmonLooksLikeOverlayRuntimeDll(L"dxgi.dll") ||
-            KmonLooksLikeOverlayRuntimeDll(L"ntdll.dll"))
+            KmonLooksLikeOverlayRuntimeDll(L"ntdll.dll") ||
+            !KmonLooksLikeCfgHostModule(L"ntoskrnl.exe") ||
+            !KmonLooksLikeCfgHostModule(L"win32kfull.sys") ||
+            !KmonLooksLikeCfgHostModule(L"dxgkrnl.sys") ||
+            KmonLooksLikeCfgHostModule(L"acpi.sys") ||
+            !KmonVaLooksLikePagingOrFirmware(0x00007FF800000000ull) ||
+            !KmonVaLooksLikePagingOrFirmware(0xFFFFF68000000000ull) ||
+            !KmonVaLooksLikePagingOrFirmware(0xFFFFF78000000000ull) ||
+            KmonVaLooksLikePagingOrFirmware(0xFFFFF80000000000ull))
         {
             break;
         }
@@ -11883,6 +12735,46 @@ bool KernelMonitorSelfTest()
                     stubBuf.size(),
                     0xFFFFFA8000000000ull,
                     std::vector<KernelModuleInfo>{ userMod }) != 0)
+            {
+                break;
+            }
+            uint8_t cfgText[32] = {};
+            cfgText[0] = 0x48;
+            cfgText[1] = 0x8B;
+            cfgText[2] = 0x05;
+            const int32_t slotDisp = static_cast<int32_t>(0x2000 - 7);
+            std::memcpy(cfgText + 3, &slotDisp, sizeof(slotDisp));
+            cfgText[7] = 0xE8;
+            const int32_t callDisp = static_cast<int32_t>(0x5000 - 12);
+            std::memcpy(cfgText + 8, &callDisp, sizeof(callDisp));
+            std::unordered_set<uint32_t> guardCall = { 0x5000 };
+            std::unordered_set<uint32_t> guardIat;
+            std::vector<uint32_t> slotRvas;
+            if (CollectCfgDataPtrSlotRvas(
+                    cfgText,
+                    sizeof(cfgText),
+                    0,
+                    0x3000,
+                    guardCall,
+                    guardIat,
+                    &slotRvas,
+                    8) != 1 ||
+                slotRvas.size() != 1 ||
+                slotRvas[0] != 0x2000)
+            {
+                break;
+            }
+            cfgText[7] = 0x90;
+            slotRvas.clear();
+            if (CollectCfgDataPtrSlotRvas(
+                    cfgText,
+                    sizeof(cfgText),
+                    0,
+                    0x3000,
+                    guardCall,
+                    guardIat,
+                    &slotRvas,
+                    8) != 0)
             {
                 break;
             }
