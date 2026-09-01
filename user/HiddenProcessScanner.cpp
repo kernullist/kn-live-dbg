@@ -8,8 +8,10 @@
 #include <TlHelp32.h>
 
 #include <cstring>
+#include <cstddef>
 #include <limits>
 #include <map>
+#include <new>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -22,6 +24,7 @@ namespace
     constexpr uint32_t kMaxProcesses = 8192;
     constexpr uint32_t kMaxInfoBytes = 32u * 1024u * 1024u;
     constexpr size_t kSystemProcessInfoPrefix = 0x100;
+    constexpr size_t kSystemThreadInformationSize = 0x50;
 
     typedef LONG NTSTATUS_LOCAL;
     typedef NTSTATUS_LOCAL (NTAPI* PfnNtQuerySystemInformation)(
@@ -51,6 +54,12 @@ namespace
     static_assert(
         sizeof(SystemProcessInfoHeader) <= kSystemProcessInfoPrefix,
         "SYSTEM_PROCESS_INFORMATION header must fit in the documented x64 prefix");
+    static_assert(
+        offsetof(SystemProcessInfoHeader, ImageName) == 0x38,
+        "x64 SYSTEM_PROCESS_INFORMATION ImageName offset");
+    static_assert(
+        offsetof(SystemProcessInfoHeader, UniqueProcessId) == 0x50,
+        "x64 SYSTEM_PROCESS_INFORMATION UniqueProcessId offset");
 
     struct ProcessView
     {
@@ -514,6 +523,258 @@ namespace
         }
     }
 
+    bool ParseSystemProcessInformationBuffer(
+        const uint8_t* data,
+        size_t validLength,
+        UserInventory* inventory,
+        std::wstring* warning)
+    {
+        if (inventory == nullptr)
+        {
+            return false;
+        }
+        *inventory = UserInventory{};
+
+        if (data == nullptr || validLength < kSystemProcessInfoPrefix)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"SystemProcessInformation returned an invalid buffer length";
+            }
+            return false;
+        }
+
+        const uintptr_t bufferStart = reinterpret_cast<uintptr_t>(data);
+        if (validLength > (std::numeric_limits<uintptr_t>::max)() - bufferStart)
+        {
+            if (warning != nullptr)
+            {
+                *warning = L"SystemProcessInformation buffer address overflow";
+            }
+            return false;
+        }
+        const uintptr_t bufferEnd = bufferStart + validLength;
+
+        size_t offset = 0;
+        uint32_t spiCount = 0;
+        bool malformed = false;
+        bool terminalEntrySeen = false;
+        UserInventory parsed = {};
+        while (offset <= validLength &&
+            kSystemProcessInfoPrefix <= validLength - offset &&
+            spiCount < kMaxProcesses)
+        {
+            const SystemProcessInfoHeader* info =
+                reinterpret_cast<const SystemProcessInfoHeader*>(data + offset);
+            const size_t entryLength = info->NextEntryOffset != 0
+                ? static_cast<size_t>(info->NextEntryOffset)
+                : validLength - offset;
+            if (entryLength < kSystemProcessInfoPrefix ||
+                entryLength > validLength - offset ||
+                (info->NextEntryOffset != 0 &&
+                    ((info->NextEntryOffset % alignof(void*)) != 0 ||
+                        offset + info->NextEntryOffset < offset)) ||
+                info->NumberOfThreads >
+                    (entryLength - kSystemProcessInfoPrefix) / kSystemThreadInformationSize)
+            {
+                malformed = true;
+                break;
+            }
+
+            const uintptr_t processId = reinterpret_cast<uintptr_t>(info->UniqueProcessId);
+            if (processId > (std::numeric_limits<uint32_t>::max)())
+            {
+                malformed = true;
+                break;
+            }
+            const uint32_t pid = static_cast<uint32_t>(processId);
+            std::wstring image;
+            if ((info->ImageName.Length % sizeof(wchar_t)) != 0 ||
+                info->ImageName.MaximumLength < info->ImageName.Length ||
+                (info->ImageName.Length != 0 && info->ImageName.Buffer == nullptr))
+            {
+                malformed = true;
+                break;
+            }
+            if (info->ImageName.Buffer != nullptr && info->ImageName.Length > 0)
+            {
+                const uintptr_t nameStart =
+                    reinterpret_cast<uintptr_t>(info->ImageName.Buffer);
+                const size_t nameBytes = info->ImageName.Length;
+                if (nameStart < bufferStart ||
+                    nameStart > bufferEnd ||
+                    nameBytes > static_cast<size_t>(bufferEnd - nameStart))
+                {
+                    malformed = true;
+                    break;
+                }
+                image.assign(
+                    info->ImageName.Buffer,
+                    nameBytes / sizeof(wchar_t));
+            }
+            if (!parsed.Images.emplace(pid, std::move(image)).second)
+            {
+                malformed = true;
+                break;
+            }
+            ++spiCount;
+
+            if (info->NextEntryOffset == 0)
+            {
+                terminalEntrySeen = true;
+                break;
+            }
+            offset += info->NextEntryOffset;
+        }
+
+        if (malformed || !terminalEntrySeen || spiCount == 0)
+        {
+            if (warning != nullptr)
+            {
+                *warning = malformed
+                    ? L"SystemProcessInformation snapshot was malformed"
+                    : L"SystemProcessInformation snapshot was incomplete";
+            }
+            return false;
+        }
+
+        parsed.Count = spiCount;
+        *inventory = std::move(parsed);
+        return true;
+    }
+
+    bool HiddenProcessSpiParseSelfTest()
+    {
+        bool ok = false;
+
+        do
+        {
+            std::vector<uint8_t> wellFormed(kSystemProcessInfoPrefix, 0);
+            const uint32_t pid = 1234;
+            HANDLE pidHandle = ULongToHandle(pid);
+            memcpy(
+                wellFormed.data() + offsetof(SystemProcessInfoHeader, UniqueProcessId),
+                &pidHandle,
+                sizeof(pidHandle));
+            UserInventory inventory = {};
+            std::wstring warning;
+            if (!ParseSystemProcessInformationBuffer(
+                    wellFormed.data(),
+                    wellFormed.size(),
+                    &inventory,
+                    &warning) ||
+                inventory.Count != 1 ||
+                inventory.Images.find(pid) == inventory.Images.end())
+            {
+                break;
+            }
+
+            std::vector<uint8_t> named(kSystemProcessInfoPrefix, 0);
+            const uint32_t namedPid = 4321;
+            HANDLE namedHandle = ULongToHandle(namedPid);
+            memcpy(
+                named.data() + offsetof(SystemProcessInfoHeader, UniqueProcessId),
+                &namedHandle,
+                sizeof(namedHandle));
+            const wchar_t imageChars[] = { L'f', L'o', L'o', L'.', L'e', L'x', L'e' };
+            const size_t imageBytes = sizeof(imageChars);
+            const size_t imageOffset = 0xC0;
+            memcpy(named.data() + imageOffset, imageChars, imageBytes);
+            SystemProcessInfoHeader* header =
+                reinterpret_cast<SystemProcessInfoHeader*>(named.data());
+            header->ImageName.Length = static_cast<USHORT>(imageBytes);
+            header->ImageName.MaximumLength = static_cast<USHORT>(imageBytes);
+            header->ImageName.Buffer = reinterpret_cast<PWSTR>(named.data() + imageOffset);
+            warning.clear();
+            if (!ParseSystemProcessInformationBuffer(
+                    named.data(),
+                    named.size(),
+                    &inventory,
+                    &warning) ||
+                inventory.Images[namedPid] != std::wstring(imageChars, imageChars + (imageBytes / sizeof(wchar_t))))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> outsideName = wellFormed;
+            header = reinterpret_cast<SystemProcessInfoHeader*>(outsideName.data());
+            header->ImageName.Length = sizeof(wchar_t);
+            header->ImageName.MaximumLength = sizeof(wchar_t);
+            header->ImageName.Buffer = reinterpret_cast<PWSTR>(static_cast<uintptr_t>(0xffff800000001000ull));
+            warning.clear();
+            if (ParseSystemProcessInformationBuffer(
+                    outsideName.data(),
+                    outsideName.size(),
+                    &inventory,
+                    &warning))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> maxBelowLength = named;
+            header = reinterpret_cast<SystemProcessInfoHeader*>(maxBelowLength.data());
+            header->ImageName.MaximumLength = 2;
+            header->ImageName.Length = 8;
+            warning.clear();
+            if (ParseSystemProcessInformationBuffer(
+                    maxBelowLength.data(),
+                    maxBelowLength.size(),
+                    &inventory,
+                    &warning))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> oddLength = wellFormed;
+            header = reinterpret_cast<SystemProcessInfoHeader*>(oddLength.data());
+            header->ImageName.Length = 1;
+            header->ImageName.MaximumLength = 2;
+            header->ImageName.Buffer =
+                reinterpret_cast<PWSTR>(oddLength.data() + 0x60);
+            warning.clear();
+            if (ParseSystemProcessInformationBuffer(
+                    oddLength.data(),
+                    oddLength.size(),
+                    &inventory,
+                    &warning))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> shortPrefix(sizeof(SystemProcessInfoHeader) + 8, 0);
+            memcpy(
+                shortPrefix.data() + offsetof(SystemProcessInfoHeader, UniqueProcessId),
+                &pidHandle,
+                sizeof(pidHandle));
+            warning.clear();
+            if (ParseSystemProcessInformationBuffer(
+                    shortPrefix.data(),
+                    shortPrefix.size(),
+                    &inventory,
+                    &warning))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> shortNext = wellFormed;
+            header = reinterpret_cast<SystemProcessInfoHeader*>(shortNext.data());
+            header->NextEntryOffset = static_cast<ULONG>(sizeof(SystemProcessInfoHeader));
+            warning.clear();
+            if (ParseSystemProcessInformationBuffer(
+                    shortNext.data(),
+                    shortNext.size(),
+                    &inventory,
+                    &warning))
+            {
+                break;
+            }
+
+            ok = true;
+        } while (false);
+
+        return ok;
+    }
+
     bool CollectSystemProcessInformation(UserInventory* inventory, std::wstring* warning)
     {
         if (inventory == nullptr)
@@ -580,85 +841,11 @@ namespace
             return false;
         }
 
-        const size_t validLength = static_cast<size_t>(needed);
-        size_t offset = 0;
-        uint32_t spiCount = 0;
-        bool malformed = false;
-        bool terminalEntrySeen = false;
-        const uint8_t* bufStart = buffer.data();
-        const uint8_t* bufEnd = buffer.data() + validLength;
-        UserInventory parsed = {};
-        while (offset + sizeof(SystemProcessInfoHeader) <= validLength && spiCount < kMaxProcesses)
-        {
-            const SystemProcessInfoHeader* info =
-                reinterpret_cast<const SystemProcessInfoHeader*>(buffer.data() + offset);
-            const uintptr_t processId = reinterpret_cast<uintptr_t>(info->UniqueProcessId);
-            if (processId > (std::numeric_limits<uint32_t>::max)())
-            {
-                malformed = true;
-                break;
-            }
-            const uint32_t pid = static_cast<uint32_t>(processId);
-            std::wstring image;
-            if (info->ImageName.Buffer != nullptr && info->ImageName.Length > 0)
-            {
-                const uint8_t* namePtr =
-                    reinterpret_cast<const uint8_t*>(info->ImageName.Buffer);
-                const size_t nameBytes = info->ImageName.Length;
-                // namePtr > bufEnd makes (bufEnd - namePtr) a huge size_t and
-                // would skip the remaining-bytes check.
-                if (namePtr < bufStart || namePtr > bufEnd)
-                {
-                    malformed = true;
-                    break;
-                }
-                const size_t remaining = static_cast<size_t>(bufEnd - namePtr);
-                if ((nameBytes % sizeof(wchar_t)) != 0 || nameBytes > remaining)
-                {
-                    malformed = true;
-                    break;
-                }
-                image.assign(
-                    info->ImageName.Buffer,
-                    info->ImageName.Buffer + (nameBytes / sizeof(wchar_t)));
-            }
-            if (!parsed.Images.emplace(pid, std::move(image)).second)
-            {
-                malformed = true;
-                break;
-            }
-            ++spiCount;
-
-            if (info->NextEntryOffset == 0)
-            {
-                terminalEntrySeen = true;
-                break;
-            }
-            if (info->NextEntryOffset < sizeof(SystemProcessInfoHeader) ||
-                (info->NextEntryOffset % alignof(void*)) != 0 ||
-                offset + info->NextEntryOffset < offset ||
-                offset + info->NextEntryOffset > validLength)
-            {
-                malformed = true;
-                break;
-            }
-            offset += info->NextEntryOffset;
-        }
-
-        if (malformed || !terminalEntrySeen || spiCount == 0)
-        {
-            if (warning != nullptr)
-            {
-                *warning = malformed
-                    ? L"SystemProcessInformation snapshot was malformed"
-                    : L"SystemProcessInformation snapshot was incomplete";
-            }
-            return false;
-        }
-
-        parsed.Count = spiCount;
-        *inventory = std::move(parsed);
-        return true;
+        return ParseSystemProcessInformationBuffer(
+            buffer.data(),
+            static_cast<size_t>(needed),
+            inventory,
+            warning);
     }
 
     bool CollectToolhelpProcesses(UserInventory* inventory, std::wstring* warning)
@@ -896,6 +1083,8 @@ bool HiddenProcessScanner::Scan(
 {
     bool ok = false;
 
+    try
+    {
     do
     {
         if (result == nullptr)
@@ -1345,6 +1534,19 @@ bool HiddenProcessScanner::Scan(
 
         ok = true;
     } while (false);
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (result != nullptr)
+        {
+            *result = HiddenProcessScanResult{};
+        }
+        if (error != nullptr)
+        {
+            *error = L"out of memory during hidden-process scan";
+        }
+        return false;
+    }
 
     return ok;
 }
@@ -1609,6 +1811,11 @@ bool HiddenProcessViewSelfTest()
         cidFakeExit.ExitTime = 1;
         const HiddenProcessClassifyResult cidFakeExitResult = ClassifyHiddenProcess(cidFakeExit);
         if (!cidFakeExitResult.Suspicious || cidFakeExitResult.Ignored)
+        {
+            break;
+        }
+
+        if (!HiddenProcessSpiParseSelfTest())
         {
             break;
         }

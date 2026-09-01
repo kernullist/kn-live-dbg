@@ -2518,6 +2518,28 @@ namespace
         return _wcsicmp(field.Name.c_str(), name.c_str()) == 0;
     }
 
+    bool IsEmbeddedAggregateChild(const TypeFieldInfo& field)
+    {
+        // Pointer/array/base ChildTypeIds are not in-place layout. Walking them
+        // from _ETHREAD/_EPROCESS exploded into GetTypeLayoutById on every
+        // PEPROCESS* and similar fields. Allow only tags that can be an
+        // embedded UDT (including typedef-to-UDT, which GetTypeLayoutById
+        // unwraps). Tag 0 is "dbghelp omitted SYMTAG"; GetTypeLayoutById now
+        // rejects non-UDTs instead of succeeding with an empty field list.
+        if (field.ChildTypeId == 0)
+        {
+            return false;
+        }
+        if (field.ChildTag == 0 ||
+            field.ChildTag == KNDBG_SYMTAG_UDT ||
+            field.ChildTag == KNDBG_SYMTAG_TYPEDEF ||
+            field.ChildTag == KNDBG_SYMTAG_BASE_CLASS)
+        {
+            return true;
+        }
+        return false;
+    }
+
     bool FindFieldRecursiveById(
         SymbolEngine& symbols,
         uint64_t moduleBase,
@@ -2569,7 +2591,7 @@ namespace
 
             for (const TypeFieldInfo& field : layout.Fields)
             {
-                if (field.ChildTypeId == 0 || field.ChildTypeId == typeId)
+                if (!IsEmbeddedAggregateChild(field) || field.ChildTypeId == typeId)
                 {
                     continue;
                 }
@@ -2636,7 +2658,7 @@ namespace
 
                 for (const TypeFieldInfo& field : layout.Fields)
                 {
-                    if (field.ChildTypeId == 0)
+                    if (!IsEmbeddedAggregateChild(field))
                     {
                         continue;
                     }

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <memory>
+#include <new>
 #include <sstream>
 
 #pragma comment(lib, "Dbghelp.lib")
@@ -2549,8 +2550,60 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
         layout->Size = 0;
         layout->Fields.clear();
 
+        // Nested field walks (ETHREAD UniqueThread, dotted EPROCESS paths) pass
+        // ChildTypeId values that are often pointers, arrays, or typedefs.
+        // TI_GET_CHILDRENCOUNT on those tags is undocumented; older dbghelp on
+        // Windows 10 has been observed to succeed with a garbage count, which
+        // turns the ChildId allocation below into bad_alloc / abort.
+        ULONG resolvedTypeId = typeId;
+        DWORD tag = 0;
+        bool haveTag = false;
+        for (ULONG aliasDepth = 0; aliasDepth < 8; ++aliasDepth)
+        {
+            if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_SYMTAG, &tag))
+            {
+                haveTag = false;
+                break;
+            }
+            haveTag = true;
+            if (tag != SymTagTypedef)
+            {
+                break;
+            }
+            ULONG nextTypeId = 0;
+            if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_TYPEID, &nextTypeId) ||
+                nextTypeId == 0 ||
+                nextTypeId == resolvedTypeId)
+            {
+                break;
+            }
+            resolvedTypeId = nextTypeId;
+        }
+        if (!haveTag)
+        {
+            if (error != nullptr)
+            {
+                *error = DbgHelpErrorText(L"TI_GET_SYMTAG failed", GetLastError());
+            }
+            break;
+        }
+        layout->TypeId = resolvedTypeId;
+        if (tag != SymTagUDT && tag != SymTagBaseClass)
+        {
+            // Pointer/array/enum/function TypeIds used to take TI_GET_CHILDRENCOUNT.
+            // Succeeding here with an empty field list made callers treat a
+            // pointer as a resolved UDT (dt dump, dotted FindField). Fail so
+            // the caller can skip the branch.
+            if (error != nullptr)
+            {
+                *error = L"type is not a UDT";
+            }
+            break;
+        }
+
+        constexpr ULONG kMaxTypeChildren = 8192;
         ULONG childrenCount = 0;
-        if (!SymGetTypeInfo(process_, moduleBase, typeId, TI_GET_CHILDRENCOUNT, &childrenCount))
+        if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_CHILDRENCOUNT, &childrenCount))
         {
             if (error != nullptr)
             {
@@ -2559,21 +2612,44 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
             break;
         }
 
-        SymGetTypeInfo(process_, moduleBase, typeId, TI_GET_LENGTH, &layout->Size);
+        SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_LENGTH, &layout->Size);
 
         if (childrenCount == 0)
         {
             ok = true;
             break;
         }
+        if (childrenCount > kMaxTypeChildren)
+        {
+            if (error != nullptr)
+            {
+                *error = L"type child count exceeds layout safety cap";
+            }
+            break;
+        }
 
-        size_t findChildrenSize = FIELD_OFFSET(TI_FINDCHILDREN_PARAMS, ChildId) + sizeof(ULONG) * childrenCount;
-        std::vector<uint8_t> findChildrenBuffer(findChildrenSize);
+        const size_t findChildrenSize =
+            FIELD_OFFSET(TI_FINDCHILDREN_PARAMS, ChildId) +
+            sizeof(ULONG) * static_cast<size_t>(childrenCount);
+        std::vector<uint8_t> findChildrenBuffer;
+        try
+        {
+            findChildrenBuffer.resize(findChildrenSize);
+            layout->Fields.reserve(childrenCount);
+        }
+        catch (const std::bad_alloc&)
+        {
+            if (error != nullptr)
+            {
+                *error = L"type child list is too large to materialize";
+            }
+            break;
+        }
         auto findChildren = reinterpret_cast<TI_FINDCHILDREN_PARAMS*>(findChildrenBuffer.data());
         findChildren->Count = childrenCount;
         findChildren->Start = 0;
 
-        if (!SymGetTypeInfo(process_, moduleBase, typeId, TI_FINDCHILDREN, findChildren))
+        if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_FINDCHILDREN, findChildren))
         {
             if (error != nullptr)
             {
@@ -2582,87 +2658,97 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
             break;
         }
 
-        layout->Fields.reserve(childrenCount);
         size_t skippedWithoutOffset = 0;
-
-        for (ULONG index = 0; index < childrenCount; ++index)
+        try
         {
-            ULONG childId = findChildren->ChildId[index];
-            TypeFieldInfo field = {};
-            field.ModuleBase = moduleBase;
-            field.TypeId = childId;
-            field.ChildTypeId = 0;
-            field.Offset = 0;
-            field.Length = 0;
-            field.Tag = 0;
-            field.ChildTag = 0;
-            field.BaseType = 0;
-            field.IsBitField = false;
-            field.BitPosition = 0;
-
-            // Only data members and base classes participate in layout offsets.
-            // Nested types/functions without TI_GET_OFFSET used to be recorded
-            // as Offset=0 and silently corrupt every scanner that trusted them.
-            if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMTAG, &field.Tag))
+            for (ULONG index = 0; index < childrenCount; ++index)
             {
-                ++skippedWithoutOffset;
-                continue;
-            }
+                ULONG childId = findChildren->ChildId[index];
+                TypeFieldInfo field = {};
+                field.ModuleBase = moduleBase;
+                field.TypeId = childId;
+                field.ChildTypeId = 0;
+                field.Offset = 0;
+                field.Length = 0;
+                field.Tag = 0;
+                field.ChildTag = 0;
+                field.BaseType = 0;
+                field.IsBitField = false;
+                field.BitPosition = 0;
 
-            if (field.Tag != SymTagData && field.Tag != SymTagBaseClass)
-            {
-                continue;
-            }
-
-            WCHAR* rawName = nullptr;
-            if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMNAME, &rawName) && rawName != nullptr)
-            {
-                field.Name = rawName;
-                LocalFree(rawName);
-            }
-
-            if (field.Name.empty())
-            {
-                continue;
-            }
-
-            if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_OFFSET, &field.Offset))
-            {
-                // Do not invent Offset=0 for named members when DbgHelp fails.
-                // A true first member may still be 0 only when OFFSET succeeds.
-                ++skippedWithoutOffset;
-                continue;
-            }
-
-            SymGetTypeInfo(process_, moduleBase, childId, TI_GET_LENGTH, &field.Length);
-
-            if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_BITPOSITION, &field.BitPosition))
-            {
-                field.IsBitField = true;
-            }
-
-            if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_TYPEID, &field.ChildTypeId))
-            {
-                // TI_GET_LENGTH on the data symbol is the bit width for a
-                // bitfield.  The child type length is its storage size, so
-                // overwriting the former turns one-bit flags into multi-bit
-                // values and makes adjacent flags look set.  Keep this path
-                // consistent with the DIA layout reader above.
-                if (field.Length == 0 || !field.IsBitField)
+                // Only data members and base classes participate in layout offsets.
+                // Nested types/functions without TI_GET_OFFSET used to be recorded
+                // as Offset=0 and silently corrupt every scanner that trusted them.
+                if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMTAG, &field.Tag))
                 {
-                    SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_LENGTH, &field.Length);
+                    ++skippedWithoutOffset;
+                    continue;
                 }
-                SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_BASETYPE, &field.BaseType);
-                SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_SYMTAG, &field.ChildTag);
-                field.TypeName = DescribeType(process_, moduleBase, field.ChildTypeId, 0);
-            }
 
-            if (field.TypeName.empty())
+                if (field.Tag != SymTagData && field.Tag != SymTagBaseClass)
+                {
+                    continue;
+                }
+
+                WCHAR* rawName = nullptr;
+                if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMNAME, &rawName) && rawName != nullptr)
+                {
+                    field.Name = rawName;
+                    LocalFree(rawName);
+                }
+
+                if (field.Name.empty())
+                {
+                    continue;
+                }
+
+                if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_OFFSET, &field.Offset))
+                {
+                    // Do not invent Offset=0 for named members when DbgHelp fails.
+                    // A true first member may still be 0 only when OFFSET succeeds.
+                    ++skippedWithoutOffset;
+                    continue;
+                }
+
+                SymGetTypeInfo(process_, moduleBase, childId, TI_GET_LENGTH, &field.Length);
+
+                if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_BITPOSITION, &field.BitPosition))
+                {
+                    field.IsBitField = true;
+                }
+
+                if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_TYPEID, &field.ChildTypeId))
+                {
+                    // TI_GET_LENGTH on the data symbol is the bit width for a
+                    // bitfield.  The child type length is its storage size, so
+                    // overwriting the former turns one-bit flags into multi-bit
+                    // values and makes adjacent flags look set.  Keep this path
+                    // consistent with the DIA layout reader above.
+                    if (field.Length == 0 || !field.IsBitField)
+                    {
+                        SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_LENGTH, &field.Length);
+                    }
+                    SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_BASETYPE, &field.BaseType);
+                    SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_SYMTAG, &field.ChildTag);
+                    field.TypeName = DescribeType(process_, moduleBase, field.ChildTypeId, 0);
+                }
+
+                if (field.TypeName.empty())
+                {
+                    field.TypeName = L"<unknown>";
+                }
+
+                layout->Fields.push_back(field);
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            layout->Fields.clear();
+            if (error != nullptr)
             {
-                field.TypeName = L"<unknown>";
+                *error = L"type child list is too large to materialize";
             }
-
-            layout->Fields.push_back(field);
+            break;
         }
 
         if (layout->Fields.empty() && childrenCount != 0 && skippedWithoutOffset != 0)
