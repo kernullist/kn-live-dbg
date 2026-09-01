@@ -73,6 +73,10 @@ namespace
         bool CidTable = false;
         bool UserBefore = false;
         bool UserAfter = false;
+        bool SpiBefore = false;
+        bool SpiAfter = false;
+        bool ToolhelpBefore = false;
+        bool ToolhelpAfter = false;
         bool Auxiliary = false;
         bool ProcessExiting = false;
         bool ProcessDelete = false;
@@ -102,13 +106,16 @@ namespace
         bool CidTable = false;
         bool UserBefore = false;
         bool UserAfter = false;
+        bool SpiBefore = false;
+        bool SpiAfter = false;
+        bool ToolhelpBefore = false;
+        bool ToolhelpAfter = false;
         bool KernelWalkOk = false;
         bool KernelInventoryComplete = false;
         bool UserWalkOk = false;
         bool SpiWalkOk = false;
         bool ToolhelpWalkOk = false;
         bool CidConfirmAvailable = false;
-        bool RequireStableUserPresence = false;
         bool LifecycleLayoutAvailable = false;
         bool HasLifecycle = false;
         bool PidRevalidated = false;
@@ -290,21 +297,21 @@ namespace
 
     bool IsTerminatingView(const HiddenProcessClassifyInput& input)
     {
+        // Match hunt leftovers. ProcessExiting/Delete/Rundown fire while
+        // threads still run, so flags alone are not proof the object is a
+        // zombie. Scan CID-confirms every still-allocated EPROCESS; a CID
+        // slot is not evidence that a leftover is live and hidden.
         if (input.HasExitTime && input.ExitTime != 0)
         {
             return true;
         }
-        // ActiveThreads==0 alone is not an exit when AuxiliaryProcess was
-        // resolved -- snapshot clones set that bit, and an attacker can zero
-        // the thread count. If the PDB lacks AuxiliaryProcess, keep the
-        // threadless fallback so clones do not light up as hidden.
-        if (input.HasActiveThreads &&
-            input.ActiveThreads == 0 &&
-            !input.HasAuxiliaryResolved)
-        {
-            return true;
-        }
-        return input.ProcessExiting || input.ProcessDelete || input.ProcessRundown;
+        return input.HasActiveThreads && input.ActiveThreads == 0;
+    }
+
+    bool HasStableSameApiPresence(const HiddenProcessClassifyInput& input)
+    {
+        return (input.SpiBefore && input.SpiAfter) ||
+            (input.ToolhelpBefore && input.ToolhelpAfter);
     }
 
     HiddenProcessClassifyResult ClassifyHiddenProcess(const HiddenProcessClassifyInput& input)
@@ -329,33 +336,31 @@ namespace
                     L"SPI or Toolhelp inventory was incomplete; kernel-only process was not escalated";
                 return result;
             }
-            // Handle/CID confirmation means the object is still a live
-            // process. Cheats set AuxiliaryProcess or fake ExitTime to ride
-            // the clone/zombie filters.
-            const bool independentlyVisible = input.HandleOwner || input.CidTable;
-            if (input.Auxiliary && !independentlyVisible)
+            // CID confirmation runs before UniqueProcessId is re-read on the
+            // walked EPROCESS. Stale Auxiliary/ExitTime from that window
+            // must not look like a live hide, and must not count as a clone.
+            if (!input.PidRevalidated)
+            {
+                result.Ignored = true;
+                result.IgnoredRace = true;
+                result.Notes = L"kernel-only process disappeared before lifecycle revalidation";
+                return result;
+            }
+            // PssCaptureSnapshot clones stay in ActiveProcessLinks, are
+            // omitted from SPI by design, and still have CID slots.
+            if (input.Auxiliary)
             {
                 result.Ignored = true;
                 result.IgnoredAuxiliary = true;
                 result.Notes = L"ActiveProcessLinks auxiliary/snapshot clone omitted from SPI";
                 return result;
             }
-            if (IsTerminatingView(input) && !independentlyVisible)
+            if (IsTerminatingView(input))
             {
                 result.Ignored = true;
                 result.IgnoredTerminating = true;
                 result.Notes = L"exiting process still linked in ActiveProcessLinks";
                 return result;
-            }
-            if (!input.HasLifecycle)
-            {
-                if (input.LifecycleLayoutAvailable && !input.PidRevalidated)
-                {
-                    result.Ignored = true;
-                    result.IgnoredRace = true;
-                    result.Notes = L"kernel-only process disappeared before lifecycle revalidation";
-                    return result;
-                }
             }
             result.Suspicious = true;
             result.Notes = L"present in ActiveProcessLinks but absent from SPI and Toolhelp";
@@ -371,11 +376,26 @@ namespace
                 result.Notes = L"ActiveProcessLinks walk was incomplete; API-only process was not escalated";
                 return result;
             }
-            if (input.RequireStableUserPresence && !(input.UserBefore && input.UserAfter))
+            if (!input.SpiWalkOk || !input.ToolhelpWalkOk)
             {
                 result.Ignored = true;
                 result.IgnoredRace = true;
-                result.Notes = L"user-mode view appeared in only one snapshot";
+                result.Notes =
+                    L"SPI or Toolhelp inventory was incomplete; API-only process was not escalated";
+                return result;
+            }
+            if (!HasStableSameApiPresence(input))
+            {
+                result.Ignored = true;
+                result.IgnoredRace = true;
+                result.Notes = L"user-mode view was not stable on the same API across both snapshots";
+                return result;
+            }
+            if (IsTerminatingView(input))
+            {
+                result.Ignored = true;
+                result.IgnoredTerminating = true;
+                result.Notes = L"exiting process still visible to user-mode enumeration";
                 return result;
             }
             result.Suspicious = true;
@@ -404,8 +424,7 @@ namespace
                     L"SPI or Toolhelp inventory was incomplete; CID/handle-only process was not escalated";
                 return result;
             }
-            const bool independentlyVisible = input.HandleOwner || input.CidTable;
-            if (IsTerminatingView(input) && !independentlyVisible)
+            if (IsTerminatingView(input))
             {
                 result.Ignored = true;
                 result.IgnoredTerminating = true;
@@ -447,7 +466,6 @@ namespace
         bool spiWalkOk,
         bool toolhelpWalkOk,
         bool cidConfirmAvailable,
-        bool requireStableUserPresence,
         bool lifecycleLayoutAvailable)
     {
         HiddenProcessClassifyInput input = {};
@@ -459,13 +477,16 @@ namespace
         input.CidTable = view.CidTable;
         input.UserBefore = view.UserBefore;
         input.UserAfter = view.UserAfter;
+        input.SpiBefore = view.SpiBefore;
+        input.SpiAfter = view.SpiAfter;
+        input.ToolhelpBefore = view.ToolhelpBefore;
+        input.ToolhelpAfter = view.ToolhelpAfter;
         input.KernelWalkOk = kernelWalkOk;
         input.KernelInventoryComplete = kernelInventoryComplete;
         input.UserWalkOk = userWalkOk;
         input.SpiWalkOk = spiWalkOk;
         input.ToolhelpWalkOk = toolhelpWalkOk;
         input.CidConfirmAvailable = cidConfirmAvailable;
-        input.RequireStableUserPresence = requireStableUserPresence;
         input.LifecycleLayoutAvailable = lifecycleLayoutAvailable;
         input.HasLifecycle = view.HasLifecycle;
         input.PidRevalidated = view.PidRevalidated;
@@ -495,10 +516,26 @@ namespace
             if (spi)
             {
                 view.Spi = true;
+                if (before)
+                {
+                    view.SpiBefore = true;
+                }
+                else
+                {
+                    view.SpiAfter = true;
+                }
             }
             if (toolhelp)
             {
                 view.Toolhelp = true;
+                if (before)
+                {
+                    view.ToolhelpBefore = true;
+                }
+                else
+                {
+                    view.ToolhelpAfter = true;
+                }
             }
             if (before)
             {
@@ -1033,6 +1070,13 @@ namespace
                 view->Eprocess = ctx.Eprocess;
             }
             view->CidTable = true;
+            // Kernel-list hits re-read UniqueProcessId on the walked EPROCESS
+            // before lifecycle is trusted. Filling ExitTime/Auxiliary here
+            // would leave stale leftover bits after that re-read fails.
+            if (!view->Kernel)
+            {
+                ReadProcessLifecycle(device, lifecycle, view);
+            }
             if (view->Image.empty() && imageField.Offset != 0)
             {
                 std::vector<uint8_t> nameBytes;
@@ -1057,7 +1101,6 @@ namespace
                             nameBytes.size()));
                 }
             }
-            ReadProcessLifecycle(device, lifecycle, view);
             ok = true;
         } while (false);
         return ok;
@@ -1313,6 +1356,11 @@ bool HiddenProcessScanner::Scan(
         {
             result->Warnings.push_back(L"kernel process lifecycle fields were not fully resolved");
         }
+        if (!lifecycle.HasAuxiliary)
+        {
+            result->Warnings.push_back(
+                L"AuxiliaryProcess was not resolved; PssCaptureSnapshot clones may be reported as hidden");
+        }
 
         const bool userInventoryComplete =
             result->SystemProcessInfoCount > 0 &&
@@ -1322,9 +1370,6 @@ bool HiddenProcessScanner::Scan(
         const bool userWalkOk =
             result->SystemProcessInfoCount > 0 ||
             result->ToolhelpCount > 0;
-        const bool userBeforeOk = spiBeforeOk || toolhelpBeforeOk;
-        const bool userAfterOk = spiAfterOk || toolhelpAfterOk;
-        const bool requireStableUserPresence = userBeforeOk && userAfterOk;
         const bool lifecycleLayoutAvailable =
             lifecycle.HasExitTime || lifecycle.HasActiveThreads;
 
@@ -1467,7 +1512,6 @@ bool HiddenProcessScanner::Scan(
                     spiBeforeOk && spiAfterOk,
                     toolhelpBeforeOk && toolhelpAfterOk,
                     hasDtb,
-                    requireStableUserPresence,
                     lifecycleLayoutAvailable);
             const HiddenProcessClassifyResult classified = ClassifyHiddenProcess(classifiedInput);
 
@@ -1519,15 +1563,6 @@ bool HiddenProcessScanner::Scan(
             if (record.Suspicious)
             {
                 ++result->SuspiciousCount;
-            }
-
-            // Keep non-suspicious records only when they disagree across views.
-            if (record.Suspicious ||
-                (view.Kernel != view.Spi) ||
-                (view.Kernel != view.Toolhelp) ||
-                (view.HandleOwner && !view.Kernel && !view.Spi && !view.Toolhelp) ||
-                (view.CidTable && !view.Kernel && !view.Spi && !view.Toolhelp))
-            {
                 result->Records.push_back(record);
             }
         }
@@ -1616,6 +1651,7 @@ bool HiddenProcessViewSelfTest()
         hidden.HasExitTime = true;
         hidden.ExitTime = 0;
         hidden.LifecycleLayoutAvailable = true;
+        hidden.PidRevalidated = true;
         const HiddenProcessClassifyResult hiddenResult = ClassifyHiddenProcess(hidden);
         if (!hiddenResult.Suspicious || hiddenResult.Ignored)
         {
@@ -1632,16 +1668,18 @@ bool HiddenProcessViewSelfTest()
 
         HiddenProcessClassifyInput cloneCid = clone;
         cloneCid.CidTable = true;
+        cloneCid.HandleOwner = true;
         const HiddenProcessClassifyResult cloneCidResult = ClassifyHiddenProcess(cloneCid);
-        if (!cloneCidResult.Suspicious || cloneCidResult.Ignored)
+        if (cloneCidResult.Suspicious || !cloneCidResult.IgnoredAuxiliary)
         {
             break;
         }
 
         HiddenProcessClassifyInput threadless = hidden;
         threadless.ActiveThreads = 0;
+        threadless.CidTable = true;
         const HiddenProcessClassifyResult threadlessResult = ClassifyHiddenProcess(threadless);
-        if (!threadlessResult.Suspicious || threadlessResult.Ignored)
+        if (threadlessResult.Suspicious || !threadlessResult.IgnoredTerminating)
         {
             break;
         }
@@ -1658,7 +1696,18 @@ bool HiddenProcessViewSelfTest()
         HiddenProcessClassifyInput exiting = hidden;
         exiting.ProcessExiting = true;
         const HiddenProcessClassifyResult exitingResult = ClassifyHiddenProcess(exiting);
-        if (exitingResult.Suspicious || !exitingResult.IgnoredTerminating)
+        if (!exitingResult.Suspicious || exitingResult.Ignored)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput kernelCidZombie = hidden;
+        kernelCidZombie.CidTable = true;
+        kernelCidZombie.HandleOwner = true;
+        kernelCidZombie.ExitTime = 1;
+        const HiddenProcessClassifyResult kernelCidZombieResult =
+            ClassifyHiddenProcess(kernelCidZombie);
+        if (kernelCidZombieResult.Suspicious || !kernelCidZombieResult.IgnoredTerminating)
         {
             break;
         }
@@ -1675,6 +1724,25 @@ bool HiddenProcessViewSelfTest()
             break;
         }
 
+        HiddenProcessClassifyInput staleCid = hidden;
+        staleCid.PidRevalidated = false;
+        staleCid.CidTable = true;
+        const HiddenProcessClassifyResult staleCidResult = ClassifyHiddenProcess(staleCid);
+        if (staleCidResult.Suspicious || !staleCidResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput staleCidAux = staleCid;
+        staleCidAux.Auxiliary = true;
+        const HiddenProcessClassifyResult staleCidAuxResult = ClassifyHiddenProcess(staleCidAux);
+        if (staleCidAuxResult.Suspicious ||
+            !staleCidAuxResult.IgnoredRace ||
+            staleCidAuxResult.IgnoredAuxiliary)
+        {
+            break;
+        }
+
         HiddenProcessClassifyInput liveUnread = vanished;
         liveUnread.PidRevalidated = true;
         const HiddenProcessClassifyResult liveUnreadResult = ClassifyHiddenProcess(liveUnread);
@@ -1684,6 +1752,7 @@ bool HiddenProcessViewSelfTest()
         }
 
         HiddenProcessClassifyInput noLayout = vanished;
+        noLayout.PidRevalidated = true;
         noLayout.LifecycleLayoutAvailable = false;
         const HiddenProcessClassifyResult noLayoutResult = ClassifyHiddenProcess(noLayout);
         if (!noLayoutResult.Suspicious || noLayoutResult.Ignored)
@@ -1699,7 +1768,12 @@ bool HiddenProcessViewSelfTest()
         visible.Toolhelp = true;
         visible.UserBefore = true;
         visible.UserAfter = true;
-        visible.RequireStableUserPresence = true;
+        visible.SpiBefore = true;
+        visible.SpiAfter = true;
+        visible.ToolhelpBefore = true;
+        visible.ToolhelpAfter = true;
+        visible.SpiWalkOk = true;
+        visible.ToolhelpWalkOk = true;
         visible.KernelInventoryComplete = true;
         const HiddenProcessClassifyResult visibleResult = ClassifyHiddenProcess(visible);
         if (!visibleResult.Suspicious || visibleResult.Ignored)
@@ -1709,6 +1783,8 @@ bool HiddenProcessViewSelfTest()
 
         HiddenProcessClassifyInput race = visible;
         race.UserAfter = false;
+        race.SpiAfter = false;
+        race.ToolhelpAfter = false;
         const HiddenProcessClassifyResult raceResult = ClassifyHiddenProcess(race);
         if (raceResult.Suspicious || !raceResult.IgnoredRace)
         {
@@ -1716,9 +1792,37 @@ bool HiddenProcessViewSelfTest()
         }
 
         HiddenProcessClassifyInput singleSnapshot = race;
-        singleSnapshot.RequireStableUserPresence = false;
         const HiddenProcessClassifyResult singleSnapshotResult = ClassifyHiddenProcess(singleSnapshot);
-        if (!singleSnapshotResult.Suspicious || singleSnapshotResult.Ignored)
+        if (singleSnapshotResult.Suspicious || !singleSnapshotResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput mixedApi = visible;
+        mixedApi.SpiAfter = false;
+        mixedApi.ToolhelpBefore = false;
+        mixedApi.Toolhelp = true;
+        mixedApi.Spi = true;
+        const HiddenProcessClassifyResult mixedApiResult = ClassifyHiddenProcess(mixedApi);
+        if (mixedApiResult.Suspicious || !mixedApiResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput apiNoSpi = visible;
+        apiNoSpi.SpiWalkOk = false;
+        const HiddenProcessClassifyResult apiNoSpiResult = ClassifyHiddenProcess(apiNoSpi);
+        if (apiNoSpiResult.Suspicious || !apiNoSpiResult.IgnoredRace)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput apiZombie = visible;
+        apiZombie.HasExitTime = true;
+        apiZombie.ExitTime = 1;
+        apiZombie.HasLifecycle = true;
+        const HiddenProcessClassifyResult apiZombieResult = ClassifyHiddenProcess(apiZombie);
+        if (apiZombieResult.Suspicious || !apiZombieResult.IgnoredTerminating)
         {
             break;
         }
@@ -1810,7 +1914,17 @@ bool HiddenProcessViewSelfTest()
         cidFakeExit.HasExitTime = true;
         cidFakeExit.ExitTime = 1;
         const HiddenProcessClassifyResult cidFakeExitResult = ClassifyHiddenProcess(cidFakeExit);
-        if (!cidFakeExitResult.Suspicious || cidFakeExitResult.Ignored)
+        if (cidFakeExitResult.Suspicious || !cidFakeExitResult.IgnoredTerminating)
+        {
+            break;
+        }
+
+        HiddenProcessClassifyInput cidThreadless = cidOnly;
+        cidThreadless.HasActiveThreads = true;
+        cidThreadless.ActiveThreads = 0;
+        cidThreadless.HasLifecycle = true;
+        const HiddenProcessClassifyResult cidThreadlessResult = ClassifyHiddenProcess(cidThreadless);
+        if (cidThreadlessResult.Suspicious || !cidThreadlessResult.IgnoredTerminating)
         {
             break;
         }
