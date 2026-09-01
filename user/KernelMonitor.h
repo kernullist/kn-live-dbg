@@ -197,12 +197,15 @@ private:
         std::unordered_set<std::wstring> Hash;
         uint32_t PiddbElementCount = 0;
         uint32_t UnloadedSlotCount = 0;
+        bool PiddbTruncated = false;
+        bool HashTruncated = false;
         bool Complete = false;
     };
     MapperWatchFingerprint MapperWatchLast;
     std::wstring MapperWatchDriver;
     std::unordered_map<std::wstring, uint64_t> MapperWatchEmitTick;
     std::atomic<uint64_t> MapperWatchUntilMs{0};
+    std::atomic<uint64_t> MapperWatchOriginMs{0};
     std::atomic<bool> MapperWatchDeepPfnPending{false};
 
     mutable std::mutex RingMutex;

@@ -19351,10 +19351,11 @@ namespace
                     vad.HasSubsection &&
                     vad.Subsection != 0 &&
                     !privateMemory;
-                const HuntModuleRecord* loaderOwner = sectionBackedExecutable
-                    ? FindLoaderModuleContainingAddress(*process, vad.StartAddress)
-                    : nullptr;
-                bool loaderCovered = loaderOwner != nullptr;
+                const HuntModuleRecord* addressOwner =
+                    FindLoaderModuleContainingAddress(*process, vad.StartAddress);
+                const HuntModuleRecord* loaderOwner =
+                    sectionBackedExecutable ? addressOwner : nullptr;
+                bool loaderCovered = addressOwner != nullptr;
                 std::vector<std::wstring> imageSectionReasons;
                 std::map<std::wstring, std::wstring> imageSectionEvidence;
 
@@ -20894,9 +20895,7 @@ namespace
             }
             const std::wstring leaf =
                 LeafName(module.Name.empty() ? module.Path : module.Name);
-            if (ModuleLooksLikeGraphicsApiDll(leaf) ||
-                IsCoreOsDllLeaf(leaf) ||
-                leaf == L"win32u.dll")
+            if (ModuleLooksLikeGraphicsApiDll(leaf))
             {
                 scan = true;
             }
@@ -21854,8 +21853,7 @@ namespace
             {
                 break;
             }
-            if (ProcessLooksLikeJitHost(process) &&
-                !ProcessHasGraphicsApiModule(process))
+            if (ProcessLooksLikeJitHost(process))
             {
                 break;
             }
@@ -21905,7 +21903,7 @@ namespace
                     continue;
                 }
                 if (LoaderModuleCoversAddress(process, rip, nullptr) ||
-                    !AddressInUnbackedExecutableVad(process, rip))
+                    !AddressInPrivateExecutableVad(process, rip))
                 {
                     continue;
                 }
@@ -22175,6 +22173,14 @@ namespace
                     continue;
                 }
 
+                std::set<uint64_t> seenTargets;
+                const std::wstring leaf =
+                    LeafName(module.Name.empty() ? module.Path : module.Name);
+                const bool scanRdata =
+                    ModuleLooksLikeGraphicsApiDll(leaf) ||
+                    (IsMainImageModule(process, module) &&
+                        !ProcessLooksLikeJitHost(process));
+
                 auto emitHook =
                     [&](uint64_t target,
                         const std::wstring& reason,
@@ -22185,11 +22191,13 @@ namespace
                         if (findings >= kMaxFindings ||
                             target == 0 ||
                             !IsUserAddress(target) ||
+                            seenTargets.find(target) != seenTargets.end() ||
                             LoaderModuleCoversAddress(process, target, nullptr) ||
                             !AddressInUnbackedExecutableVad(process, target))
                         {
                             return;
                         }
+                        seenTargets.insert(target);
                         std::map<std::wstring, std::wstring> evidence;
                         evidence[slotName] = std::to_wstring(slotIndex);
                         evidence[L"thunk"] = HuntHex(target, 16);
@@ -22245,70 +22253,93 @@ namespace
                     }
                 }
 
-                const size_t sectionOffset =
-                    optionalOffset + fileHeader.SizeOfOptionalHeader;
-                const uint16_t sectionLimit =
-                    (fileHeader.NumberOfSections < 24)
-                        ? fileHeader.NumberOfSections
-                        : static_cast<uint16_t>(24);
-                for (uint16_t sectionIndex = 0;
-                    sectionIndex < sectionLimit && findings < kMaxFindings;
-                    ++sectionIndex)
+                if (scanRdata)
                 {
-                    const size_t off =
-                        sectionOffset +
-                        static_cast<size_t>(sectionIndex) * sizeof(IMAGE_SECTION_HEADER);
-                    if (off + sizeof(IMAGE_SECTION_HEADER) > header.size())
+                    const size_t sectionOffset =
+                        optionalOffset + fileHeader.SizeOfOptionalHeader;
+                    const uint16_t sectionLimit =
+                        (fileHeader.NumberOfSections < 24)
+                            ? fileHeader.NumberOfSections
+                            : static_cast<uint16_t>(24);
+                    for (uint16_t sectionIndex = 0;
+                        sectionIndex < sectionLimit && findings < kMaxFindings;
+                        ++sectionIndex)
                     {
-                        break;
-                    }
-                    IMAGE_SECTION_HEADER section = {};
-                    std::memcpy(&section, header.data() + off, sizeof(section));
-                    if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
-                        (section.Characteristics & IMAGE_SCN_CNT_CODE) != 0 ||
-                        (section.Characteristics & IMAGE_SCN_MEM_READ) == 0)
-                    {
-                        continue;
-                    }
-                    const uint32_t span =
-                        (section.Misc.VirtualSize != 0)
-                            ? section.Misc.VirtualSize
-                            : section.SizeOfRawData;
-                    if (span < thunkSize ||
-                        section.VirtualAddress == 0 ||
-                        module.Base > (~0ull - section.VirtualAddress))
-                    {
-                        continue;
-                    }
-                    const uint32_t toRead = (std::min)(span, kMaxTableBytes);
-                    std::vector<uint8_t> table;
-                    if (!ReadHuntProcessMemory(
-                            device,
-                            process.Kernel,
-                            module.Base + section.VirtualAddress,
-                            toRead,
-                            &table,
-                            &ignored) ||
-                        table.size() < thunkSize)
-                    {
-                        continue;
-                    }
-                    const size_t count = table.size() / thunkSize;
-                    for (size_t slot = 0;
-                        slot < count && findings < kMaxFindings;
-                        ++slot)
-                    {
-                        uint64_t target = 0;
-                        std::memcpy(
-                            &target,
-                            table.data() + (slot * thunkSize),
-                            thunkSize);
-                        emitHook(
-                            target,
-                            L"vtable_hook_private_exec",
-                            L"module call-table slot points at unbacked executable memory",
-                            L"table_index",
-                            static_cast<uint32_t>(slot));
+                        const size_t off =
+                            sectionOffset +
+                            static_cast<size_t>(sectionIndex) * sizeof(IMAGE_SECTION_HEADER);
+                        if (off + sizeof(IMAGE_SECTION_HEADER) > header.size())
+                        {
+                            break;
+                        }
+                        IMAGE_SECTION_HEADER section = {};
+                        std::memcpy(&section, header.data() + off, sizeof(section));
+                        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
+                            (section.Characteristics & IMAGE_SCN_CNT_CODE) != 0 ||
+                            (section.Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
+                            (section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0)
+                        {
+                            continue;
+                        }
+                        char sectionName[9] = {};
+                        std::memcpy(sectionName, section.Name, 8);
+                        if (_stricmp(sectionName, ".reloc") == 0 ||
+                            _stricmp(sectionName, ".rsrc") == 0 ||
+                            _stricmp(sectionName, ".pdata") == 0 ||
+                            _stricmp(sectionName, "INIT") == 0)
+                        {
+                            continue;
+                        }
+                        const uint32_t span =
+                            (section.Misc.VirtualSize != 0)
+                                ? section.Misc.VirtualSize
+                                : section.SizeOfRawData;
+                        if (span < thunkSize ||
+                            section.VirtualAddress == 0 ||
+                            module.Base > (~0ull - section.VirtualAddress))
+                        {
+                            continue;
+                        }
+                        const uint32_t toRead = (std::min)(span, kMaxTableBytes);
+                        std::vector<uint8_t> table;
+                        if (!ReadHuntProcessMemory(
+                                device,
+                                process.Kernel,
+                                module.Base + section.VirtualAddress,
+                                toRead,
+                                &table,
+                                &ignored) ||
+                            table.size() < thunkSize)
+                        {
+                            continue;
+                        }
+                        const size_t count = table.size() / thunkSize;
+                        for (size_t slot = 0;
+                            slot < count && findings < kMaxFindings;
+                            ++slot)
+                        {
+                            const uint32_t slotRva =
+                                section.VirtualAddress +
+                                static_cast<uint32_t>(slot * thunkSize);
+                            if (iat.Size != 0 &&
+                                slotRva >= iat.VirtualAddress &&
+                                static_cast<uint64_t>(slotRva) <
+                                    static_cast<uint64_t>(iat.VirtualAddress) + iat.Size)
+                            {
+                                continue;
+                            }
+                            uint64_t target = 0;
+                            std::memcpy(
+                                &target,
+                                table.data() + (slot * thunkSize),
+                                thunkSize);
+                            emitHook(
+                                target,
+                                L"vtable_hook_private_exec",
+                                L"module call-table slot points at unbacked executable memory",
+                                L"table_index",
+                                static_cast<uint32_t>(slot));
+                        }
                     }
                 }
             }
@@ -22372,14 +22403,30 @@ namespace
                 uint32_t graphicsSlots = 0;
                 uint32_t unbackedSlots = 0;
                 uint64_t firstUnbacked = 0;
-                const size_t count = bytes.size() / sizeof(uint64_t);
+                const size_t slotSize =
+                    ProcessNativePebShowsWow64(process)
+                        ? sizeof(uint32_t)
+                        : sizeof(uint64_t);
+                const size_t count = bytes.size() / slotSize;
                 for (size_t slot = 0; slot < count; ++slot)
                 {
                     uint64_t target = 0;
-                    std::memcpy(
-                        &target,
-                        bytes.data() + (slot * sizeof(uint64_t)),
-                        sizeof(target));
+                    if (slotSize == sizeof(uint64_t))
+                    {
+                        std::memcpy(
+                            &target,
+                            bytes.data() + (slot * slotSize),
+                            sizeof(target));
+                    }
+                    else
+                    {
+                        uint32_t target32 = 0;
+                        std::memcpy(
+                            &target32,
+                            bytes.data() + (slot * slotSize),
+                            sizeof(target32));
+                        target = target32;
+                    }
                     if (target == 0 || !IsUserAddress(target))
                     {
                         continue;
@@ -25685,9 +25732,18 @@ bool HuntInProcessHookSelfTest()
         engine.ToolhelpSeen = true;
         engine.LdrLoadSeen = true;
 
+        HuntModuleRecord ntdll = {};
+        ntdll.Base = 0x7ff700000000ull;
+        ntdll.Size = 0x200000;
+        ntdll.Name = L"ntdll.dll";
+        ntdll.Path = L"C:\\Windows\\System32\\ntdll.dll";
+        ntdll.ToolhelpSeen = true;
+        ntdll.LdrLoadSeen = true;
+
         game.Modules.push_back(main);
         game.Modules.push_back(dxgi);
         game.Modules.push_back(engine);
+        game.Modules.push_back(ntdll);
 
         ProcessVadRecord privateRx = {};
         privateRx.StartAddress = 0x200000;
@@ -25707,6 +25763,7 @@ bool HuntInProcessHookSelfTest()
             !ModuleShouldScanForCallTableHooks(game, main) ||
             !ModuleShouldScanForCallTableHooks(game, dxgi) ||
             ModuleShouldScanForCallTableHooks(game, engine) ||
+            ModuleShouldScanForCallTableHooks(game, ntdll) ||
             !AddressInPrivateExecutableVad(game, 0x200100) ||
             !AddressInUnbackedExecutableVad(game, 0x200100) ||
             AddressInUnbackedExecutableVad(game, dxgi.Base + 0x1000) ||

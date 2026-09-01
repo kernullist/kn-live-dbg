@@ -43,6 +43,7 @@ namespace
     constexpr uint32_t kKpageScanIntervalMs = 20000;
     constexpr uint32_t kUserScanIntervalMs = 8000;
     constexpr uint32_t kMapperWatchWindowMs = 30000;
+    constexpr uint32_t kMapperWatchMaxMs = 90000;
     constexpr uint32_t kMapperWatchIntervalMs = 400;
     constexpr uint32_t kMapperWatchKpageIntervalMs = 1500;
     constexpr uint32_t kMapperWatchEmitDebounceMs = 2000;
@@ -2928,6 +2929,7 @@ namespace
     }
 
     bool KmonLooksLikeHookableSystemDll(const std::wstring& leaf);
+    bool KmonLooksLikeGraphicsApiDll(const std::wstring& leaf);
     bool ProtectHasExecute(DWORD protect);
     bool AddressInModuleRanges(
         uint64_t address,
@@ -3207,6 +3209,30 @@ namespace
             std::memcpy(&magic, headers.data() + optionalOffset, sizeof(magic));
             const uint32_t thunkSize =
                 (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) ? 8u : 4u;
+            uint32_t iatRva = 0;
+            uint32_t iatSize = 0;
+            if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                optionalOffset + sizeof(IMAGE_OPTIONAL_HEADER64) <= headers.size())
+            {
+                IMAGE_OPTIONAL_HEADER64 optional = {};
+                std::memcpy(&optional, headers.data() + optionalOffset, sizeof(optional));
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT)
+                {
+                    iatRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+                    iatSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+                }
+            }
+            else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC &&
+                optionalOffset + sizeof(IMAGE_OPTIONAL_HEADER32) <= headers.size())
+            {
+                IMAGE_OPTIONAL_HEADER32 optional = {};
+                std::memcpy(&optional, headers.data() + optionalOffset, sizeof(optional));
+                if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT)
+                {
+                    iatRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+                    iatSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+                }
+            }
             const size_t sectionOffset =
                 optionalOffset + fileHeader.SizeOfOptionalHeader;
             constexpr uint32_t kMaxSectionBytes = 0x10000u;
@@ -3227,7 +3253,17 @@ namespace
                 std::memcpy(&section, headers.data() + off, sizeof(section));
                 if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
                     (section.Characteristics & IMAGE_SCN_CNT_CODE) != 0 ||
-                    (section.Characteristics & IMAGE_SCN_MEM_READ) == 0)
+                    (section.Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
+                    (section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0)
+                {
+                    continue;
+                }
+                char sectionName[9] = {};
+                std::memcpy(sectionName, section.Name, 8);
+                if (_stricmp(sectionName, ".reloc") == 0 ||
+                    _stricmp(sectionName, ".rsrc") == 0 ||
+                    _stricmp(sectionName, ".pdata") == 0 ||
+                    _stricmp(sectionName, "INIT") == 0)
                 {
                     continue;
                 }
@@ -3259,6 +3295,15 @@ namespace
                 const size_t count = bytes.size() / thunkSize;
                 for (size_t slot = 0; slot < count && *hits < 4; ++slot)
                 {
+                    const uint32_t slotRva =
+                        section.VirtualAddress +
+                        static_cast<uint32_t>(slot * thunkSize);
+                    if (iatSize != 0 &&
+                        slotRva >= iatRva &&
+                        slotRva < iatRva + iatSize)
+                    {
+                        continue;
+                    }
                     uint64_t target = 0;
                     if (thunkSize == 8)
                     {
@@ -3591,6 +3636,33 @@ namespace
             L"wow64.dll",
             L"wow64cpu.dll",
             L"wow64win.dll",
+            L"dxgi.dll",
+            L"d3d9.dll",
+            L"d3d10.dll",
+            L"d3d10_1.dll",
+            L"d3d11.dll",
+            L"d3d11on12.dll",
+            L"d3d12.dll",
+            L"d3d12core.dll",
+            L"opengl32.dll",
+            L"vulkan-1.dll"
+        };
+        for (const wchar_t* name : names)
+        {
+            if (leaf == name)
+            {
+                matched = true;
+                break;
+            }
+        }
+        return matched;
+    }
+
+    bool KmonLooksLikeGraphicsApiDll(const std::wstring& leaf)
+    {
+        bool matched = false;
+        static const wchar_t* names[] =
+        {
             L"dxgi.dll",
             L"d3d9.dll",
             L"d3d10.dll",
@@ -4470,8 +4542,7 @@ bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
         const bool looksKernelImage =
             systemMode ||
             event.ProcessId == 0 ||
-            event.ProcessId == 4 ||
-            KmonPathLooksLikeSys(event.Entity);
+            event.ProcessId == 4;
         const bool unnamedPlaceholder =
             event.Entity.empty() ||
             event.Entity.rfind(L"pid:", 0) == 0;
@@ -4749,9 +4820,23 @@ static bool KmonPathClassLooksMapped(const std::wstring& pathClass, const std::w
 
 bool KmonDriverLoadArmsMapperWatch(const KmonEvent& event)
 {
-    if (event.Kind == L"driver.drop_load" || event.Kind == L"driver.image_only")
+    if (event.Kind == L"driver.drop_load")
     {
         return true;
+    }
+    if (event.Kind == L"driver.image_only")
+    {
+        const std::wstring pathClass = KmonEventPathClass(event);
+        if (pathClass == L"inbox")
+        {
+            return false;
+        }
+        if (event.Driver.empty())
+        {
+            return true;
+        }
+        return KmonPathClassLooksMapped(pathClass, event.Driver) ||
+            pathClass == L"unknown";
     }
     if (event.Kind == L"driver.official_load")
     {
@@ -4995,6 +5080,7 @@ bool KernelMonitor::Start(
             NextKpageScanTickMs = 0;
             NextUserScanTickMs = 0;
             MapperWatchUntilMs.store(0);
+            MapperWatchOriginMs.store(0);
             MapperWatchDeepPfnPending.store(false);
 
             EventsKept.store(0);
@@ -5181,13 +5267,7 @@ void KernelMonitor::WorkerLoop()
         {
             mapperInterval = 8000;
         }
-        if (mapperWatch)
-        {
-            mapperInterval = kMapperWatchIntervalMs;
-        }
-        const uint32_t kpageInterval = mapperWatch
-            ? kMapperWatchKpageIntervalMs
-            : kKpageScanIntervalMs;
+        const uint32_t idleMapperInterval = mapperInterval;
 
         // First tick only schedules the scans. Walking PsActiveProcessHead
         // plus mapper leftovers stalls TI ingest at the exact moment a
@@ -5239,7 +5319,8 @@ void KernelMonitor::WorkerLoop()
             {
                 ScanHookInput();
             }
-            NextMapperScanTickMs = GetTickCount64() + mapperInterval;
+            NextMapperScanTickMs = GetTickCount64() +
+                (IsMapperWatchActive() ? kMapperWatchIntervalMs : idleMapperInterval);
         }
 
         if (NextKpageScanTickMs == 0)
@@ -5255,7 +5336,10 @@ void KernelMonitor::WorkerLoop()
             {
                 ScanOrphanMappedPages();
             }
-            NextKpageScanTickMs = GetTickCount64() + kpageInterval;
+            NextKpageScanTickMs = GetTickCount64() +
+                (IsMapperWatchActive()
+                    ? kMapperWatchKpageIntervalMs
+                    : kKpageScanIntervalMs);
         }
 
         if (NextUserScanTickMs == 0)
@@ -5272,7 +5356,8 @@ void KernelMonitor::WorkerLoop()
             NextUserScanTickMs = GetTickCount64() + kUserScanIntervalMs;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(mapperWatch ? 50 : 200));
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(IsMapperWatchActive() ? 50 : 200));
     }
 }
 
@@ -5671,18 +5756,44 @@ bool KernelMonitor::IsMapperWatchActive() const
 void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
 {
     const uint64_t nowMs = GetTickCount64();
-    const uint64_t until = nowMs + kMapperWatchWindowMs;
     const std::wstring base = KmonBasenameLower(event.Driver);
     bool emit = false;
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
         const uint64_t previous = MapperWatchUntilMs.load();
+        const bool wasActive = previous != 0 && nowMs < previous;
+        uint64_t origin = MapperWatchOriginMs.load();
+        if (!wasActive)
+        {
+            origin = nowMs;
+            MapperWatchOriginMs.store(origin);
+            MapperWatchLast = MapperWatchFingerprint{};
+            MapperWatchDeepPfnPending.store(true);
+            for (auto it = EmittedMapperKeys.begin(); it != EmittedMapperKeys.end(); )
+            {
+                if (it->compare(0, 9, L"unloaded:") == 0 ||
+                    it->compare(0, 6, L"piddb:") == 0 ||
+                    it->compare(0, 5, L"hash:") == 0)
+                {
+                    it = EmittedMapperKeys.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+        uint64_t until = nowMs + kMapperWatchWindowMs;
+        const uint64_t cap = origin + kMapperWatchMaxMs;
+        if (until > cap)
+        {
+            until = cap;
+        }
         if (until > previous)
         {
             MapperWatchUntilMs.store(until);
         }
         MapperWatchDriver = event.Driver.empty() ? base : event.Driver;
-        MapperWatchDeepPfnPending.store(true);
         uint64_t& lastEmit = MapperWatchEmitTick[base.empty() ? L"<unnamed>" : base];
         if (lastEmit == 0 || nowMs < lastEmit || (nowMs - lastEmit) >= kMapperWatchEmitDebounceMs)
         {
@@ -5712,6 +5823,7 @@ void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
         watch.Summary += L" " + base;
     }
     watch.Evidence[L"window_ms"] = std::to_wstring(kMapperWatchWindowMs);
+    watch.Evidence[L"window_max_ms"] = std::to_wstring(kMapperWatchMaxMs);
     watch.Evidence[L"scan_ms"] = std::to_wstring(kMapperWatchIntervalMs);
     watch.Evidence[L"kpage_ms"] = std::to_wstring(kMapperWatchKpageIntervalMs);
     watch.Evidence[L"followup"] = L"!mapper all; !pool pe /suspicious; !kpage /pe /deep";
@@ -6109,6 +6221,8 @@ void KernelMonitor::ScanMapperRemnants()
         current.Complete = true;
         current.PiddbElementCount = result.PiddbElementCount;
         current.UnloadedSlotCount = result.UnloadedSlotCount;
+        current.PiddbTruncated = result.Piddb.size() >= options.Limit;
+        current.HashTruncated = result.HashEntries.size() >= options.Limit;
         for (const MapperUnloadedRecord& record : result.Unloaded)
         {
             current.Unloaded.insert(MapperUnloadedFingerprint(record));
@@ -6152,21 +6266,22 @@ void KernelMonitor::ScanMapperRemnants()
                         L"entry present on the previous burst scan is gone");
                 }
             };
-            emitCleared(
-                previous.Unloaded,
-                current.Unloaded,
-                L"MmUnloadedDrivers_wipe",
-                L"unloaded_cleared:");
-            emitCleared(
-                previous.Piddb,
-                current.Piddb,
-                L"PiDDBCache_wipe",
-                L"piddb_cleared:");
-            emitCleared(
-                previous.Hash,
-                current.Hash,
-                L"ci_hash_wipe",
-                L"hash_cleared:");
+            if (!previous.PiddbTruncated && !current.PiddbTruncated)
+            {
+                emitCleared(
+                    previous.Piddb,
+                    current.Piddb,
+                    L"PiDDBCache_wipe",
+                    L"piddb_cleared:");
+            }
+            if (!previous.HashTruncated && !current.HashTruncated)
+            {
+                emitCleared(
+                    previous.Hash,
+                    current.Hash,
+                    L"ci_hash_wipe",
+                    L"hash_cleared:");
+            }
             if (previous.PiddbElementCount >= current.PiddbElementCount + 4)
             {
                 EmitMappedResidue(
@@ -6445,6 +6560,10 @@ void KernelMonitor::ScanOrphanMappedPages()
     std::wstring error;
     if (!scanner.Scan(options, &result, &error))
     {
+        if (deepPfn && IsMapperWatchActive())
+        {
+            MapperWatchDeepPfnPending.store(true);
+        }
         EmitMappedResidue(
             L"scan_failed:kpage",
             std::wstring(),
@@ -9275,14 +9394,17 @@ void KernelMonitor::ScanUserModeHostility()
                                 pid);
                         }
                     }
-                    const bool scanCallTables =
+                    const bool scanIatTables =
                         moduleInventoryComplete &&
                         !modulePaths.empty() &&
                         loadedModuleBase != 0 &&
                         (compareGameText ||
                             compareSystemText ||
                             ((watched || dropHost) && moduleLeaf == leaf));
-                    if (parsedModule && scanCallTables)
+                    const bool scanVtables =
+                        scanIatTables &&
+                        KmonLooksLikeGraphicsApiDll(moduleLeaf);
+                    if (parsedModule && scanIatTables)
                     {
                         uint32_t dllIatHits = 0;
                         ScanLiveImportThunks(
@@ -9335,29 +9457,32 @@ void KernelMonitor::ScanUserModeHostility()
                                 L"hits=" + std::to_wstring(dllIatHits),
                                 pid);
                         }
-                        uint32_t tableHits = 0;
-                        ScanLiveCallTablePointers(
-                            moduleHeaders,
-                            loadedModuleBase,
-                            processHandle,
-                            device,
-                            symbols,
-                            pid,
-                            moduleRanges,
-                            &tableHits);
-                        if (tableHits > 0)
+                        if (scanVtables)
                         {
-                            EmitUnique(
-                                L"process.implant",
-                                L"vtable_hook:" + std::to_wstring(pid) + L":" +
-                                    moduleLeaf,
-                                imagePath,
-                                L"vtable_hook",
-                                L"module call-table slots point at private executable memory pid=" +
-                                    std::to_wstring(pid) + L" " + leaf +
-                                    L" module=" + moduleLeaf,
-                                L"hits=" + std::to_wstring(tableHits),
-                                pid);
+                            uint32_t tableHits = 0;
+                            ScanLiveCallTablePointers(
+                                moduleHeaders,
+                                loadedModuleBase,
+                                processHandle,
+                                device,
+                                symbols,
+                                pid,
+                                moduleRanges,
+                                &tableHits);
+                            if (tableHits > 0)
+                            {
+                                EmitUnique(
+                                    L"process.implant",
+                                    L"vtable_hook:" + std::to_wstring(pid) + L":" +
+                                        moduleLeaf,
+                                    imagePath,
+                                    L"vtable_hook",
+                                    L"module call-table slots point at private executable memory pid=" +
+                                        std::to_wstring(pid) + L" " + leaf +
+                                        L" module=" + moduleLeaf,
+                                    L"hits=" + std::to_wstring(tableHits),
+                                    pid);
+                            }
                         }
                     }
                 }
@@ -10171,6 +10296,7 @@ void KernelMonitor::Clear()
         MapperWatchEmitTick.clear();
     }
     MapperWatchUntilMs.store(0);
+    MapperWatchOriginMs.store(0);
     MapperWatchDeepPfnPending.store(false);
 }
 
@@ -10884,7 +11010,14 @@ bool KernelMonitorSelfTest()
         liveUserPidDrop.ProcessId = 1234;
         liveUserPidDrop.Entity = L"C:\\Temp\\mapped.sys";
         liveUserPidDrop.Source = L"kernel-live";
-        if (!KmonClassifyLiveEvent(liveUserPidDrop, &classified) ||
+        if (KmonClassifyLiveEvent(liveUserPidDrop, &classified))
+        {
+            break;
+        }
+
+        TimelineEvent liveUserPidSysSystemMode = liveUserPidDrop;
+        liveUserPidSysSystemMode.Evidence[L"system_mode"] = L"true";
+        if (!KmonClassifyLiveEvent(liveUserPidSysSystemMode, &classified) ||
             classified.Kind != L"driver.drop_load")
         {
             break;
@@ -11106,7 +11239,19 @@ bool KernelMonitorSelfTest()
         inboxImage.Driver = L"C:\\Windows\\System32\\drivers\\acpi.sys";
         inboxImage.Evidence[L"path_class"] = L"inbox";
         if (!KmonWatchMatches(inboxImage, emptyWatch) ||
-            !KmonDriverLoadArmsMapperWatch(inboxImage))
+            KmonDriverLoadArmsMapperWatch(inboxImage))
+        {
+            break;
+        }
+        KmonEvent unnamedImage = {};
+        unnamedImage.Kind = L"driver.image_only";
+        unnamedImage.Evidence[L"path_class"] = L"unknown";
+        KmonEvent dropImage = {};
+        dropImage.Kind = L"driver.image_only";
+        dropImage.Driver = L"C:\\Temp\\mapped.sys";
+        dropImage.Evidence[L"path_class"] = L"drop";
+        if (!KmonDriverLoadArmsMapperWatch(unnamedImage) ||
+            !KmonDriverLoadArmsMapperWatch(dropImage))
         {
             break;
         }
@@ -11190,7 +11335,11 @@ bool KernelMonitorSelfTest()
             !KmonLooksLikeHookableSystemDll(L"dxgi.dll") ||
             !KmonLooksLikeHookableSystemDll(L"d3d11.dll") ||
             KmonLooksLikeHookableSystemDll(L"game.dll") ||
-            KmonLooksLikeHookableSystemDll(L"version.dll"))
+            KmonLooksLikeHookableSystemDll(L"version.dll") ||
+            !KmonLooksLikeGraphicsApiDll(L"dxgi.dll") ||
+            !KmonLooksLikeGraphicsApiDll(L"d3d11.dll") ||
+            KmonLooksLikeGraphicsApiDll(L"ntdll.dll") ||
+            KmonLooksLikeGraphicsApiDll(L"game.dll"))
         {
             break;
         }
