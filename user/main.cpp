@@ -23311,8 +23311,12 @@ static std::wstring TimelineImageSignatureTypeName(uint32_t type)
     {
     case 0: return L"none";
     case 1: return L"embedded";
-    case 2: return L"catalog";
-    case 3: return L"catalog_uncached";
+    case 2: return L"cache";
+    case 3: return L"catalog_cached";
+    case 4: return L"catalog_uncached";
+    case 5: return L"catalog_hint";
+    case 6: return L"package_catalog";
+    case 7: return L"ppl_mitigated";
     default: return L"type_" + std::to_wstring(type);
     }
 }
@@ -24715,8 +24719,9 @@ static void PrintKmonHelp()
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
     std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
-    std::wcout << L"  mapper.watch            30s burst after a kernel driver load/unload: mapper/pool/kpage\n";
-    std::wcout << L"                          every 400ms, leftover+wipe diffs, one DeepPfn kpage pass\n";
+    std::wcout << L"  mapper.watch            30s burst after drop/third-party kernel load/unload (capped 90s);\n";
+    std::wcout << L"                          inbox image-notify prints but does not arm; leftover+wipe diffs,\n";
+    std::wcout << L"                          400ms mapper/pool, 1.5s kpage, one DeepPfn pass per window\n";
     std::wcout << L"  hook.unbacked           callback/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter\n";
     std::wcout << L"                          whose routine is outside PsLoadedModuleList (empty list is fail-closed);\n";
     std::wcout << L"                          InstrumentationCallback outside modules (watch/builtin, PPL via VAD)\n";
@@ -24730,8 +24735,8 @@ static void PrintKmonHelp()
     std::wcout << L"                          unknown module outside the image dir on a watch target,\n";
     std::wcout << L"                          extra non-inbox module in a Windows builtin,\n";
     std::wcout << L"                          private W+X / PE VAD / hidden executable PTEs on watch or PPL,\n";
-    std::wcout << L"                          IAT or .rdata call-table slots in the main image, game DLLs, or\n";
-    std::wcout << L"                          dxgi/d3d*/opengl/vulkan/ntdll that point at private/mapped RX\n";
+    std::wcout << L"                          IAT thunks in the main image, game DLLs, or hookable system DLLs,\n";
+    std::wcout << L"                          plus dxgi/d3d*/opengl/vulkan .rdata slots, that point at private/mapped RX\n";
     std::wcout << L"  inject.remote           drop/unknown-path remote AllocVM/ProtectVM/MapView/WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          builtin WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView\n";
