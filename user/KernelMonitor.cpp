@@ -2928,6 +2928,10 @@ namespace
     }
 
     bool KmonLooksLikeHookableSystemDll(const std::wstring& leaf);
+    bool ProtectHasExecute(DWORD protect);
+    bool AddressInModuleRanges(
+        uint64_t address,
+        const std::vector<std::pair<uint64_t, uint32_t>>& ranges);
 
     void ScanLiveImportThunks(
         const std::wstring& imagePath,
@@ -3147,6 +3151,149 @@ namespace
                     if (ModulePathLooksInboxWindows(ownerPath) &&
                         (importLoadedInbox ||
                             KmonLooksLikeHookableSystemDll(importLeaf)))
+                    {
+                        continue;
+                    }
+                    ++(*hits);
+                }
+            }
+        } while (false);
+    }
+
+    void ScanLiveCallTablePointers(
+        const std::vector<uint8_t>& headers,
+        uint64_t imageBase,
+        HANDLE processHandle,
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        uint32_t pid,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
+        uint32_t* hits)
+    {
+        do
+        {
+            if (hits == nullptr ||
+                imageBase == 0 ||
+                processHandle == nullptr ||
+                headers.size() < sizeof(IMAGE_DOS_HEADER))
+            {
+                break;
+            }
+
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, headers.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE)
+            {
+                break;
+            }
+            const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
+            if (static_cast<uint64_t>(ntOffset) + 4 + sizeof(IMAGE_FILE_HEADER) >
+                headers.size())
+            {
+                break;
+            }
+            IMAGE_FILE_HEADER fileHeader = {};
+            std::memcpy(
+                &fileHeader,
+                headers.data() + ntOffset + 4,
+                sizeof(fileHeader));
+            const size_t optionalOffset =
+                static_cast<size_t>(ntOffset) + 4 + sizeof(IMAGE_FILE_HEADER);
+            if (optionalOffset + sizeof(uint16_t) > headers.size())
+            {
+                break;
+            }
+            uint16_t magic = 0;
+            std::memcpy(&magic, headers.data() + optionalOffset, sizeof(magic));
+            const uint32_t thunkSize =
+                (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) ? 8u : 4u;
+            const size_t sectionOffset =
+                optionalOffset + fileHeader.SizeOfOptionalHeader;
+            constexpr uint32_t kMaxSectionBytes = 0x10000u;
+            constexpr uint32_t kMaxSections = 24;
+            const uint16_t sectionLimit =
+                (fileHeader.NumberOfSections < kMaxSections)
+                    ? fileHeader.NumberOfSections
+                    : static_cast<uint16_t>(kMaxSections);
+            for (uint16_t i = 0; i < sectionLimit && *hits < 4; ++i)
+            {
+                const size_t off =
+                    sectionOffset + static_cast<size_t>(i) * sizeof(IMAGE_SECTION_HEADER);
+                if (off + sizeof(IMAGE_SECTION_HEADER) > headers.size())
+                {
+                    break;
+                }
+                IMAGE_SECTION_HEADER section = {};
+                std::memcpy(&section, headers.data() + off, sizeof(section));
+                if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
+                    (section.Characteristics & IMAGE_SCN_CNT_CODE) != 0 ||
+                    (section.Characteristics & IMAGE_SCN_MEM_READ) == 0)
+                {
+                    continue;
+                }
+                const uint32_t span =
+                    (section.Misc.VirtualSize != 0)
+                        ? section.Misc.VirtualSize
+                        : section.SizeOfRawData;
+                if (span < thunkSize ||
+                    section.VirtualAddress == 0 ||
+                    imageBase > (std::numeric_limits<uint64_t>::max)() -
+                        section.VirtualAddress)
+                {
+                    continue;
+                }
+                const uint32_t toRead = (std::min)(span, kMaxSectionBytes);
+                std::vector<uint8_t> bytes;
+                if (!ReadProcessBytes(
+                        device,
+                        symbols,
+                        processHandle,
+                        pid,
+                        imageBase + section.VirtualAddress,
+                        toRead,
+                        &bytes) ||
+                    bytes.size() < thunkSize)
+                {
+                    continue;
+                }
+                const size_t count = bytes.size() / thunkSize;
+                for (size_t slot = 0; slot < count && *hits < 4; ++slot)
+                {
+                    uint64_t target = 0;
+                    if (thunkSize == 8)
+                    {
+                        std::memcpy(&target, bytes.data() + (slot * 8), 8);
+                    }
+                    else
+                    {
+                        uint32_t target32 = 0;
+                        std::memcpy(&target32, bytes.data() + (slot * 4), 4);
+                        target = target32;
+                    }
+                    if (target == 0 || !IsUserModeImageBase(target))
+                    {
+                        continue;
+                    }
+                    if (AddressInModuleRanges(target, moduleRanges))
+                    {
+                        continue;
+                    }
+                    MEMORY_BASIC_INFORMATION region = {};
+                    if (VirtualQueryEx(
+                            processHandle,
+                            reinterpret_cast<LPCVOID>(target),
+                            &region,
+                            sizeof(region)) != sizeof(region))
+                    {
+                        continue;
+                    }
+                    if (region.State != MEM_COMMIT ||
+                        !ProtectHasExecute(region.Protect))
+                    {
+                        continue;
+                    }
+                    if (region.Type != MEM_PRIVATE &&
+                        region.Type != MEM_MAPPED)
                     {
                         continue;
                     }
@@ -3443,7 +3590,17 @@ namespace
             L"bcryptprimitives.dll",
             L"wow64.dll",
             L"wow64cpu.dll",
-            L"wow64win.dll"
+            L"wow64win.dll",
+            L"dxgi.dll",
+            L"d3d9.dll",
+            L"d3d10.dll",
+            L"d3d10_1.dll",
+            L"d3d11.dll",
+            L"d3d11on12.dll",
+            L"d3d12.dll",
+            L"d3d12core.dll",
+            L"opengl32.dll",
+            L"vulkan-1.dll"
         };
         for (const wchar_t* name : names)
         {
@@ -9118,10 +9275,14 @@ void KernelMonitor::ScanUserModeHostility()
                                 pid);
                         }
                     }
-                    if (parsedModule &&
-                        compareGameText &&
+                    const bool scanCallTables =
                         moduleInventoryComplete &&
-                        !modulePaths.empty())
+                        !modulePaths.empty() &&
+                        loadedModuleBase != 0 &&
+                        (compareGameText ||
+                            compareSystemText ||
+                            ((watched || dropHost) && moduleLeaf == leaf));
+                    if (parsedModule && scanCallTables)
                     {
                         uint32_t dllIatHits = 0;
                         ScanLiveImportThunks(
@@ -9172,6 +9333,30 @@ void KernelMonitor::ScanUserModeHostility()
                                     std::to_wstring(pid) + L" " + leaf +
                                     L" module=" + moduleLeaf,
                                 L"hits=" + std::to_wstring(dllIatHits),
+                                pid);
+                        }
+                        uint32_t tableHits = 0;
+                        ScanLiveCallTablePointers(
+                            moduleHeaders,
+                            loadedModuleBase,
+                            processHandle,
+                            device,
+                            symbols,
+                            pid,
+                            moduleRanges,
+                            &tableHits);
+                        if (tableHits > 0)
+                        {
+                            EmitUnique(
+                                L"process.implant",
+                                L"vtable_hook:" + std::to_wstring(pid) + L":" +
+                                    moduleLeaf,
+                                imagePath,
+                                L"vtable_hook",
+                                L"module call-table slots point at private executable memory pid=" +
+                                    std::to_wstring(pid) + L" " + leaf +
+                                    L" module=" + moduleLeaf,
+                                L"hits=" + std::to_wstring(tableHits),
                                 pid);
                         }
                     }
@@ -11002,6 +11187,8 @@ bool KernelMonitorSelfTest()
         }
         if (!KmonLooksLikeHookableSystemDll(L"ntdll.dll") ||
             !KmonLooksLikeHookableSystemDll(L"win32u.dll") ||
+            !KmonLooksLikeHookableSystemDll(L"dxgi.dll") ||
+            !KmonLooksLikeHookableSystemDll(L"d3d11.dll") ||
             KmonLooksLikeHookableSystemDll(L"game.dll") ||
             KmonLooksLikeHookableSystemDll(L"version.dll"))
         {

@@ -350,6 +350,7 @@ std::wstring HuntModeToText(HuntMode mode);
 std::wstring HuntFirstCommandLineImage(const std::wstring& commandLine);
 bool HuntProcessLifecycleSelfTest();
 bool HuntInjectedModuleSelfTest();
+bool HuntInProcessHookSelfTest();
 bool HuntCidTableAnchorSelfTest();
 bool EnumerateCidProcessIds(
     DeviceClient& device,

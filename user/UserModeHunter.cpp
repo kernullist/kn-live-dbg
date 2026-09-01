@@ -5186,6 +5186,72 @@ namespace
         return matched;
     }
 
+    bool ModuleLooksLikeGraphicsApiDll(const std::wstring& leaf)
+    {
+        return leaf == L"dxgi.dll" ||
+            leaf == L"d3d9.dll" ||
+            leaf == L"d3d10.dll" ||
+            leaf == L"d3d10_1.dll" ||
+            leaf == L"d3d11.dll" ||
+            leaf == L"d3d11on12.dll" ||
+            leaf == L"d3d12.dll" ||
+            leaf == L"d3d12core.dll" ||
+            leaf == L"opengl32.dll" ||
+            leaf == L"vulkan-1.dll";
+    }
+
+    bool ProcessHasGraphicsApiModule(const HuntProcessRecord& process)
+    {
+        bool found = false;
+        for (const HuntModuleRecord& module : process.Modules)
+        {
+            const std::wstring leaf =
+                LeafName(module.Name.empty() ? module.Path : module.Name);
+            if (ModuleLooksLikeGraphicsApiDll(leaf))
+            {
+                found = true;
+                break;
+            }
+        }
+        return found;
+    }
+
+    bool AddressInUnbackedExecutableVad(
+        const HuntProcessRecord& process,
+        uint64_t address)
+    {
+        bool matched = false;
+
+        do
+        {
+            if (AddressInPrivateExecutableVad(process, address))
+            {
+                matched = true;
+                break;
+            }
+            if (LoaderModuleCoversAddress(process, address, nullptr))
+            {
+                break;
+            }
+            const ProcessVadRecord* vad = FindVadContaining(process, address);
+            if (vad == nullptr || !vad->Executable)
+            {
+                break;
+            }
+            if (vad->HasPrivateMemory && vad->PrivateMemory)
+            {
+                break;
+            }
+            if (!ProcessHasCompleteUserModuleInventory(process))
+            {
+                break;
+            }
+            matched = true;
+        } while (false);
+
+        return matched;
+    }
+
     bool IsCoreOsDllLeaf(const std::wstring& leaf)
     {
         return leaf == L"ntdll.dll" ||
@@ -19656,6 +19722,11 @@ namespace
                     }
                 }
 
+                bool unbackedMappedExecutable =
+                    vad.Executable &&
+                    !privateMemory &&
+                    !loaderCovered &&
+                    ProcessHasCompleteUserModuleInventory(*process);
                 bool imageSectionPermissionSuspicious = !imageSectionReasons.empty();
                 bool imageExecutePermissionDrift =
                     std::find(
@@ -19684,7 +19755,8 @@ namespace
                     imageExecutePermissionDrift ||
                     imageWritePermissionDrift ||
                     moduleStompingPermissionEvidence ||
-                    defaultImageRwxSection;
+                    defaultImageRwxSection ||
+                    unbackedMappedExecutable;
                 // Raw stack slots routinely contain legitimate JIT and
                 // emulator return addresses.  Treat them as execution
                 // corroboration only after the VAD already has PE/header,
@@ -19716,7 +19788,8 @@ namespace
                     !largePrivateExecutable &&
                     !privatePe &&
                     !executablePrivatePeSuspicious &&
-                    !imageSectionPermissionSuspicious)
+                    !imageSectionPermissionSuspicious &&
+                    !unbackedMappedExecutable)
                 {
                     continue;
                 }
@@ -19773,6 +19846,10 @@ namespace
                 if (executablePrivatePeSuspicious)
                 {
                     reasons.push_back(L"wiped_pe_header");
+                }
+                if (unbackedMappedExecutable)
+                {
+                    reasons.push_back(L"mapped_executable_without_loader");
                 }
                 for (const std::wstring& reason : imageSectionReasons)
                 {
@@ -20797,6 +20874,37 @@ namespace
         return isMain;
     }
 
+    bool ModuleShouldScanForCallTableHooks(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module)
+    {
+        bool scan = false;
+
+        do
+        {
+            if (module.Base == 0 ||
+                !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)))
+            {
+                break;
+            }
+            if (IsMainImageModule(process, module))
+            {
+                scan = true;
+                break;
+            }
+            const std::wstring leaf =
+                LeafName(module.Name.empty() ? module.Path : module.Name);
+            if (ModuleLooksLikeGraphicsApiDll(leaf) ||
+                IsCoreOsDllLeaf(leaf) ||
+                leaf == L"win32u.dll")
+            {
+                scan = true;
+            }
+        } while (false);
+
+        return scan;
+    }
+
     bool ModuleLooksLikeProcessMainImage(
         const HuntProcessRecord& process,
         const HuntModuleRecord& module)
@@ -21742,8 +21850,12 @@ namespace
         {
             if (result == nullptr ||
                 process.ProcessId <= 4 ||
-                process.ThreadRecords.empty() ||
-                ProcessLooksLikeJitHost(process))
+                process.ThreadRecords.empty())
+            {
+                break;
+            }
+            if (ProcessLooksLikeJitHost(process) &&
+                !ProcessHasGraphicsApiModule(process))
             {
                 break;
             }
@@ -21793,7 +21905,7 @@ namespace
                     continue;
                 }
                 if (LoaderModuleCoversAddress(process, rip, nullptr) ||
-                    !AddressInPrivateExecutableVad(process, rip))
+                    !AddressInUnbackedExecutableVad(process, rip))
                 {
                     continue;
                 }
@@ -21945,7 +22057,7 @@ namespace
         } while (false);
     }
 
-    void AddMainImageIatHookFindings(
+    void AddCallTableHookFindings(
         DeviceClient& device,
         HuntResult* result,
         const HuntProcessRecord& process)
@@ -21954,152 +22066,364 @@ namespace
         {
             if (result == nullptr ||
                 process.ProcessId <= 4 ||
-                !process.HasPebImageBase ||
-                process.PebImageBase == 0 ||
                 process.Modules.empty())
             {
                 break;
             }
 
-            std::vector<uint8_t> header;
-            std::wstring ignored;
-            if (!ReadHuntProcessMemory(
-                    device,
-                    process.Kernel,
-                    process.PebImageBase,
-                    0x400,
-                    &header,
-                    &ignored) ||
-                header.size() < sizeof(IMAGE_DOS_HEADER) + sizeof(uint32_t) +
-                    sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t))
+            size_t findings = 0;
+            constexpr size_t kMaxFindings = 8;
+            constexpr uint32_t kMaxHeaderBytes = 0x1000;
+            constexpr uint32_t kMaxIatBytes = 0x10000;
+            constexpr uint32_t kMaxTableBytes = 0x20000;
+            for (const HuntModuleRecord& module : process.Modules)
             {
-                break;
-            }
-
-            IMAGE_DOS_HEADER dos = {};
-            std::memcpy(&dos, header.data(), sizeof(dos));
-            if (dos.e_magic != IMAGE_DOS_SIGNATURE)
-            {
-                break;
-            }
-            const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
-            if (ntOffset < sizeof(IMAGE_DOS_HEADER) ||
-                static_cast<uint64_t>(ntOffset) + sizeof(uint32_t) +
-                    sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t) >
-                    header.size())
-            {
-                break;
-            }
-            uint16_t magic = 0;
-            const size_t optionalOffset =
-                static_cast<size_t>(ntOffset) + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER);
-            if (optionalOffset + sizeof(uint16_t) > header.size())
-            {
-                break;
-            }
-            std::memcpy(&magic, header.data() + optionalOffset, sizeof(magic));
-
-            IMAGE_DATA_DIRECTORY iat = {};
-            size_t thunkSize = sizeof(uint64_t);
-            if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-            {
-                if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER64, DataDirectory) +
-                        (IMAGE_DIRECTORY_ENTRY_IAT + 1) * sizeof(IMAGE_DATA_DIRECTORY) >
-                    header.size())
+                if (findings >= kMaxFindings ||
+                    !ModuleShouldScanForCallTableHooks(process, module))
                 {
-                    break;
+                    continue;
                 }
-                IMAGE_OPTIONAL_HEADER64 optional = {};
+
+                std::vector<uint8_t> header;
+                std::wstring ignored;
+                if (!ReadHuntProcessMemory(
+                        device,
+                        process.Kernel,
+                        module.Base,
+                        kMaxHeaderBytes,
+                        &header,
+                        &ignored) ||
+                    header.size() < sizeof(IMAGE_DOS_HEADER) + sizeof(uint32_t) +
+                        sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t))
+                {
+                    continue;
+                }
+
+                IMAGE_DOS_HEADER dos = {};
+                std::memcpy(&dos, header.data(), sizeof(dos));
+                if (dos.e_magic != IMAGE_DOS_SIGNATURE)
+                {
+                    continue;
+                }
+                const uint32_t ntOffset = static_cast<uint32_t>(dos.e_lfanew);
+                if (ntOffset < sizeof(IMAGE_DOS_HEADER) ||
+                    static_cast<uint64_t>(ntOffset) + sizeof(uint32_t) +
+                        sizeof(IMAGE_FILE_HEADER) + sizeof(uint16_t) >
+                        header.size())
+                {
+                    continue;
+                }
+                IMAGE_FILE_HEADER fileHeader = {};
                 std::memcpy(
-                    &optional,
-                    header.data() + optionalOffset,
-                    (std::min)(header.size() - optionalOffset, sizeof(optional)));
-                if (optional.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+                    &fileHeader,
+                    header.data() + ntOffset + sizeof(uint32_t),
+                    sizeof(fileHeader));
+                uint16_t magic = 0;
+                const size_t optionalOffset =
+                    static_cast<size_t>(ntOffset) + sizeof(uint32_t) +
+                    sizeof(IMAGE_FILE_HEADER);
+                if (optionalOffset + sizeof(uint16_t) > header.size())
                 {
-                    break;
+                    continue;
                 }
-                iat = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
-                thunkSize = sizeof(uint64_t);
-            }
-            else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
-            {
-                if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER32, DataDirectory) +
-                        (IMAGE_DIRECTORY_ENTRY_IAT + 1) * sizeof(IMAGE_DATA_DIRECTORY) >
-                    header.size())
-                {
-                    break;
-                }
-                IMAGE_OPTIONAL_HEADER32 optional = {};
-                std::memcpy(
-                    &optional,
-                    header.data() + optionalOffset,
-                    (std::min)(header.size() - optionalOffset, sizeof(optional)));
-                if (optional.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
-                {
-                    break;
-                }
-                iat = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
-                thunkSize = sizeof(uint32_t);
-            }
-            else
-            {
-                break;
-            }
-            if (iat.VirtualAddress == 0 || iat.Size < thunkSize || iat.Size > 0x4000)
-            {
-                break;
-            }
-            if (static_cast<uint64_t>(iat.VirtualAddress) > (~0ull - process.PebImageBase))
-            {
-                break;
-            }
+                std::memcpy(&magic, header.data() + optionalOffset, sizeof(magic));
 
-            std::vector<uint8_t> thunks;
-            if (!ReadHuntProcessMemory(
-                    device,
-                    process.Kernel,
-                    process.PebImageBase + iat.VirtualAddress,
-                    iat.Size,
-                    &thunks,
-                    &ignored) ||
-                thunks.size() < thunkSize)
+                IMAGE_DATA_DIRECTORY iat = {};
+                size_t thunkSize = sizeof(uint64_t);
+                if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+                {
+                    if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER64, DataDirectory) +
+                            (IMAGE_DIRECTORY_ENTRY_IAT + 1) * sizeof(IMAGE_DATA_DIRECTORY) >
+                        header.size())
+                    {
+                        continue;
+                    }
+                    IMAGE_OPTIONAL_HEADER64 optional = {};
+                    std::memcpy(
+                        &optional,
+                        header.data() + optionalOffset,
+                        (std::min)(header.size() - optionalOffset, sizeof(optional)));
+                    if (optional.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+                    {
+                        continue;
+                    }
+                    iat = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+                    thunkSize = sizeof(uint64_t);
+                }
+                else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+                {
+                    if (optionalOffset + offsetof(IMAGE_OPTIONAL_HEADER32, DataDirectory) +
+                            (IMAGE_DIRECTORY_ENTRY_IAT + 1) * sizeof(IMAGE_DATA_DIRECTORY) >
+                        header.size())
+                    {
+                        continue;
+                    }
+                    IMAGE_OPTIONAL_HEADER32 optional = {};
+                    std::memcpy(
+                        &optional,
+                        header.data() + optionalOffset,
+                        (std::min)(header.size() - optionalOffset, sizeof(optional)));
+                    if (optional.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT)
+                    {
+                        continue;
+                    }
+                    iat = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+                    thunkSize = sizeof(uint32_t);
+                }
+                else
+                {
+                    continue;
+                }
+
+                auto emitHook =
+                    [&](uint64_t target,
+                        const std::wstring& reason,
+                        const std::wstring& title,
+                        const std::wstring& slotName,
+                        uint32_t slotIndex)
+                    {
+                        if (findings >= kMaxFindings ||
+                            target == 0 ||
+                            !IsUserAddress(target) ||
+                            LoaderModuleCoversAddress(process, target, nullptr) ||
+                            !AddressInUnbackedExecutableVad(process, target))
+                        {
+                            return;
+                        }
+                        std::map<std::wstring, std::wstring> evidence;
+                        evidence[slotName] = std::to_wstring(slotIndex);
+                        evidence[L"thunk"] = HuntHex(target, 16);
+                        evidence[L"thunk_width"] =
+                            std::to_wstring(static_cast<uint32_t>(thunkSize));
+                        evidence[L"module_base"] = HuntHex(module.Base, 16);
+                        AddFinding(
+                            result,
+                            process,
+                            L"high",
+                            L"high",
+                            L"process_injection",
+                            title,
+                            target,
+                            module.Name.empty() ? LeafName(module.Path) : module.Name,
+                            {reason},
+                            evidence);
+                        ++findings;
+                    };
+
+                if (iat.VirtualAddress != 0 &&
+                    iat.Size >= thunkSize &&
+                    iat.Size <= kMaxIatBytes &&
+                    static_cast<uint64_t>(iat.VirtualAddress) <= (~0ull - module.Base))
+                {
+                    std::vector<uint8_t> thunks;
+                    if (ReadHuntProcessMemory(
+                            device,
+                            process.Kernel,
+                            module.Base + iat.VirtualAddress,
+                            iat.Size,
+                            &thunks,
+                            &ignored) &&
+                        thunks.size() >= thunkSize)
+                    {
+                        const size_t count = thunks.size() / thunkSize;
+                        for (size_t index = 0;
+                            index < count && findings < kMaxFindings;
+                            ++index)
+                        {
+                            uint64_t thunk = 0;
+                            std::memcpy(
+                                &thunk,
+                                thunks.data() + (index * thunkSize),
+                                thunkSize);
+                            emitHook(
+                                thunk,
+                                L"iat_hook_private_exec",
+                                L"module IAT thunk points at unbacked executable memory",
+                                L"iat_index",
+                                static_cast<uint32_t>(index));
+                        }
+                    }
+                }
+
+                const size_t sectionOffset =
+                    optionalOffset + fileHeader.SizeOfOptionalHeader;
+                const uint16_t sectionLimit =
+                    (fileHeader.NumberOfSections < 24)
+                        ? fileHeader.NumberOfSections
+                        : static_cast<uint16_t>(24);
+                for (uint16_t sectionIndex = 0;
+                    sectionIndex < sectionLimit && findings < kMaxFindings;
+                    ++sectionIndex)
+                {
+                    const size_t off =
+                        sectionOffset +
+                        static_cast<size_t>(sectionIndex) * sizeof(IMAGE_SECTION_HEADER);
+                    if (off + sizeof(IMAGE_SECTION_HEADER) > header.size())
+                    {
+                        break;
+                    }
+                    IMAGE_SECTION_HEADER section = {};
+                    std::memcpy(&section, header.data() + off, sizeof(section));
+                    if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
+                        (section.Characteristics & IMAGE_SCN_CNT_CODE) != 0 ||
+                        (section.Characteristics & IMAGE_SCN_MEM_READ) == 0)
+                    {
+                        continue;
+                    }
+                    const uint32_t span =
+                        (section.Misc.VirtualSize != 0)
+                            ? section.Misc.VirtualSize
+                            : section.SizeOfRawData;
+                    if (span < thunkSize ||
+                        section.VirtualAddress == 0 ||
+                        module.Base > (~0ull - section.VirtualAddress))
+                    {
+                        continue;
+                    }
+                    const uint32_t toRead = (std::min)(span, kMaxTableBytes);
+                    std::vector<uint8_t> table;
+                    if (!ReadHuntProcessMemory(
+                            device,
+                            process.Kernel,
+                            module.Base + section.VirtualAddress,
+                            toRead,
+                            &table,
+                            &ignored) ||
+                        table.size() < thunkSize)
+                    {
+                        continue;
+                    }
+                    const size_t count = table.size() / thunkSize;
+                    for (size_t slot = 0;
+                        slot < count && findings < kMaxFindings;
+                        ++slot)
+                    {
+                        uint64_t target = 0;
+                        std::memcpy(
+                            &target,
+                            table.data() + (slot * thunkSize),
+                            thunkSize);
+                        emitHook(
+                            target,
+                            L"vtable_hook_private_exec",
+                            L"module call-table slot points at unbacked executable memory",
+                            L"table_index",
+                            static_cast<uint32_t>(slot));
+                    }
+                }
+            }
+        } while (false);
+    }
+
+    void AddClonedVtableFindings(
+        DeviceClient& device,
+        HuntResult* result,
+        const HuntProcessRecord& process)
+    {
+        do
+        {
+            if (result == nullptr ||
+                process.ProcessId <= 4 ||
+                !ProcessHasGraphicsApiModule(process) ||
+                process.VadRecords.empty())
             {
                 break;
             }
 
             size_t findings = 0;
-            const size_t count = thunks.size() / thunkSize;
-            for (size_t index = 0; index < count && findings < 4; ++index)
+            uint32_t scanned = 0;
+            constexpr uint32_t kMaxScan = 48;
+            constexpr size_t kMaxFindings = 4;
+            constexpr uint64_t kMinSize = 0x40;
+            constexpr uint64_t kMaxSize = 0x4000;
+            for (const ProcessVadRecord& vad : process.VadRecords)
             {
-                uint64_t thunk = 0;
-                std::memcpy(&thunk, thunks.data() + (index * thunkSize), thunkSize);
-                if (thunk == 0 || !IsUserAddress(thunk))
+                if (findings >= kMaxFindings || scanned >= kMaxScan)
+                {
+                    break;
+                }
+                const bool privateRw =
+                    vad.HasPrivateMemory &&
+                    vad.PrivateMemory &&
+                    !vad.Executable &&
+                    vad.Size >= kMinSize &&
+                    vad.Size <= kMaxSize &&
+                    vad.StartAddress != 0;
+                if (!privateRw)
                 {
                     continue;
                 }
-                if (LoaderModuleCoversAddress(process, thunk, nullptr))
+                ++scanned;
+                const uint32_t toRead =
+                    static_cast<uint32_t>((std::min)(vad.Size, 0x1000ull));
+                std::vector<uint8_t> bytes;
+                std::wstring ignored;
+                if (!ReadHuntProcessMemory(
+                        device,
+                        process.Kernel,
+                        vad.StartAddress,
+                        toRead,
+                        &bytes,
+                        &ignored) ||
+                    bytes.size() < 16)
                 {
                     continue;
                 }
-                if (!AddressInPrivateExecutableVad(process, thunk))
+                uint32_t graphicsSlots = 0;
+                uint32_t unbackedSlots = 0;
+                uint64_t firstUnbacked = 0;
+                const size_t count = bytes.size() / sizeof(uint64_t);
+                for (size_t slot = 0; slot < count; ++slot)
+                {
+                    uint64_t target = 0;
+                    std::memcpy(
+                        &target,
+                        bytes.data() + (slot * sizeof(uint64_t)),
+                        sizeof(target));
+                    if (target == 0 || !IsUserAddress(target))
+                    {
+                        continue;
+                    }
+                    const HuntModuleRecord* owner =
+                        FindLoaderModuleContainingAddress(process, target);
+                    if (owner != nullptr)
+                    {
+                        const std::wstring leaf =
+                            LeafName(owner->Name.empty() ? owner->Path : owner->Name);
+                        if (ModuleLooksLikeGraphicsApiDll(leaf))
+                        {
+                            ++graphicsSlots;
+                        }
+                        continue;
+                    }
+                    if (AddressInUnbackedExecutableVad(process, target))
+                    {
+                        ++unbackedSlots;
+                        if (firstUnbacked == 0)
+                        {
+                            firstUnbacked = target;
+                        }
+                    }
+                }
+                if (graphicsSlots < 3 || unbackedSlots == 0 || firstUnbacked == 0)
                 {
                     continue;
                 }
-
                 std::map<std::wstring, std::wstring> evidence;
-                evidence[L"iat_index"] = std::to_wstring(static_cast<uint32_t>(index));
-                evidence[L"thunk"] = HuntHex(thunk, 16);
-                evidence[L"thunk_width"] = std::to_wstring(static_cast<uint32_t>(thunkSize));
+                evidence[L"vtable"] = HuntHex(vad.StartAddress, 16);
+                evidence[L"graphics_slots"] = std::to_wstring(graphicsSlots);
+                evidence[L"unbacked_slots"] = std::to_wstring(unbackedSlots);
+                evidence[L"hook"] = HuntHex(firstUnbacked, 16);
                 AddFinding(
                     result,
                     process,
                     L"high",
-                    L"medium",
+                    L"high",
                     L"process_injection",
-                    L"main-image IAT thunk points at private executable memory",
-                    thunk,
-                    BestProcessImageName(process),
-                    {L"iat_hook_private_exec"},
+                    L"cloned graphics vtable points at unbacked executable memory",
+                    firstUnbacked,
+                    L"",
+                    {L"cloned_vtable_private_exec", L"vtable_hook_private_exec"},
                     evidence);
                 ++findings;
             }
@@ -22179,7 +22503,7 @@ namespace
                         continue;
                     }
 
-                    const bool inPrivate = AddressInPrivateExecutableVad(process, dr[index]);
+                    const bool inPrivate = AddressInUnbackedExecutableVad(process, dr[index]);
                     const HuntModuleRecord* owner =
                         FindLoaderModuleContainingAddress(process, dr[index]);
                     bool coreOs = false;
@@ -23652,21 +23976,27 @@ namespace
                     {
                         if (module == nullptr)
                         {
-                            return 4;
+                            return 5;
                         }
                         if (IsMainImageModule(*process, *module))
                         {
                             return 0;
                         }
-                        if (module->VadImageSeen)
+                        const std::wstring leaf =
+                            LeafName(module->Name.empty() ? module->Path : module->Name);
+                        if (ModuleLooksLikeGraphicsApiDll(leaf))
                         {
                             return 1;
                         }
-                        if (ModuleHasLoaderView(*module))
+                        if (module->VadImageSeen)
                         {
                             return 2;
                         }
-                        return 3;
+                        if (ModuleHasLoaderView(*module))
+                        {
+                            return 3;
+                        }
+                        return 4;
                     };
 
                     return priority(left) < priority(right);
@@ -23734,7 +24064,12 @@ namespace
                 }
 
                 bool mainImage = IsMainImageModule(*process, module);
-                bool compareFullExecutableSections = mainImage || !process->BuiltinProfileViolations.empty();
+                const std::wstring moduleLeaf =
+                    LeafName(module.Name.empty() ? module.Path : module.Name);
+                bool compareFullExecutableSections =
+                    mainImage ||
+                    ModuleLooksLikeGraphicsApiDll(moduleLeaf) ||
+                    !process->BuiltinProfileViolations.empty();
                 std::set<uint32_t> comparedPageRvas;
                 if (metadata.HasEntryPoint)
                 {
@@ -24599,6 +24934,10 @@ namespace
                 lowered == L"main_section_object_file_section_object_pointer_mismatch" ||
                 lowered == L"module_stomping_permission_evidence" ||
                 lowered == L"module_entrypoint_write_permission_drift" ||
+                lowered == L"iat_hook_private_exec" ||
+                lowered == L"vtable_hook_private_exec" ||
+                lowered == L"cloned_vtable_private_exec" ||
+                lowered == L"mapped_executable_without_loader" ||
                 lowered == L"security_tool_communication_blocking" ||
                 lowered == L"security_tool_communication_throttling" ||
                 lowered == L"qos_security_product_throttle_policy" ||
@@ -25292,6 +25631,90 @@ bool HuntInjectedModuleSelfTest()
         {
             break;
         }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool HuntInProcessHookSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        if (!ModuleLooksLikeGraphicsApiDll(L"dxgi.dll") ||
+            !ModuleLooksLikeGraphicsApiDll(L"d3d11.dll") ||
+            !ModuleLooksLikeGraphicsApiDll(L"vulkan-1.dll") ||
+            ModuleLooksLikeGraphicsApiDll(L"game.dll") ||
+            ModuleLooksLikeGraphicsApiDll(L"ntdll.dll"))
+        {
+            break;
+        }
+
+        HuntProcessRecord game = {};
+        game.ProcessId = 1000;
+        game.ApiImagePath = L"C:\\Games\\Title\\game.exe";
+        game.HasPebImageBase = true;
+        game.PebImageBase = 0x140000000ull;
+        game.PebLdrEnumerated = true;
+        game.PebLdrLoadEnumerated = true;
+        game.ToolhelpModuleEnumerated = true;
+
+        HuntModuleRecord main = {};
+        main.Base = 0x140000000ull;
+        main.Size = 0x100000;
+        main.Name = L"game.exe";
+        main.Path = game.ApiImagePath;
+        main.ToolhelpSeen = true;
+        main.LdrLoadSeen = true;
+
+        HuntModuleRecord dxgi = {};
+        dxgi.Base = 0x7ff800000000ull;
+        dxgi.Size = 0x200000;
+        dxgi.Name = L"dxgi.dll";
+        dxgi.Path = L"C:\\Windows\\System32\\dxgi.dll";
+        dxgi.ToolhelpSeen = true;
+        dxgi.LdrLoadSeen = true;
+
+        HuntModuleRecord engine = {};
+        engine.Base = 0x180000000ull;
+        engine.Size = 0x40000;
+        engine.Name = L"engine.dll";
+        engine.Path = L"C:\\Games\\Title\\engine.dll";
+        engine.ToolhelpSeen = true;
+        engine.LdrLoadSeen = true;
+
+        game.Modules.push_back(main);
+        game.Modules.push_back(dxgi);
+        game.Modules.push_back(engine);
+
+        ProcessVadRecord privateRx = {};
+        privateRx.StartAddress = 0x200000;
+        privateRx.EndAddress = 0x201fff;
+        privateRx.Executable = true;
+        privateRx.HasPrivateMemory = true;
+        privateRx.PrivateMemory = true;
+        game.VadRecords.push_back(privateRx);
+
+        HuntProcessRecord noGraphics = game;
+        noGraphics.Modules.clear();
+        noGraphics.Modules.push_back(main);
+        noGraphics.Modules.push_back(engine);
+
+        if (!ProcessHasGraphicsApiModule(game) ||
+            ProcessHasGraphicsApiModule(noGraphics) ||
+            !ModuleShouldScanForCallTableHooks(game, main) ||
+            !ModuleShouldScanForCallTableHooks(game, dxgi) ||
+            ModuleShouldScanForCallTableHooks(game, engine) ||
+            !AddressInPrivateExecutableVad(game, 0x200100) ||
+            !AddressInUnbackedExecutableVad(game, 0x200100) ||
+            AddressInUnbackedExecutableVad(game, dxgi.Base + 0x1000) ||
+            AddressInUnbackedExecutableVad(game, 0x1234))
+        {
+            break;
+        }
+
         ok = true;
     } while (false);
 
@@ -28890,7 +29313,8 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 AddInstrumentationCallbackFinding(device_, symbols_, result, process);
                 AddTrapFrameRipFindings(device_, symbols_, result, process);
                 AddDirectSyscallStubFindings(device_, result, process);
-                AddMainImageIatHookFindings(device_, result, process);
+                AddCallTableHookFindings(device_, result, process);
+                AddClonedVtableFindings(device_, result, process);
                 AddHardwareBreakpointFindings(device_, result, process);
                 AddMainImageHerpaderpFinding(device_, result, process);
                 AddMainImageVadFinding(device_, symbols_, result, &process);
