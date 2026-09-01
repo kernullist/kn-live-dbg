@@ -23288,6 +23288,35 @@ static void PrintTimelineIngestResult(const std::wstring& source, const Timeline
     }
 }
 
+static std::wstring TimelineImageSignatureLevelName(uint32_t level)
+{
+    switch (level)
+    {
+    case 0: return L"unchecked";
+    case 1: return L"unsigned";
+    case 2: return L"enterprise";
+    case 4: return L"authenticode";
+    case 6: return L"store";
+    case 7: return L"antimalware";
+    case 8: return L"microsoft";
+    case 12: return L"windows";
+    case 14: return L"windows_tcb";
+    default: return L"level_" + std::to_wstring(level);
+    }
+}
+
+static std::wstring TimelineImageSignatureTypeName(uint32_t type)
+{
+    switch (type)
+    {
+    case 0: return L"none";
+    case 1: return L"embedded";
+    case 2: return L"catalog";
+    case 3: return L"catalog_uncached";
+    default: return L"type_" + std::to_wstring(type);
+    }
+}
+
 static std::wstring TimelineLiveEventTypeText(uint32_t type)
 {
     std::wstring text = L"unknown";
@@ -23394,6 +23423,29 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     if (live.FileObject != 0)
     {
         event.Evidence[L"file_object"] = HexTextWidth(live.FileObject, 16, true);
+    }
+    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD && live.Flags != 0)
+    {
+        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_SYSTEM_MODE) != 0)
+        {
+            event.Evidence[L"system_mode"] = L"true";
+        }
+        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_PARTIAL_MAP) != 0)
+        {
+            event.Evidence[L"partial_map"] = L"true";
+        }
+        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_EXTENDED) != 0)
+        {
+            event.Evidence[L"extended_info"] = L"true";
+        }
+        const uint32_t sigLevel =
+            (live.Flags & KNDBG_TIMELINE_IMAGE_SIGLEVEL_MASK) >>
+            KNDBG_TIMELINE_IMAGE_SIGLEVEL_SHIFT;
+        const uint32_t sigType =
+            (live.Flags & KNDBG_TIMELINE_IMAGE_SIGTYPE_MASK) >>
+            KNDBG_TIMELINE_IMAGE_SIGTYPE_SHIFT;
+        event.Evidence[L"signature_level"] = TimelineImageSignatureLevelName(sigLevel);
+        event.Evidence[L"signature_type"] = TimelineImageSignatureTypeName(sigType);
     }
     if (event.Risk.empty())
     {
@@ -24644,18 +24696,22 @@ static void PrintKmonHelp()
     std::wcout << L"  /background     arm only, return to the prompt (JSONL still fills); /nowatch alias\n";
     std::wcout << L"  /name game.exe  add overlay inject.remote (overlays/AC can be noisy)\n";
     std::wcout << L"  /driver name    highlight only; never hides unknown drop names\n";
-    std::wcout << L"  /verbose        also keep inbox System32\\drivers loads (first start only)\n";
+    std::wcout << L"  /verbose        also keep inbox TI DriverObjectLoad (first start only)\n";
     std::wcout << L"  /log /verbose /throttle apply only on the first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
-    std::wcout << L"  shown:  drop_load, short_lived, mapped_residue, hook.unbacked, hidden,\n";
+    std::wcout << L"  shown:  drop_load, image_only (post-arm kernel image notify), short_lived,\n";
+    std::wcout << L"          mapped_residue, hook.unbacked, hidden,\n";
     std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw\n";
-    std::wcout << L"  hidden: inbox System32\\drivers, process create, local AllocVM, kernel R/W\n";
+    std::wcout << L"  hidden: inbox TI DriverObjectLoad, process create, local AllocVM, kernel R/W,\n";
+    std::wcout << L"          ReadVM/suspend/resume alone\n";
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
     std::wcout << L"  a quiet idle host is mostly silent after the start line.\n";
     std::wcout << L"\n";
     std::wcout << L"logged kinds:\n";
     std::wcout << L"  driver.drop_load        .sys outside System32\\drivers (Temp/Users/Program Files/root)\n";
+    std::wcout << L"  driver.image_only       kernel image-load notify after !kmon arm (inbox included);\n";
+    std::wcout << L"                          prints path, image base, size, and CI signature level\n";
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
     std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
@@ -24672,9 +24728,10 @@ static void PrintKmonHelp()
     std::wcout << L"                          unknown module outside the image dir on a watch target,\n";
     std::wcout << L"                          extra non-inbox module in a Windows builtin,\n";
     std::wcout << L"                          private W+X / PE VAD / hidden executable PTEs on watch or PPL\n";
-    std::wcout << L"  inject.remote           drop/unknown-path any remote inject; builtin WriteVM/APC/SetThreadContext;\n";
-    std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView and ReadVM/suspend\n";
-    std::wcout << L"                          on non-inbox watch targets (builtin ReadVM stays off)\n";
+    std::wcout << L"  inject.remote           drop/unknown-path remote AllocVM/ProtectVM/MapView/WriteVM/APC/SetThreadContext;\n";
+    std::wcout << L"                          builtin WriteVM/APC/SetThreadContext;\n";
+    std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView\n";
+    std::wcout << L"                          (ReadVM/suspend/resume alone are not inject)\n";
     std::wcout << L"  integrity.ci / .cr      DSE off, CR0.WP=0 (test-signing is not a finding)\n";
     std::wcout << L"  kernel MmCopyVirtualMemory is not on TI; hooks and pool PE are the substitute.\n";
     std::wcout << L"  lab fixture: KnLiveDbgKmonTarget.exe (docs/KMON_TEST_TARGET.md)\n";
@@ -25060,7 +25117,7 @@ static void HandleKmonCommand(
             }
 
             PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
-            std::wcout << L" started. logging unknown drop/map/hidden events.\n";
+            std::wcout << L" started. logging unknown drop/map/hidden events and post-arm kernel image loads.\n";
             KmonOptions current = kmon.CurrentOptions();
             std::wcout << L"     log directory=" << current.LogDirectory
                        << L" verbose_inbox=" << (current.VerboseDrivers ? L"yes" : L"no") << L"\n";
@@ -30961,7 +31018,9 @@ static int RunConsoleSurfaceSelfTest()
                     kmonHelp.find(L"write on") != std::wstring::npos &&
                     kmonHelp.find(L"filename is not an input") != std::wstring::npos &&
                     kmonHelp.find(L"not a TI firehose") != std::wstring::npos &&
-                    kmonHelp.find(L"!kmon watch") != std::wstring::npos,
+                    kmonHelp.find(L"!kmon watch") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.image_only") != std::wstring::npos &&
+                    kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos,
                 L"kmon-help-covers-drop-load-and-live-tail");
         }
         CheckCompletionCandidate(&context, {L"help", L"!byovd"}, L"fixture", L"help-byovd-fixture-completion");

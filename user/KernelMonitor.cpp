@@ -4038,16 +4038,16 @@ bool KmonTaskLooksLikeDeviceObject(const std::wstring& task)
 
 bool KmonTaskLooksLikeRemoteInject(const std::wstring& task)
 {
+    // ReadVM / Suspend / Resume alone are not injection. Anti-cheat, overlays,
+    // dumpers, and the OS itself remote-read constantly. Staging + write/APC
+    // / context change is the inject surface.
     std::wstring lower = ToLowerCopy(task);
     return lower.find(L"allocvm") != std::wstring::npos ||
         lower.find(L"protectvm") != std::wstring::npos ||
         lower.find(L"mapview") != std::wstring::npos ||
         lower.find(L"queueuserapc") != std::wstring::npos ||
         lower.find(L"setthreadcontext") != std::wstring::npos ||
-        lower.find(L"writevm") != std::wstring::npos ||
-        lower.find(L"readvm") != std::wstring::npos ||
-        lower.find(L"suspend") != std::wstring::npos ||
-        lower.find(L"resume") != std::wstring::npos;
+        lower.find(L"writevm") != std::wstring::npos;
 }
 
 bool KmonTaskLooksLikeRemoteInjectWrite(const std::wstring& task)
@@ -4206,6 +4206,71 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
     return classified;
 }
 
+static bool EvidenceIsTrue(const std::map<std::wstring, std::wstring>& evidence, const std::wstring& key)
+{
+    auto it = evidence.find(key);
+    return it != evidence.end() && it->second == L"true";
+}
+
+static void CopyImageNotifyEvidence(const TimelineEvent& event, KmonEvent* out)
+{
+    if (out == nullptr)
+    {
+        return;
+    }
+
+    const std::wstring keys[] = {
+        L"image_base",
+        L"image_size",
+        L"file_object",
+        L"system_mode",
+        L"signature_level",
+        L"signature_type",
+        L"partial_map"
+    };
+    for (const std::wstring& key : keys)
+    {
+        auto it = event.Evidence.find(key);
+        if (it != event.Evidence.end() && !it->second.empty())
+        {
+            out->Evidence[key] = it->second;
+        }
+    }
+}
+
+static void AppendImageNotifySummary(KmonEvent* out)
+{
+    if (out == nullptr)
+    {
+        return;
+    }
+
+    auto append = [&](const std::wstring& key, const std::wstring& label)
+    {
+        auto it = out->Evidence.find(key);
+        if (it == out->Evidence.end() || it->second.empty())
+        {
+            return;
+        }
+        if (key == L"system_mode" && it->second == L"true")
+        {
+            out->Summary += L" km";
+            return;
+        }
+        if (key == L"partial_map" && it->second == L"true")
+        {
+            out->Summary += L" partial";
+            return;
+        }
+        out->Summary += L" " + label + L"=" + it->second;
+    };
+    append(L"image_base", L"base");
+    append(L"image_size", L"size");
+    append(L"signature_level", L"sig");
+    append(L"system_mode", L"km");
+    append(L"partial_map", L"partial");
+}
+
 bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
 {
     bool classified = false;
@@ -4225,40 +4290,67 @@ bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
         out->Task = event.Action;
 
         std::wstring action = ToLowerCopy(event.Action);
+        const bool systemMode = EvidenceIsTrue(event.Evidence, L"system_mode");
         const bool looksKernelImage =
+            systemMode ||
             event.ProcessId == 0 ||
             event.ProcessId == 4 ||
             KmonPathLooksLikeSys(event.Entity);
-        if (action == L"image-load" && looksKernelImage && !event.Entity.empty())
+        const bool unnamedPlaceholder =
+            event.Entity.empty() ||
+            event.Entity.rfind(L"pid:", 0) == 0;
+        if (action == L"image-load" && looksKernelImage)
         {
-            const std::wstring pathClass = KmonClassifyDriverPath(event.Entity);
+            if (unnamedPlaceholder && !systemMode && event.ProcessId != 0 && event.ProcessId != 4)
+            {
+                break;
+            }
+
+            const std::wstring pathClass = unnamedPlaceholder
+                ? std::wstring(L"unknown")
+                : KmonClassifyDriverPath(event.Entity);
             const bool fileDrop =
                 pathClass == L"drop" ||
                 pathClass == L"third_party" ||
                 (pathClass != L"inbox" && KmonDriverPathHasFileDirectory(event.Entity));
             if (!fileDrop &&
                 pathClass != L"inbox" &&
-                !KmonPathLooksLikeSys(event.Entity))
+                !KmonPathLooksLikeSys(event.Entity) &&
+                !systemMode &&
+                event.ProcessId != 0 &&
+                event.ProcessId != 4)
             {
                 break;
             }
 
-            out->Driver = event.Entity;
+            out->Driver = unnamedPlaceholder ? std::wstring() : event.Entity;
             out->Evidence[L"path_class"] = pathClass;
             out->Evidence[L"source"] = L"image_notify";
+            CopyImageNotifyEvidence(event, out);
             if (fileDrop)
             {
                 out->Kind = L"driver.drop_load";
-                out->Summary = L"non-inbox kernel image load " + event.Entity;
+                out->Summary = L"non-inbox kernel image load " +
+                    (unnamedPlaceholder ? std::wstring(L"<unnamed>") : event.Entity);
                 out->Evidence[L"followup"] = L"!pool pe /suspicious; !mapper; !kpage /pe";
             }
             else
             {
                 out->Kind = L"driver.image_only";
-                out->Summary = (pathClass == L"inbox")
-                    ? (L"inbox kernel image load " + KmonBasenameLower(event.Entity))
-                    : (L"kernel image load " + KmonBasenameLower(event.Entity));
+                if (unnamedPlaceholder)
+                {
+                    out->Summary = L"unnamed kernel image load";
+                }
+                else if (pathClass == L"inbox")
+                {
+                    out->Summary = L"inbox kernel image load " + KmonBasenameLower(event.Entity);
+                }
+                else
+                {
+                    out->Summary = L"kernel image load " + KmonBasenameLower(event.Entity);
+                }
             }
+            AppendImageNotifySummary(out);
             classified = true;
             break;
         }
@@ -4304,6 +4396,7 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"process.hidden" ||
             event.Kind == L"process.syscall_unnamed" ||
             event.Kind == L"driver.drop_load" ||
+            event.Kind == L"driver.image_only" ||
             event.Kind == L"driver.short_lived" ||
             event.Kind == L"driver.mapped_residue" ||
             event.Kind == L"hook.unbacked" ||
@@ -4387,7 +4480,8 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
                     PathHasDirectorySeparator(event.TargetImage));
             const bool builtinSide =
                 KmonIsWindowsBuiltinLeaf(caller) || KmonIsWindowsBuiltinLeaf(target);
-            if (dropSide || unknownFileSide)
+            if ((dropSide || unknownFileSide) &&
+                KmonTaskLooksLikeRemoteInject(event.Task))
             {
                 matched = true;
                 break;
@@ -4422,14 +4516,6 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             {
                 matched = true;
                 break;
-            }
-            // ReadVM/suspend against a watched non-inbox process. Builtin
-            // endpoints stay excluded; they are a firehose.
-            const bool callerOk = watchCaller && !KmonIsWindowsBuiltinLeaf(caller);
-            const bool targetOk = watchTarget && !KmonIsWindowsBuiltinLeaf(target);
-            if ((callerOk || targetOk) && KmonTaskLooksLikeRemoteInject(event.Task))
-            {
-                matched = true;
             }
             break;
         }
@@ -5138,7 +5224,8 @@ void KernelMonitor::IngestLiveTimeline()
         }
 
         if (classified.Kind == L"driver.drop_load" ||
-            classified.Kind == L"driver.official_load")
+            classified.Kind == L"driver.official_load" ||
+            classified.Kind == L"driver.image_only")
         {
             NoteDriverLoad(classified);
         }
@@ -10189,7 +10276,10 @@ bool KernelMonitorSelfTest()
         {
             break;
         }
-        if (!KmonTaskLooksLikeRemoteInject(L"WriteVM"))
+        if (!KmonTaskLooksLikeRemoteInject(L"WriteVM") ||
+            KmonTaskLooksLikeRemoteInject(L"ReadVM") ||
+            KmonTaskLooksLikeRemoteInject(L"Suspend") ||
+            KmonTaskLooksLikeRemoteInject(L"Resume"))
         {
             break;
         }
@@ -10255,14 +10345,48 @@ bool KernelMonitorSelfTest()
             break;
         }
 
+        TiEventRecord remoteRead = {};
+        remoteRead.ProcessId = 1000;
+        remoteRead.TargetProcessId = 2000;
+        remoteRead.TaskName = L"ReadVM";
+        remoteRead.ImagePath = L"C:\\Users\\a\\AppData\\Local\\Temp\\x.exe";
+        remoteRead.TargetImageBase = L"game.exe";
+        if (KmonClassifyTiEvent(remoteRead, &classified))
+        {
+            break;
+        }
+
         TimelineEvent liveInbox = {};
         liveInbox.Action = L"image-load";
         liveInbox.ProcessId = 0;
         liveInbox.Entity = L"\\SystemRoot\\System32\\drivers\\mapped.sys";
         liveInbox.Source = L"kernel-live";
+        liveInbox.Evidence[L"image_base"] = L"0xfffff80012340000";
+        liveInbox.Evidence[L"image_size"] = L"0x0000000000012000";
+        liveInbox.Evidence[L"system_mode"] = L"true";
+        liveInbox.Evidence[L"signature_level"] = L"windows";
         if (!KmonClassifyLiveEvent(liveInbox, &classified) ||
             classified.Kind != L"driver.image_only" ||
-            classified.Summary.find(L"inbox") == std::wstring::npos)
+            classified.Summary.find(L"inbox") == std::wstring::npos ||
+            classified.Evidence[L"image_base"] != L"0xfffff80012340000" ||
+            classified.Evidence[L"signature_level"] != L"windows" ||
+            classified.Summary.find(L"base=0xfffff80012340000") == std::wstring::npos ||
+            !KmonWatchMatches(classified, emptyWatchForUnnamed))
+        {
+            break;
+        }
+
+        TimelineEvent liveSystemModeUnnamed = {};
+        liveSystemModeUnnamed.Action = L"image-load";
+        liveSystemModeUnnamed.ProcessId = 0;
+        liveSystemModeUnnamed.Entity = L"pid:0";
+        liveSystemModeUnnamed.Source = L"kernel-live";
+        liveSystemModeUnnamed.Evidence[L"system_mode"] = L"true";
+        liveSystemModeUnnamed.Evidence[L"image_base"] = L"0xfffff80099990000";
+        if (!KmonClassifyLiveEvent(liveSystemModeUnnamed, &classified) ||
+            classified.Kind != L"driver.image_only" ||
+            classified.Summary.find(L"unnamed") == std::wstring::npos ||
+            !KmonWatchMatches(classified, emptyWatchForUnnamed))
         {
             break;
         }
@@ -10306,6 +10430,16 @@ bool KernelMonitorSelfTest()
         liveUserPidDrop.Source = L"kernel-live";
         if (!KmonClassifyLiveEvent(liveUserPidDrop, &classified) ||
             classified.Kind != L"driver.drop_load")
+        {
+            break;
+        }
+
+        TimelineEvent liveUserDll = {};
+        liveUserDll.Action = L"image-load";
+        liveUserDll.ProcessId = 1234;
+        liveUserDll.Entity = L"C:\\Windows\\System32\\ntdll.dll";
+        liveUserDll.Source = L"kernel-live";
+        if (KmonClassifyLiveEvent(liveUserDll, &classified))
         {
             break;
         }
@@ -10367,11 +10501,16 @@ bool KernelMonitorSelfTest()
         }
         KmonEvent gameRead = injectEvent;
         gameRead.Task = L"ReadVM";
-        if (!KmonWatchMatches(gameRead, gameWatch))
+        if (KmonWatchMatches(gameRead, gameWatch) ||
+            KmonWatchMatches(gameRead, emptyWatch))
         {
             break;
         }
-        if (KmonWatchMatches(gameRead, emptyWatch))
+        KmonEvent dropRead = injectEvent;
+        dropRead.Image = L"C:\\Users\\a\\AppData\\Local\\Temp\\x.exe";
+        dropRead.Task = L"ReadVM";
+        if (KmonWatchMatches(dropRead, emptyWatch) ||
+            KmonWatchMatches(dropRead, gameWatch))
         {
             break;
         }
