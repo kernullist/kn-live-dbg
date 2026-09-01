@@ -24694,7 +24694,7 @@ static void PrintKmonHelp()
     std::wcout << L"bare !kmon (or !kmon start) arms TI + kernel live callbacks and stays on the\n";
     std::wcout << L"live tail. Esc/q returns to knkd>; collection keeps running. !kmon again reattaches.\n";
     std::wcout << L"  /background     arm only, return to the prompt (JSONL still fills); /nowatch alias\n";
-    std::wcout << L"  /name game.exe  add overlay inject.remote (overlays/AC can be noisy)\n";
+    std::wcout << L"  /name game.exe  add overlay inject.remote and in-process dxgi/d3d IAT/vtable scans\n";
     std::wcout << L"  /driver name    highlight only; never hides unknown drop names\n";
     std::wcout << L"  /verbose        also keep inbox TI DriverObjectLoad (first start only)\n";
     std::wcout << L"  /log /verbose /throttle apply only on the first start; later start extends watches.\n";
@@ -24729,7 +24729,9 @@ static void PrintKmonHelp()
     std::wcout << L"  process.implant         drop-dir module in a builtin or /name|/pid target,\n";
     std::wcout << L"                          unknown module outside the image dir on a watch target,\n";
     std::wcout << L"                          extra non-inbox module in a Windows builtin,\n";
-    std::wcout << L"                          private W+X / PE VAD / hidden executable PTEs on watch or PPL\n";
+    std::wcout << L"                          private W+X / PE VAD / hidden executable PTEs on watch or PPL,\n";
+    std::wcout << L"                          IAT or .rdata call-table slots in the main image, game DLLs, or\n";
+    std::wcout << L"                          dxgi/d3d*/opengl/vulkan/ntdll that point at private/mapped RX\n";
     std::wcout << L"  inject.remote           drop/unknown-path remote AllocVM/ProtectVM/MapView/WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          builtin WriteVM/APC/SetThreadContext;\n";
     std::wcout << L"                          /name|/pid adds overlay AllocVM/ProtectVM/MapView\n";
@@ -28731,7 +28733,8 @@ static void PrintHuntHelp()
     std::wcout << L"notes:\n";
     std::wcout << L"  No process target is accepted. The command scans the whole current system view.\n";
     std::wcout << L"  Findings combine process cross-view, identity, VAD, hidden-PTE, module, thread, APC,\n";
-    std::wcout << L"  and kernel-driver evidence. The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
+    std::wcout << L"  IAT/vtable call-table hooks (dxgi/d3d/main image), cloned graphics vtables, and kernel-driver evidence.\n";
+    std::wcout << L"  The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
     std::wcout << L"  /deep reuses recent !ti events if the Threat-Intelligence subscriber has captured any.\n";
     std::wcout << L"  Console output is concise by default: conclusion, subject/what/why/next assessment, summary, and suppressed detail notice.\n";
     std::wcout << L"  Default output is a short subject/what/why/next assessment; raw tables and per-finding detail are hidden unless /details or /limit is supplied.\n";
@@ -30240,6 +30243,10 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             HuntInjectedModuleSelfTest(),
             L"hunt-injected-foreign-module");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            HuntInProcessHookSelfTest(),
+            L"hunt-in-process-call-table-hooks");
         CheckConsoleSurfaceSelfTest(
             &context,
             HuntCidTableAnchorSelfTest(),
@@ -39506,6 +39513,22 @@ static std::wstring HuntConsoleReasonLabel(const std::wstring& reason)
     {
         label = L"builtin_process_injection_context";
     }
+    else if (lowered == L"iat_hook_private_exec")
+    {
+        label = L"iat_hook_private_exec";
+    }
+    else if (lowered == L"vtable_hook_private_exec")
+    {
+        label = L"vtable_hook_private_exec";
+    }
+    else if (lowered == L"cloned_vtable_private_exec")
+    {
+        label = L"cloned_vtable_private_exec";
+    }
+    else if (lowered == L"mapped_executable_without_loader")
+    {
+        label = L"mapped_executable_without_loader";
+    }
 
     return label;
 }
@@ -39621,7 +39644,11 @@ static uint32_t HuntConsoleSignalPriority(const std::wstring& signal)
              lowered == L"wfp_security_product_block_filter" ||
              lowered == L"wfp_anticheat_block_filter" ||
              lowered == L"wfp_appid_block_condition" ||
-             lowered == L"builtin_process_injection_context")
+             lowered == L"builtin_process_injection_context" ||
+             lowered == L"iat_hook_private_exec" ||
+             lowered == L"vtable_hook_private_exec" ||
+             lowered == L"cloned_vtable_private_exec" ||
+             lowered == L"mapped_executable_without_loader")
     {
         priority = 80;
     }
@@ -39825,6 +39852,13 @@ static std::wstring HuntAssessmentKindForFinding(
     {
         kind = L"process_tampering";
     }
+    else if (classLabel == L"process_injection" ||
+             HuntLabelsContain(labels, L"iat_hook_private_exec") ||
+             HuntLabelsContain(labels, L"vtable_hook_private_exec") ||
+             HuntLabelsContain(labels, L"cloned_vtable_private_exec"))
+    {
+        kind = L"in_process_code_hook";
+    }
     else if (classLabel == L"module_stomping" ||
              HuntLabelsContain(labels, L"module_stomping_permission_evidence") ||
              HuntLabelsContain(labels, L"module_entrypoint_write_permission_drift") ||
@@ -39850,6 +39884,7 @@ static std::wstring HuntAssessmentKindForFinding(
              HuntLabelsContain(labels, L"image_mapping_without_loader_entry") ||
              HuntLabelsContain(labels, L"image_vad_hidden_from_loader") ||
              HuntLabelsContain(labels, L"manual_mapped_private_pe") ||
+             HuntLabelsContain(labels, L"mapped_executable_without_loader") ||
              HuntLabelsContain(labels, L"partial_loader_unlink") ||
              HuntLabelsContain(labels, L"module_view_mismatch"))
     {
@@ -39903,6 +39938,10 @@ static uint32_t HuntAssessmentPriority(const std::wstring& kind)
     else if (kind == L"module_stomping")
     {
         priority = 50;
+    }
+    else if (kind == L"in_process_code_hook")
+    {
+        priority = 55;
     }
     else if (kind == L"mapped_code_or_loader_evasion")
     {
@@ -39990,6 +40029,10 @@ static std::wstring HuntAssessmentTechniqueText(const std::wstring& kind)
     else if (kind == L"module_stomping")
     {
         technique = L"modified loaded module code or executable section permissions";
+    }
+    else if (kind == L"in_process_code_hook")
+    {
+        technique = L"hooked in-process call tables or cloned graphics vtables into unbacked code";
     }
     else if (kind == L"mapped_code_or_loader_evasion")
     {
@@ -40351,6 +40394,22 @@ static std::wstring HuntAssessmentEvidencePhrase(const std::wstring& label)
     else if (lowered == L"builtin_process_injection_context")
     {
         phrase = L"built-in Windows process injection context";
+    }
+    else if (lowered == L"iat_hook_private_exec")
+    {
+        phrase = L"IAT thunk points at unbacked executable memory";
+    }
+    else if (lowered == L"vtable_hook_private_exec")
+    {
+        phrase = L"call-table slot points at unbacked executable memory";
+    }
+    else if (lowered == L"cloned_vtable_private_exec")
+    {
+        phrase = L"cloned graphics vtable points at unbacked code";
+    }
+    else if (lowered == L"mapped_executable_without_loader")
+    {
+        phrase = L"mapped executable memory missing from the loader";
     }
     else
     {
@@ -41064,6 +41123,10 @@ static std::wstring HuntAssessmentWhatText(const std::wstring& kind)
     {
         text = L"loaded module code or section permissions indicate module stomping";
     }
+    else if (kind == L"in_process_code_hook")
+    {
+        text = L"IAT, vtable, or cloned graphics call-table slots point at unbacked executable memory";
+    }
     else if (kind == L"mapped_code_or_loader_evasion")
     {
         text = L"executable code is hidden, replaced, or inconsistent with normal loader views";
@@ -41119,6 +41182,10 @@ static std::wstring HuntAssessmentNextText(const HuntConsoleAssessmentSummary& s
     else if (summary.Kind == L"module_stomping")
     {
         next = L"review module section permissions and live-vs-disk page evidence in /json";
+    }
+    else if (summary.Kind == L"in_process_code_hook")
+    {
+        next = L"run !vad /exec /private and !dps on the hooked module, or !hunt /deep /details";
     }
     else if (summary.Kind == L"mapped_code_or_loader_evasion")
     {

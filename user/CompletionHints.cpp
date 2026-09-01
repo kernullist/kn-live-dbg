@@ -706,7 +706,7 @@ namespace
     const CompletionHint kKmonOptTokens[] =
     {
         { L"/pid", L"/pid <PID>", L"optional; add inject.remote for this PID" },
-        { L"/name", L"/name <image>", L"optional; add inject.remote for this image" },
+        { L"/name", L"/name <image>", L"optional; inject.remote plus dxgi/d3d IAT/vtable scans" },
         { L"/driver", L"/driver <sys>", L"highlight only; does not hide unknown drop names" },
         { L"/verbose", L"/verbose", L"also keep inbox System32\\drivers loads" },
         { L"/all-drivers", L"/all-drivers", L"alias for /verbose" },
