@@ -3722,7 +3722,10 @@ namespace
                 GetLogicalDriveStringsW(
                     ARRAYSIZE(drives) - 1,
                     drives);
-            if (driveLen > 0 && driveLen <= ARRAYSIZE(drives) - 1)
+            // A return equal to the buffer capacity means the list was
+            // truncated; treat that as "no mapping" so those files keep
+            // the GLOBALROOT spelling instead of a half-walked drive list.
+            if (driveLen > 0 && driveLen < ARRAYSIZE(drives) - 1)
             {
                 const wchar_t* cursor = drives;
                 while (*cursor != L'\0')
@@ -3742,7 +3745,15 @@ namespace
                                 ToLowerCopy(devicePath);
                             const std::wstring targetLower =
                                 ToLowerCopy(target);
-                            if (deviceLower.compare(
+                            // Prefix alone is not enough: HarddiskVolume30
+                            // must not match a drive mapped to
+                            // HarddiskVolume3, or the converted path eats
+                            // the trailing digit.
+                            const bool boundaryIsSeparator =
+                                deviceLower.size() == targetLower.size() ||
+                                deviceLower[targetLower.size()] == L'\\';
+                            if (boundaryIsSeparator &&
+                                deviceLower.compare(
                                     0,
                                     targetLower.size(),
                                     targetLower) == 0)
@@ -9446,7 +9457,11 @@ void KernelMonitor::ScanUserModeHostility()
                     {
                         continue;
                     }
+                    // Named data-file mappings (game assets, pagefile
+                    // sections are nameless) also carry section file names;
+                    // only PE-probed VADs are loader modules.
                     if (record.SectionFileName.empty() ||
+                        !record.PeHeaderFound ||
                         record.Size < 0x1000 ||
                         record.Size > 0x10000000ull)
                     {
@@ -12252,6 +12267,17 @@ bool KernelMonitorSelfTest()
                                 KmonDevicePathToWin32(built);
                             if (converted !=
                                 drive.substr(0, 2) + L"\\KnDbg\\a.dll")
+                            {
+                                break;
+                            }
+                            // A device whose name extends the target with a
+                            // digit (HarddiskVolume30 under a drive mapped
+                            // to HarddiskVolume3) must not fold onto that
+                            // drive with the digit eaten.
+                            const std::wstring boundaryBuilt =
+                                std::wstring(dosTarget) + L"0\\KnDbg\\b.dll";
+                            if (KmonDevicePathToWin32(boundaryBuilt) ==
+                                drive.substr(0, 2) + L"0\\KnDbg\\b.dll")
                             {
                                 break;
                             }
