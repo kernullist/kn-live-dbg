@@ -316,6 +316,8 @@ bool KmonTaskLooksLikeDriverObjectLoad(const std::wstring& task);
 bool KmonTaskLooksLikeDriverObjectUnload(const std::wstring& task);
 bool KmonTaskLooksLikeDeviceObject(const std::wstring& task);
 bool KmonTaskLooksLikeRemoteInject(const std::wstring& task);
+bool KmonTaskLooksLikeWindowHook(const std::wstring& task);
+bool KmonTaskLooksLikeProcessImpairTask(const std::wstring& task);
 std::wstring KmonExtractPayloadDriverName(const std::vector<TiPayloadField>& payload);
 bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out);
 bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out);

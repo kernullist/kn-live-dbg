@@ -197,7 +197,9 @@ namespace
             L"createremotethread",
             L"terminateprocess",
             L"suspendprocess",
-            L"processimpairment"
+            L"processimpairment",
+            L"setwindowshook",
+            L"suspendthread"
         };
         static const wchar_t* const warningTerms[] =
         {
