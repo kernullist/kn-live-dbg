@@ -6304,9 +6304,15 @@ void KernelMonitor::WorkerLoop()
 {
     while (!StopRequested.load())
     {
-        IngestLiveTimeline();
-        IngestThreatIntel();
-        DrainIotraceEvents();
+        // One failing scan tick must never take the process down: this
+        // thread has no handler above it, so an escaping C++ exception
+        // would std::terminate the whole console. Log once (deduped) and
+        // let the next tick retry.
+        try
+        {
+            IngestLiveTimeline();
+            IngestThreatIntel();
+            DrainIotraceEvents();
 
         const uint64_t nowMs = GetTickCount64();
         const bool mapperWatch = IsMapperWatchActive();
@@ -6420,6 +6426,32 @@ void KernelMonitor::WorkerLoop()
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(IsMapperWatchActive() ? 50 : 200));
+        }
+        catch (const std::exception& ex)
+        {
+            const char* rawWhat = ex.what();
+            const char* what = rawWhat != nullptr ? rawWhat : "";
+            EmitUnique(
+                L"process.implant",
+                L"scan_failed:worker:exception",
+                std::wstring(),
+                L"user",
+                L"kmon worker tick failed; the tick was skipped and the loop continues",
+                L"unhandled exception: " +
+                    std::wstring(what, what + strlen(what)),
+                0);
+        }
+        catch (...)
+        {
+            EmitUnique(
+                L"process.implant",
+                L"scan_failed:worker:exception",
+                std::wstring(),
+                L"user",
+                L"kmon worker tick failed; the tick was skipped and the loop continues",
+                L"unhandled exception (unknown type)",
+                0);
+        }
     }
 }
 
