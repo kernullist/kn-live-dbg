@@ -12612,29 +12612,37 @@ private:
         static constexpr uint64_t UPDATE_INTERVAL_MS = 3000;
         uint64_t nextUpdate = START_DELAY_MS;
 
-        while (!stopRequested_.load())
+        // Progress is best-effort; an escaping exception here would
+        // std::terminate the process, so swallow and simply stop drawing.
+        try
         {
-            uint64_t elapsed = GetTickCount64() - startTick_;
-            if (elapsed >= nextUpdate)
+            while (!stopRequested_.load())
             {
-                if (g_CommandStreamOutputSerial.load(std::memory_order_relaxed) != initialOutputSerial_)
+                uint64_t elapsed = GetTickCount64() - startTick_;
+                if (elapsed >= nextUpdate)
                 {
-                    Sleep(100);
-                    continue;
+                    if (g_CommandStreamOutputSerial.load(std::memory_order_relaxed) != initialOutputSerial_)
+                    {
+                        Sleep(100);
+                        continue;
+                    }
+
+                    if (WriteConsoleTuiLineDirect(
+                            handle_,
+                            L"[ .. ] " + origin_ + L" still running: " + command_ + L" elapsed=" + FormatElapsedSeconds(elapsed),
+                            KNDBG_COLOR_STEP,
+                            initialOutputSerial_))
+                    {
+                        displayed_ = true;
+                        nextUpdate += UPDATE_INTERVAL_MS;
+                    }
                 }
 
-                if (WriteConsoleTuiLineDirect(
-                        handle_,
-                        L"[ .. ] " + origin_ + L" still running: " + command_ + L" elapsed=" + FormatElapsedSeconds(elapsed),
-                        KNDBG_COLOR_STEP,
-                        initialOutputSerial_))
-                {
-                    displayed_ = true;
-                    nextUpdate += UPDATE_INTERVAL_MS;
-                }
+                Sleep(100);
             }
-
-            Sleep(100);
+        }
+        catch (...)
+        {
         }
     }
 
@@ -23767,32 +23775,41 @@ private:
         {
             while (!StopRequested.load())
             {
-                std::vector<TimelineLiveEvent> liveEvents;
-                TimelineLiveStatus drainStatus = {};
-                std::wstring error;
-                if (!DrainTimelineLiveEvents(device, 1024, &liveEvents, &drainStatus, &error))
+                // An exception escaping this worker thread would
+                // std::terminate the process; record it and keep draining.
+                bool busy = false;
+                try
                 {
-                    RecordError(error);
-                    for (size_t i = 0; i < 10 && !StopRequested.load(); ++i)
+                    std::vector<TimelineLiveEvent> liveEvents;
+                    TimelineLiveStatus drainStatus = {};
+                    std::wstring error;
+                    if (!DrainTimelineLiveEvents(device, 1024, &liveEvents, &drainStatus, &error))
                     {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        RecordError(error);
+                        for (size_t i = 0; i < 10 && !StopRequested.load(); ++i)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                std::vector<TimelineEvent> events;
-                events.reserve(liveEvents.size());
-                for (const TimelineLiveEvent& item : liveEvents)
+                    std::vector<TimelineEvent> events;
+                    events.reserve(liveEvents.size());
+                    for (const TimelineLiveEvent& item : liveEvents)
+                    {
+                        events.push_back(BuildTimelineEventFromLiveEvent(item));
+                    }
+
+                    TimelineIngestResult result = state->Timeline.IngestEvents(events);
+                    RecordDrain(liveEvents.size(), result.Added);
+
+                    busy = liveEvents.size() >= 1024 || drainStatus.Count > 0;
+                }
+                catch (...)
                 {
-                    events.push_back(BuildTimelineEventFromLiveEvent(item));
+                    RecordError(L"drain tick raised an unhandled exception; tick skipped");
                 }
 
-                TimelineIngestResult result = state->Timeline.IngestEvents(events);
-                RecordDrain(liveEvents.size(), result.Added);
-
-                const bool busy =
-                    liveEvents.size() >= 1024 ||
-                    drainStatus.Count > 0;
                 if (!busy)
                 {
                     for (size_t i = 0; i < 5; ++i)
@@ -51152,6 +51169,46 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     SymbolEngine& symbols,
     AiProviderRuntime& ai,
     AiPlanState& aiState,
+    bool enableConsoleProgress);
+
+// SEH guard: with /EHsc, catch(...) does not trap access violations, so a
+// wild pointer inside any command still terminates the process. __try
+// cannot share a frame with C++ unwinding, hence this object-free wrapper.
+static volatile LONG g_CommandSehFaultCount = 0;
+
+static bool RunHandleCommandSeh(
+    const std::vector<std::wstring>& args,
+    const std::wstring& originalLine,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState)
+{
+    __try
+    {
+        return HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        InterlockedIncrement(&g_CommandSehFaultCount);
+        return true;
+    }
+}
+
+static CommandExecutionResult ExecuteCommandWithTranscript(
+    const std::vector<std::wstring>& args,
+    const std::wstring& originalLine,
+    const std::wstring& origin,
+    DebuggerState& state,
+    DbgEngBackend& dbgeng,
+    DeviceClient& device,
+    DriverService& service,
+    SymbolEngine& symbols,
+    AiProviderRuntime& ai,
+    AiPlanState& aiState,
     bool enableConsoleProgress)
 {
     CommandExecutionResult result = {};
@@ -51163,10 +51220,11 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     do
     {
         ScopedCommandProgress progress(originalLine, origin, enableConsoleProgress && !args.empty());
+        const LONG sehFaultsBefore = g_CommandSehFaultCount;
         try
         {
             ScopedWideStreamCapture capture(&result.Output, &result.Error);
-            result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
+            result.KeepRunning = RunHandleCommandSeh(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
         }
         catch (const std::exception& ex)
         {
@@ -51183,6 +51241,11 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
         {
             result.KeepRunning = true;
             result.Error += L"[unhandled exception]";
+        }
+        if (g_CommandSehFaultCount != sehFaultsBefore)
+        {
+            result.KeepRunning = true;
+            result.Error += L"[access violation inside command; state may be partially applied]";
         }
         progress.Complete();
 
@@ -52412,8 +52475,27 @@ static void RunMcpEngineLoop(
         std::shared_ptr<McpJob> job;
         while ((job = g_McpServer.TryPopJob()) != nullptr)
         {
-            McpEngineResult dispatchResult = DispatchMcpRequest(
-                job->Request, state, dbgeng, device, service, symbols, ai, aiState);
+            // The engine thread is the last handler above MCP tools; an
+            // escaping C++ exception would std::terminate the process.
+            McpEngineResult dispatchResult;
+            try
+            {
+                dispatchResult = DispatchMcpRequest(
+                    job->Request, state, dbgeng, device, service, symbols, ai, aiState);
+            }
+            catch (const std::exception& ex)
+            {
+                const char* rawWhat = ex.what();
+                const char* what = rawWhat != nullptr ? rawWhat : "";
+                dispatchResult.IsError = true;
+                dispatchResult.Text = L"tool raised an unhandled exception: " +
+                    std::wstring(what, what + strlen(what));
+            }
+            catch (...)
+            {
+                dispatchResult.IsError = true;
+                dispatchResult.Text = L"tool raised an unhandled exception (unknown type)";
+            }
             try
             {
                 job->ResultPromise.set_value(dispatchResult);
@@ -53870,6 +53952,34 @@ static void HandleRemoteCommand(
 
 int wmain(int argc, wchar_t** argv)
 {
+    // Last-resort crash diagnostics for faults that escape every guard
+    // (e.g. an access violation on a worker thread): print the fault site
+    // so field crashes are reportable, then let the default handler run.
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* info) -> LONG
+    {
+        fwprintf(
+            stderr,
+            L"[fatal] unhandled exception code=0x%08lx address=%p tid=%lu\n",
+            info != nullptr && info->ExceptionRecord != nullptr
+                ? info->ExceptionRecord->ExceptionCode
+                : 0ul,
+            info != nullptr && info->ExceptionRecord != nullptr
+                ? info->ExceptionRecord->ExceptionAddress
+                : nullptr,
+            GetCurrentThreadId());
+        fflush(stderr);
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
+    std::set_terminate([]()
+    {
+        fwprintf(
+            stderr,
+            L"[fatal] std::terminate reached (uncaught exception or noexcept violation) tid=%lu\n",
+            GetCurrentThreadId());
+        fflush(stderr);
+        std::abort();
+    });
+
     // Permanently install the tee buffer in front of std::wcout. Must
     // happen before any ScopedWideStreamCapture (i.e. before any
     // command is dispatched) so that "log enable" only needs to
