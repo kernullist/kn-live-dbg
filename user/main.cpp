@@ -50953,9 +50953,26 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     do
     {
         ScopedCommandProgress progress(originalLine, origin, enableConsoleProgress && !args.empty());
+        try
         {
             ScopedWideStreamCapture capture(&result.Output, &result.Error);
             result.KeepRunning = HandleCommand(args, originalLine, state, dbgeng, device, service, symbols, ai, aiState);
+        }
+        catch (const std::exception& ex)
+        {
+            // A command must never take the console down (deep-scan
+            // bad_alloc/length_error style failures); report and keep the
+            // prompt alive.
+            result.KeepRunning = true;
+            const char* rawWhat = ex.what();
+            const char* what = rawWhat != nullptr ? rawWhat : "";
+            result.Error += L"[unhandled exception: " +
+                std::wstring(what, what + strlen(what)) + L"]";
+        }
+        catch (...)
+        {
+            result.KeepRunning = true;
+            result.Error += L"[unhandled exception]";
         }
         progress.Complete();
 
@@ -50984,7 +51001,9 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
 
 // ---------------------------------------------------------------------------
 // MCP engine-thread integration. These run on the single engine thread (the
-// wmain thread) so DeviceClient and DbgHelp/DIA stay strictly serialized.
+// wmain thread) so DeviceClient stays strictly serialized; DbgHelp/DIA are
+// serialized by SymbolEngine's own dbghelpMutex_ because the kmon worker
+// resolves offsets from its own thread while hunt commands run.
 // ---------------------------------------------------------------------------
 
 static bool McpGetArg(const std::wstring& argsJson, const wchar_t* key, std::wstring* value)
