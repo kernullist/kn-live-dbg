@@ -115,5 +115,10 @@ private:
     bool ready_;
     std::wstring symbolPath_;
     mutable std::mutex modulesMutex_;
+    // DbgHelp and DIA are single-threaded; the kmon worker resolves
+    // offsets while a hunt command runs on the engine thread, so every
+    // entry point that can reach Sym*/DIA takes this lock first. Lock
+    // order is always dbghelpMutex_ -> modulesMutex_.
+    mutable std::recursive_mutex dbghelpMutex_;
     std::vector<KernelModuleInfo> modules_;
 };

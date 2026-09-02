@@ -963,6 +963,7 @@ SymbolEngine::~SymbolEngine()
 
 bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -990,6 +991,7 @@ bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* erro
 
 void SymbolEngine::Shutdown()
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     if (ready_)
     {
         SymCleanup(process_);
@@ -1012,6 +1014,7 @@ const std::wstring& SymbolEngine::SymbolPath() const
 
 void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     symbolPath_ = symbolPath;
 
     if (ready_)
@@ -1387,6 +1390,7 @@ bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& modu
 
 bool SymbolEngine::LoadKernelModules(std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -1422,6 +1426,7 @@ bool SymbolEngine::LoadKernelModules(std::wstring* error)
 
 bool SymbolEngine::PreloadKernelSymbols(size_t* loadedCount, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -1556,6 +1561,7 @@ bool SymbolEngine::LoadDiaDataForModule(const KernelModuleInfo& module, IDiaData
 
 bool SymbolEngine::ResolveSymbol(const std::wstring& name, uint64_t* address, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -1600,6 +1606,7 @@ bool SymbolEngine::ResolveSymbol(const std::wstring& name, uint64_t* address, st
 
 bool SymbolEngine::FindNearestSymbol(uint64_t address, std::wstring* name, uint64_t* displacement, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -1733,6 +1740,7 @@ static BOOL CALLBACK KnDbgEnumTypesCallback(PSYMBOL_INFOW SymbolInfo, ULONG Symb
 
 bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std::vector<SymbolMatchInfo>* matches, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -2040,6 +2048,7 @@ bool SymbolEngine::EnumerateTypesWithDia(
 
 bool SymbolEngine::EnumerateTypes(const std::wstring& mask, size_t limit, std::vector<TypeMatchInfo>* matches, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -2514,6 +2523,7 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
 
 bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -2768,6 +2778,7 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
 
 bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -2953,6 +2964,7 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
 
 bool SymbolEngine::GetTypeFields(const std::wstring& typeName, std::vector<TypeFieldInfo>* fields, ULONG64* typeSize, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do
@@ -2986,6 +2998,7 @@ bool SymbolEngine::GetTypeFields(const std::wstring& typeName, std::vector<TypeF
 
 bool SymbolEngine::FindField(const std::wstring& typeName, const std::wstring& fieldName, TypeFieldInfo* field, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
     bool ok = false;
 
     do

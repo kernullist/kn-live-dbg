@@ -36,6 +36,7 @@ Kn Live Dbg follows a LiveKD-style split:
    - Owns kernel module enumeration.
    - Owns symbol path, PDB loading, type lookup, and field offset resolution.
    - Uses DIA SDK as a fallback when `DbgHelp` cannot return complete UDT field metadata.
+   - Serializes every `DbgHelp`/DIA entry point behind an internal recursive mutex (`dbghelpMutex_`), because the `!kmon` worker thread resolves offsets while hunt/kmon commands run on the engine thread — DbgHelp is single-threaded and unsynchronized use crashed `!hunt /deep` sessions. Recursive field walks (`FindFieldRecursiveById`) additionally cap their total `GetTypeLayoutById` calls per top-level lookup so wide embedded-UDT graphs cannot explode combinatorially.
    - Owns PDB-driven callback list decoding for object, registry, process, thread, image-load, and minifilter callbacks.
    - Presents Windbg-like commands.
    - Redraws the dashboard with `home` or `dashboard`.

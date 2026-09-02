@@ -50,6 +50,10 @@ namespace
     constexpr uint32_t kCidAnchorMaxInstructions = 96;
     constexpr size_t kMaxDeepModuleComparisonsPerProcess = 96;
     constexpr size_t kMaxDeepPagesPerProcess = 512;
+    // GetTypeLayoutById calls one embedded-child descent of a
+    // FindFieldRecursive lookup may spend; each root child gets a fresh
+    // budget so a pathological sibling cannot starve the rest.
+    constexpr uint32_t kFieldWalkBudget = 512;
     constexpr size_t kMaxSampledExecPagesPerSection = 2;
     constexpr size_t kMaxStackReferenceFindingsPerProcess = 16;
     constexpr size_t kMaxDeepStackPointerSamplesPerProcess = 32768;
@@ -2549,6 +2553,7 @@ namespace
         uint64_t baseOffset,
         uint32_t depth,
         std::vector<ULONG>* visited,
+        uint32_t* budget,
         TypeFieldInfo* out)
     {
         bool found = false;
@@ -2559,6 +2564,14 @@ namespace
             {
                 break;
             }
+            // Embedded-UDT breadth is unbounded; without a shared budget an
+            // EPROCESS/ETHREAD-shaped PDB turns this walk into a
+            // GetTypeLayoutById explosion.
+            if (budget == nullptr || *budget == 0)
+            {
+                break;
+            }
+            --*budget;
 
             if (std::find(visited->begin(), visited->end(), typeId) != visited->end())
             {
@@ -2606,6 +2619,7 @@ namespace
                         baseOffset + field.Offset,
                         depth + 1,
                         &branchVisited,
+                        budget,
                         out))
                 {
                     found = true;
@@ -2664,6 +2678,7 @@ namespace
                     }
 
                     std::vector<ULONG> visited;
+                    uint32_t budget = kFieldWalkBudget;
                     if (FindFieldRecursiveById(
                             symbols,
                             field.ModuleBase != 0 ? field.ModuleBase : layout.ModuleBase,
@@ -2673,6 +2688,7 @@ namespace
                             field.Offset,
                             1,
                             &visited,
+                            &budget,
                             out))
                     {
                         found = true;
