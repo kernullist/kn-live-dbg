@@ -10,6 +10,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -99,6 +100,10 @@ public:
     bool AddWatchDriver(const std::wstring& driverBase);
     bool RemoveWatchDriver(const std::wstring& driverBase);
 
+    bool ArmIotrace(uint64_t driverObjectAddress, const std::wstring& driverName, std::wstring* error);
+    bool DisarmIotrace(std::wstring* error);
+    bool IotraceArmed() const;
+
     void SetLiveOutput(bool enabled);
     bool IsLiveOutputEnabled() const;
 
@@ -154,6 +159,9 @@ private:
     void ArmMapperWatch(const KmonEvent& event);
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
+    bool NoteWatchActivityTask(uint32_t pid, const std::wstring& task);
+    void ScanWatchedHandleTables();
+    void DrainIotraceEvents();
     void PromoteNamedWatchPid(uint32_t pid);
     void EnableLoggingForWatchTargets();
     void PruneStalePromotedWatches();
@@ -184,6 +192,25 @@ private:
     std::vector<std::wstring> WatchDriversLower;
     std::unordered_set<uint32_t> WatchPromotedPids;
     std::unordered_map<uint32_t, uint64_t> WatchPromotedCreated;
+    // Descendants of watched processes (loader -> 2nd stage) that were
+    // auto-promoted; child pid -> parent pid. Pruned on liveness, not by
+    // watch-name re-enumeration, so differently-named stages stay watched.
+    std::unordered_map<uint32_t, uint32_t> WatchChildPids;
+    // First-seen TI task names per watched pid backing loader.activity.
+    std::unordered_map<uint32_t, std::unordered_set<std::wstring>> WatchActivityTasks;
+    // Handle-table diff state for watched pids: pid -> known (handle,object)
+    // pairs. First pass per pid is a silent baseline; later passes emit
+    // driver.handle for new Device-typed handles.
+    std::map<uint32_t, std::set<std::pair<uint64_t, uint64_t>>> WatchKnownHandles;
+    uint32_t WatchDeviceTypeIndex = 0;
+    bool WatchDeviceTypeKnown = false;
+    // Iotrace state (guard with WatchMutex): armed flag for the worker
+    // drain loop, target name for evidence, and first-seen (pid, ioctl)
+    // pairs so the tail shows the traffic shape without a firehose.
+    bool IotraceActive = false;
+    std::wstring IotraceDriverName;
+    std::set<std::pair<uint32_t, uint64_t>> IotraceSeen;
+    bool IotraceSeenCapNoted = false;
     std::unordered_map<uint32_t, uint64_t> LoggingEnabledPids;
     std::unordered_map<uint32_t, uint64_t> LoggingFailedPids;
     std::map<uint32_t, uint64_t> RecentCreatePids;

@@ -74,6 +74,24 @@ static ULONG g_KnDbgTimelineCount = 0;
 static ULONGLONG g_KnDbgTimelineDropped = 0;
 static ULONGLONG g_KnDbgTimelineNextSequence = 1;
 
+// Iotrace: single-target IRP_MJ_DEVICE_CONTROL interposition. The target
+// DRIVER_OBJECT is referenced for the lifetime of the hook so it cannot be
+// freed while a dispatch entry still points at our trampoline; disarm
+// restores the original entry, waits for in-flight trampolines, and only
+// then drops the reference.
+static FAST_MUTEX g_KnDbgIotraceControlLock;
+static KSPIN_LOCK g_KnDbgIotraceLock;
+static PDRIVER_OBJECT g_KnDbgIotraceTarget = nullptr;
+static PDRIVER_DISPATCH volatile g_KnDbgIotraceOriginalDispatch = nullptr;
+static volatile LONG g_KnDbgIotraceArmed = 0;
+static volatile LONG g_KnDbgIotraceActive = 0;
+static KNDBG_IOTRACE_RECORD* g_KnDbgIotraceRing = nullptr;
+static ULONG g_KnDbgIotraceHead = 0;
+static ULONG g_KnDbgIotraceCount = 0;
+static ULONGLONG g_KnDbgIotraceDropped = 0;
+static ULONGLONG g_KnDbgIotraceNextSequence = 1;
+static ULONGLONG g_KnDbgIotraceTotalRecorded = 0;
+
 // CFG-valid minifilter Pre stand-in.
 // Must return 1 (FLT_PREOP_SUCCESS_NO_CALLBACK). Return 0 is
 // FLT_PREOP_SUCCESS_WITH_CALLBACK and drains FastIO to IRP.
@@ -1747,6 +1765,388 @@ static NTSTATUS KnDbgHandleTimelineDrain(PIRP Irp, PIO_STACK_LOCATION Stack, PVO
     return KnDbgCompleteIrp(Irp, status, information);
 }
 
+// SEH probe: the caller-supplied address must really point at a
+// DRIVER_OBJECT before any field is dereferenced. Kept free of C++
+// objects so __try is legal here.
+// Declared in some WDK wdm.h variants only; always exported by ntoskrnl
+// as a C symbol.
+extern "C" extern POBJECT_TYPE IoDriverObjectType;
+
+static BOOLEAN KnDbgIotraceValidateDriverObject(PVOID Address)
+{
+    BOOLEAN ok = FALSE;
+
+    __try
+    {
+        PDRIVER_OBJECT target = reinterpret_cast<PDRIVER_OBJECT>(Address);
+        // DRIVER_OBJECT.Type == IO_TYPE_DRIVER (4); Size is the structure
+        // size in bytes on every supported build.
+        if (target->Type == 4 && target->Size >= sizeof(DRIVER_OBJECT))
+        {
+            ok = TRUE;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = FALSE;
+    }
+
+    return ok;
+}
+
+static VOID KnDbgIotracePush(PIRP Irp, PIO_STACK_LOCATION Stack)
+{
+    KIRQL oldIrql = PASSIVE_LEVEL;
+    KNDBG_IOTRACE_RECORD record = {};
+
+    record.Timestamp100ns = KeQueryInterruptTime();
+    record.IoctlCode =
+        Stack->Parameters.DeviceIoControl.IoControlCode;
+    record.InputLength =
+        Stack->Parameters.DeviceIoControl.InputBufferLength;
+    record.OutputLength =
+        Stack->Parameters.DeviceIoControl.OutputBufferLength;
+    record.ProcessId = IoGetRequestorProcessId(Irp);
+
+    KeAcquireSpinLock(&g_KnDbgIotraceLock, &oldIrql);
+    if (g_KnDbgIotraceRing != nullptr)
+    {
+        KNDBG_IOTRACE_RECORD* slot =
+            &g_KnDbgIotraceRing[g_KnDbgIotraceHead];
+        record.Sequence = g_KnDbgIotraceNextSequence;
+        ++g_KnDbgIotraceNextSequence;
+        RtlCopyMemory(slot, &record, sizeof(*slot));
+
+        ++g_KnDbgIotraceHead;
+        if (g_KnDbgIotraceHead >= KNDBG_IOTRACE_RING_CAPACITY)
+        {
+            g_KnDbgIotraceHead = 0;
+        }
+        if (g_KnDbgIotraceCount < KNDBG_IOTRACE_RING_CAPACITY)
+        {
+            ++g_KnDbgIotraceCount;
+        }
+        else
+        {
+            ++g_KnDbgIotraceDropped;
+        }
+        ++g_KnDbgIotraceTotalRecorded;
+    }
+    KeReleaseSpinLock(&g_KnDbgIotraceLock, oldIrql);
+}
+
+static NTSTATUS KnDbgIotraceDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    // Capture the original before leaving the active window: disarm only
+    // nulls it after every in-flight trampoline has returned, so the call
+    // target stays valid even if disarm races this entry.
+    InterlockedIncrement(&g_KnDbgIotraceActive);
+    PDRIVER_DISPATCH original = reinterpret_cast<PDRIVER_DISPATCH>(
+        InterlockedCompareExchangePointer(
+            reinterpret_cast<PVOID volatile*>(
+                &g_KnDbgIotraceOriginalDispatch),
+            nullptr,
+            nullptr));
+
+    NTSTATUS status = STATUS_DEVICE_NOT_READY;
+    if (original != nullptr)
+    {
+        PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+        KnDbgIotracePush(Irp, stack);
+        status = original(DeviceObject, Irp);
+    }
+    else
+    {
+        // Unreachable while armed: arm installs the original before the
+        // dispatch pointer, disarm removes the dispatch pointer first.
+        status = KnDbgCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+    }
+
+    InterlockedDecrement(&g_KnDbgIotraceActive);
+    return status;
+}
+
+// Restores the target's dispatch entry and drops the reference only after
+// every in-flight trampoline has returned. Runs at PASSIVE under the
+// control mutex.
+static NTSTATUS KnDbgIotraceDisarmLocked(BOOLEAN Wait)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    do
+    {
+        PDRIVER_OBJECT target = g_KnDbgIotraceTarget;
+        if (target == nullptr)
+        {
+            break;
+        }
+
+        PDRIVER_DISPATCH original = g_KnDbgIotraceOriginalDispatch;
+        if (original != nullptr)
+        {
+            InterlockedExchangePointer(
+                reinterpret_cast<PVOID volatile*>(
+                    &target->MajorFunction[IRP_MJ_DEVICE_CONTROL]),
+                original);
+        }
+        InterlockedExchange(&g_KnDbgIotraceArmed, 0);
+
+        if (Wait)
+        {
+            for (ULONG attempt = 0; attempt < 4000; ++attempt)
+            {
+                if (InterlockedCompareExchange(&g_KnDbgIotraceActive, 0, 0) == 0)
+                {
+                    break;
+                }
+                LARGE_INTEGER interval = {};
+                interval.QuadPart = -1000; // 100us
+                KeDelayExecutionThread(KernelMode, FALSE, &interval);
+            }
+        }
+
+        if (InterlockedCompareExchange(&g_KnDbgIotraceActive, 0, 0) != 0)
+        {
+            // A trampoline is still inside the original dispatch (a
+            // pended IRP). The restored entry keeps future calls safe;
+            // keep the reference and report the race instead of freeing.
+            status = STATUS_DEVICE_BUSY;
+            break;
+        }
+
+        g_KnDbgIotraceOriginalDispatch = nullptr;
+        g_KnDbgIotraceTarget = nullptr;
+        ObDereferenceObject(target);
+    } while (false);
+
+    return status;
+}
+
+static NTSTATUS KnDbgHandleIotraceControl(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_IOTRACE_CONTROL_REQUEST)) ||
+            outputLength < sizeof(KNDBG_IOTRACE_CONTROL_RESPONSE))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        KNDBG_IOTRACE_CONTROL_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+        if (request.Acknowledge != KNDBG_WRITE_ACK_MAGIC)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        ExAcquireFastMutex(&g_KnDbgIotraceControlLock);
+
+        do
+        {
+            if (request.Mode == KNDBG_IOTRACE_MODE_DISARM)
+            {
+                status = KnDbgIotraceDisarmLocked(TRUE);
+                break;
+            }
+
+            if (request.Mode == KNDBG_IOTRACE_MODE_STATUS)
+            {
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            if (request.Mode != KNDBG_IOTRACE_MODE_ARM)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            if (g_KnDbgIotraceTarget != nullptr)
+            {
+                status = STATUS_DEVICE_BUSY;
+                break;
+            }
+
+            // Lazy ring allocation keeps a failed DriverEntry free of
+            // cleanup obligations for this feature.
+            if (g_KnDbgIotraceRing == nullptr)
+            {
+                g_KnDbgIotraceRing = reinterpret_cast<KNDBG_IOTRACE_RECORD*>(
+                    ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED,
+                        sizeof(KNDBG_IOTRACE_RECORD) * KNDBG_IOTRACE_RING_CAPACITY,
+                        'oInK'));
+                if (g_KnDbgIotraceRing == nullptr)
+                {
+                    status = STATUS_INSUFFICIENT_RESOURCES;
+                    break;
+                }
+            }
+
+            if (!MmIsAddressValid(reinterpret_cast<PVOID>(request.DriverObjectAddress)) ||
+                request.DriverObjectAddress < (ULONGLONG)MmHighestUserAddress ||
+                !KnDbgIotraceValidateDriverObject(
+                    reinterpret_cast<PVOID>(request.DriverObjectAddress)))
+            {
+                status = STATUS_INVALID_ADDRESS;
+                break;
+            }
+
+            PDRIVER_OBJECT target =
+                reinterpret_cast<PDRIVER_OBJECT>(request.DriverObjectAddress);
+            NTSTATUS refStatus = ObReferenceObjectByPointer(
+                target,
+                0,
+                IoDriverObjectType,
+                KernelMode);
+            if (!NT_SUCCESS(refStatus))
+            {
+                status = refStatus;
+                break;
+            }
+
+            PDRIVER_DISPATCH current = target->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+            if (current == nullptr || current == KnDbgIotraceDispatch)
+            {
+                ObDereferenceObject(target);
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            g_KnDbgIotraceTarget = target;
+            g_KnDbgIotraceOriginalDispatch = current;
+            InterlockedExchangePointer(
+                reinterpret_cast<PVOID volatile*>(
+                    &target->MajorFunction[IRP_MJ_DEVICE_CONTROL]),
+                KnDbgIotraceDispatch);
+            InterlockedExchange(&g_KnDbgIotraceArmed, 1);
+            status = STATUS_SUCCESS;
+        } while (false);
+
+        KNDBG_IOTRACE_CONTROL_RESPONSE response = {};
+        response.Size = sizeof(response);
+        response.Flags = 0;
+        response.Armed = g_KnDbgIotraceTarget != nullptr ? 1u : 0u;
+        response.NtStatus = static_cast<KNDBG_UINT32>(status);
+        response.DriverObjectAddress =
+            reinterpret_cast<KNDBG_UINT64>(g_KnDbgIotraceTarget);
+        response.OriginalDispatch =
+            reinterpret_cast<KNDBG_UINT64>(g_KnDbgIotraceOriginalDispatch);
+        {
+            KIRQL oldIrql = PASSIVE_LEVEL;
+            KeAcquireSpinLock(&g_KnDbgIotraceLock, &oldIrql);
+            response.EventsRecorded = g_KnDbgIotraceTotalRecorded;
+            response.EventsDropped = g_KnDbgIotraceDropped;
+            KeReleaseSpinLock(&g_KnDbgIotraceLock, oldIrql);
+        }
+
+        ExReleaseFastMutex(&g_KnDbgIotraceControlLock);
+
+        RtlCopyMemory(Buffer, &response, sizeof(response));
+        information = sizeof(response);
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
+static NTSTATUS KnDbgHandleIotraceDrain(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    ULONG_PTR information = 0;
+
+    do
+    {
+        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+        ULONG headerLength = FIELD_OFFSET(KNDBG_IOTRACE_DRAIN_RESPONSE, Records);
+
+        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_IOTRACE_DRAIN_REQUEST)) ||
+            outputLength < headerLength)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
+        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+
+        KNDBG_IOTRACE_DRAIN_REQUEST request = {};
+        RtlCopyMemory(&request, Buffer, sizeof(request));
+
+        ULONG maxByOutput = (outputLength - headerLength) / sizeof(KNDBG_IOTRACE_RECORD);
+        ULONG maxRecords = request.MaxRecords;
+        if (maxRecords == 0 || maxRecords > KNDBG_IOTRACE_DRAIN_MAX)
+        {
+            maxRecords = KNDBG_IOTRACE_DRAIN_MAX;
+        }
+        if (maxRecords > maxByOutput)
+        {
+            maxRecords = maxByOutput;
+        }
+        if (maxRecords == 0)
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(Buffer, outputLength);
+        KNDBG_IOTRACE_DRAIN_RESPONSE* response =
+            reinterpret_cast<KNDBG_IOTRACE_DRAIN_RESPONSE*>(Buffer);
+        KIRQL oldIrql = PASSIVE_LEVEL;
+        KeAcquireSpinLock(&g_KnDbgIotraceLock, &oldIrql);
+        ULONG toCopy = g_KnDbgIotraceCount < maxRecords
+            ? g_KnDbgIotraceCount
+            : maxRecords;
+        if (g_KnDbgIotraceRing != nullptr)
+        {
+            ULONG oldest = (g_KnDbgIotraceHead + KNDBG_IOTRACE_RING_CAPACITY -
+                g_KnDbgIotraceCount) % KNDBG_IOTRACE_RING_CAPACITY;
+            for (ULONG index = 0; index < toCopy; ++index)
+            {
+                ULONG ringIndex = oldest + index;
+                if (ringIndex >= KNDBG_IOTRACE_RING_CAPACITY)
+                {
+                    ringIndex -= KNDBG_IOTRACE_RING_CAPACITY;
+                }
+                RtlCopyMemory(
+                    &response->Records[index],
+                    &g_KnDbgIotraceRing[ringIndex],
+                    sizeof(KNDBG_IOTRACE_RECORD));
+            }
+            g_KnDbgIotraceCount -= toCopy;
+        }
+        response->RecordCount = toCopy;
+        response->TotalRecorded = g_KnDbgIotraceTotalRecorded;
+        response->TotalDropped = g_KnDbgIotraceDropped;
+        KeReleaseSpinLock(&g_KnDbgIotraceLock, oldIrql);
+
+        information = headerLength + static_cast<ULONG_PTR>(toCopy) * sizeof(KNDBG_IOTRACE_RECORD);
+        response->Size = static_cast<KNDBG_UINT32>(information);
+        status = STATUS_SUCCESS;
+    } while (false);
+
+    return KnDbgCompleteIrp(Irp, status, information);
+}
+
 static NTSTATUS KnDbgHandleResolveProcess(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -2985,6 +3385,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         g_KnDbgTimelineDropped = 0;
         g_KnDbgTimelineNextSequence = 1;
 
+        ExInitializeFastMutex(&g_KnDbgIotraceControlLock);
+        KeInitializeSpinLock(&g_KnDbgIotraceLock);
+        g_KnDbgIotraceTarget = nullptr;
+        g_KnDbgIotraceOriginalDispatch = nullptr;
+        g_KnDbgIotraceArmed = 0;
+        g_KnDbgIotraceActive = 0;
+        g_KnDbgIotraceHead = 0;
+        g_KnDbgIotraceCount = 0;
+        g_KnDbgIotraceDropped = 0;
+        g_KnDbgIotraceNextSequence = 1;
+        g_KnDbgIotraceTotalRecorded = 0;
+        // The ring is allocated lazily on the first ARM (audit: allocating
+        // here would leak on any later DriverEntry failure step, since a
+        // failed DriverEntry never reaches KnDbgUnload).
+        g_KnDbgIotraceRing = nullptr;
+
         for (ULONG index = 0; index <= IRP_MJ_MAXIMUM_FUNCTION; ++index)
         {
             DriverObject->MajorFunction[index] = KnDbgNotSupportedDispatch;
@@ -3042,6 +3458,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
 static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
 {
+    // Unhook any interposed target before anything else: a live dispatch
+    // entry pointing into this image would crash the moment we unload.
+    // Retry because a stuck in-flight dispatch would otherwise race the
+    // unload; dispatch calls are short, so 2s total is generous.
+    for (ULONG attempt = 0; attempt < 5; ++attempt)
+    {
+        ExAcquireFastMutex(&g_KnDbgIotraceControlLock);
+        NTSTATUS disarmStatus = KnDbgIotraceDisarmLocked(TRUE);
+        ExReleaseFastMutex(&g_KnDbgIotraceControlLock);
+        if (disarmStatus != STATUS_DEVICE_BUSY)
+        {
+            break;
+        }
+    }
+
     ExAcquireFastMutex(&g_KnDbgTimelineControlLock);
     KnDbgTimelineUnregisterCallbacks();
     ExReleaseFastMutex(&g_KnDbgTimelineControlLock);
@@ -3050,6 +3481,12 @@ static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
     {
         ExFreePoolWithTag(g_KnDbgTimelineRing, 'tLnK');
         g_KnDbgTimelineRing = nullptr;
+    }
+
+    if (g_KnDbgIotraceRing != nullptr)
+    {
+        ExFreePoolWithTag(g_KnDbgIotraceRing, 'oInK');
+        g_KnDbgIotraceRing = nullptr;
     }
 
     IoDeleteSymbolicLink(&g_KnDbgSymbolicLink);
@@ -3101,6 +3538,13 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                 KnDbgReleaseController(fileContext);
                 ExFreePoolWithTag(fileContext, 'gDnK');
             }
+
+            // The controlling client is going away (including abrupt
+            // process termination): never leave an interposed dispatch
+            // entry behind pointing into this driver.
+            ExAcquireFastMutex(&g_KnDbgIotraceControlLock);
+            KnDbgIotraceDisarmLocked(TRUE);
+            ExReleaseFastMutex(&g_KnDbgIotraceControlLock);
         }
     } while (false);
 
@@ -3536,6 +3980,12 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_SET_PROCESS_LOGGING:
         status = KnDbgHandleSetProcessLogging(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_IOTRACE_CONTROL:
+        status = KnDbgHandleIotraceControl(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_IOTRACE_DRAIN:
+        status = KnDbgHandleIotraceDrain(Irp, stack, buffer);
         break;
     default:
         status = KnDbgCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

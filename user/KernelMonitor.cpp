@@ -6,6 +6,7 @@
 #include "DpcTimerScanner.h"
 #include "HalDispatchScanner.h"
 #include "HiddenProcessScanner.h"
+#include "HandleTableScanner.h"
 #include "IdtScanner.h"
 #include "InputStackScanner.h"
 #include "IntegrityScanner.h"
@@ -5515,6 +5516,8 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"driver.image_only" ||
             event.Kind == L"driver.short_lived" ||
             event.Kind == L"driver.mapped_residue" ||
+            event.Kind == L"driver.handle" ||
+            event.Kind == L"driver.ioctl" ||
             event.Kind == L"mapper.watch" ||
             event.Kind == L"hook.unbacked" ||
             event.Kind == L"hook.dataptr" ||
@@ -5635,6 +5638,29 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             {
                 matched = true;
                 break;
+            }
+            break;
+        }
+
+        if (event.Kind == L"loader.activity")
+        {
+            if (options.WatchPids.empty() && options.WatchNames.empty())
+            {
+                break;
+            }
+            std::wstring caller = KmonBasenameLower(event.Image);
+            if (NameEqualsWatch(caller, options.WatchNames))
+            {
+                matched = true;
+                break;
+            }
+            for (uint32_t pid : options.WatchPids)
+            {
+                if (pid == event.ProcessId || pid == event.TargetProcessId)
+                {
+                    matched = true;
+                    break;
+                }
             }
             break;
         }
@@ -5994,6 +6020,14 @@ bool KernelMonitor::Start(
                 WatchDriversLower = Options.WatchDrivers;
                 WatchPromotedPids.clear();
                 WatchPromotedCreated.clear();
+                WatchChildPids.clear();
+                WatchActivityTasks.clear();
+                WatchKnownHandles.clear();
+                WatchDeviceTypeKnown = false;
+                IotraceActive = false;
+                IotraceDriverName.clear();
+                IotraceSeen.clear();
+                IotraceSeenCapNoted = false;
                 LoggingEnabledPids.clear();
                 LoggingFailedPids.clear();
                 RecentCreatePids.clear();
@@ -6189,6 +6223,10 @@ bool KernelMonitor::Stop(std::wstring* error)
         worker.join();
     }
 
+    // Leaving an interposed dispatch in place after the session ends would
+    // keep pointing at this process's IOCTL channel; disarm it now.
+    DisarmIotrace(nullptr);
+
     for (uint32_t pid : loggingPids)
     {
         DisableProcessLogging(device, pid);
@@ -6212,6 +6250,7 @@ void KernelMonitor::WorkerLoop()
     {
         IngestLiveTimeline();
         IngestThreatIntel();
+        DrainIotraceEvents();
 
         const uint64_t nowMs = GetTickCount64();
         const bool mapperWatch = IsMapperWatchActive();
@@ -6314,6 +6353,10 @@ void KernelMonitor::WorkerLoop()
             PruneStalePromotedWatches();
             EnableLoggingForWatchTargets();
             ScanUserModeHostility();
+            if (!StopRequested.load())
+            {
+                ScanWatchedHandleTables();
+            }
             IngestLiveTimeline();
             IngestThreatIntel();
             NextUserScanTickMs = GetTickCount64() + kUserScanIntervalMs;
@@ -6341,6 +6384,7 @@ void KernelMonitor::IngestThreatIntel()
     }
 
     std::vector<TiEventRecord> batch = ti->RecentAfterSequence(TiCursorSequence, 512);
+    uint32_t activityEvents = 0;
     for (const TiEventRecord& record : batch)
     {
         if (record.Sequence != 0)
@@ -6401,6 +6445,52 @@ void KernelMonitor::IngestThreatIntel()
                 resolveInjectImage(classified.ProcessId, &classified.Image);
             }
             RecordEvent(std::move(classified));
+        }
+        else if (activityEvents < 128)
+        {
+            // Unclassified TI tasks still describe what a watched loader
+            // did (file/registry/VM/material tasks); keep a compact
+            // first-seen-per-task trail instead of dropping them. This
+            // also lets NoteWatchTiWriteIfNeeded see WriteVM/ProtectVM
+            // tasks that classification rejected.
+            const uint32_t callerPid =
+                record.ProcessId != 0 ? record.ProcessId : record.TargetProcessId;
+            const std::wstring task = record.TaskName.empty()
+                ? (L"Task" + std::to_wstring(record.TaskId))
+                : record.TaskName;
+            if (NoteWatchActivityTask(callerPid, task))
+            {
+                KmonEvent activity = {};
+                activity.Timestamp = record.Timestamp;
+                activity.ProcessId = record.ProcessId;
+                activity.TargetProcessId = record.TargetProcessId;
+                activity.Image = record.ImagePath;
+                activity.Task = task;
+                activity.Kind = L"loader.activity";
+                activity.Summary = task + L" pid=" + std::to_wstring(record.ProcessId);
+                if (record.TargetProcessId != 0 &&
+                    record.TargetProcessId != record.ProcessId)
+                {
+                    activity.Summary += L" -> pid=" +
+                        std::to_wstring(record.TargetProcessId);
+                }
+                activity.Evidence[L"task"] = task;
+                if (!record.OpcodeName.empty())
+                {
+                    activity.Evidence[L"opcode"] = record.OpcodeName;
+                }
+                if (record.TargetProcessId != 0)
+                {
+                    activity.Evidence[L"target_pid"] =
+                        std::to_wstring(record.TargetProcessId);
+                }
+                if (record.ThreadId != 0)
+                {
+                    activity.Evidence[L"tid"] = std::to_wstring(record.ThreadId);
+                }
+                ++activityEvents;
+                RecordEvent(std::move(activity));
+            }
         }
 
         if (record.ProcessId > 4 && record.ImagePath.empty())
@@ -6495,7 +6585,15 @@ void KernelMonitor::IngestLiveTimeline()
             classified.Kind == L"process.masquerade")
         {
             std::wstring base = KmonBasenameLower(classified.Image);
+            uint32_t parentPid = 0;
+            auto parentIt = event.Evidence.find(L"parent_pid");
+            if (parentIt != event.Evidence.end())
+            {
+                parentPid = static_cast<uint32_t>(
+                    std::wcstoul(parentIt->second.c_str(), nullptr, 10));
+            }
             bool nameWatch = false;
+            bool childWatch = false;
             {
                 std::lock_guard<std::mutex> watchLock(WatchMutex);
                 nameWatch = NameEqualsWatch(base, WatchNamesLower) &&
@@ -6504,6 +6602,20 @@ void KernelMonitor::IngestLiveTimeline()
                 {
                     WatchPromotedPids.insert(classified.ProcessId);
                     WatchPids.insert(classified.ProcessId);
+                }
+                // Descendants of a watched loader inherit the watch so the
+                // 2nd stage gets hostility scans, VM logging, and the TI
+                // activity trail even after the parent exits.
+                childWatch =
+                    !nameWatch &&
+                    classified.ProcessId > 4 &&
+                    parentPid != 0 &&
+                    WatchPids.count(parentPid) != 0;
+                if (childWatch)
+                {
+                    WatchPromotedPids.insert(classified.ProcessId);
+                    WatchPids.insert(classified.ProcessId);
+                    WatchChildPids[classified.ProcessId] = parentPid;
                 }
                 if (classified.ProcessId > 4)
                 {
@@ -6522,9 +6634,14 @@ void KernelMonitor::IngestLiveTimeline()
                     }
                 }
             }
-            if (nameWatch && classified.ProcessId > 4)
+            if ((nameWatch || childWatch) && classified.ProcessId > 4)
             {
                 EnableLoggingForPid(classified.ProcessId);
+            }
+            if (childWatch)
+            {
+                classified.Evidence[L"watch_source"] =
+                    L"child_of:" + std::to_wstring(parentPid);
             }
         }
 
@@ -11035,14 +11152,410 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     }
 }
 
+// Handle-table diff for watched pids: report new Device-typed handles as
+// driver.handle so a loader acquiring a driver/device channel (BYOVD
+// precondition) shows up on the tail. First pass per pid is a silent
+// baseline; handle closes are not tracked.
+void KernelMonitor::ScanWatchedHandleTables()
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || symbols == nullptr || !device->IsOpen())
+    {
+        return;
+    }
+
+    std::vector<uint32_t> pids;
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        pids.assign(WatchPids.begin(), WatchPids.end());
+    }
+    if (pids.empty())
+    {
+        return;
+    }
+    std::sort(pids.begin(), pids.end());
+    constexpr size_t kMaxWatchedHandleScans = 8;
+    if (pids.size() > kMaxWatchedHandleScans)
+    {
+        pids.resize(kMaxWatchedHandleScans);
+    }
+
+    if (!WatchDeviceTypeKnown)
+    {
+        std::wstring typeError;
+        uint32_t index = 0;
+        if (!device->QueryDeviceObjectTypeIndex(&index, &typeError) ||
+            index == 0)
+        {
+            EmitUnique(
+                L"driver.handle",
+                L"scan_failed:handles:type_index",
+                std::wstring(),
+                L"handle",
+                L"device object type index could not be learned; driver.handle diffing is inactive",
+                typeError.empty() ? L"QueryDeviceObjectTypeIndex failed" : typeError,
+                0);
+            return;
+        }
+        WatchDeviceTypeIndex = index;
+        WatchDeviceTypeKnown = true;
+        ClearEmittedKey(L"scan_failed:handles:type_index");
+    }
+
+    HandleTableScanner scanner(*device, *symbols);
+    for (uint32_t pid : pids)
+    {
+        HandleTableScanOptions options = {};
+        options.HasOwnerPid = true;
+        options.OwnerPid = pid;
+        options.ProcessHandlesOnly = false;
+        options.CollectRecords = true;
+        HandleTableScanResult result = {};
+        std::wstring error;
+        const std::wstring failKey =
+            L"scan_failed:handles:" + std::to_wstring(pid);
+        if (!scanner.Scan(options, &result, &error))
+        {
+            EmitUnique(
+                L"driver.handle",
+                failKey,
+                std::wstring(),
+                L"handle",
+                L"handle-table scan failed for pid=" + std::to_wstring(pid),
+                error.empty() ? L"Scan returned false" : error,
+                pid);
+            continue;
+        }
+        ClearEmittedKey(failKey);
+
+        std::set<std::pair<uint64_t, uint64_t>> known;
+        {
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            auto it = WatchKnownHandles.find(pid);
+            if (it != WatchKnownHandles.end())
+            {
+                known = it->second;
+            }
+        }
+
+        bool firstBaseline = known.empty();
+        for (const HandleTableRecord& record : result.Records)
+        {
+            const std::pair<uint64_t, uint64_t> key(
+                static_cast<uint64_t>(record.HandleValue),
+                record.Object);
+            if (known.find(key) != known.end())
+            {
+                continue;
+            }
+            known.insert(key);
+            if (firstBaseline ||
+                record.ObjectTypeIndex != WatchDeviceTypeIndex)
+            {
+                continue;
+            }
+            EmitUnique(
+                L"driver.handle",
+                L"driver_handle:" + std::to_wstring(pid) + L":" +
+                    HexU64(record.HandleValue),
+                std::wstring(),
+                L"handle",
+                L"watched process opened a device handle pid=" +
+                    std::to_wstring(pid),
+                L"handle=" + HexU64(record.HandleValue) +
+                    L" object=" + HexU64(record.Object) +
+                    L" access=" + HexU64(record.GrantedAccess),
+                pid);
+        }
+
+        {
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            WatchKnownHandles[pid] = std::move(known);
+        }
+    }
+}
+
+// Iotrace control: the driver interposes the target's IRP_MJ_DEVICE_CONTROL
+// and the worker loop drains the non-paged ring into driver.ioctl events
+// (first seen per caller pid + ioctl code).
+bool KernelMonitor::ArmIotrace(uint64_t driverObjectAddress, const std::wstring& driverName, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        DeviceClient* device = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(StateMutex);
+            device = Device;
+        }
+        if (device == nullptr || !device->IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"kernel device is not open";
+            }
+            break;
+        }
+
+        uint32_t armed = 0;
+        std::wstring ioctlError;
+        if (!device->ControlIotrace(
+                KNDBG_IOTRACE_MODE_ARM,
+                driverObjectAddress,
+                &armed,
+                nullptr,
+                nullptr,
+                &ioctlError))
+        {
+            if (error != nullptr)
+            {
+                *error = ioctlError;
+            }
+            break;
+        }
+        if (armed == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver did not arm the interposition";
+            }
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            IotraceActive = true;
+            IotraceDriverName = driverName;
+            IotraceSeen.clear();
+            IotraceSeenCapNoted = false;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool KernelMonitor::DisarmIotrace(std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        DeviceClient* device = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(StateMutex);
+            device = Device;
+        }
+        if (device == nullptr || !device->IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"kernel device is not open";
+            }
+            break;
+        }
+
+        DrainIotraceEvents();
+
+        uint32_t armed = 0;
+        std::wstring ioctlError;
+        if (!device->ControlIotrace(
+                KNDBG_IOTRACE_MODE_DISARM,
+                0,
+                &armed,
+                nullptr,
+                nullptr,
+                &ioctlError))
+        {
+            if (error != nullptr)
+            {
+                *error = ioctlError;
+            }
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            IotraceActive = false;
+            IotraceDriverName.clear();
+            IotraceSeen.clear();
+            IotraceSeenCapNoted = false;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool KernelMonitor::IotraceArmed() const
+{
+    std::lock_guard<std::mutex> watchLock(WatchMutex);
+    return IotraceActive;
+}
+
+void KernelMonitor::DrainIotraceEvents()
+{
+    DeviceClient* device = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+    }
+    if (device == nullptr || !device->IsOpen())
+    {
+        return;
+    }
+
+    bool active = false;
+    std::wstring driverName;
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        active = IotraceActive;
+        driverName = IotraceDriverName;
+    }
+    if (!active)
+    {
+        return;
+    }
+
+    std::vector<IotraceRecord> records;
+    uint64_t dropped = 0;
+    std::wstring error;
+    if (!device->DrainIotrace(&records, &dropped, &error))
+    {
+        EmitUnique(
+            L"driver.ioctl",
+            L"scan_failed:iotrace:drain",
+            driverName,
+            L"iotrace",
+            L"iotrace drain failed",
+            error.empty() ? L"DrainIotrace returned false" : error,
+            0);
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:iotrace:drain");
+
+    constexpr size_t kMaxSeenEntries = 256;
+    for (const IotraceRecord& record : records)
+    {
+        const std::pair<uint32_t, uint64_t> key(record.ProcessId, record.IoctlCode);
+        bool firstSeen = false;
+        {
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            if (IotraceSeen.size() < kMaxSeenEntries)
+            {
+                firstSeen = IotraceSeen.insert(key).second;
+            }
+        }
+        if (!firstSeen)
+        {
+            continue;
+        }
+
+        const uint32_t function =
+            static_cast<uint32_t>((record.IoctlCode >> 2) & 0xFFF);
+        const uint32_t deviceType =
+            static_cast<uint32_t>((record.IoctlCode >> 16) & 0xFFFF);
+        const uint32_t method =
+            static_cast<uint32_t>(record.IoctlCode & 0x3);
+        EmitUnique(
+            L"driver.ioctl",
+            L"driver_ioctl:" + std::to_wstring(record.ProcessId) + L":" +
+                HexU64(record.IoctlCode),
+            driverName,
+            L"iotrace",
+            L"IOCTL to " + (driverName.empty() ? L"<target>" : driverName) +
+                L" pid=" + std::to_wstring(record.ProcessId),
+            L"ctl=" + HexU64(record.IoctlCode) +
+                L" function=" + HexU64(function) +
+                L" device_type=" + HexU64(deviceType) +
+                L" method=" + std::to_wstring(method) +
+                L" in=" + std::to_wstring(record.InputLength) +
+                L" out=" + std::to_wstring(record.OutputLength),
+            record.ProcessId);
+    }
+
+    bool noteCap = false;
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        if (!IotraceSeenCapNoted && IotraceSeen.size() >= kMaxSeenEntries)
+        {
+            IotraceSeenCapNoted = true;
+            noteCap = true;
+        }
+    }
+    if (noteCap)
+    {
+        EmitUnique(
+            L"driver.ioctl",
+            L"iotrace_cap:" + driverName,
+            driverName,
+            L"iotrace",
+            L"iotrace first-seen table hit its cap; later distinct IOCTLs are not printed",
+            L"cap=256; interposition keeps running",
+            0);
+    }
+    if (dropped != 0)
+    {
+        EmitUnique(
+            L"driver.ioctl",
+            L"iotrace_dropped:" + driverName,
+            driverName,
+            L"iotrace",
+            L"iotrace ring dropped records; drain more often",
+            L"dropped=" + std::to_wstring(dropped),
+            0);
+    }
+}
+
+// First-seen-per-task throttle for the loader.activity trail: true when
+// pid is watched and this TI task name has not been recorded yet.
+bool KernelMonitor::NoteWatchActivityTask(uint32_t pid, const std::wstring& task)
+{
+    bool record = false;
+
+    do
+    {
+        if (pid <= 4 || task.empty())
+        {
+            break;
+        }
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (WatchPids.count(pid) == 0)
+        {
+            break;
+        }
+        std::unordered_set<std::wstring>& seen = WatchActivityTasks[pid];
+        if (seen.size() >= 64)
+        {
+            break;
+        }
+        record = seen.insert(task).second;
+    } while (false);
+
+    return record;
+}
+
 void KernelMonitor::PruneStalePromotedWatches()
 {
     std::vector<std::wstring> names;
     std::unordered_set<uint32_t> promoted;
+    std::vector<uint32_t> childPids;
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
         names = WatchNamesLower;
         promoted = WatchPromotedPids;
+        childPids.reserve(WatchChildPids.size());
+        for (const auto& entry : WatchChildPids)
+        {
+            childPids.push_back(entry.first);
+        }
     }
     bool prunePromoted = false;
     std::unordered_set<uint32_t> liveSet;
@@ -11110,6 +11623,28 @@ void KernelMonitor::PruneStalePromotedWatches()
         }
     }
 
+    // Children carry a different image name than the watch, so name
+    // re-enumeration would drop them. Keep them on the wildcard-style
+    // liveness rule (the create-time pin below still applies).
+    for (uint32_t pid : childPids)
+    {
+        if (liveSet.count(pid) != 0)
+        {
+            continue;
+        }
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process != nullptr)
+        {
+            liveSet.insert(pid);
+            CloseHandle(process);
+            continue;
+        }
+        if (GetLastError() != ERROR_INVALID_PARAMETER)
+        {
+            liveSet.insert(pid);
+        }
+    }
+
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     {
@@ -11162,6 +11697,9 @@ void KernelMonitor::PruneStalePromotedWatches()
                     continue;
                 }
                 WatchPromotedCreated.erase(pid);
+                WatchChildPids.erase(pid);
+                WatchActivityTasks.erase(pid);
+                WatchKnownHandles.erase(pid);
                 if (WatchExplicitPids.count(pid) == 0)
                 {
                     WatchPids.erase(pid);
@@ -11721,6 +12259,8 @@ bool KernelMonitor::RemoveWatchPid(uint32_t pid)
         WatchExplicitPids.erase(pid);
         WatchPromotedPids.erase(pid);
         WatchPromotedCreated.erase(pid);
+        WatchChildPids.erase(pid);
+        WatchActivityTasks.erase(pid);
         removed = WatchPids.erase(pid) != 0;
         wasLogging = LoggingEnabledPids.erase(pid) != 0;
         LoggingFailedPids.erase(pid);
@@ -12943,6 +13483,59 @@ bool KernelMonitorSelfTest()
         KmonOptions pathWatch;
         pathWatch.WatchNames.push_back(KmonBasenameLower(L"C:\\games\\game.exe"));
         if (!KmonWatchMatches(injectEvent, pathWatch))
+        {
+            break;
+        }
+
+        // loader.activity trails only surface for watched caller/target
+        // pids or watched names, and never with an empty watch set.
+        KmonEvent activity = {};
+        activity.Kind = L"loader.activity";
+        activity.ProcessId = 501;
+        activity.Image = L"C:\\drops\\loader.exe";
+        activity.Task = L"RegSet_value";
+        if (KmonWatchMatches(activity, emptyWatch))
+        {
+            break;
+        }
+        KmonOptions pidWatch;
+        pidWatch.WatchPids.push_back(501);
+        if (!KmonWatchMatches(activity, pidWatch))
+        {
+            break;
+        }
+        KmonOptions nameWatch2;
+        nameWatch2.WatchNames.push_back(L"loader.exe");
+        if (!KmonWatchMatches(activity, nameWatch2))
+        {
+            break;
+        }
+        KmonEvent otherActivity = activity;
+        otherActivity.ProcessId = 502;
+        otherActivity.TargetProcessId = 501;
+        if (!KmonWatchMatches(otherActivity, pidWatch))
+        {
+            break;
+        }
+        otherActivity.TargetProcessId = 0;
+        if (KmonWatchMatches(otherActivity, pidWatch))
+        {
+            break;
+        }
+
+        // driver.handle / driver.ioctl always match: both are emitted only
+        // for watched targets or an explicitly armed interposition.
+        KmonEvent driverHandle = {};
+        driverHandle.Kind = L"driver.handle";
+        driverHandle.ProcessId = 601;
+        if (!KmonWatchMatches(driverHandle, emptyWatch))
+        {
+            break;
+        }
+        KmonEvent driverIoctl = {};
+        driverIoctl.Kind = L"driver.ioctl";
+        driverIoctl.ProcessId = 601;
+        if (!KmonWatchMatches(driverIoctl, emptyWatch))
         {
             break;
         }
