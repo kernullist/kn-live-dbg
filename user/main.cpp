@@ -5043,6 +5043,18 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                 };
                 AddCompletionCandidates(&candidates, values);
             }
+            else if (ToLower(argsBefore[1]) == L"iotrace")
+            {
+                // !kmon iotrace <driver> on|off|status
+                static const wchar_t* values[] =
+                {
+                    L"on",
+                    L"off",
+                    L"status",
+                    L"help"
+                };
+                AddCompletionCandidates(&candidates, values);
+            }
             else
             {
                 static const wchar_t* values[] =
@@ -24764,10 +24776,10 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/throttle N]\n";
     std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
     std::wcout << L"  !kmon add /pid|/name|/driver <v>     while collecting; later start extends watches\n";
+    std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
     std::wcout << L"  !kmon iotrace <driver> on|off|status lab-only: interpose the named driver's\n";
     std::wcout << L"                                       IRP_MJ_DEVICE_CONTROL and print driver.ioctl\n";
     std::wcout << L"                                       (first per pid+ioctl code); off restores it\n";
-    std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
     std::wcout << L"  !kmon watch            reattach live tail after Esc (optional)\n";
     std::wcout << L"\n";
     std::wcout << L"typical hunt (driver filename is not an input):\n";
@@ -24777,15 +24789,18 @@ static void PrintKmonHelp()
     std::wcout << L"bare !kmon (or !kmon start) arms TI + kernel live callbacks and stays on the\n";
     std::wcout << L"live tail. Esc/q returns to knkd>; collection keeps running. !kmon again reattaches.\n";
     std::wcout << L"  /background     arm only, return to the prompt (JSONL still fills); /nowatch alias\n";
-    std::wcout << L"  /name game.exe  add overlay inject.remote and in-process dxgi/d3d IAT/vtable scans\n";
+    std::wcout << L"  /name game.exe  add overlay inject.remote and in-process dxgi/d3d IAT/vtable scans;\n";
+    std::wcout << L"                  /name * watches every new process (wildcard promotion)\n";
     std::wcout << L"  /driver name    highlight only; never hides unknown drop names\n";
-    std::wcout << L"  /verbose        also keep inbox TI DriverObjectLoad (first start only)\n";
+    std::wcout << L"  /verbose        also keep inbox TI DriverObjectLoad (first start only);\n";
+    std::wcout << L"                  /all-drivers is the same switch\n";
     std::wcout << L"  /log /verbose /throttle apply only on the first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
     std::wcout << L"  shown:  drop_load, image_only (post-arm kernel image notify), short_lived,\n";
     std::wcout << L"          mapped_residue, mapper.watch, hook.unbacked, hook.dataptr, hidden,\n";
-    std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw\n";
+    std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw,\n";
+    std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids\n";
     std::wcout << L"  hidden: inbox TI DriverObjectLoad, process create, local AllocVM, kernel R/W,\n";
     std::wcout << L"          ReadVM/suspend/resume alone\n";
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
@@ -30281,6 +30296,7 @@ static std::wstring FirstTokenMissingCompletionHint()
         {L"!kmon"},
         {L"!kmon", L"start"},
         {L"!kmon", L"add"},
+        {L"!kmon", L"iotrace"},
         {L"!timeline"},
         {L"!timeline", L"ingest"},
         {L"!timeline", L"ingest", L"ti"},
@@ -31223,6 +31239,12 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {}, L"!kmon", L"kmon-root-completion");
         CheckCompletionCandidate(&context, {L"!kmon"}, L"start", L"kmon-start-completion");
         CheckCompletionCandidate(&context, {L"!kmon"}, L"iotrace", L"kmon-iotrace-completion");
+        CheckCompletionCandidate(&context, {L"!kmon", L"iotrace"}, L"on", L"kmon-iotrace-on-completion");
+        CheckCompletionCandidate(&context, {L"!kmon", L"iotrace", L"drv"}, L"on", L"kmon-iotrace-driver-on-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !CompletionCandidateExists({L"!kmon", L"iotrace"}, L"/pid"),
+            L"kmon-iotrace-completion-is-value-scoped");
         CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/driver", L"kmon-start-driver-completion");
         CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/verbose", L"kmon-start-verbose-completion");
         CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/background", L"kmon-start-background-completion");

@@ -702,6 +702,8 @@ namespace
         { L"add", L"!kmon add /pid|/name|/driver <v>", L"while collecting; extend inject.remote or highlight set" },
         { L"remove", L"!kmon remove /pid|/name|/driver <v>", L"while collecting; drop a watch target" },
         { L"iotrace", L"!kmon iotrace <driver> on|off|status", L"lab-only: interpose a driver's IOCTL dispatch and print driver.ioctl" },
+        { L"on", L"!kmon iotrace <driver> on", L"interpose the named driver's IRP_MJ_DEVICE_CONTROL (lab-only)" },
+        { L"off", L"!kmon iotrace off", L"restore the interposed dispatch entry" },
         { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"save", L"!kmon save <path>", L"export derived ring as JSONL" },
