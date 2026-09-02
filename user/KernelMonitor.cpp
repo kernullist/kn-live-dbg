@@ -5513,6 +5513,9 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"process.hidden" ||
             event.Kind == L"process.syscall_unnamed" ||
             event.Kind == L"driver.drop_load" ||
+            event.Kind == L"driver.official_load" ||
+            event.Kind == L"driver.official_unload" ||
+            event.Kind == L"driver.device" ||
             event.Kind == L"driver.image_only" ||
             event.Kind == L"driver.short_lived" ||
             event.Kind == L"driver.mapped_residue" ||
@@ -5532,61 +5535,10 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             break;
         }
 
-        std::wstring driverBase = KmonBasenameLower(event.Driver);
-        const bool namedDriver =
-            !event.Driver.empty() && NameEqualsWatch(driverBase, options.WatchDrivers);
-        std::wstring pathClass;
-        auto pathIt = event.Evidence.find(L"path_class");
-        if (pathIt != event.Evidence.end())
-        {
-            pathClass = pathIt->second;
-        }
-
-        if (event.Kind.rfind(L"driver.", 0) == 0)
-        {
-            // /driver is a highlight, not an exclusive filter. Unknown
-            // drop/map/unload names must still surface.
-            if (namedDriver)
-            {
-                matched = true;
-                break;
-            }
-            if (options.VerboseDrivers)
-            {
-                matched = true;
-                break;
-            }
-            // Empty payload paths are common when TDH leaves DriverName as
-            // <struct>. Do not treat those as drops or the tail becomes a
-            // DeviceObject/unload firehose. /driver * must not override this.
-            if (event.Driver.empty())
-            {
-                break;
-            }
-            if (pathClass == L"inbox")
-            {
-                break;
-            }
-            if (event.Kind == L"driver.official_unload")
-            {
-                if (pathClass == L"drop" ||
-                    pathClass == L"third_party" ||
-                    KmonDriverPathHasFileDirectory(event.Driver))
-                {
-                    matched = true;
-                }
-                break;
-            }
-            if (event.Kind == L"driver.device")
-            {
-                if (KmonPathLooksLikeSys(event.Driver))
-                {
-                    matched = true;
-                }
-                break;
-            }
-            break;
-        }
+        // All driver.* kinds are covered by the always-match list above:
+        // !kmon runs post-boot right before the suspect activity, so every
+        // driver lifecycle event (load, unload, device object) is signal
+        // and none is filtered; /driver stays a highlight only.
 
         if (event.Kind == L"inject.remote")
         {
@@ -5692,63 +5644,22 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
     return matched;
 }
 
-static std::wstring KmonEventPathClass(const KmonEvent& event)
-{
-    auto it = event.Evidence.find(L"path_class");
-    if (it == event.Evidence.end())
-    {
-        return std::wstring();
-    }
-    return it->second;
-}
-
-static bool KmonPathClassLooksMapped(const std::wstring& pathClass, const std::wstring& driver)
-{
-    if (pathClass == L"drop" || pathClass == L"third_party")
-    {
-        return true;
-    }
-    if (pathClass != L"inbox" && KmonDriverPathHasFileDirectory(driver))
-    {
-        return true;
-    }
-    return false;
-}
-
 bool KmonDriverLoadArmsMapperWatch(const KmonEvent& event)
 {
-    if (event.Kind == L"driver.drop_load")
-    {
-        return true;
-    }
-    if (event.Kind == L"driver.image_only")
-    {
-        const std::wstring pathClass = KmonEventPathClass(event);
-        if (pathClass == L"inbox")
-        {
-            return false;
-        }
-        if (event.Driver.empty())
-        {
-            return true;
-        }
-        return KmonPathClassLooksMapped(pathClass, event.Driver) ||
-            pathClass == L"unknown";
-    }
-    if (event.Kind == L"driver.official_load")
-    {
-        return KmonPathClassLooksMapped(KmonEventPathClass(event), event.Driver);
-    }
-    return false;
+    // !kmon runs long after boot, right before the suspect activity: any
+    // driver load in that window (inbox-named, undecoded, or dropped) is
+    // context worth a capped 30s burst, so there is no exception path.
+    return event.Kind == L"driver.drop_load" ||
+        event.Kind == L"driver.image_only" ||
+        event.Kind == L"driver.official_load";
 }
 
 bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event)
 {
-    if (event.Kind != L"driver.official_unload" && event.Kind != L"driver.short_lived")
-    {
-        return false;
-    }
-    return KmonPathClassLooksMapped(KmonEventPathClass(event), event.Driver);
+    // Same reasoning as loads: a mapper that unloads its vulnerable driver
+    // right after mapping can carry an inbox-looking or undecoded path.
+    return event.Kind == L"driver.official_unload" ||
+        event.Kind == L"driver.short_lived";
 }
 
 KernelMonitor::KernelMonitor() = default;
@@ -12953,8 +12864,10 @@ bool KernelMonitorSelfTest()
         {
             break;
         }
-        KmonOptions emptyWatchForUnnamed;
-        if (KmonWatchMatches(classified, emptyWatchForUnnamed))
+        KmonOptions anyWatchQuiet;
+        // Undecoded DRIVER_OBJECT paths are still driver loads: they must
+        // print with no exception path.
+        if (!KmonWatchMatches(classified, anyWatchQuiet))
         {
             break;
         }
@@ -13005,7 +12918,7 @@ bool KernelMonitorSelfTest()
             classified.Evidence[L"image_base"] != L"0xfffff80012340000" ||
             classified.Evidence[L"signature_level"] != L"windows" ||
             classified.Summary.find(L"base=0xfffff80012340000") == std::wstring::npos ||
-            !KmonWatchMatches(classified, emptyWatchForUnnamed))
+            !KmonWatchMatches(classified, anyWatchQuiet))
         {
             break;
         }
@@ -13020,7 +12933,7 @@ bool KernelMonitorSelfTest()
         if (!KmonClassifyLiveEvent(liveSystemModeUnnamed, &classified) ||
             classified.Kind != L"driver.image_only" ||
             classified.Summary.find(L"unnamed") == std::wstring::npos ||
-            !KmonWatchMatches(classified, emptyWatchForUnnamed))
+            !KmonWatchMatches(classified, anyWatchQuiet))
         {
             break;
         }
@@ -13088,7 +13001,7 @@ bool KernelMonitorSelfTest()
             classified.Summary.find(L"inbox") == std::wstring::npos ||
             classified.Summary.find(L"base=0xfffff80012340000") == std::wstring::npos ||
             classified.Summary.find(L"sig=windows") == std::wstring::npos ||
-            !KmonWatchMatches(classified, emptyWatchForUnnamed))
+            !KmonWatchMatches(classified, anyWatchQuiet))
         {
             break;
         }
@@ -13122,20 +13035,20 @@ bool KernelMonitorSelfTest()
         KmonEvent mappedLive = {};
         mappedLive.Kind = L"driver.mapped_residue";
         mappedLive.Evidence[L"layer"] = L"pool_pe";
-        if (!KmonWatchMatches(mappedLive, emptyWatchForUnnamed))
+        if (!KmonWatchMatches(mappedLive, anyWatchQuiet))
         {
             break;
         }
         KmonEvent hookEvent = {};
         hookEvent.Kind = L"hook.unbacked";
         hookEvent.Evidence[L"layer"] = L"callback";
-        if (!KmonWatchMatches(hookEvent, emptyWatchForUnnamed))
+        if (!KmonWatchMatches(hookEvent, anyWatchQuiet))
         {
             break;
         }
         KmonEvent ciEvent = {};
         ciEvent.Kind = L"integrity.ci";
-        if (!KmonWatchMatches(ciEvent, emptyWatchForUnnamed))
+        if (!KmonWatchMatches(ciEvent, anyWatchQuiet))
         {
             break;
         }
@@ -13310,7 +13223,7 @@ bool KernelMonitorSelfTest()
         inboxImage.Driver = L"C:\\Windows\\System32\\drivers\\acpi.sys";
         inboxImage.Evidence[L"path_class"] = L"inbox";
         if (!KmonWatchMatches(inboxImage, emptyWatch) ||
-            KmonDriverLoadArmsMapperWatch(inboxImage))
+            !KmonDriverLoadArmsMapperWatch(inboxImage))
         {
             break;
         }
@@ -13354,8 +13267,18 @@ bool KernelMonitorSelfTest()
         inboxEvent.Kind = L"driver.official_load";
         inboxEvent.Driver = L"C:\\Windows\\System32\\drivers\\acpi.sys";
         inboxEvent.Evidence[L"path_class"] = L"inbox";
-        if (KmonWatchMatches(inboxEvent, emptyWatch) ||
-            KmonDriverLoadArmsMapperWatch(inboxEvent))
+        // Every driver load prints AND arms the capped mapper watch, inbox
+        // included: !kmon runs post-boot, so any load is signal.
+        if (!KmonWatchMatches(inboxEvent, emptyWatch) ||
+            !KmonDriverLoadArmsMapperWatch(inboxEvent))
+        {
+            break;
+        }
+        KmonEvent undecodedLoad = {};
+        undecodedLoad.Kind = L"driver.official_load";
+        undecodedLoad.Evidence[L"path_class"] = L"unknown";
+        if (!KmonWatchMatches(undecodedLoad, emptyWatch) ||
+            !KmonDriverLoadArmsMapperWatch(undecodedLoad))
         {
             break;
         }
@@ -13366,7 +13289,7 @@ bool KernelMonitorSelfTest()
         KmonEvent inboxUnload = inboxEvent;
         inboxUnload.Kind = L"driver.official_unload";
         if (!KmonDriverUnloadArmsMapperWatch(dropUnload) ||
-            KmonDriverUnloadArmsMapperWatch(inboxUnload))
+            !KmonDriverUnloadArmsMapperWatch(inboxUnload))
         {
             break;
         }
@@ -13382,16 +13305,18 @@ bool KernelMonitorSelfTest()
             break;
         }
 
+        // Unload and device-object events print with no exception path;
+        // undecoded/empty driver names included.
         KmonEvent emptyDevice = {};
         emptyDevice.Kind = L"driver.device";
-        if (KmonWatchMatches(emptyDevice, emptyWatch))
+        if (!KmonWatchMatches(emptyDevice, emptyWatch))
         {
             break;
         }
 
         KmonOptions starDriver;
         starDriver.WatchDrivers.push_back(L"*");
-        if (KmonWatchMatches(emptyDevice, starDriver))
+        if (!KmonWatchMatches(emptyDevice, starDriver))
         {
             break;
         }
@@ -13461,7 +13386,7 @@ bool KernelMonitorSelfTest()
         bareInbox.Payload.push_back(bareField);
         if (!KmonClassifyTiEvent(bareInbox, &classified) ||
             classified.Kind != L"driver.official_load" ||
-            KmonWatchMatches(classified, emptyWatch))
+            !KmonWatchMatches(classified, emptyWatch))
         {
             break;
         }

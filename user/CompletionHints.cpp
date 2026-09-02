@@ -716,7 +716,7 @@ namespace
         { L"/pid", L"/pid <PID>", L"optional; add inject.remote for this PID" },
         { L"/name", L"/name <image>", L"optional; inject.remote plus dxgi/d3d IAT/vtable scans" },
         { L"/driver", L"/driver <sys>", L"highlight only; does not hide unknown drop names" },
-        { L"/verbose", L"/verbose", L"also keep inbox System32\\drivers loads" },
+        { L"/verbose", L"/verbose", L"kept for compatibility; all driver events already print" },
         { L"/all-drivers", L"/all-drivers", L"alias for /verbose" },
         { L"/background", L"/background", L"arm only; do not occupy the prompt" },
         { L"/nowatch", L"/nowatch", L"alias for /background" },

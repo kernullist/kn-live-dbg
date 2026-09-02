@@ -24792,25 +24792,30 @@ static void PrintKmonHelp()
     std::wcout << L"  /name game.exe  add overlay inject.remote and in-process dxgi/d3d IAT/vtable scans;\n";
     std::wcout << L"                  /name * watches every new process (wildcard promotion)\n";
     std::wcout << L"  /driver name    highlight only; never hides unknown drop names\n";
-    std::wcout << L"  /verbose        also keep inbox TI DriverObjectLoad (first start only);\n";
-    std::wcout << L"                  /all-drivers is the same switch\n";
+    std::wcout << L"  /verbose        kept for compatibility; every driver load/unload and device\n";
+    std::wcout << L"                  object event already prints regardless; /all-drivers is the\n";
+    std::wcout << L"                  same switch\n";
     std::wcout << L"  /log /verbose /throttle apply only on the first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
-    std::wcout << L"  shown:  drop_load, image_only (post-arm kernel image notify), short_lived,\n";
+    std::wcout << L"  shown:  every driver lifecycle event (drop_load, official load/unload, device\n";
+    std::wcout << L"          objects, post-arm kernel image notify) with no exception path, short_lived,\n";
     std::wcout << L"          mapped_residue, mapper.watch, hook.unbacked, hook.dataptr, hidden,\n";
     std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw,\n";
     std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids\n";
-    std::wcout << L"  hidden: inbox TI DriverObjectLoad, process create, local AllocVM, kernel R/W,\n";
+    std::wcout << L"  hidden: process create, local AllocVM, kernel R/W,\n";
     std::wcout << L"          ReadVM/suspend/resume alone\n";
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
     std::wcout << L"  a quiet idle host is mostly silent after the start line.\n";
     std::wcout << L"\n";
     std::wcout << L"logged kinds:\n";
     std::wcout << L"  driver.drop_load        .sys outside System32\\drivers (Temp/Users/Program Files/root)\n";
+    std::wcout << L"  driver.official_load    DRIVER_OBJECT load, inbox and undecoded paths included\n";
     std::wcout << L"  driver.image_only       kernel image-load notify after !kmon arm (inbox included);\n";
     std::wcout << L"                          prints path, image base, size, and CI signature level\n";
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
+    std::wcout << L"  driver.official_unload  DRIVER_OBJECT unload, no path exception\n";
+    std::wcout << L"  driver.device           DEVICE_OBJECT load/unload, no path exception\n";
     std::wcout << L"  driver.handle           watched pid opened a new device handle (BYOVD precondition)\n";
     std::wcout << L"  driver.ioctl            iotrace: IOCTL to the interposed driver, first per pid+code\n";
     std::wcout << L"  loader.activity         unclassified TI tasks (file/registry/VM ops) from\n";
@@ -24820,8 +24825,8 @@ static void PrintKmonHelp()
     std::wcout << L"                          headerless kpage/pool import stubs (kpage_code/pool_code) during\n";
     std::wcout << L"                          mapper.watch, non-paged big-pool stubs also while idle (>=3 stubs),\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
-    std::wcout << L"  mapper.watch            30s burst after drop/third-party kernel load/unload (capped 90s);\n";
-    std::wcout << L"                          inbox image-notify prints but does not arm; leftover+wipe diffs,\n";
+    std::wcout << L"  mapper.watch            30s burst after ANY kernel driver load/unload (capped 90s);\n";
+    std::wcout << L"                          leftover+wipe diffs,\n";
     std::wcout << L"                          400ms mapper/pool, 1.5s kpage, one DeepPfn pass per window\n";
     std::wcout << L"  hook.unbacked           callback/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter\n";
     std::wcout << L"                          whose routine is outside PsLoadedModuleList (empty list is fail-closed);\n";
@@ -25244,7 +25249,7 @@ static void HandleKmonCommand(
             std::wcout << L" started. logging unknown drop/map/hidden events and post-arm kernel image loads.\n";
             KmonOptions current = kmon.CurrentOptions();
             std::wcout << L"     log directory=" << current.LogDirectory
-                       << L" verbose_inbox=" << (current.VerboseDrivers ? L"yes" : L"no") << L"\n";
+                       << L" verbose_flag=" << (current.VerboseDrivers ? L"yes" : L"no") << L"\n";
             std::wcout << L"     watch:";
             if (current.WatchPids.empty() &&
                 current.WatchNames.empty() &&
