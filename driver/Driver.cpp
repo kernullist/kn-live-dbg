@@ -431,25 +431,39 @@ static void KnDbgTimelinePushEvent(const KNDBG_TIMELINE_EVENT_RECORD* Event)
     KeAcquireSpinLock(&g_KnDbgTimelineLock, &oldIrql);
     if (g_KnDbgTimelineRing != nullptr && g_KnDbgTimelineCapacity != 0)
     {
-        KNDBG_TIMELINE_EVENT_RECORD* slot = &g_KnDbgTimelineRing[g_KnDbgTimelineHead];
-        RtlCopyMemory(slot, Event, sizeof(*slot));
-        slot->Size = sizeof(*slot);
-        slot->Sequence = g_KnDbgTimelineNextSequence;
-        ++g_KnDbgTimelineNextSequence;
-
-        ++g_KnDbgTimelineHead;
-        if (g_KnDbgTimelineHead >= g_KnDbgTimelineCapacity)
+        const BOOLEAN threadNoise =
+            Event->Type == KNDBG_TIMELINE_EVENT_THREAD_CREATE ||
+            Event->Type == KNDBG_TIMELINE_EVENT_THREAD_EXIT;
+        // Thread create/exit dwarfs image-load. Drop the noise first when
+        // the ring is under pressure so a post-arm driver map is not
+        // overwritten before user mode drains it.
+        if (threadNoise != FALSE &&
+            g_KnDbgTimelineCount * 4ul >= g_KnDbgTimelineCapacity * 3ul)
         {
-            g_KnDbgTimelineHead = 0;
-        }
-
-        if (g_KnDbgTimelineCount < g_KnDbgTimelineCapacity)
-        {
-            ++g_KnDbgTimelineCount;
+            ++g_KnDbgTimelineDropped;
         }
         else
         {
-            ++g_KnDbgTimelineDropped;
+            KNDBG_TIMELINE_EVENT_RECORD* slot = &g_KnDbgTimelineRing[g_KnDbgTimelineHead];
+            RtlCopyMemory(slot, Event, sizeof(*slot));
+            slot->Size = sizeof(*slot);
+            slot->Sequence = g_KnDbgTimelineNextSequence;
+            ++g_KnDbgTimelineNextSequence;
+
+            ++g_KnDbgTimelineHead;
+            if (g_KnDbgTimelineHead >= g_KnDbgTimelineCapacity)
+            {
+                g_KnDbgTimelineHead = 0;
+            }
+
+            if (g_KnDbgTimelineCount < g_KnDbgTimelineCapacity)
+            {
+                ++g_KnDbgTimelineCount;
+            }
+            else
+            {
+                ++g_KnDbgTimelineDropped;
+            }
         }
     }
     KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
@@ -546,12 +560,20 @@ static NTSTATUS KnDbgTimelineRegisterCallbacks()
 
     do
     {
+        if (g_KnDbgTimelineProcessRegistered != FALSE &&
+            g_KnDbgTimelineImageRegistered != FALSE &&
+            g_KnDbgTimelineThreadRegistered != FALSE)
+        {
+            InterlockedExchange(&g_KnDbgTimelineEnabled, 1);
+            status = STATUS_SUCCESS;
+            break;
+        }
+
         if (g_KnDbgTimelineProcessRegistered != FALSE ||
             g_KnDbgTimelineImageRegistered != FALSE ||
             g_KnDbgTimelineThreadRegistered != FALSE)
         {
-            status = STATUS_SUCCESS;
-            break;
+            KnDbgTimelineUnregisterCallbacks();
         }
 
         status = PsSetCreateProcessNotifyRoutineEx(KnDbgTimelineProcessNotify, FALSE);

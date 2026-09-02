@@ -23430,7 +23430,7 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     {
         event.Evidence[L"file_object"] = HexTextWidth(live.FileObject, 16, true);
     }
-    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD && live.Flags != 0)
+    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
     {
         if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_SYSTEM_MODE) != 0)
         {
@@ -23683,7 +23683,7 @@ private:
                 std::vector<TimelineLiveEvent> liveEvents;
                 TimelineLiveStatus drainStatus = {};
                 std::wstring error;
-                if (!DrainTimelineLiveEvents(device, 256, &liveEvents, &drainStatus, &error))
+                if (!DrainTimelineLiveEvents(device, 1024, &liveEvents, &drainStatus, &error))
                 {
                     RecordError(error);
                     for (size_t i = 0; i < 10 && !StopRequested.load(); ++i)
@@ -23703,13 +23703,19 @@ private:
                 TimelineIngestResult result = state->Timeline.IngestEvents(events);
                 RecordDrain(liveEvents.size(), result.Added);
 
-                for (size_t i = 0; i < 5; ++i)
+                const bool busy =
+                    liveEvents.size() >= 1024 ||
+                    drainStatus.Count > 0;
+                if (!busy)
                 {
-                    if (StopRequested.load())
+                    for (size_t i = 0; i < 5; ++i)
                     {
-                        break;
+                        if (StopRequested.load())
+                        {
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
             }
         } while (false);
@@ -24768,8 +24774,14 @@ static void PrintKmonEventLine(const KmonEvent& event)
     {
         std::wcout << L" driver=";
         PrintColoredText(KmonBasenameLower(event.Driver), KNDBG_COLOR_FAIL);
+        if (event.Driver.find(L'\\') != std::wstring::npos ||
+            event.Driver.find(L'/') != std::wstring::npos)
+        {
+            std::wcout << L" path=" << event.Driver;
+        }
     }
-    if (!event.Image.empty())
+    if (!event.Image.empty() &&
+        KmonBasenameLower(event.Image) != KmonBasenameLower(event.Driver))
     {
         std::wcout << L" image=" << KmonBasenameLower(event.Image);
     }
@@ -24778,6 +24790,7 @@ static void PrintKmonEventLine(const KmonEvent& event)
         std::wcout << L" " << event.Summary;
     }
     std::wcout << L"\n";
+    std::wcout.flush();
 }
 
 static void RunKmonLiveTail(KernelMonitor& kmon)
@@ -24820,6 +24833,7 @@ static void RunKmonLiveTail(KernelMonitor& kmon)
         {
             PrintColoredText(L"[kmon.throttle]", KNDBG_COLOR_WARN);
             std::wcout << L" suppressed " << suppressed << L" events\n";
+            std::wcout.flush();
         }
         if (batch.empty())
         {
