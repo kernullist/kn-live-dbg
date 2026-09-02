@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <cwctype>
@@ -5096,6 +5097,59 @@ static bool EvidenceIsTrue(const std::map<std::wstring, std::wstring>& evidence,
     return it != evidence.end() && it->second == L"true";
 }
 
+static bool KmonParseHexU64(const std::wstring& text, uint64_t* value)
+{
+    bool ok = false;
+
+    do
+    {
+        if (value == nullptr || text.empty())
+        {
+            break;
+        }
+
+        const wchar_t* start = text.c_str();
+        if (start[0] == L'0' && (start[1] == L'x' || start[1] == L'X'))
+        {
+            start += 2;
+        }
+        if (*start == L'\0')
+        {
+            break;
+        }
+
+        wchar_t* end = nullptr;
+        unsigned long long parsed = wcstoull(start, &end, 16);
+        if (end == start)
+        {
+            break;
+        }
+
+        *value = static_cast<uint64_t>(parsed);
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool KmonEvidenceLooksKernelImageBase(const std::map<std::wstring, std::wstring>& evidence)
+{
+    auto it = evidence.find(L"image_base");
+    if (it == evidence.end())
+    {
+        return false;
+    }
+
+    uint64_t va = 0;
+    if (!KmonParseHexU64(it->second, &va) || va == 0)
+    {
+        return false;
+    }
+
+    // Bit 63 set is the x64 kernel half for both 48-bit and LA57 canonical VAs.
+    return (va & 0x8000000000000000ull) != 0;
+}
+
 static void CopyImageNotifyEvidence(const TimelineEvent& event, KmonEvent* out)
 {
     if (out == nullptr)
@@ -5175,8 +5229,10 @@ bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
 
         std::wstring action = ToLowerCopy(event.Action);
         const bool systemMode = EvidenceIsTrue(event.Evidence, L"system_mode");
+        const bool kernelImageBase = KmonEvidenceLooksKernelImageBase(event.Evidence);
         const bool looksKernelImage =
             systemMode ||
+            kernelImageBase ||
             event.ProcessId == 0 ||
             event.ProcessId == 4;
         const bool unnamedPlaceholder =
@@ -5184,7 +5240,11 @@ bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
             event.Entity.rfind(L"pid:", 0) == 0;
         if (action == L"image-load" && looksKernelImage)
         {
-            if (unnamedPlaceholder && !systemMode && event.ProcessId != 0 && event.ProcessId != 4)
+            if (unnamedPlaceholder &&
+                !systemMode &&
+                !kernelImageBase &&
+                event.ProcessId != 0 &&
+                event.ProcessId != 4)
             {
                 break;
             }
@@ -5200,6 +5260,7 @@ bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out)
                 pathClass != L"inbox" &&
                 !KmonPathLooksLikeSys(event.Entity) &&
                 !systemMode &&
+                !kernelImageBase &&
                 event.ProcessId != 0 &&
                 event.ProcessId != 4)
             {
@@ -6234,7 +6295,7 @@ void KernelMonitor::IngestLiveTimeline()
         LiveCursorEventId = 0;
     }
 
-    std::vector<TimelineEvent> batch = timeline->RecentAfterEventId(LiveCursorEventId, 256);
+    std::vector<TimelineEvent> batch = timeline->RecentAfterEventId(LiveCursorEventId, 1024);
     for (const TimelineEvent& event : batch)
     {
         if (event.EventId > LiveCursorEventId)
@@ -12058,11 +12119,30 @@ bool KernelMonitorSelfTest()
             break;
         }
 
+        TimelineEvent liveUserPidKernelVa = {};
+        liveUserPidKernelVa.Action = L"image-load";
+        liveUserPidKernelVa.ProcessId = 1234;
+        liveUserPidKernelVa.Entity = L"\\SystemRoot\\System32\\drivers\\acpi.sys";
+        liveUserPidKernelVa.Source = L"kernel-live";
+        liveUserPidKernelVa.Evidence[L"image_base"] = L"0xfffff80012340000";
+        liveUserPidKernelVa.Evidence[L"image_size"] = L"0x0000000000012000";
+        liveUserPidKernelVa.Evidence[L"signature_level"] = L"windows";
+        if (!KmonClassifyLiveEvent(liveUserPidKernelVa, &classified) ||
+            classified.Kind != L"driver.image_only" ||
+            classified.Summary.find(L"inbox") == std::wstring::npos ||
+            classified.Summary.find(L"base=0xfffff80012340000") == std::wstring::npos ||
+            classified.Summary.find(L"sig=windows") == std::wstring::npos ||
+            !KmonWatchMatches(classified, emptyWatchForUnnamed))
+        {
+            break;
+        }
+
         TimelineEvent liveUserDll = {};
         liveUserDll.Action = L"image-load";
         liveUserDll.ProcessId = 1234;
         liveUserDll.Entity = L"C:\\Windows\\System32\\ntdll.dll";
         liveUserDll.Source = L"kernel-live";
+        liveUserDll.Evidence[L"image_base"] = L"0x00007ff812340000";
         if (KmonClassifyLiveEvent(liveUserDll, &classified))
         {
             break;
