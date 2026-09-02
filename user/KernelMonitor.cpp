@@ -9,6 +9,7 @@
 #include "IdtScanner.h"
 #include "InputStackScanner.h"
 #include "IntegrityScanner.h"
+#include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "MinifilterIrpScanner.h"
 #include "MsrScanner.h"
@@ -4044,9 +4045,13 @@ namespace
             return false;
         };
 
+        auto isIndirectBranchOpcode = [](uint8_t b) -> bool
+        {
+            return b == 0x25 || b == 0x15;
+        };
         for (size_t i = 0; i + 6 <= size; ++i)
         {
-            if (bytes[i] != 0xFF || bytes[i + 1] != 0x25)
+            if (bytes[i] != 0xFF || !isIndirectBranchOpcode(bytes[i + 1]))
             {
                 continue;
             }
@@ -4080,6 +4085,47 @@ namespace
             {
                 ++hits;
                 i += 5;
+            }
+        }
+        // Absolute-target thunks: mov rax, <imm64> followed within a few
+        // bytes by jmp rax (FF E0) or call rax (FF D0). Mappers that skip
+        // IAT-style slots resolve imports this way.
+        for (size_t i = 0; i + 12 <= size; ++i)
+        {
+            if (bytes[i] != 0x48 || bytes[i + 1] != 0xB8)
+            {
+                continue;
+            }
+            uint64_t target = 0;
+            std::memcpy(&target, bytes + i + 2, sizeof(target));
+            if (target == 0)
+            {
+                continue;
+            }
+            if (target >= regionVa &&
+                size > 0 &&
+                target < regionVa + size)
+            {
+                continue;
+            }
+            bool branchesThroughRax = false;
+            for (size_t j = i + 10; j + 1 < size && j <= i + 13; ++j)
+            {
+                if (bytes[j] == 0xFF &&
+                    (bytes[j + 1] == 0xE0 || bytes[j + 1] == 0xD0))
+                {
+                    branchesThroughRax = true;
+                    break;
+                }
+            }
+            if (!branchesThroughRax)
+            {
+                continue;
+            }
+            if (targetIsKernelImport(target))
+            {
+                ++hits;
+                i += 11;
             }
         }
         return hits;
@@ -5620,18 +5666,23 @@ void KernelMonitor::NoteMapperWatchResidue(
     const std::wstring& layer,
     uint64_t physicalAddress)
 {
-    if (!IsMapperWatchActive())
+    const bool watchActive = IsMapperWatchActive();
+    // Idle findings still register their PFN so !hunt can join them into
+    // kernel_backed_user_window; the watch-scoped flags and the callers
+    // that pass no physical address stay gated on an active watch.
+    if (!watchActive && physicalAddress < 0x1000)
     {
         return;
     }
     std::lock_guard<std::mutex> lock(WatchMutex);
-    if (layer == L"kpage_code" ||
-        layer == L"pool_code" ||
-        layer == L"dataptr")
+    if (watchActive &&
+        (layer == L"kpage_code" ||
+         layer == L"pool_code" ||
+         layer == L"dataptr"))
     {
         MapperWatchHasResidue = true;
     }
-    if (layer == L"overlay_slot")
+    if (watchActive && layer == L"overlay_slot")
     {
         MapperWatchHasOverlaySlot = true;
     }
@@ -7411,17 +7462,30 @@ void KernelMonitor::ScanOrphanMappedPages()
         }
 
         uint32_t stubHits = 0;
-        const bool stubCandidate =
-            mapperWatch &&
+        const bool idlePoolCandidate =
             region.Executable &&
             !region.SessionSpace &&
-            !peHit;
+            !peHit &&
+            region.InBigPool &&
+            region.PoolNonPaged;
+        const bool stubCandidate =
+            (mapperWatch &&
+             region.Executable &&
+             !region.SessionSpace &&
+             !peHit) ||
+            idlePoolCandidate;
+        const bool idleScan = !mapperWatch && idlePoolCandidate;
         if (stubCandidate)
         {
-            constexpr uint32_t kStubSample = 0x800;
+            // Deeper samples: mappers place import thunks well past the
+            // first page. NonPaged pool reads are reliable, so one bulk
+            // read is enough for the slot-in-buffer heuristics.
+            constexpr uint32_t kWatchStubSample = 0x4000;
+            constexpr uint32_t kIdleStubSample = 0x2000;
+            const uint32_t sampleCap = mapperWatch ? kWatchStubSample : kIdleStubSample;
             const uint32_t sampleLen =
-                region.Size > kStubSample
-                    ? kStubSample
+                region.Size > sampleCap
+                    ? sampleCap
                     : static_cast<uint32_t>(region.Size);
             if (sampleLen >= 14)
             {
@@ -7442,7 +7506,10 @@ void KernelMonitor::ScanOrphanMappedPages()
                 }
             }
         }
-        const bool stubHit = stubHits >= 2;
+        // Idle scans only see non-paged big-pool code, so require one more
+        // recognizable thunk to keep the noise floor down.
+        const uint32_t stubThreshold = idleScan ? 3 : 2;
+        const bool stubHit = stubHits >= stubThreshold;
         if (!peHit && !wxStub && !stubHit)
         {
             continue;
@@ -7451,6 +7518,15 @@ void KernelMonitor::ScanOrphanMappedPages()
         std::wstring notes = L"class=" + region.Classification +
             L" risk=" + region.Risk +
             L" size=" + HexU64(region.Size);
+        if (stubCandidate)
+        {
+            notes += L" scan=";
+            notes += idleScan ? L"idle" : L"watch";
+        }
+        if (region.PoolTag != 0)
+        {
+            notes += L" tag=" + LeftoverFormatTag(region.PoolTag);
+        }
         if (!region.Notes.empty())
         {
             notes += L" " + region.Notes;
@@ -12815,6 +12891,75 @@ bool KernelMonitorSelfTest()
                     stubBuf.size(),
                     0xFFFFFA8000000000ull,
                     std::vector<KernelModuleInfo>{ userMod }) != 0)
+            {
+                break;
+            }
+            // FF 15 call [rip+disp] through an in-buffer slot must count
+            // the same way the FF 25 jmp form does.
+            stubBuf.assign(0x80, 0xCC);
+            stubBuf[0] = 0xFF;
+            stubBuf[1] = 0x15;
+            const int32_t dispCall = 0x1A;
+            std::memcpy(stubBuf.data() + 2, &dispCall, sizeof(dispCall));
+            std::memcpy(stubBuf.data() + 0x20, &ntosTarget, sizeof(ntosTarget));
+            if (CountKernelImportStubs(
+                    stubBuf.data(),
+                    stubBuf.size(),
+                    0xFFFFFA8000000000ull,
+                    mods) < 1)
+            {
+                break;
+            }
+            // Absolute thunk: mov rax, <imm64>; jmp rax.
+            stubBuf.assign(0x80, 0xCC);
+            stubBuf[0] = 0x48;
+            stubBuf[1] = 0xB8;
+            std::memcpy(stubBuf.data() + 2, &ntosTarget, sizeof(ntosTarget));
+            stubBuf[10] = 0xFF;
+            stubBuf[11] = 0xE0;
+            stubBuf[0x20] = 0x48;
+            stubBuf[0x21] = 0xB8;
+            std::memcpy(stubBuf.data() + 0x22, &halTarget, sizeof(halTarget));
+            stubBuf[0x2C] = 0xFF;
+            stubBuf[0x2D] = 0xD0;
+            if (CountKernelImportStubs(
+                    stubBuf.data(),
+                    stubBuf.size(),
+                    0xFFFFFA8000000000ull,
+                    mods) < 2)
+            {
+                break;
+            }
+            // Absolute thunk to a user-mode target must not count even with
+            // the jmp rax tail present.
+            stubBuf[0x22] = 0;
+            stubBuf[0x23] = 0;
+            stubBuf[0x24] = 0;
+            stubBuf[0x25] = 0;
+            stubBuf[0x26] = 0x01;
+            stubBuf[0x27] = 0;
+            stubBuf[0x28] = 0;
+            stubBuf[0x29] = 0;
+            stubBuf[0x2A] = 0;
+            if (CountKernelImportStubs(
+                    stubBuf.data(),
+                    stubBuf.size(),
+                    0xFFFFFA8000000000ull,
+                    mods) >= 2)
+            {
+                break;
+            }
+            // mov rax, <kernel imm64> without a jmp/call rax tail is just a
+            // pointer load, not an import thunk.
+            stubBuf.assign(0x80, 0xCC);
+            stubBuf[0] = 0x48;
+            stubBuf[1] = 0xB8;
+            std::memcpy(stubBuf.data() + 2, &ntosTarget, sizeof(ntosTarget));
+            if (CountKernelImportStubs(
+                    stubBuf.data(),
+                    stubBuf.size(),
+                    0xFFFFFA8000000000ull,
+                    mods) != 0)
             {
                 break;
             }
