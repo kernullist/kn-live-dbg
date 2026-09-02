@@ -92,6 +92,149 @@ bool DeviceClient::IsOpen() const
     return device_ != INVALID_HANDLE_VALUE;
 }
 
+namespace
+{
+    struct DeviceClientHandleEntryEx
+    {
+        PVOID Object;
+        HANDLE ProcessId;
+        ULONG HandleValue;
+        ACCESS_MASK GrantedAccess;
+        USHORT CreatorBackTraceIndex;
+        USHORT ObjectTypeIndex;
+        ULONG HandleAttributes;
+        ULONG Reserved;
+    };
+
+    struct DeviceClientHandleInfoEx
+    {
+        ULONG_PTR NumberOfHandles;
+        ULONG_PTR Reserved;
+        DeviceClientHandleEntryEx Handles[1];
+    };
+}
+
+bool DeviceClient::QueryDeviceObjectTypeIndex(uint32_t* objectTypeIndex, std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (objectTypeIndex == nullptr)
+        {
+            break;
+        }
+        *objectTypeIndex = 0;
+        if (device_ == INVALID_HANDLE_VALUE)
+        {
+            if (error != nullptr)
+            {
+                *error = L"device handle is not open";
+            }
+            break;
+        }
+
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"ntdll is not loaded";
+            }
+            break;
+        }
+        typedef LONG NtStatusLocal;
+        typedef NtStatusLocal(NTAPI* NtQuerySystemInformationPtr)(
+            int,
+            PVOID,
+            ULONG,
+            PULONG);
+        auto query = reinterpret_cast<NtQuerySystemInformationPtr>(
+            GetProcAddress(ntdll, "NtQuerySystemInformation"));
+        if (query == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"NtQuerySystemInformation is unavailable";
+            }
+            break;
+        }
+
+        const ULONG currentPid = GetCurrentProcessId();
+        const ULONG wanted = static_cast<ULONG>(
+            reinterpret_cast<ULONG_PTR>(device_));
+        const int SystemExtendedHandleInformation = 64;
+
+        std::vector<uint8_t> buffer;
+        for (ULONG attempt = 0; attempt < 4; ++attempt)
+        {
+            ULONG required = 0;
+            LONG status = query(
+                SystemExtendedHandleInformation,
+                nullptr,
+                0,
+                &required);
+            if (required == 0)
+            {
+                required = 1u << 20;
+            }
+            buffer.assign(static_cast<size_t>(required) + (1u << 20), 0);
+            ULONG returned = 0;
+            status = query(
+                SystemExtendedHandleInformation,
+                buffer.data(),
+                static_cast<ULONG>(buffer.size()),
+                &returned);
+            if (status == 0)
+            {
+                auto info = reinterpret_cast<DeviceClientHandleInfoEx*>(buffer.data());
+                const size_t capacity =
+                    (buffer.size() - sizeof(ULONG_PTR) * 2) /
+                    sizeof(DeviceClientHandleEntryEx);
+                const ULONG_PTR count =
+                    info->NumberOfHandles < capacity
+                        ? info->NumberOfHandles
+                        : capacity;
+                bool found = false;
+                for (ULONG_PTR index = 0; index < count; ++index)
+                {
+                    const DeviceClientHandleEntryEx& entry = info->Handles[index];
+                    if (static_cast<ULONG>(
+                            reinterpret_cast<ULONG_PTR>(entry.ProcessId)) ==
+                            currentPid &&
+                        entry.HandleValue == wanted)
+                    {
+                        *objectTypeIndex = entry.ObjectTypeIndex;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"own device handle was not found in the handle table";
+                    }
+                    break;
+                }
+                ok = true;
+                break;
+            }
+            if (status != 0xC0000004u /* STATUS_INFO_LENGTH_MISMATCH */)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"NtQuerySystemInformation handles failed: 0x" +
+                        std::to_wstring(static_cast<unsigned long>(status));
+                }
+                break;
+            }
+        }
+    } while (false);
+
+    return ok;
+}
+
 bool DeviceClient::Ioctl(
     DWORD code,
     void* buffer,
@@ -1199,6 +1342,186 @@ bool DeviceClient::SetProcessProtection(
             *eprocessAddress = buffer.Response.EprocessAddress;
         }
 
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DeviceClient::ControlIotrace(
+    uint32_t mode,
+    uint64_t driverObjectAddress,
+    uint32_t* armed,
+    uint64_t* eventsRecorded,
+    uint64_t* eventsDropped,
+    std::wstring* error,
+    DWORD* deviceError)
+{
+    bool ok = false;
+
+    do
+    {
+        if (armed != nullptr)
+        {
+            *armed = 0;
+        }
+        if (eventsRecorded != nullptr)
+        {
+            *eventsRecorded = 0;
+        }
+        if (eventsDropped != nullptr)
+        {
+            *eventsDropped = 0;
+        }
+
+        union
+        {
+            KNDBG_IOTRACE_CONTROL_REQUEST Request;
+            KNDBG_IOTRACE_CONTROL_RESPONSE Response;
+            unsigned char Padding[
+                sizeof(KNDBG_IOTRACE_CONTROL_REQUEST) >= sizeof(KNDBG_IOTRACE_CONTROL_RESPONSE)
+                    ? sizeof(KNDBG_IOTRACE_CONTROL_REQUEST)
+                    : sizeof(KNDBG_IOTRACE_CONTROL_RESPONSE)];
+        } buffer = {};
+
+        buffer.Request.Size = sizeof(buffer.Request);
+        buffer.Request.Flags = 0;
+        buffer.Request.Mode = mode;
+        buffer.Request.DriverObjectAddress = driverObjectAddress;
+        buffer.Request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_IOTRACE_CONTROL,
+                &buffer,
+                sizeof(buffer),
+                sizeof(buffer.Response),
+                &returned,
+                error,
+                deviceError) ||
+            returned < sizeof(buffer.Response))
+        {
+            if (error != nullptr && returned < sizeof(buffer.Response))
+            {
+                *error = L"Short iotrace control response";
+            }
+            break;
+        }
+
+        if (buffer.Response.NtStatus != 0)
+        {
+            if (deviceError != nullptr)
+            {
+                *deviceError = buffer.Response.NtStatus;
+            }
+            if (error != nullptr)
+            {
+                *error = L"iotrace control failed: ntstatus=0x" +
+                    std::to_wstring(buffer.Response.NtStatus);
+            }
+            break;
+        }
+
+        if (armed != nullptr)
+        {
+            *armed = buffer.Response.Armed;
+        }
+        if (eventsRecorded != nullptr)
+        {
+            *eventsRecorded = buffer.Response.EventsRecorded;
+        }
+        if (eventsDropped != nullptr)
+        {
+            *eventsDropped = buffer.Response.EventsDropped;
+        }
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DeviceClient::DrainIotrace(
+    std::vector<IotraceRecord>* records,
+    uint64_t* totalDropped,
+    std::wstring* error)
+{
+    bool ok = false;
+
+    do
+    {
+        if (records == nullptr)
+        {
+            break;
+        }
+        records->clear();
+        if (totalDropped != nullptr)
+        {
+            *totalDropped = 0;
+        }
+
+        const uint32_t maxRecords = KNDBG_IOTRACE_DRAIN_MAX;
+        const size_t bufferBytes =
+            FIELD_OFFSET(KNDBG_IOTRACE_DRAIN_RESPONSE, Records) +
+            static_cast<size_t>(maxRecords) * sizeof(KNDBG_IOTRACE_RECORD);
+        std::vector<unsigned char> buffer(bufferBytes, 0);
+
+        auto* request = reinterpret_cast<KNDBG_IOTRACE_DRAIN_REQUEST*>(buffer.data());
+        request->Size = sizeof(*request);
+        request->Flags = 0;
+        request->MaxRecords = maxRecords;
+
+        DWORD returned = 0;
+        if (!Ioctl(
+                IOCTL_KNDBG_IOTRACE_DRAIN,
+                buffer.data(),
+                static_cast<DWORD>(bufferBytes),
+                static_cast<DWORD>(bufferBytes),
+                &returned,
+                error))
+        {
+            break;
+        }
+
+        const size_t headerBytes =
+            FIELD_OFFSET(KNDBG_IOTRACE_DRAIN_RESPONSE, Records);
+        if (returned < headerBytes)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Short iotrace drain response";
+            }
+            break;
+        }
+
+        auto* response = reinterpret_cast<KNDBG_IOTRACE_DRAIN_RESPONSE*>(buffer.data());
+        const size_t count = response->RecordCount;
+        if (count > maxRecords ||
+            returned < headerBytes + count * sizeof(KNDBG_IOTRACE_RECORD))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Malformed iotrace drain response";
+            }
+            break;
+        }
+
+        records->reserve(count);
+        for (size_t index = 0; index < count; ++index)
+        {
+            const KNDBG_IOTRACE_RECORD& src = response->Records[index];
+            IotraceRecord record = {};
+            record.Sequence = src.Sequence;
+            record.Timestamp100ns = src.Timestamp100ns;
+            record.IoctlCode = src.IoctlCode;
+            record.ProcessId = src.ProcessId;
+            record.InputLength = src.InputLength;
+            record.OutputLength = src.OutputLength;
+            records->push_back(record);
+        }
+        if (totalDropped != nullptr)
+        {
+            *totalDropped = response->TotalDropped;
+        }
         ok = true;
     } while (false);
 

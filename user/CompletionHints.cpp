@@ -701,6 +701,7 @@ namespace
         { L"status", L"!kmon status", L"session counters and watch set" },
         { L"add", L"!kmon add /pid|/name|/driver <v>", L"while collecting; extend inject.remote or highlight set" },
         { L"remove", L"!kmon remove /pid|/name|/driver <v>", L"while collecting; drop a watch target" },
+        { L"iotrace", L"!kmon iotrace <driver> on|off|status", L"lab-only: interpose a driver's IOCTL dispatch and print driver.ioctl" },
         { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"save", L"!kmon save <path>", L"export derived ring as JSONL" },

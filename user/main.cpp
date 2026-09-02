@@ -5034,6 +5034,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"status",
                     L"add",
                     L"remove",
+                    L"iotrace",
                     L"watch",
                     L"recent",
                     L"save",
@@ -24763,6 +24764,9 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/throttle N]\n";
     std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
     std::wcout << L"  !kmon add /pid|/name|/driver <v>     while collecting; later start extends watches\n";
+    std::wcout << L"  !kmon iotrace <driver> on|off|status lab-only: interpose the named driver's\n";
+    std::wcout << L"                                       IRP_MJ_DEVICE_CONTROL and print driver.ioctl\n";
+    std::wcout << L"                                       (first per pid+ioctl code); off restores it\n";
     std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
     std::wcout << L"  !kmon watch            reattach live tail after Esc (optional)\n";
     std::wcout << L"\n";
@@ -24792,6 +24796,11 @@ static void PrintKmonHelp()
     std::wcout << L"  driver.image_only       kernel image-load notify after !kmon arm (inbox included);\n";
     std::wcout << L"                          prints path, image base, size, and CI signature level\n";
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
+    std::wcout << L"  driver.handle           watched pid opened a new device handle (BYOVD precondition)\n";
+    std::wcout << L"  driver.ioctl            iotrace: IOCTL to the interposed driver, first per pid+code\n";
+    std::wcout << L"  loader.activity         unclassified TI tasks (file/registry/VM ops) from\n";
+    std::wcout << L"                          watched pids, first event per task name; children of\n";
+    std::wcout << L"                          watched processes are auto-watched (watch_source=child_of)\n";
     std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
     std::wcout << L"                          headerless kpage/pool import stubs (kpage_code/pool_code) during\n";
     std::wcout << L"                          mapper.watch, non-paged big-pool stubs also while idle (>=3 stubs),\n";
@@ -25388,6 +25397,89 @@ static void HandleKmonCommand(
             {
                 std::wcerr << L"!kmon " << action << L": unknown kind \"" << args[2] << L"\"\n";
             }
+            break;
+        }
+
+        if (action == L"iotrace")
+        {
+            if (!kmon.IsActive())
+            {
+                std::wcerr << L"!kmon iotrace: not active. run '!kmon' first.\n";
+                break;
+            }
+            // Documented form: !kmon iotrace <driver> on | iotrace off | iotrace status.
+            std::wstring verb;
+            std::wstring driverName;
+            if (args.size() >= 3 &&
+                (ToLower(args[2]) == L"off" || ToLower(args[2]) == L"status"))
+            {
+                verb = ToLower(args[2]);
+            }
+            else
+            {
+                driverName = args.size() >= 3 ? args[2] : std::wstring();
+                verb = args.size() >= 4 ? ToLower(args[3]) : std::wstring();
+                if (driverName.empty() || verb != L"on")
+                {
+                    std::wcerr << L"usage: !kmon iotrace <driver-name> on|off|status\n";
+                    break;
+                }
+            }
+
+            if (verb == L"off")
+            {
+                std::wstring error;
+                if (!kmon.DisarmIotrace(&error))
+                {
+                    std::wcerr << L"!kmon iotrace off failed: " << error << L"\n";
+                    break;
+                }
+                std::wcout << L"[kmon] iotrace disarmed\n";
+                break;
+            }
+            if (verb == L"status")
+            {
+                std::wcout << L"[kmon] iotrace "
+                           << (kmon.IotraceArmed() ? L"armed" : L"disarmed")
+                           << L"\n";
+                break;
+            }
+
+            IntegrityScanner scanner(device, symbols);
+            DriverObjectInspectResult inspect = {};
+            std::wstring inspectError;
+            if (!scanner.InspectDriverObject(
+                    driverName,
+                    false,
+                    false,
+                    &inspect,
+                    &inspectError,
+                    /*exactName*/ true) ||
+                inspect.Drivers.empty())
+            {
+                std::wcerr << L"!kmon iotrace: driver object not found for "
+                           << driverName << L"\n";
+                if (!inspectError.empty())
+                {
+                    std::wcerr << L"!kmon iotrace: " << inspectError << L"\n";
+                }
+                break;
+            }
+
+            // Lab-only, high-risk: the driver interposes the target's
+            // IRP_MJ_DEVICE_CONTROL dispatch entry while armed.
+            std::wstring armError;
+            if (!kmon.ArmIotrace(
+                    inspect.Drivers[0].DriverObject,
+                    inspect.Drivers[0].Name,
+                    &armError))
+            {
+                std::wcerr << L"!kmon iotrace on failed: " << armError << L"\n";
+                break;
+            }
+            std::wcout << L"[kmon] iotrace armed on " << inspect.Drivers[0].Name
+                       << L" driver_object=" << HexText(inspect.Drivers[0].DriverObject)
+                       << L" (lab-only interposition; !kmon iotrace off to restore)\n";
             break;
         }
 
@@ -31130,6 +31222,7 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"help", L"!ti"}, L"start", L"help-ti-start-completion");
         CheckCompletionCandidate(&context, {}, L"!kmon", L"kmon-root-completion");
         CheckCompletionCandidate(&context, {L"!kmon"}, L"start", L"kmon-start-completion");
+        CheckCompletionCandidate(&context, {L"!kmon"}, L"iotrace", L"kmon-iotrace-completion");
         CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/driver", L"kmon-start-driver-completion");
         CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/verbose", L"kmon-start-verbose-completion");
         CheckCompletionCandidate(&context, {L"!kmon", L"start"}, L"/background", L"kmon-start-background-completion");

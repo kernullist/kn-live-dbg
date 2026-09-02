@@ -105,6 +105,16 @@ struct TimelineLiveEvent
     std::wstring ImagePath;
 };
 
+struct IotraceRecord
+{
+    uint64_t Sequence = 0;
+    uint64_t Timestamp100ns = 0;
+    uint64_t IoctlCode = 0;
+    uint32_t ProcessId = 0;
+    uint32_t InputLength = 0;
+    uint32_t OutputLength = 0;
+};
+
 class DeviceClient
 {
 public:
@@ -115,6 +125,28 @@ public:
     bool Open(const std::wstring& userDeviceName, std::wstring* error);
     void Close();
     bool IsOpen() const;
+
+    // Boot-stable type index of "Device" objects, learned by matching this
+    // client's own device handle in a SystemExtendedHandleInformation walk
+    // (no NtQueryObject name query, which can block on device objects).
+    // Returns false when the index cannot be resolved.
+    bool QueryDeviceObjectTypeIndex(uint32_t* objectTypeIndex, std::wstring* error);
+
+    // Iotrace (ABI 17): interpose the target driver's IRP_MJ_DEVICE_CONTROL.
+    // Mode is one of KNDBG_IOTRACE_MODE_*; driverObjectAddress is required
+    // for ARM. *armed reports post-call state.
+    bool ControlIotrace(
+        uint32_t mode,
+        uint64_t driverObjectAddress,
+        uint32_t* armed,
+        uint64_t* eventsRecorded,
+        uint64_t* eventsDropped,
+        std::wstring* error,
+        DWORD* deviceError = nullptr);
+    bool DrainIotrace(
+        std::vector<IotraceRecord>* records,
+        uint64_t* totalDropped,
+        std::wstring* error);
 
     bool QueryVersion(std::wstring* error);
     bool QuerySessionStatus(DriverSessionStatus* status, std::wstring* error);
