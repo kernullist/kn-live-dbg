@@ -3236,6 +3236,11 @@ namespace
     bool AddressInModuleRanges(
         uint64_t address,
         const std::vector<std::pair<uint64_t, uint32_t>>& ranges);
+    std::wstring KmonDevicePathToWin32(const std::wstring& devicePath);
+    bool KmonVadRecordLooksLikeCodeTarget(const ProcessVadRecord& record);
+    const ProcessVadRecord* KmonFindCoveringVadRecord(
+        const std::vector<ProcessVadRecord>* records,
+        uint64_t address);
 
     void ScanLiveImportThunks(
         const std::wstring& imagePath,
@@ -3472,13 +3477,14 @@ namespace
         SymbolEngine* symbols,
         uint32_t pid,
         const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
+        const std::vector<ProcessVadRecord>* kernelVads,
         uint32_t* hits)
     {
         do
         {
             if (hits == nullptr ||
                 imageBase == 0 ||
-                processHandle == nullptr ||
+                (processHandle == nullptr && kernelVads == nullptr) ||
                 headers.size() < sizeof(IMAGE_DOS_HEADER))
             {
                 break;
@@ -3626,21 +3632,37 @@ namespace
                         continue;
                     }
                     MEMORY_BASIC_INFORMATION region = {};
-                    if (VirtualQueryEx(
+                    if (processHandle != nullptr &&
+                        VirtualQueryEx(
                             processHandle,
                             reinterpret_cast<LPCVOID>(target),
                             &region,
-                            sizeof(region)) != sizeof(region))
+                            sizeof(region)) == sizeof(region))
+                    {
+                        if (region.State != MEM_COMMIT ||
+                            !ProtectHasExecute(region.Protect))
+                        {
+                            continue;
+                        }
+                        if (region.Type != MEM_PRIVATE &&
+                            region.Type != MEM_MAPPED)
+                        {
+                            continue;
+                        }
+                        ++(*hits);
+                        continue;
+                    }
+                    // Handle stripped of PROCESS_QUERY_* (or absent): fall
+                    // back to the kernel VAD view instead of dropping the
+                    // slot as a false negative.
+                    if (kernelVads == nullptr)
                     {
                         continue;
                     }
-                    if (region.State != MEM_COMMIT ||
-                        !ProtectHasExecute(region.Protect))
-                    {
-                        continue;
-                    }
-                    if (region.Type != MEM_PRIVATE &&
-                        region.Type != MEM_MAPPED)
+                    const ProcessVadRecord* vadRecord =
+                        KmonFindCoveringVadRecord(kernelVads, target);
+                    if (vadRecord == nullptr ||
+                        !KmonVadRecordLooksLikeCodeTarget(*vadRecord))
                     {
                         continue;
                     }
@@ -3682,6 +3704,99 @@ namespace
             }
         }
         return found;
+    }
+
+    // Kernel VAD section file names are NT device paths
+    // (\Device\HarddiskVolume3\...). Map them onto drive letters so the
+    // existing disk-read and path-classification helpers keep working;
+    // keep the \\?\GLOBALROOT spelling when no DOS device matches.
+    std::wstring KmonDevicePathToWin32(const std::wstring& devicePath)
+    {
+        if (devicePath.compare(0, 8, L"\\Device\\") != 0)
+        {
+            return devicePath;
+        }
+        {
+            wchar_t drives[1024] = {};
+            const DWORD driveLen =
+                GetLogicalDriveStringsW(
+                    ARRAYSIZE(drives) - 1,
+                    drives);
+            if (driveLen > 0 && driveLen <= ARRAYSIZE(drives) - 1)
+            {
+                const wchar_t* cursor = drives;
+                while (*cursor != L'\0')
+                {
+                    const std::wstring drive(cursor);
+                    if (drive.size() >= 2)
+                    {
+                        wchar_t target[1024] = {};
+                        const DWORD targetLen =
+                            QueryDosDeviceW(
+                                drive.substr(0, 2).c_str(),
+                                target,
+                                ARRAYSIZE(target) - 1);
+                        if (targetLen > 0 && target[0] == L'\\')
+                        {
+                            const std::wstring deviceLower =
+                                ToLowerCopy(devicePath);
+                            const std::wstring targetLower =
+                                ToLowerCopy(target);
+                            if (deviceLower.compare(
+                                    0,
+                                    targetLower.size(),
+                                    targetLower) == 0)
+                            {
+                                return drive.substr(0, 2) +
+                                    devicePath.substr(targetLower.size());
+                            }
+                        }
+                    }
+                    cursor += drive.size() + 1;
+                }
+            }
+        }
+        return L"\\\\?\\GLOBALROOT" + devicePath;
+    }
+
+    // VirtualQueryEx analogue for handles stripped of PROCESS_QUERY_*:
+    // a call-table slot target is interesting when a kernel VAD record
+    // covers it, the VAD is executable, and the backing is private or a
+    // data mapping rather than a module image (images are excluded by the
+    // module-range check the caller already ran).
+    bool KmonVadRecordLooksLikeCodeTarget(const ProcessVadRecord& record)
+    {
+        if (!record.Executable && !record.WritableExecutable)
+        {
+            return false;
+        }
+        if (record.HasPrivateMemory && record.PrivateMemory)
+        {
+            return record.CommitCharge != 0;
+        }
+        if (record.HasSubsection)
+        {
+            return record.SectionFileName.empty();
+        }
+        return false;
+    }
+
+    const ProcessVadRecord* KmonFindCoveringVadRecord(
+        const std::vector<ProcessVadRecord>* records,
+        uint64_t address)
+    {
+        if (records == nullptr)
+        {
+            return nullptr;
+        }
+        for (const ProcessVadRecord& record : *records)
+        {
+            if (VadCoversUserAddress(record, address))
+            {
+                return &record;
+            }
+        }
+        return nullptr;
     }
 
     bool KmonOrphanRegionInteresting(
@@ -9312,6 +9427,73 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 ClearEmittedKeyForPid(vadFailKey, pid);
             }
+            // ObCallback handle stripping also blanks the Toolhelp module
+            // list, which silently disables the IAT/export/vtable/text hook
+            // scans below. Rebuild the inventory from kernel VAD records
+            // (image-backed mappings keep their section file name) so those
+            // scans keep running with kernel reads only. Toolhelp-based
+            // completeness gates stay untouched.
+            bool kernelModuleInventory = false;
+            if (!moduleWalkOk && hasKernelVadScan)
+            {
+                for (const ProcessVadRecord& record : kernelVad.Records)
+                {
+                    if (modulePaths.size() >= kMaxModuleRows)
+                    {
+                        break;
+                    }
+                    if (record.HasPrivateMemory && record.PrivateMemory)
+                    {
+                        continue;
+                    }
+                    if (record.SectionFileName.empty() ||
+                        record.Size < 0x1000 ||
+                        record.Size > 0x10000000ull)
+                    {
+                        continue;
+                    }
+                    modulePaths.push_back(
+                        KmonDevicePathToWin32(record.SectionFileName));
+                    moduleRanges.push_back(std::make_pair(
+                        record.StartAddress,
+                        static_cast<uint32_t>(
+                            (std::min<uint64_t>)(
+                                record.Size,
+                                0xFFFFFFFFull))));
+                }
+                kernelModuleInventory = !modulePaths.empty();
+            }
+            // A stripped or refused handle is itself hostility evidence
+            // (ObRegisterCallbacks access-mask removal); say so once per
+            // pid instead of silently switching to kernel-only mode. The
+            // kernel VAD scan doubles as proof the process is alive, so
+            // exit races do not fire this.
+            const bool handleStripped =
+                processHandle == nullptr || !hasVmRead;
+            const std::wstring handleDeniedKey =
+                L"handle_denied:" + std::to_wstring(pid);
+            if (handleStripped &&
+                (hostileHost || watched || dropHost) &&
+                wantKernelVad &&
+                kernelVadScanned)
+            {
+                EmitUnique(
+                    L"process.implant",
+                    handleDeniedKey,
+                    imagePath,
+                    L"user",
+                    L"user handle to process was denied; kernel-only investigation active pid=" +
+                        std::to_wstring(pid) + L" " + leaf,
+                    std::wstring(L"requested=QUERY_INFORMATION|VM_READ ") +
+                        (processHandle == nullptr
+                            ? L"result=open_denied"
+                            : L"result=vm_read_stripped"),
+                    pid);
+            }
+            else
+            {
+                ClearEmittedKeyForPid(handleDeniedKey, pid);
+            }
             bool hasKernelVad = false;
             if (hasKernelVadScan && exeRegion != 0)
             {
@@ -9389,6 +9571,17 @@ void KernelMonitor::ScanUserModeHostility()
                 {
                     mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath);
                 }
+                bool mappedFromKernelVad = false;
+                if (mappedPath.empty() &&
+                    hasKernelVad &&
+                    !exeVad.SectionFileName.empty())
+                {
+                    // GetMappedFileNameW needs a VM_READ handle the target
+                    // may strip; the kernel VAD already carries the section
+                    // file name via ControlArea -> FILE_OBJECT.
+                    mappedPath = KmonDevicePathToWin32(exeVad.SectionFileName);
+                    mappedFromKernelVad = !mappedPath.empty();
+                }
 
                 if (queried && !committed)
                 {
@@ -9457,7 +9650,10 @@ void KernelMonitor::ScanUserModeHostility()
                             L"exe_mapped_path",
                             L"main EXE mapping file does not match process image pid=" +
                                 std::to_wstring(pid) + L" " + leaf,
-                            L"mapped=" + mappedPath,
+                            L"mapped=" + mappedPath +
+                                (mappedFromKernelVad
+                                    ? L" mapped_source=kernel_vad"
+                                    : std::wstring()),
                             pid);
                     }
                 }
@@ -10371,6 +10567,10 @@ void KernelMonitor::ScanUserModeHostility()
             uint32_t implants = 0;
             uint32_t gameTextHits = 0;
             uint32_t systemTextHits = 0;
+            const std::wstring moduleSourceNote =
+                kernelModuleInventory
+                    ? L" module_source=kernel_vad"
+                    : std::wstring();
             const std::wstring imageDir = [&imagePath]() {
                 std::wstring dir = ToLowerCopy(imagePath);
                 for (wchar_t& ch : dir)
@@ -10484,11 +10684,11 @@ void KernelMonitor::ScanUserModeHostility()
                                 moduleLeaf,
                             imagePath,
                             L"module_text",
-                            L"module code bytes differ from disk pid=" +
-                                std::to_wstring(pid) + L" " + leaf +
-                                L" module=" + moduleLeaf,
-                            modulePath,
-                            pid);
+                                L"module code bytes differ from disk pid=" +
+                                    std::to_wstring(pid) + L" " + leaf +
+                                    L" module=" + moduleLeaf,
+                                modulePath + moduleSourceNote,
+                                pid);
                     }
                     else if (textCmp == SliceUnknown)
                     {
@@ -10534,7 +10734,8 @@ void KernelMonitor::ScanUserModeHostility()
                                 L"Nt/Zw export prologues differ from disk pid=" +
                                     std::to_wstring(pid) + L" " + leaf +
                                     L" module=" + moduleLeaf,
-                                L"hits=" + std::to_wstring(exportHits),
+                                L"hits=" + std::to_wstring(exportHits) +
+                                    moduleSourceNote,
                                 pid);
                         }
                     }
@@ -10596,11 +10797,12 @@ void KernelMonitor::ScanUserModeHostility()
                                     moduleLeaf,
                                 imagePath,
                                 L"iat_hook",
-                                L"module IAT thunks leave imported modules pid=" +
-                                    std::to_wstring(pid) + L" " + leaf +
-                                    L" module=" + moduleLeaf,
-                                L"hits=" + std::to_wstring(dllIatHits),
-                                pid);
+                            L"module IAT thunks leave imported modules pid=" +
+                                std::to_wstring(pid) + L" " + leaf +
+                                L" module=" + moduleLeaf,
+                            L"hits=" + std::to_wstring(dllIatHits) +
+                                moduleSourceNote,
+                            pid);
                         }
                         if (scanVtables)
                         {
@@ -10613,6 +10815,7 @@ void KernelMonitor::ScanUserModeHostility()
                                 symbols,
                                 pid,
                                 moduleRanges,
+                                hasKernelVadScan ? &kernelVad.Records : nullptr,
                                 &tableHits);
                             if (tableHits > 0)
                             {
@@ -10630,9 +10833,10 @@ void KernelMonitor::ScanUserModeHostility()
                                     (overlayLeaf
                                         ? L"overlay call-table slots point at private executable memory pid="
                                         : L"module call-table slots point at private executable memory pid=") +
-                                        std::to_wstring(pid) + L" " + leaf +
-                                        L" module=" + moduleLeaf,
-                                    L"hits=" + std::to_wstring(tableHits),
+                                    std::to_wstring(pid) + L" " + leaf +
+                                    L" module=" + moduleLeaf,
+                                    L"hits=" + std::to_wstring(tableHits) +
+                                        moduleSourceNote,
                                     pid);
                             }
                         }
@@ -12006,6 +12210,116 @@ bool KernelMonitorSelfTest()
             VadCoversUserAddress(cover, 0))
         {
             break;
+        }
+        {
+            // Device-path conversion: pass-through for non-device paths,
+            // GLOBALROOT fallback for unknown devices, and a real DOS
+            // device round-trip when the host has one.
+            if (KmonDevicePathToWin32(L"c:\\game\\x.dll") != L"c:\\game\\x.dll")
+            {
+                break;
+            }
+            if (KmonDevicePathToWin32(L"\\Device\\KnDbgNoVolume\\x.dll") !=
+                L"\\\\?\\GLOBALROOT\\Device\\KnDbgNoVolume\\x.dll")
+            {
+                break;
+            }
+            wchar_t dosTarget[512] = {};
+            bool mappedRoundTrip = false;
+            const DWORD driveLen = GetLogicalDriveStringsW(0, nullptr);
+            if (driveLen > 0 && driveLen < 1024)
+            {
+                std::vector<wchar_t> drives(
+                    static_cast<size_t>(driveLen) + 1, L'\0');
+                if (GetLogicalDriveStringsW(
+                        driveLen,
+                        drives.data()) > 0)
+                {
+                    const wchar_t* cursor = drives.data();
+                    while (*cursor != L'\0')
+                    {
+                        const std::wstring drive(cursor);
+                        if (drive.size() >= 2 &&
+                            QueryDosDeviceW(
+                                drive.substr(0, 2).c_str(),
+                                dosTarget,
+                                ARRAYSIZE(dosTarget) - 1) > 0 &&
+                            dosTarget[0] == L'\\')
+                        {
+                            const std::wstring built =
+                                std::wstring(dosTarget) + L"\\KnDbg\\a.dll";
+                            const std::wstring converted =
+                                KmonDevicePathToWin32(built);
+                            if (converted !=
+                                drive.substr(0, 2) + L"\\KnDbg\\a.dll")
+                            {
+                                break;
+                            }
+                            mappedRoundTrip = true;
+                            break;
+                        }
+                        cursor += drive.size() + 1;
+                    }
+                }
+            }
+            if (!mappedRoundTrip)
+            {
+                break;
+            }
+        }
+        {
+            // Kernel VAD code-target validation used when VirtualQueryEx
+            // is unavailable.
+            ProcessVadRecord shellcode = {};
+            shellcode.StartAddress = 0x140000000ull;
+            shellcode.EndAddress = 0x140000fffull;
+            shellcode.Executable = true;
+            shellcode.HasPrivateMemory = true;
+            shellcode.PrivateMemory = true;
+            shellcode.CommitCharge = 4;
+            if (!KmonVadRecordLooksLikeCodeTarget(shellcode))
+            {
+                break;
+            }
+            shellcode.CommitCharge = 0;
+            if (KmonVadRecordLooksLikeCodeTarget(shellcode))
+            {
+                break;
+            }
+            ProcessVadRecord dataMap = {};
+            dataMap.StartAddress = 0x140100000ull;
+            dataMap.EndAddress = 0x140100fffull;
+            dataMap.Executable = true;
+            dataMap.HasSubsection = true;
+            if (!KmonVadRecordLooksLikeCodeTarget(dataMap))
+            {
+                break;
+            }
+            dataMap.SectionFileName = L"\\Device\\HarddiskVolume3\\game\\a.dll";
+            if (KmonVadRecordLooksLikeCodeTarget(dataMap))
+            {
+                break;
+            }
+            dataMap.SectionFileName.clear();
+            dataMap.Executable = false;
+            if (KmonVadRecordLooksLikeCodeTarget(dataMap))
+            {
+                break;
+            }
+            shellcode.CommitCharge = 4;
+            dataMap.Executable = true;
+            const std::vector<ProcessVadRecord> vadList = { shellcode, dataMap };
+            if (KmonFindCoveringVadRecord(&vadList, 0x140000000ull) == nullptr)
+            {
+                break;
+            }
+            if (KmonFindCoveringVadRecord(
+                    &vadList,
+                    0x150000000ull) != nullptr ||
+                KmonFindCoveringVadRecord(nullptr, 0x140000000ull) != nullptr)
+            {
+                break;
+            }
         }
         bool wow64Unknown = true;
         if (QueryProcessIsWow64(nullptr, nullptr, nullptr, 0, &wow64Unknown) ||
