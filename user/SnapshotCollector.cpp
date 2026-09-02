@@ -11,6 +11,7 @@
 #include "MapperRemnantScanner.h"
 #include "MinifilterAttachmentScanner.h"
 #include "NmiScanner.h"
+#include "OrphanKernelPageScanner.h"
 #include "MsrScanner.h"
 #include "CrScanner.h"
 #include "SsdtScanner.h"
@@ -1678,6 +1679,86 @@ namespace
         }
     }
 
+    // Diffable "executable kernel memory outside loaded modules" baseline:
+    // a PTE walk catches headerless mapper code in pool that the tag/size
+    // pool domain cannot single out, so a before/after diff surfaces the
+    // regions a mapper hid regardless of pool type or tag.
+    void CaptureKpage(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
+    {
+        OrphanKernelPageScanner scanner(device, symbols);
+        OrphanKernelPageOptions options;
+        options.IncludeSession = false;
+        options.Limit = 512;
+        options.MaxTablePages = 65536;
+        OrphanKernelPageResult result = {};
+        std::wstring error;
+
+        if (!scanner.Scan(options, &result, &error))
+        {
+            AddWarning(document, L"kpage", error);
+            AddWarnings(document, L"kpage", result.Warnings);
+            return;
+        }
+
+        AddWarnings(document, L"kpage", result.Warnings);
+        if (!result.PageWalkComplete)
+        {
+            AddWarning(
+                document,
+                L"kpage",
+                L"page-table walk was incomplete; orphan executable coverage is partial");
+        }
+
+        for (const OrphanKernelPageRegion& region : result.Regions)
+        {
+            if (region.Classification == L"mmio" || region.SessionSpace)
+            {
+                continue;
+            }
+            const bool wx = region.Writable && region.Executable;
+            SnapshotRecord record;
+            record.Domain = L"kpage";
+            record.Identity = L"kpage:" + SnapshotHex(region.Start, 16) + L":" +
+                DecText(region.Size);
+            record.Display = (region.InBigPool ? L"pool exec " : L"kpage exec ") +
+                SnapshotHex(region.Start, 16);
+            record.Risk = (region.HasPe || wx) ? L"high" : L"medium";
+            record.Volatile = true;
+            record.Tags = {L"kpage"};
+            if (region.HasPe)
+            {
+                record.Tags.push_back(L"pe");
+            }
+            if (wx)
+            {
+                record.Tags.push_back(L"wx");
+            }
+            if (region.InBigPool)
+            {
+                record.Tags.push_back(L"big-pool");
+            }
+            record.Evidence[L"address"] = SnapshotHex(region.Start, 16);
+            record.Evidence[L"size"] = DecText(region.Size);
+            if (region.PhysicalAddress >= 0x1000)
+            {
+                record.Evidence[L"pfn"] = DecText(region.PhysicalAddress >> 12);
+            }
+            record.Evidence[L"writable"] = BoolText(region.Writable);
+            record.Evidence[L"executable"] = BoolText(region.Executable);
+            record.Evidence[L"classification"] = region.Classification;
+            record.Evidence[L"in_big_pool"] = BoolText(region.InBigPool);
+            if (region.PoolTag != 0)
+            {
+                record.Evidence[L"tag"] = LeftoverFormatTag(region.PoolTag);
+            }
+            if (!region.Notes.empty())
+            {
+                record.Evidence[L"notes"] = region.Notes;
+            }
+            AddRecord(document, std::move(record));
+        }
+    }
+
     void CaptureWfpScope(WfpScanner& scanner, WfpScanner::Scope scope, const std::wstring& scopeName, SnapshotDocument* document)
     {
         WfpScanner::Options options = {};
@@ -2072,6 +2153,7 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
         CaptureFirmwareTables(device_, symbols_, document);
         CapturePool(device_, symbols_, document);
         CapturePoolPe(device_, document);
+        CaptureKpage(device_, symbols_, document);
         CaptureWfp(document);
         CaptureAlpc(device_, symbols_, document);
         CaptureWnf(device_, symbols_, document);

@@ -73,6 +73,15 @@ namespace
         {
             follow = L"!fwtable providers";
         }
+        else if (record.Domain == L"kpage")
+        {
+            follow = L"!kpage /wx";
+            const std::wstring& address = EvidenceValue(record, L"address");
+            if (!address.empty())
+            {
+                follow = L"!payload " + address;
+            }
+        }
 
         return follow;
     }

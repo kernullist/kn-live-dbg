@@ -3677,6 +3677,7 @@ static void AddSnapshotCompletionCandidates(std::vector<std::wstring>* candidate
         L"show",
         L"/all",
         L"/name",
+        L"/memory",
         L"/domains",
         L"/no-domains",
         L"/warnings",
@@ -3686,7 +3687,9 @@ static void AddSnapshotCompletionCandidates(std::vector<std::wstring>* candidate
     AddCompletionCandidates(candidates, values);
 }
 
-static void AddDiffCompletionCandidates(std::vector<std::wstring>* candidates)
+static void AddDiffCompletionCandidates(
+    std::vector<std::wstring>* candidates,
+    const std::vector<std::wstring>& argsBefore)
 {
     static const wchar_t* values[] =
     {
@@ -3698,6 +3701,52 @@ static void AddDiffCompletionCandidates(std::vector<std::wstring>* candidates)
         L"/limit",
         L"help"
     };
+
+    // Value completion right after an option token: surface the mapper
+    // hunt domains first so before/after diffs are one tab away.
+    if (argsBefore.size() >= 2)
+    {
+        const std::wstring last = ToLower(argsBefore[argsBefore.size() - 1]);
+        if (last == L"/domain")
+        {
+            static const wchar_t* domains[] =
+            {
+                L"kpage",
+                L"pool",
+                L"leftover-mapper",
+                L"process",
+                L"process-security",
+                L"modules",
+                L"drivers",
+                L"callbacks",
+                L"etw",
+                L"nmi",
+                L"cpu-state",
+                L"hal",
+                L"hive",
+                L"dpc-timer",
+                L"fwtable",
+                L"wfp",
+                L"alpc",
+                L"wnf",
+                L"vbs",
+                L"byovd",
+                L"vad-dkom"
+            };
+            AddCompletionCandidates(candidates, domains);
+            return;
+        }
+        if (last == L"/risk")
+        {
+            static const wchar_t* risks[] =
+            {
+                L"high",
+                L"all"
+            };
+            AddCompletionCandidates(candidates, risks);
+            return;
+        }
+    }
 
     AddCompletionCandidates(candidates, values);
 }
@@ -4583,7 +4632,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
         }
         else if (command == L"!diff")
         {
-            AddDiffCompletionCandidates(&candidates);
+            AddDiffCompletionCandidates(&candidates, argsBefore);
         }
         else if (command == L"!alpc")
         {
@@ -8714,12 +8763,18 @@ static void PrintSnapshotHelp()
     std::wcout << L"description:\n";
     std::wcout << L"  Captures same-boot evidence snapshots over native scanners and stores a\n";
     std::wcout << L"  session baseline in memory plus JSON and Markdown files under .kn-live-dbg.\n";
-    std::wcout << L"  Baseline captures process inventory; VAD DKOM hidden-PTE scans run during\n";
-    std::wcout << L"  !diff baseline for processes newly present since the baseline.\n";
+    std::wcout << L"  VAD DKOM hidden-PTE scans run during !diff baseline for processes newly\n";
+    std::wcout << L"  present since the baseline. Every capture includes the full kernel domain\n";
+    std::wcout << L"  set (/all is accepted for compatibility and is the default). kpage records\n";
+    std::wcout << L"  outside loaded modules (PTE walk, pool-type and tag agnostic), so a\n";
+    std::wcout << L"  before/after diff surfaces mapper code hidden in pool even without a PE\n";
+    std::wcout << L"  header. The PFN /deep pass stays outside snapshots.\n";
     std::wcout << L"  leftover-mapper is the bookkeeping-remnant layer only (!mapper). A clean\n";
-    std::wcout << L"  leftover-mapper diff does not prove the payload is gone; run !kpage /pe\n";
-    std::wcout << L"  and !payload scan for orphan pages and hook-to-body. !kpage is not a\n";
-    std::wcout << L"  snapshot domain.\n";
+    std::wcout << L"  leftover-mapper diff does not prove the payload is gone; run !payload scan\n";
+    std::wcout << L"  for hook-to-body. Typical before/after hunt:\n";
+    std::wcout << L"    !snapshot baseline /name clean        (before the cheat runs)\n";
+    std::wcout << L"    !diff baseline /domain kpage /risk high\n";
+    std::wcout << L"    !diff baseline /domain pool /risk high\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !snapshot baseline /name clean-boot\n";
@@ -8737,10 +8792,14 @@ static void PrintDiffHelp()
     std::wcout << L"  Compares snapshots with new-focused semantics: records absent from baseline\n";
     std::wcout << L"  but present now, plus high-risk escalations. !diff baseline captures a fresh\n";
     std::wcout << L"  current snapshot, scans VAD DKOM for newly live processes, writes JSON and\n";
-    std::wcout << L"  a Markdown diff report, then prints compact domain summaries.\n";
+    std::wcout << L"  a Markdown diff report, then prints compact domain summaries. The kpage\n";
+    std::wcout << L"  domain holds executable kernel memory outside loaded modules (PTE walk),\n";
+    std::wcout << L"  so a before/after diff surfaces mapper code hidden in pool with no PE\n";
+    std::wcout << L"  header; pair it with the pool domain for W+X allocations and pool PEs.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !diff baseline\n";
+    std::wcout << L"  !diff baseline /domain kpage /risk high\n";
     std::wcout << L"  !diff baseline /domain pool /limit 20\n";
     std::wcout << L"  !diff .\\clean.json .\\after.json /risk high\n";
 }
@@ -8989,6 +9048,11 @@ static void HandleSnapshotCommand(
                 state.SnapshotBaselineReportPath = reportPath;
             }
 
+            // Teach the before/after hunt at the moment the "before" exists.
+            std::wcout << L"\nbaseline stored; after the suspect activity runs, compare with\n";
+            std::wcout << L"  !diff baseline /domain kpage /risk high   (kernel code hidden in pool)\n";
+            std::wcout << L"  !diff baseline /domain pool /risk high    (new W+X pools / pool PEs)\n";
+
             if (structuredJsonOut != nullptr)
             {
                 *structuredJsonOut = BuildSnapshotJson(document);
@@ -9024,6 +9088,9 @@ static void HandleSnapshotCommand(
             {
                 break;
             }
+
+            std::wcout << L"\nsnapshot saved; compare it against a later capture with\n";
+            std::wcout << L"  !diff " << jsonPath << L" <next.json> /risk high\n";
             break;
         }
 
@@ -31006,6 +31073,17 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"!pool"}, L"pe", L"pool-pe-scope-completion");
         CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/suspicious", L"pool-pe-suspicious-completion");
         CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/dump", L"pool-pe-dump-completion");
+        CheckCompletionCandidate(&context, {}, L"!snapshot", L"snapshot-root-completion");
+        CheckCompletionCandidate(&context, {L"!snapshot"}, L"/memory", L"snapshot-memory-completion");
+        CheckCompletionCandidate(&context, {L"!diff"}, L"/domain", L"diff-domain-option-completion");
+        CheckCompletionCandidate(&context, {L"!diff", L"/domain"}, L"kpage", L"diff-domain-kpage-completion");
+        CheckCompletionCandidate(&context, {L"!diff", L"/domain"}, L"pool", L"diff-domain-pool-completion");
+        CheckCompletionCandidate(&context, {L"!diff", L"/risk"}, L"high", L"diff-risk-value-completion");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            !CompletionCandidateExists({L"!diff"}, L"kpage") &&
+                !CompletionCandidateExists({L"!diff", L"/domain"}, L"/limit"),
+            L"diff-domain-completion-is-value-scoped");
         CheckCompletionCandidate(&context, {L"help", L"!pool"}, L"pe", L"help-pool-pe-completion");
         CheckCompletionCandidate(&context, {L"help", L"!pool", L"pe"}, L"/suspicious", L"help-pool-pe-option-completion");
         CheckCompletionCandidate(&context, {}, L"!dml_proc", L"dml-proc-root-completion");
