@@ -22411,6 +22411,13 @@ static void PrintTiHelp()
     std::wcout << L"  Subscription is silent by default. Ring/log capture every event but the\n";
     std::wcout << L"  TUI prints nothing until '!ti watch' is invoked OR a /pid or /name\n";
     std::wcout << L"  watch target matches an incoming event.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notable task names (substring OK for 'by task'):\n";
+    std::wcout << L"  AllocVM ProtectVM MapView WriteVM ReadVM QueueUserApc SetThreadContext\n";
+    std::wcout << L"  Suspend Resume SetWindowsHook TerminateProcess CreateRemoteThread\n";
+    std::wcout << L"  Driver Device LdrPreload\n";
+    std::wcout << L"  kmon classifies SetWindowsHook as hook.window and Terminate/Suspend/\n";
+    std::wcout << L"  ResumeProcess as process.impair on its own tail.\n";
 }
 
 static std::wstring FormatTimestampLocal(uint64_t fileTimeTicks)
@@ -24802,7 +24809,8 @@ static void PrintKmonHelp()
     std::wcout << L"          objects, post-arm kernel image notify) with no exception path, short_lived,\n";
     std::wcout << L"          mapped_residue, mapper.watch, hook.unbacked, hook.dataptr, hidden,\n";
     std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw,\n";
-    std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids\n";
+    std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids,\n";
+    std::wcout << L"          hook.window / process.impair from TI (see logged kinds)\n";
     std::wcout << L"  hidden: process create, local AllocVM, kernel R/W,\n";
     std::wcout << L"          ReadVM/suspend/resume alone\n";
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
@@ -24828,6 +24836,10 @@ static void PrintKmonHelp()
     std::wcout << L"  mapper.watch            30s burst after ANY kernel driver load/unload (capped 90s);\n";
     std::wcout << L"                          leftover+wipe diffs,\n";
     std::wcout << L"                          400ms mapper/pool, 1.5s kpage, one DeepPfn pass per window\n";
+    std::wcout << L"  hook.window             TI SetWindowsHook/UnhookWindowsHookEx; Steam/OBS/Discord/RTSS\n";
+    std::wcout << L"                          overlays are suppressed, drop callers / builtin targets / watched show\n";
+    std::wcout << L"  process.impair          TI Terminate/Suspend/ResumeProcess on watched or builtin targets,\n";
+    std::wcout << L"                          or from drop-path callers\n";
     std::wcout << L"  hook.unbacked           callback/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter\n";
     std::wcout << L"                          whose routine is outside PsLoadedModuleList (empty list is fail-closed);\n";
     std::wcout << L"                          InstrumentationCallback outside modules (watch/builtin, PPL via VAD)\n";

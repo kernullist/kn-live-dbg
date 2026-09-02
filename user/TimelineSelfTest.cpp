@@ -415,6 +415,39 @@ int RunTimelineSelfTest()
                 tiAllIngest.Added == 0,
             L"ti-all-rescans-ring-with-dedupe");
 
+        // SetWindowsHook and SuspendThread promote to critical risk.
+        std::vector<TiEventRecord> hookTiEvents;
+        hookTiEvents.push_back(MakeTiEvent(310000, 402, 500, L"KERNEL_THREATINT_TASK_SETWINDOWSHOOK", L"injector.exe"));
+        hookTiEvents.push_back(MakeTiEvent(320000, 402, 500, L"SuspendThread", L"injector.exe"));
+        TimelineIngestResult hookIngest = store.IngestThreatIntel(hookTiEvents, L"all");
+        TimelineQueryOptions hookQuery = {};
+        hookQuery.Source = L"ti";
+        hookQuery.HasProcessId = true;
+        hookQuery.ProcessId = 402;
+        hookQuery.Limit = 10;
+        std::vector<TimelineEvent> hookFiltered = store.Query(hookQuery);
+        bool hookCritical = false;
+        bool suspendCritical = false;
+        for (const TimelineEvent& item : hookFiltered)
+        {
+            if (item.Action == L"KERNEL_THREATINT_TASK_SETWINDOWSHOOK" &&
+                item.Risk == L"critical")
+            {
+                hookCritical = true;
+            }
+            if (item.Action == L"SuspendThread" && item.Risk == L"critical")
+            {
+                suspendCritical = true;
+            }
+        }
+        Check(
+            &context,
+            hookIngest.Added == 2 &&
+                hookFiltered.size() == 2 &&
+                hookCritical &&
+                suspendCritical,
+            L"ti-windowshook-and-suspendthread-are-critical");
+
         // Out-of-order ETW timestamp must not be skipped when Sequence advances.
         TimelineStore oooStore(1024);
         std::vector<TiEventRecord> oooFirst;

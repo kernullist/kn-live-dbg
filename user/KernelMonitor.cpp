@@ -5122,7 +5122,31 @@ bool KmonTaskLooksLikeRemoteInjectMaterial(const std::wstring& task)
     return KmonTaskLooksLikeRemoteInjectWrite(task) ||
         lower.find(L"allocvm") != std::wstring::npos ||
         lower.find(L"protectvm") != std::wstring::npos ||
-        lower.find(L"mapview") != std::wstring::npos;
+        lower.find(L"mapview") != std::wstring::npos ||
+        lower.find(L"createremotethread") != std::wstring::npos ||
+        lower.find(L"create_remote_thread") != std::wstring::npos;
+}
+
+bool KmonTaskLooksLikeWindowHook(const std::wstring& task)
+{
+    // SetWindowsHookEx / UnhookWindowsHookEx share the windowshook stem in
+    // both the friendly and KERNEL_THREATINT_TASK_SETWINDOWSHOOK spellings.
+    std::wstring lower = ToLowerCopy(task);
+    return lower.find(L"windowshook") != std::wstring::npos ||
+        lower.find(L"windows_hook") != std::wstring::npos;
+}
+
+bool KmonTaskLooksLikeProcessImpairTask(const std::wstring& task)
+{
+    // Whole-process termination/suspension. Suspend/Resume of a thread is
+    // not here: the ring keeps it, but alone it is not impairment signal.
+    std::wstring lower = ToLowerCopy(task);
+    return lower.find(L"terminateprocess") != std::wstring::npos ||
+        lower.find(L"terminate_process") != std::wstring::npos ||
+        lower.find(L"suspendprocess") != std::wstring::npos ||
+        lower.find(L"suspend_process") != std::wstring::npos ||
+        lower.find(L"resumeprocess") != std::wstring::npos ||
+        lower.find(L"resume_process") != std::wstring::npos;
 }
 
 std::wstring KmonExtractPayloadDriverName(const std::vector<TiPayloadField>& payload)
@@ -5240,6 +5264,42 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
             if (!out->Driver.empty())
             {
                 out->Summary += L" " + KmonBasenameLower(out->Driver);
+            }
+            classified = true;
+            break;
+        }
+
+        if (KmonTaskLooksLikeWindowHook(out->Task))
+        {
+            out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
+            out->TargetImage = KmonImageForClassify(
+                record.TargetProcessId,
+                record.TargetImageBase);
+            out->Kind = L"hook.window";
+            out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId);
+            if (record.TargetProcessId != 0 &&
+                record.TargetProcessId != record.ProcessId)
+            {
+                out->Summary += L" -> pid=" +
+                    std::to_wstring(record.TargetProcessId);
+            }
+            classified = true;
+            break;
+        }
+
+        if (KmonTaskLooksLikeProcessImpairTask(out->Task))
+        {
+            out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
+            out->TargetImage = KmonImageForClassify(
+                record.TargetProcessId,
+                record.TargetImageBase);
+            out->Kind = L"process.impair";
+            out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId);
+            if (record.TargetProcessId != 0 &&
+                record.TargetProcessId != record.ProcessId)
+            {
+                out->Summary += L" -> pid=" +
+                    std::to_wstring(record.TargetProcessId);
             }
             classified = true;
             break;
@@ -5539,6 +5599,91 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
         // !kmon runs post-boot right before the suspect activity, so every
         // driver lifecycle event (load, unload, device object) is signal
         // and none is filtered; /driver stays a highlight only.
+
+        if (event.Kind == L"hook.window")
+        {
+            std::wstring caller = KmonBasenameLower(event.Image);
+            std::wstring target = KmonBasenameLower(event.TargetImage);
+            // Steam/OBS/Discord/RTSS overlays hook legitimately; suppress
+            // them before any allow rule so the tail stays quiet.
+            if (!caller.empty() && KmonLooksLikeOverlayRuntimeDll(caller))
+            {
+                break;
+            }
+            const std::wstring callerClass = KmonClassifyDriverPath(event.Image);
+            const bool dropSide = callerClass == L"drop";
+            const bool unknownFileSide =
+                callerClass == L"unknown" &&
+                PathHasDirectorySeparator(event.Image);
+            const bool builtinTarget = KmonIsWindowsBuiltinLeaf(target);
+            if (dropSide || unknownFileSide || builtinTarget)
+            {
+                matched = true;
+                break;
+            }
+            if (options.WatchPids.empty() && options.WatchNames.empty())
+            {
+                break;
+            }
+            if (NameEqualsWatch(caller, options.WatchNames) ||
+                NameEqualsWatch(target, options.WatchNames))
+            {
+                matched = true;
+                break;
+            }
+            for (uint32_t pid : options.WatchPids)
+            {
+                if (pid == event.ProcessId || pid == event.TargetProcessId)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            break;
+        }
+
+        if (event.Kind == L"process.impair")
+        {
+            std::wstring caller = KmonBasenameLower(event.Image);
+            std::wstring target = KmonBasenameLower(event.TargetImage);
+            const std::wstring callerClass = KmonClassifyDriverPath(event.Image);
+            const bool dropSide = callerClass == L"drop";
+            const bool unknownFileSide =
+                callerClass == L"unknown" &&
+                PathHasDirectorySeparator(event.Image);
+            const bool builtinTarget = KmonIsWindowsBuiltinLeaf(target);
+            if ((dropSide || unknownFileSide) && event.TargetProcessId != 0)
+            {
+                matched = true;
+                break;
+            }
+            if (builtinTarget &&
+                event.TargetProcessId != 0 &&
+                event.TargetProcessId != event.ProcessId)
+            {
+                matched = true;
+                break;
+            }
+            if (options.WatchPids.empty() && options.WatchNames.empty())
+            {
+                break;
+            }
+            if (NameEqualsWatch(caller, options.WatchNames) ||
+                NameEqualsWatch(target, options.WatchNames))
+            {
+                matched = true;
+                break;
+            }
+            for (uint32_t pid : options.WatchPids)
+            {
+                if (pid == event.ProcessId || pid == event.TargetProcessId)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            break;
+        }
 
         if (event.Kind == L"inject.remote")
         {
@@ -6320,7 +6465,12 @@ void KernelMonitor::IngestThreatIntel()
                     ArmMapperWatch(classified);
                 }
             }
-            if (classified.Kind == L"inject.remote")
+            // Full-path resolution matters for every kind whose display
+            // gate keys off caller/target path classes; TI often delivers
+            // only the image basename.
+            if (classified.Kind == L"inject.remote" ||
+                classified.Kind == L"hook.window" ||
+                classified.Kind == L"process.impair")
             {
                 auto resolveInjectImage = [&](uint32_t pid, std::wstring* image)
                 {
@@ -13444,6 +13594,82 @@ bool KernelMonitorSelfTest()
         }
         otherActivity.TargetProcessId = 0;
         if (KmonWatchMatches(otherActivity, pidWatch))
+        {
+            break;
+        }
+
+        // hook.window (SetWindowsHook) and process.impair (Terminate/
+        // Suspend/Resume process) classification plus gating.
+        TiEventRecord hookRecord = {};
+        hookRecord.ProcessId = 1000;
+        hookRecord.TargetProcessId = 2000;
+        hookRecord.TaskName = L"SetWindowsHook";
+        hookRecord.ImagePath = L"C:\\cheats\\x.exe";
+        hookRecord.TargetImageBase = L"game.exe";
+        if (!KmonClassifyTiEvent(hookRecord, &classified) ||
+            classified.Kind != L"hook.window" ||
+            !KmonWatchMatches(classified, emptyWatch))
+        {
+            break;
+        }
+        KmonEvent overlayHook = classified;
+        overlayHook.Image = L"C:\\Program Files (x86)\\Steam\\gameoverlayrenderer64.dll";
+        if (KmonWatchMatches(overlayHook, emptyWatch))
+        {
+            break;
+        }
+        KmonOptions hookWatch;
+        hookWatch.WatchPids.push_back(2000);
+        if (!KmonWatchMatches(classified, hookWatch))
+        {
+            break;
+        }
+        KmonEvent quietHook = classified;
+        quietHook.Image = L"C:\\Program Files\\NormalApp\\app.exe";
+        quietHook.TargetImage = L"othergame.exe";
+        quietHook.TargetProcessId = 3000;
+        if (KmonWatchMatches(quietHook, emptyWatch))
+        {
+            break;
+        }
+
+        TiEventRecord termRecord = {};
+        termRecord.ProcessId = 1000;
+        termRecord.TargetProcessId = 2000;
+        termRecord.TaskName = L"TerminateProcess";
+        termRecord.ImagePath = L"C:\\cheats\\x.exe";
+        termRecord.TargetImageBase = L"game.exe";
+        if (!KmonClassifyTiEvent(termRecord, &classified) ||
+            classified.Kind != L"process.impair" ||
+            !KmonWatchMatches(classified, emptyWatch))
+        {
+            break;
+        }
+        TiEventRecord svcSuspend = {};
+        svcSuspend.ProcessId = 1000;
+        svcSuspend.TargetProcessId = 777;
+        svcSuspend.TaskName = L"SuspendProcess";
+        svcSuspend.ImagePath = L"C:\\tools\\p\\tool.exe";
+        svcSuspend.TargetImageBase = L"svchost.exe";
+        if (!KmonClassifyTiEvent(svcSuspend, &classified) ||
+            classified.Kind != L"process.impair" ||
+            !KmonWatchMatches(classified, emptyWatch))
+        {
+            break;
+        }
+        TiEventRecord quietSuspend = {};
+        quietSuspend.ProcessId = 1000;
+        quietSuspend.TargetProcessId = 2000;
+        quietSuspend.TaskName = L"SuspendProcess";
+        quietSuspend.ImagePath = L"C:\\Program Files\\NormalApp\\app.exe";
+        quietSuspend.TargetImageBase = L"other.exe";
+        if (!KmonClassifyTiEvent(quietSuspend, &classified) ||
+            KmonWatchMatches(classified, emptyWatch))
+        {
+            break;
+        }
+        if (!KmonTaskLooksLikeRemoteInjectMaterial(L"CreateRemoteThread") ||
+            !KmonTaskLooksLikeRemoteInjectMaterial(L"Create_Remote_Thread"))
         {
             break;
         }
