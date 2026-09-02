@@ -24726,7 +24726,8 @@ static void PrintKmonHelp()
     std::wcout << L"                          prints path, image base, size, and CI signature level\n";
     std::wcout << L"  driver.short_lived      load then unload within 30s\n";
     std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
-    std::wcout << L"                          headerless kpage/pool import stubs (kpage_code/pool_code) during mapper.watch,\n";
+    std::wcout << L"                          headerless kpage/pool import stubs (kpage_code/pool_code) during\n";
+    std::wcout << L"                          mapper.watch, non-paged big-pool stubs also while idle (>=3 stubs),\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
     std::wcout << L"  mapper.watch            30s burst after drop/third-party kernel load/unload (capped 90s);\n";
     std::wcout << L"                          inbox image-notify prints but does not arm; leftover+wipe diffs,\n";
