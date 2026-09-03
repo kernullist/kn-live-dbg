@@ -22688,14 +22688,38 @@ static bool CheckSelfIsPplAntimalware(
     return bytes[0] == 0x31;
 }
 
+// Under --cloak the process runs from a %TEMP% work directory that
+// CleanupCloakArtifacts removes wholesale on exit, so an ExeDirectory()-based
+// log default would evaporate with it (and a bugcheck session's tail sits in
+// a folder nobody looks in). Anchor unspecified log directories to the
+// original exe's folder, which survives cloak teardown.
+static void DefaultLogDirectoryToOriginalExe(
+    bool cloakActive,
+    const std::wstring& originalExePath,
+    std::wstring* logDirectory)
+{
+    if (logDirectory == nullptr ||
+        !logDirectory->empty() ||
+        !cloakActive ||
+        originalExePath.empty())
+    {
+        return;
+    }
+
+    const size_t lastSlash = originalExePath.find_last_of(L"\\/");
+    if (lastSlash == std::wstring::npos || lastSlash == 0)
+    {
+        return;
+    }
+    *logDirectory = originalExePath.substr(0, lastSlash);
+}
+
 static void HandleTiCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
     SymbolEngine& symbols)
 {
-    (void)state;
-
     TiSubscriber& sub = GetTiSubscriberInstance();
 
     do
@@ -22767,6 +22791,7 @@ static void HandleTiCommand(
             // it on a never-started subscriber is a no-op.
             g_TiSubscriberForShutdown.store(&sub);
 
+            DefaultLogDirectoryToOriginalExe(state.CloakActive, state.Cloak.OriginalExePath, &options.LogDirectory);
             std::wstring startError;
             if (!sub.Start(options, &startError))
             {
@@ -25220,6 +25245,7 @@ static void HandleKmonCommand(
                 TiOptions tiOptions;
                 tiOptions.SelfPid = GetCurrentProcessId();
                 tiOptions.ExcludeSelf = true;
+                DefaultLogDirectoryToOriginalExe(state.CloakActive, state.Cloak.OriginalExePath, &tiOptions.LogDirectory);
                 if (!ti.Start(tiOptions, &startError))
                 {
                     g_TiSubscriberForShutdown.store(nullptr);
@@ -25253,6 +25279,7 @@ static void HandleKmonCommand(
             }
 
             g_KmonForShutdown.store(&kmon);
+            DefaultLogDirectoryToOriginalExe(state.CloakActive, state.Cloak.OriginalExePath, &options.LogDirectory);
             std::wstring startError;
             if (!kmon.Start(options, &ti, &state.Timeline, &device, &symbols, &startError))
             {
@@ -31989,6 +32016,56 @@ static int RunConsoleSurfaceSelfTest()
                 L"cloak-copies-dbgeng-runtime-sidecars");
         }
 
+        {
+            std::wstring logDir = L"";
+            DefaultLogDirectoryToOriginalExe(
+                true,
+                L"F:\\tools\\kn-live-dbg\\x64\\Release\\KnLiveDbg.exe",
+                &logDir);
+            std::wstring explicitDir = L"D:\\kmon-logs";
+            DefaultLogDirectoryToOriginalExe(
+                true,
+                L"F:\\tools\\KnLiveDbg.exe",
+                &explicitDir);
+            std::wstring uncDir = L"";
+            DefaultLogDirectoryToOriginalExe(
+                true,
+                L"\\\\labhost\\share\\KnLiveDbg.exe",
+                &uncDir);
+            std::wstring driveRootDir = L"";
+            DefaultLogDirectoryToOriginalExe(
+                true,
+                L"C:\\KnLiveDbg.exe",
+                &driveRootDir);
+            std::wstring uncloakedDir = L"";
+            DefaultLogDirectoryToOriginalExe(
+                false,
+                L"F:\\tools\\KnLiveDbg.exe",
+                &uncloakedDir);
+            std::wstring noOriginalDir = L"";
+            DefaultLogDirectoryToOriginalExe(
+                true,
+                L"",
+                &noOriginalDir);
+            std::wstring slashlessDir = L"";
+            DefaultLogDirectoryToOriginalExe(
+                true,
+                L"\\KnLiveDbg.exe",
+                &slashlessDir);
+            // The drive-root case yields "C:", which BuildLogFilePath joins as
+            // "C:\kmon-events..." -- absolute, so pin the raw value here.
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                logDir == L"F:\\tools\\kn-live-dbg\\x64\\Release" &&
+                    explicitDir == L"D:\\kmon-logs" &&
+                    uncDir == L"\\\\labhost\\share" &&
+                    driveRootDir == L"C:" &&
+                    uncloakedDir.empty() &&
+                    noOriginalDir.empty() &&
+                    slashlessDir.empty(),
+                L"cloak-log-dir-defaults-to-original-exe-parent");
+        }
+
         TimelineStats populatedTimelineStats = {};
         populatedTimelineStats.Stored = 1;
         populatedTimelineStats.Capacity = 262144;
@@ -32645,7 +32722,11 @@ static bool AppendUtf8Line(const std::wstring& path, const std::wstring& line, s
             break;
         }
 
-        file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        // WRITE_THROUGH pushes line data past the lazy writer, and the
+        // explicit flush also pins the file-size metadata, which neither
+        // WRITE_THROUGH nor CloseHandle forces. Without both, a bugcheck
+        // can still truncate the visible tail.
+        file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
         if (file == INVALID_HANDLE_VALUE)
         {
             if (error != nullptr)
@@ -32671,6 +32752,7 @@ static bool AppendUtf8Line(const std::wstring& path, const std::wstring& line, s
 
     if (file != INVALID_HANDLE_VALUE)
     {
+        FlushFileBuffers(file);
         CloseHandle(file);
     }
 

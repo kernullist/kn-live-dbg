@@ -273,6 +273,7 @@ private:
     int LogActiveRotation = 0;
     uint64_t LogRotateBytes = 100ull * 1024ull * 1024ull;
     uint32_t LogRotateCount = 5;
+    uint64_t LogLastFlushTickMs = 0;
 
     std::atomic<uint64_t> EventsKept{0};
     std::atomic<uint64_t> EventsDropped{0};
