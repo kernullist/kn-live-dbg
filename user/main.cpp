@@ -24831,6 +24831,10 @@ static void PrintKmonHelp()
     std::wcout << L"                                       (first per pid+ioctl code); off restores it\n";
     std::wcout << L"  !kmon watch            reattach live tail after Esc (optional)\n";
     std::wcout << L"\n";
+    std::wcout << L"dwm.exe is watched by default (no /name needed): its Microsoft-signed main\n";
+    std::wcout << L"image text, graphics vtables, and heap vtable clones are compared every\n";
+    std::wcout << L"scan tick because PresentDWM/PresentMPO render hooks land there.\n";
+    std::wcout << L"\n";
     std::wcout << L"typical hunt (driver filename is not an input):\n";
     std::wcout << L"  write on\n";
     std::wcout << L"  !kmon\n";
