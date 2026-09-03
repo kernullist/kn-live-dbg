@@ -3817,6 +3817,335 @@ namespace
         return nullptr;
     }
 
+    // Periodic-scan port of hunt's AddClonedVtableFindings: a private RW heap
+    // table whose slots still point at graphics-API code while at least one
+    // slot was redirected to unbacked executable memory is the per-object
+    // Present-hook shape (cloned IDXGISwapChain vtable). ScanLiveCallTable
+    // Pointers above only sees tables inside loaded modules; this walk finds
+    // the heap-side clone those module scans cannot see.
+    bool KmonVadLooksLikeClonedVtableCandidate(
+        bool hasPrivateMemory,
+        bool privateMemory,
+        bool executable,
+        uint64_t size)
+    {
+        return hasPrivateMemory &&
+            privateMemory &&
+            !executable &&
+            size >= 0x40ull &&
+            size <= 0x4000ull;
+    }
+
+    bool KmonVadLooksLikeLargeClonedVtableSample(
+        bool hasPrivateMemory,
+        bool privateMemory,
+        bool executable,
+        uint64_t size)
+    {
+        // Heap-embedded clone: the table sits inside a larger RW heap VAD
+        // instead of a dedicated small allocation. Only the first page is
+        // ever sampled, so the bound is about read cost, not coverage of
+        // the table itself.
+        return hasPrivateMemory &&
+            privateMemory &&
+            !executable &&
+            size > 0x4000ull &&
+            size <= 0x400000ull;
+    }
+
+    bool KmonClonedVtableSlotsLookHooked(
+        uint32_t graphicsSlots,
+        uint32_t unbackedSlots)
+    {
+        // Three live graphics slots prove the table really is a graphics
+        // interface clone; one unbacked slot proves at least one entry was
+        // redirected to code no loader module backs.
+        return graphicsSlots >= 3 && unbackedSlots >= 1;
+    }
+
+    struct KmonClonedVtableHit
+    {
+        uint64_t VtableAddress = 0;
+        uint64_t FirstUnbackedTarget = 0;
+        uint32_t GraphicsSlots = 0;
+        uint32_t UnbackedSlots = 0;
+    };
+
+    size_t KmonFindModuleRangeIndex(
+        uint64_t address,
+        const std::vector<std::pair<uint64_t, uint32_t>>& ranges)
+    {
+        size_t found = SIZE_MAX;
+        for (size_t i = 0; i < ranges.size(); ++i)
+        {
+            const uint64_t base = ranges[i].first;
+            const uint32_t size = ranges[i].second;
+            if (base == 0 ||
+                size == 0 ||
+                base > (std::numeric_limits<uint64_t>::max)() - size)
+            {
+                continue;
+            }
+            if (address >= base &&
+                address < base + static_cast<uint64_t>(size))
+            {
+                found = i;
+                break;
+            }
+        }
+        return found;
+    }
+
+    void KmonClassifyVtableSlots(
+        const std::vector<uint8_t>& bytes,
+        size_t slotSize,
+        HANDLE processHandle,
+        const std::vector<std::wstring>& modulePaths,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
+        const std::vector<ProcessVadRecord>* kernelVads,
+        uint32_t* graphicsSlots,
+        uint32_t* unbackedSlots,
+        uint64_t* firstUnbacked)
+    {
+        if (graphicsSlots != nullptr)
+        {
+            *graphicsSlots = 0;
+        }
+        if (unbackedSlots != nullptr)
+        {
+            *unbackedSlots = 0;
+        }
+        if (firstUnbacked != nullptr)
+        {
+            *firstUnbacked = 0;
+        }
+        if (slotSize != 4 && slotSize != 8)
+        {
+            return;
+        }
+
+        const size_t count = bytes.size() / slotSize;
+        for (size_t slot = 0; slot < count; ++slot)
+        {
+            uint64_t target = 0;
+            if (slotSize == sizeof(uint64_t))
+            {
+                std::memcpy(
+                    &target,
+                    bytes.data() + (slot * slotSize),
+                    sizeof(target));
+            }
+            else
+            {
+                uint32_t target32 = 0;
+                std::memcpy(
+                    &target32,
+                    bytes.data() + (slot * slotSize),
+                    sizeof(target32));
+                target = target32;
+            }
+            if (target == 0 || !IsUserModeImageBase(target))
+            {
+                continue;
+            }
+
+            const size_t ownerIndex =
+                KmonFindModuleRangeIndex(target, moduleRanges);
+            if (ownerIndex != SIZE_MAX)
+            {
+                if (ownerIndex < modulePaths.size() &&
+                    KmonLooksLikeGraphicsApiDll(
+                        KmonBasenameLower(modulePaths[ownerIndex])))
+                {
+                    if (graphicsSlots != nullptr)
+                    {
+                        ++(*graphicsSlots);
+                    }
+                }
+                continue;
+            }
+
+            bool unbackedExec = false;
+            MEMORY_BASIC_INFORMATION region = {};
+            if (processHandle != nullptr &&
+                VirtualQueryEx(
+                    processHandle,
+                    reinterpret_cast<LPCVOID>(target),
+                    &region,
+                    sizeof(region)) == sizeof(region))
+            {
+                unbackedExec =
+                    region.State == MEM_COMMIT &&
+                    ProtectHasExecute(region.Protect) &&
+                    (region.Type == MEM_PRIVATE ||
+                        region.Type == MEM_MAPPED);
+            }
+            else
+            {
+                // Handle stripped or absent: classify through the
+                // kernel VAD view instead of dropping the slot.
+                const ProcessVadRecord* targetVad =
+                    KmonFindCoveringVadRecord(kernelVads, target);
+                unbackedExec =
+                    targetVad != nullptr &&
+                    KmonVadRecordLooksLikeCodeTarget(*targetVad);
+            }
+            if (unbackedExec)
+            {
+                if (unbackedSlots != nullptr)
+                {
+                    ++(*unbackedSlots);
+                }
+                if (firstUnbacked != nullptr && *firstUnbacked == 0)
+                {
+                    *firstUnbacked = target;
+                }
+            }
+        }
+    }
+
+    void KmonScanPrivateVtablesForGraphicsClones(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        HANDLE processHandle,
+        uint32_t pid,
+        size_t slotSize,
+        const std::vector<std::wstring>& modulePaths,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
+        const std::vector<ProcessVadRecord>* kernelVads,
+        KmonClonedVtableHit* hit)
+    {
+        do
+        {
+            if (hit == nullptr ||
+                kernelVads == nullptr ||
+                (slotSize != 4 && slotSize != 8) ||
+                (processHandle == nullptr &&
+                    (device == nullptr || symbols == nullptr)))
+            {
+                break;
+            }
+
+            // Dedicated-alloc shape: a small RW region sized like a vtable.
+            constexpr uint32_t kMaxSmallVadScans = 48;
+            // Heap-embedded shape: only the first page of a large RW VAD is
+            // sampled, after a 0x40 code-pointer prefilter rejects pure data
+            // pages. Separate budgets mean a decoy spray of one shape cannot
+            // starve the other.
+            constexpr uint32_t kMaxLargeVadReads = 80;
+            constexpr uint64_t kMaxVadRead = 0x1000ull;
+            constexpr uint32_t kLargeProbeBytes = 0x40;
+            uint32_t smallScanned = 0;
+            uint32_t largeReads = 0;
+            for (const ProcessVadRecord& vad : *kernelVads)
+            {
+                const bool smallCandidate = KmonVadLooksLikeClonedVtableCandidate(
+                    vad.HasPrivateMemory,
+                    vad.PrivateMemory,
+                    vad.Executable,
+                    vad.Size);
+                const bool largeCandidate =
+                    KmonVadLooksLikeLargeClonedVtableSample(
+                        vad.HasPrivateMemory,
+                        vad.PrivateMemory,
+                        vad.Executable,
+                        vad.Size);
+                if (!smallCandidate && !largeCandidate)
+                {
+                    continue;
+                }
+                if (smallCandidate &&
+                    smallScanned >= kMaxSmallVadScans)
+                {
+                    continue;
+                }
+                if (largeCandidate && largeReads >= kMaxLargeVadReads)
+                {
+                    continue;
+                }
+
+                if (largeCandidate)
+                {
+                    std::vector<uint8_t> probe;
+                    if (!ReadProcessBytes(
+                            device,
+                            symbols,
+                            processHandle,
+                            pid,
+                            vad.StartAddress,
+                            kLargeProbeBytes,
+                            &probe) ||
+                        probe.size() < slotSize)
+                    {
+                        continue;
+                    }
+                    uint32_t probeGraphics = 0;
+                    uint32_t probeUnbacked = 0;
+                    uint64_t probeFirst = 0;
+                    KmonClassifyVtableSlots(
+                        probe,
+                        slotSize,
+                        processHandle,
+                        modulePaths,
+                        moduleRanges,
+                        kernelVads,
+                        &probeGraphics,
+                        &probeUnbacked,
+                        &probeFirst);
+                    if (probeGraphics == 0 && probeUnbacked == 0)
+                    {
+                        continue;
+                    }
+                    ++largeReads;
+                }
+                else
+                {
+                    ++smallScanned;
+                }
+
+                const uint32_t toRead = static_cast<uint32_t>(
+                    (std::min)(vad.Size, kMaxVadRead));
+                std::vector<uint8_t> bytes;
+                if (!ReadProcessBytes(
+                        device,
+                        symbols,
+                        processHandle,
+                        pid,
+                        vad.StartAddress,
+                        toRead,
+                        &bytes) ||
+                    bytes.size() < slotSize)
+                {
+                    continue;
+                }
+
+                uint32_t graphicsSlots = 0;
+                uint32_t unbackedSlots = 0;
+                uint64_t firstUnbacked = 0;
+                KmonClassifyVtableSlots(
+                    bytes,
+                    slotSize,
+                    processHandle,
+                    modulePaths,
+                    moduleRanges,
+                    kernelVads,
+                    &graphicsSlots,
+                    &unbackedSlots,
+                    &firstUnbacked);
+                if (KmonClonedVtableSlotsLookHooked(
+                        graphicsSlots,
+                        unbackedSlots))
+                {
+                    hit->VtableAddress = vad.StartAddress;
+                    hit->FirstUnbackedTarget = firstUnbacked;
+                    hit->GraphicsSlots = graphicsSlots;
+                    hit->UnbackedSlots = unbackedSlots;
+                    break;
+                }
+            }
+        } while (false);
+    }
+
     bool KmonOrphanRegionInteresting(
         const MEMORY_BASIC_INFORMATION& region,
         uint64_t exeRegion,
@@ -5007,6 +5336,17 @@ bool KmonIsWindowsBuiltinLeaf(const std::wstring& leaf)
         }
     }
     return matched;
+}
+
+// dwm.exe is the composition host every game presents through, so render
+// hooks (PresentDWM/PresentMPO inline patches, cloned swapchain vtables)
+// land there without ever touching the game process. It receives the
+// watched memory-forensics gates by default -- no !kmon watch entry -- but
+// this is NOT a watch-list promotion: TI process logging, mapper watch
+// arming, and event display gating stay keyed to explicit watches.
+bool KmonIsDefaultWatchLeaf(const std::wstring& leaf)
+{
+    return KmonBasenameLower(leaf) == L"dwm.exe";
 }
 
 bool KmonWindowsBuiltinPathLooksInbox(const std::wstring& path)
@@ -9447,6 +9787,7 @@ void KernelMonitor::ScanUserModeHostility()
         const bool builtin = KmonIsWindowsBuiltinLeaf(leaf);
         const bool nameWatched = NameEqualsWatch(leaf, watchNames);
         const bool watched = nameWatched || watchPids.count(pid) != 0;
+        const bool defaultWatched = KmonIsDefaultWatchLeaf(leaf);
         const bool dropHost = KmonClassifyDriverPath(imagePath) == L"drop";
         const bool hostileHost = watched || builtin || dropHost;
         if (watched && pid > 4)
@@ -9602,7 +9943,8 @@ void KernelMonitor::ScanUserModeHostility()
             const bool needKernelPrivateImplants =
                 (hostileHost) &&
                 (!queried || !moduleInventoryComplete);
-            const bool wantKernelVad = watched || dropHost || needKernelPrivateImplants;
+            const bool wantKernelVad =
+                watched || dropHost || defaultWatched || needKernelPrivateImplants;
             // Watched/drop hosts still need private-VAD PE probes when the
             // usermode module list is complete; header-intact and wiped
             // manual maps would otherwise hide behind the JIT skip.
@@ -10798,6 +11140,8 @@ void KernelMonitor::ScanUserModeHostility()
             uint32_t implants = 0;
             uint32_t gameTextHits = 0;
             uint32_t systemTextHits = 0;
+            uint32_t builtinTextHits = 0;
+            bool processHasGraphicsDll = false;
             const std::wstring moduleSourceNote =
                 kernelModuleInventory
                     ? L" module_source=kernel_vad"
@@ -10835,6 +11179,10 @@ void KernelMonitor::ScanUserModeHostility()
                     imageDir.size() > 3 &&
                     moduleLower.find(imageDir) == 0;
                 const std::wstring moduleLeaf = KmonBasenameLower(modulePath);
+                if (KmonLooksLikeGraphicsApiDll(moduleLeaf))
+                {
+                    processHasGraphicsDll = true;
+                }
                 const bool dropImplant =
                     moduleClass == L"drop" &&
                     moduleLeaf != leaf &&
@@ -10887,15 +11235,32 @@ void KernelMonitor::ScanUserModeHostility()
                     systemTextHits < 16 &&
                     loadedModuleBase != 0 &&
                     PathLooksLikeWin32File(modulePath);
-                if (compareGameText || compareSystemText)
+                // Builtin hosts (dwm.exe by default, any builtin under
+                // !kmon watch) run Microsoft-signed main images that have no
+                // legitimate reason to diverge from disk; PresentDWM/MPO
+                // render-hook patches land exactly there. The game-module
+                // branch above deliberately excludes the main image, so this
+                // branch is the only main-image .text compare.
+                const bool compareBuiltinImageText =
+                    builtin &&
+                    (watched || dropHost || defaultWatched) &&
+                    moduleLeaf == leaf &&
+                    builtinTextHits < 4 &&
+                    loadedModuleBase != 0 &&
+                    PathLooksLikeWin32File(modulePath);
+                if (compareGameText || compareSystemText || compareBuiltinImageText)
                 {
                     if (compareGameText)
                     {
                         ++gameTextHits;
                     }
-                    else
+                    else if (compareSystemText)
                     {
                         ++systemTextHits;
+                    }
+                    else
+                    {
+                        ++builtinTextHits;
                     }
                     const std::wstring textFailKey =
                         L"scan_failed:userhostility:module_text:" +
@@ -10911,15 +11276,19 @@ void KernelMonitor::ScanUserModeHostility()
                     {
                         EmitUnique(
                             L"process.implant",
-                            L"module_text:" + std::to_wstring(pid) + L":" +
-                                moduleLeaf,
+                            (compareBuiltinImageText
+                                ? L"main_image_text:"
+                                : L"module_text:") +
+                                std::to_wstring(pid) + L":" + moduleLeaf,
                             imagePath,
-                            L"module_text",
-                                L"module code bytes differ from disk pid=" +
-                                    std::to_wstring(pid) + L" " + leaf +
-                                    L" module=" + moduleLeaf,
-                                modulePath + moduleSourceNote,
-                                pid);
+                            compareBuiltinImageText ? L"main_image_text" : L"module_text",
+                            (compareBuiltinImageText
+                                ? L"main image code bytes differ from disk pid="
+                                : L"module code bytes differ from disk pid=") +
+                                std::to_wstring(pid) + L" " + leaf +
+                                L" module=" + moduleLeaf,
+                            modulePath + moduleSourceNote,
+                            pid);
                     }
                     else if (textCmp == SliceUnknown)
                     {
@@ -10976,6 +11345,7 @@ void KernelMonitor::ScanUserModeHostility()
                         loadedModuleBase != 0 &&
                         (compareGameText ||
                             compareSystemText ||
+                            compareBuiltinImageText ||
                             ((watched || dropHost) && moduleLeaf == leaf));
                     const bool overlayLeaf = KmonLooksLikeOverlayRuntimeDll(moduleLeaf);
                     const bool scanVtables =
@@ -11107,6 +11477,54 @@ void KernelMonitor::ScanUserModeHostility()
                     modulePath,
                     pid);
                 ++implants;
+            }
+
+            // Per-object vtable clones live in private heap, not in module
+            // tables, so the module loop above cannot see them. dwm.exe gets
+            // this scan through defaultWatched; other hosts need watch or a
+            // drop-path classification. Needs the kernel VAD inventory for
+            // both the RW-table candidates and the unbacked exec
+            // classification.
+            if ((watched || dropHost || defaultWatched) &&
+                processHasGraphicsDll &&
+                hasKernelVadScan)
+            {
+                bool processIsWow64 = false;
+                QueryProcessIsWow64(
+                    processHandle,
+                    device,
+                    symbols,
+                    pid,
+                    &processIsWow64);
+                KmonClonedVtableHit clonedVtable = {};
+                KmonScanPrivateVtablesForGraphicsClones(
+                    device,
+                    symbols,
+                    processHandle,
+                    pid,
+                    processIsWow64 ? sizeof(uint32_t) : sizeof(uint64_t),
+                    modulePaths,
+                    moduleRanges,
+                    &kernelVad.Records,
+                    &clonedVtable);
+                if (clonedVtable.GraphicsSlots != 0)
+                {
+                    EmitUnique(
+                        L"process.implant",
+                        L"cloned_vtable:" + std::to_wstring(pid),
+                        imagePath,
+                        L"cloned_vtable",
+                        L"cloned graphics vtable points at unbacked executable memory pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"vtable=" + HexU64(clonedVtable.VtableAddress) +
+                            L" graphics_slots=" +
+                            std::to_wstring(clonedVtable.GraphicsSlots) +
+                            L" unbacked_slots=" +
+                            std::to_wstring(clonedVtable.UnbackedSlots) +
+                            L" hook=" +
+                            HexU64(clonedVtable.FirstUnbackedTarget),
+                        pid);
+                }
             }
             if (processHandle != nullptr)
             {
@@ -13548,6 +13966,26 @@ bool KernelMonitorSelfTest()
             !KmonLooksLikeGraphicsApiDll(L"d3d11.dll") ||
             KmonLooksLikeGraphicsApiDll(L"ntdll.dll") ||
             KmonLooksLikeGraphicsApiDll(L"game.dll") ||
+            !KmonVadLooksLikeClonedVtableCandidate(true, true, false, 0x100ull) ||
+            KmonVadLooksLikeClonedVtableCandidate(true, true, true, 0x100ull) ||
+            KmonVadLooksLikeClonedVtableCandidate(true, false, false, 0x100ull) ||
+            KmonVadLooksLikeClonedVtableCandidate(true, true, false, 0x20ull) ||
+            KmonVadLooksLikeClonedVtableCandidate(true, true, false, 0x8000ull) ||
+            !KmonClonedVtableSlotsLookHooked(3, 1) ||
+            !KmonClonedVtableSlotsLookHooked(22, 5) ||
+            KmonClonedVtableSlotsLookHooked(2, 1) ||
+            KmonClonedVtableSlotsLookHooked(3, 0) ||
+            KmonClonedVtableSlotsLookHooked(0, 64) ||
+            !KmonVadLooksLikeLargeClonedVtableSample(true, true, false, 0x8000ull) ||
+            !KmonVadLooksLikeLargeClonedVtableSample(true, true, false, 0x400000ull) ||
+            KmonVadLooksLikeLargeClonedVtableSample(true, true, false, 0x4000ull) ||
+            KmonVadLooksLikeLargeClonedVtableSample(true, true, false, 0x800000ull) ||
+            KmonVadLooksLikeLargeClonedVtableSample(true, true, true, 0x8000ull) ||
+            KmonVadLooksLikeLargeClonedVtableSample(true, false, false, 0x8000ull) ||
+            !KmonIsDefaultWatchLeaf(L"dwm.exe") ||
+            !KmonIsDefaultWatchLeaf(L"C:\\Windows\\System32\\DWM.EXE") ||
+            KmonIsDefaultWatchLeaf(L"explorer.exe") ||
+            KmonIsDefaultWatchLeaf(L"dwmapi.dll") ||
             !KmonLooksLikeOverlayRuntimeDll(L"gameoverlayrenderer64.dll") ||
             !KmonLooksLikeOverlayRuntimeDll(L"graphics-hook64.dll") ||
             !KmonLooksLikeOverlayRuntimeDll(L"rtsshooks64.dll") ||
