@@ -3817,6 +3817,130 @@ namespace
         return nullptr;
     }
 
+    // Theme (.msstyles) and MUI resource-only PEs load through data-file
+    // mappings that surface as private executable VADs with intact PE
+    // headers: dwm and explorer carried a dozen of them in live captures.
+    // A mapped image with no executable section, or a machine/architecture
+    // that cannot even run inside the host process (32-bit MUI in a 64-bit
+    // host), is a data carrier, not runnable code.
+    enum class KmonPeCarrierVerdict
+    {
+        Unknown = 0,
+        RunnableImage = 1,
+        ResourceOnly = 2,
+        ForeignArch = 3,
+    };
+
+    KmonPeCarrierVerdict KmonClassifyMappedPeCarrier(
+        const uint8_t* headers,
+        size_t size,
+        bool processIsWow64)
+    {
+        if (headers == nullptr || size < 0x40 || size < sizeof(IMAGE_DOS_HEADER))
+        {
+            return KmonPeCarrierVerdict::Unknown;
+        }
+        IMAGE_DOS_HEADER dos = {};
+        std::memcpy(&dos, headers, sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE ||
+            dos.e_lfanew <= 0 ||
+            static_cast<size_t>(dos.e_lfanew) + 4 + sizeof(IMAGE_FILE_HEADER) > size)
+        {
+            return KmonPeCarrierVerdict::Unknown;
+        }
+        const size_t nt = static_cast<size_t>(dos.e_lfanew);
+        if (std::memcmp(headers + nt, "PE\0\0", 4) != 0)
+        {
+            return KmonPeCarrierVerdict::Unknown;
+        }
+        IMAGE_FILE_HEADER file = {};
+        std::memcpy(&file, headers + nt + 4, sizeof(file));
+        const uint16_t machine = file.Machine;
+        const bool host64 = !processIsWow64;
+        if ((host64 && machine == IMAGE_FILE_MACHINE_I386) ||
+            (!host64 && machine == IMAGE_FILE_MACHINE_AMD64))
+        {
+            return KmonPeCarrierVerdict::ForeignArch;
+        }
+        const size_t sectionOffset =
+            nt + 4 + sizeof(IMAGE_FILE_HEADER) + file.SizeOfOptionalHeader;
+        if (file.NumberOfSections == 0 ||
+            file.NumberOfSections > 96 ||
+            sectionOffset + sizeof(IMAGE_SECTION_HEADER) > size)
+        {
+            return KmonPeCarrierVerdict::Unknown;
+        }
+        bool hasExecutableSection = false;
+        for (uint16_t i = 0; i < file.NumberOfSections; ++i)
+        {
+            const size_t off = sectionOffset + static_cast<size_t>(i) * sizeof(IMAGE_SECTION_HEADER);
+            if (off + sizeof(IMAGE_SECTION_HEADER) > size)
+            {
+                return KmonPeCarrierVerdict::Unknown;
+            }
+            uint32_t characteristics = 0;
+            std::memcpy(
+                &characteristics,
+                headers + off + 36,
+                sizeof(characteristics));
+            if ((characteristics & IMAGE_SCN_MEM_EXECUTE) != 0)
+            {
+                hasExecutableSection = true;
+                break;
+            }
+        }
+        return hasExecutableSection
+            ? KmonPeCarrierVerdict::RunnableImage
+            : KmonPeCarrierVerdict::ResourceOnly;
+    }
+
+    // dwm maps small graphics tables (gradient LUTs, stride grids) into
+    // executable-classified private pages; entropy 0.2-1.6 bits/byte versus
+    // ~6+ for real x64 code. Below ~4.0 the page is data, not a shellcode
+    // stub, and can be dropped from the orphan report.
+    double KmonShannonEntropy(const uint8_t* bytes, size_t size)
+    {
+        if (bytes == nullptr || size == 0)
+        {
+            return 0.0;
+        }
+        const size_t span = size < 0x200 ? size : 0x200;
+        uint32_t counts[256] = {};
+        for (size_t i = 0; i < span; ++i)
+        {
+            ++counts[bytes[i]];
+        }
+        double entropy = 0.0;
+        for (uint32_t count : counts)
+        {
+            if (count == 0)
+            {
+                continue;
+            }
+            const double p = static_cast<double>(count) / static_cast<double>(span);
+            entropy -= p * std::log2(p);
+        }
+        return entropy;
+    }
+
+    bool KmonBytesLookLikeCode(const uint8_t* bytes, size_t size)
+    {
+        return bytes != nullptr &&
+            size >= 0x40 &&
+            KmonShannonEntropy(bytes, size) >= 4.0;
+    }
+
+    // Sustained remote reads of lsass are credential scraping (the Berkan
+    // loader issued 36k-40k reads per run). Reads stay unclassified by
+    // design because anti-cheat, dumpers, and the OS remote-read constantly,
+    // so this predicate only names the task; volume, caller class, and the
+    // lsass target are enforced by the caller.
+    bool KmonTaskLooksLikeLsassRead(const std::wstring& task)
+    {
+        std::wstring lower = ToLowerCopy(task);
+        return lower.find(L"readvm") != std::wstring::npos;
+    }
+
     // Periodic-scan port of hunt's AddClonedVtableFindings: a private RW heap
     // table whose slots still point at graphics-API code while at least one
     // slot was redirected to unbacked executable memory is the per-object
@@ -5349,6 +5473,11 @@ bool KmonIsDefaultWatchLeaf(const std::wstring& leaf)
     return KmonBasenameLower(leaf) == L"dwm.exe";
 }
 
+bool KmonEventOriginatesFromSystem(const std::wstring& image)
+{
+    return KmonBasenameLower(image) == L"system";
+}
+
 bool KmonWindowsBuiltinPathLooksInbox(const std::wstring& path)
 {
     bool inbox = false;
@@ -5655,14 +5784,38 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
             record.TargetProcessId != 0 &&
             record.TargetProcessId != record.ProcessId)
         {
-            out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
-            out->TargetImage = KmonImageForClassify(
-                record.TargetProcessId,
-                record.TargetImageBase);
-            out->Kind = L"inject.remote";
-            out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId) +
-                L" -> pid=" + std::to_wstring(record.TargetProcessId);
-            classified = true;
+            // csrss writes window/console state into every GUI process and
+            // lsass/services write process-creation bookkeeping into
+            // builtins; classified as inject.remote these made up 80%+ of
+            // live-capture logs and starved ingest. The raw TI log keeps
+            // every record, so suppressing classification is forensic-safe.
+            // APC/context tasks are never suppressed -- they stay rare and
+            // decisive.
+            const std::wstring injectCallerLeaf =
+                KmonBasenameLower(record.ImagePath);
+            const std::wstring injectTargetLeaf =
+                KmonBasenameLower(record.TargetImageBase);
+            std::wstring injectTaskLower = ToLowerCopy(out->Task);
+            const bool writeVmOnly =
+                injectTaskLower.find(L"writevm") != std::wstring::npos &&
+                injectTaskLower.find(L"queueuserapc") == std::wstring::npos &&
+                injectTaskLower.find(L"setthreadcontext") == std::wstring::npos;
+            const bool osWriteNoise =
+                writeVmOnly &&
+                (injectCallerLeaf == L"csrss.exe" ||
+                    (KmonIsWindowsBuiltinLeaf(injectCallerLeaf) &&
+                        KmonIsWindowsBuiltinLeaf(injectTargetLeaf)));
+            if (!osWriteNoise)
+            {
+                out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
+                out->TargetImage = KmonImageForClassify(
+                    record.TargetProcessId,
+                    record.TargetImageBase);
+                out->Kind = L"inject.remote";
+                out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId) +
+                    L" -> pid=" + std::to_wstring(record.TargetProcessId);
+                classified = true;
+            }
             break;
         }
     } while (false);
@@ -6031,6 +6184,22 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             break;
         }
 
+        // A user APC or thread-context write attributed to System is a
+        // kernel driver queueing execution into a user process (the Berkan
+        // driver did exactly this twice while watch gating hid it), and
+        // credscan is caller-class-gated at emission; both always display.
+        // The empty-image clause covers system-origin records whose image
+        // field never resolved.
+        if (event.Kind == L"process.credscan" ||
+            (event.Kind == L"inject.remote" &&
+                (KmonEventOriginatesFromSystem(event.Image) ||
+                    (event.Image.empty() && event.ProcessId <= 4)) &&
+                KmonTaskLooksLikeRemoteInjectWrite(event.Task)))
+        {
+            matched = true;
+            break;
+        }
+
         if (event.Kind == L"inject.remote")
         {
             std::wstring caller = KmonBasenameLower(event.Image);
@@ -6360,6 +6529,10 @@ bool KernelMonitor::Start(
             {
                 nextOptions.LogDirectory = ExeDirectory();
             }
+            if (nextOptions.DataDirectory.empty())
+            {
+                nextOptions.DataDirectory = ExeDirectory();
+            }
             if (nextOptions.HiddenScanIntervalMs < 1000)
             {
                 nextOptions.HiddenScanIntervalMs = 5000;
@@ -6462,6 +6635,14 @@ bool KernelMonitor::Start(
             // after a standalone !ti session.
             TiCursorSequence = 0;
             LiveCursorEventId = 0;
+            CredscanWindows.clear();
+            TiResolvedImageCache.clear();
+            TiResolvedImageTickMs.clear();
+            {
+                std::lock_guard<std::mutex> capturesLock(CapturesMutex);
+                CapturedKeys.clear();
+                CapturedBytes = 0;
+            }
             {
                 std::vector<TiEventRecord> latestTi = ti->Recent(1, true);
                 if (!latestTi.empty() && latestTi[0].Sequence != 0)
@@ -6801,6 +6982,105 @@ void KernelMonitor::WorkerLoop()
     }
 }
 
+void KernelMonitor::NoteCredscanRead(
+    const TiEventRecord& record,
+    DeviceClient* device,
+    SymbolEngine* symbols)
+{
+    // 256 remote reads of lsass inside a 60s window from a drop/unknown
+    // caller is scraping volume (the Berkan loader issued 36k-40k reads per
+    // run). Signed/Program Files callers stay outside this gate: TavernWorker
+    // legitimately mass-reads lsass while hunting cheats hiding there.
+    constexpr uint64_t kCredscanWindowMs = 60000;
+    constexpr uint64_t kCredscanThreshold = 256;
+
+    if (record.ProcessId == 0 ||
+        record.TargetProcessId == 0 ||
+        record.TargetProcessId == record.ProcessId)
+    {
+        return;
+    }
+    const std::wstring task = record.TaskName.empty()
+        ? (L"Task" + std::to_wstring(record.TaskId))
+        : record.TaskName;
+    if (!KmonTaskLooksLikeLsassRead(task))
+    {
+        return;
+    }
+    const std::wstring callerClass = KmonClassifyDriverPath(record.ImagePath);
+    if (callerClass != L"drop" &&
+        !(callerClass == L"unknown" &&
+            PathHasDirectorySeparator(record.ImagePath)))
+    {
+        return;
+    }
+
+    // 1024 pairs keeps the reset-everything cap far above any legitimate
+    // fan-out; an attacker must interleave a thousand distinct targets
+    // (itself a loud multi-target scraping signature) just to reset the
+    // lsass window.
+    if (CredscanWindows.size() > 1024)
+    {
+        CredscanWindows.clear();
+    }
+    // Keyed per (caller, target) pair: a scraper interleaving reads across
+    // two targets must not reset its own window on every switch.
+    const uint64_t windowKey =
+        (static_cast<uint64_t>(record.ProcessId) << 32) |
+        static_cast<uint64_t>(record.TargetProcessId);
+    const uint64_t nowMs = GetTickCount64();
+    KmonCredscanWindow& window = CredscanWindows[windowKey];
+    if (window.WindowStartMs == 0 ||
+        nowMs - window.WindowStartMs > kCredscanWindowMs)
+    {
+        window.Count = 0;
+        window.WindowStartMs = nowMs;
+        window.Emitted = false;
+    }
+    ++window.Count;
+    if (window.Emitted || window.Count != kCredscanThreshold)
+    {
+        return;
+    }
+
+    // Confirm the target really is lsass before firing; an unresolvable
+    // target stays silent rather than guessing.
+    std::wstring targetImage = record.TargetImageBase;
+    if (!PathLooksLikeWin32File(targetImage))
+    {
+        std::wstring resolved;
+        if (QueryKernelImagePath(
+                device,
+                symbols,
+                record.TargetProcessId,
+                &resolved) &&
+            PathHasDirectorySeparator(resolved))
+        {
+            targetImage = std::move(resolved);
+        }
+    }
+    if (KmonBasenameLower(targetImage) != L"lsass.exe")
+    {
+        return;
+    }
+    window.Emitted = true;
+
+    KmonEvent event = {};
+    event.Timestamp = record.Timestamp;
+    event.ProcessId = record.ProcessId;
+    event.TargetProcessId = record.TargetProcessId;
+    event.Image = record.ImagePath;
+    event.TargetImage = targetImage;
+    event.Task = task;
+    event.Kind = L"process.credscan";
+    event.Summary = task + L" pid=" + std::to_wstring(record.ProcessId) +
+        L" -> lsass.exe reads>=" + std::to_wstring(kCredscanThreshold);
+    event.Evidence[L"reads"] = std::to_wstring(window.Count);
+    event.Evidence[L"window_ms"] = std::to_wstring(kCredscanWindowMs);
+    event.Evidence[L"target"] = L"lsass";
+    RecordEvent(std::move(event));
+}
+
 void KernelMonitor::IngestThreatIntel()
 {
     TiSubscriber* ti = nullptr;
@@ -6826,6 +7106,9 @@ void KernelMonitor::IngestThreatIntel()
             TiCursorSequence = record.Sequence;
         }
         TiIngested.fetch_add(1);
+        // Runs before classification: remote reads never classify, and the
+        // credscan window needs to see every one of them.
+        NoteCredscanRead(record, device, symbols);
 
         KmonEvent classified = {};
         if (KmonClassifyTiEvent(record, &classified))
@@ -6860,12 +7143,41 @@ void KernelMonitor::IngestThreatIntel()
                     {
                         return;
                     }
+                    // The console-write storm re-resolved the same pids
+                    // through kernel queries thousands of times and starved
+                    // driver-lifecycle ingest; a short-TTL cache caps that.
+                    // The key carries the event's own basename so a reused
+                    // pid with a different image cannot inherit the
+                    // previous process's resolved path.
+                    constexpr uint64_t kImageCacheTtlMs = 30000;
+                    const uint64_t nowTickMs = GetTickCount64();
+                    const std::wstring cacheKey =
+                        std::to_wstring(pid) + L"|" + KmonBasenameLower(*image);
+                    auto cached = TiResolvedImageCache.find(cacheKey);
+                    if (cached != TiResolvedImageCache.end() &&
+                        !cached->second.empty())
+                    {
+                        auto tick = TiResolvedImageTickMs.find(cacheKey);
+                        if (tick != TiResolvedImageTickMs.end() &&
+                            nowTickMs - tick->second < kImageCacheTtlMs)
+                        {
+                            *image = cached->second;
+                            return;
+                        }
+                    }
                     if (PathHasDirectorySeparator(*image))
                     {
                         std::wstring win32 = Win32PathFromKernelImagePath(*image);
                         if (PathLooksLikeWin32File(win32))
                         {
                             *image = std::move(win32);
+                            if (TiResolvedImageCache.size() > 512)
+                            {
+                                TiResolvedImageCache.clear();
+                                TiResolvedImageTickMs.clear();
+                            }
+                            TiResolvedImageCache[cacheKey] = *image;
+                            TiResolvedImageTickMs[cacheKey] = nowTickMs;
                             return;
                         }
                     }
@@ -6877,11 +7189,52 @@ void KernelMonitor::IngestThreatIntel()
                             &resolved) &&
                         PathHasDirectorySeparator(resolved))
                     {
-                        *image = std::move(resolved);
+                        *image = resolved;
+                        if (TiResolvedImageCache.size() > 512)
+                        {
+                            TiResolvedImageCache.clear();
+                            TiResolvedImageTickMs.clear();
+                        }
+                        TiResolvedImageCache[cacheKey] = std::move(resolved);
+                        TiResolvedImageTickMs[cacheKey] = nowTickMs;
+                    }
+                    else
+                    {
+                        // Kernel resolution can lag or miss short-lived
+                        // processes; the user-mode toolhelp query is cheap
+                        // and usually answers for anything still alive.
+                        std::wstring userResolved;
+                        if (QueryProcessImagePathByPid(pid, &userResolved) &&
+                            !userResolved.empty())
+                        {
+                            *image = userResolved;
+                            if (TiResolvedImageCache.size() > 512)
+                            {
+                                TiResolvedImageCache.clear();
+                                TiResolvedImageTickMs.clear();
+                            }
+                            TiResolvedImageCache[cacheKey] = std::move(userResolved);
+                            TiResolvedImageTickMs[cacheKey] = nowTickMs;
+                        }
                     }
                 };
                 resolveInjectImage(classified.TargetProcessId, &classified.TargetImage);
                 resolveInjectImage(classified.ProcessId, &classified.Image);
+                // The summary historically carried only pids; append the
+                // resolved leaves so console/log readers do not have to
+                // cross-reference the image fields.
+                if (!classified.Image.empty() &&
+                    classified.Summary.find(L"caller=") == std::wstring::npos)
+                {
+                    classified.Summary +=
+                        L" caller=" + KmonBasenameLower(classified.Image);
+                }
+                if (!classified.TargetImage.empty() &&
+                    classified.Summary.find(L"target=") == std::wstring::npos)
+                {
+                    classified.Summary +=
+                        L" target=" + KmonBasenameLower(classified.TargetImage);
+                }
             }
             RecordEvent(std::move(classified));
         }
@@ -7596,6 +7949,173 @@ void KernelMonitor::EmitMappedResidue(
     EmitUnique(L"driver.mapped_residue", key, driver, layer, summary, notes);
 }
 
+bool KernelMonitor::CaptureRegion(
+    const wchar_t* layer,
+    uint64_t address,
+    uint64_t sizeBytes,
+    uint32_t processId,
+    bool userMode,
+    DeviceClient* device,
+    SymbolEngine* symbols,
+    HANDLE processHandle,
+    uint64_t maxBytes,
+    std::wstring* captureNote)
+{
+    constexpr uint64_t kCaptureBudgetBytes = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t kCaptureDefaultMaxBytes = 256ull * 1024ull;
+    const uint64_t cap = maxBytes != 0 ? maxBytes : kCaptureDefaultMaxBytes;
+
+    if (layer == nullptr || address == 0 || sizeBytes == 0)
+    {
+        return false;
+    }
+    const std::wstring key = std::wstring(layer) + L":" + HexU64(address) +
+        L":" + (processId != 0 ? std::to_wstring(processId) : L"k");
+    {
+        std::lock_guard<std::mutex> lock(CapturesMutex);
+        if (CapturedBytes >= kCaptureBudgetBytes ||
+            CapturedKeys.count(key) != 0)
+        {
+            return false;
+        }
+        if (CapturedKeys.size() > 4096)
+        {
+            CapturedKeys.clear();
+        }
+        CapturedKeys.insert(key);
+    }
+
+    const uint64_t capped =
+        sizeBytes > cap ? cap : sizeBytes;
+    // ReadProcessBytes rejects lengths above 0x10000 and the kernel IOCTL
+    // caps transfers at 1MB, so large regions are read in 64KB chunks. A
+    // mid-region failure keeps the prefix: a truncated PE still carries
+    // headers, sections, and identification strings.
+    constexpr uint32_t kCaptureChunkBytes = 0x10000;
+    std::vector<uint8_t> bytes;
+    bytes.reserve(static_cast<size_t>(capped));
+    bool anyRead = false;
+    for (uint64_t offset = 0; offset < capped; offset += kCaptureChunkBytes)
+    {
+        const uint64_t remaining = capped - offset;
+        const uint32_t chunk = static_cast<uint32_t>(
+            remaining > kCaptureChunkBytes ? kCaptureChunkBytes : remaining);
+        std::vector<uint8_t> chunkBytes;
+        bool chunkRead = false;
+        if (userMode)
+        {
+            chunkRead = ReadProcessBytes(
+                device,
+                symbols,
+                processHandle,
+                processId,
+                address + offset,
+                chunk,
+                &chunkBytes);
+        }
+        else
+        {
+            DeviceClient* kernelDevice = device;
+            if (kernelDevice == nullptr)
+            {
+                std::lock_guard<std::mutex> lock(StateMutex);
+                kernelDevice = Device;
+            }
+            std::wstring readError;
+            if (kernelDevice != nullptr)
+            {
+                chunkRead = kernelDevice->ReadMemory(
+                    address + offset,
+                    chunk,
+                    &chunkBytes,
+                    &readError);
+            }
+        }
+        if (!chunkRead || chunkBytes.empty())
+        {
+            break;
+        }
+        anyRead = true;
+        bytes.insert(
+            bytes.end(),
+            chunkBytes.begin(),
+            chunkBytes.end());
+        if (chunkBytes.size() < chunk)
+        {
+            break;
+        }
+    }
+    if (!anyRead || bytes.size() < 0x40)
+    {
+        // Transient failure: release the key so a later scan can retry.
+        std::lock_guard<std::mutex> lock(CapturesMutex);
+        CapturedKeys.erase(key);
+        return false;
+    }
+
+    std::wstring logDirectory;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        logDirectory = Options.LogDirectory.empty()
+            ? ExeDirectory()
+            : Options.LogDirectory;
+    }
+    const std::wstring captureDir = logDirectory + L"\\captures";
+    CreateDirectoryW(captureDir.c_str(), nullptr);
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+    wchar_t stamp[16] = {};
+    swprintf_s(stamp, L"%02u%02u%02u", now.wHour, now.wMinute, now.wSecond);
+    const std::wstring path = captureDir + L"\\capture-" + layer + L"-" +
+        (processId != 0 ? std::to_wstring(processId) : L"k") + L"-" +
+        HexU64(address) + L"-" + stamp + L".bin";
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+        nullptr);
+    bool wrote = false;
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        wrote = bytes.size() <= static_cast<size_t>((std::numeric_limits<DWORD>::max)()) &&
+            WriteFile(
+                file,
+                bytes.data(),
+                static_cast<DWORD>(bytes.size()),
+                &written,
+                nullptr) &&
+            written == bytes.size();
+        if (wrote)
+        {
+            FlushFileBuffers(file);
+        }
+        CloseHandle(file);
+    }
+    if (!wrote)
+    {
+        DeleteFileW(path.c_str());
+        std::lock_guard<std::mutex> lock(CapturesMutex);
+        CapturedKeys.erase(key);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(CapturesMutex);
+        CapturedBytes += bytes.size();
+    }
+    if (captureNote != nullptr)
+    {
+        *captureNote = L" capture=" + path +
+            L" capture_bytes=" + std::to_wstring(bytes.size());
+    }
+    return true;
+}
+
 void KernelMonitor::ClearEmittedKey(const std::wstring& key)
 {
     std::lock_guard<std::mutex> lock(WatchMutex);
@@ -7921,6 +8441,27 @@ void KernelMonitor::ScanPoolMappedImages()
                 notes += L"+e_lfanew";
             }
         }
+        // Idle scans surface the boot-time EtwB/IPss/ConT baseline on every
+        // machine; capture pool PEs only while a mapper watch is active so
+        // the budget follows actual incident windows.
+        if (IsMapperWatchActive())
+        {
+            std::wstring captureNote;
+            CaptureRegion(
+                L"pool_pe",
+                hit.Address,
+                hit.Probe.SizeOfImage != 0
+                    ? hit.Probe.SizeOfImage
+                    : hit.SizeInBytes,
+                0,
+                false,
+                device,
+                symbols,
+                nullptr,
+                8ull * 1024ull * 1024ull,
+                &captureNote);
+            notes += captureNote;
+        }
 
         EmitMappedResidue(
             L"poolpe:" + HexU64(hit.Address),
@@ -8226,6 +8767,18 @@ void KernelMonitor::ScanOrphanMappedPages()
         {
             const wchar_t* layer = region.InBigPool ? L"pool_code" : L"kpage_code";
             NoteMapperWatchResidue(layer, region.PhysicalAddress);
+            std::wstring captureNote;
+            CaptureRegion(
+                layer,
+                region.Start,
+                region.Size,
+                0,
+                false,
+                device,
+                symbols,
+                nullptr,
+                0,
+                &captureNote);
             EmitMappedResidue(
                 std::wstring(layer) + L":" + HexU64(region.Start),
                 region.Classification,
@@ -8234,18 +8787,31 @@ void KernelMonitor::ScanOrphanMappedPages()
                     ? L"headerless pool executable import stubs "
                     : L"headerless kpage executable import stubs ") +
                     HexU64(region.Start),
-                notes);
+                notes + captureNote);
             continue;
         }
 
+        const wchar_t* orphanLayer = peHit ? L"orphan_page" : L"orphan_wx";
+        std::wstring orphanCaptureNote;
+        CaptureRegion(
+            orphanLayer,
+            region.Start,
+            region.Size,
+            0,
+            false,
+            device,
+            symbols,
+            nullptr,
+            peHit ? (8ull * 1024ull * 1024ull) : 0,
+            &orphanCaptureNote);
         EmitMappedResidue(
             L"kpage:" + HexU64(region.Start),
             region.Classification,
-            peHit ? L"orphan_page" : L"orphan_wx",
+            orphanLayer,
             (peHit
                 ? L"mapped PE outside loaded modules "
                 : L"W+X kernel pages outside loaded modules ") + HexU64(region.Start),
-            notes);
+            notes + orphanCaptureNote);
     }
 }
 
@@ -9364,7 +9930,17 @@ void KernelMonitor::ScanCpuIntegrityHooks()
     }
 
     {
-        ByovdScanner scanner(*symbols, ExeDirectory());
+        // Under --cloak the process runs from a %TEMP% copy without the
+        // data\byovd tree; Options.DataDirectory is anchored to the
+        // original exe folder for exactly this case.
+        std::wstring byovdDataDir;
+        {
+            std::lock_guard<std::mutex> lock(StateMutex);
+            byovdDataDir = Options.DataDirectory.empty()
+                ? ExeDirectory()
+                : Options.DataDirectory;
+        }
+        ByovdScanner scanner(*symbols, byovdDataDir);
         ByovdScanOptions options;
         options.AutoUpdate = false;
         options.EnableYara = false;
@@ -10870,19 +11446,65 @@ void KernelMonitor::ScanUserModeHostility()
                             ProtectHasExecute(region.Protect) &&
                             region.RegionSize <= 0x10000)
                         {
-                            EmitUnique(
-                                L"process.implant",
-                                L"private_exec:" + std::to_wstring(pid) + L":" + HexU64(alloc),
-                                imagePath,
-                                L"private_exec",
-                                L"private executable region is not in the module list pid=" +
-                                    std::to_wstring(pid) + L" " + leaf,
-                                L"base=" + HexU64(alloc) +
-                                    L" size=" + std::to_wstring(
-                                        static_cast<unsigned long long>(region.RegionSize)) +
-                                    L" protect=" + std::to_wstring(region.Protect),
-                                pid);
-                            ++orphans;
+                            // dwm maps small graphics tables (gradient
+                            // LUTs, stride grids) into RX-classified private
+                            // pages; drop data pages before reporting so the
+                            // orphan list only carries code-shaped regions.
+                            // Sample the flagged region's own base page:
+                            // AllocationBase can point at a different
+                            // (data) page inside the same allocation.
+                            // ReadProcessBytes falls back to kernel reads
+                            // when the handle lacks PROCESS_VM_READ, so the
+                            // entropy gate stays effective on restricted
+                            // targets instead of silently failing open.
+                            const uint64_t execRegionBase =
+                                reinterpret_cast<uint64_t>(region.BaseAddress);
+                            bool looksLikeCode = true;
+                            std::vector<uint8_t> codeProbe;
+                            if (ReadProcessBytes(
+                                    device,
+                                    symbols,
+                                    processHandle,
+                                    pid,
+                                    execRegionBase,
+                                    0x200,
+                                    &codeProbe) &&
+                                codeProbe.size() >= 0x40)
+                            {
+                                looksLikeCode =
+                                    KmonBytesLookLikeCode(
+                                        codeProbe.data(),
+                                        codeProbe.size());
+                            }
+                            if (looksLikeCode)
+                            {
+                                std::wstring captureNote;
+                                CaptureRegion(
+                                    L"private_exec",
+                                    execRegionBase,
+                                    region.RegionSize,
+                                    pid,
+                                    true,
+                                    device,
+                                    symbols,
+                                    processHandle,
+                                    0,
+                                    &captureNote);
+                                EmitUnique(
+                                    L"process.implant",
+                                    L"private_exec:" + std::to_wstring(pid) + L":" + HexU64(alloc),
+                                    imagePath,
+                                    L"private_exec",
+                                    L"private executable region is not in the module list pid=" +
+                                        std::to_wstring(pid) + L" " + leaf,
+                                    L"base=" + HexU64(execRegionBase) +
+                                        L" size=" + std::to_wstring(
+                                            static_cast<unsigned long long>(region.RegionSize)) +
+                                        L" protect=" + std::to_wstring(region.Protect) +
+                                        captureNote,
+                                    pid);
+                                ++orphans;
+                            }
                         }
                     }
                     if (next <= cursor)
@@ -10916,6 +11538,13 @@ void KernelMonitor::ScanUserModeHostility()
                 // watched/drop hosts so wiped/header-intact maps are not
                 // dropped when the module list is complete.
                 const bool emitPrivateVadImplants = probePrivatePe;
+                bool vadHostIsWow64 = false;
+                QueryProcessIsWow64(
+                    processHandle,
+                    device,
+                    symbols,
+                    pid,
+                    &vadHostIsWow64);
                 for (const ProcessVadRecord& record : kernelVad.Records)
                 {
                     if (!emitPrivateVadImplants)
@@ -10955,11 +11584,70 @@ void KernelMonitor::ScanUserModeHostility()
                             continue;
                         }
                     }
+                    if (pe || wiped)
+                    {
+                        // Theme/MUI data-file views (aero.msstyles, *.dll.mui)
+                        // land here with intact headers but no executable
+                        // section, or a machine that cannot run in this host.
+                        // Downgrade them to one quiet note per pid instead of
+                        // private_exec_pe so real mapped images stand out.
+                        std::vector<uint8_t> carrierBytes;
+                        const uint8_t* carrier = nullptr;
+                        size_t carrierSize = 0;
+                        if (ReadProcessBytes(
+                                device,
+                                symbols,
+                                processHandle,
+                                pid,
+                                record.StartAddress,
+                                0x400,
+                                &carrierBytes) &&
+                            carrierBytes.size() >= 0x40)
+                        {
+                            carrier = carrierBytes.data();
+                            carrierSize = carrierBytes.size();
+                        }
+                        const KmonPeCarrierVerdict carrierVerdict =
+                            KmonClassifyMappedPeCarrier(
+                                carrier,
+                                carrierSize,
+                                vadHostIsWow64);
+                        if (carrierVerdict == KmonPeCarrierVerdict::ResourceOnly ||
+                            carrierVerdict == KmonPeCarrierVerdict::ForeignArch)
+                        {
+                            EmitUnique(
+                                L"process.implant",
+                                L"resource_only_pe:" + std::to_wstring(pid),
+                                imagePath,
+                                L"resource_only_pe",
+                                (carrierVerdict == KmonPeCarrierVerdict::ResourceOnly
+                                    ? L"resource-only PE mapped as data pid="
+                                    : L"foreign-architecture PE mapped as data pid=") +
+                                    std::to_wstring(pid) + L" " + leaf,
+                                L"base=" + HexU64(record.StartAddress) +
+                                    L" size=" + std::to_wstring(
+                                        static_cast<unsigned long long>(record.Size)),
+                                pid);
+                            continue;
+                        }
+                    }
                     const wchar_t* layer = wiped
                         ? L"private_exec_wiped"
                         : (pe
                             ? L"private_exec_pe"
                             : (rwx ? L"private_wx_vad" : L"private_exec_vad"));
+                    std::wstring vadCaptureNote;
+                    CaptureRegion(
+                        layer,
+                        record.StartAddress,
+                        record.Size,
+                        pid,
+                        true,
+                        device,
+                        symbols,
+                        processHandle,
+                        pe ? (8ull * 1024ull * 1024ull) : 0,
+                        &vadCaptureNote);
                     EmitUnique(
                         L"process.implant",
                         std::wstring(layer) + L":" + std::to_wstring(pid) + L":" +
@@ -10973,7 +11661,8 @@ void KernelMonitor::ScanUserModeHostility()
                                 static_cast<unsigned long long>(record.Size)) +
                             L" rwx=" + std::to_wstring(rwx ? 1 : 0) +
                             L" pe=" + std::to_wstring(pe ? 1 : 0) +
-                            L" wiped=" + std::to_wstring(wiped ? 1 : 0),
+                            L" wiped=" + std::to_wstring(wiped ? 1 : 0) +
+                            vadCaptureNote,
                         pid);
                     ++vadImplants;
                 }
@@ -11509,6 +12198,30 @@ void KernelMonitor::ScanUserModeHostility()
                     &clonedVtable);
                 if (clonedVtable.GraphicsSlots != 0)
                 {
+                    std::wstring tableCaptureNote;
+                    CaptureRegion(
+                        L"cloned_vtable",
+                        clonedVtable.VtableAddress,
+                        0x1000,
+                        pid,
+                        true,
+                        device,
+                        symbols,
+                        processHandle,
+                        0,
+                        &tableCaptureNote);
+                    std::wstring hookCaptureNote;
+                    CaptureRegion(
+                        L"cloned_vtable_hook",
+                        clonedVtable.FirstUnbackedTarget,
+                        0x1000,
+                        pid,
+                        true,
+                        device,
+                        symbols,
+                        processHandle,
+                        0,
+                        &hookCaptureNote);
                     EmitUnique(
                         L"process.implant",
                         L"cloned_vtable:" + std::to_wstring(pid),
@@ -11522,7 +12235,9 @@ void KernelMonitor::ScanUserModeHostility()
                             L" unbacked_slots=" +
                             std::to_wstring(clonedVtable.UnbackedSlots) +
                             L" hook=" +
-                            HexU64(clonedVtable.FirstUnbackedTarget),
+                            HexU64(clonedVtable.FirstUnbackedTarget) +
+                            tableCaptureNote +
+                            hookCaptureNote,
                         pid);
                 }
             }
@@ -13524,6 +14239,56 @@ bool KernelMonitorSelfTest()
             break;
         }
 
+        // csrss window/console writes and builtin-to-builtin bookkeeping are
+        // OS noise, not inject.remote; APC/context tasks never suppress.
+        TiEventRecord csrssWrite = {};
+        csrssWrite.ProcessId = 656;
+        csrssWrite.TargetProcessId = 9676;
+        csrssWrite.TaskName = L"WriteVM";
+        csrssWrite.ImagePath = L"C:\\Windows\\System32\\csrss.exe";
+        csrssWrite.TargetImageBase = L"sky-2.2.1.0.exe";
+        if (KmonClassifyTiEvent(csrssWrite, &classified))
+        {
+            break;
+        }
+        TiEventRecord builtinWrite = {};
+        builtinWrite.ProcessId = 1192;
+        builtinWrite.TargetProcessId = 4608;
+        builtinWrite.TaskName = L"WriteVM";
+        builtinWrite.ImagePath = L"C:\\Windows\\System32\\lsass.exe";
+        builtinWrite.TargetImageBase = L"explorer.exe";
+        if (KmonClassifyTiEvent(builtinWrite, &classified))
+        {
+            break;
+        }
+        TiEventRecord csrssApc = {};
+        csrssApc.ProcessId = 656;
+        csrssApc.TargetProcessId = 9676;
+        csrssApc.TaskName = L"QueueUserAPC";
+        csrssApc.ImagePath = L"C:\\Windows\\System32\\csrss.exe";
+        csrssApc.TargetImageBase = L"sky-2.2.1.0.exe";
+        if (!KmonClassifyTiEvent(csrssApc, &classified) ||
+            classified.Kind != L"inject.remote")
+        {
+            break;
+        }
+
+        // Kernel-origin user APCs display regardless of watch state.
+        KmonEvent kernelApc = {};
+        kernelApc.Kind = L"inject.remote";
+        kernelApc.Image = L"System";
+        kernelApc.Task = L"KERNEL_THREATINT_TASK_QUEUEUSERAPC";
+        if (!KmonWatchMatches(kernelApc, anyWatchQuiet))
+        {
+            break;
+        }
+        KmonEvent credscanDisplay = {};
+        credscanDisplay.Kind = L"process.credscan";
+        if (!KmonWatchMatches(credscanDisplay, anyWatchQuiet))
+        {
+            break;
+        }
+
         TimelineEvent liveInbox = {};
         liveInbox.Action = L"image-load";
         liveInbox.ProcessId = 0;
@@ -14001,6 +14766,56 @@ bool KernelMonitorSelfTest()
             KmonVaLooksLikePagingOrFirmware(0xFFFFF80000000000ull))
         {
             break;
+        }
+        {
+            const auto buildCarrierPe = [](uint16_t machine, bool execSection)
+            {
+                std::vector<uint8_t> pe(0x400, 0);
+                pe[0] = 'M';
+                pe[1] = 'Z';
+                const uint32_t lfanew = 0x80;
+                std::memcpy(&pe[0x3c], &lfanew, sizeof(lfanew));
+                std::memcpy(&pe[lfanew], "PE\0\0", 4);
+                std::memcpy(&pe[lfanew + 4], &machine, sizeof(machine));
+                const uint16_t sections = 1;
+                std::memcpy(&pe[lfanew + 6], &sections, sizeof(sections));
+                const uint16_t optsz = 0xf0;
+                std::memcpy(&pe[lfanew + 20], &optsz, sizeof(optsz));
+                const size_t secOff = lfanew + 24 + optsz;
+                std::memcpy(&pe[secOff], ".rsrc", 5);
+                const uint32_t chars = execSection ? 0x60000020u : 0x40000040u;
+                std::memcpy(&pe[secOff + 36], &chars, sizeof(chars));
+                return pe;
+            };
+            const std::vector<uint8_t> runnable =
+                buildCarrierPe(0x8664, true);
+            const std::vector<uint8_t> resourceOnly =
+                buildCarrierPe(0x8664, false);
+            const std::vector<uint8_t> foreign =
+                buildCarrierPe(0x14c, true);
+            std::vector<uint8_t> noise(0x200, 0);
+            std::vector<uint8_t> codeish(0x200, 0);
+            uint32_t lcg = 0x12345678u;
+            for (size_t i = 0; i < codeish.size(); ++i)
+            {
+                lcg = lcg * 1103515245u + 12345u;
+                codeish[i] = static_cast<uint8_t>(lcg >> 16);
+            }
+            if (KmonClassifyMappedPeCarrier(runnable.data(), runnable.size(), false) !=
+                    KmonPeCarrierVerdict::RunnableImage ||
+                KmonClassifyMappedPeCarrier(resourceOnly.data(), resourceOnly.size(), false) !=
+                    KmonPeCarrierVerdict::ResourceOnly ||
+                KmonClassifyMappedPeCarrier(foreign.data(), foreign.size(), false) !=
+                    KmonPeCarrierVerdict::ForeignArch ||
+                KmonClassifyMappedPeCarrier(nullptr, 0, false) !=
+                    KmonPeCarrierVerdict::Unknown ||
+                KmonBytesLookLikeCode(noise.data(), noise.size()) ||
+                !KmonBytesLookLikeCode(codeish.data(), codeish.size()) ||
+                !KmonTaskLooksLikeLsassRead(L"KERNEL_THREATINT_TASK_READVM") ||
+                KmonTaskLooksLikeLsassRead(L"KERNEL_THREATINT_TASK_WRITEVM"))
+            {
+                break;
+            }
         }
         if (!KmonLooksLikeKnownRuntimePath(
                 L"c:\\program files (x86)\\steam\\gameoverlayrenderer64.dll") ||

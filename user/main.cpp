@@ -24834,6 +24834,9 @@ static void PrintKmonHelp()
     std::wcout << L"dwm.exe is watched by default (no /name needed): its Microsoft-signed main\n";
     std::wcout << L"image text, graphics vtables, and heap vtable clones are compared every\n";
     std::wcout << L"scan tick because PresentDWM/PresentMPO render hooks land there.\n";
+    std::wcout << L"Mapper and user-mode implant detections auto-capture the region to\n";
+    std::wcout << L"<log dir>\\captures (deduped, session budget) so volatile evidence survives\n";
+    std::wcout << L"unmaps and reboots.\n";
     std::wcout << L"\n";
     std::wcout << L"typical hunt (driver filename is not an input):\n";
     std::wcout << L"  write on\n";
@@ -25284,6 +25287,7 @@ static void HandleKmonCommand(
 
             g_KmonForShutdown.store(&kmon);
             DefaultLogDirectoryToOriginalExe(state.CloakActive, state.Cloak.OriginalExePath, &options.LogDirectory);
+            DefaultLogDirectoryToOriginalExe(state.CloakActive, state.Cloak.OriginalExePath, &options.DataDirectory);
             std::wstring startError;
             if (!kmon.Start(options, &ti, &state.Timeline, &device, &symbols, &startError))
             {
