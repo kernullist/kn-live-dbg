@@ -44,6 +44,12 @@ namespace
 {
     constexpr uint64_t kLogRotateBytes = 100ull * 1024ull * 1024ull;
     constexpr uint32_t kLogRotateCount = 5;
+    // Write-through keeps event data out of the lazy writer's hands; the
+    // coalesced FlushFileBuffers below exists to also pin the file-size
+    // metadata, which WRITE_THROUGH alone does not force. A bugcheck eats
+    // everything still sitting in the cache manager, so this window is the
+    // maximum BSOD tail loss.
+    constexpr uint32_t kLogFlushIntervalMs = 250;
     constexpr size_t kPrintQueueCap = 1024;
     constexpr uint32_t kKpageScanIntervalMs = 20000;
     constexpr uint32_t kUserScanIntervalMs = 8000;
@@ -12149,6 +12155,16 @@ bool KernelMonitor::WriteLogLine(const KmonEvent& event)
         LogCurrentBytes += written;
         LogBytesWritten.fetch_add(written);
         EventsLogged.fetch_add(1);
+
+        const uint64_t nowMs = GetTickCount64();
+        if (LogLastFlushTickMs == 0 ||
+            nowMs - LogLastFlushTickMs >= kLogFlushIntervalMs)
+        {
+            if (FlushFileBuffers(LogHandle))
+            {
+                LogLastFlushTickMs = nowMs;
+            }
+        }
         ok = true;
     } while (false);
 
@@ -12484,12 +12500,13 @@ bool KernelMonitor::EnsureLogOpenLocked()
             FILE_SHARE_READ,
             nullptr,
             OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
             nullptr);
         if (LogHandle == INVALID_HANDLE_VALUE)
         {
             break;
         }
+        LogLastFlushTickMs = 0;
         LogCurrentBytes = 0;
         LARGE_INTEGER size = {};
         if (GetFileSizeEx(LogHandle, &size) && size.QuadPart > 0)
@@ -12514,6 +12531,10 @@ void KernelMonitor::CloseLogLocked()
 {
     if (LogHandle != INVALID_HANDLE_VALUE)
     {
+        // CloseHandle does not force the file-size metadata to disk; without
+        // this, a bugcheck between the last coalesced flush and exit could
+        // still truncate the visible tail.
+        FlushFileBuffers(LogHandle);
         CloseHandle(LogHandle);
         LogHandle = INVALID_HANDLE_VALUE;
     }
