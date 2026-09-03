@@ -25,6 +25,10 @@ struct KmonOptions
     uint32_t ThrottlePerSecond = 50;
     uint32_t RingCapacity = 65536;
     std::wstring LogDirectory;
+    // Root for on-disk scanner data (data\byovd\...); under --cloak the
+    // process runs from a %TEMP% copy without the data tree, so main.cpp
+    // anchors this to the original exe folder like LogDirectory.
+    std::wstring DataDirectory;
     uint32_t HiddenScanIntervalMs = 5000;
     uint32_t MapperScanIntervalMs = 8000;
     bool VerboseDrivers = false;
@@ -125,6 +129,26 @@ private:
     void WorkerLoop();
     void IngestThreatIntel();
     void IngestLiveTimeline();
+    void NoteCredscanRead(
+        const struct TiEventRecord& record,
+        DeviceClient* device,
+        SymbolEngine* symbols);
+    // Auto-capture turns a mapper/user-mode detection into preserved
+    // evidence: both the Berkan kernel arena and its explorer stub pages
+    // were detected while resident but lost before a human could dump.
+    // Returns an evidence note (" capture=<path> capture_bytes=<n>") on
+    // success. Worker thread context.
+    bool CaptureRegion(
+        const wchar_t* layer,
+        uint64_t address,
+        uint64_t sizeBytes,
+        uint32_t processId,
+        bool userMode,
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        HANDLE processHandle,
+        uint64_t maxBytes,
+        std::wstring* captureNote);
     void ScanHiddenProcesses();
     void ScanMapperRemnants();
     void ScanPoolMappedImages();
@@ -274,6 +298,33 @@ private:
     uint64_t LogRotateBytes = 100ull * 1024ull * 1024ull;
     uint32_t LogRotateCount = 5;
     uint64_t LogLastFlushTickMs = 0;
+
+    // Sustained lsass remote-read tracking (process.credscan). Keyed by the
+    // (caller pid << 32 | target pid) pair so a scraper interleaving two
+    // targets cannot reset its own window. Worker thread only; reset on
+    // Start().
+    struct KmonCredscanWindow
+    {
+        uint64_t Count = 0;
+        uint64_t WindowStartMs = 0;
+        bool Emitted = false;
+    };
+    std::map<uint64_t, KmonCredscanWindow> CredscanWindows;
+
+    // TI caller/target image resolution cache, keyed by pid plus the
+    // event's own image basename when present: the console-write flood
+    // re-resolved the same pid through kernel queries thousands of times
+    // and starved driver-lifecycle ingest, while a bare pid key would
+    // misattribute after pid reuse. Worker thread only; reset on Start().
+    std::map<std::wstring, std::wstring> TiResolvedImageCache;
+    std::map<std::wstring, uint64_t> TiResolvedImageTickMs;
+
+    // Detection-time evidence capture state: per-session (layer, address)
+    // dedupe plus a byte budget so auto-capture can never fill the disk.
+    // Guarded by CapturesMutex; reset on Start().
+    std::mutex CapturesMutex;
+    std::set<std::wstring> CapturedKeys;
+    uint64_t CapturedBytes = 0;
 
     std::atomic<uint64_t> EventsKept{0};
     std::atomic<uint64_t> EventsDropped{0};
