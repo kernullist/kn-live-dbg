@@ -24976,6 +24976,9 @@ static void PrintKmonHelp()
     std::wcout << L"private_exec/pe, cloned_vtable (+ hook page), apc_routine (injected\n";
     std::wcout << L"user-mode entry), hidden_eprocess (DKOM evidence), graphics_dispatch\n";
     std::wcout << L"(dxgkrnl/GPU DDI .data unbacked pointers).\n";
+    std::wcout << L"TI events carry the caller callstack (ETW stack tracing, enabled via\n";
+    std::wcout << L"EVENT_ENABLE_PROPERTY_STACK_TRACE on the session) as callstack evidence\n";
+    std::wcout << L"in every classified event -- the API chain identifies the exact call path.\n";
     std::wcout << L"\n";
     std::wcout << L"typical hunt (driver filename is not an input):\n";
     std::wcout << L"  write on\n";

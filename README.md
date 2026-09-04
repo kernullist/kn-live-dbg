@@ -104,7 +104,7 @@ that walks dxgkrnl.sys/dxgmms2.sys/nvlddmkm/amdkmdag/igdkmd64 `.data` sections f
 function pointers outside every loaded module -- the per-adapter DDI dispatch tables where
 a present-path renderer hook would live, unreachable by any existing callback/FastIo/IDT/SSDT
 scan), and pool_pe cross-checking captures against import strings for remapped-normal-driver
-identification (code stomping detection).
+identification (code stomping detection). TI events now carry ETW-captured callstacks (EVENT_ENABLE_PROPERTY_STACK_TRACE on the session, addresses extracted from EVENT_HEADER_EXT_TYPE_STACK_TRACE32/64 extended data) so every classified event includes the calling thread's exact API chain as callstack evidence -- the Berkan lsass reads and APC injection would have shown the full function path from cheat code through kernel32/ntdll to the syscall boundary.
 
 ## Design Notes
 
