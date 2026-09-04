@@ -168,6 +168,9 @@ private:
     void ScanUnbackedDriverObjects();
     void ScanOrphanMappedPages();
     void ScanHookCallbacks();
+    // dxgkrnl/GPU kernel driver writable data sections: per-adapter DDI
+    // dispatch tables that no callback/FastIo/IDT scan reaches.
+    void ScanGraphicsDispatchTables();
     void ScanHookInput();
     void ScanCpuIntegrityHooks();
     void ScanHookDataPointers();

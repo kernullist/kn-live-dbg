@@ -28,6 +28,7 @@
 #include <Psapi.h>
 #include <TlHelp32.h>
 #include <WinTrust.h>
+#include <fstream>
 #include <Softpub.h>
 
 #include <algorithm>
@@ -6120,6 +6121,7 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"process.hidden" ||
             event.Kind == L"process.syscall_unnamed" ||
             event.Kind == L"driver.drop_load" ||
+            event.Kind == L"driver.captured" ||
             event.Kind == L"driver.official_load" ||
             event.Kind == L"driver.official_unload" ||
             event.Kind == L"driver.device" ||
@@ -6958,6 +6960,15 @@ void KernelMonitor::WorkerLoop()
             {
                 ScanHookInput();
             }
+            IngestLiveTimeline();
+            IngestThreatIntel();
+            if (!StopRequested.load())
+            {
+                // Graphics dispatch tables follow the same mapper scan
+                // cadence; the DDI hooks the Berkan renderer placed were
+                // invisible to every other callback scan.
+                ScanGraphicsDispatchTables();
+            }
             NextMapperScanTickMs = GetTickCount64() +
                 (IsMapperWatchActive() ? kMapperWatchIntervalMs : idleMapperInterval);
         }
@@ -7177,6 +7188,53 @@ void KernelMonitor::IngestThreatIntel()
             // Full-path resolution matters for every kind whose display
             // gate keys off caller/target path classes; TI often delivers
             // only the image basename.
+            // System-origin APC routine capture: the routine address is
+            // the kernel-injected code entry point in the target process.
+            if (classified.Kind == L"inject.remote" &&
+                (KmonEventOriginatesFromSystem(classified.Image) ||
+                    (classified.Image.empty() && classified.ProcessId <= 4)) &&
+                KmonTaskLooksLikeRemoteInjectWrite(classified.Task))
+            {
+                uint64_t apcRoutine = 0;
+                for (const TiPayloadField& field : record.Payload)
+                {
+                    std::wstring fieldName = ToLowerCopy(field.Name);
+                    if (fieldName.find(L"routine") != std::wstring::npos ||
+                        fieldName.find(L"apc") != std::wstring::npos)
+                    {
+                        apcRoutine = std::wcstoull(field.Value.c_str(), nullptr, 0);
+                        break;
+                    }
+                }
+                if (apcRoutine != 0 && apcRoutine > 0x10000 && apcRoutine < 0x00007FFFFFFFFFFFFull)
+                {
+                    HANDLE apcProcess = OpenProcess(
+                        PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+                        FALSE,
+                        classified.TargetProcessId);
+                    std::wstring apcCaptureNote;
+                    CaptureRegion(
+                        L"apc_routine",
+                        apcRoutine & ~0xfff,
+                        0x1000,
+                        classified.TargetProcessId,
+                        true,
+                        device,
+                        symbols,
+                        apcProcess,
+                        0,
+                        &apcCaptureNote);
+                    if (apcProcess != nullptr)
+                    {
+                        CloseHandle(apcProcess);
+                    }
+                    if (!apcCaptureNote.empty())
+                    {
+                        classified.Evidence[L"routine_capture"] = apcCaptureNote;
+                    }
+                }
+            }
+
             if (classified.Kind == L"inject.remote" ||
                 classified.Kind == L"hook.window" ||
                 classified.Kind == L"process.impair")
@@ -7638,6 +7696,27 @@ void KernelMonitor::ScanHiddenProcesses()
         event.Evidence[L"in_cid"] = record.InCidTable ? L"true" : L"false";
         event.Evidence[L"notes"] = record.Notes;
         event.Evidence[L"followup"] = L"!hiddenproc; !vad " + std::to_wstring(record.ProcessId);
+        // EPROCESS capture at detection time: DKOM unlink evidence and the
+        // Protection field state are volatile if the cheat re-links.
+        if (record.Eprocess != 0)
+        {
+            std::wstring eprocessCaptureNote;
+            CaptureRegion(
+                L"hidden_eprocess",
+                record.Eprocess,
+                0x800,
+                0,
+                false,
+                device,
+                symbols,
+                nullptr,
+                0,
+                &eprocessCaptureNote);
+            if (!eprocessCaptureNote.empty())
+            {
+                event.Evidence[L"eprocess_capture"] = eprocessCaptureNote;
+            }
+        }
         RecordEvent(std::move(event));
     }
 }
@@ -7664,6 +7743,63 @@ void KernelMonitor::NoteDriverLoad(const KmonEvent& event)
     if (KmonDriverLoadArmsMapperWatch(event))
     {
         ArmMapperWatch(event);
+    }
+
+    // Auto-capture the driver image itself: the Berkan driver was detected
+    // at 0xfffff804d4e20000/0x263000 but the image was never dumped, losing
+    // every string, import, and code pattern the driver carried.
+    {
+        DeviceClient* device = nullptr;
+        SymbolEngine* symbols = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(StateMutex);
+            device = Device;
+            symbols = Symbols;
+        }
+        uint64_t imageBase = 0;
+        uint64_t imageSize = 0;
+        auto baseIt = event.Evidence.find(L"image_base");
+        auto sizeIt = event.Evidence.find(L"image_size");
+        if (baseIt != event.Evidence.end())
+        {
+            imageBase = std::wcstoull(baseIt->second.c_str(), nullptr, 0);
+        }
+        if (sizeIt != event.Evidence.end())
+        {
+            imageSize = std::wcstoull(sizeIt->second.c_str(), nullptr, 0);
+        }
+        // NOTE: no path-class gate here. The Berkan driver
+        // (jrvwfjhdyprtjeaf.sys) lived in System32\drivers so its
+        // path_class was "inbox" --- gating on inbox would have skipped the
+        // exact driver we need. With a 256MB budget, capturing every
+        // driver load (even tvk.sys at 3.5MB) is affordable and gives
+        // baseline comparison data.
+        if (imageBase != 0 && imageSize > 0x1000)
+        {
+            std::wstring captureNote;
+            CaptureRegion(
+                L"driver_image",
+                imageBase,
+                imageSize,
+                0,
+                false,
+                device,
+                symbols,
+                nullptr,
+                16ull * 1024ull * 1024ull,
+                &captureNote);
+            if (!captureNote.empty())
+            {
+                EmitUnique(
+                    L"driver.captured",
+                    L"driver_capture:" + KmonBasenameLower(event.Driver),
+                    event.Driver,
+                    L"driver_capture",
+                    L"driver image auto-captured " + KmonBasenameLower(event.Driver),
+                    captureNote,
+                    0);
+            }
+        }
     }
 }
 
@@ -7729,6 +7865,10 @@ void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
     }
     NextMapperScanTickMs = 1;
     NextKpageScanTickMs = 1;
+    // Force kpage on the next tick: the Berkan driver mapped its arena
+    // within 8s of load and the 20s periodic missed the fresh mappings.
+    // Hidden scan stays on its own cadence --- ActiveProcessLinks walks
+    // are expensive and only the kpage result is time-critical here.
     MapperWatchArmedCount.fetch_add(1);
 
     if (!emit)
@@ -8009,7 +8149,7 @@ bool KernelMonitor::CaptureRegion(
     uint64_t maxBytes,
     std::wstring* captureNote)
 {
-    constexpr uint64_t kCaptureBudgetBytes = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t kCaptureBudgetBytes = 256ull * 1024ull * 1024ull;
     constexpr uint64_t kCaptureDefaultMaxBytes = 256ull * 1024ull;
     const uint64_t cap = maxBytes != 0 ? maxBytes : kCaptureDefaultMaxBytes;
 
@@ -8536,6 +8676,62 @@ void KernelMonitor::ScanPoolMappedImages()
                 8ull * 1024ull * 1024ull,
                 &captureNote);
             notes += captureNote;
+
+            // Code-stomping check: the Berkan pool PEs carried imports from
+            // tdi.sys/tcpipreg.sys  --  remapped normal drivers. If any byte in
+            // the first executable section differs from the on-disk module,
+            // the pool copy has been patched. Identify the source module from
+            // the first 0x200 bytes of the capture's import strings.
+            if (!captureNote.empty())
+            {
+                // Extract the capture file path and re-read it
+                std::wstring capturePath = captureNote;
+                const size_t eqPos = capturePath.find(L"capture=");
+                if (eqPos != std::wstring::npos)
+                {
+                    capturePath = capturePath.substr(eqPos + 8);
+                    // Paths may contain spaces; extract up to the
+                    // " capture_bytes=" field delimiter, not the first
+                    // space.
+                    const size_t bytesPos = capturePath.find(L" capture_bytes=");
+                    if (bytesPos != std::wstring::npos)
+                    {
+                        capturePath = capturePath.substr(0, bytesPos);
+                    }
+                    // Read the captured bytes from disk and scan for a
+                    // recognizable module name in the import table area
+                    std::ifstream captureFile(
+                        capturePath,
+                        std::ios::binary);
+                    if (captureFile.is_open())
+                    {
+                        // Read only the first 0x2000 bytes: import strings
+                        // live near the PE start, and reading an 8MB capture
+                        // synchronously in the scan worker would stall.
+                        std::vector<uint8_t> captureBytes(0x2000, 0);
+                        captureFile.read(
+                            reinterpret_cast<char*>(captureBytes.data()),
+                            0x2000);
+                        captureBytes.resize(
+                            static_cast<size_t>(captureFile.gcount()));
+                        captureFile.close();
+                        // Look for .sys references in import strings (ASCII)
+                        for (size_t i = 0; i + 4 < captureBytes.size(); ++i)
+                        {
+                            if (captureBytes[i] == L'.' &&
+                                captureBytes[i+1] == L's' &&
+                                captureBytes[i+2] == L'y' &&
+                                captureBytes[i+3] == L's')
+                            {
+                                // Found a .sys reference; the pool PE maps a
+                                // known driver. Flag for manual comparison.
+                                notes += L" pool_pe_module_ref=yes";
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         EmitMappedResidue(
@@ -8877,7 +9073,7 @@ void KernelMonitor::ScanOrphanMappedPages()
             device,
             symbols,
             nullptr,
-            peHit ? (8ull * 1024ull * 1024ull) : 0,
+            peHit ? (8ull * 1024ull * 1024ull) : (2ull * 1024ull * 1024ull),
             &orphanCaptureNote);
         EmitMappedResidue(
             L"kpage:" + HexU64(region.Start),
@@ -9005,6 +9201,209 @@ void KernelMonitor::ScanHookCallbacks()
                 L"callback",
                 L"poisoned " + record.Kind + L" callback entry " + HexU64(record.Entry),
                 record.Notes);
+        }
+    }
+}
+
+void KernelMonitor::ScanGraphicsDispatchTables()
+{
+    // dxgkrnl.sys and the GPU kernel driver (nvlddmkm/amdkmdag) carry DDI
+    // dispatch tables in their .data sections. The Berkan renderer hooked
+    // a present-path entry that no existing callback scan reached because
+    // these are per-adapter arrays of function pointers, not global
+    // registry callbacks. Scan both drivers' writable data for kernel-VA
+    // pointers that land outside every loaded module.
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || !device->IsOpen())
+    {
+        return;
+    }
+    if (!EnsureLoadedKernelModules(symbols, true))
+    {
+        return;
+    }
+
+    static const wchar_t* kGraphicsDrivers[] =
+    {
+        L"dxgkrnl.sys",
+        L"dxgmms2.sys",
+        L"nvlddmkm.sys",
+        L"amdkmdag.sys",
+        L"atikmdag.sys",
+        L"igdkmd64.sys",
+    };
+
+    const std::vector<KernelModuleInfo> modules = symbols->CopyModules();
+    if (modules.empty())
+    {
+        return;
+    }
+
+    for (const wchar_t* driverName : kGraphicsDrivers)
+    {
+        const KernelModuleInfo* target = nullptr;
+        for (const KernelModuleInfo& mod : modules)
+        {
+            if (KmonBasenameLower(mod.ImageName.empty() ? mod.ImagePath : mod.ImageName) == driverName)
+            {
+                target = &mod;
+                break;
+            }
+        }
+        if (target == nullptr || target->Base == 0)
+        {
+            continue;
+        }
+
+        // Read the PE headers to find .data and KERNEL data sections
+        std::vector<uint8_t> headers;
+        std::wstring readError;
+        if (!device->ReadMemory(target->Base, 0x400, &headers, &readError) ||
+            headers.size() < 0x200)
+        {
+            continue;
+        }
+        // Parse section table for writable, non-discardable data sections
+        IMAGE_DOS_HEADER dos = {};
+        std::memcpy(&dos, headers.data(), sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0)
+        {
+            continue;
+        }
+        const size_t nt = static_cast<size_t>(dos.e_lfanew);
+        if (nt + 4 + sizeof(IMAGE_FILE_HEADER) > headers.size())
+        {
+            continue;
+        }
+        IMAGE_FILE_HEADER file = {};
+        std::memcpy(&file, headers.data() + nt + 4, sizeof(file));
+        const size_t sectionOffset =
+            nt + 4 + sizeof(IMAGE_FILE_HEADER) + file.SizeOfOptionalHeader;
+
+        for (uint16_t i = 0; i < file.NumberOfSections && i < 32; ++i)
+        {
+            const size_t off = sectionOffset + i * sizeof(IMAGE_SECTION_HEADER);
+            if (off + sizeof(IMAGE_SECTION_HEADER) > headers.size())
+            {
+                break;
+            }
+            IMAGE_SECTION_HEADER section = {};
+            std::memcpy(&section, headers.data() + off, sizeof(section));
+
+            char sectionName[9] = {};
+            std::memcpy(sectionName, section.Name, 8);
+
+            // Only scan .data: other writable sections carry import
+            // strings and resource pointers that are legitimate non-module
+            // kernel VAs (pool allocations, DPC objects, spin locks).
+            if (_stricmp(sectionName, ".data") != 0)
+            {
+                continue;
+            }
+
+            // Skip non-writable or discardable sections
+            if ((section.Characteristics & IMAGE_SCN_MEM_WRITE) == 0 ||
+                (section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0)
+            {
+                continue;
+            }
+            // dxgkrnl .data is typically 1-4MB; bound cost at 8MB
+            const uint32_t sectionSize = section.Misc.VirtualSize != 0
+                ? section.Misc.VirtualSize
+                : section.SizeOfRawData;
+            if (sectionSize == 0 || sectionSize > 0x800000)
+            {
+                continue;
+            }
+
+            // Read the section and scan for kernel-VA function pointers
+            std::vector<uint8_t> sectionData;
+            if (!device->ReadMemory(
+                    target->Base + section.VirtualAddress,
+                    sectionSize,
+                    &sectionData,
+                    &readError) ||
+                sectionData.size() < 8)
+            {
+                continue;
+            }
+
+            uint32_t unbacked = 0;
+            uint64_t firstUnbacked = 0;
+            const size_t slots = sectionData.size() / 8;
+            for (size_t slot = 0; slot < slots && unbacked < 16; ++slot)
+            {
+                uint64_t value = 0;
+                std::memcpy(&value, sectionData.data() + slot * 8, sizeof(value));
+
+                // Kernel VA range check (canonical, above user space)
+                if (value < 0xFFFFF80000000000ull || value > 0xFFFFFFFFFFFFFFFFull)
+                {
+                    continue;
+                }
+
+                // Check against loaded modules
+                bool backed = false;
+                for (const KernelModuleInfo& mod : modules)
+                {
+                    if (mod.Base != 0 &&
+                        value >= mod.Base &&
+                        value < mod.Base + mod.Size)
+                    {
+                        backed = true;
+                        break;
+                    }
+                }
+                if (!backed)
+                {
+                    ++unbacked;
+                    if (firstUnbacked == 0)
+                    {
+                        firstUnbacked = value;
+                    }
+                }
+            }
+
+            // .data contains legitimate non-module kernel VAs (pool
+            // pointers, spin locks, DPC objects). 1-3 is noise; 4+ in
+            // .data suggests a dispatch table entry was redirected.
+            if (unbacked >= 4)
+            {
+                std::wstring captureNote;
+                CaptureRegion(
+                    L"graphics_dispatch",
+                    target->Base + section.VirtualAddress,
+                    0x1000,
+                    0,
+                    false,
+                    device,
+                    symbols,
+                    nullptr,
+                    0,
+                    &captureNote);
+                EmitUnique(
+                    L"hook.unbacked",
+                    std::wstring(L"graphics_dispatch:") + driverName +
+                        L":" + std::to_wstring(section.VirtualAddress),
+                    driverName,
+                    L"graphics_dispatch",
+                    std::wstring(driverName) + L" writable data section " +
+                        L"contains " + std::to_wstring(unbacked) +
+                        L" kernel-VA pointer(s) outside loaded modules" +
+                        (firstUnbacked != 0
+                            ? L" first=" + HexU64(firstUnbacked)
+                            : L""),
+                    L"section_rva=0x" + HexU64(section.VirtualAddress) +
+                        L" size=0x" + HexU64(sectionSize) +
+                        L" unbacked=" + std::to_wstring(unbacked) +
+                        captureNote);
+            }
         }
     }
 }
