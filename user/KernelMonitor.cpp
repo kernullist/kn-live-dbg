@@ -7235,6 +7235,27 @@ void KernelMonitor::IngestThreatIntel()
                 }
             }
 
+            // Attach the ETW-captured callstack to the event: the return
+            // addresses identify the exact API chain (e.g. SKY -> kernel32!
+            // ReadProcessMemory -> ntdll!NtReadVirtualMemory) rather than
+            // just the process name. Symbolization happens at display time.
+            if (!record.CallstackAddresses.empty() &&
+                classified.Kind != L"driver.captured")
+            {
+                std::wstring stackText;
+                for (size_t si = 0; si < record.CallstackAddresses.size() && si < 16; ++si)
+                {
+                    if (!stackText.empty())
+                    {
+                        stackText += L";";
+                    }
+                    stackText += HexU64(record.CallstackAddresses[si]);
+                }
+                classified.Evidence[L"callstack"] = stackText;
+                classified.Evidence[L"callstack_depth"] =
+                    std::to_wstring(record.CallstackAddresses.size());
+            }
+
             if (classified.Kind == L"inject.remote" ||
                 classified.Kind == L"hook.window" ||
                 classified.Kind == L"process.impair")

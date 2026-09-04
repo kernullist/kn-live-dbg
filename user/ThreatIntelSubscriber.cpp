@@ -1,6 +1,8 @@
 #include "ThreatIntelSubscriber.h"
 
 #include <tdh.h>
+#include <evntrace.h>
+#include <evntcons.h>
 #include <in6addr.h>
 #include <iphlpapi.h>
 #include <psapi.h>
@@ -404,6 +406,19 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         return false;
     }
 
+    // Enable with stack tracing: the TI provider is manifest-based, so
+    // callstacks are requested through ENABLE_TRACE_PARAMETERS with
+    // EVENT_ENABLE_PROPERTY_STACK_TRACE in EnableTraceEx2 --- NOT via
+    // TraceSetInformation with CLASSIC_EVENT_ID (that API is for classic
+    // kernel events only and silently does nothing for manifest providers).
+    ENABLE_TRACE_PARAMETERS enableParams = {};
+    enableParams.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    enableParams.EnableProperty = 0;
+    if (Options.EnableCallstacks)
+    {
+        enableParams.EnableProperty |= EVENT_ENABLE_PROPERTY_STACK_TRACE;
+    }
+
     status = EnableTraceEx2(
         SessionHandle,
         &kThreatIntelligenceProviderGuid,
@@ -412,7 +427,7 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         kThreatIntelMatchAnyKeyword,
         kThreatIntelMatchAllKeyword,
         0,
-        nullptr);
+        &enableParams);
 
     if (status != ERROR_SUCCESS)
     {
@@ -588,6 +603,51 @@ void TiSubscriber::OnEventRecord(PEVENT_RECORD eventRecord)
 
     TiEventRecord record;
     DecodeEvent(eventRecord, &record);
+
+    // Extract ETW-captured callstack: when stack tracing is enabled the
+    // kernel appends the return addresses after the event payload in the
+    // user data region. The stack blob starts at the first 8-byte-aligned
+    // offset after the TDH-decoded payload and consists of sequential
+    // ULONG_PTR (user-mode return addresses) terminated by the user data
+    // boundary. We read them from the extended data if available.
+    if (Options.EnableCallstacks)
+    {
+        for (USHORT ei = 0; ei < eventRecord->ExtendedDataCount; ++ei)
+        {
+            EVENT_HEADER_EXTENDED_DATA_ITEM* ext =
+                &eventRecord->ExtendedData[ei];
+            if (ext->ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE32 &&
+                ext->DataPtr != 0 && ext->DataSize >= sizeof(ULONG))
+            {
+                // 32-bit stack: array of ULONG addresses
+                const ULONG* addr32 = reinterpret_cast<const ULONG*>(
+                    ext->DataPtr);
+                USHORT count = ext->DataSize / sizeof(ULONG);
+                for (USHORT ai = 0; ai < count && ai < 32; ++ai)
+                {
+                    if (addr32[ai] != 0)
+                    {
+                        record.CallstackAddresses.push_back(addr32[ai]);
+                    }
+                }
+            }
+            else if (ext->ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE64 &&
+                ext->DataPtr != 0 && ext->DataSize >= sizeof(ULONGLONG))
+            {
+                // 64-bit stack: array of ULONGLONG addresses
+                const ULONGLONG* addr64 = reinterpret_cast<const ULONGLONG*>(
+                    ext->DataPtr);
+                USHORT count = ext->DataSize / sizeof(ULONGLONG);
+                for (USHORT ai = 0; ai < count && ai < 32; ++ai)
+                {
+                    if (addr64[ai] != 0)
+                    {
+                        record.CallstackAddresses.push_back(addr64[ai]);
+                    }
+                }
+            }
+        }
+    }
 
     // Pre-extract the cross-process target so the watch matcher and the
     // printer never walk the payload again. Prefer explicit target-ish field

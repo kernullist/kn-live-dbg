@@ -25,6 +25,11 @@ struct TiPayloadField
 
 struct TiEventRecord
 {
+    // Return addresses captured by ETW stack tracing (enabled via
+    // TraceSetInformation on the session). User-mode VAs of the calling
+    // thread; empty when stack tracing is not active or the event type
+    // was not registered for stack capture.
+    std::vector<uint64_t> CallstackAddresses;
     // Monotonic ring arrival id (assigned in RecordKeep). Used by timeline
     // recent-mode cursor so out-of-order ETW timestamps are not skipped.
     uint64_t Sequence = 0;
@@ -87,6 +92,7 @@ struct TiSubscriberStatsAtomic
 
 struct TiOptions
 {
+    bool EnableCallstacks = true;
     std::vector<uint32_t> WatchPids;
     std::vector<std::wstring> WatchNames; // case-insensitive basename match
     uint32_t ThrottlePerSecond = 50;
