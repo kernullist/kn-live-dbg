@@ -113,6 +113,11 @@ public:
     bool Stop(std::wstring* error);
     bool IsActive() const;
 
+    // Every log path this subscriber opened in the process lifetime,
+    // including rotations (rotation filenames drop the pid suffix, so a
+    // directory glob cannot reconstruct them reliably).
+    std::vector<std::wstring> SessionLogPaths() const;
+
     bool AddWatchPid(uint32_t pid);
     bool RemoveWatchPid(uint32_t pid);
     bool AddWatchName(const std::wstring& imageBase);
@@ -225,6 +230,7 @@ private:
     uint64_t LogCurrentBytes = 0;
     std::wstring LogActivePath;
     int LogActiveRotation = 0;
+    std::vector<std::wstring> OpenedLogPaths;
 
     // PID -> image path cache to avoid OpenProcess on every ETW event.
     struct ImageCacheEntry

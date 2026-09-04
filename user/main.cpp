@@ -4986,11 +4986,15 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
             if (argsBefore.size() >= 4)
             {
                 AddCompletionCandidate(&candidates, L"/zerofill");
+                AddCompletionCandidate(&candidates, L"/pid");
+                AddCompletionCandidate(&candidates, L"/name");
             }
             AddCompletionCandidate(&candidates, L"help");
         }
         else if (command == L"dump-pe")
         {
+            AddCompletionCandidate(&candidates, L"/pid");
+            AddCompletionCandidate(&candidates, L"/name");
             AddCompletionCandidate(&candidates, L"help");
         }
         else if (command == L"dump-kernel")
@@ -19146,6 +19150,88 @@ static void PrintDumpPeHelp()
     std::wcout << L"  dump-pe 0xfffff80300000000 \"C:\\Program Files\\Dumps\\unknown-driver.sys\"\n";
 }
 
+// Shared /pid N | /name <image> parsing for dump-raw/dump-pe. Returns false
+// on a malformed or unresolvable target; hasTarget stays false for plain
+// kernel-space dumps. /name resolves via the process snapshot and rejects
+// ambiguity (use /pid then).
+static bool ParseUserDumpTarget(
+    const std::vector<std::wstring>& args,
+    size_t startIndex,
+    bool* hasTarget,
+    uint32_t* targetPid,
+    std::wstring* targetLabel,
+    std::wstring* error)
+{
+    if (hasTarget == nullptr || targetPid == nullptr)
+    {
+        return false;
+    }
+    *hasTarget = false;
+    for (size_t i = startIndex; i < args.size(); ++i)
+    {
+        const std::wstring option = ToLower(args[i]);
+        if (option != L"/pid" && option != L"/name")
+        {
+            continue;
+        }
+        if (i + 1 >= args.size())
+        {
+            if (error != nullptr)
+            {
+                *error = option + L" requires a value";
+            }
+            return false;
+        }
+        if (option == L"/pid")
+        {
+            uint64_t pid = 0;
+            if (!ParseUnsigned(args[i + 1], 10, &pid) ||
+                pid <= 4 ||
+                pid > 0xFFFFFFFFull)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"/pid expects a user process id";
+                }
+                return false;
+            }
+            *targetPid = static_cast<uint32_t>(pid);
+            *targetLabel = L"pid=" + args[i + 1];
+        }
+        else
+        {
+            std::vector<uint32_t> pids;
+            if (!FindPidsByImageName(args[i + 1], &pids))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"no live process named \"" + args[i + 1] + L"\"";
+                }
+                return false;
+            }
+            if (pids.size() > 1)
+            {
+                std::wstring list;
+                for (uint32_t pid : pids)
+                {
+                    list += (list.empty() ? L"" : L",") + std::to_wstring(pid);
+                }
+                if (error != nullptr)
+                {
+                    *error = L"\"" + args[i + 1] +
+                        L"\" matches several pids (" + list +
+                        L"); pass /pid explicitly";
+                }
+                return false;
+            }
+            *targetPid = pids[0];
+            *targetLabel = L"name=" + args[i + 1];
+        }
+        *hasTarget = true;
+    }
+    return true;
+}
+
 static void HandleDumpRawCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -19162,12 +19248,28 @@ static void HandleDumpRawCommand(
 
         if (args.size() < 4)
         {
-            std::wcerr << L"usage: dump-raw <address> <length> <path> [/zerofill]\n";
+            std::wcerr << L"usage: dump-raw <address> <length> <path> [/zerofill] [/pid N | /name <image>]\n";
             PrintDumpRawHelp();
             break;
         }
 
-        if (!device.IsOpen())
+        bool userTarget = false;
+        uint32_t targetPid = 0;
+        std::wstring targetLabel;
+        std::wstring targetError;
+        if (!ParseUserDumpTarget(
+                args,
+                4,
+                &userTarget,
+                &targetPid,
+                &targetLabel,
+                &targetError))
+        {
+            std::wcerr << L"dump-raw: " << targetError << L"\n";
+            break;
+        }
+
+        if (!userTarget && !device.IsOpen())
         {
             std::wcerr << L"dump-raw requires the KnLiveDbg.sys driver device to be open\n";
             break;
@@ -19204,6 +19306,10 @@ static void HandleDumpRawCommand(
             {
                 zeroFill = true;
             }
+            else if (opt == L"/pid" || opt == L"/name")
+            {
+                ++i;
+            }
             else
             {
                 std::wcerr << L"dump-raw: unrecognised argument \"" << args[i] << L"\"\n";
@@ -19220,7 +19326,32 @@ static void HandleDumpRawCommand(
 
         DumpRawResult result = {};
         std::wstring dumpError;
-        if (!DumpKernelRangeToFile(device, address, length, path, zeroFill, &result, &dumpError))
+        bool dumped = false;
+        if (userTarget)
+        {
+            dumped = DumpUserRangeToFile(
+                device,
+                symbols,
+                targetPid,
+                address,
+                length,
+                path,
+                zeroFill,
+                &result,
+                &dumpError);
+        }
+        else
+        {
+            dumped = DumpKernelRangeToFile(
+                device,
+                address,
+                length,
+                path,
+                zeroFill,
+                &result,
+                &dumpError);
+        }
+        if (!dumped)
         {
             std::wcerr << L"dump-raw failed: " << dumpError << L"\n";
             for (const std::wstring& warning : result.Warnings)
@@ -19238,11 +19369,15 @@ static void HandleDumpRawCommand(
         PrintColoredText(L"[dump-raw]", KNDBG_COLOR_TITLE);
         std::wcout << L" address=" << HexTextWidth(result.StartAddress, 16, true)
                    << L" requested=0x" << std::hex << result.BytesRequested << std::dec
-                   << L" kernel_bytes=" << result.BytesRead
+                   << L" " << (userTarget ? L"user_bytes=" : L"kernel_bytes=") << result.BytesRead
                    << L" zero_bytes=" << result.BytesZeroFilled
                    << L" wrote=" << result.BytesWritten
                    << L" chunks_ok=" << result.ChunksRead
                    << L" complete=" << (result.Complete ? L"yes" : L"no");
+        if (userTarget)
+        {
+            std::wcout << L" target=" << targetLabel;
+        }
         if (result.ShortRead || result.ChunksFailed > 0)
         {
             std::wcout << L" ";
@@ -24857,7 +24992,9 @@ static void PrintKmonHelp()
     std::wcout << L"  shown:  every driver lifecycle event (drop_load, official load/unload, device\n";
     std::wcout << L"          objects, post-arm kernel image notify) with no exception path, short_lived,\n";
     std::wcout << L"          mapped_residue, mapper.watch, hook.unbacked, hook.dataptr, hidden,\n";
-    std::wcout << L"          masquerade/hollow/implant, builtin/drop inject.remote, gap.kernel_rw,\n";
+    std::wcout << L"          masquerade/hollow/implant (incl. cloned_vtable, main_image_text,\n";
+    std::wcout << L"          resource_only_pe as a quiet downgrade note), builtin/drop inject.remote\n";
+    std::wcout << L"          (System-origin APC/context always shows), process.credscan, gap.kernel_rw,\n";
     std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids,\n";
     std::wcout << L"          hook.window / process.impair from TI (see logged kinds)\n";
     std::wcout << L"  hidden: process create, local AllocVM, kernel R/W,\n";
@@ -26818,12 +26955,49 @@ static void HandleDumpPeCommand(
 
         if (args.size() < 3)
         {
-            std::wcerr << L"usage: dump-pe <address> <path>\n";
+            std::wcerr << L"usage: dump-pe <address> <path> [/pid N | /name <image>]\n";
             PrintDumpPeHelp();
             break;
         }
 
-        if (!device.IsOpen())
+        bool userTarget = false;
+        uint32_t targetPid = 0;
+        std::wstring targetLabel;
+        std::wstring targetError;
+        if (!ParseUserDumpTarget(
+                args,
+                3,
+                &userTarget,
+                &targetPid,
+                &targetLabel,
+                &targetError))
+        {
+            std::wcerr << L"dump-pe: " << targetError << L"\n";
+            break;
+        }
+
+        // Keep the historical strictness: anything beyond <address> <path>
+        // and the target options is a typo, not a silent default.
+        bool unexpectedArgument = false;
+        for (size_t i = 3; i < args.size(); ++i)
+        {
+            const std::wstring option = ToLower(args[i]);
+            if (option == L"/pid" || option == L"/name")
+            {
+                ++i;
+                continue;
+            }
+            std::wcerr << L"dump-pe: unrecognised argument \"" << args[i] << L"\"\n";
+            PrintDumpPeHelp();
+            unexpectedArgument = true;
+            break;
+        }
+        if (unexpectedArgument)
+        {
+            break;
+        }
+
+        if (!userTarget && !device.IsOpen())
         {
             std::wcerr << L"dump-pe requires the KnLiveDbg.sys driver device to be open\n";
             break;
@@ -26838,16 +27012,31 @@ static void HandleDumpPeCommand(
         }
 
         std::wstring path = args[2];
-        if (args.size() > 3)
-        {
-            std::wcerr << L"dump-pe: unexpected extra argument \"" << args[3] << L"\"\n";
-            PrintDumpPeHelp();
-            break;
-        }
 
         DumpPeResult result = {};
         std::wstring dumpError;
-        if (!DumpKernelPeToFile(device, address, path, &result, &dumpError))
+        bool dumped = false;
+        if (userTarget)
+        {
+            dumped = DumpUserPeToFile(
+                device,
+                symbols,
+                targetPid,
+                address,
+                path,
+                &result,
+                &dumpError);
+        }
+        else
+        {
+            dumped = DumpKernelPeToFile(
+                device,
+                address,
+                path,
+                &result,
+                &dumpError);
+        }
+        if (!dumped)
         {
             std::wcerr << L"dump-pe failed: " << dumpError << L"\n";
             for (const std::wstring& warning : result.Warnings)
@@ -31890,6 +32079,10 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 DecodeKdbgSelfTest(),
                 L"dump-kernel-kdbg-decoder-round-trip");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                DumpUserModeSelfTest(),
+                L"dump-user-mode-e2e-own-ntdll");
             CheckConsoleSurfaceSelfTest(
                 &context,
                 DumpLiveProcessFilterSelfTest(),
@@ -54478,6 +54671,71 @@ int wmain(int argc, wchar_t** argv)
         g_MainThreadHandle = nullptr;
     }
     ReleaseSingleInstanceLock();
+
+    // Session artifact summary: stop the collectors first so every log
+    // handle gets its final flush (and the durable-log final metadata
+    // write), then print where this session's evidence landed before the
+    // console goes away. Idempotent Stops cover the never-started case.
+    {
+        std::wstring stopError;
+        GetKmonInstance().Stop(&stopError);
+        GetTiSubscriberInstance().Stop(&stopError);
+
+        struct SessionArtifactGroup
+        {
+            const wchar_t* Label;
+            std::vector<std::wstring> Paths;
+        };
+        std::vector<SessionArtifactGroup> groups;
+
+        SessionArtifactGroup kmonLogs = { L"kmon events", GetKmonInstance().SessionLogPaths() };
+        SessionArtifactGroup tiLogs = { L"ti events", GetTiSubscriberInstance().SessionLogPaths() };
+        SessionArtifactGroup captures = { L"captures", GetKmonInstance().SessionCapturePaths() };
+        groups.push_back(kmonLogs);
+        groups.push_back(tiLogs);
+        groups.push_back(captures);
+
+        std::wstring transcriptPath;
+        if (aiState.TranscriptEnabled && !aiState.TranscriptPath.empty())
+        {
+            transcriptPath = aiState.TranscriptPath;
+            SessionArtifactGroup transcript = { L"transcript", { transcriptPath } };
+            groups.push_back(transcript);
+        }
+        std::wstring outputLogPath;
+        {
+            std::lock_guard<std::mutex> guard(g_OutputLog.Lock);
+            outputLogPath = g_OutputLog.Path;
+        }
+        if (!outputLogPath.empty())
+        {
+            SessionArtifactGroup outputLog = { L"output log", { outputLogPath } };
+            groups.push_back(outputLog);
+        }
+
+        bool any = false;
+        for (const SessionArtifactGroup& group : groups)
+        {
+            for (const std::wstring& path : group.Paths)
+            {
+                if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+                {
+                    continue;
+                }
+                if (!any)
+                {
+                    any = true;
+                    PrintColoredText(L"[session logs]", KNDBG_COLOR_TITLE);
+                    std::wcout << L" this session wrote:\n";
+                }
+                std::wcout << L"  ";
+                PrintColoredText(group.Label, KNDBG_COLOR_ACCENT);
+                std::wcout << L"  ";
+                PrintColoredText(path, KNDBG_COLOR_OK);
+                std::wcout << L"\n";
+            }
+        }
+    }
 
     DisableOutputLog(nullptr);
     UninstallOutputTee();

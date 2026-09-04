@@ -104,6 +104,21 @@ bool DumpKernelRangeToFile(
     DumpRawResult* result,
     std::wstring* error);
 
+// Same as DumpKernelRangeToFile but reads a user-mode range of another
+// process: PROCESS_VM_READ handle first (works even without the driver
+// device), kernel ReadProcessVirtual as the fallback for restricted or
+// protected targets.
+bool DumpUserRangeToFile(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint32_t processId,
+    uint64_t address,
+    uint64_t length,
+    const std::wstring& path,
+    bool zeroFillOnFailure,
+    DumpRawResult* result,
+    std::wstring* error);
+
 // Interprets the region at <address> as an in-memory loaded PE image, rebuilds
 // it back into on-disk form (section RVAs -> file PointerToRawData) and writes
 // the result to <path>. Failed section reads are zero-filled (typical for
@@ -114,6 +129,29 @@ bool DumpKernelPeToFile(
     const std::wstring& path,
     DumpPeResult* result,
     std::wstring* error);
+
+// Same as DumpKernelPeToFile but for a user-mode mapped image inside another
+// process (loader module, manual map, or MUI data-file view). SizeOfImage
+// comes from the mapped headers; the on-disk rebuild keeps the output
+// analyzable regardless of the source mapping style.
+bool DumpUserPeToFile(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint32_t processId,
+    uint64_t address,
+    const std::wstring& path,
+    DumpPeResult* result,
+    std::wstring* error);
+
+// Resolves live process ids whose image leaf name matches <image>
+// (case-insensitive). Returns false when nothing matched.
+bool FindPidsByImageName(
+    const std::wstring& image,
+    std::vector<uint32_t>* processIds);
+
+// Round-trip check of the user-mode dump path against the current process
+// (handle-first reader, raw range write, PE rebuild). Self-test only.
+bool DumpUserModeSelfTest();
 
 // WinDbg complete-dump header is a fixed 8 KB prefix.
 constexpr uint32_t kCrashDumpHeaderBytes = 0x2000;
