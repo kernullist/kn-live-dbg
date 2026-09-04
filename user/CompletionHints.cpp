@@ -214,7 +214,16 @@ namespace
     const CompletionHint kDumpRawTokens[] =
     {
         { L"/zerofill", L"dump-raw <addr> <len> <path> /zerofill", L"zero-fill failed chunks and continue" },
+        { L"/pid", L"dump-raw <addr> <len> <path> /pid <N>", L"dump a user-mode range of process N (handle first, kernel fallback)" },
+        { L"/name", L"dump-raw <addr> <len> <path> /name <image>", L"same as /pid after resolving the process image name" },
         { L"help", nullptr, L"show dump-raw usage" },
+    };
+
+    const CompletionHint kDumpPeTokens[] =
+    {
+        { L"/pid", L"dump-pe <addr> <path> /pid <N>", L"rebuild a user-mode mapped image inside process N" },
+        { L"/name", L"dump-pe <addr> <path> /name <image>", L"same as /pid after resolving the process image name" },
+        { L"help", nullptr, L"show dump-pe usage" },
     };
 
     const CompletionHint kDumpKernelTokens[] =
@@ -1223,12 +1232,12 @@ namespace
 
     const CompletionScopeTable kDumpRawScopes[] =
     {
-        SCOPE(L"", L"dump-raw <addr> <len> <path> [/zerofill]", L"verbatim kernel VA dump through the driver", kDumpRawTokens),
+        SCOPE(L"", L"dump-raw <addr> <len> <path> [/zerofill] [/pid N | /name <image>]", L"verbatim VA dump (kernel space, or a user process with /pid or /name)", kDumpRawTokens),
     };
 
     const CompletionScopeTable kDumpPeScopes[] =
     {
-        SCOPE(L"", L"dump-pe <addr> <path>", L"rebuild an on-disk PE from a live image", kHelpOnlyTokens),
+        SCOPE(L"", L"dump-pe <addr> <path> [/pid N | /name <image>]", L"rebuild an on-disk PE from a live image (kernel or user process)", kDumpPeTokens),
     };
 
     const CompletionScopeTable kDumpKernelScopes[] =

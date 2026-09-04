@@ -10,11 +10,15 @@
 #include <cstdint>
 #include <set>
 #include <fstream>
+#include <functional>
+#include <memory>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <cstring>
+#include <cwctype>
+#include <tlhelp32.h>
 
 namespace
 {
@@ -39,13 +43,273 @@ namespace
             KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK);
     }
 
+    // Pluggable chunk reader so the range/PE dump cores can target either
+    // kernel VA or another process's user VA (handle first, kernel
+    // ReadProcessVirtual as fallback).
+    using MemoryChunkReader = std::function<
+        bool(uint64_t address, uint32_t length, std::vector<uint8_t>* out, std::wstring* error)>;
+
+    MemoryChunkReader MakeKernelChunkReader(DeviceClient& device)
+    {
+        return [&device](uint64_t address, uint32_t length, std::vector<uint8_t>* out, std::wstring* error)
+        {
+            return ReadKernelChunk(device, address, length, out, error);
+        };
+    }
+
+    // User-mode chunk reader for a target process: PROCESS_VM_READ handle
+    // first (works without the driver), kernel ReadProcessVirtual as the
+    // fallback for restricted/protected targets. The handle, EPROCESS, and
+    // creation time are resolved lazily on first use and reused afterwards.
+    uint64_t QueryUserProcessCreateTicks(HANDLE process)
+    {
+        if (process == nullptr)
+        {
+            return 0;
+        }
+        FILETIME created = {};
+        FILETIME exited = {};
+        FILETIME kernel = {};
+        FILETIME user = {};
+        if (!GetProcessTimes(process, &created, &exited, &kernel, &user))
+        {
+            return 0;
+        }
+        return (static_cast<uint64_t>(created.dwHighDateTime) << 32) |
+            static_cast<uint64_t>(created.dwLowDateTime);
+    }
+
+    uint64_t QueryUserEprocessCreateTime(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint64_t eprocess)
+    {
+        TypeFieldInfo createField = {};
+        std::wstring ignored;
+        if (!symbols.FindField(L"nt!_EPROCESS", L"CreateTime", &createField, &ignored) &&
+            !symbols.FindField(L"_EPROCESS", L"CreateTime", &createField, &ignored))
+        {
+            return 0;
+        }
+        if (eprocess > (std::numeric_limits<uint64_t>::max)() - createField.Offset)
+        {
+            return 0;
+        }
+        std::vector<uint8_t> bytes;
+        std::wstring error;
+        if (!device.ReadMemory(
+                eprocess + createField.Offset,
+                sizeof(uint64_t),
+                &bytes,
+                &error) ||
+            bytes.size() != sizeof(uint64_t))
+        {
+            return 0;
+        }
+        uint64_t ticks = 0;
+        std::memcpy(&ticks, bytes.data(), sizeof(ticks));
+        return ticks;
+    }
+
+    MemoryChunkReader BuildUserModeChunkReader(
+        DeviceClient& device,
+        SymbolEngine& symbols,
+        uint32_t processId,
+        std::wstring* error)
+    {
+        if (processId == 0 || processId <= 4)
+        {
+            if (error != nullptr)
+            {
+                *error = L"user-mode dumps need a user process pid";
+            }
+            return nullptr;
+        }
+
+        // Shared ownership with a closing deleter so std::function copies
+        // close the handle exactly once when the last copy goes away.
+        auto closeHandle = [](void* raw)
+        {
+            if (raw != nullptr)
+            {
+                CloseHandle(static_cast<HANDLE>(raw));
+            }
+        };
+        HANDLE opened = OpenProcess(
+            PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            processId);
+        std::shared_ptr<void> handleHolder(
+            opened,
+            closeHandle);
+
+        uint64_t eprocess = 0;
+        uint64_t createTime = 0;
+        if (opened == nullptr)
+        {
+            if (!device.IsOpen())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"OpenProcess failed (gle=" +
+                        std::to_wstring(GetLastError()) +
+                        L") and the kernel device is not open for fallback";
+                }
+                return nullptr;
+            }
+            TypeFieldInfo dtbField = {};
+            std::wstring ignored;
+            if (symbols.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) ||
+                symbols.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) ||
+                symbols.FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            {
+                ProcessAddressContext context = {};
+                if (device.ResolveProcess(
+                        processId,
+                        static_cast<uint32_t>(dtbField.Offset),
+                        0,
+                        &context,
+                        &ignored))
+                {
+                    eprocess = context.Eprocess;
+                }
+            }
+            if (eprocess == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"OpenProcess failed (gle=" +
+                        std::to_wstring(GetLastError()) +
+                        L") and the kernel EPROCESS could not be resolved";
+                }
+                return nullptr;
+            }
+            createTime = QueryUserEprocessCreateTime(device, symbols, eprocess);
+            if (createTime == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"OpenProcess failed and _EPROCESS.CreateTime was unreadable";
+                }
+                return nullptr;
+            }
+        }
+
+        // Kernel identity resolution is lazy: a working PROCESS_VM_READ
+        // handle path never pays for it, restricted targets resolve once on
+        // the first failed handle read, and later chunks reuse the result.
+        return MemoryChunkReader(
+            [processId, handleHolder, eprocess, createTime, &device, &symbols]
+            (uint64_t address, uint32_t length, std::vector<uint8_t>* out, std::wstring* readError) mutable
+            {
+                if (out == nullptr)
+                {
+                    return false;
+                }
+                out->clear();
+                if (address == 0 || length == 0)
+                {
+                    if (readError != nullptr)
+                    {
+                        *readError = L"invalid user-mode read request";
+                    }
+                    return false;
+                }
+                if (handleHolder != nullptr)
+                {
+                    out->resize(length, 0);
+                    SIZE_T read = 0;
+                    if (ReadProcessMemory(
+                            static_cast<HANDLE>(handleHolder.get()),
+                            reinterpret_cast<LPCVOID>(address),
+                            out->data(),
+                            length,
+                            &read))
+                    {
+                        out->resize(read);
+                        // A short-but-true read flows back as success with a
+                        // smaller buffer; the range core reports it as a
+                        // short chunk instead of discarding the prefix.
+                        return true;
+                    }
+                    out->clear();
+                }
+                uint64_t effectiveEprocess = eprocess;
+                uint64_t effectiveCreateTime = createTime;
+                if (effectiveEprocess == 0 || effectiveCreateTime == 0)
+                {
+                    TypeFieldInfo dtbField = {};
+                    std::wstring ignored;
+                    if (!(symbols.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) ||
+                          symbols.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) ||
+                          symbols.FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored)))
+                    {
+                        if (readError != nullptr)
+                        {
+                            *readError = L"DirectoryTableBase offset unresolved";
+                        }
+                        return false;
+                    }
+                    ProcessAddressContext context = {};
+                    if (!device.ResolveProcess(
+                            processId,
+                            static_cast<uint32_t>(dtbField.Offset),
+                            0,
+                            &context,
+                            &ignored) ||
+                        context.Eprocess == 0)
+                    {
+                        if (readError != nullptr)
+                        {
+                            *readError = L"ResolveProcess failed";
+                        }
+                        return false;
+                    }
+                    effectiveEprocess = context.Eprocess;
+                    effectiveCreateTime =
+                        QueryUserEprocessCreateTime(device, symbols, effectiveEprocess);
+                    if (effectiveCreateTime == 0)
+                    {
+                        if (readError != nullptr)
+                        {
+                            *readError = L"_EPROCESS.CreateTime unreadable";
+                        }
+                        return false;
+                    }
+                    eprocess = effectiveEprocess;
+                    createTime = effectiveCreateTime;
+                }
+                std::vector<uint8_t> kernelBytes;
+                std::wstring kernelError;
+                if (!device.ReadProcessVirtual(
+                        processId,
+                        effectiveEprocess,
+                        effectiveCreateTime,
+                        address,
+                        length,
+                        &kernelBytes,
+                        &kernelError))
+                {
+                    if (readError != nullptr)
+                    {
+                        *readError = kernelError.empty()
+                            ? L"ReadProcessVirtual failed"
+                            : kernelError;
+                    }
+                    return false;
+                }
+                *out = std::move(kernelBytes);
+                return !out->empty();
+            });
+    }
+
     // Read [address, address+length) into out, chunked. Returns false on first
     // failure unless zeroFillOnFailure is set, in which case the missing tail of
     // the chunk is zero-filled and the read continues. failedChunks is
     // incremented per incomplete chunk; bytesZeroFilled/bytesFromKernel track
     // actual byte counts (not chunk-size approximations).
-    bool ReadKernelRange(
-        DeviceClient& device,
+    bool ReadRangeWithReader(
+        const MemoryChunkReader& readChunk,
         uint64_t address,
         uint64_t length,
         bool zeroFillOnFailure,
@@ -108,11 +372,11 @@ namespace
 
                 std::vector<uint8_t> buf;
                 std::wstring chunkErr;
-                bool readOk = ReadKernelChunk(device,
-                                              address + offset,
-                                              chunk,
-                                              &buf,
-                                              &chunkErr);
+                bool readOk = readChunk(
+                              address + offset,
+                              chunk,
+                              &buf,
+                              &chunkErr);
 
                 const uint32_t got = readOk
                     ? static_cast<uint32_t>(std::min<size_t>(buf.size(), chunk))
@@ -149,7 +413,7 @@ namespace
                         if (error != nullptr)
                         {
                             std::wstringstream ss;
-                            ss << L"ReadMemory failed at va=0x"
+                            ss << L"chunk read failed at va=0x"
                                << std::hex << (address + offset)
                                << L" length=0x" << chunk
                                << L" got=0x" << got
@@ -708,8 +972,8 @@ bool PeProbeLooksLikeImage(const PeHeaderProbe& probe, uint64_t containingSize)
     return ok;
 }
 
-bool DumpKernelRangeToFile(
-    DeviceClient& device,
+bool DumpRangeToFileWithReader(
+    const std::function<bool(uint64_t, uint32_t, std::vector<uint8_t>*, std::wstring*)>& reader,
     uint64_t address,
     uint64_t length,
     const std::wstring& path,
@@ -721,7 +985,7 @@ bool DumpKernelRangeToFile(
     {
         if (error != nullptr)
         {
-            *error = L"DumpKernelRangeToFile called without result buffer";
+            *error = L"DumpRangeToFileWithReader called without result buffer";
         }
         return false;
     }
@@ -740,7 +1004,7 @@ bool DumpKernelRangeToFile(
         std::wstring readError;
         uint64_t kernelBytes = 0;
         uint64_t zeroBytes = 0;
-        bool readOk = ReadKernelRange(device,
+        bool readOk = ReadRangeWithReader(reader,
                                        address,
                                        length,
                                        zeroFillOnFailure,
@@ -817,8 +1081,66 @@ bool DumpKernelRangeToFile(
     return ok;
 }
 
-bool DumpKernelPeToFile(
+bool DumpKernelRangeToFile(
     DeviceClient& device,
+    uint64_t address,
+    uint64_t length,
+    const std::wstring& path,
+    bool zeroFillOnFailure,
+    DumpRawResult* result,
+    std::wstring* error)
+{
+    return DumpRangeToFileWithReader(
+        MakeKernelChunkReader(device),
+        address,
+        length,
+        path,
+        zeroFillOnFailure,
+        result,
+        error);
+}
+
+bool DumpUserRangeToFile(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint32_t processId,
+    uint64_t address,
+    uint64_t length,
+    const std::wstring& path,
+    bool zeroFillOnFailure,
+    DumpRawResult* result,
+    std::wstring* error)
+{
+    std::wstring readerError;
+    MemoryChunkReader reader = BuildUserModeChunkReader(
+        device,
+        symbols,
+        processId,
+        &readerError);
+    if (!reader)
+    {
+        if (result != nullptr)
+        {
+            result->Warnings.push_back(readerError);
+        }
+        if (error != nullptr)
+        {
+            *error = L"user-mode reader unavailable: " + readerError;
+        }
+        return false;
+    }
+    return DumpRangeToFileWithReader(
+        reader,
+        address,
+        length,
+        path,
+        zeroFillOnFailure,
+        result,
+        error);
+}
+
+bool DumpPeToFileWithReader(
+    const MemoryChunkReader& reader,
     uint64_t address,
     const std::wstring& path,
     DumpPeResult* result,
@@ -846,7 +1168,7 @@ bool DumpKernelPeToFile(
         // potentially re-read if SizeOfHeaders > 4 KB.
         std::vector<uint8_t> headerBytes;
         std::wstring readError;
-        if (!ReadKernelRange(device,
+        if (!ReadRangeWithReader(reader,
                              address,
                              kInitialHeaderBytes,
                              false,
@@ -985,7 +1307,7 @@ bool DumpKernelPeToFile(
         if (sizeOfHeaders > headerBytes.size())
         {
             std::wstring rereadError;
-            if (!ReadKernelRange(device,
+            if (!ReadRangeWithReader(reader,
                                  address,
                                  sizeOfHeaders,
                                  false,
@@ -1142,7 +1464,7 @@ bool DumpKernelPeToFile(
                 uint32_t sectionChunksRead = 0;
                 uint32_t sectionChunksFailed = 0;
 
-                bool readOk = ReadKernelRange(device,
+                bool readOk = ReadRangeWithReader(reader,
                                               address + rec.VirtualAddress,
                                               rec.SizeOfRawData,
                                               false,
@@ -1194,6 +1516,220 @@ bool DumpKernelPeToFile(
         ok = true;
     } while (false);
 
+    return ok;
+}
+
+bool DumpKernelPeToFile(
+    DeviceClient& device,
+    uint64_t address,
+    const std::wstring& path,
+    DumpPeResult* result,
+    std::wstring* error)
+{
+    return DumpPeToFileWithReader(
+        MakeKernelChunkReader(device),
+        address,
+        path,
+        result,
+        error);
+}
+
+bool DumpUserPeToFile(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    uint32_t processId,
+    uint64_t address,
+    const std::wstring& path,
+    DumpPeResult* result,
+    std::wstring* error)
+{
+    std::wstring readerError;
+    MemoryChunkReader reader = BuildUserModeChunkReader(
+        device,
+        symbols,
+        processId,
+        &readerError);
+    if (!reader)
+    {
+        if (result != nullptr)
+        {
+            result->Warnings.push_back(readerError);
+        }
+        if (error != nullptr)
+        {
+            *error = L"user-mode reader unavailable: " + readerError;
+        }
+        return false;
+    }
+    return DumpPeToFileWithReader(
+        reader,
+        address,
+        path,
+        result,
+        error);
+}
+
+bool FindPidsByImageName(
+    const std::wstring& image,
+    std::vector<uint32_t>* processIds)
+{
+    bool ok = false;
+    do
+    {
+        if (processIds == nullptr || image.empty())
+        {
+            break;
+        }
+        processIds->clear();
+        const auto lowerCopy = [](const std::wstring& value)
+        {
+            std::wstring lowered(value);
+            std::transform(
+                lowered.begin(),
+                lowered.end(),
+                lowered.begin(),
+                [](wchar_t ch)
+                {
+                    return static_cast<wchar_t>(std::towlower(ch));
+                });
+            return lowered;
+        };
+        const std::wstring needle = lowerCopy(image);
+        HANDLE snapshot = CreateToolhelp32Snapshot(
+            TH32CS_SNAPPROCESS,
+            0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            break;
+        }
+        PROCESSENTRY32W entry = {};
+        entry.dwSize = sizeof(entry);
+        BOOL more = Process32FirstW(snapshot, &entry);
+        while (more)
+        {
+            const std::wstring leaf = lowerCopy(entry.szExeFile);
+            if (leaf == needle)
+            {
+                processIds->push_back(entry.th32ProcessID);
+            }
+            entry.dwSize = sizeof(entry);
+            more = Process32NextW(snapshot, &entry);
+        }
+        CloseHandle(snapshot);
+        ok = !processIds->empty();
+    } while (false);
+    return ok;
+}
+
+// End-to-end check of the user-mode dump path against our own process:
+// handle-first reader (no driver, no elevation), raw range write, and the
+// PE rebuild all run against this process's ntdll and the output files must
+// carry a real MZ image. Self-test only.
+bool DumpUserModeSelfTest()
+{
+    bool ok = false;
+    std::wstring rawPath;
+    std::wstring pePath;
+
+    do
+    {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+        {
+            break;
+        }
+        const uint64_t ntdllBase = reinterpret_cast<uint64_t>(ntdll);
+
+        DeviceClient device;
+        SymbolEngine symbols;
+        std::wstring readerError;
+        MemoryChunkReader reader = BuildUserModeChunkReader(
+            device,
+            symbols,
+            GetCurrentProcessId(),
+            &readerError);
+        if (!reader)
+        {
+            break;
+        }
+
+        wchar_t tempDir[MAX_PATH] = {};
+        if (GetTempPathW(MAX_PATH, tempDir) == 0)
+        {
+            break;
+        }
+        rawPath = std::wstring(tempDir) + L"knlivedbg-dumpuser-raw-selftest.bin";
+        pePath = std::wstring(tempDir) + L"knlivedbg-dumpuser-pe-selftest.bin";
+
+        DumpRawResult raw = {};
+        std::wstring rawError;
+        if (!DumpRangeToFileWithReader(
+                reader,
+                ntdllBase,
+                0x400,
+                rawPath,
+                false,
+                &raw,
+                &rawError) ||
+            !raw.Complete ||
+            raw.BytesWritten != 0x400)
+        {
+            break;
+        }
+
+        DumpPeResult pe = {};
+        std::wstring peError;
+        if (!DumpPeToFileWithReader(
+                reader,
+                ntdllBase,
+                pePath,
+                &pe,
+                &peError) ||
+            !pe.Is64Bit ||
+            pe.SizeOfImage == 0 ||
+            pe.Sections.empty())
+        {
+            break;
+        }
+
+        auto fileStartsWithMz = [](const std::wstring& path) -> bool
+        {
+            HANDLE file = CreateFileW(
+                path.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+            uint8_t head[2] = {};
+            DWORD read = 0;
+            const bool mz = ReadFile(file, head, sizeof(head), &read, nullptr) &&
+                read == sizeof(head) &&
+                head[0] == 'M' &&
+                head[1] == 'Z';
+            CloseHandle(file);
+            return mz;
+        };
+        if (!fileStartsWithMz(rawPath) || !fileStartsWithMz(pePath))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    if (!rawPath.empty())
+    {
+        DeleteFileW(rawPath.c_str());
+    }
+    if (!pePath.empty())
+    {
+        DeleteFileW(pePath.c_str());
+    }
     return ok;
 }
 

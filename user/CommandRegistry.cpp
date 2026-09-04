@@ -351,8 +351,8 @@ const std::vector<CommandInfo>& CommandRegistry::Commands()
         Make(L"!kmon", L"!kmon", L"kernel", L"arm TI+live and tail unknown kernel drops/maps/hidden/masquerade/hollow processes; no driver filename; Esc detaches", CommandSupport::Native),
         Make(L"!timeline", L"!timeline", L"session", L"ingest TI and snapshot evidence into a queryable user-mode timeline/graph store", CommandSupport::Native),
         Make(L"!pool", L"!pool", L"kernel", L"enumerate big pool allocations, or !pool pe to hunt intact/signature-wiped PE images in those allocations", CommandSupport::Native),
-        Make(L"dump-raw", L"dump-raw", L"memory", L"dump a kernel virtual range to file verbatim via the driver ReadMemory IOCTL", CommandSupport::Native),
-        Make(L"dump-pe", L"dump-pe", L"memory", L"reconstruct an on-disk PE image from an in-memory loaded kernel PE by walking the section table", CommandSupport::Native),
+        Make(L"dump-raw", L"dump-raw", L"memory", L"dump a kernel virtual range (or a user-mode range of another process via /pid N | /name <image>) to file verbatim, handle-first with kernel-read fallback", CommandSupport::Native),
+        Make(L"dump-pe", L"dump-pe", L"memory", L"reconstruct an on-disk PE image from an in-memory loaded PE (kernel module, or a user-process mapped image via /pid N | /name <image>) by walking the section table", CommandSupport::Native),
         Make(L"dump-kernel", L"dump-kernel", L"memory", L"write a WinDbg-openable complete dump from live physical RAM runs", CommandSupport::Native),
         Make(L"dump-live", L"dump-live", L"memory", L"ask Windows to write a live kernel dump via NtSystemDebugControl; /user [pid|eprocess] writes a WinDbg kernel dump of that process user+kernel AS", CommandSupport::Native),
 

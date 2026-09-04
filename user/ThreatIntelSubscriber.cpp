@@ -1582,6 +1582,12 @@ bool TiSubscriber::RemoveWatchName(const std::wstring& imageBase)
     return true;
 }
 
+std::vector<std::wstring> TiSubscriber::SessionLogPaths() const
+{
+    std::lock_guard<std::mutex> lock(LogMutex);
+    return OpenedLogPaths;
+}
+
 std::wstring TiSubscriber::BuildLogFilePath(int rotationIndex) const
 {
     std::wstringstream ss;
@@ -1634,6 +1640,7 @@ bool TiSubscriber::EnsureLogOpenLocked()
     }
     LogCurrentBytes = 0;
     LogActiveRotation = 0;
+    OpenedLogPaths.push_back(LogActivePath);
     return true;
 }
 
@@ -1663,6 +1670,7 @@ void TiSubscriber::RotateLogLocked()
     }
     LogActiveRotation = nextIndex;
     LogActivePath = BuildLogFilePath(LogActiveRotation);
+    OpenedLogPaths.push_back(LogActivePath);
 
     // Best-effort delete; the file may not exist yet on first wrap.
     DeleteFileW(LogActivePath.c_str());

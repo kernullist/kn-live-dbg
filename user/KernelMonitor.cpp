@@ -5406,6 +5406,54 @@ bool KmonDriverPathHasFileDirectory(const std::wstring& path)
     return true;
 }
 
+std::vector<std::wstring> KmonFindFilesWithPattern(
+    const std::wstring& directory,
+    const std::wstring& prefix,
+    const std::wstring& suffix)
+{
+    std::vector<std::wstring> matches;
+    if (directory.empty() || prefix.empty())
+    {
+        return matches;
+    }
+    std::wstring glob = directory;
+    const wchar_t last = glob.back();
+    if (last != L'\\' && last != L'/')
+    {
+        glob += L"\\";
+    }
+    glob += L"*";
+    WIN32_FIND_DATAW data = {};
+    HANDLE find = FindFirstFileW(glob.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE)
+    {
+        return matches;
+    }
+    do
+    {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            continue;
+        }
+        const std::wstring name(data.cFileName);
+        if (name.size() >= prefix.size() + suffix.size() &&
+            name.compare(0, prefix.size(), prefix) == 0 &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+        {
+            std::wstring full(directory);
+            const wchar_t dirLast = full.back();
+            if (dirLast != L'\\' && dirLast != L'/')
+            {
+                full += L"\\";
+            }
+            full += name;
+            matches.push_back(std::move(full));
+        }
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    return matches;
+}
+
 bool KmonIsWindowsBuiltinLeaf(const std::wstring& leaf)
 {
     const std::wstring name = KmonBasenameLower(leaf);
@@ -8107,6 +8155,10 @@ bool KernelMonitor::CaptureRegion(
     {
         std::lock_guard<std::mutex> lock(CapturesMutex);
         CapturedBytes += bytes.size();
+        if (CapturedFiles.size() < 4096)
+        {
+            CapturedFiles.push_back(path);
+        }
     }
     if (captureNote != nullptr)
     {
@@ -8114,6 +8166,29 @@ bool KernelMonitor::CaptureRegion(
             L" capture_bytes=" + std::to_wstring(bytes.size());
     }
     return true;
+}
+
+std::vector<std::wstring> KernelMonitor::SessionLogPaths() const
+{
+    std::wstring logDirectory;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        logDirectory = Options.LogDirectory.empty()
+            ? ExeDirectory()
+            : Options.LogDirectory;
+    }
+    // Every kmon rotation carries the console pid, so the glob is
+    // session-exact even after restarts inside the same directory.
+    return KmonFindFilesWithPattern(
+        logDirectory,
+        L"kmon-events." + std::to_wstring(GetCurrentProcessId()) + L".",
+        L".jsonl");
+}
+
+std::vector<std::wstring> KernelMonitor::SessionCapturePaths() const
+{
+    std::lock_guard<std::mutex> lock(CapturesMutex);
+    return CapturedFiles;
 }
 
 void KernelMonitor::ClearEmittedKey(const std::wstring& key)
@@ -14813,6 +14888,52 @@ bool KernelMonitorSelfTest()
                 !KmonBytesLookLikeCode(codeish.data(), codeish.size()) ||
                 !KmonTaskLooksLikeLsassRead(L"KERNEL_THREATINT_TASK_READVM") ||
                 KmonTaskLooksLikeLsassRead(L"KERNEL_THREATINT_TASK_WRITEVM"))
+            {
+                break;
+            }
+        }
+        {
+            // Session-log glob: rotation names carry the pid, foreign pids
+            // and non-matching suffixes must not leak into the exit summary.
+            wchar_t tempDir[MAX_PATH] = {};
+            if (GetTempPathW(MAX_PATH, tempDir) == 0)
+            {
+                break;
+            }
+            const std::wstring base = std::wstring(tempDir) + L"knlivedbg-glob-selftest";
+            CreateDirectoryW(base.c_str(), nullptr);
+            const std::wstring matchA = base + L"\\kmon-events.4242.0.jsonl";
+            const std::wstring matchB = base + L"\\kmon-events.4242.1.jsonl";
+            const std::wstring foreignPid = base + L"\\kmon-events.7777.0.jsonl";
+            const std::wstring unrelated = base + L"\\unrelated.jsonl";
+            const std::wstring badSuffix = base + L"\\kmon-events.4242.0.txt";
+            const wchar_t* create[] = { matchA.c_str(), matchB.c_str(), foreignPid.c_str(), unrelated.c_str(), badSuffix.c_str() };
+            for (const wchar_t* path : create)
+            {
+                HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (file != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(file);
+                }
+            }
+            std::vector<std::wstring> found = KmonFindFilesWithPattern(
+                base,
+                L"kmon-events.4242.",
+                L".jsonl");
+            bool globOk = found.size() == 2;
+            for (const std::wstring& path : found)
+            {
+                if (path == foreignPid || path == unrelated || path == badSuffix)
+                {
+                    globOk = false;
+                }
+            }
+            for (const wchar_t* path : create)
+            {
+                DeleteFileW(path);
+            }
+            RemoveDirectoryW(base.c_str());
+            if (!globOk)
             {
                 break;
             }

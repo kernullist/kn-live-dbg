@@ -50,6 +50,13 @@ struct KmonEvent
     std::map<std::wstring, std::wstring> Evidence;
 };
 
+// Returns full paths of files in <directory> whose leaf name starts with
+// <prefix> and ends with <suffix>. Missing directory yields an empty list.
+std::vector<std::wstring> KmonFindFilesWithPattern(
+    const std::wstring& directory,
+    const std::wstring& prefix,
+    const std::wstring& suffix);
+
 struct KmonStats
 {
     uint64_t EventsKept = 0;
@@ -96,6 +103,12 @@ public:
         std::wstring* error);
     bool Stop(std::wstring* error);
     bool IsActive() const;
+
+    // Session artifact inventory for the exit summary: kmon log files for
+    // this process id (all rotations) and every capture written this
+    // session. Empty when kmon never started.
+    std::vector<std::wstring> SessionLogPaths() const;
+    std::vector<std::wstring> SessionCapturePaths() const;
 
     bool AddWatchPid(uint32_t pid);
     bool RemoveWatchPid(uint32_t pid);
@@ -322,8 +335,9 @@ private:
     // Detection-time evidence capture state: per-session (layer, address)
     // dedupe plus a byte budget so auto-capture can never fill the disk.
     // Guarded by CapturesMutex; reset on Start().
-    std::mutex CapturesMutex;
+    mutable std::mutex CapturesMutex;
     std::set<std::wstring> CapturedKeys;
+    std::vector<std::wstring> CapturedFiles;
     uint64_t CapturedBytes = 0;
 
     std::atomic<uint64_t> EventsKept{0};
