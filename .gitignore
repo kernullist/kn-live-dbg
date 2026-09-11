@@ -38,3 +38,8 @@ vendor/*
 !vendor/**
 !third_party/
 !third_party/**
+
+# Pre-existing capture artifacts and agent scratch (user decision, outside any Goal)
+knlivedbg-logs/
+dump-bin/
+.zcode/
