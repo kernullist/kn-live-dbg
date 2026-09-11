@@ -31527,6 +31527,10 @@ static int RunConsoleSurfaceSelfTest()
             L"kmon-artifact-primitives");
         CheckConsoleSurfaceSelfTest(
             &context,
+            KernelMonitorHiddenDriverSelfTest(),
+            L"kmon-hidden-driver-regression");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             IsNativeOwnedCommand(L"!kmon"),
             L"kmon-is-native-owned");
         {
