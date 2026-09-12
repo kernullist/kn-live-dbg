@@ -631,6 +631,18 @@ namespace
 
     bool RunChild(const std::wstring& scenario, uint32_t seconds)
     {
+        // /overwrite replaces the first 64 bytes of this image's exec section
+        // with a 0x90 sled, and that sled lands on the code that writes the pid
+        // file and the KMON_FIXTURE marker (measured: /child stamp leaves a
+        // 6-byte artifact.pid, /child overwrite leaves the same file at 0
+        // bytes). Announce before the destructive step so the documented signal
+        // of docs/KMON_TEST_TARGET.md stays valid for every scenario.
+        const bool announceFirst = scenario == L"overwrite";
+        if (announceFirst)
+        {
+            Announce(GetCurrentProcessId(), scenario.c_str());
+        }
+
         bool ok = false;
         if (scenario == L"overwrite")
         {
@@ -656,9 +668,12 @@ namespace
         {
             ok = true;
         }
-        if (ok)
+        if (ok && !announceFirst)
         {
             Announce(GetCurrentProcessId(), scenario.c_str());
+        }
+        if (ok)
+        {
             HoldSeconds(seconds);
         }
         return ok;

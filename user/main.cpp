@@ -25009,6 +25009,9 @@ static void PrintKmonHelp()
     std::wcout << L"  hidden: process create, local AllocVM, kernel R/W,\n";
     std::wcout << L"          ReadVM/suspend/resume alone\n";
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
+    std::wcout << L"  driver.vanished / driver.unnotified_load assume TI lifecycle events arrive; where\n";
+    std::wcout << L"  the unload notification never fires a clean unload can print as vanished.\n";
+    std::wcout << L"  the kernel-side module-list fingerprint is not implemented (host-side diff only).\n";
     std::wcout << L"  a quiet idle host is mostly silent after the start line.\n";
     std::wcout << L"\n";
     std::wcout << L"logged kinds:\n";
@@ -25028,6 +25031,14 @@ static void PrintKmonHelp()
     std::wcout << L"                          headerless kpage/pool import stubs (kpage_code/pool_code) during\n";
     std::wcout << L"                          mapper.watch, non-paged big-pool stubs also while idle (>=3 stubs),\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
+    std::wcout << L"  driver.vanished         resident module left PsLoadedModuleList with no unload event\n";
+    std::wcout << L"                          (2 scans must agree, 120s lifecycle window, fail-closed)\n";
+    std::wcout << L"  driver.unnotified_load  module appeared in PsLoadedModuleList with no load event\n";
+    std::wcout << L"  driver.remap            same module name on a new image base, no lifecycle event\n";
+    std::wcout << L"  driver.tampered         a loaded driver's image head/entry hash or DRIVER_OBJECT\n";
+    std::wcout << L"                          identity fields changed after the load (fail-closed)\n";
+    std::wcout << L"  driver.evidence_asymmetry  driver still in PsLoadedModuleList but its service key\n";
+    std::wcout << L"                          and/or its image file on disk is gone\n";
     std::wcout << L"  mapper.watch            30s burst after ANY kernel driver load/unload (capped 90s);\n";
     std::wcout << L"                          leftover+wipe diffs,\n";
     std::wcout << L"                          400ms mapper/pool, 1.5s kpage, one DeepPfn pass per window\n";
@@ -31545,6 +31556,11 @@ static int RunConsoleSurfaceSelfTest()
                     kmonHelp.find(L"!kmon watch") != std::wstring::npos &&
                     kmonHelp.find(L"driver.image_only") != std::wstring::npos &&
                     kmonHelp.find(L"mapper.watch") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.vanished") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.unnotified_load") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.remap") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.tampered") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.evidence_asymmetry") != std::wstring::npos &&
                     kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos,
                 L"kmon-help-covers-drop-load-and-live-tail");
         }
