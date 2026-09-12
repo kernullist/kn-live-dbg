@@ -47,8 +47,12 @@ Completed core slices:
     (pool PE / unbacked DRIVER_OBJECT / kpage PE), unbacked callbacks and
     input/SSDT/IDT hooks, mapper leftovers, post-load driver hiding
     (`driver.vanished` / `driver.unnotified_load` / `driver.remap` /
-    `driver.tampered` / `driver.evidence_asymmetry`: fail-closed host-side
-    `PsLoadedModuleList` diff), hidden processes (CID/handle
+    `driver.tampered` / `driver.evidence_asymmetry` / `driver.inventory_divergence` /
+    `driver.module_chain_broken`: fail-closed host-side `PsLoadedModuleList`
+    diff plus a kernel-context cross view; the service-key-only asymmetry
+    form and the single-scan vanished verdict need corroboration, and a
+    bounded `_OBJECT_TYPE.TypeList` sweep reaches DRIVER_OBJECTs that neither
+    the `\Driver` directory nor the `\Device` back-references expose), hidden processes (CID/handle
     confirm for DKOM unlink), Windows-named masquerade, user-mode
     EXE-region replace (`process.hollow`: private/unbacked MEM_IMAGE,
     mapped-path, process-overwriting COW and reloc-aware `.text` vs disk

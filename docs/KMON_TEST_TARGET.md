@@ -41,7 +41,7 @@ instead of leaving PEB ImageBase unmapped.
 | Flag | Artifact | Expected `process.hollow` / related layer |
 |---|---|---|
 | `/masquerade` | temp `notepad.exe` copy, no memory patch | `process.masquerade` |
-| `/overwrite` | NOP patch on own `.text`, RX restored | `exe_cow`, `exe_text` |
+| `/overwrite` | NOP patch on own `.text` (`0x90` sled over the section head, `kOverwritePatchBytes`), RX restored | `exe_cow`, `exe_text` |
 | `/stamp` | in-memory `TimeDateStamp` rewritten | `hollow` |
 | `/nomz` | ImageBase MZ wiped | `exe_no_mz` |
 | `/orphan-private` | `VirtualAlloc` RX page with MZ | `exe_orphan_private` |
@@ -64,7 +64,7 @@ Stdout line:
 KMON_FIXTURE pid=<pid> scenario=<name> image=<path>
 ```
 
-PID is also written to `%TEMP%\kn-live-dbg-kmon\artifact.pid`.
+PID is also written to `%TEMP%\kn-live-dbg-kmon\artifact.pid`. Every mode prints that line and writes that pid file; `/overwrite` announces before its destructive step because the `0x90` sled lands on the code that emits them, so a `/child overwrite` run still leaves the documented readiness signal.
 
 ## Live `!kmon` pass
 
@@ -100,7 +100,17 @@ hold expires.
 2. A private MZ page is `MEM_PRIVATE`.
 3. `GetMappedFileNameW` returns a path for the current EXE mapping.
 4. If the fixture EXE is next to `KnLiveDbg.exe` (or under `tools\`), a
-   `/child overwrite` process shows private COW pages.
+   `/child overwrite` process shows private COW pages. The parent observes
+   the sled in the child image before it judges the mapping, and the
+   observed length comes from the fixture shared contract
+   (`kmon_test_target/KmonTestTargetContract.h`) instead of a second
+   hard-coded copy: a sled shorter than the contract fails this case rather
+   than silently skipping the comparison.
+5. When the fixture binary or process creation is unavailable the
+   cross-process half is skipped with one explicit reason line naming which
+   of the six conditions applied (fixture missing, `CreateProcessW` failed,
+   `OpenProcess` refused, PEB ImageBase unreadable, contract sled never
+   observed, child exited before the COW sample).
 
 That gate does not require `write on` or `!kmon`. It does **not** assert that
 an unmodified `KnLiveDbg.exe` `.text` matches disk: reloc-aware compare of the

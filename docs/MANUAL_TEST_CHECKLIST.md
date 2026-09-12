@@ -258,14 +258,24 @@ must stay suspended.
 .\x64\Release\KnLiveDbg.exe --self-test console
 ```
 
-`kmon-artifact-primitives` must pass. That does not replace the live `!kmon`
-pass.
+`kmon-artifact-primitives` and `kmon-hidden-driver-regression` must pass. The
+COW half shares one sled-length contract with the fixture
+(`kmon_test_target/KmonTestTargetContract.h`), so a sled shorter than the
+contract fails the case instead of silently skipping it, and a skipped
+cross-process half prints exactly one reason line (fixture missing,
+`CreateProcessW` failed, `OpenProcess` refused, PEB ImageBase unreadable,
+contract sled never observed, child exited before the COW sample). That does not replace the live `!kmon` pass.
 
 ### Still manual
 
 - Game + anti-cheat idle FP soak (Program Files EAC/BE/Vanguard `drop_load` is
   expected; overlay `inject.remote` should stay off until `/name game.exe`).
 - Live DKOM `ActiveProcessLinks` unlink (no kernel hide fixture yet).
+- Live post-load driver hiding (module-list unlink, a query-filtered module
+  view, a cut `\Driver` link, or an anonymous `DRIVER_OBJECT`): the host-side
+  diff, the kernel-context cross view, the loader-chain check, and the
+  `_OBJECT_TYPE.TypeList` sweep are exercised by the synthetic
+  `kmon-hidden-driver-regression` self-test instead of a kernel fixture.
 
 ## Positive controls (optional)
 
