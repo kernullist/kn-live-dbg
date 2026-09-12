@@ -10555,6 +10555,15 @@ void KernelMonitor::ScanDriverTamper()
     }
 }
 
+// A found-but-unreported anonymous object is a silent truncation unless the
+// count reaches the output, so the reporting cap is a pure predicate that the
+// self-test can drive without a live kernel.
+static bool KmonTypeListReportCapped(uint64_t found, uint64_t dropped, uint64_t reported)
+{
+    const uint64_t unreported = found > reported ? found - reported : 0;
+    return dropped > 0 || unreported > 0;
+}
+
 void KernelMonitor::ScanUnbackedDriverObjects()
 {
     DeviceClient* device = nullptr;
@@ -10838,23 +10847,31 @@ void KernelMonitor::ScanUnbackedDriverObjects()
         }
     }
 
+    std::set<uint64_t> knownDriverObjects;
+    for (const DriverIntegrityRecord& record : result.Records)
+    {
+        if (record.DriverObject != 0)
+        {
+            knownDriverObjects.insert(record.DriverObject);
+        }
+    }
+    // A truncated \Driver walk leaves objects that were simply not listed, so
+    // the type-list sweep below must not run against a partial directory view.
+    const bool driverDirectoryComplete = !result.Truncated;
+    DeviceBackrefResult backrefs = {};
+    // True only when the \Device back-reference pass completed, so an object
+    // missing from it owns no device rather than merely being unseen.
+    bool backrefViewComplete = false;
+
     // P0: driver objects that own a \Device object but are missing from the
     // \Driver enumeration had their object-directory link cut. The \Driver
     // walk above cannot see them at all, so this back-reference pass is the
     // only path that reaches them.
     {
-        std::set<uint64_t> knownDriverObjects;
-        for (const DriverIntegrityRecord& record : result.Records)
-        {
-            if (record.DriverObject != 0)
-            {
-                knownDriverObjects.insert(record.DriverObject);
-            }
-        }
-        DeviceBackrefResult backrefs = {};
         std::wstring backrefError;
         if (scanner.ScanDeviceDriverBackrefs(knownDriverObjects, &backrefs, &backrefError))
         {
+            backrefViewComplete = backrefs.Complete && backrefs.DirectoryFound;
             ClearEmittedKey(L"scan_failed:devbackref");
             for (const AnonymousDriverBackrefRecord& anonymous : backrefs.AnonymousDrivers)
             {
@@ -10910,6 +10927,165 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                 L"driver_object",
                 L"\\Device back-reference scan skipped; the device object directory was not walkable",
                 backrefError.empty() ? L"ScanDeviceDriverBackrefs returned false" : backrefError);
+        }
+    }
+
+    // P0 follow-up: a DRIVER_OBJECT whose \Driver directory link was cut and
+    // which owns no device is invisible to both views above. The driver object
+    // type's own list still holds every allocated object, so this bounded sweep
+    // is the only path left. It runs on its own cadence because it costs a
+    // chain walk plus one read per unknown candidate.
+    {
+        constexpr uint32_t kTypeListScanIntervalMs = 60000;
+        constexpr uint32_t kTypeListScanWatchIntervalMs = 5000;
+        constexpr size_t kTypeListEmitCap = 16;
+
+        const uint64_t typeListNow = GetTickCount64();
+        bool typeListDue = false;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            if (NextTypeListScanTickMs == 0 || typeListNow >= NextTypeListScanTickMs)
+            {
+                typeListDue = true;
+                NextTypeListScanTickMs = typeListNow +
+                    (IsMapperWatchActive()
+                        ? kTypeListScanWatchIntervalMs
+                        : kTypeListScanIntervalMs);
+            }
+        }
+
+        if (typeListDue)
+        {
+            if (!driverDirectoryComplete)
+            {
+                // fail-closed: a partial \Driver view cannot prove that an
+                // object is absent from it.
+                EmitMappedResidue(
+                    L"scan_failed:drvobj:typelist",
+                    std::wstring(),
+                    L"driver_object",
+                    L"driver object type-list sweep withheld; the \\Driver enumeration was truncated",
+                    L"DriverIntegrityResult.Truncated is true");
+            }
+            else
+            {
+                DriverTypeListResult typeList = {};
+                std::wstring typeListError;
+                if (!scanner.ScanTypeListDriverObjects(
+                        knownDriverObjects, backrefs.DeviceDriverObjects, &typeList, &typeListError))
+                {
+                    EmitMappedResidue(
+                        L"scan_failed:drvobj:typelist",
+                        std::wstring(),
+                        L"driver_object",
+                        L"driver object type-list sweep skipped; the type list was not readable",
+                        typeListError.empty()
+                            ? std::wstring(L"ScanTypeListDriverObjects returned false")
+                            : typeListError);
+                }
+                else
+                {
+                    ClearEmittedKey(L"scan_failed:drvobj:typelist");
+                    if (typeList.Truncated)
+                    {
+                        EmitMappedResidue(
+                            L"scan_failed:drvobj:typelist:truncated",
+                            std::wstring(),
+                            L"driver_object",
+                            L"driver object type-list walk was truncated; extra anonymous objects may be missed",
+                            L"the walk stopped at the entry cap or on a cycle");
+                    }
+                    else
+                    {
+                        ClearEmittedKey(L"scan_failed:drvobj:typelist:truncated");
+                    }
+
+                    size_t typeListEmits = 0;
+                    for (const AnonymousTypeListDriverRecord& anonymous : typeList.AnonymousDrivers)
+                    {
+                        if (typeListEmits >= kTypeListEmitCap)
+                        {
+                            break;
+                        }
+                        // An object that owns a device but is missing from the
+                        // \Device walk is only "unreachable" when that walk
+                        // completed; otherwise the device view is unavailable
+                        // and the object is not reported.
+                        if (!backrefViewComplete && anonymous.DeviceObject != 0)
+                        {
+                            continue;
+                        }
+                        ++typeListEmits;
+
+                        const std::wstring label = anonymous.DriverName.empty()
+                            ? HexU64(anonymous.DriverObject)
+                            : anonymous.DriverName;
+                        std::wstring notes =
+                            L"driver_object_not_in_driver_directory=true type_list_only=true device_backref=" +
+                            std::wstring(
+                                !backrefViewComplete ? L"unknown" :
+                                    (anonymous.DeviceObject != 0 ? L"yes" : L"no")) +
+                            L" driver_object=" + HexU64(anonymous.DriverObject);
+                        if (!anonymous.DriverName.empty())
+                        {
+                            notes += L" driver_name=" + anonymous.DriverName;
+                        }
+                        if (anonymous.HasDriverStart)
+                        {
+                            notes += L" driver_start=" + HexU64(anonymous.DriverStart) +
+                                L" driver_size=" + HexU64(anonymous.DriverSize);
+                        }
+                        else
+                        {
+                            notes += L" driver_start=0";
+                        }
+                        if (anonymous.DriverSection != 0)
+                        {
+                            notes += L" driver_section=" + HexU64(anonymous.DriverSection);
+                        }
+                        if (anonymous.DeviceObject != 0)
+                        {
+                            notes += L" device=" + HexU64(anonymous.DeviceObject);
+                        }
+                        if (!anonymous.ModuleName.empty())
+                        {
+                            notes += L" module=" + anonymous.ModuleName;
+                        }
+                        notes += L" dispatch_backed=" + std::to_wstring(anonymous.BackedDispatch) +
+                            L" dispatch_unbacked=" + std::to_wstring(anonymous.UnbackedDispatch) +
+                            L" scan=driver_object_type_list" +
+                            L" followup=!driverobj " + label +
+                            L"; !driver; !devstack; !module integrity";
+                        EmitMappedResidue(
+                            L"drvobj_typelist:" + HexU64(anonymous.DriverObject),
+                            label,
+                            L"driver_object",
+                            L"DRIVER_OBJECT " + label +
+                                L" is in the driver object type list but in neither the \\Driver directory nor the \\Device back-reference view",
+                            notes);
+                    }
+
+                    const bool typeListCapped = KmonTypeListReportCapped(
+                        typeList.AnonymousFound,
+                        typeList.AnonymousDropped,
+                        static_cast<uint64_t>(typeListEmits));
+                    if (typeListCapped)
+                    {
+                        EmitMappedResidue(
+                            L"scan_failed:drvobj:typelist:reportcap",
+                            std::wstring(),
+                            L"driver_object",
+                            L"anonymous driver object reports were capped; extra objects were not reported",
+                            L"anonymous_found=" + std::to_wstring(typeList.AnonymousFound) +
+                                L" anonymous_dropped=" + std::to_wstring(typeList.AnonymousDropped) +
+                                L" reported=" + std::to_wstring(typeListEmits));
+                    }
+                    else
+                    {
+                        ClearEmittedKey(L"scan_failed:drvobj:typelist:reportcap");
+                    }
+                }
+            }
         }
     }
 }
@@ -16624,6 +16800,21 @@ bool KernelMonitorHiddenDriverSelfTest()
         asymmetryEvent.Kind = L"driver.evidence_asymmetry";
         KmonOptions asymmetryOptions = {};
         ok = ok && KmonWatchMatches(asymmetryEvent, asymmetryOptions);
+    }
+
+    // --- type-list reporting cap (silent truncation must be surfaced) ------
+    {
+        // Everything that was found reached the caller.
+        ok = ok && !KmonTypeListReportCapped(3, 0, 3);
+        // The result cap dropped objects before the emit loop saw them.
+        ok = ok && KmonTypeListReportCapped(65, 1, 16);
+        // The emit cap stopped early even though the result held every object.
+        ok = ok && KmonTypeListReportCapped(64, 0, 16);
+        // fail-closed: nothing found is nothing to warn about.
+        ok = ok && !KmonTypeListReportCapped(0, 0, 0);
+        // A reported count above the found count cannot happen and must not
+        // turn into a warning on its own.
+        ok = ok && !KmonTypeListReportCapped(2, 0, 5);
     }
 
     // --- kernel-context cross-view (driver.inventory_divergence) ----------

@@ -398,6 +398,10 @@ private:
     // print a verdict nor corroborate the host-side diff.
     std::map<std::wstring, uint32_t> KernelViewPending;
     uint64_t NextKernelViewScanTickMs = 0;
+    // P0 follow-up: the driver object type-list sweep costs a chain walk plus
+    // one read per unknown candidate, so it runs on its own cadence and only
+    // speeds up inside a mapper watch window.
+    uint64_t NextTypeListScanTickMs = 0;
     struct MapperWatchFingerprint
     {
         std::unordered_set<std::wstring> Unloaded;

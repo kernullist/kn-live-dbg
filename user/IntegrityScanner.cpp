@@ -4334,6 +4334,7 @@ bool IntegrityScanner::ScanDeviceDriverBackrefs(
             if (knownDriverObjects.count(driverObject) != 0)
             {
                 ++result->DevicesWithKnownDriver;
+                result->DeviceDriverObjects.insert(driverObject);
                 continue;
             }
             if (!reported.insert(driverObject).second)
@@ -4396,12 +4397,593 @@ bool IntegrityScanner::ScanDeviceDriverBackrefs(
                     record.ModuleName = owner->ImageName;
                 }
             }
+            result->DeviceDriverObjects.insert(driverObject);
             result->AnonymousDrivers.push_back(std::move(record));
         }
 
         result->Complete = !result->Truncated;
         ok = true;
     } while (false);
+
+    return ok;
+}
+
+// A node in nt!_OBJECT_TYPE.TypeList is a LIST_ENTRY embedded in the object,
+// and no PDB field names the distance between that link and the object body.
+// The offset is therefore derived from objects the \Driver walk already
+// confirmed: every (node, known driver object) pair proposes one candidate
+// offset, and only an offset confirmed by at least two independent known
+// objects is trusted. Without that corroboration a wrong offset would turn
+// arbitrary pool bytes into "driver objects".
+constexpr int64_t kMaxTypeListLinkDelta = 0x1000;
+constexpr uint64_t kMinTypeListCalibrationMatches = 2;
+
+// Walks one LIST_ENTRY chain through an injected reader. The termination
+// rules -- reach the list head, revisit a node, run out of the entry cap, or
+// fail to read a link -- are the whole safety story for the sweep, so they are
+// separated from the kernel reads and driven by the self-test with a synthetic
+// chain.
+template <typename ReadLinkFn>
+bool WalkObjectTypeListChain(
+    uint64_t headField,
+    uint64_t firstNode,
+    size_t maxEntries,
+    const ReadLinkFn& readLink,
+    std::vector<uint64_t>* nodes,
+    bool* truncated)
+{
+    if (nodes == nullptr || truncated == nullptr || maxEntries == 0)
+    {
+        return false;
+    }
+
+    nodes->clear();
+    *truncated = false;
+    if (firstNode == 0 || firstNode == headField)
+    {
+        return false;
+    }
+
+    std::set<uint64_t> visited;
+    uint64_t node = firstNode;
+    while (IsKernelAddress(node) && node != headField)
+    {
+        if (nodes->size() >= maxEntries)
+        {
+            *truncated = true;
+            break;
+        }
+        if (!visited.insert(node).second)
+        {
+            break;
+        }
+        nodes->push_back(node);
+        uint64_t next = 0;
+        if (!readLink(node, &next) || next == 0)
+        {
+            break;
+        }
+        node = next;
+    }
+
+    return !nodes->empty();
+}
+
+static bool DeriveTypeListLinkDelta(
+    const std::vector<uint64_t>& nodes,
+    const std::set<uint64_t>& knownDriverObjects,
+    int64_t* delta,
+    uint64_t* matchCount)
+{
+    bool ok = false;
+
+    do
+    {
+        if (delta == nullptr || matchCount == nullptr)
+        {
+            break;
+        }
+
+        *delta = 0;
+        *matchCount = 0;
+        if (nodes.empty() || knownDriverObjects.size() < kMinTypeListCalibrationMatches)
+        {
+            break;
+        }
+
+        std::map<int64_t, std::set<uint64_t>> support;
+        for (const uint64_t node : nodes)
+        {
+            for (const uint64_t body : knownDriverObjects)
+            {
+                if (node == 0 || body == 0)
+                {
+                    continue;
+                }
+                const int64_t candidate =
+                    static_cast<int64_t>(node) - static_cast<int64_t>(body);
+                if (candidate == 0 || candidate > kMaxTypeListLinkDelta ||
+                    candidate < -kMaxTypeListLinkDelta)
+                {
+                    continue;
+                }
+                if ((candidate % 8) != 0)
+                {
+                    continue;
+                }
+                support[candidate].insert(body);
+            }
+        }
+
+        int64_t best = 0;
+        uint64_t bestCount = 0;
+        bool tie = false;
+        for (const auto& entry : support)
+        {
+            const uint64_t count = entry.second.size();
+            if (count > bestCount)
+            {
+                bestCount = count;
+                best = entry.first;
+                tie = false;
+            }
+            else if (count == bestCount)
+            {
+                tie = true;
+            }
+        }
+
+        // A single confirming object can be a coincidence, and two offsets
+        // with the same support cannot be told apart: both are refused rather
+        // than guessed.
+        if (bestCount < kMinTypeListCalibrationMatches || tie)
+        {
+            break;
+        }
+
+        *delta = best;
+        *matchCount = bestCount;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+// Only a candidate that carries the I/O manager's own \Driver\Name string is
+// reported. A candidate that reads as unnamed is either an object with a wiped
+// name (documented as out of scope for this sweep) or a mis-derived address,
+// and the two cannot be told apart from the body alone.
+static bool TypeListDriverCandidateIsNamed(const std::wstring& name)
+{
+    if (name.size() < 9)
+    {
+        return false;
+    }
+    return EqualsNoCaseLocal(name.substr(0, 8), L"\\Driver\\");
+}
+
+bool IntegrityScanner::ScanTypeListDriverObjects(
+    const std::set<uint64_t>& knownDriverObjects,
+    const std::set<uint64_t>& deviceDriverObjects,
+    DriverTypeListResult* result,
+    std::wstring* error)
+{
+    // The chain is walked to the list head or the cycle guard; the cap keeps a
+    // corrupted list from turning the sweep into an unbounded loop.
+    constexpr size_t kMaxTypeListEntries = 2048;
+    constexpr size_t kMaxAnonymousReports = 64;
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid driver type-list result output";
+            }
+            break;
+        }
+
+        *result = DriverTypeListResult{};
+        result->DriverObjectsKnown = knownDriverObjects.size();
+        result->DeviceObjectsKnown = deviceDriverObjects.size();
+
+        if (symbols_.Modules().empty())
+        {
+            if (!symbols_.LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        ObjectWalkContext ctx(device_, symbols_);
+
+        // nt!IoDriverObjectType is the direct global for the driver object
+        // type; the object type directory is the fallback.
+        uint64_t typeAddress = 0;
+        uint64_t typeGlobal = 0;
+        if (ctx.ResolveSymbol(L"nt!IoDriverObjectType", &typeGlobal) &&
+            ctx.ReadU64(typeGlobal, &typeAddress) &&
+            IsKernelAddress(typeAddress))
+        {
+            // resolved from the global
+        }
+        else
+        {
+            typeAddress = 0;
+            std::vector<ObjectTypeRecord> types;
+            std::wstring typeError;
+            if (!DiscoverObjectTypes(ctx, &types, &typeError))
+            {
+                if (error != nullptr)
+                {
+                    *error = typeError.empty()
+                        ? std::wstring(L"object types were not enumerated")
+                        : typeError;
+                }
+                break;
+            }
+            const ObjectTypeRecord* driverType = FindObjectType(types, L"Driver");
+            if (driverType == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"the Driver object type was not found";
+                }
+                break;
+            }
+            typeAddress = driverType->Address;
+        }
+
+        TypeFieldInfo typeList = {};
+        TypeFieldInfo driverStart = {};
+        TypeFieldInfo driverSize = {};
+        TypeFieldInfo driverSection = {};
+        TypeFieldInfo deviceObject = {};
+        TypeFieldInfo fastIoDispatch = {};
+        TypeFieldInfo driverUnload = {};
+        TypeFieldInfo majorFunction = {};
+        TypeFieldInfo driverName = {};
+        if (!ctx.FindField(L"nt!_OBJECT_TYPE", {L"TypeList"}, &typeList))
+        {
+            if (error != nullptr)
+            {
+                *error = L"_OBJECT_TYPE.TypeList was not resolved";
+            }
+            break;
+        }
+        if (!ctx.FindField(L"nt!_DRIVER_OBJECT", {L"DriverStart"}, &driverStart) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"DriverSize"}, &driverSize) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"DriverSection"}, &driverSection) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"DeviceObject"}, &deviceObject) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"FastIoDispatch"}, &fastIoDispatch) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"DriverUnload"}, &driverUnload) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"MajorFunction"}, &majorFunction))
+        {
+            if (error != nullptr)
+            {
+                *error = L"_DRIVER_OBJECT field layout was not resolved";
+            }
+            break;
+        }
+        ctx.FindField(L"nt!_DRIVER_OBJECT", {L"DriverName"}, &driverName);
+
+        uint64_t headField = 0;
+        uint64_t firstNode = 0;
+        if (!TryAdd(typeAddress, typeList.Offset, &headField) ||
+            !ctx.ReadU64(headField, &firstNode))
+        {
+            if (error != nullptr)
+            {
+                *error = L"the driver object type list head was not readable";
+            }
+            break;
+        }
+        if (firstNode == 0 || firstNode == headField)
+        {
+            // An empty list is indistinguishable from a type that does not
+            // maintain one; either way the sweep has nothing to conclude from.
+            if (error != nullptr)
+            {
+                *error = L"the driver object type list is empty";
+            }
+            break;
+        }
+
+        std::vector<uint64_t> nodes;
+        bool truncated = false;
+        const auto readTypeListLink = [&ctx](uint64_t address, uint64_t* next) -> bool
+        {
+            return ctx.ReadU64(address, next);
+        };
+        if (!WalkObjectTypeListChain(
+                headField, firstNode, kMaxTypeListEntries, readTypeListLink, &nodes, &truncated))
+        {
+            if (error != nullptr)
+            {
+                *error = L"the driver object type list walk read no entries";
+            }
+            break;
+        }
+
+        result->TypeListEntries = nodes.size();
+        result->Truncated = truncated;
+        if (nodes.empty())
+        {
+            if (error != nullptr)
+            {
+                *error = L"the driver object type list walk read no entries";
+            }
+            break;
+        }
+
+        int64_t linkDelta = 0;
+        uint64_t calibrationMatches = 0;
+        if (!DeriveTypeListLinkDelta(
+                nodes, knownDriverObjects, &linkDelta, &calibrationMatches))
+        {
+            if (error != nullptr)
+            {
+                *error = L"the type-list link offset could not be calibrated against the \\Driver walk";
+            }
+            break;
+        }
+        result->CalibrationMatches = calibrationMatches;
+
+        for (const uint64_t candidateNode : nodes)
+        {
+            const uint64_t body = static_cast<uint64_t>(
+                static_cast<int64_t>(candidateNode) - linkDelta);
+            if (!IsKernelAddress(body) || (body % 8) != 0)
+            {
+                continue;
+            }
+            ++result->CandidatesScanned;
+            if (knownDriverObjects.count(body) != 0)
+            {
+                ++result->DriversInDirectory;
+                continue;
+            }
+            if (deviceDriverObjects.count(body) != 0)
+            {
+                ++result->DriversInDeviceView;
+                continue;
+            }
+
+            DirectoryObjectRecord object = {};
+            object.Body = body;
+            object.Path = L"\\Driver";
+            if (driverName.Length != 0)
+            {
+                uint64_t nameAddress = 0;
+                if (TryAdd(body, driverName.Offset, &nameAddress))
+                {
+                    ctx.ReadUnicodeStringAt(nameAddress, &object.Name);
+                }
+            }
+            if (!TypeListDriverCandidateIsNamed(object.Name))
+            {
+                ++result->UnnamedCandidates;
+                continue;
+            }
+
+            DriverIntegrityRecord record = {};
+            if (!ReadDriverRecord(
+                    device_,
+                    symbols_,
+                    object,
+                    driverStart,
+                    driverSize,
+                    driverSection,
+                    deviceObject,
+                    fastIoDispatch,
+                    driverUnload,
+                    majorFunction,
+                    &record))
+            {
+                continue;
+            }
+
+            AnonymousTypeListDriverRecord anonymous = {};
+            anonymous.DriverObject = record.DriverObject;
+            anonymous.DriverName = record.Name;
+            anonymous.DriverStart = record.DriverStart;
+            anonymous.DriverSize = record.DriverSize;
+            anonymous.DriverSection = record.DriverSection;
+            anonymous.DeviceObject = record.DeviceObject;
+            anonymous.HasDriverStart = record.HasDriverStart;
+            anonymous.ModuleName = record.OwningModule;
+            for (const DriverDispatchRecord& dispatch : record.Dispatch)
+            {
+                if (dispatch.Function == 0)
+                {
+                    continue;
+                }
+                if (dispatch.InLoadedModule)
+                {
+                    ++anonymous.BackedDispatch;
+                }
+                else
+                {
+                    ++anonymous.UnbackedDispatch;
+                }
+            }
+            ++result->AnonymousFound;
+            if (result->AnonymousDrivers.size() < kMaxAnonymousReports)
+            {
+                result->AnonymousDrivers.push_back(std::move(anonymous));
+            }
+            else
+            {
+                ++result->AnonymousDropped;
+            }
+        }
+
+        result->Complete = !truncated;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+bool DriverTypeListSweepSelfTest()
+{
+    bool ok = true;
+
+    // --- link-offset calibration (pure) ------------------------------------
+    {
+        const uint64_t known1 = 0xFFFF800000100000ull;
+        const uint64_t known2 = 0xFFFF800000200000ull;
+        const uint64_t known3 = 0xFFFF800000300000ull;
+        const std::set<uint64_t> known = { known1, known2, known3 };
+        const int64_t linkOffset = 0x18;
+
+        // Every node sits the same distance above its own object: the offset
+        // is recovered from the known objects alone.
+        const std::vector<uint64_t> nodes = {
+            static_cast<uint64_t>(static_cast<int64_t>(known1) + linkOffset),
+            static_cast<uint64_t>(static_cast<int64_t>(known2) + linkOffset),
+            static_cast<uint64_t>(static_cast<int64_t>(known3) + linkOffset),
+            0xFFFF800000400100ull,
+        };
+        int64_t delta = 0;
+        uint64_t matches = 0;
+        ok = ok && DeriveTypeListLinkDelta(nodes, known, &delta, &matches);
+        ok = ok && delta == linkOffset;
+        ok = ok && matches == 3;
+
+        // A link that sits below the object (header info blocks are allocated
+        // before the body) is recovered the same way.
+        std::vector<uint64_t> negativeNodes;
+        for (const uint64_t body : known)
+        {
+            negativeNodes.push_back(
+                static_cast<uint64_t>(static_cast<int64_t>(body) - 0x30));
+        }
+        delta = 0;
+        matches = 0;
+        ok = ok && DeriveTypeListLinkDelta(negativeNodes, known, &delta, &matches);
+        ok = ok && delta == -0x30;
+        ok = ok && matches == 3;
+
+        // A single confirming object is not enough.
+        const std::vector<uint64_t> singleNode = { known1 + 0x18 };
+        delta = 0;
+        matches = 0;
+        ok = ok && !DeriveTypeListLinkDelta(singleNode, known, &delta, &matches);
+        ok = ok && delta == 0;
+        ok = ok && matches == 0;
+
+        // Two offsets with equal support must not be guessed between.
+        const std::vector<uint64_t> tied = {
+            known1 + 0x18, known2 + 0x18, known1 + 0x20, known2 + 0x20 };
+        delta = 0;
+        matches = 0;
+        ok = ok && !DeriveTypeListLinkDelta(tied, known, &delta, &matches);
+
+        // A candidate that cannot be a LIST_ENTRY address is ignored.
+        const std::vector<uint64_t> misaligned = { known1 + 0x1A, known2 + 0x1A };
+        delta = 0;
+        matches = 0;
+        ok = ok && !DeriveTypeListLinkDelta(misaligned, known, &delta, &matches);
+
+        // fail-closed: neither an empty chain nor an empty known set may
+        // produce an offset.
+        ok = ok && !DeriveTypeListLinkDelta(
+            std::vector<uint64_t>(), known, &delta, &matches);
+        ok = ok && !DeriveTypeListLinkDelta(
+            nodes, std::set<uint64_t>(), &delta, &matches);
+        ok = ok && !DeriveTypeListLinkDelta(nodes, { known1 }, &delta, &matches);
+    }
+
+    // --- anonymous candidate shape (pure) ----------------------------------
+    {
+        ok = ok && TypeListDriverCandidateIsNamed(L"\\Driver\\jrvwfjhdyprtjeaf");
+        ok = ok && TypeListDriverCandidateIsNamed(L"\\DRIVER\\ntfs");
+        ok = ok && !TypeListDriverCandidateIsNamed(L"");
+        ok = ok && !TypeListDriverCandidateIsNamed(L"\\Driver");
+        ok = ok && !TypeListDriverCandidateIsNamed(L"\\Driver\\");
+        ok = ok && !TypeListDriverCandidateIsNamed(L"\\FileSystem\\ntfs");
+        ok = ok && !TypeListDriverCandidateIsNamed(L"jrvwfjhdyprtjeaf");
+    }
+
+    // --- chain termination rules (pure, injected reader) -------------------
+    {
+        const uint64_t head = 0xFFFF900000000000ull;
+        const uint64_t nodeA = 0xFFFF900000010000ull;
+        const uint64_t nodeB = 0xFFFF900000020000ull;
+        const uint64_t nodeC = 0xFFFF900000030000ull;
+
+        std::map<uint64_t, uint64_t> chain;
+        chain[nodeA] = nodeB;
+        chain[nodeB] = nodeC;
+        chain[nodeC] = head;
+        const auto readChain = [&chain](uint64_t address, uint64_t* next) -> bool
+        {
+            const auto it = chain.find(address);
+            if (it == chain.end())
+            {
+                return false;
+            }
+            *next = it->second;
+            return true;
+        };
+
+        // A chain that ends at the list head is walked in full.
+        std::vector<uint64_t> nodes;
+        bool truncated = false;
+        ok = ok && WalkObjectTypeListChain(head, nodeA, 16, readChain, &nodes, &truncated);
+        ok = ok && nodes.size() == 3;
+        ok = ok && !truncated;
+        ok = ok && nodes[0] == nodeA && nodes[2] == nodeC;
+
+        // The cap stops the walk and reports the truncation instead of
+        // silently returning a partial view.
+        nodes.clear();
+        truncated = false;
+        ok = ok && WalkObjectTypeListChain(head, nodeA, 2, readChain, &nodes, &truncated);
+        ok = ok && nodes.size() == 2;
+        ok = ok && truncated;
+
+        // A cycle that never reaches the head stops instead of looping.
+        std::map<uint64_t, uint64_t> cyclic;
+        cyclic[nodeA] = nodeB;
+        cyclic[nodeB] = nodeA;
+        const auto readCyclic = [&cyclic](uint64_t address, uint64_t* next) -> bool
+        {
+            const auto it = cyclic.find(address);
+            if (it == cyclic.end())
+            {
+                return false;
+            }
+            *next = it->second;
+            return true;
+        };
+        nodes.clear();
+        truncated = false;
+        ok = ok && WalkObjectTypeListChain(head, nodeA, 16, readCyclic, &nodes, &truncated);
+        ok = ok && nodes.size() == 2;
+        ok = ok && !truncated;
+
+        // An unreadable link ends the walk with what was already read.
+        const auto readNone = [](uint64_t, uint64_t*) -> bool { return false; };
+        nodes.clear();
+        truncated = false;
+        ok = ok && WalkObjectTypeListChain(head, nodeA, 16, readNone, &nodes, &truncated);
+        ok = ok && nodes.size() == 1;
+
+        // fail-closed: an empty list, a null first node, or a zero cap yields
+        // no entries at all.
+        nodes.clear();
+        truncated = false;
+        ok = ok && !WalkObjectTypeListChain(head, head, 16, readChain, &nodes, &truncated);
+        ok = ok && nodes.empty();
+        ok = ok && !WalkObjectTypeListChain(head, 0, 16, readChain, &nodes, &truncated);
+        ok = ok && nodes.empty();
+        ok = ok && !WalkObjectTypeListChain(head, nodeA, 0, readChain, &nodes, &truncated);
+        ok = ok && nodes.empty();
+    }
 
     return ok;
 }

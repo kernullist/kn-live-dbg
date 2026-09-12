@@ -31544,6 +31544,10 @@ static int RunConsoleSurfaceSelfTest()
             L"kmon-artifact-primitives");
         CheckConsoleSurfaceSelfTest(
             &context,
+            DriverTypeListSweepSelfTest(),
+            L"integrity-driver-type-list-sweep");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             KernelMonitorHiddenDriverSelfTest(),
             L"kmon-hidden-driver-regression");
         CheckConsoleSurfaceSelfTest(

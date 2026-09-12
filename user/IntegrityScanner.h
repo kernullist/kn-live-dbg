@@ -208,11 +208,52 @@ struct DeviceBackrefResult
 {
     std::vector<AnonymousDriverBackrefRecord> AnonymousDrivers;
     std::vector<std::wstring> Warnings;
+    // Every DRIVER_OBJECT the \Device walk reached, whether or not it is also
+    // in the \Driver directory. The driver object type-list sweep uses this to
+    // tell an object the device view already explains from one that no view
+    // explains at all.
+    std::set<uint64_t> DeviceDriverObjects;
     uint64_t DevicesScanned = 0;
     uint64_t DevicesWithKnownDriver = 0;
     uint64_t DevicesWithoutDriver = 0;
     uint64_t DriverObjectsKnown = 0;
     bool DirectoryFound = false;
+    bool Truncated = false;
+    bool Complete = false;
+};
+
+// P0 follow-up: a DRIVER_OBJECT reachable from neither the \Driver directory
+// nor a \Device back-reference. The object is still allocated and still owns
+// its dispatch table, so the driver object type's own list of objects
+// (_OBJECT_TYPE.TypeList) is the only view left that holds it.
+struct AnonymousTypeListDriverRecord
+{
+    uint64_t DriverObject = 0;
+    uint64_t DriverStart = 0;
+    uint64_t DriverSize = 0;
+    uint64_t DriverSection = 0;
+    uint64_t DeviceObject = 0;
+    uint64_t BackedDispatch = 0;
+    uint64_t UnbackedDispatch = 0;
+    std::wstring DriverName;
+    std::wstring ModuleName;
+    bool HasDriverStart = false;
+};
+
+struct DriverTypeListResult
+{
+    std::vector<AnonymousTypeListDriverRecord> AnonymousDrivers;
+    std::vector<std::wstring> Warnings;
+    uint64_t TypeListEntries = 0;
+    uint64_t CandidatesScanned = 0;
+    uint64_t CalibrationMatches = 0;
+    uint64_t DriversInDirectory = 0;
+    uint64_t DriversInDeviceView = 0;
+    uint64_t UnnamedCandidates = 0;
+    uint64_t AnonymousFound = 0;
+    uint64_t AnonymousDropped = 0;
+    uint64_t DriverObjectsKnown = 0;
+    uint64_t DeviceObjectsKnown = 0;
     bool Truncated = false;
     bool Complete = false;
 };
@@ -294,6 +335,16 @@ public:
         const std::set<uint64_t>& knownDriverObjects,
         DeviceBackrefResult* result,
         std::wstring* error);
+    // P0 follow-up: bounded sweep of the driver object type list for
+    // DRIVER_OBJECTs that neither the \Driver directory nor a \Device
+    // back-reference reaches. The type-list link offset is calibrated against
+    // the \Driver set and needs two independent confirmations; anything less
+    // fails closed with an error instead of guessing.
+    bool ScanTypeListDriverObjects(
+        const std::set<uint64_t>& knownDriverObjects,
+        const std::set<uint64_t>& deviceDriverObjects,
+        DriverTypeListResult* result,
+        std::wstring* error);
 
 private:
     DeviceClient& device_;
@@ -308,3 +359,8 @@ bool IntegrityIatOwnerSelfTest();
 bool IntegrityDiscardedSectionSelfTest();
 bool IntegrityProloguePatternSelfTest();
 bool DeviceStackWalkSelfTest();
+// P0 follow-up: deterministic regression for the driver object type-list
+// sweep. Drives the link-offset calibration and the candidate shape predicate
+// from synthetic node lists, so the sweep semantics are covered without a live
+// kernel.
+bool DriverTypeListSweepSelfTest();
