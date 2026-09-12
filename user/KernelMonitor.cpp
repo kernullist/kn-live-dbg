@@ -23,6 +23,7 @@
 #include "WfpCalloutScanner.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
+#include "../kmon_test_target/KmonTestTargetContract.h"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -16511,10 +16512,77 @@ std::wstring KernelMonitor::BuildLogFilePath(int rotationIndex) const
         std::to_wstring(rotationIndex) + L".jsonl";
 }
 
-bool KernelMonitorArtifactSelfTest()
+// R5: the observer reads the fixture's /overwrite sled against the length in
+// the shared lab contract, so the fixture and this check cannot drift apart
+// silently. A head that is patched but shorter than the contract is a hard
+// failure; only an untouched head means "no sled observed".
+uint32_t KmonLeadingSledRun(const uint8_t* bytes, size_t length, uint8_t pattern)
+{
+    if (bytes == nullptr)
+    {
+        return 0;
+    }
+    uint32_t run = 0;
+    while (run < length && bytes[run] == pattern)
+    {
+        ++run;
+    }
+    return run;
+}
+
+KmonSledObservation KmonClassifySledObservation(
+    const uint8_t* bytes,
+    size_t length,
+    uint32_t contractBytes)
+{
+    if (bytes == nullptr || length == 0 || contractBytes == 0)
+    {
+        return KmonSledObservation::None;
+    }
+    const uint32_t run = KmonLeadingSledRun(bytes, length, 0x90);
+    if (run >= contractBytes)
+    {
+        return KmonSledObservation::Satisfied;
+    }
+    if (run >= KmonTestTargetContract::kMinObservedSledBytes)
+    {
+        return KmonSledObservation::ShortPatched;
+    }
+    return KmonSledObservation::None;
+}
+
+// R6: every way the cross-process half can be skipped carries its own text, so
+// the caller can report a reason instead of passing quietly.
+const wchar_t* KmonArtifactSkipReasonText(KmonArtifactSkipReason reason)
+{
+    switch (reason)
+    {
+    case KmonArtifactSkipReason::FixtureMissing:
+        return L"fixture KnLiveDbgKmonTarget.exe not found next to KnLiveDbg.exe";
+    case KmonArtifactSkipReason::LaunchFailed:
+        return L"CreateProcessW on the fixture failed";
+    case KmonArtifactSkipReason::ProcessOpenFailed:
+        return L"OpenProcess on the fixture child was refused";
+    case KmonArtifactSkipReason::ImageBaseUnreadable:
+        return L"the child's PEB ImageBase could not be read";
+    case KmonArtifactSkipReason::SledNotObserved:
+        return L"the contract sled was never observed in the child";
+    case KmonArtifactSkipReason::ChildDiedBeforeSample:
+        return L"the child exited before the COW page state could be sampled";
+    default:
+        return L"";
+    }
+}
+
+bool KernelMonitorArtifactSelfTest(KmonArtifactSkipReason* skipReason)
 {
     bool ok = false;
     HANDLE childProc = nullptr;
+    // R6: the cross-process half is the only skippable part of this check, and
+    // the reason is handed back to the caller so a skip is reported rather than
+    // hidden. FixtureMissing is the default because the fixture path check
+    // below is the first thing that can fail.
+    KmonArtifactSkipReason skipped = KmonArtifactSkipReason::FixtureMissing;
     do
     {
         HMODULE self = GetModuleHandleW(nullptr);
@@ -16619,6 +16687,7 @@ bool KernelMonitorArtifactSelfTest()
         }
         if (GetFileAttributesW(fixture.c_str()) != INVALID_FILE_ATTRIBUTES)
         {
+            skipped = KmonArtifactSkipReason::None;
             uint32_t childExecRva = 0x1000;
             std::vector<uint8_t> fixtureHead;
             KmonPeLayout fixtureLayout = {};
@@ -16667,29 +16736,36 @@ bool KernelMonitorArtifactSelfTest()
                     uint32_t childRva[1] = { childExecRva };
                     uint32_t childPriv = 0;
                     uint32_t childValid = 0;
+                    if (childBase == 0)
+                    {
+                        skipped = KmonArtifactSkipReason::ImageBaseUnreadable;
+                    }
                     if (childBase != 0)
                     {
                         // Readiness is observed, not announced. The fixture's own
                         // announce cannot serve as the gate here: /overwrite
-                        // replaces the first 64 bytes of its exec section with a
+                        // replaces the first kOverwritePatchBytes bytes of its
+                        // exec section (the shared length lives in
+                        // KmonTestTargetContract.h) with a
                         // 0x90 sled, and that sled lands on the code that writes
                         // %TEMP%\kn-live-dbg-kmon\artifact.pid, so the file is
                         // created but left at 0 bytes (measured; /child stamp,
                         // which does not patch, writes its pid there). Observe
-                        // the patch instead: once those 64 sled bytes are visible
+                        // the patch instead: once those contract-length sled
+                        // bytes are visible
                         // in the child, its write already happened and the image
                         // page must be private, so a page that still reads shared
                         // is a broken COW counter rather than a timing artifact.
                         // The child also dies by design when it returns into the
                         // sled, so a sample taken after that death is skipped
                         // instead of failed.
-                        uint8_t sled[64] = {};
-                        std::memset(sled, 0x90, sizeof(sled));
+                        uint8_t observed[KmonTestTargetContract::kOverwritePatchBytes] = {};
                         bool patched = false;
+                        KmonSledObservation observation = KmonSledObservation::None;
                         const uint64_t readyDeadlineMs = GetTickCount64() + 4000;
                         while (GetTickCount64() < readyDeadlineMs)
                         {
-                            uint8_t observed[sizeof(sled)] = {};
+                            std::memset(observed, 0, sizeof(observed));
                             SIZE_T observedBytes = 0;
                             if (ReadProcessMemory(
                                     inspect,
@@ -16698,17 +16774,34 @@ bool KernelMonitorArtifactSelfTest()
                                     observed,
                                     sizeof(observed),
                                     &observedBytes) &&
-                                observedBytes == sizeof(observed) &&
-                                std::memcmp(observed, sled, sizeof(sled)) == 0)
+                                observedBytes == sizeof(observed))
                             {
-                                patched = true;
-                                break;
+                                observation = KmonClassifySledObservation(
+                                    observed,
+                                    sizeof(observed),
+                                    KmonTestTargetContract::kOverwritePatchBytes);
+                                if (observation == KmonSledObservation::Satisfied)
+                                {
+                                    patched = true;
+                                    break;
+                                }
+                                if (observation == KmonSledObservation::ShortPatched)
+                                {
+                                    break;
+                                }
                             }
                             if (WaitForSingleObject(childProc, 0) == WAIT_OBJECT_0)
                             {
                                 break;
                             }
                             Sleep(25);
+                        }
+                        // R5: a head patched with fewer bytes than the shared
+                        // contract is a fixture/observer mismatch, so the check
+                        // fails instead of sampling unobserved state.
+                        if (observation == KmonSledObservation::ShortPatched)
+                        {
+                            break;
                         }
                         bool sawPrivate = false;
                         bool childAliveThroughout = patched;
@@ -16738,6 +16831,16 @@ bool KernelMonitorArtifactSelfTest()
                             }
                             Sleep(50);
                         }
+                        // R6: record why the cross-process half reached no
+                        // verdict, so the caller can name the skip.
+                        if (!patched)
+                        {
+                            skipped = KmonArtifactSkipReason::SledNotObserved;
+                        }
+                        else if (!sawPrivate && !childAliveThroughout)
+                        {
+                            skipped = KmonArtifactSkipReason::ChildDiedBeforeSample;
+                        }
                         if (patched && !sawPrivate && childAliveThroughout &&
                             childValid > 0 && childPriv == 0)
                         {
@@ -16746,13 +16849,18 @@ bool KernelMonitorArtifactSelfTest()
                     }
                     CloseHandle(inspect);
                 }
+                else
+                {
+                    skipped = KmonArtifactSkipReason::ProcessOpenFailed;
+                }
             }
             else
             {
-                // The fixture could not be launched or inspected (AV,
-                // permission, or path): the in-process COW check above already
-                // exercised the primitive, so the cross-process half is
-                // skipped rather than failed.
+                // The fixture could not be launched (AV, permission, or path):
+                // the in-process COW check above already exercised the
+                // primitive, so the cross-process half is skipped rather than
+                // failed -- and the reason is handed back to the caller (R6).
+                skipped = KmonArtifactSkipReason::LaunchFailed;
             }
         }
 
@@ -16763,6 +16871,10 @@ bool KernelMonitorArtifactSelfTest()
         TerminateProcess(childProc, 0);
         WaitForSingleObject(childProc, 5000);
         CloseHandle(childProc);
+    }
+    if (skipReason != nullptr)
+    {
+        *skipReason = skipped;
     }
     return ok;
 }
@@ -16965,6 +17077,103 @@ bool KernelMonitorHiddenDriverSelfTest()
         asymmetryEvent.Kind = L"driver.evidence_asymmetry";
         KmonOptions asymmetryOptions = {};
         ok = ok && KmonWatchMatches(asymmetryEvent, asymmetryOptions);
+    }
+
+    // --- fixture sled contract and cross-process skip reasons (R5/R6) ------
+    {
+        uint8_t full[KmonTestTargetContract::kOverwritePatchBytes] = {};
+        std::memset(full, 0x90, sizeof(full));
+        ok = ok && KmonClassifySledObservation(
+            full,
+            sizeof(full),
+            KmonTestTargetContract::kOverwritePatchBytes) == KmonSledObservation::Satisfied;
+
+        // A fixture that patched fewer bytes than the contract is a mismatch,
+        // not "no patch": this has to fail the check, never skip it.
+        uint8_t shortPatch[KmonTestTargetContract::kOverwritePatchBytes] = {};
+        std::memset(shortPatch, 0x90, 16);
+        shortPatch[16] = 0x48;
+        shortPatch[17] = 0x8b;
+        ok = ok && KmonClassifySledObservation(
+            shortPatch,
+            sizeof(shortPatch),
+            KmonTestTargetContract::kOverwritePatchBytes) == KmonSledObservation::ShortPatched;
+
+        // Boundary: exactly the minimum observable run is still a patch.
+        uint8_t minRun[KmonTestTargetContract::kOverwritePatchBytes] = {};
+        std::memset(minRun, 0x90, KmonTestTargetContract::kMinObservedSledBytes);
+        minRun[KmonTestTargetContract::kMinObservedSledBytes] = 0xcc;
+        ok = ok && KmonClassifySledObservation(
+            minRun,
+            sizeof(minRun),
+            KmonTestTargetContract::kOverwritePatchBytes) == KmonSledObservation::ShortPatched;
+
+        // One byte below the minimum is ordinary code, not a patch.
+        uint8_t belowMin[KmonTestTargetContract::kOverwritePatchBytes] = {};
+        std::memset(belowMin, 0x90, KmonTestTargetContract::kMinObservedSledBytes - 1);
+        belowMin[KmonTestTargetContract::kMinObservedSledBytes - 1] = 0x48;
+        ok = ok && KmonClassifySledObservation(
+            belowMin,
+            sizeof(belowMin),
+            KmonTestTargetContract::kOverwritePatchBytes) == KmonSledObservation::None;
+
+        // Untouched code, a null head, an empty head and a zero contract are
+        // all "nothing concluded" rather than a violation.
+        uint8_t code[KmonTestTargetContract::kOverwritePatchBytes] = {};
+        code[0] = 0x48;
+        code[1] = 0x8b;
+        ok = ok && KmonClassifySledObservation(
+            code,
+            sizeof(code),
+            KmonTestTargetContract::kOverwritePatchBytes) == KmonSledObservation::None;
+        ok = ok && KmonClassifySledObservation(
+            nullptr,
+            sizeof(code),
+            KmonTestTargetContract::kOverwritePatchBytes) == KmonSledObservation::None;
+        ok = ok && KmonClassifySledObservation(
+            full,
+            0,
+            KmonTestTargetContract::kOverwritePatchBytes) == KmonSledObservation::None;
+        ok = ok && KmonClassifySledObservation(
+            full,
+            sizeof(full),
+            0) == KmonSledObservation::None;
+
+        // The run helper stays inside the caller's window.
+        const uint8_t mixed[4] = { 0x90, 0x90, 0xcc, 0x90 };
+        ok = ok && KmonLeadingSledRun(mixed, sizeof(mixed), 0x90) == 2;
+        ok = ok && KmonLeadingSledRun(mixed, 2, 0x90) == 2;
+        ok = ok && KmonLeadingSledRun(mixed + 3, 1, 0x90) == 1;
+        ok = ok && KmonLeadingSledRun(nullptr, sizeof(mixed), 0x90) == 0;
+
+        // R6: every skip reason has its own non-empty text and None has none,
+        // so a reported skip always names a distinct cause.
+        const KmonArtifactSkipReason skipReasons[] = {
+            KmonArtifactSkipReason::FixtureMissing,
+            KmonArtifactSkipReason::LaunchFailed,
+            KmonArtifactSkipReason::ProcessOpenFailed,
+            KmonArtifactSkipReason::ImageBaseUnreadable,
+            KmonArtifactSkipReason::SledNotObserved,
+            KmonArtifactSkipReason::ChildDiedBeforeSample,
+        };
+        const size_t skipReasonCount = sizeof(skipReasons) / sizeof(skipReasons[0]);
+        const wchar_t* noneText = KmonArtifactSkipReasonText(KmonArtifactSkipReason::None);
+        ok = ok && noneText != nullptr && noneText[0] == L'\0';
+        for (size_t i = 0; i < skipReasonCount; ++i)
+        {
+            const wchar_t* text = KmonArtifactSkipReasonText(skipReasons[i]);
+            const bool textUsable = text != nullptr && text[0] != L'\0';
+            ok = ok && textUsable;
+            if (textUsable)
+            {
+                for (size_t j = i + 1; j < skipReasonCount; ++j)
+                {
+                    const wchar_t* other = KmonArtifactSkipReasonText(skipReasons[j]);
+                    ok = ok && other != nullptr &&
+                        std::wstring(other) != std::wstring(text);
+                }
+            }
+        }
     }
 
     // --- type-list reporting cap (silent truncation must be surfaced) ------

@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "KmonTestTargetContract.h"
+
 namespace
 {
     constexpr uint32_t kHoldSecondsDefault = 45;
@@ -262,7 +264,7 @@ namespace
             return false;
         }
         uint8_t* text = ImageBase() + execRva;
-        uint8_t patch[64];
+        uint8_t patch[KmonTestTargetContract::kOverwritePatchBytes];
         std::memset(patch, 0x90, sizeof(patch));
         if (!PatchCurrentProcessBytes(text, patch, sizeof(patch)))
         {
@@ -631,8 +633,10 @@ namespace
 
     bool RunChild(const std::wstring& scenario, uint32_t seconds)
     {
-        // /overwrite replaces the first 64 bytes of this image's exec section
-        // with a 0x90 sled, and that sled lands on the code that writes the pid
+        // /overwrite replaces the first kOverwritePatchBytes bytes of this
+        // image's exec section with a 0x90 sled -- the length is the shared
+        // contract in KmonTestTargetContract.h -- and that sled lands on the
+        // code that writes the pid
         // file and the KMON_FIXTURE marker (measured: /child stamp leaves a
         // 6-byte artifact.pid, /child overwrite leaves the same file at 0
         // bytes). Announce before the destructive step so the documented signal

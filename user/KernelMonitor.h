@@ -6,6 +6,7 @@
 #include "TimelineStore.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -646,7 +647,40 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options);
 bool KmonDriverLoadArmsMapperWatch(const KmonEvent& event);
 bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event);
 bool KernelMonitorSelfTest();
-bool KernelMonitorArtifactSelfTest();
+
+// R6: the cross-process half of kmon-artifact-primitives can legitimately be
+// skipped (no fixture next to the exe, no process creation, no readable PEB
+// ImageBase). The reason is returned through this out-parameter so the console
+// self-test can report the skip instead of passing silently; None means the
+// half ran to a verdict.
+enum class KmonArtifactSkipReason
+{
+    None = 0,
+    FixtureMissing,
+    LaunchFailed,
+    ProcessOpenFailed,
+    ImageBaseUnreadable,
+    SledNotObserved,
+    ChildDiedBeforeSample,
+};
+const wchar_t* KmonArtifactSkipReasonText(KmonArtifactSkipReason reason);
+
+// R5: how the observer reads the fixture's /overwrite sled. The child's head is
+// measured against the shared lab contract (KmonTestTargetContract.h) instead
+// of a second hard-coded length, so a fixture that patches a different number
+// of bytes fails this check rather than quietly skipping it.
+enum class KmonSledObservation
+{
+    None = 0,
+    Satisfied,
+    ShortPatched,
+};
+uint32_t KmonLeadingSledRun(const uint8_t* bytes, size_t length, uint8_t pattern);
+KmonSledObservation KmonClassifySledObservation(
+    const uint8_t* bytes,
+    size_t length,
+    uint32_t contractBytes);
+bool KernelMonitorArtifactSelfTest(KmonArtifactSkipReason* skipReason = nullptr);
 // P2: deterministic regression for the "loaded then hidden" layer. Drives the
 // pure module-inventory diff and tamper verdict from synthetic snapshots, so
 // driver.vanished / driver.unnotified_load / driver.remap / driver.tampered

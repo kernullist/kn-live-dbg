@@ -25029,17 +25029,24 @@ static void PrintKmonHelp()
     std::wcout << L"                          watched pids, first event per task name; children of\n";
     std::wcout << L"                          watched processes are auto-watched (watch_source=child_of)\n";
     std::wcout << L"  driver.mapped_residue   live pool PE / unbacked DRIVER_OBJECT / kpage PE / BYOVD,\n";
+    std::wcout << L"                          a bounded _OBJECT_TYPE.TypeList sweep for DRIVER_OBJECTs that no\n";
+    std::wcout << L"                          \\Driver or \\Device view reaches (truncated/reportcap notes mark an\n";
+    std::wcout << L"                          incomplete result),\n";
     std::wcout << L"                          headerless kpage/pool import stubs (kpage_code/pool_code) during\n";
     std::wcout << L"                          mapper.watch, non-paged big-pool stubs also while idle (>=3 stubs),\n";
     std::wcout << L"                          plus MmUnloadedDrivers / PiDDB / ci-hash leftovers\n";
     std::wcout << L"  driver.vanished         resident module left PsLoadedModuleList with no unload event\n";
-    std::wcout << L"                          (2 scans must agree, 120s lifecycle window, fail-closed)\n";
+    std::wcout << L"                          (2 scans must agree, or one scan when the kernel-context walk or\n";
+    std::wcout << L"                          the loader chain corroborates it; 120s lifecycle window, fail-closed)\n";
     std::wcout << L"  driver.unnotified_load  module appeared in PsLoadedModuleList with no load event\n";
     std::wcout << L"  driver.remap            same module name on a new image base, no lifecycle event\n";
     std::wcout << L"  driver.tampered         a loaded driver's image head/entry hash or DRIVER_OBJECT\n";
     std::wcout << L"                          identity fields changed after the load (fail-closed)\n";
     std::wcout << L"  driver.evidence_asymmetry  driver still in PsLoadedModuleList but its service key\n";
-    std::wcout << L"                          and/or its image file on disk is gone\n";
+    std::wcout << L"                          and/or its image file on disk is gone. Service-key-only loss on a\n";
+    std::wcout << L"                          non-inbox loader prints only with corroboration (inventory_divergence,\n";
+    std::wcout << L"                          module_chain_broken, tamper) and the notes carry\n";
+    std::wcout << L"                          corroboration=<source|none>; image-file loss prints as before\n";
     std::wcout << L"  driver.inventory_divergence  the kernel-context PsLoadedModuleList walk and the\n";
     std::wcout << L"                          host NtQuerySystemInformation view disagree about a module\n";
     std::wcout << L"                          (user_view_missing = filtered query view; fail-closed);\n";
@@ -25079,7 +25086,10 @@ static void PrintKmonHelp()
     std::wcout << L"                          (ReadVM/suspend/resume alone are not inject)\n";
     std::wcout << L"  integrity.ci / .cr      DSE off, CR0.WP=0 (test-signing is not a finding)\n";
     std::wcout << L"  kernel MmCopyVirtualMemory is not on TI; hooks and pool PE are the substitute.\n";
-    std::wcout << L"  lab fixture: KnLiveDbgKmonTarget.exe (docs/KMON_TEST_TARGET.md)\n";
+    std::wcout << L"  lab fixture: KnLiveDbgKmonTarget.exe (docs/KMON_TEST_TARGET.md); the self-test\n";
+    std::wcout << L"  cross-process half reports an explicit reason when it is skipped because the\n";
+    std::wcout << L"  fixture or process creation is unavailable, and the sled length it observes is\n";
+    std::wcout << L"  the fixture's shared contract\n";
 }
 
 static void PrintKmonEventLine(const KmonEvent& event)
@@ -31538,10 +31548,20 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             KernelMonitorSelfTest(),
             L"kmon-classification");
-        CheckConsoleSurfaceSelfTest(
-            &context,
-            KernelMonitorArtifactSelfTest(),
-            L"kmon-artifact-primitives");
+        {
+            KmonArtifactSkipReason artifactSkip = KmonArtifactSkipReason::None;
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                KernelMonitorArtifactSelfTest(&artifactSkip),
+                L"kmon-artifact-primitives");
+            // R6: a skipped cross-process half is reported once, with its reason.
+            const wchar_t* artifactSkipText = KmonArtifactSkipReasonText(artifactSkip);
+            if (artifactSkipText != nullptr && artifactSkipText[0] != L'\0')
+            {
+                std::wcerr << L"[console.selftest] kmon-artifact-primitives: cross-process COW half skipped ("
+                           << artifactSkipText << L")\n";
+            }
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             DriverTypeListSweepSelfTest(),
@@ -31573,6 +31593,12 @@ static int RunConsoleSurfaceSelfTest()
                     kmonHelp.find(L"driver.evidence_asymmetry") != std::wstring::npos &&
                     kmonHelp.find(L"driver.inventory_divergence") != std::wstring::npos &&
                     kmonHelp.find(L"driver.module_chain_broken") != std::wstring::npos &&
+                    kmonHelp.find(L"2 scans must agree, or one scan when the kernel-context walk or") !=
+                        std::wstring::npos &&
+                    kmonHelp.find(L"corroboration=<source|none>") != std::wstring::npos &&
+                    kmonHelp.find(L"_OBJECT_TYPE.TypeList sweep") != std::wstring::npos &&
+                    kmonHelp.find(L"reports an explicit reason when it is skipped") !=
+                        std::wstring::npos &&
                     kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos,
                 L"kmon-help-covers-drop-load-and-live-tail");
         }
