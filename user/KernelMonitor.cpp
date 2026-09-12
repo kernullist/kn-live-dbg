@@ -6128,6 +6128,11 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"driver.image_only" ||
             event.Kind == L"driver.short_lived" ||
             event.Kind == L"driver.mapped_residue" ||
+            event.Kind == L"driver.vanished" ||
+            event.Kind == L"driver.unnotified_load" ||
+            event.Kind == L"driver.remap" ||
+            event.Kind == L"driver.tampered" ||
+            event.Kind == L"driver.evidence_asymmetry" ||
             event.Kind == L"driver.handle" ||
             event.Kind == L"driver.ioctl" ||
             event.Kind == L"mapper.watch" ||
@@ -6659,6 +6664,12 @@ bool KernelMonitor::Start(
                 EmittedUnnamedPids.clear();
                 EmittedMapperKeys.clear();
                 RecentLoads.clear();
+                RecentUnloads.clear();
+                ModuleBaseline.clear();
+                ModuleBaselineValid = false;
+                ModuleBaselineTickMs = 0;
+                ModulePending.clear();
+                ModuleScans = 0;
                 MapperWatchLast = MapperWatchFingerprint{};
                 MapperWatchDriver.clear();
                 MapperWatchId.clear();
@@ -6952,6 +6963,24 @@ void KernelMonitor::WorkerLoop()
             IngestThreatIntel();
             if (!StopRequested.load())
             {
+                // P0: the module inventory diff shares this mapper tick and
+                // reuses the snapshot the tick just refreshed, so it adds no
+                // extra module reload and no extra scan cadence.
+                ScanModuleInventory();
+            }
+            IngestLiveTimeline();
+            IngestThreatIntel();
+            if (!StopRequested.load())
+            {
+                // P1: re-check the load-time image baselines on the same tick
+                // so a self-patching driver is reported while it is resident.
+                // Bounded to a few drivers per pass with a 60s recheck floor.
+                ScanDriverTamper();
+            }
+            IngestLiveTimeline();
+            IngestThreatIntel();
+            if (!StopRequested.load())
+            {
                 ScanHookCallbacks();
             }
             IngestLiveTimeline();
@@ -7180,6 +7209,7 @@ void KernelMonitor::IngestThreatIntel()
             if (classified.Kind == L"driver.official_unload")
             {
                 MaybeEmitShortLived(classified);
+                NoteDriverUnload(classified);
                 if (KmonDriverUnloadArmsMapperWatch(classified))
                 {
                     ArmMapperWatch(classified);
@@ -7742,6 +7772,546 @@ void KernelMonitor::ScanHiddenProcesses()
     }
 }
 
+uint64_t KmonHashBytes64(const uint8_t* data, size_t size)
+{
+    if (data == nullptr || size == 0)
+    {
+        return 0;
+    }
+    // FNV-1a: order sensitive and cheap enough for a header window.
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i)
+    {
+        hash ^= static_cast<uint64_t>(data[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::wstring KmonDriverNameStem(const std::wstring& name)
+{
+    std::wstring stem = KmonBasenameLower(name);
+    if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, L".sys") == 0)
+    {
+        stem.resize(stem.size() - 4);
+    }
+    return stem;
+}
+
+uint32_t KmonDriverTamperMask(
+    const KmonDriverIdentitySnapshot& baseline,
+    const KmonDriverIdentitySnapshot& live)
+{
+    uint32_t mask = KmonTamperNone;
+
+    // Fail-closed: a snapshot we never captured proves nothing.
+    if (baseline.HasImage && live.HasImage)
+    {
+        const bool imageChanged =
+            baseline.Base != live.Base ||
+            baseline.Size != live.Size ||
+            (baseline.HeaderHash != 0 && live.HeaderHash != 0 &&
+             baseline.HeaderHash != live.HeaderHash) ||
+            (baseline.EntryHash != 0 && live.EntryHash != 0 &&
+             (baseline.EntryHash != live.EntryHash ||
+              baseline.EntryOffset != live.EntryOffset));
+        if (imageChanged)
+        {
+            mask |= static_cast<uint32_t>(KmonTamperImage);
+        }
+    }
+
+    if (baseline.HasFields && live.HasFields)
+    {
+        // The I/O manager fills DriverStart/DriverSize/DriverSection at load
+        // and never rewrites them, so any change is post-load field tampering.
+        const bool identityChanged =
+            baseline.DriverStart != live.DriverStart ||
+            baseline.DriverSize != live.DriverSize ||
+            baseline.DriverSection != live.DriverSection;
+        // A device object that existed and is now zero lost its device link.
+        // A device that merely changed identity is a normal create/delete
+        // cycle, not a verdict.
+        const bool deviceWiped =
+            baseline.DeviceObject != 0 && live.DeviceObject == 0;
+        if (identityChanged || deviceWiped)
+        {
+            mask |= static_cast<uint32_t>(KmonTamperFields);
+        }
+    }
+
+    return mask;
+}
+
+namespace
+{
+    // Single 64-bit kernel read used by the DRIVER_OBJECT secondary judgment.
+    // Non-kernel addresses are rejected up front so a garbage DriverSection
+    // pointer cannot turn into a speculative read.
+    bool KmonReadKernelU64(DeviceClient* device, uint64_t address, uint64_t* value)
+    {
+        if (device == nullptr || value == nullptr || address == 0)
+        {
+            return false;
+        }
+        if (address < 0xFFFF800000000000ull)
+        {
+            return false;
+        }
+        std::vector<uint8_t> bytes;
+        std::wstring ignored;
+        if (!device->ReadMemory(address, sizeof(uint64_t), &bytes, &ignored) ||
+            bytes.size() < sizeof(uint64_t))
+        {
+            return false;
+        }
+        std::memcpy(value, bytes.data(), sizeof(*value));
+        return true;
+    }
+
+    // Bounded kernel window read: the same canonical-address guard as the
+    // single u64 helper, with a 4KB cap so a bogus size cannot turn into a
+    // huge read.
+    bool KmonReadKernelBytes(
+        DeviceClient* device,
+        uint64_t address,
+        size_t size,
+        std::vector<uint8_t>* out)
+    {
+        if (device == nullptr || out == nullptr || size == 0 || address == 0)
+        {
+            return false;
+        }
+        if (address < 0xFFFF800000000000ull)
+        {
+            return false;
+        }
+        if (size > 0x1000)
+        {
+            size = 0x1000;
+        }
+        out->clear();
+        std::wstring ignored;
+        if (!device->ReadMemory(address, static_cast<uint32_t>(size), out, &ignored))
+        {
+            return false;
+        }
+        return !out->empty();
+    }
+
+    // P1: reverse-resolve an image range from the loaded-module inventory by
+    // image stem, for load events that carry no image_base/image_size
+    // evidence (the TI-only path).
+    bool KmonResolveModuleRangeByName(
+        SymbolEngine* symbols,
+        const std::wstring& stem,
+        uint64_t* base,
+        uint64_t* size)
+    {
+        if (symbols == nullptr || base == nullptr || size == nullptr || stem.empty())
+        {
+            return false;
+        }
+        const std::vector<KernelModuleInfo> modules = symbols->CopyModules();
+        for (const KernelModuleInfo& module : modules)
+        {
+            const std::wstring name = KmonDriverNameStem(
+                module.ImageName.empty() ? module.ImagePath : module.ImageName);
+            if (name == stem && module.Base != 0 && module.Size != 0)
+            {
+                *base = module.Base;
+                *size = module.Size;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Image fingerprint: PE header window plus the entry-point window. A MZ/PE
+    // sanity check is required before the entry-point offset is trusted, so
+    // garbage bytes cannot produce a bogus hash pair.
+    bool KmonSnapshotDriverImage(
+        DeviceClient* device,
+        uint64_t base,
+        uint64_t size,
+        KmonDriverIdentitySnapshot* snapshot)
+    {
+        if (device == nullptr || snapshot == nullptr || base == 0 || size == 0)
+        {
+            return false;
+        }
+        std::vector<uint8_t> header;
+        if (!KmonReadKernelBytes(device, base, 0x400, &header))
+        {
+            return false;
+        }
+        snapshot->Base = base;
+        snapshot->Size = size;
+        snapshot->HeaderHash = KmonHashBytes64(header.data(), header.size());
+        if (header.size() >= 0x40 && header[0] == 'M' && header[1] == 'Z')
+        {
+            uint32_t peOffset = 0;
+            std::memcpy(&peOffset, header.data() + 0x3C, sizeof(peOffset));
+            if (peOffset != 0 && peOffset <= header.size() - 0x2Cu)
+            {
+                uint32_t signature = 0;
+                std::memcpy(&signature, header.data() + peOffset, sizeof(signature));
+                if (signature == 0x00004550)
+                {
+                    uint32_t entryOffset = 0;
+                    std::memcpy(
+                        &entryOffset,
+                        header.data() + peOffset + 0x28,
+                        sizeof(entryOffset));
+                    std::vector<uint8_t> entry;
+                    if (entryOffset != 0 &&
+                        KmonReadKernelBytes(device, base + entryOffset, 0x100, &entry))
+                    {
+                        snapshot->EntryOffset = entryOffset;
+                        snapshot->EntryHash = KmonHashBytes64(entry.data(), entry.size());
+                    }
+                }
+            }
+        }
+        snapshot->HasImage = snapshot->HeaderHash != 0;
+        return snapshot->HasImage;
+    }
+
+    bool KmonInventoryEntryUsable(const KmonModuleInventoryView& entry)
+    {
+        if (entry.Base == 0 || entry.Size == 0)
+        {
+            return false;
+        }
+        // dbghelp synthetic pseudo-modules ("__kernel", "__drv_*") are not
+        // loader list entries; they must never drive a vanish verdict.
+        if (entry.Name.empty() || entry.Name.rfind(L"__", 0) == 0)
+        {
+            return false;
+        }
+        return true;
+    }
+}
+
+const wchar_t* KmonModuleDiffKindName(KmonModuleDiffKind kind)
+{
+    switch (kind)
+    {
+        case KmonModuleDiffKind::Vanished:
+            return L"vanished";
+        case KmonModuleDiffKind::UnnotifiedLoad:
+            return L"unnotified_load";
+        case KmonModuleDiffKind::Remap:
+            return L"remap";
+        default:
+            return L"none";
+    }
+}
+
+// P1 cross-view: is the driver service root readable at all? When it is not,
+// the whole service-key view is unknown and no verdict may be produced.
+bool KmonDriverServiceRootReadable()
+{
+    HKEY key = nullptr;
+    const LSTATUS status = RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services",
+        0,
+        KEY_READ,
+        &key);
+    if (key != nullptr)
+    {
+        RegCloseKey(key);
+    }
+    return status == ERROR_SUCCESS;
+}
+
+// P1 cross-view: is the driver's service key still registered? The answer is
+// definitive only when the registry answered (present, or definitely absent);
+// an access or transient failure leaves the view unknown.
+bool KmonServiceKeyExistsForDriver(const std::wstring& stem, bool* exists)
+{
+    if (exists != nullptr)
+    {
+        *exists = false;
+    }
+    if (stem.empty())
+    {
+        return false;
+    }
+    HKEY key = nullptr;
+    const LSTATUS status = RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE,
+        (L"SYSTEM\\CurrentControlSet\\Services\\" + stem).c_str(),
+        0,
+        KEY_READ,
+        &key);
+    if (key != nullptr)
+    {
+        RegCloseKey(key);
+    }
+    if (status == ERROR_SUCCESS)
+    {
+        if (exists != nullptr)
+        {
+            *exists = true;
+        }
+        return true;
+    }
+    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND)
+    {
+        return true;
+    }
+    // Access denied or a transient failure: the view stays unknown.
+    return false;
+}
+
+// P1 cross-view: does the file the module was loaded from still exist? The
+// answer is definitive only for a resolvable path and a missing-file error.
+bool KmonImageFileStateForDriver(
+    const std::wstring& path,
+    bool* exists,
+    bool* inbox)
+{
+    if (exists != nullptr)
+    {
+        *exists = false;
+    }
+    if (inbox != nullptr)
+    {
+        *inbox = false;
+    }
+    if (path.empty())
+    {
+        return false;
+    }
+    const std::wstring win32 = Win32PathFromKernelImagePath(path);
+    if (!PathLooksLikeWin32File(win32))
+    {
+        return false;
+    }
+    if (inbox != nullptr)
+    {
+        *inbox = KmonImagePathIsInbox(win32);
+    }
+    const DWORD attributes = GetFileAttributesW(win32.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+    {
+        if (exists != nullptr)
+        {
+            *exists = true;
+        }
+        return true;
+    }
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+    {
+        return true;
+    }
+    return false;
+}
+
+// \Windows\System32 holds the keyless core images Windows always has loaded
+// (ntoskrnl, hal, win32k); a missing driver service key there is normal.
+bool KmonImagePathIsInbox(const std::wstring& win32Path)
+{
+    if (win32Path.empty())
+    {
+        return false;
+    }
+    const std::wstring lowered = ToLowerCopy(win32Path);
+    return lowered.find(L"\\windows\\system32\\") != std::wstring::npos;
+}
+
+// Pure verdict: the service-key view and the image-file view disagree about a
+// driver that PsLoadedModuleList still reports.
+KmonEvidenceAsymmetryKind KmonClassifyEvidenceAsymmetry(
+    bool serviceKeyKnown,
+    bool serviceKeyExists,
+    bool imageFileKnown,
+    bool imageFileExists,
+    bool imagePathInbox)
+{
+    if (!serviceKeyKnown || !imageFileKnown)
+    {
+        // fail-closed: an unknown view never proves hiding.
+        return KmonEvidenceAsymmetryKind::None;
+    }
+    if (!serviceKeyExists && !imageFileExists)
+    {
+        return KmonEvidenceAsymmetryKind::NoServiceKeyNoImageFile;
+    }
+    if (!imageFileExists)
+    {
+        // The registration survived; the binary it named did not.
+        return KmonEvidenceAsymmetryKind::NoImageFile;
+    }
+    if (!serviceKeyExists && !imagePathInbox)
+    {
+        // A non-inbox image nobody registers any more: the load-time service
+        // key was removed after the load.
+        return KmonEvidenceAsymmetryKind::NoServiceKey;
+    }
+    return KmonEvidenceAsymmetryKind::None;
+}
+
+const wchar_t* KmonEvidenceAsymmetryReason(KmonEvidenceAsymmetryKind kind)
+{
+    switch (kind)
+    {
+    case KmonEvidenceAsymmetryKind::NoServiceKey:
+        return L"no_service_key";
+    case KmonEvidenceAsymmetryKind::NoImageFile:
+        return L"no_image_file";
+    case KmonEvidenceAsymmetryKind::NoServiceKeyNoImageFile:
+        return L"no_service_key_no_image_file";
+    default:
+        return L"";
+    }
+}
+
+std::vector<KmonModuleDiffRecord> KmonDiffModuleInventory(
+    const std::vector<KmonModuleInventoryView>& previous,
+    const std::vector<KmonModuleInventoryView>& current,
+    const std::set<std::wstring>& recentUnloads,
+    const std::set<std::wstring>& recentLoads)
+{
+    std::vector<KmonModuleDiffRecord> records = {};
+
+    // fail-closed: without both inventories nothing can be concluded.
+    if (previous.empty() || current.empty())
+    {
+        return records;
+    }
+
+    std::map<std::wstring, const KmonModuleInventoryView*> previousByName;
+    std::set<std::pair<uint64_t, uint64_t>> previousRanges;
+    for (const KmonModuleInventoryView& entry : previous)
+    {
+        if (!KmonInventoryEntryUsable(entry))
+        {
+            continue;
+        }
+        previousByName[entry.Name] = &entry;
+        previousRanges.insert(std::make_pair(entry.Base, entry.Size));
+    }
+
+    std::map<std::wstring, const KmonModuleInventoryView*> currentByName;
+    std::set<std::pair<uint64_t, uint64_t>> currentRanges;
+    for (const KmonModuleInventoryView& entry : current)
+    {
+        if (!KmonInventoryEntryUsable(entry))
+        {
+            continue;
+        }
+        currentByName[entry.Name] = &entry;
+        currentRanges.insert(std::make_pair(entry.Base, entry.Size));
+    }
+
+    if (previousRanges.empty() || currentRanges.empty())
+    {
+        // Every entry was unusable; do not guess.
+        return records;
+    }
+
+    // 1) vanished: present before, gone now, and no unload event explains it.
+    // A same-name entry that only moved is reported as a remap below.
+    for (const auto& pair : previousByName)
+    {
+        const KmonModuleInventoryView& entry = *pair.second;
+        if (currentRanges.count(std::make_pair(entry.Base, entry.Size)) != 0)
+        {
+            continue;
+        }
+        if (currentByName.count(entry.Name) != 0)
+        {
+            continue;
+        }
+        if (recentUnloads.count(entry.Name) != 0)
+        {
+            continue;
+        }
+        KmonModuleDiffRecord record = {};
+        record.Kind = KmonModuleDiffKind::Vanished;
+        record.Name = entry.Name;
+        record.Base = entry.Base;
+        record.Size = entry.Size;
+        record.PreviousBase = entry.Base;
+        record.Layer = L"module_list";
+        records.push_back(std::move(record));
+    }
+
+    // 2) appeared without a load event, and 3) same name with a new base.
+    for (const auto& pair : currentByName)
+    {
+        const KmonModuleInventoryView& entry = *pair.second;
+        const auto previousIt = previousByName.find(entry.Name);
+        if (previousIt == previousByName.end())
+        {
+            if (previousRanges.count(std::make_pair(entry.Base, entry.Size)) != 0)
+            {
+                // Same image range under a different name: a rename, not a
+                // fresh image. Stay quiet rather than guess a kind.
+                continue;
+            }
+            if (recentLoads.count(entry.Name) != 0)
+            {
+                continue;
+            }
+            KmonModuleDiffRecord record = {};
+            record.Kind = KmonModuleDiffKind::UnnotifiedLoad;
+            record.Name = entry.Name;
+            record.Base = entry.Base;
+            record.Size = entry.Size;
+            record.Layer = L"module_list";
+            records.push_back(std::move(record));
+            continue;
+        }
+
+        const KmonModuleInventoryView& before = *previousIt->second;
+        if (before.Base == entry.Base && before.Size == entry.Size)
+        {
+            continue;
+        }
+        if (recentLoads.count(entry.Name) != 0 || recentUnloads.count(entry.Name) != 0)
+        {
+            continue;
+        }
+        KmonModuleDiffRecord record = {};
+        record.Kind = KmonModuleDiffKind::Remap;
+        record.Name = entry.Name;
+        record.Base = entry.Base;
+        record.Size = entry.Size;
+        record.PreviousBase = before.Base;
+        record.Layer = L"module_list";
+        records.push_back(std::move(record));
+    }
+
+    return records;
+}
+
+void KernelMonitor::NoteDriverUnload(const KmonEvent& event)
+{
+    std::wstring base = KmonBasenameLower(event.Driver);
+    if (base.empty())
+    {
+        base = KmonBasenameLower(event.Image);
+    }
+    if (base.empty())
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    RecentDriverUnload unload = {};
+    unload.Base = std::move(base);
+    unload.Timestamp = event.Timestamp;
+    RecentUnloads.push_back(std::move(unload));
+    while (RecentUnloads.size() > 64)
+    {
+        RecentUnloads.pop_front();
+    }
+}
+
 void KernelMonitor::NoteDriverLoad(const KmonEvent& event)
 {
     {
@@ -7779,6 +8349,7 @@ void KernelMonitor::NoteDriverLoad(const KmonEvent& event)
         }
         uint64_t imageBase = 0;
         uint64_t imageSize = 0;
+        bool imageRangeResolved = false;
         auto baseIt = event.Evidence.find(L"image_base");
         auto sizeIt = event.Evidence.find(L"image_size");
         if (baseIt != event.Evidence.end())
@@ -7789,12 +8360,45 @@ void KernelMonitor::NoteDriverLoad(const KmonEvent& event)
         {
             imageSize = std::wcstoull(sizeIt->second.c_str(), nullptr, 0);
         }
+        // P1: a TI-only load event (KmonClassifyTiEvent) carries path_class
+        // and no image coordinates, so the capture and the later module-diff
+        // comparison had nothing to work with. Resolve the range from the
+        // loaded-module inventory by image basename instead of giving up.
+        if ((imageBase == 0 || imageSize == 0) && symbols != nullptr)
+        {
+            const std::wstring stem = KmonDriverNameStem(
+                event.Driver.empty() ? event.Image : event.Driver);
+            uint64_t resolvedBase = 0;
+            uint64_t resolvedSize = 0;
+            if (KmonResolveModuleRangeByName(symbols, stem, &resolvedBase, &resolvedSize))
+            {
+                if (imageBase == 0)
+                {
+                    imageBase = resolvedBase;
+                }
+                if (imageSize == 0)
+                {
+                    imageSize = resolvedSize;
+                }
+                imageRangeResolved = true;
+            }
+        }
         // NOTE: no path-class gate here. The Berkan driver
         // (jrvwfjhdyprtjeaf.sys) lived in System32\drivers so its
         // path_class was "inbox" --- gating on inbox would have skipped the
         // exact driver we need. With a 256MB budget, capturing every
         // driver load (even tvk.sys at 3.5MB) is affordable and gives
         // baseline comparison data.
+        if (imageBase != 0 && imageSize != 0)
+        {
+            // P1: the load-time identity baseline that driver.tampered later
+            // compares against.
+            RecordDriverImageBaseline(
+                KmonDriverNameStem(event.Driver.empty() ? event.Image : event.Driver),
+                imageBase,
+                imageSize,
+                device);
+        }
         if (imageBase != 0 && imageSize > 0x1000)
         {
             std::wstring captureNote;
@@ -7811,6 +8415,10 @@ void KernelMonitor::NoteDriverLoad(const KmonEvent& event)
                 &captureNote);
             if (!captureNote.empty())
             {
+                if (imageRangeResolved)
+                {
+                    captureNote += L" image_range_source=module_list";
+                }
                 EmitUnique(
                     L"driver.captured",
                     L"driver_capture:" + KmonBasenameLower(event.Driver),
@@ -8764,6 +9372,612 @@ void KernelMonitor::ScanPoolMappedImages()
     }
 }
 
+void KernelMonitor::ScanModuleInventory()
+{
+    // A lifecycle load/unload older than this must not explain a change: an
+    // old official unload would otherwise mask a later DKOM removal of the
+    // same image name.
+    constexpr uint64_t kModuleEventWindow100ns = 120ull * 10ull * 1000ull * 1000ull;
+    // Two consecutive scans must agree before a hiding verdict prints.
+    constexpr uint32_t kModuleDiffStrikeThreshold = 2;
+
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        symbols = Symbols;
+    }
+    if (symbols == nullptr)
+    {
+        EmitMappedResidue(
+            L"scan_failed:modinv:symbols",
+            std::wstring(),
+            L"module_list",
+            L"loaded-module inventory scan skipped; symbol engine is unavailable",
+            L"SymbolEngine is null");
+        return;
+    }
+    // The mapper tick refreshed the inventory moments ago; the reload guard
+    // inside EnsureLoadedKernelModules reuses that same snapshot here.
+    if (!EnsureLoadedKernelModules(symbols, true))
+    {
+        EmitMappedResidue(
+            L"scan_failed:modinv:inventory",
+            std::wstring(),
+            L"module_list",
+            L"loaded-module inventory scan skipped; the kernel module list was not readable",
+            L"EnsureLoadedKernelModules returned false");
+        return;
+    }
+    const std::vector<KernelModuleInfo> modules = symbols->CopyModules();
+    if (modules.empty())
+    {
+        // fail-closed: keep the previous baseline and stay silent about
+        // hiding, but say once that the scan is deferred.
+        EmitMappedResidue(
+            L"scan_failed:modinv:empty",
+            std::wstring(),
+            L"module_list",
+            L"loaded-module inventory scan deferred; the module list came back empty",
+            L"CopyModules returned no entries");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:modinv:symbols");
+    ClearEmittedKey(L"scan_failed:modinv:inventory");
+    ClearEmittedKey(L"scan_failed:modinv:empty");
+
+    std::vector<KmonModuleInventoryView> current;
+    current.reserve(modules.size());
+    for (const KernelModuleInfo& module : modules)
+    {
+        KmonModuleInventoryView view = {};
+        view.Name = KmonBasenameLower(
+            module.ImageName.empty() ? module.ImagePath : module.ImageName);
+        view.Base = module.Base;
+        view.Size = module.Size;
+        current.push_back(std::move(view));
+    }
+
+    FILETIME nowFileTime = {};
+    GetSystemTimeAsFileTime(&nowFileTime);
+    const uint64_t nowTicks =
+        (static_cast<uint64_t>(nowFileTime.dwHighDateTime) << 32) |
+        static_cast<uint64_t>(nowFileTime.dwLowDateTime);
+
+    std::vector<KmonModuleInventoryView> previous;
+    std::set<std::wstring> recentUnloads;
+    std::set<std::wstring> recentLoads;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        ++ModuleScans;
+        if (!ModuleBaselineValid)
+        {
+            ModuleBaseline.clear();
+            ModuleBaseline.reserve(current.size());
+            for (const KmonModuleInventoryView& view : current)
+            {
+                ModuleInventoryEntry entry = {};
+                entry.Name = view.Name;
+                entry.Base = view.Base;
+                entry.Size = view.Size;
+                ModuleBaseline.push_back(std::move(entry));
+            }
+            ModuleBaselineValid = true;
+            ModuleBaselineTickMs = GetTickCount64();
+            // The first scan after arm is the baseline only; nothing before
+            // the arm can be a hiding event.
+            return;
+        }
+        previous.reserve(ModuleBaseline.size());
+        for (const ModuleInventoryEntry& entry : ModuleBaseline)
+        {
+            KmonModuleInventoryView view = {};
+            view.Name = entry.Name;
+            view.Base = entry.Base;
+            view.Size = entry.Size;
+            previous.push_back(std::move(view));
+        }
+        for (const RecentDriverLoad& load : RecentLoads)
+        {
+            if (load.Timestamp == 0 || load.Base.empty())
+            {
+                continue;
+            }
+            if (nowTicks > load.Timestamp && (nowTicks - load.Timestamp) > kModuleEventWindow100ns)
+            {
+                continue;
+            }
+            recentLoads.insert(load.Base);
+        }
+        for (const RecentDriverUnload& unload : RecentUnloads)
+        {
+            if (unload.Timestamp == 0 || unload.Base.empty())
+            {
+                continue;
+            }
+            if (nowTicks > unload.Timestamp && (nowTicks - unload.Timestamp) > kModuleEventWindow100ns)
+            {
+                continue;
+            }
+            recentUnloads.insert(unload.Base);
+        }
+        ModuleBaseline.clear();
+        ModuleBaseline.reserve(current.size());
+        for (const KmonModuleInventoryView& view : current)
+        {
+            ModuleInventoryEntry entry = {};
+            entry.Name = view.Name;
+            entry.Base = view.Base;
+            entry.Size = view.Size;
+            ModuleBaseline.push_back(std::move(entry));
+        }
+        ModuleBaselineTickMs = GetTickCount64();
+    }
+
+    const std::vector<KmonModuleDiffRecord> diff =
+        KmonDiffModuleInventory(previous, current, recentUnloads, recentLoads);
+
+    // The accepted baseline moves forward on every scan, so a module that
+    // disappeared is reported by the diff exactly once and then looks normal
+    // again. Confirmation therefore comes from this pending table: a diff
+    // record opens (or refreshes) an entry, and an entry that the live
+    // inventory still contradicts gains another strike on every later scan
+    // until it is confirmed or resolved.
+    constexpr uint32_t kModuleDiffStrikeCap = 32;
+
+    std::set<std::wstring> currentNames;
+    std::set<std::pair<uint64_t, uint64_t>> currentRanges;
+    std::map<std::wstring, std::pair<uint64_t, uint64_t>> currentByNameRange;
+    for (const KmonModuleInventoryView& view : current)
+    {
+        if (!KmonInventoryEntryUsable(view))
+        {
+            continue;
+        }
+        currentNames.insert(view.Name);
+        currentRanges.insert(std::make_pair(view.Base, view.Size));
+        currentByNameRange[view.Name] = std::make_pair(view.Base, view.Size);
+    }
+
+    std::vector<std::pair<KmonModuleDiffRecord, uint32_t>> confirmed;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+
+        std::set<std::wstring> observed;
+        for (const KmonModuleDiffRecord& record : diff)
+        {
+            const std::wstring key =
+                std::wstring(KmonModuleDiffKindName(record.Kind)) + L":" + record.Name;
+            observed.insert(key);
+            PendingModuleAnomaly& pending = ModulePending[key];
+            if (pending.Strikes == 0)
+            {
+                pending.Kind = record.Kind;
+                pending.Name = record.Name;
+                pending.Base = record.Base;
+                pending.Size = record.Size;
+                pending.PreviousBase = record.PreviousBase;
+            }
+            if (pending.Strikes < kModuleDiffStrikeCap)
+            {
+                ++pending.Strikes;
+            }
+        }
+
+        for (auto it = ModulePending.begin(); it != ModulePending.end();)
+        {
+            PendingModuleAnomaly& pending = it->second;
+            if (observed.count(it->first) != 0)
+            {
+                ++it;
+                continue;
+            }
+
+            bool stillHolds = false;
+            if (pending.Kind == KmonModuleDiffKind::Vanished)
+            {
+                // Still missing, and still no unload event to explain it.
+                stillHolds =
+                    recentUnloads.count(pending.Name) == 0 &&
+                    currentNames.count(pending.Name) == 0 &&
+                    currentRanges.count(std::make_pair(pending.Base, pending.Size)) == 0;
+            }
+            else if (pending.Kind == KmonModuleDiffKind::UnnotifiedLoad)
+            {
+                // Still present, and still no load event to explain it.
+                stillHolds = currentNames.count(pending.Name) != 0 &&
+                    recentLoads.count(pending.Name) == 0;
+            }
+            else if (pending.Kind == KmonModuleDiffKind::Remap)
+            {
+                const auto rangeIt = currentByNameRange.find(pending.Name);
+                stillHolds =
+                    rangeIt != currentByNameRange.end() &&
+                    rangeIt->second.first != pending.PreviousBase &&
+                    recentLoads.count(pending.Name) == 0 &&
+                    recentUnloads.count(pending.Name) == 0;
+            }
+
+            if (!stillHolds)
+            {
+                it = ModulePending.erase(it);
+                continue;
+            }
+            if (pending.Strikes < kModuleDiffStrikeCap)
+            {
+                ++pending.Strikes;
+            }
+            ++it;
+        }
+
+        for (const auto& entry : ModulePending)
+        {
+            if (entry.second.Strikes < kModuleDiffStrikeThreshold)
+            {
+                continue;
+            }
+            KmonModuleDiffRecord record = {};
+            record.Kind = entry.second.Kind;
+            record.Name = entry.second.Name;
+            record.Base = entry.second.Base;
+            record.Size = entry.second.Size;
+            record.PreviousBase = entry.second.PreviousBase;
+            record.Layer = L"module_list";
+            confirmed.push_back(std::make_pair(std::move(record), entry.second.Strikes));
+        }
+    }
+
+    // P1 cross-view: a module that is still listed but no longer registered
+    // and/or whose image file is gone hid its installation, not its image.
+    std::vector<std::pair<std::wstring, std::wstring>> crossViewTargets;
+    crossViewTargets.reserve(modules.size());
+    for (const KernelModuleInfo& module : modules)
+    {
+        const std::wstring stem = KmonDriverNameStem(
+            module.ImageName.empty() ? module.ImagePath : module.ImageName);
+        if (stem.empty())
+        {
+            continue;
+        }
+        crossViewTargets.push_back(std::make_pair(stem, module.ImagePath));
+    }
+    ScanDriverEvidenceAsymmetry(crossViewTargets);
+
+    if (confirmed.empty())
+    {
+        return;
+    }
+
+    uint64_t baselineAgeMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (ModuleBaselineTickMs != 0 && GetTickCount64() >= ModuleBaselineTickMs)
+        {
+            baselineAgeMs = GetTickCount64() - ModuleBaselineTickMs;
+        }
+    }
+
+    for (const auto& confirmedEntry : confirmed)
+    {
+        const KmonModuleDiffRecord& record = confirmedEntry.first;
+        const uint32_t strikes = confirmedEntry.second;
+        std::wstring notes =
+            L"base=" + HexU64(record.Base) +
+            L" size=" + HexU64(record.Size) +
+            L" prev_base=" + HexU64(record.PreviousBase) +
+            L" scans=" + std::to_wstring(strikes) +
+            L" baseline_age_ms=" + std::to_wstring(baselineAgeMs) +
+            L" lifecycle_window_ms=120000";
+        if (record.Kind == KmonModuleDiffKind::Vanished)
+        {
+            notes += L" unload_event=none";
+            notes += L" view=system_module_information";
+            notes += L" followup=!module integrity; !driver; !callbacks; !kpage /pe";
+            EmitUnique(
+                L"driver.vanished",
+                L"modvanish:" + record.Name,
+                record.Name,
+                L"module_list",
+                L"driver vanished from PsLoadedModuleList without a lifecycle unload event " +
+                    record.Name,
+                notes,
+                0);
+        }
+        else if (record.Kind == KmonModuleDiffKind::UnnotifiedLoad)
+        {
+            notes += L" load_event=none";
+            notes += L" view=system_module_information";
+            notes += L" followup=!module integrity; !driver; !pool pe /suspicious";
+            EmitUnique(
+                L"driver.unnotified_load",
+                L"modnew:" + record.Name,
+                record.Name,
+                L"module_list",
+                L"kernel module appeared in PsLoadedModuleList without a lifecycle load event " +
+                    record.Name,
+                notes,
+                0);
+        }
+        else if (record.Kind == KmonModuleDiffKind::Remap)
+        {
+            notes += L" same_name_new_base=true";
+            notes += L" view=system_module_information";
+            notes += L" followup=!module integrity; !driver; !kpage /pe";
+            EmitUnique(
+                L"driver.remap",
+                L"modremap:" + record.Name,
+                record.Name,
+                L"module_list",
+                L"kernel module " + record.Name +
+                    L" changed image base without a lifecycle load/unload event",
+                notes,
+                0);
+        }
+    }
+}
+
+void KernelMonitor::ScanDriverEvidenceAsymmetry(
+    const std::vector<std::pair<std::wstring, std::wstring>>& modules)
+{
+    // Bounded rotation: only this many registry/file probes per scan tick, so
+    // a long module list cannot turn the cross-view into a hot loop.
+    constexpr size_t kProbesPerTick = 48;
+
+    if (modules.empty())
+    {
+        return;
+    }
+
+    if (!KmonDriverServiceRootReadable())
+    {
+        // fail-closed: without the service view no asymmetry may be claimed.
+        EmitMappedResidue(
+            L"scan_failed:modinv:services",
+            std::wstring(),
+            L"evidence_asymmetry",
+            L"driver cross-view scan skipped; the registry service root was not readable",
+            L"HKLM\\SYSTEM\\CurrentControlSet\\Services could not be opened");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:modinv:services");
+
+    uint64_t cursor = 0;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        cursor = EvidenceAsymmetryCursor;
+        EvidenceAsymmetryCursor =
+            (EvidenceAsymmetryCursor + kProbesPerTick) % modules.size();
+    }
+
+    const size_t probes =
+        modules.size() < kProbesPerTick ? modules.size() : kProbesPerTick;
+    for (size_t i = 0; i < probes; ++i)
+    {
+        const size_t index = static_cast<size_t>((cursor + i) % modules.size());
+        const std::wstring& stem = modules[index].first;
+        const std::wstring& imagePath = modules[index].second;
+
+        bool serviceKeyExists = false;
+        bool imageFileExists = false;
+        bool imagePathInbox = false;
+        const bool serviceKeyKnown =
+            KmonServiceKeyExistsForDriver(stem, &serviceKeyExists);
+        const bool imageFileKnown = KmonImageFileStateForDriver(
+            imagePath, &imageFileExists, &imagePathInbox);
+
+        const KmonEvidenceAsymmetryKind verdict = KmonClassifyEvidenceAsymmetry(
+            serviceKeyKnown,
+            serviceKeyExists,
+            imageFileKnown,
+            imageFileExists,
+            imagePathInbox);
+        const std::wstring key = L"evasym:" + stem;
+        if (verdict == KmonEvidenceAsymmetryKind::None)
+        {
+            // Recovered or unreadable: allow a later report for the same stem.
+            ClearEmittedKey(key);
+            continue;
+        }
+
+        std::wstring notes =
+            L"reason=" + std::wstring(KmonEvidenceAsymmetryReason(verdict)) +
+            L" svc_key=" + (serviceKeyExists ? L"yes" : L"no") +
+            L" image_file=" + (imageFileExists ? L"yes" : L"no") +
+            L" inbox=" + (imagePathInbox ? L"yes" : L"no") +
+            L" view=PsLoadedModuleList+service_key+image_file";
+        if (!imagePath.empty())
+        {
+            notes += L" image_path=" + imagePath;
+        }
+        notes += L" followup=!driver integrity; !module integrity; !kmon /driver";
+        EmitUnique(
+            L"driver.evidence_asymmetry",
+            key,
+            stem,
+            L"evidence_asymmetry",
+            L"loaded driver " + stem +
+                L" is gone from the service-key view and/or the image-file view",
+            notes);
+    }
+}
+
+bool KernelMonitor::RecordDriverImageBaseline(
+    const std::wstring& stem,
+    uint64_t base,
+    uint64_t size,
+    DeviceClient* device)
+{
+    if (stem.empty() || base == 0 || size == 0 || device == nullptr)
+    {
+        return false;
+    }
+    KmonDriverIdentitySnapshot snapshot = {};
+    if (!KmonSnapshotDriverImage(device, base, size, &snapshot))
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    auto it = DriverTamperBaselines.find(stem);
+    if (it != DriverTamperBaselines.end())
+    {
+        // A reload of the same name is a lifecycle event, so the image
+        // identity is re-baselined; the DRIVER_OBJECT fields already merged
+        // into the table survive.
+        if (it->second.HasFields)
+        {
+            snapshot.DriverStart = it->second.DriverStart;
+            snapshot.DriverSize = it->second.DriverSize;
+            snapshot.DriverSection = it->second.DriverSection;
+            snapshot.DeviceObject = it->second.DeviceObject;
+            snapshot.HasFields = true;
+        }
+        it->second = snapshot;
+        DriverTamperStrikes.erase(stem);
+        DriverTamperLastCheckMs.erase(stem);
+        return true;
+    }
+    DriverTamperBaselines[stem] = snapshot;
+    DriverTamperOrder.push_back(stem);
+    return true;
+}
+
+void KernelMonitor::ScanDriverTamper()
+{
+    constexpr uint32_t kDriverTamperStrikeThreshold = 2;
+    constexpr size_t kDriverTamperPerPass = 4;
+    constexpr uint64_t kDriverTamperRecheckMs = 60000;
+
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || symbols == nullptr || !device->IsOpen())
+    {
+        return;
+    }
+
+    std::vector<std::pair<std::wstring, KmonDriverIdentitySnapshot>> work;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        const size_t total = DriverTamperOrder.size();
+        if (total == 0)
+        {
+            return;
+        }
+        ++DriverTamperChecks;
+        const uint64_t nowMs = GetTickCount64();
+        const size_t start = static_cast<size_t>(DriverTamperCursor % total);
+        size_t picked = 0;
+        for (size_t step = 0; step < total && picked < kDriverTamperPerPass; ++step)
+        {
+            const std::wstring& stem = DriverTamperOrder[(start + step) % total];
+            auto baselineIt = DriverTamperBaselines.find(stem);
+            if (baselineIt == DriverTamperBaselines.end())
+            {
+                continue;
+            }
+            auto lastIt = DriverTamperLastCheckMs.find(stem);
+            if (lastIt != DriverTamperLastCheckMs.end() &&
+                nowMs >= lastIt->second &&
+                (nowMs - lastIt->second) < kDriverTamperRecheckMs)
+            {
+                continue;
+            }
+            work.push_back(std::make_pair(stem, baselineIt->second));
+            DriverTamperLastCheckMs[stem] = nowMs;
+            ++picked;
+        }
+        DriverTamperCursor = (start + picked) % total;
+    }
+
+    struct TamperFinding
+    {
+        std::wstring Stem;
+        uint64_t Base = 0;
+        uint64_t Size = 0;
+        uint64_t BaselineHeader = 0;
+        uint64_t LiveHeader = 0;
+    };
+    std::vector<TamperFinding> findings;
+
+    for (const auto& entry : work)
+    {
+        // The baseline range must still be the range the loader list reports
+        // for this name. If it is not, the driver was unloaded or reloaded
+        // elsewhere: drop the baseline instead of reporting tampering, so a
+        // legitimate lifecycle change can never look like a verdict.
+        uint64_t inventoryBase = 0;
+        uint64_t inventorySize = 0;
+        if (!KmonResolveModuleRangeByName(symbols, entry.first, &inventoryBase, &inventorySize) ||
+            inventoryBase != entry.second.Base ||
+            inventorySize != entry.second.Size)
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            DriverTamperBaselines.erase(entry.first);
+            DriverTamperStrikes.erase(entry.first);
+            DriverTamperLastCheckMs.erase(entry.first);
+            continue;
+        }
+
+        KmonDriverIdentitySnapshot live = {};
+        if (!KmonSnapshotDriverImage(device, entry.second.Base, entry.second.Size, &live))
+        {
+            // Fail-closed: an unreadable image (paged out, device busy) is
+            // never a tamper verdict and does not advance the strike counter.
+            continue;
+        }
+        const uint32_t mask = KmonDriverTamperMask(entry.second, live);
+        if ((mask & static_cast<uint32_t>(KmonTamperImage)) == 0)
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            DriverTamperStrikes.erase(entry.first);
+            continue;
+        }
+
+        uint32_t strikes = 0;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            strikes = ++DriverTamperStrikes[entry.first];
+        }
+        if (strikes < kDriverTamperStrikeThreshold)
+        {
+            continue;
+        }
+
+        TamperFinding finding = {};
+        finding.Stem = entry.first;
+        finding.Base = entry.second.Base;
+        finding.Size = entry.second.Size;
+        finding.BaselineHeader = entry.second.HeaderHash;
+        finding.LiveHeader = live.HeaderHash;
+        findings.push_back(std::move(finding));
+    }
+
+    for (const TamperFinding& finding : findings)
+    {
+        std::wstring notes =
+            L"base=" + HexU64(finding.Base) +
+            L" size=" + HexU64(finding.Size) +
+            L" baseline_header_hash=" + HexU64(finding.BaselineHeader) +
+            L" live_header_hash=" + HexU64(finding.LiveHeader) +
+            L" scans=" + std::to_wstring(kDriverTamperStrikeThreshold) +
+            L" compare=pe_header+entry_point";
+        notes += L" view=live_image_read";
+        notes += L" followup=!module integrity; !kpage /pe; !pool pe /suspicious; !driver";
+        EmitUnique(
+            L"driver.tampered",
+            L"drvtamper:" + finding.Stem + L":image",
+            finding.Stem,
+            L"driver_image",
+            L"loaded driver image changed after load " + finding.Stem,
+            notes,
+            0);
+    }
+}
+
 void KernelMonitor::ScanUnbackedDriverObjects()
 {
     DeviceClient* device = nullptr;
@@ -8844,6 +10058,184 @@ void KernelMonitor::ScanUnbackedDriverObjects()
             continue;
         }
 
+        // P1: field-level tamper. The load-time baseline for this driver (when
+        // one exists) recorded DriverStart/DriverSize/DriverSection/Device
+        // object. The I/O manager fills those at load and never rewrites them,
+        // so a change -- or a wipe to zero -- is post-load identity tampering
+        // even while the image itself stays intact. The first observation only
+        // merges the fields into the baseline; a verdict needs two strikes.
+        {
+            constexpr uint32_t kDriverTamperFieldStrikeThreshold = 2;
+            const std::wstring fieldStem = KmonDriverNameStem(record.Name);
+            KmonDriverIdentitySnapshot fieldBaseline = {};
+            uint32_t fieldStrikes = 0;
+            bool fieldVerdict = false;
+            if (!fieldStem.empty())
+            {
+                std::lock_guard<std::mutex> lock(WatchMutex);
+                auto baselineIt = DriverTamperBaselines.find(fieldStem);
+                if (baselineIt != DriverTamperBaselines.end())
+                {
+                    KmonDriverIdentitySnapshot& baseline = baselineIt->second;
+                    if (!baseline.HasFields)
+                    {
+                        baseline.DriverStart = record.DriverStart;
+                        baseline.DriverSize = record.DriverSize;
+                        baseline.DriverSection = record.DriverSection;
+                        baseline.DeviceObject = record.DeviceObject;
+                        baseline.HasFields = true;
+                    }
+                    else
+                    {
+                        KmonDriverIdentitySnapshot live = baseline;
+                        live.DriverStart = record.DriverStart;
+                        live.DriverSize = record.DriverSize;
+                        live.DriverSection = record.DriverSection;
+                        live.DeviceObject = record.DeviceObject;
+                        const uint32_t mask = KmonDriverTamperMask(baseline, live);
+                        if ((mask & static_cast<uint32_t>(KmonTamperFields)) != 0)
+                        {
+                            fieldBaseline = baseline;
+                            fieldStrikes = ++DriverTamperStrikes[fieldStem];
+                            fieldVerdict =
+                                fieldStrikes >= kDriverTamperFieldStrikeThreshold;
+                        }
+                        else
+                        {
+                            DriverTamperStrikes.erase(fieldStem);
+                        }
+                    }
+                }
+            }
+            if (fieldVerdict)
+            {
+                std::wstring notes =
+                    L"driver_object=" + HexU64(record.DriverObject) +
+                    L" baseline_start=" + HexU64(fieldBaseline.DriverStart) +
+                    L" live_start=" + HexU64(record.DriverStart) +
+                    L" baseline_size=" + HexU64(fieldBaseline.DriverSize) +
+                    L" live_size=" + HexU64(record.DriverSize) +
+                    L" baseline_section=" + HexU64(fieldBaseline.DriverSection) +
+                    L" live_section=" + HexU64(record.DriverSection) +
+                    L" baseline_device=" + HexU64(fieldBaseline.DeviceObject) +
+                    L" live_device=" + HexU64(record.DeviceObject) +
+                    L" scans=" + std::to_wstring(fieldStrikes);
+                notes += L" followup=!driver " + record.Name + L"; !driverobj " +
+                    record.Name + L"; !module integrity";
+                EmitUnique(
+                    L"driver.tampered",
+                    L"drvtamper:" + fieldStem + L":fields",
+                    record.Name,
+                    L"driver_object",
+                    L"DRIVER_OBJECT identity of " + record.Name +
+                        L" changed after load",
+                    notes,
+                    0);
+            }
+        }
+
+        // P0: DriverStart and DriverSection both zero while the object still
+        // owns a device or a dispatch table is the classic "image hidden from
+        // the loader list" shape. The I/O manager sets DriverStart for every
+        // loaded image, so this is either an IoCreateDriver-created sub-driver
+        // object or a hidden image; the note keeps both readings visible
+        // instead of guessing. AddressOwnedByLoadedModule stays the primary
+        // predicate above -- this branch never overrides it.
+        const bool hasStart = record.HasDriverStart && record.DriverStart != 0;
+        const bool hasSection = record.DriverSection != 0;
+
+        // P0 secondary judgment source: the loader entry DriverSection points
+        // at still carries DllBase and SizeOfImage even when DriverStart has
+        // been zeroed. Offsets are the documented x64 _LDR_DATA_TABLE_ENTRY
+        // layout (InLoadOrderLinks 0x00, DllBase 0x30, SizeOfImage 0x40).
+        // DllBase is only trusted when it is a canonical kernel address, so a
+        // bogus DriverSection cannot produce a verdict from garbage.
+        uint64_t sectionBase = 0;
+        uint64_t sectionSize = 0;
+        bool hasSectionImage = false;
+        if (hasSection)
+        {
+            uint64_t value = 0;
+            if (KmonReadKernelU64(device, record.DriverSection + 0x30, &value))
+            {
+                sectionBase = value;
+                hasSectionImage = value >= 0xFFFF800000000000ull;
+            }
+            if (KmonReadKernelU64(device, record.DriverSection + 0x40, &value))
+            {
+                sectionSize = value;
+            }
+        }
+        const bool unbackedSection =
+            hasSectionImage &&
+            sectionSize != 0 &&
+            record.OwningModule.empty() &&
+            !AddressOwnedByLoadedModule(symbols, sectionBase);
+        if (unbackedSection)
+        {
+            std::wstring sectionNotes = record.Notes;
+            if (!sectionNotes.empty())
+            {
+                sectionNotes += L" ";
+            }
+            sectionNotes +=
+                L"loader_entry_dllbase=" + HexU64(sectionBase) +
+                L" loader_entry_size=" + HexU64(sectionSize) +
+                L" driver_section=" + HexU64(record.DriverSection) +
+                L" driver_start=" +
+                (hasStart ? HexU64(record.DriverStart) : std::wstring(L"0"));
+            sectionNotes += L" followup=!driver " + record.Name + L"; !driverobj " +
+                record.Name + L"; !module integrity";
+            EmitMappedResidue(
+                L"drvobj_section:" + HexU64(record.DriverObject),
+                record.Name,
+                L"driver_object",
+                L"DRIVER_OBJECT " + record.Name + L" loader-entry DllBase " +
+                    HexU64(sectionBase) + L" is outside PsLoadedModuleList",
+                sectionNotes);
+        }
+
+        if (!unbackedSection && !hasStart && !hasSectionImage && record.OwningModule.empty())
+        {
+            uint32_t inModuleDispatch = 0;
+            uint32_t unbackedDispatch = 0;
+            for (const DriverDispatchRecord& dispatch : record.Dispatch)
+            {
+                if (dispatch.Function == 0)
+                {
+                    continue;
+                }
+                if (AddressOwnedByLoadedModule(symbols, dispatch.Function))
+                {
+                    ++inModuleDispatch;
+                }
+                else
+                {
+                    ++unbackedDispatch;
+                }
+            }
+            if (record.DeviceObject != 0 || (inModuleDispatch + unbackedDispatch) > 0)
+            {
+                std::wstring notes = record.Notes;
+                if (!notes.empty())
+                {
+                    notes += L" ";
+                }
+                notes += L"no_image=true driver_start=0 driver_section=0 device=" +
+                    HexU64(record.DeviceObject) +
+                    L" dispatch_in_module=" + std::to_wstring(inModuleDispatch) +
+                    L" dispatch_unbacked=" + std::to_wstring(unbackedDispatch);
+                notes += L" followup=!driver " + record.Name + L"; !driverobj " + record.Name;
+                EmitMappedResidue(
+                    L"drvobj_noimage:" + HexU64(record.DriverObject),
+                    record.Name,
+                    L"driver_object",
+                    L"DRIVER_OBJECT " + record.Name +
+                        L" has neither DriverStart nor DriverSection; the image is not in PsLoadedModuleList",
+                    notes);
+            }
+        }
+
         for (const DriverDispatchRecord& dispatch : record.Dispatch)
         {
             if (!dispatch.Suspicious || dispatch.Function == 0)
@@ -8866,6 +10258,81 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                 slotName + L" of " + record.Name +
                     L" points outside loaded modules " + HexU64(dispatch.Function),
                 dispatch.Notes);
+        }
+    }
+
+    // P0: driver objects that own a \Device object but are missing from the
+    // \Driver enumeration had their object-directory link cut. The \Driver
+    // walk above cannot see them at all, so this back-reference pass is the
+    // only path that reaches them.
+    {
+        std::set<uint64_t> knownDriverObjects;
+        for (const DriverIntegrityRecord& record : result.Records)
+        {
+            if (record.DriverObject != 0)
+            {
+                knownDriverObjects.insert(record.DriverObject);
+            }
+        }
+        DeviceBackrefResult backrefs = {};
+        std::wstring backrefError;
+        if (scanner.ScanDeviceDriverBackrefs(knownDriverObjects, &backrefs, &backrefError))
+        {
+            ClearEmittedKey(L"scan_failed:devbackref");
+            for (const AnonymousDriverBackrefRecord& anonymous : backrefs.AnonymousDrivers)
+            {
+                const std::wstring driverLabel = anonymous.DriverName.empty()
+                    ? HexU64(anonymous.DriverObject)
+                    : anonymous.DriverName;
+                std::wstring notes =
+                    L"driver_object_not_in_driver_directory=true device=" +
+                    HexU64(anonymous.DeviceObject) +
+                    L" device_type=" + std::to_wstring(anonymous.DeviceType);
+                if (!anonymous.DriverName.empty())
+                {
+                    notes += L" driver_name=" + anonymous.DriverName;
+                }
+                if (anonymous.HasDriverStart)
+                {
+                    notes += L" driver_start=" + HexU64(anonymous.DriverStart) +
+                        L" driver_size=" + HexU64(anonymous.DriverSize);
+                }
+                else
+                {
+                    notes += L" driver_start=0";
+                }
+                if (!anonymous.ModuleName.empty())
+                {
+                    notes += L" module=" + anonymous.ModuleName;
+                }
+                notes += L" followup=!driverobj " + driverLabel + L"; !driver";
+                EmitMappedResidue(
+                    L"drvobj_backref:" + HexU64(anonymous.DriverObject),
+                    driverLabel,
+                    L"driver_object",
+                    L"DRIVER_OBJECT " + driverLabel + L" owns \\Device\\" +
+                        anonymous.DeviceName +
+                        L" but is not reachable from the \\Driver directory",
+                    notes);
+            }
+            for (const std::wstring& warning : backrefs.Warnings)
+            {
+                EmitMappedResidue(
+                    L"scan_failed:devbackref:warning",
+                    std::wstring(),
+                    L"driver_object",
+                    L"\\Device back-reference scan warning",
+                    warning);
+            }
+        }
+        else
+        {
+            EmitMappedResidue(
+                L"scan_failed:devbackref",
+                std::wstring(),
+                L"driver_object",
+                L"\\Device back-reference scan skipped; the device object directory was not walkable",
+                backrefError.empty() ? L"ScanDeviceDriverBackrefs returned false" : backrefError);
         }
     }
 }
@@ -14335,53 +15802,99 @@ bool KernelMonitorArtifactSelfTest()
                         FALSE,
                         pi.dwProcessId);
                 }
-                if (inspect == nullptr)
+                if (inspect != nullptr)
                 {
-                    break;
-                }
-                uint64_t childBase = 0;
-                QueryPebImageBase(inspect, nullptr, nullptr, pi.dwProcessId, &childBase);
-                uint32_t childRva[1] = { childExecRva };
-                uint32_t childPriv = 0;
-                uint32_t childValid = 0;
-                if (childBase != 0)
-                {
-                    for (int poll = 0; poll < 50; ++poll)
+                    uint64_t childBase = 0;
+                    QueryPebImageBase(inspect, nullptr, nullptr, pi.dwProcessId, &childBase);
+                    uint32_t childRva[1] = { childExecRva };
+                    uint32_t childPriv = 0;
+                    uint32_t childValid = 0;
+                    if (childBase != 0)
                     {
-                        childPriv = 0;
-                        childValid = 0;
-                        CountPrivateCowImagePages(
-                            inspect,
-                            nullptr,
-                            nullptr,
-                            pi.dwProcessId,
-                            childBase,
-                            childRva,
-                            1,
-                            &childPriv,
-                            &childValid);
-                        if (childPriv > 0)
+                        // Readiness is observed, not announced. The fixture's own
+                        // announce cannot serve as the gate here: /overwrite
+                        // replaces the first 64 bytes of its exec section with a
+                        // 0x90 sled, and that sled lands on the code that writes
+                        // %TEMP%\kn-live-dbg-kmon\artifact.pid, so the file is
+                        // created but left at 0 bytes (measured; /child stamp,
+                        // which does not patch, writes its pid there). Observe
+                        // the patch instead: once those 64 sled bytes are visible
+                        // in the child, its write already happened and the image
+                        // page must be private, so a page that still reads shared
+                        // is a broken COW counter rather than a timing artifact.
+                        // The child also dies by design when it returns into the
+                        // sled, so a sample taken after that death is skipped
+                        // instead of failed.
+                        uint8_t sled[64] = {};
+                        std::memset(sled, 0x90, sizeof(sled));
+                        bool patched = false;
+                        const uint64_t readyDeadlineMs = GetTickCount64() + 4000;
+                        while (GetTickCount64() < readyDeadlineMs)
+                        {
+                            uint8_t observed[sizeof(sled)] = {};
+                            SIZE_T observedBytes = 0;
+                            if (ReadProcessMemory(
+                                    inspect,
+                                    reinterpret_cast<LPCVOID>(
+                                        static_cast<uintptr_t>(childBase) + childExecRva),
+                                    observed,
+                                    sizeof(observed),
+                                    &observedBytes) &&
+                                observedBytes == sizeof(observed) &&
+                                std::memcmp(observed, sled, sizeof(sled)) == 0)
+                            {
+                                patched = true;
+                                break;
+                            }
+                            if (WaitForSingleObject(childProc, 0) == WAIT_OBJECT_0)
+                            {
+                                break;
+                            }
+                            Sleep(25);
+                        }
+                        bool sawPrivate = false;
+                        bool childAliveThroughout = patched;
+                        for (int poll = 0; patched && poll < 20; ++poll)
+                        {
+                            childPriv = 0;
+                            childValid = 0;
+                            CountPrivateCowImagePages(
+                                inspect,
+                                nullptr,
+                                nullptr,
+                                pi.dwProcessId,
+                                childBase,
+                                childRva,
+                                1,
+                                &childPriv,
+                                &childValid);
+                            if (childPriv > 0)
+                            {
+                                sawPrivate = true;
+                                break;
+                            }
+                            if (WaitForSingleObject(childProc, 0) == WAIT_OBJECT_0)
+                            {
+                                childAliveThroughout = false;
+                                break;
+                            }
+                            Sleep(50);
+                        }
+                        if (patched && !sawPrivate && childAliveThroughout &&
+                            childValid > 0 && childPriv == 0)
                         {
                             break;
                         }
-                        if (WaitForSingleObject(childProc, 0) == WAIT_OBJECT_0)
-                        {
-                            break;
-                        }
-                        Sleep(100);
                     }
-                }
-                CloseHandle(inspect);
-                // Working-set query can miss on a just-spawned child. Fail
-                // when pages were visible and still shared after patch.
-                if (childValid > 0 && childPriv == 0)
-                {
-                    break;
+                    CloseHandle(inspect);
                 }
             }
             else
             {
-                break;
+                // The fixture could not be launched or inspected (AV,
+                // permission, or path): the in-process COW check above already
+                // exercised the primitive, so the cross-process half is
+                // skipped rather than failed.
             }
         }
 
@@ -14393,6 +15906,226 @@ bool KernelMonitorArtifactSelfTest()
         WaitForSingleObject(childProc, 5000);
         CloseHandle(childProc);
     }
+    return ok;
+}
+
+bool KernelMonitorHiddenDriverSelfTest()
+{
+    bool ok = true;
+
+    // --- module inventory diff (driver.vanished / unnotified_load / remap) --
+    {
+        KmonModuleInventoryView ntfs = {};
+        ntfs.Name = L"ntfs.sys";
+        ntfs.Base = 0xFFFFF80010000000ull;
+        ntfs.Size = 0x100000ull;
+        KmonModuleInventoryView tcpip = {};
+        tcpip.Name = L"tcpip.sys";
+        tcpip.Base = 0xFFFFF80020000000ull;
+        tcpip.Size = 0x80000ull;
+        KmonModuleInventoryView hidden = {};
+        hidden.Name = L"jrvwfjhdyprtjeaf.sys";
+        hidden.Base = 0xFFFFF80030000000ull;
+        hidden.Size = 0x200000ull;
+
+        const std::vector<KmonModuleInventoryView> previous = { ntfs, tcpip, hidden };
+        const std::vector<KmonModuleInventoryView> current = { ntfs, tcpip };
+        const std::set<std::wstring> noEvents;
+        const std::set<std::wstring> unloadEvent = { L"jrvwfjhdyprtjeaf.sys" };
+        const std::set<std::wstring> loadEvent = { L"jrvwfjhdyprtjeaf.sys" };
+
+        // A module that is gone with no lifecycle unload event is a vanish.
+        const std::vector<KmonModuleDiffRecord> vanished =
+            KmonDiffModuleInventory(previous, current, noEvents, noEvents);
+        ok = ok && vanished.size() == 1;
+        if (vanished.size() == 1)
+        {
+            ok = ok && vanished[0].Kind == KmonModuleDiffKind::Vanished;
+            ok = ok && vanished[0].Name == L"jrvwfjhdyprtjeaf.sys";
+            ok = ok && vanished[0].Base == hidden.Base;
+            ok = ok && vanished[0].Size == hidden.Size;
+            ok = ok && vanished[0].Layer == L"module_list";
+            ok = ok && std::wstring(KmonModuleDiffKindName(vanished[0].Kind)) == L"vanished";
+        }
+
+        // The same removal with an unload event is explained: stay silent.
+        ok = ok && KmonDiffModuleInventory(previous, current, unloadEvent, noEvents).empty();
+
+        // fail-closed: one side missing means nothing can be concluded.
+        ok = ok && KmonDiffModuleInventory(
+            previous, std::vector<KmonModuleInventoryView>(), noEvents, noEvents).empty();
+        ok = ok && KmonDiffModuleInventory(
+            std::vector<KmonModuleInventoryView>(), current, noEvents, noEvents).empty();
+
+        // dbghelp pseudo modules are not loader list entries.
+        KmonModuleInventoryView pseudo = {};
+        pseudo.Name = L"__kernel";
+        pseudo.Base = 0xFFFFF80040000000ull;
+        pseudo.Size = 0x1000ull;
+        const std::vector<KmonModuleInventoryView> pseudoPrevious = { pseudo };
+        ok = ok && KmonDiffModuleInventory(
+            pseudoPrevious, std::vector<KmonModuleInventoryView>(), noEvents, noEvents).empty();
+
+        // An unnotified load is the mirror image, and the load event explains it.
+        bool sawUnnotified = false;
+        for (const KmonModuleDiffRecord& record :
+             KmonDiffModuleInventory(current, previous, noEvents, noEvents))
+        {
+            if (record.Kind == KmonModuleDiffKind::UnnotifiedLoad &&
+                record.Name == L"jrvwfjhdyprtjeaf.sys")
+            {
+                sawUnnotified = true;
+            }
+        }
+        ok = ok && sawUnnotified;
+        for (const KmonModuleDiffRecord& record :
+             KmonDiffModuleInventory(current, previous, noEvents, loadEvent))
+        {
+            ok = ok && record.Name != L"jrvwfjhdyprtjeaf.sys";
+        }
+
+        // Same name, new image base, no lifecycle event is a remap.
+        KmonModuleInventoryView moved = hidden;
+        moved.Base = 0xFFFFF80050000000ull;
+        const std::vector<KmonModuleInventoryView> movedCurrent = { ntfs, tcpip, moved };
+        bool sawRemap = false;
+        for (const KmonModuleDiffRecord& record :
+             KmonDiffModuleInventory(previous, movedCurrent, noEvents, noEvents))
+        {
+            if (record.Kind == KmonModuleDiffKind::Remap &&
+                record.Name == L"jrvwfjhdyprtjeaf.sys" &&
+                record.PreviousBase == hidden.Base &&
+                record.Base == moved.Base)
+            {
+                sawRemap = true;
+            }
+        }
+        ok = ok && sawRemap;
+    }
+
+    // --- cross-view evidence asymmetry (driver.evidence_asymmetry) ----------
+    {
+        // Both views definitive and present: nothing to report.
+        ok = ok && KmonClassifyEvidenceAsymmetry(true, true, true, true, false) ==
+            KmonEvidenceAsymmetryKind::None;
+        // ntoskrnl/win32k are inbox images with no driver service key: normal.
+        ok = ok && KmonClassifyEvidenceAsymmetry(true, false, true, true, true) ==
+            KmonEvidenceAsymmetryKind::None;
+        // A non-inbox image whose service key was deleted after the load.
+        ok = ok && KmonClassifyEvidenceAsymmetry(true, false, true, true, false) ==
+            KmonEvidenceAsymmetryKind::NoServiceKey;
+        // The binary the driver was loaded from is gone, the key survived.
+        ok = ok && KmonClassifyEvidenceAsymmetry(true, true, true, false, false) ==
+            KmonEvidenceAsymmetryKind::NoImageFile;
+        // Nothing but PsLoadedModuleList still knows about this driver.
+        ok = ok && KmonClassifyEvidenceAsymmetry(true, false, true, false, true) ==
+            KmonEvidenceAsymmetryKind::NoServiceKeyNoImageFile;
+        // fail-closed: an unavailable view never produces a verdict.
+        ok = ok && KmonClassifyEvidenceAsymmetry(false, false, false, false, false) ==
+            KmonEvidenceAsymmetryKind::None;
+        ok = ok && KmonClassifyEvidenceAsymmetry(false, false, true, false, false) ==
+            KmonEvidenceAsymmetryKind::None;
+        ok = ok && KmonClassifyEvidenceAsymmetry(true, false, false, false, false) ==
+            KmonEvidenceAsymmetryKind::None;
+
+        ok = ok && std::wstring(KmonEvidenceAsymmetryReason(
+            KmonEvidenceAsymmetryKind::NoServiceKey)) == L"no_service_key";
+        ok = ok && std::wstring(KmonEvidenceAsymmetryReason(
+            KmonEvidenceAsymmetryKind::NoImageFile)) == L"no_image_file";
+        ok = ok && std::wstring(KmonEvidenceAsymmetryReason(
+            KmonEvidenceAsymmetryKind::NoServiceKeyNoImageFile)) ==
+            L"no_service_key_no_image_file";
+        ok = ok && KmonEvidenceAsymmetryReason(KmonEvidenceAsymmetryKind::None)[0] == L'\0';
+
+        ok = ok && KmonImagePathIsInbox(L"\\Windows\\System32\\ntoskrnl.exe");
+        ok = ok && KmonImagePathIsInbox(L"C:\\Windows\\System32\\drivers\\acpi.sys");
+        ok = ok && !KmonImagePathIsInbox(L"C:\\Users\\Public\\jrvwfjhdyprtjeaf.sys");
+        ok = ok && !KmonImagePathIsInbox(L"");
+
+        // The new kind is wired into the always-match watch list.
+        KmonEvent asymmetryEvent = {};
+        asymmetryEvent.Kind = L"driver.evidence_asymmetry";
+        KmonOptions asymmetryOptions = {};
+        ok = ok && KmonWatchMatches(asymmetryEvent, asymmetryOptions);
+    }
+
+    // --- tamper verdict (driver.tampered) ----------------------------------
+    {
+        KmonDriverIdentitySnapshot baseline = {};
+        baseline.Base = 0xFFFFF80010000000ull;
+        baseline.Size = 0x100000ull;
+        baseline.HeaderHash = 0x1111222233334444ull;
+        baseline.EntryHash = 0x5555666677778888ull;
+        baseline.EntryOffset = 0x1234;
+        baseline.DriverStart = 0xFFFFF80010000000ull;
+        baseline.DriverSize = 0x100000ull;
+        baseline.DriverSection = 0xFFFF900000001000ull;
+        baseline.DeviceObject = 0xFFFF900000002000ull;
+        baseline.HasImage = true;
+        baseline.HasFields = true;
+
+        // A resident driver that nobody touched is not tampered.
+        ok = ok && KmonDriverTamperMask(baseline, baseline) == KmonTamperNone;
+
+        KmonDriverIdentitySnapshot imageChanged = baseline;
+        imageChanged.HeaderHash = 0x9999AAAABBBBCCCCull;
+        ok = ok && (KmonDriverTamperMask(baseline, imageChanged) &
+            static_cast<uint32_t>(KmonTamperImage)) != 0;
+
+        KmonDriverIdentitySnapshot codeChanged = baseline;
+        codeChanged.EntryHash = 0xDDDDEEEEFFFF0000ull;
+        ok = ok && (KmonDriverTamperMask(baseline, codeChanged) &
+            static_cast<uint32_t>(KmonTamperImage)) != 0;
+
+        // Zeroing DriverStart / DriverSize / DriverSection is field tampering.
+        KmonDriverIdentitySnapshot startWiped = baseline;
+        startWiped.DriverStart = 0;
+        ok = ok && (KmonDriverTamperMask(baseline, startWiped) &
+            static_cast<uint32_t>(KmonTamperFields)) != 0;
+
+        KmonDriverIdentitySnapshot sizeWiped = baseline;
+        sizeWiped.DriverSize = 0;
+        ok = ok && (KmonDriverTamperMask(baseline, sizeWiped) &
+            static_cast<uint32_t>(KmonTamperFields)) != 0;
+
+        KmonDriverIdentitySnapshot sectionWiped = baseline;
+        sectionWiped.DriverSection = 0;
+        ok = ok && (KmonDriverTamperMask(baseline, sectionWiped) &
+            static_cast<uint32_t>(KmonTamperFields)) != 0;
+
+        // A device object that was unlinked to zero lost its device link.
+        KmonDriverIdentitySnapshot deviceWiped = baseline;
+        deviceWiped.DeviceObject = 0;
+        ok = ok && (KmonDriverTamperMask(baseline, deviceWiped) &
+            static_cast<uint32_t>(KmonTamperFields)) != 0;
+
+        // A device that merely changed identity is a normal create/delete
+        // cycle and must never be reported.
+        KmonDriverIdentitySnapshot deviceSwapped = baseline;
+        deviceSwapped.DeviceObject = 0xFFFF900000003000ull;
+        ok = ok && KmonDriverTamperMask(baseline, deviceSwapped) == KmonTamperNone;
+
+        // fail-closed: a snapshot that was never captured proves nothing.
+        KmonDriverIdentitySnapshot empty = {};
+        ok = ok && KmonDriverTamperMask(empty, baseline) == KmonTamperNone;
+        ok = ok && KmonDriverTamperMask(baseline, empty) == KmonTamperNone;
+
+        // Hash determinism, sensitivity, and the empty-input sentinel.
+        const uint8_t sample[8] = { 0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00 };
+        const uint8_t mutated[8] = { 0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x01 };
+        ok = ok && KmonHashBytes64(sample, sizeof(sample)) != 0;
+        ok = ok && KmonHashBytes64(sample, sizeof(sample)) ==
+            KmonHashBytes64(sample, sizeof(sample));
+        ok = ok && KmonHashBytes64(sample, sizeof(sample)) !=
+            KmonHashBytes64(mutated, sizeof(mutated));
+        ok = ok && KmonHashBytes64(sample, 0) == 0;
+
+        // The TI path form and the DRIVER_OBJECT name form key one baseline.
+        ok = ok && KmonDriverNameStem(L"\\SystemRoot\\System32\\drivers\\Foo.SYS") == L"foo";
+        ok = ok && KmonDriverNameStem(L"\\Driver\\Foo") == L"foo";
+        ok = ok && KmonDriverNameStem(L"jrvwfjhdyprtjeaf.sys") == L"jrvwfjhdyprtjeaf";
+    }
+
     return ok;
 }
 

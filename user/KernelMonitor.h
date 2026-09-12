@@ -85,6 +85,72 @@ struct KmonStats
     uint64_t LastEventTickMs = 0;
 };
 
+// P1: post-load identity baseline for a loaded driver image. The image head
+// and entry point hashes plus the DRIVER_OBJECT identity fields are captured
+// when the load is observed; a later mismatch is driver.tampered. Fail-closed:
+// a field that was never captured never produces a verdict, and an image that
+// cannot be read only defers the check.
+struct KmonDriverIdentitySnapshot
+{
+    uint64_t Base = 0;
+    uint64_t Size = 0;
+    uint64_t HeaderHash = 0;
+    uint64_t EntryHash = 0;
+    uint64_t EntryOffset = 0;
+    uint64_t DriverStart = 0;
+    uint64_t DriverSize = 0;
+    uint64_t DriverSection = 0;
+    uint64_t DeviceObject = 0;
+    bool HasImage = false;
+    bool HasFields = false;
+};
+
+enum KmonTamperMask : uint32_t
+{
+    KmonTamperNone = 0,
+    KmonTamperImage = 1u << 0,
+    KmonTamperFields = 1u << 1,
+};
+
+uint64_t KmonHashBytes64(const uint8_t* data, size_t size);
+
+// Returns the subset of KmonTamperMask that the live snapshot contradicts.
+// Pure so the self-test can drive it with synthetic snapshots.
+uint32_t KmonDriverTamperMask(
+    const KmonDriverIdentitySnapshot& baseline,
+    const KmonDriverIdentitySnapshot& live);
+
+// P1 cross-view: PsLoadedModuleList still reports a driver while another view
+// of it (its service key, its image file on disk) does not. Both views must be
+// definitive before a verdict; an unavailable view only defers the check.
+enum class KmonEvidenceAsymmetryKind
+{
+    None = 0,
+    NoServiceKey,
+    NoImageFile,
+    NoServiceKeyNoImageFile,
+};
+
+// Pure decision function over the two view results, so the self-test can drive
+// every combination without a live kernel.
+KmonEvidenceAsymmetryKind KmonClassifyEvidenceAsymmetry(
+    bool serviceKeyKnown,
+    bool serviceKeyExists,
+    bool imageFileKnown,
+    bool imageFileExists,
+    bool imagePathInbox);
+const wchar_t* KmonEvidenceAsymmetryReason(KmonEvidenceAsymmetryKind kind);
+// \Windows\System32 holds the keyless core images Windows always has loaded.
+bool KmonImagePathIsInbox(const std::wstring& win32Path);
+
+enum class KmonModuleDiffKind
+{
+    None = 0,
+    Vanished,
+    UnnotifiedLoad,
+    Remap,
+};
+
 class KernelMonitor
 {
 public:
@@ -166,6 +232,9 @@ private:
     void ScanMapperRemnants();
     void ScanPoolMappedImages();
     void ScanUnbackedDriverObjects();
+    // P0: baseline/diff of the loaded kernel module inventory that
+    // NtQuerySystemInformation reports (the PsLoadedModuleList view).
+    void ScanModuleInventory();
     void ScanOrphanMappedPages();
     void ScanHookCallbacks();
     // dxgkrnl/GPU kernel driver writable data sections: per-adapter DDI
@@ -196,6 +265,9 @@ private:
     void ClearEmittedKey(const std::wstring& key);
     void ClearEmittedKeyForPid(const std::wstring& key, uint32_t processId);
     void NoteDriverLoad(const KmonEvent& event);
+    // P0: remember a lifecycle unload so the module diff does not report a
+    // legitimate unload as a hiding event.
+    void NoteDriverUnload(const KmonEvent& event);
     void ArmMapperWatch(const KmonEvent& event);
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
@@ -264,6 +336,63 @@ private:
         uint64_t Timestamp = 0;
     };
     std::deque<RecentDriverLoad> RecentLoads;
+    // P0 module inventory baseline. ModuleBaselineValid false means no
+    // baseline was captured yet; the first scan after that only records the
+    // baseline and never emits.
+    struct ModuleInventoryEntry
+    {
+        std::wstring Name;
+        uint64_t Base = 0;
+        uint64_t Size = 0;
+    };
+    std::vector<ModuleInventoryEntry> ModuleBaseline;
+    bool ModuleBaselineValid = false;
+    uint64_t ModuleBaselineTickMs = 0;
+    // P1 cross-view cursor: the service-key/image-file probe rotates over the
+    // module list so no single scan tick pays for every module.
+    uint64_t EvidenceAsymmetryCursor = 0;
+    void ScanDriverEvidenceAsymmetry(
+        const std::vector<std::pair<std::wstring, std::wstring>>& modules);
+    // Lifecycle unload correlation window for the module diff.
+    struct RecentDriverUnload
+    {
+        std::wstring Base;
+        uint64_t Timestamp = 0;
+    };
+    std::deque<RecentDriverUnload> RecentUnloads;
+    // P1 driver tamper baselines, keyed by image stem. Populated when a load
+    // event is observed; the DRIVER_OBJECT walk merges in the identity fields
+    // on first sight and compares them on every later pass. Worker thread
+    // only; guarded by WatchMutex.
+    std::map<std::wstring, KmonDriverIdentitySnapshot> DriverTamperBaselines;
+    std::map<std::wstring, uint32_t> DriverTamperStrikes;
+    std::map<std::wstring, uint64_t> DriverTamperLastCheckMs;
+    std::vector<std::wstring> DriverTamperOrder;
+    uint64_t DriverTamperCursor = 0;
+    uint64_t DriverTamperChecks = 0;
+    void ScanDriverTamper();
+    bool RecordDriverImageBaseline(
+        const std::wstring& stem,
+        uint64_t base,
+        uint64_t size,
+        DeviceClient* device);
+    // Two-scan confirmation so a transient enumeration race cannot print a
+    // hiding verdict. Key is "<kind>:<basename>".
+    // Anomaly memory for the module diff. The accepted baseline advances on
+    // every scan, so a persistent anomaly (a module that stays gone) is
+    // re-confirmed from here instead of from the per-scan diff, which would
+    // report it only once.
+    struct PendingModuleAnomaly
+    {
+        KmonModuleDiffKind Kind = KmonModuleDiffKind::None;
+        std::wstring Name;
+        uint64_t Base = 0;
+        uint64_t Size = 0;
+        uint64_t PreviousBase = 0;
+        uint32_t Strikes = 0;
+    };
+    std::map<std::wstring, PendingModuleAnomaly> ModulePending;
+    uint64_t ModuleScans = 0;
     struct MapperWatchFingerprint
     {
         std::unordered_set<std::wstring> Unloaded;
@@ -374,6 +503,10 @@ private:
 };
 
 std::wstring KmonBasenameLower(const std::wstring& path);
+// P1: driver name stem -- basename lower case with a trailing ".sys"
+// removed, so a TI load event ("\SystemRoot\...\x.sys") and a DRIVER_OBJECT
+// name ("\Driver\x") key the same tamper baseline.
+std::wstring KmonDriverNameStem(const std::wstring& name);
 std::wstring KmonNormalizeDriverPath(const std::wstring& path);
 std::wstring KmonClassifyDriverPath(const std::wstring& path);
 bool KmonDriverPathIsInbox(const std::wstring& path);
@@ -388,6 +521,36 @@ bool KmonTaskLooksLikeRemoteInject(const std::wstring& task);
 bool KmonTaskLooksLikeWindowHook(const std::wstring& task);
 bool KmonTaskLooksLikeProcessImpairTask(const std::wstring& task);
 std::wstring KmonExtractPayloadDriverName(const std::vector<TiPayloadField>& payload);
+// P0: "loaded then hidden" kernel module inventory diff. The inventory view
+// is the PsLoadedModuleList image NtQuerySystemInformation reports, and the
+// verdict is event symmetry -- a change that no load/unload lifecycle event
+// explains -- never a name allowlist, so a driver that keeps its image in the
+// loader list while dropping its identity is still reported. Fail-closed:
+// with either snapshot empty nothing is concluded.
+struct KmonModuleInventoryView
+{
+    std::wstring Name;   // basename, lower case
+    uint64_t Base = 0;
+    uint64_t Size = 0;
+};
+
+struct KmonModuleDiffRecord
+{
+    KmonModuleDiffKind Kind = KmonModuleDiffKind::None;
+    std::wstring Name;
+    uint64_t Base = 0;
+    uint64_t Size = 0;
+    uint64_t PreviousBase = 0;
+    std::wstring Layer;
+};
+
+std::vector<KmonModuleDiffRecord> KmonDiffModuleInventory(
+    const std::vector<KmonModuleInventoryView>& previous,
+    const std::vector<KmonModuleInventoryView>& current,
+    const std::set<std::wstring>& recentUnloads,
+    const std::set<std::wstring>& recentLoads);
+const wchar_t* KmonModuleDiffKindName(KmonModuleDiffKind kind);
+
 bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out);
 bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out);
 bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options);
@@ -395,3 +558,8 @@ bool KmonDriverLoadArmsMapperWatch(const KmonEvent& event);
 bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event);
 bool KernelMonitorSelfTest();
 bool KernelMonitorArtifactSelfTest();
+// P2: deterministic regression for the "loaded then hidden" layer. Drives the
+// pure module-inventory diff and tamper verdict from synthetic snapshots, so
+// driver.vanished / driver.unnotified_load / driver.remap / driver.tampered
+// semantics are covered without a live kernel.
+bool KernelMonitorHiddenDriverSelfTest();

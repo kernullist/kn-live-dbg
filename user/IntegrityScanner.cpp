@@ -4169,6 +4169,243 @@ bool IntegrityScanner::InspectDeviceStack(
     return ok;
 }
 
+bool IntegrityScanner::ScanDeviceDriverBackrefs(
+    const std::set<uint64_t>& knownDriverObjects,
+    DeviceBackrefResult* result,
+    std::wstring* error)
+{
+    // The back-reference pass costs one device read per \Device entry, so it
+    // is bounded well below the \Driver walk limit.
+    constexpr uint64_t kMaxDeviceObjects = 2048;
+    bool ok = false;
+
+    do
+    {
+        if (result == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"invalid device back-reference result output";
+            }
+            break;
+        }
+
+        *result = DeviceBackrefResult{};
+        result->DriverObjectsKnown = knownDriverObjects.size();
+
+        if (symbols_.Modules().empty())
+        {
+            if (!symbols_.LoadKernelModules(error))
+            {
+                break;
+            }
+        }
+
+        ObjectWalkContext ctx(device_, symbols_);
+        ObjectHeaderLayout headerLayout = {};
+        DirectoryLayout dirLayout = {};
+        DirectoryEntryLayout entryLayout = {};
+        if (!ResolveObjectHeaderLayout(ctx, &headerLayout) ||
+            !ResolveDirectoryLayouts(ctx, &dirLayout, &entryLayout))
+        {
+            if (error != nullptr)
+            {
+                *error = L"object directory layouts were not resolved";
+            }
+            break;
+        }
+
+        std::vector<ObjectTypeRecord> types;
+        if (!DiscoverObjectTypes(ctx, &types, error))
+        {
+            break;
+        }
+
+        const ObjectTypeRecord* directoryType = FindObjectType(types, L"Directory");
+        const ObjectTypeRecord* deviceType = FindObjectType(types, L"Device");
+        if (directoryType == nullptr || deviceType == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Directory or Device object type was not found";
+            }
+            break;
+        }
+
+        uint8_t cookie = 0;
+        bool hasCookie = false;
+        ReadObHeaderCookie(ctx, &cookie, &hasCookie);
+        if (!hasCookie)
+        {
+            result->Warnings.push_back(
+                L"ObHeaderCookie not available; using raw object type indices");
+        }
+
+        uint64_t deviceDirectory = 0;
+        std::wstring directoryError;
+        if (!FindRootChildDirectory(
+                ctx,
+                headerLayout,
+                dirLayout,
+                entryLayout,
+                directoryType->Index,
+                cookie,
+                hasCookie,
+                L"Device",
+                &deviceDirectory,
+                &directoryError))
+        {
+            // Without the directory the pass cannot conclude anything; the
+            // caller keeps its previous verdict instead of clearing it.
+            result->Warnings.push_back(
+                directoryError.empty()
+                    ? std::wstring(L"\\Device directory was not found")
+                    : directoryError);
+            break;
+        }
+        result->DirectoryFound = true;
+
+        std::vector<DirectoryObjectRecord> entries;
+        if (!EnumerateDirectory(
+                ctx,
+                headerLayout,
+                dirLayout,
+                entryLayout,
+                deviceDirectory,
+                cookie,
+                hasCookie,
+                L"\\Device",
+                &entries))
+        {
+            result->Warnings.push_back(L"failed to enumerate \\Device");
+            break;
+        }
+
+        DeviceObjectLayout deviceLayout = {};
+        if (!ResolveDeviceObjectLayout(symbols_, &deviceLayout, error))
+        {
+            break;
+        }
+
+        TypeFieldInfo driverStart = {};
+        TypeFieldInfo driverSize = {};
+        if (!FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DriverStart"}, &driverStart) ||
+            !FindField(symbols_, L"nt!_DRIVER_OBJECT", {L"DriverSize"}, &driverSize))
+        {
+            if (error != nullptr)
+            {
+                *error = L"_DRIVER_OBJECT DriverStart/DriverSize layout was not resolved";
+            }
+            break;
+        }
+
+        std::set<uint64_t> reported;
+        for (const DirectoryObjectRecord& entry : entries)
+        {
+            if (entry.TypeIndex != deviceType->Index || entry.Body == 0)
+            {
+                continue;
+            }
+            if (result->DevicesScanned >= kMaxDeviceObjects)
+            {
+                result->Truncated = true;
+                break;
+            }
+            ++result->DevicesScanned;
+
+            // One read per device on the fast path: only the driver object
+            // pointer is needed to decide, and the extra fields are read for
+            // the few entries that turn out to be anonymous.
+            uint64_t driverObject = 0;
+            if (!ReadFieldInteger(
+                    device_,
+                    entry.Body,
+                    deviceLayout.DriverObject,
+                    sizeof(uint64_t),
+                    &driverObject,
+                    nullptr) ||
+                driverObject == 0 ||
+                !IsKernelAddress(driverObject))
+            {
+                ++result->DevicesWithoutDriver;
+                continue;
+            }
+
+            if (knownDriverObjects.count(driverObject) != 0)
+            {
+                ++result->DevicesWithKnownDriver;
+                continue;
+            }
+            if (!reported.insert(driverObject).second)
+            {
+                continue;
+            }
+
+            AnonymousDriverBackrefRecord record = {};
+            record.DriverObject = driverObject;
+            record.DeviceObject = entry.Body;
+            record.DeviceName = entry.Name;
+            uint64_t value = 0;
+            if (ReadFieldInteger(
+                    device_,
+                    entry.Body,
+                    deviceLayout.DeviceType,
+                    sizeof(uint32_t),
+                    &value,
+                    nullptr))
+            {
+                record.DeviceType = static_cast<uint32_t>(value);
+            }
+            if (deviceLayout.HasDriverName)
+            {
+                uint64_t nameAddress = 0;
+                if (TryAdd(driverObject, deviceLayout.DriverName.Offset, &nameAddress))
+                {
+                    ctx.ReadUnicodeStringAt(nameAddress, &record.DriverName);
+                }
+            }
+            value = 0;
+            if (ReadFieldInteger(
+                    device_,
+                    driverObject,
+                    driverStart,
+                    sizeof(uint64_t),
+                    &value,
+                    nullptr))
+            {
+                record.DriverStart = value;
+                record.HasDriverStart = value != 0;
+            }
+            value = 0;
+            if (ReadFieldInteger(
+                    device_,
+                    driverObject,
+                    driverSize,
+                    sizeof(uint64_t),
+                    &value,
+                    nullptr))
+            {
+                record.DriverSize = value;
+            }
+            if (record.HasDriverStart)
+            {
+                const std::vector<KernelModuleInfo> modules = symbols_.CopyModules();
+                const KernelModuleInfo* owner = FindModuleForAddress(modules, record.DriverStart);
+                if (owner != nullptr)
+                {
+                    record.ModuleName = owner->ImageName;
+                }
+            }
+            result->AnonymousDrivers.push_back(std::move(record));
+        }
+
+        result->Complete = !result->Truncated;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
 bool IntegrityScanner::InspectDriverObject(
     const std::wstring& filter,
     bool includeDispatch,

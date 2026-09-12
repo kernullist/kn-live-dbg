@@ -4,6 +4,7 @@
 #include "SymbolEngine.h"
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -186,6 +187,36 @@ struct DriverIntegrityRecord
     std::vector<DriverDispatchRecord> Dispatch;
 };
 
+// P0: a DRIVER_OBJECT that owns a \Device object but is absent from the
+// \Driver object-directory enumeration has had its directory link cut. That
+// is the classic driver-object hiding shape, and no \Driver-rooted walk can
+// reach it, so it is collected through a \Device back-reference instead.
+struct AnonymousDriverBackrefRecord
+{
+    uint64_t DriverObject = 0;
+    uint64_t DriverStart = 0;
+    uint64_t DriverSize = 0;
+    uint64_t DeviceObject = 0;
+    uint32_t DeviceType = 0;
+    std::wstring DeviceName;
+    std::wstring DriverName;
+    std::wstring ModuleName;
+    bool HasDriverStart = false;
+};
+
+struct DeviceBackrefResult
+{
+    std::vector<AnonymousDriverBackrefRecord> AnonymousDrivers;
+    std::vector<std::wstring> Warnings;
+    uint64_t DevicesScanned = 0;
+    uint64_t DevicesWithKnownDriver = 0;
+    uint64_t DevicesWithoutDriver = 0;
+    uint64_t DriverObjectsKnown = 0;
+    bool DirectoryFound = false;
+    bool Truncated = false;
+    bool Complete = false;
+};
+
 struct DriverIntegrityOptions
 {
     std::wstring DriverFilter;
@@ -257,6 +288,12 @@ public:
         std::wstring* error,
         bool exactName = false);
     bool InspectDeviceStack(uint64_t deviceObject, DeviceStackResult* result, std::wstring* error);
+    // P0: walk \Device and collect DRIVER_OBJECTs that are not part of the
+    // knownDriverObjects set the \Driver enumeration produced.
+    bool ScanDeviceDriverBackrefs(
+        const std::set<uint64_t>& knownDriverObjects,
+        DeviceBackrefResult* result,
+        std::wstring* error);
 
 private:
     DeviceClient& device_;
