@@ -143,6 +143,22 @@ const wchar_t* KmonEvidenceAsymmetryReason(KmonEvidenceAsymmetryKind kind);
 // \Windows\System32 holds the keyless core images Windows always has loaded.
 bool KmonImagePathIsInbox(const std::wstring& win32Path);
 
+// R4: the service-key-only verdict is the noisy one. A non-inbox loader that
+// lost its service key alone is ordinary on its own (a driver uninstalled while
+// still resident), so it is reported only when another confirmed post-load
+// hiding signal names the same image stem. The verdicts that already require
+// the image file to be gone are unaffected.
+bool KmonEvidenceAsymmetryIsReportable(
+    KmonEvidenceAsymmetryKind kind,
+    bool corroborated);
+// Which independent signal names this stem: a fixed-order, '+'-joined source
+// list, empty when nothing corroborates. Callers pass stems, not paths.
+std::wstring KmonEvidenceAsymmetryCorroboration(
+    const std::wstring& stem,
+    const std::set<std::wstring>& divergenceStems,
+    const std::set<std::wstring>& chainBreakStems,
+    const std::set<std::wstring>& tamperStems);
+
 enum class KmonModuleDiffKind
 {
     None = 0,
@@ -352,7 +368,10 @@ private:
     // module list so no single scan tick pays for every module.
     uint64_t EvidenceAsymmetryCursor = 0;
     void ScanDriverEvidenceAsymmetry(
-        const std::vector<std::pair<std::wstring, std::wstring>>& modules);
+        const std::vector<std::pair<std::wstring, std::wstring>>& modules,
+        const std::set<std::wstring>& divergenceStems,
+        const std::set<std::wstring>& chainBreakStems,
+        const std::set<std::wstring>& tamperStems);
     // Lifecycle unload correlation window for the module diff.
     struct RecentDriverUnload
     {

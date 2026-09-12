@@ -8174,6 +8174,63 @@ const wchar_t* KmonEvidenceAsymmetryReason(KmonEvidenceAsymmetryKind kind)
     }
 }
 
+// R4: the service-key-only verdict needs an independent signal before it is
+// reported, because a non-inbox loader that lost only its service key is
+// ordinary on its own. The other verdicts already require the binary the
+// loader named to be gone, so they stay reportable exactly as they were.
+bool KmonEvidenceAsymmetryIsReportable(
+    KmonEvidenceAsymmetryKind kind,
+    bool corroborated)
+{
+    if (kind == KmonEvidenceAsymmetryKind::NoServiceKey)
+    {
+        return corroborated;
+    }
+    return kind == KmonEvidenceAsymmetryKind::NoImageFile ||
+        kind == KmonEvidenceAsymmetryKind::NoServiceKeyNoImageFile;
+}
+
+// Deterministic source list in a fixed order, so the notes of a report say
+// which signal made a noisy verdict reportable.
+std::wstring KmonEvidenceAsymmetryCorroboration(
+    const std::wstring& stem,
+    const std::set<std::wstring>& divergenceStems,
+    const std::set<std::wstring>& chainBreakStems,
+    const std::set<std::wstring>& tamperStems)
+{
+    if (stem.empty())
+    {
+        return std::wstring();
+    }
+    std::wstring sources;
+    if (divergenceStems.count(stem) != 0)
+    {
+        sources += L"kernel_view_divergence";
+    }
+    if (chainBreakStems.count(stem) != 0)
+    {
+        if (!sources.empty())
+        {
+            sources += L"+";
+        }
+        sources += L"module_chain_broken";
+    }
+    if (tamperStems.count(stem) != 0)
+    {
+        if (!sources.empty())
+        {
+            sources += L"+";
+        }
+        sources += L"tamper";
+    }
+    return sources;
+}
+
+// Single source for the driver-tamper strike threshold: ScanDriverTamper emits
+// driver.tampered once a stem reaches it, and the R4 asymmetry gate treats a
+// stem at or above it as corroborated.
+constexpr uint32_t kDriverTamperStrikeThreshold = 2;
+
 std::vector<KmonModuleDiffRecord> KmonDiffModuleInventory(
     const std::vector<KmonModuleInventoryView>& previous,
     const std::vector<KmonModuleInventoryView>& current,
@@ -10153,7 +10210,40 @@ void KernelMonitor::ScanModuleInventory()
         }
         crossViewTargets.push_back(std::make_pair(stem, module.ImagePath));
     }
-    ScanDriverEvidenceAsymmetry(crossViewTargets);
+    // R4: which drivers already carry an independent post-load-hiding signal?
+    // Every source here cleared its own confirmation gate in this scan, so the
+    // gate below can never promote a single unconfirmed observation.
+    std::set<std::wstring> divergenceStems;
+    for (const KmonModuleDivergenceRecord& divergence : divergences)
+    {
+        const std::wstring signalStem = KmonDriverNameStem(divergence.Name);
+        if (!signalStem.empty())
+        {
+            divergenceStems.insert(signalStem);
+        }
+    }
+    std::set<std::wstring> chainBreakStems;
+    for (const KmonModuleChainBreakRecord& chainBreak : chainBreaks)
+    {
+        const std::wstring signalStem = KmonDriverNameStem(chainBreak.Name);
+        if (!signalStem.empty())
+        {
+            chainBreakStems.insert(signalStem);
+        }
+    }
+    std::set<std::wstring> tamperStems;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        for (const auto& entry : DriverTamperStrikes)
+        {
+            if (entry.second >= kDriverTamperStrikeThreshold)
+            {
+                tamperStems.insert(entry.first);
+            }
+        }
+    }
+    ScanDriverEvidenceAsymmetry(
+        crossViewTargets, divergenceStems, chainBreakStems, tamperStems);
 
     // R1/R2: report the kernel-context cross-view and the loader link
     // integrity before the early return, so a module the host view never
@@ -10293,7 +10383,10 @@ void KernelMonitor::ScanModuleInventory()
 }
 
 void KernelMonitor::ScanDriverEvidenceAsymmetry(
-    const std::vector<std::pair<std::wstring, std::wstring>>& modules)
+    const std::vector<std::pair<std::wstring, std::wstring>>& modules,
+    const std::set<std::wstring>& divergenceStems,
+    const std::set<std::wstring>& chainBreakStems,
+    const std::set<std::wstring>& tamperStems)
 {
     // Bounded rotation: only this many registry/file probes per scan tick, so
     // a long module list cannot turn the cross-view into a hot loop.
@@ -10341,6 +10434,11 @@ void KernelMonitor::ScanDriverEvidenceAsymmetry(
         const bool imageFileKnown = KmonImageFileStateForDriver(
             imagePath, &imageFileExists, &imagePathInbox);
 
+        const std::wstring corroboration = KmonEvidenceAsymmetryCorroboration(
+            stem,
+            divergenceStems,
+            chainBreakStems,
+            tamperStems);
         const KmonEvidenceAsymmetryKind verdict = KmonClassifyEvidenceAsymmetry(
             serviceKeyKnown,
             serviceKeyExists,
@@ -10354,12 +10452,20 @@ void KernelMonitor::ScanDriverEvidenceAsymmetry(
             ClearEmittedKey(key);
             continue;
         }
+        if (!KmonEvidenceAsymmetryIsReportable(verdict, !corroboration.empty()))
+        {
+            // R4: a service-key-only asymmetry is withheld until another
+            // confirmed signal names this stem. Nothing is recorded as
+            // reported, so a later corroboration still reports it once.
+            continue;
+        }
 
         std::wstring notes =
             L"reason=" + std::wstring(KmonEvidenceAsymmetryReason(verdict)) +
             L" svc_key=" + (serviceKeyExists ? L"yes" : L"no") +
             L" image_file=" + (imageFileExists ? L"yes" : L"no") +
             L" inbox=" + (imagePathInbox ? L"yes" : L"no") +
+            L" corroboration=" + (corroboration.empty() ? L"none" : corroboration) +
             L" view=PsLoadedModuleList+service_key+image_file";
         if (!imagePath.empty())
         {
@@ -10420,7 +10526,6 @@ bool KernelMonitor::RecordDriverImageBaseline(
 
 void KernelMonitor::ScanDriverTamper()
 {
-    constexpr uint32_t kDriverTamperStrikeThreshold = 2;
     constexpr size_t kDriverTamperPerPass = 4;
     constexpr uint64_t kDriverTamperRecheckMs = 60000;
 
@@ -16794,6 +16899,66 @@ bool KernelMonitorHiddenDriverSelfTest()
         ok = ok && KmonImagePathIsInbox(L"C:\\Windows\\System32\\drivers\\acpi.sys");
         ok = ok && !KmonImagePathIsInbox(L"C:\\Users\\Public\\jrvwfjhdyprtjeaf.sys");
         ok = ok && !KmonImagePathIsInbox(L"");
+
+        // R4: a service-key-only asymmetry is withheld until an independent
+        // signal names the same stem. The other verdicts are unchanged.
+        ok = ok && !KmonEvidenceAsymmetryIsReportable(
+            KmonEvidenceAsymmetryKind::NoServiceKey, false);
+        ok = ok && KmonEvidenceAsymmetryIsReportable(
+            KmonEvidenceAsymmetryKind::NoServiceKey, true);
+        ok = ok && KmonEvidenceAsymmetryIsReportable(
+            KmonEvidenceAsymmetryKind::NoImageFile, false);
+        ok = ok && KmonEvidenceAsymmetryIsReportable(
+            KmonEvidenceAsymmetryKind::NoServiceKeyNoImageFile, false);
+        ok = ok && !KmonEvidenceAsymmetryIsReportable(
+            KmonEvidenceAsymmetryKind::None, true);
+
+        const std::set<std::wstring> noStems;
+        const std::set<std::wstring> divergenceStems = { L"jrvwfjhdyprtjeaf" };
+        const std::set<std::wstring> chainStems = { L"jrvwfjhdyprtjeaf" };
+        const std::set<std::wstring> tamperStems = { L"jrvwfjhdyprtjeaf" };
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            L"jrvwfjhdyprtjeaf", noStems, noStems, noStems).empty();
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            L"jrvwfjhdyprtjeaf", divergenceStems, noStems, noStems) ==
+            L"kernel_view_divergence";
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            L"jrvwfjhdyprtjeaf", noStems, chainStems, noStems) ==
+            L"module_chain_broken";
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            L"jrvwfjhdyprtjeaf", noStems, noStems, tamperStems) == L"tamper";
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            L"jrvwfjhdyprtjeaf", divergenceStems, chainStems, tamperStems) ==
+            L"kernel_view_divergence+module_chain_broken+tamper";
+        // A different driver, an empty stem, and a stemless signal never
+        // corroborate anything.
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            L"otherdriver", divergenceStems, chainStems, tamperStems).empty();
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            L"", divergenceStems, chainStems, tamperStems).empty();
+        // Callers stem both sides, so a full path still matches the signal.
+        const std::wstring asymmetricStem = KmonDriverNameStem(
+            L"C:\\Users\\Public\\Jrvwfjhdyprtjeaf.SYS");
+        ok = ok && asymmetricStem == L"jrvwfjhdyprtjeaf";
+        ok = ok && KmonEvidenceAsymmetryCorroboration(
+            asymmetricStem, divergenceStems, noStems, noStems) ==
+            L"kernel_view_divergence";
+        // End to end: the noisy verdict is withheld with no signal and
+        // reported once a signal names it, while an inbox loader never
+        // produced the verdict in the first place.
+        const KmonEvidenceAsymmetryKind noisy = KmonClassifyEvidenceAsymmetry(
+            true, false, true, true, false);
+        ok = ok && noisy == KmonEvidenceAsymmetryKind::NoServiceKey;
+        ok = ok && !KmonEvidenceAsymmetryIsReportable(
+            noisy,
+            !KmonEvidenceAsymmetryCorroboration(
+                L"jrvwfjhdyprtjeaf", noStems, noStems, noStems).empty());
+        ok = ok && KmonEvidenceAsymmetryIsReportable(
+            noisy,
+            !KmonEvidenceAsymmetryCorroboration(
+                L"jrvwfjhdyprtjeaf", divergenceStems, noStems, noStems).empty());
+        ok = ok && KmonClassifyEvidenceAsymmetry(true, false, true, true, true) ==
+            KmonEvidenceAsymmetryKind::None;
 
         // The new kind is wired into the always-match watch list.
         KmonEvent asymmetryEvent = {};
