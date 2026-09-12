@@ -6133,6 +6133,8 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"driver.remap" ||
             event.Kind == L"driver.tampered" ||
             event.Kind == L"driver.evidence_asymmetry" ||
+            event.Kind == L"driver.inventory_divergence" ||
+            event.Kind == L"driver.module_chain_broken" ||
             event.Kind == L"driver.handle" ||
             event.Kind == L"driver.ioctl" ||
             event.Kind == L"mapper.watch" ||
@@ -6669,6 +6671,8 @@ bool KernelMonitor::Start(
                 ModuleBaselineValid = false;
                 ModuleBaselineTickMs = 0;
                 ModulePending.clear();
+                KernelViewPending.clear();
+                NextKernelViewScanTickMs = 0;
                 ModuleScans = 0;
                 MapperWatchLast = MapperWatchFingerprint{};
                 MapperWatchDriver.clear();
@@ -8290,6 +8294,355 @@ std::vector<KmonModuleDiffRecord> KmonDiffModuleInventory(
     return records;
 }
 
+namespace
+{
+    // R1: bounded kernel-context walk of PsLoadedModuleList. Offsets are the
+    // documented x64 _LDR_DATA_TABLE_ENTRY layout and match the ones the
+    // DriverSection check already relies on (DllBase 0x30, SizeOfImage 0x40).
+    constexpr size_t kMaxKernelModuleEntries = 512;
+    constexpr size_t kMaxKernelModuleNameChars = 96;
+    constexpr uint64_t kLdrFlinkOffset = 0x00;
+    constexpr uint64_t kLdrBlinkOffset = 0x08;
+    constexpr uint64_t kLdrDllBaseOffset = 0x30;
+    constexpr uint64_t kLdrSizeOfImageOffset = 0x40;
+    constexpr uint64_t kLdrBaseDllNameOffset = 0x58;
+    constexpr uint64_t kKernelViewVaFloor = 0xFFFF800000000000ull;
+
+    // The range and the name are judged separately on purpose. A loader entry
+    // whose BaseDllName could not be read still proves that its image range is
+    // resident, so the range set must not depend on the name: folding the two
+    // would make a paged-out name look like an image the walk never saw.
+    bool KmonKernelEntryHasRange(const KmonKernelModuleView& entry)
+    {
+        return entry.Base != 0 && entry.Size != 0;
+    }
+
+    bool KmonKernelEntryHasName(const KmonKernelModuleView& entry)
+    {
+        // dbghelp synthetic pseudo-modules are not loader list entries.
+        return !entry.Name.empty() && entry.Name.rfind(L"__", 0) != 0;
+    }
+
+    // BaseDllName is a UNICODE_STRING: Length(2) MaximumLength(2) pad(4)
+    // Buffer(8). A torn or bogus descriptor yields no name, which the caller
+    // treats as unusable rather than as a verdict input.
+    bool KmonReadLoaderEntryName(DeviceClient* device, uint64_t entry, std::wstring* name)
+    {
+        std::vector<uint8_t> descriptor;
+        if (!KmonReadKernelBytes(device, entry + kLdrBaseDllNameOffset, 16, &descriptor) ||
+            descriptor.size() < 16)
+        {
+            return false;
+        }
+        uint16_t length = 0;
+        uint64_t buffer = 0;
+        std::memcpy(&length, descriptor.data(), sizeof(length));
+        std::memcpy(&buffer, descriptor.data() + 8, sizeof(buffer));
+        if (length < sizeof(wchar_t) || buffer < kKernelViewVaFloor)
+        {
+            return false;
+        }
+        if (length > kMaxKernelModuleNameChars * sizeof(wchar_t))
+        {
+            length = static_cast<uint16_t>(kMaxKernelModuleNameChars * sizeof(wchar_t));
+        }
+        std::vector<uint8_t> bytes;
+        if (!KmonReadKernelBytes(device, buffer, length, &bytes) ||
+            bytes.size() < sizeof(wchar_t))
+        {
+            return false;
+        }
+        *name = std::wstring(
+            reinterpret_cast<const wchar_t*>(bytes.data()),
+            bytes.size() / sizeof(wchar_t));
+        return !name->empty();
+    }
+}
+
+bool KmonWalkKernelModuleList(
+    DeviceClient* device,
+    SymbolEngine* symbols,
+    std::vector<KmonKernelModuleView>* out,
+    uint64_t* listHead,
+    bool* incomplete,
+    std::wstring* error)
+{
+    if (out == nullptr)
+    {
+        return false;
+    }
+    out->clear();
+    if (listHead != nullptr)
+    {
+        *listHead = 0;
+    }
+    if (incomplete != nullptr)
+    {
+        *incomplete = true;
+    }
+    if (device == nullptr || symbols == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = L"the kernel device or the symbol engine is unavailable";
+        }
+        return false;
+    }
+
+    uint64_t head = 0;
+    std::wstring ignored;
+    if (!symbols->ResolveSymbol(L"nt!PsLoadedModuleList", &head, &ignored) ||
+        head < kKernelViewVaFloor)
+    {
+        if (error != nullptr)
+        {
+            *error = L"nt!PsLoadedModuleList was not resolvable to a kernel address";
+        }
+        return false;
+    }
+
+    uint64_t first = 0;
+    if (!KmonReadKernelU64(device, head + kLdrFlinkOffset, &first) ||
+        first < kKernelViewVaFloor)
+    {
+        if (error != nullptr)
+        {
+            *error = L"the loader list head was not readable";
+        }
+        return false;
+    }
+
+    std::set<uint64_t> visited;
+    uint64_t link = first;
+    while (link != head && link >= kKernelViewVaFloor)
+    {
+        if (visited.count(link) != 0 || visited.size() >= kMaxKernelModuleEntries)
+        {
+            break;
+        }
+        visited.insert(link);
+
+        KmonKernelModuleView view = {};
+        view.Entry = link;
+        uint64_t flink = 0;
+        uint64_t blink = 0;
+        if (!KmonReadKernelU64(device, link + kLdrFlinkOffset, &flink) ||
+            !KmonReadKernelU64(device, link + kLdrBlinkOffset, &blink))
+        {
+            break;
+        }
+        view.Flink = flink;
+        view.Blink = blink;
+
+        uint64_t dllBase = 0;
+        uint64_t sizeOfImage = 0;
+        if (KmonReadKernelU64(device, link + kLdrDllBaseOffset, &dllBase) &&
+            dllBase >= kKernelViewVaFloor)
+        {
+            view.Base = dllBase;
+        }
+        if (KmonReadKernelU64(device, link + kLdrSizeOfImageOffset, &sizeOfImage))
+        {
+            view.Size = sizeOfImage;
+        }
+        std::wstring name;
+        if (KmonReadLoaderEntryName(device, link, &name))
+        {
+            view.Name = KmonBasenameLower(name);
+        }
+        out->push_back(std::move(view));
+
+        if (flink < kKernelViewVaFloor)
+        {
+            break;
+        }
+        link = flink;
+    }
+
+    if (out->empty())
+    {
+        if (error != nullptr)
+        {
+            *error = L"no loader entries were readable";
+        }
+        return false;
+    }
+    if (listHead != nullptr)
+    {
+        *listHead = head;
+    }
+    // Reaching the list head is the only proof that the whole list was read; a
+    // cap, a cycle, or a torn link leaves a partial snapshot that must never be
+    // used to claim a module is absent from the kernel list.
+    if (incomplete != nullptr)
+    {
+        *incomplete = (link != head);
+    }
+    return true;
+}
+
+const wchar_t* KmonModuleDivergenceDirectionName(KmonModuleDivergenceDirection direction)
+{
+    switch (direction)
+    {
+    case KmonModuleDivergenceDirection::UserViewMissing:
+        return L"user_view_missing";
+    case KmonModuleDivergenceDirection::KernelViewMissing:
+        return L"kernel_view_missing";
+    default:
+        return L"";
+    }
+}
+
+std::vector<KmonModuleDivergenceRecord> KmonCompareModuleViews(
+    const std::vector<KmonModuleInventoryView>& userView,
+    const std::vector<KmonKernelModuleView>& kernelView)
+{
+    std::vector<KmonModuleDivergenceRecord> records = {};
+
+    std::map<std::wstring, const KmonModuleInventoryView*> userByName;
+    std::set<std::pair<uint64_t, uint64_t> > userRanges;
+    for (const KmonModuleInventoryView& entry : userView)
+    {
+        if (!KmonInventoryEntryUsable(entry))
+        {
+            continue;
+        }
+        userByName[entry.Name] = &entry;
+        userRanges.insert(std::make_pair(entry.Base, entry.Size));
+    }
+
+    std::map<std::wstring, const KmonKernelModuleView*> kernelByName;
+    std::set<std::pair<uint64_t, uint64_t> > kernelRanges;
+    for (const KmonKernelModuleView& entry : kernelView)
+    {
+        if (!KmonKernelEntryHasRange(entry))
+        {
+            continue;
+        }
+        kernelRanges.insert(std::make_pair(entry.Base, entry.Size));
+        if (KmonKernelEntryHasName(entry))
+        {
+            kernelByName[entry.Name] = &entry;
+        }
+    }
+
+    // fail-closed: a comparison needs usable entries on both sides.
+    if (userRanges.empty() || kernelRanges.empty())
+    {
+        return records;
+    }
+
+    // 1) the kernel walk sees it, the host query view does not: the module is
+    //    resident but the enumeration the query returns was filtered.
+    for (const auto& pair : kernelByName)
+    {
+        const KmonKernelModuleView& entry = *pair.second;
+        if (userRanges.count(std::make_pair(entry.Base, entry.Size)) != 0 ||
+            userByName.count(entry.Name) != 0)
+        {
+            continue;
+        }
+        KmonModuleDivergenceRecord record = {};
+        record.Direction = KmonModuleDivergenceDirection::UserViewMissing;
+        record.Name = entry.Name;
+        record.Base = entry.Base;
+        record.Size = entry.Size;
+        records.push_back(std::move(record));
+    }
+
+    // 2) the host query view reports it, the kernel walk does not.
+    for (const auto& pair : userByName)
+    {
+        const KmonModuleInventoryView& entry = *pair.second;
+        if (kernelRanges.count(std::make_pair(entry.Base, entry.Size)) != 0 ||
+            kernelByName.count(entry.Name) != 0)
+        {
+            continue;
+        }
+        KmonModuleDivergenceRecord record = {};
+        record.Direction = KmonModuleDivergenceDirection::KernelViewMissing;
+        record.Name = entry.Name;
+        record.Base = entry.Base;
+        record.Size = entry.Size;
+        records.push_back(std::move(record));
+    }
+
+    return records;
+}
+
+std::vector<KmonModuleChainBreakRecord> KmonModuleChainBreaks(
+    const std::vector<KmonKernelModuleView>& kernelView)
+{
+    std::vector<KmonModuleChainBreakRecord> records = {};
+    if (kernelView.empty())
+    {
+        return records;
+    }
+
+    std::map<uint64_t, const KmonKernelModuleView*> byEntry;
+    for (const KmonKernelModuleView& entry : kernelView)
+    {
+        if (entry.Entry != 0)
+        {
+            byEntry[entry.Entry] = &entry;
+        }
+    }
+
+    for (const KmonKernelModuleView& entry : kernelView)
+    {
+        KmonModuleChainBreakRecord record = {};
+        // Forward: our Flink must be back-pointed by its own Blink.
+        const auto forward = byEntry.find(entry.Flink);
+        if (forward != byEntry.end() && forward->second->Blink != entry.Entry)
+        {
+            record.ForwardBreak = true;
+        }
+        // Backward: our Blink must be forward-pointed by its own Flink.
+        const auto backward = byEntry.find(entry.Blink);
+        if (backward != byEntry.end() && backward->second->Flink != entry.Entry)
+        {
+            record.BackwardBreak = true;
+        }
+        if (!record.ForwardBreak && !record.BackwardBreak)
+        {
+            continue;
+        }
+        record.Name = entry.Name;
+        record.Entry = entry.Entry;
+        record.Flink = entry.Flink;
+        record.Blink = entry.Blink;
+        records.push_back(std::move(record));
+    }
+
+    return records;
+}
+
+bool KmonModuleCorroborated(
+    const std::wstring& name,
+    uint64_t base,
+    const std::vector<KmonModuleDivergenceRecord>& divergences,
+    const std::vector<KmonModuleChainBreakRecord>& chainBreaks)
+{
+    for (const KmonModuleDivergenceRecord& divergence : divergences)
+    {
+        if ((!name.empty() && divergence.Name == name) ||
+            (base != 0 && divergence.Base == base))
+        {
+            return true;
+        }
+    }
+    for (const KmonModuleChainBreakRecord& chainBreak : chainBreaks)
+    {
+        if ((!name.empty() && chainBreak.Name == name) ||
+            (base != 0 && chainBreak.Entry == base))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void KernelMonitor::NoteDriverUnload(const KmonEvent& event)
 {
     std::wstring base = KmonBasenameLower(event.Driver);
@@ -9380,6 +9733,12 @@ void KernelMonitor::ScanModuleInventory()
     constexpr uint64_t kModuleEventWindow100ns = 120ull * 10ull * 1000ull * 1000ull;
     // Two consecutive scans must agree before a hiding verdict prints.
     constexpr uint32_t kModuleDiffStrikeThreshold = 2;
+    constexpr uint32_t kModuleDiffStrikeCap = 32;
+    // R1: the kernel-context walk costs a few reads per module, so it runs on
+    // its own slower cadence and only speeds up inside a mapper watch window.
+    constexpr uint32_t kKernelViewIntervalMs = 15000;
+    constexpr uint32_t kKernelViewWatchIntervalMs = 1500;
+    constexpr size_t kKernelViewEmitCap = 16;
 
     SymbolEngine* symbols = nullptr;
     {
@@ -9513,6 +9872,147 @@ void KernelMonitor::ScanModuleInventory()
         ModuleBaselineTickMs = GetTickCount64();
     }
 
+    // R1: kernel-context cross-view of the same list. The host inventory above
+    // goes through NtQuerySystemInformation, so a filter on that query hides a
+    // resident module from it while the raw walk still sees the entry. The walk
+    // costs a few reads per module, so it is throttled by its own cadence.
+    std::vector<KmonModuleDivergenceRecord> divergences;
+    std::vector<KmonModuleChainBreakRecord> chainBreaks;
+    {
+        const uint64_t kernelViewNow = GetTickCount64();
+        bool kernelViewDue = false;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            if (NextKernelViewScanTickMs == 0 || kernelViewNow >= NextKernelViewScanTickMs)
+            {
+                kernelViewDue = true;
+                NextKernelViewScanTickMs = kernelViewNow +
+                    (IsMapperWatchActive()
+                        ? kKernelViewWatchIntervalMs
+                        : kKernelViewIntervalMs);
+            }
+        }
+
+        if (kernelViewDue)
+        {
+            DeviceClient* kernelViewDevice = nullptr;
+            SymbolEngine* kernelViewSymbols = nullptr;
+            if (!GetLiveTargets(&kernelViewDevice, &kernelViewSymbols) ||
+                kernelViewDevice == nullptr || kernelViewSymbols == nullptr)
+            {
+                EmitMappedResidue(
+                    L"scan_failed:modinv:kernelview",
+                    std::wstring(),
+                    L"module_list",
+                    L"kernel-context module list walk skipped; the kernel device is unavailable",
+                    L"device is null or closed, or the symbol engine is unavailable");
+            }
+            else
+            {
+                std::vector<KmonKernelModuleView> kernelView;
+                std::wstring kernelViewError;
+                uint64_t kernelViewHead = 0;
+                bool kernelViewIncomplete = true;
+                if (KmonWalkKernelModuleList(
+                        kernelViewDevice, kernelViewSymbols, &kernelView,
+                        &kernelViewHead, &kernelViewIncomplete, &kernelViewError))
+                {
+                    // A partial walk still proves the links it did read, but it
+                    // can never prove that a module is missing from the list.
+                    std::vector<KmonModuleDivergenceRecord> rawDivergences;
+                    if (kernelViewIncomplete)
+                    {
+                        EmitMappedResidue(
+                            L"scan_failed:modinv:kernelview",
+                            std::wstring(),
+                            L"module_list",
+                            L"kernel-context cross-view withheld; the loader walk was incomplete",
+                            L"the walk stopped before the list head (cap, cycle, or a torn link)");
+                    }
+                    else
+                    {
+                        ClearEmittedKey(L"scan_failed:modinv:kernelview");
+                        rawDivergences = KmonCompareModuleViews(current, kernelView);
+                    }
+                    const std::vector<KmonModuleChainBreakRecord> rawBreaks =
+                        KmonModuleChainBreaks(kernelView);
+
+                    std::set<std::wstring> rawKeys;
+                    for (const KmonModuleDivergenceRecord& divergence : rawDivergences)
+                    {
+                        rawKeys.insert(
+                            std::wstring(L"div:") +
+                            KmonModuleDivergenceDirectionName(divergence.Direction) +
+                            L":" + divergence.Name);
+                    }
+                    for (const KmonModuleChainBreakRecord& chainBreak : rawBreaks)
+                    {
+                        rawKeys.insert(L"chain:" + HexU64(chainBreak.Entry));
+                    }
+
+                    // Two-scan confirmation: a module that loads between the
+                    // host snapshot and the walk is a race, not a finding.
+                    std::set<std::wstring> confirmedKeys;
+                    {
+                        std::lock_guard<std::mutex> lock(WatchMutex);
+                        for (const std::wstring& key : rawKeys)
+                        {
+                            uint32_t& strikes = KernelViewPending[key];
+                            if (strikes < kModuleDiffStrikeCap)
+                            {
+                                ++strikes;
+                            }
+                        }
+                        for (auto it = KernelViewPending.begin();
+                             it != KernelViewPending.end();)
+                        {
+                            if (rawKeys.count(it->first) == 0)
+                            {
+                                it = KernelViewPending.erase(it);
+                                continue;
+                            }
+                            if (it->second >= kModuleDiffStrikeThreshold)
+                            {
+                                confirmedKeys.insert(it->first);
+                            }
+                            ++it;
+                        }
+                    }
+
+                    for (const KmonModuleDivergenceRecord& divergence : rawDivergences)
+                    {
+                        const std::wstring key =
+                            std::wstring(L"div:") +
+                            KmonModuleDivergenceDirectionName(divergence.Direction) +
+                            L":" + divergence.Name;
+                        if (confirmedKeys.count(key) != 0)
+                        {
+                            divergences.push_back(divergence);
+                        }
+                    }
+                    for (const KmonModuleChainBreakRecord& chainBreak : rawBreaks)
+                    {
+                        if (confirmedKeys.count(L"chain:" + HexU64(chainBreak.Entry)) != 0)
+                        {
+                            chainBreaks.push_back(chainBreak);
+                        }
+                    }
+                }
+                else
+                {
+                    EmitMappedResidue(
+                        L"scan_failed:modinv:kernelview",
+                        std::wstring(),
+                        L"module_list",
+                        L"kernel-context module list walk skipped; the loader list was not readable",
+                        kernelViewError.empty()
+                            ? std::wstring(L"KmonWalkKernelModuleList returned false")
+                            : kernelViewError);
+                }
+            }
+        }
+    }
+
     const std::vector<KmonModuleDiffRecord> diff =
         KmonDiffModuleInventory(previous, current, recentUnloads, recentLoads);
 
@@ -9522,7 +10022,6 @@ void KernelMonitor::ScanModuleInventory()
     // record opens (or refreshes) an entry, and an entry that the live
     // inventory still contradicts gains another strike on every later scan
     // until it is confirmed or resolved.
-    constexpr uint32_t kModuleDiffStrikeCap = 32;
 
     std::set<std::wstring> currentNames;
     std::set<std::pair<uint64_t, uint64_t>> currentRanges;
@@ -9556,6 +10055,14 @@ void KernelMonitor::ScanModuleInventory()
                 pending.Base = record.Base;
                 pending.Size = record.Size;
                 pending.PreviousBase = record.PreviousBase;
+            }
+            // R2: an independent kernel-view signal for the same module
+            // confirms on this scan instead of waiting for the next one.
+            if (pending.Strikes < kModuleDiffStrikeThreshold &&
+                KmonModuleCorroborated(
+                    record.Name, record.Base, divergences, chainBreaks))
+            {
+                pending.Strikes = kModuleDiffStrikeThreshold;
             }
             if (pending.Strikes < kModuleDiffStrikeCap)
             {
@@ -9602,6 +10109,12 @@ void KernelMonitor::ScanModuleInventory()
                 it = ModulePending.erase(it);
                 continue;
             }
+            if (pending.Strikes < kModuleDiffStrikeThreshold &&
+                KmonModuleCorroborated(
+                    pending.Name, pending.Base, divergences, chainBreaks))
+            {
+                pending.Strikes = kModuleDiffStrikeThreshold;
+            }
             if (pending.Strikes < kModuleDiffStrikeCap)
             {
                 ++pending.Strikes;
@@ -9641,6 +10154,70 @@ void KernelMonitor::ScanModuleInventory()
         crossViewTargets.push_back(std::make_pair(stem, module.ImagePath));
     }
     ScanDriverEvidenceAsymmetry(crossViewTargets);
+
+    // R1/R2: report the kernel-context cross-view and the loader link
+    // integrity before the early return, so a module the host view never
+    // showed (filtered from its first scan) still prints.
+    {
+        size_t divergenceEmits = 0;
+        for (const KmonModuleDivergenceRecord& divergence : divergences)
+        {
+            if (divergenceEmits >= kKernelViewEmitCap)
+            {
+                break;
+            }
+            ++divergenceEmits;
+            const std::wstring direction =
+                KmonModuleDivergenceDirectionName(divergence.Direction);
+            std::wstring notes =
+                L"direction=" + direction +
+                L" base=" + HexU64(divergence.Base) +
+                L" size=" + HexU64(divergence.Size) +
+                L" scans=" + std::to_wstring(kModuleDiffStrikeThreshold) +
+                L" view=kernel_ldr_walk+system_module_information";
+            notes += L" followup=!module integrity; !driver; !pool pe /suspicious";
+            EmitUnique(
+                L"driver.inventory_divergence",
+                L"moddiv:" + direction + L":" + divergence.Name,
+                divergence.Name,
+                L"module_list",
+                L"kernel-context PsLoadedModuleList walk and the host module inventory disagree about " +
+                    divergence.Name,
+                notes,
+                0);
+        }
+
+        size_t chainEmits = 0;
+        for (const KmonModuleChainBreakRecord& chainBreak : chainBreaks)
+        {
+            if (chainEmits >= kKernelViewEmitCap)
+            {
+                break;
+            }
+            ++chainEmits;
+            const std::wstring label = chainBreak.Name.empty()
+                ? HexU64(chainBreak.Entry)
+                : chainBreak.Name;
+            std::wstring notes =
+                L"entry=" + HexU64(chainBreak.Entry) +
+                L" flink=" + HexU64(chainBreak.Flink) +
+                L" blink=" + HexU64(chainBreak.Blink) +
+                L" forward_break=" + (chainBreak.ForwardBreak ? L"true" : L"false") +
+                L" backward_break=" + (chainBreak.BackwardBreak ? L"true" : L"false") +
+                L" scans=" + std::to_wstring(kModuleDiffStrikeThreshold) +
+                L" view=kernel_ldr_walk";
+            notes += L" followup=!module integrity; !driver; !driverobj; !kpage /pe";
+            EmitUnique(
+                L"driver.module_chain_broken",
+                L"modchain:" + HexU64(chainBreak.Entry),
+                label,
+                L"module_list",
+                L"loader list link of " + label +
+                    L" is not reciprocal; an entry was unlinked from PsLoadedModuleList",
+                notes,
+                0);
+        }
+    }
 
     if (confirmed.empty())
     {
@@ -16049,6 +16626,184 @@ bool KernelMonitorHiddenDriverSelfTest()
         ok = ok && KmonWatchMatches(asymmetryEvent, asymmetryOptions);
     }
 
+    // --- kernel-context cross-view (driver.inventory_divergence) ----------
+    {
+        KmonModuleInventoryView userNtfs = {};
+        userNtfs.Name = L"ntfs.sys";
+        userNtfs.Base = 0xFFFFF80010000000ull;
+        userNtfs.Size = 0x100000ull;
+        KmonModuleInventoryView userTcpip = {};
+        userTcpip.Name = L"tcpip.sys";
+        userTcpip.Base = 0xFFFFF80020000000ull;
+        userTcpip.Size = 0x80000ull;
+
+        KmonKernelModuleView kernelNtfs = {};
+        kernelNtfs.Name = L"ntfs.sys";
+        kernelNtfs.Entry = 0xFFFF900000010000ull;
+        kernelNtfs.Base = userNtfs.Base;
+        kernelNtfs.Size = userNtfs.Size;
+        KmonKernelModuleView kernelTcpip = kernelNtfs;
+        kernelTcpip.Name = L"tcpip.sys";
+        kernelTcpip.Entry = 0xFFFF900000020000ull;
+        kernelTcpip.Base = userTcpip.Base;
+        kernelTcpip.Size = userTcpip.Size;
+        KmonKernelModuleView kernelHidden = kernelNtfs;
+        kernelHidden.Name = L"jrvwfjhdyprtjeaf.sys";
+        kernelHidden.Entry = 0xFFFF900000030000ull;
+        kernelHidden.Base = 0xFFFFF80030000000ull;
+        kernelHidden.Size = 0x200000ull;
+
+        const std::vector<KmonModuleInventoryView> userBoth = { userNtfs, userTcpip };
+        const std::vector<KmonKernelModuleView> kernelBoth = { kernelNtfs, kernelTcpip };
+
+        // Views that agree are silent.
+        ok = ok && KmonCompareModuleViews(userBoth, kernelBoth).empty();
+
+        // Resident in the walk, invisible to the query view: the filtered case.
+        const std::vector<KmonKernelModuleView> kernelFiltered = {
+            kernelNtfs, kernelTcpip, kernelHidden };
+        const std::vector<KmonModuleDivergenceRecord> filtered =
+            KmonCompareModuleViews(userBoth, kernelFiltered);
+        ok = ok && filtered.size() == 1;
+        if (filtered.size() == 1)
+        {
+            ok = ok && filtered[0].Direction == KmonModuleDivergenceDirection::UserViewMissing;
+            ok = ok && filtered[0].Name == L"jrvwfjhdyprtjeaf.sys";
+            ok = ok && filtered[0].Base == kernelHidden.Base;
+            ok = ok && std::wstring(KmonModuleDivergenceDirectionName(
+                filtered[0].Direction)) == L"user_view_missing";
+        }
+
+        // The mirror case: the query view reports what the walk does not.
+        KmonModuleInventoryView userExtra = userTcpip;
+        userExtra.Name = L"other.sys";
+        userExtra.Base = 0xFFFFF80040000000ull;
+        const std::vector<KmonModuleInventoryView> userMirrored = { userNtfs, userExtra };
+        const std::vector<KmonKernelModuleView> kernelNtfsOnly = { kernelNtfs };
+        const std::vector<KmonModuleDivergenceRecord> mirrored =
+            KmonCompareModuleViews(userMirrored, kernelNtfsOnly);
+        ok = ok && mirrored.size() == 1;
+        if (mirrored.size() == 1)
+        {
+            ok = ok && mirrored[0].Direction == KmonModuleDivergenceDirection::KernelViewMissing;
+            ok = ok && mirrored[0].Name == L"other.sys";
+            ok = ok && std::wstring(KmonModuleDivergenceDirectionName(
+                mirrored[0].Direction)) == L"kernel_view_missing";
+        }
+
+        // A resident image range whose BaseDllName could not be read must not
+        // look like a module the kernel walk missed.
+        KmonKernelModuleView kernelNameless = kernelTcpip;
+        kernelNameless.Name.clear();
+        const std::vector<KmonKernelModuleView> kernelNamelessView = {
+            kernelNtfs, kernelNameless };
+        ok = ok && KmonCompareModuleViews(userBoth, kernelNamelessView).empty();
+
+        // fail-closed: no usable entries on one side concludes nothing.
+        ok = ok && KmonCompareModuleViews(
+            std::vector<KmonModuleInventoryView>(), kernelBoth).empty();
+        ok = ok && KmonCompareModuleViews(
+            userBoth, std::vector<KmonKernelModuleView>()).empty();
+        // dbghelp pseudo modules are not loader entries on either side.
+        KmonModuleInventoryView pseudo = userNtfs;
+        pseudo.Name = L"__kernel";
+        const std::vector<KmonModuleInventoryView> userPseudo = { pseudo };
+        ok = ok && KmonCompareModuleViews(userPseudo, kernelNtfsOnly).empty();
+
+        // --- loader link integrity (driver.module_chain_broken) -----------
+        const uint64_t headVa = 0xFFFF800000000000ull;
+        KmonKernelModuleView chainA = {};
+        chainA.Name = L"ntfs.sys";
+        chainA.Entry = 0xFFFF900000010000ull;
+        chainA.Flink = 0xFFFF900000020000ull;
+        chainA.Blink = headVa;
+        KmonKernelModuleView chainB = {};
+        chainB.Name = L"tcpip.sys";
+        chainB.Entry = 0xFFFF900000020000ull;
+        chainB.Flink = headVa;
+        chainB.Blink = chainA.Entry;
+
+        // A reciprocal pair is not a break.
+        const std::vector<KmonKernelModuleView> chainPair = { chainA, chainB };
+        ok = ok && KmonModuleChainBreaks(chainPair).empty();
+
+        // The spliced node's neighbour still points at the removed entry.
+        KmonKernelModuleView spliced = chainB;
+        spliced.Blink = 0xFFFF900000009000ull;
+        const std::vector<KmonKernelModuleView> forwardPair = { chainA, spliced };
+        const std::vector<KmonModuleChainBreakRecord> forwardBreaks =
+            KmonModuleChainBreaks(forwardPair);
+        ok = ok && forwardBreaks.size() == 1;
+        if (forwardBreaks.size() == 1)
+        {
+            ok = ok && forwardBreaks[0].ForwardBreak;
+            ok = ok && !forwardBreaks[0].BackwardBreak;
+            ok = ok && forwardBreaks[0].Entry == chainA.Entry;
+            ok = ok && forwardBreaks[0].Name == L"ntfs.sys";
+        }
+
+        // The backward direction is read from Blink/Flink independently.
+        KmonKernelModuleView backwardA = chainA;
+        backwardA.Blink = chainB.Entry;
+        KmonKernelModuleView backwardB = chainB;
+        backwardB.Blink = chainA.Entry;
+        backwardB.Flink = 0xFFFF900000009000ull;
+        const std::vector<KmonKernelModuleView> backwardPair = { backwardA, backwardB };
+        const std::vector<KmonModuleChainBreakRecord> backwardBreaks =
+            KmonModuleChainBreaks(backwardPair);
+        ok = ok && backwardBreaks.size() == 1;
+        if (backwardBreaks.size() == 1)
+        {
+            ok = ok && backwardBreaks[0].BackwardBreak;
+            ok = ok && !backwardBreaks[0].ForwardBreak;
+            ok = ok && backwardBreaks[0].Entry == backwardA.Entry;
+        }
+
+        // Both directions break on the same entry when that entry's Flink and
+        // Blink neighbours are both inside the snapshot and both disagree.
+        KmonKernelModuleView bothX = {};
+        bothX.Name = L"ntfs.sys";
+        bothX.Entry = 0xFFFF900000010000ull;
+        bothX.Flink = 0xFFFF900000020000ull;
+        bothX.Blink = 0xFFFF900000030000ull;
+        KmonKernelModuleView bothY = {};
+        bothY.Name = L"tcpip.sys";
+        bothY.Entry = 0xFFFF900000020000ull;
+        bothY.Flink = 0xFFFF900000009000ull;
+        bothY.Blink = 0xFFFF900000009500ull;
+        KmonKernelModuleView bothZ = {};
+        bothZ.Name = L"other.sys";
+        bothZ.Entry = 0xFFFF900000030000ull;
+        bothZ.Flink = 0xFFFF900000009700ull;
+        bothZ.Blink = 0xFFFF900000009800ull;
+        const std::vector<KmonKernelModuleView> bothPair = { bothX, bothY, bothZ };
+        const std::vector<KmonModuleChainBreakRecord> bothBreaks =
+            KmonModuleChainBreaks(bothPair);
+        ok = ok && bothBreaks.size() == 1;
+        if (bothBreaks.size() == 1)
+        {
+            ok = ok && bothBreaks[0].ForwardBreak && bothBreaks[0].BackwardBreak;
+            ok = ok && bothBreaks[0].Entry == bothX.Entry;
+        }
+
+        // A truncated walk must not invent a break: the neighbour is absent.
+        const std::vector<KmonKernelModuleView> chainAOnly = { chainA };
+        ok = ok && KmonModuleChainBreaks(chainAOnly).empty();
+        ok = ok && KmonModuleChainBreaks(std::vector<KmonKernelModuleView>()).empty();
+
+        // Corroboration: a confirmed signal names the module or its range.
+        const std::vector<KmonModuleDivergenceRecord> noDivergences;
+        const std::vector<KmonModuleChainBreakRecord> noBreaks;
+        ok = ok && KmonModuleCorroborated(
+            L"jrvwfjhdyprtjeaf.sys", 0, filtered, noBreaks);
+        ok = ok && KmonModuleCorroborated(L"", kernelHidden.Base, filtered, noBreaks);
+        ok = ok && KmonModuleCorroborated(
+            L"ntfs.sys", 0, noDivergences, forwardBreaks);
+        ok = ok && !KmonModuleCorroborated(
+            L"ntfs.sys", userNtfs.Base, noDivergences, noBreaks);
+        ok = ok && !KmonModuleCorroborated(
+            L"unrelated.sys", 0xFFFFF80070000000ull, filtered, forwardBreaks);
+    }
     // --- tamper verdict (driver.tampered) ----------------------------------
     {
         KmonDriverIdentitySnapshot baseline = {};

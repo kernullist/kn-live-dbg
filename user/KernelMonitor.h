@@ -393,6 +393,11 @@ private:
     };
     std::map<std::wstring, PendingModuleAnomaly> ModulePending;
     uint64_t ModuleScans = 0;
+    // R1/R2: two-scan confirmation for the kernel-context cross-view and the
+    // loader link integrity, so a load/unload race inside one scan can neither
+    // print a verdict nor corroborate the host-side diff.
+    std::map<std::wstring, uint32_t> KernelViewPending;
+    uint64_t NextKernelViewScanTickMs = 0;
     struct MapperWatchFingerprint
     {
         std::unordered_set<std::wstring> Unloaded;
@@ -550,6 +555,67 @@ std::vector<KmonModuleDiffRecord> KmonDiffModuleInventory(
     const std::set<std::wstring>& recentUnloads,
     const std::set<std::wstring>& recentLoads);
 const wchar_t* KmonModuleDiffKindName(KmonModuleDiffKind kind);
+
+// R1: kernel-context view of the module list. The host inventory goes through
+// NtQuerySystemInformation, so a filter on that query hides an otherwise
+// resident module. This view walks the loader list straight out of kernel
+// memory through the device, which the same filter does not cover.
+enum class KmonModuleDivergenceDirection
+{
+    None = 0,
+    UserViewMissing,
+    KernelViewMissing,
+};
+
+// One loader entry as read by the kernel-context walk. Flink/Blink are the
+// entry's own InLoadOrderLinks neighbours, kept so link integrity can be
+// judged from the snapshot alone rather than from a second scan.
+struct KmonKernelModuleView
+{
+    std::wstring Name;
+    uint64_t Entry = 0;
+    uint64_t Flink = 0;
+    uint64_t Blink = 0;
+    uint64_t Base = 0;
+    uint64_t Size = 0;
+};
+
+struct KmonModuleDivergenceRecord
+{
+    KmonModuleDivergenceDirection Direction = KmonModuleDivergenceDirection::None;
+    std::wstring Name;
+    uint64_t Base = 0;
+    uint64_t Size = 0;
+};
+
+// R2: a loader entry whose neighbours disagree about the link was cut out of
+// the list (DKOM unlink). Both neighbours must be inside the same snapshot, so
+// a truncated walk can never invent a break.
+struct KmonModuleChainBreakRecord
+{
+    std::wstring Name;
+    uint64_t Entry = 0;
+    uint64_t Flink = 0;
+    uint64_t Blink = 0;
+    bool ForwardBreak = false;
+    bool BackwardBreak = false;
+};
+
+// Pure comparisons over two snapshots, so the self-test can drive every
+// combination without a live kernel. Both sides need usable entries;
+// otherwise nothing is concluded.
+std::vector<KmonModuleDivergenceRecord> KmonCompareModuleViews(
+    const std::vector<KmonModuleInventoryView>& userView,
+    const std::vector<KmonKernelModuleView>& kernelView);
+const wchar_t* KmonModuleDivergenceDirectionName(KmonModuleDivergenceDirection direction);
+std::vector<KmonModuleChainBreakRecord> KmonModuleChainBreaks(
+    const std::vector<KmonKernelModuleView>& kernelView);
+// Does an already-confirmed kernel-view signal name this module or range?
+bool KmonModuleCorroborated(
+    const std::wstring& name,
+    uint64_t base,
+    const std::vector<KmonModuleDivergenceRecord>& divergences,
+    const std::vector<KmonModuleChainBreakRecord>& chainBreaks);
 
 bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out);
 bool KmonClassifyLiveEvent(const TimelineEvent& event, KmonEvent* out);

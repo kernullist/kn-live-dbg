@@ -25011,7 +25011,8 @@ static void PrintKmonHelp()
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
     std::wcout << L"  driver.vanished / driver.unnotified_load assume TI lifecycle events arrive; where\n";
     std::wcout << L"  the unload notification never fires a clean unload can print as vanished.\n";
-    std::wcout << L"  the kernel-side module-list fingerprint is not implemented (host-side diff only).\n";
+    std::wcout << L"  the kernel-context loader walk covers the query-filtered case, and the host-side\n";
+    std::wcout << L"  baseline diff still carries the lifecycle verdict; both are fail-closed.\n";
     std::wcout << L"  a quiet idle host is mostly silent after the start line.\n";
     std::wcout << L"\n";
     std::wcout << L"logged kinds:\n";
@@ -25039,6 +25040,11 @@ static void PrintKmonHelp()
     std::wcout << L"                          identity fields changed after the load (fail-closed)\n";
     std::wcout << L"  driver.evidence_asymmetry  driver still in PsLoadedModuleList but its service key\n";
     std::wcout << L"                          and/or its image file on disk is gone\n";
+    std::wcout << L"  driver.inventory_divergence  the kernel-context PsLoadedModuleList walk and the\n";
+    std::wcout << L"                          host NtQuerySystemInformation view disagree about a module\n";
+    std::wcout << L"                          (user_view_missing = filtered query view; fail-closed);\n";
+    std::wcout << L"  driver.module_chain_broken  loader list link is not reciprocal, so an entry was\n";
+    std::wcout << L"                          unlinked from PsLoadedModuleList (fail-closed);\n";
     std::wcout << L"  mapper.watch            30s burst after ANY kernel driver load/unload (capped 90s);\n";
     std::wcout << L"                          leftover+wipe diffs,\n";
     std::wcout << L"                          400ms mapper/pool, 1.5s kpage, one DeepPfn pass per window\n";
@@ -31561,6 +31567,8 @@ static int RunConsoleSurfaceSelfTest()
                     kmonHelp.find(L"driver.remap") != std::wstring::npos &&
                     kmonHelp.find(L"driver.tampered") != std::wstring::npos &&
                     kmonHelp.find(L"driver.evidence_asymmetry") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.inventory_divergence") != std::wstring::npos &&
+                    kmonHelp.find(L"driver.module_chain_broken") != std::wstring::npos &&
                     kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos,
                 L"kmon-help-covers-drop-load-and-live-tail");
         }
