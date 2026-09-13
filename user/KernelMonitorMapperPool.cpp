@@ -46,6 +46,14 @@
 //     address falls outside the sampled body, and a destination inside the
 //     sampled region itself are all ignored, so ordinary data bytes cannot
 //     invent a stub;
+//   * an mov reg,imm64 whose transfer consumes any other register is left
+//     alone: the immediate is only the transfer target when that same register
+//     is what the jmp or call reads, so a mismatched pair cannot report a
+//     destination it does not use;
+//   * the absolute-target form is decoded for the plain REX.W prefix (0x48)
+//     over rax..rdi, the register set a relocated import thunk writes; an
+//     r8..r15 form (a second REX prefix on both instructions) is not decoded
+//     and stays uncounted rather than guessed;
 //   * a near jump is decoded only at the head of the body and only when it
 //     transfers to a page-aligned address: a lone 0xE9 byte occurs in ordinary
 //     data far too often to be a signal on its own, so the form is held to the
@@ -220,10 +228,14 @@ void KmonCountMapperStubs(
             continue;
         }
 
-        // mov reg,imm64 (48 B8) whose immediate is consumed by jmp/call reg
-        // within the next two bytes: the absolute-target thunk mappers use
-        // when they resolve imports without an image import table.
-        if (first == 0x48 && second == 0xB8 && i + 12 <= size)
+        // mov reg,imm64 (REX.W, rax..rdi) whose immediate is consumed by a
+        // jmp/call of the same register within the next two bytes: the
+        // absolute-target thunk mappers use when they resolve imports without
+        // an image import table. The transfer has to name the register the load
+        // wrote, because only then is the immediate what control flow reads; a
+        // jump through any other register has no statically known destination,
+        // so reporting this immediate as its target would be a false one.
+        if (first == 0x48 && second >= 0xB8 && second <= 0xBF && i + 12 <= size)
         {
             uint64_t destination = 0;
             std::memcpy(&destination, bytes + i + 2, sizeof(destination));
@@ -231,10 +243,13 @@ void KmonCountMapperStubs(
             {
                 continue;
             }
+            const uint8_t loadedRegister = static_cast<uint8_t>(second - 0xB8);
             bool transferred = false;
             for (size_t j = i + 10; j + 2 <= size && j < i + 12; ++j)
             {
-                if (bytes[j] == 0xFF && (bytes[j + 1] == 0xE0 || bytes[j + 1] == 0xD0))
+                if (bytes[j] == 0xFF &&
+                    (bytes[j + 1] == static_cast<uint8_t>(0xE0 + loadedRegister) ||
+                     bytes[j + 1] == static_cast<uint8_t>(0xD0 + loadedRegister)))
                 {
                     transferred = true;
                     break;
@@ -577,6 +592,63 @@ bool KernelMonitorMapperPoolSelfTest()
         KmonCountMapperStubs(absoluteStub, sizeof(absoluteStub), regionVa, modules, &stats);
         if (stats.Slots != 1 || stats.Unbacked != 1 ||
             stats.FirstUnbacked != unbackedTarget)
+        {
+            break;
+        }
+
+        // The same thunk through another register of the decoded set is the same
+        // stub: the load is what the transfer consumes, so the immediate is the
+        // target for `mov rcx,imm64; jmp rcx` and for `mov rdi,imm64; jmp rdi`.
+        uint8_t otherRegisterStub[16] = {};
+        otherRegisterStub[0] = 0x48;
+        otherRegisterStub[1] = 0xB9;
+        std::memcpy(otherRegisterStub + 2, &unbackedTarget, sizeof(unbackedTarget));
+        otherRegisterStub[10] = 0xFF;
+        otherRegisterStub[11] = 0xE1;
+        stats = KmonMapperStubStats();
+        KmonCountMapperStubs(
+            otherRegisterStub, sizeof(otherRegisterStub), regionVa, modules, &stats);
+        if (stats.Slots != 1 || stats.Unbacked != 1 ||
+            stats.FirstUnbacked != unbackedTarget)
+        {
+            break;
+        }
+        otherRegisterStub[1] = 0xBF;
+        std::memcpy(otherRegisterStub + 2, &unbackedTarget, sizeof(unbackedTarget));
+        otherRegisterStub[10] = 0xFF;
+        otherRegisterStub[11] = 0xE7;
+        stats = KmonMapperStubStats();
+        KmonCountMapperStubs(
+            otherRegisterStub, sizeof(otherRegisterStub), regionVa, modules, &stats);
+        if (stats.Slots != 1 || stats.Unbacked != 1 ||
+            stats.FirstUnbacked != unbackedTarget)
+        {
+            break;
+        }
+
+        // A transfer through a register the load did not write has no statically
+        // known destination, so this immediate must not be reported as its
+        // target: the thunk is not a stub of this layer.
+        uint8_t mismatchedStub[16] = {};
+        mismatchedStub[0] = 0x48;
+        mismatchedStub[1] = 0xB9;
+        std::memcpy(mismatchedStub + 2, &unbackedTarget, sizeof(unbackedTarget));
+        mismatchedStub[10] = 0xFF;
+        mismatchedStub[11] = 0xE0;
+        stats = KmonMapperStubStats();
+        KmonCountMapperStubs(
+            mismatchedStub, sizeof(mismatchedStub), regionVa, modules, &stats);
+        if (stats.Slots != 0 || stats.Unbacked != 0)
+        {
+            break;
+        }
+        mismatchedStub[1] = 0xBF;
+        mismatchedStub[10] = 0xFF;
+        mismatchedStub[11] = 0xD0;
+        stats = KmonMapperStubStats();
+        KmonCountMapperStubs(
+            mismatchedStub, sizeof(mismatchedStub), regionVa, modules, &stats);
+        if (stats.Slots != 0 || stats.Unbacked != 0)
         {
             break;
         }
