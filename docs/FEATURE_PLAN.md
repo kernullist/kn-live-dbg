@@ -48,12 +48,17 @@ Completed core slices:
     input/SSDT/IDT hooks, hot-entry inline patches (`hook.inline` /
     `hook.breakpoint`: a non-inbox head transfer or an `int3` trap on
     ntoskrnl/win32k entry points, while an in-module hotpatch, an inbox win32k
-    forwarder, and a register-indirect head defer), kernel threads
+    forwarder, and a register-indirect head defer, and a destination below the
+    canonical kernel floor is not reported at all because a value there is not
+    kernel code), kernel threads
     (`thread.unbacked` / `thread.hidden` / `thread.dkom`: kernel-context
     `_EPROCESS.ThreadListHead` view plus `ActiveThreads` accounting against the
-    host Toolhelp view, the DKOM form needs two passes), stub-body residuals
-    (`pool.hidden` for a region the big-pool table no longer reports,
-    `mapper.stub` for one it still does), mapper leftovers, post-load driver hiding
+    host Toolhelp view, the hidden-thread and DKOM forms need two passes while an
+    unbacked start prints on its first confirming pass), stub-body residuals
+    (`pool.hidden` for a region the big-pool table does not report at all,
+    `mapper.stub` for one it does; the table alone cannot tell a removed
+    allocation from a mapping that never was a big-pool allocation), mapper
+    leftovers, post-load driver hiding
     (`driver.vanished` / `driver.unnotified_load` / `driver.remap` /
     `driver.tampered` / `driver.evidence_asymmetry` / `driver.inventory_divergence` /
     `driver.module_chain_broken`: fail-closed host-side `PsLoadedModuleList`

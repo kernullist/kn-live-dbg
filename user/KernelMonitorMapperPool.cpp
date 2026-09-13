@@ -18,15 +18,22 @@
 //     no loaded module owns. The kernel-import stub counter the orphan-page
 //     layer already runs only counts thunks that land inside
 //     ntoskrnl/hal/wdf*, so a destination that no module backs was invisible;
-//   * a pool-table-silent allocation -- the same stub body lives in a kernel
+//   * a pool-table-silent region -- the same stub body lives in a kernel
 //     executable region that the big pool address view
 //     (SystemBigPoolInformation, i.e. nt!PoolBigPageTable) does not cover at
-//     all. That is the observable effect of hiding an allocation from the pool
-//     table: the pages stay mapped and executable while the table is silent.
+//     all, which is what hiding an allocation from the pool table looks like
+//     from the table side: the pages stay mapped and executable while the table
+//     is silent. That silence is all the table can report, so it cannot tell an
+//     allocation that was removed from the table apart from an executable
+//     mapping that never was a big-pool allocation (an MDL/section/contiguous
+//     mapping, a large page, or a page-table-backed window, i.e. the
+//     independent_or_system_pte class). The verdict therefore states the table
+//     silence, and the notes carry the region class so the two can be told
+//     apart; the stub evidence itself does not depend on that split.
 //
 // The two verdicts are disjoint, and the table view is what separates them:
-// the same stub body inside a region the table still reports is mapper.stub,
-// and inside a region the table no longer reports it is pool.hidden. A region
+// the same stub body inside a region the table reports is mapper.stub, and
+// inside a region the table does not report it is pool.hidden. A region
 // that carries a PE header keeps the older unbacked_pe / orphan_page verdict,
 // because the caller gates this layer on region.HasPe, so one region is never
 // reported twice by two layers.
@@ -500,8 +507,8 @@ bool KernelMonitor::EmitMapperPoolResidual(
         region.Classification,
         kLayer,
         std::wstring(hidden
-            ? L"pool allocation missing from the big pool table view with an unbacked stub body "
-            : L"stub body transferring to unbacked code inside a reported pool allocation ") +
+            ? L"executable region the big pool table view does not report, holding a stub body whose destination no loaded module owns "
+            : L"stub body transferring to unbacked code inside an allocation the big pool table reports ") +
             ResidualHex(region.Start),
         notes + captureNote);
     return true;

@@ -23,7 +23,14 @@
 //   * a transfer through a register (jmp rax) has no statically known
 //     destination, so it stays a deferral instead of a guess;
 //   * a patch inside the function body, a .data slot swap (hook.dataptr), and a
-//     callback/SSDT/IDT hook (hook.unbacked) are covered by other layers.
+//     callback/SSDT/IDT hook (hook.unbacked) are covered by other layers;
+//   * a head transfer whose decoded destination is below the canonical kernel
+//     floor is not a verdict, and not a deferral either: such a value is not
+//     kernel code at all (the 32-bit immediate of a push/ret head sign-extends
+//     into the user half, and a thunk slot or an r/m the decoder read can hold
+//     anything). KmonCountMapperStubs applies the same rule to its stub slots,
+//     so a value that is data there is not a hook destination here. The int3
+//     trap form is unaffected.
 //
 // The reads repeat the canonical-address guard the kernel helpers in
 // KernelMonitor.cpp apply: a bogus size or a user-mode address must never turn
@@ -212,6 +219,18 @@ namespace
         return true;
     }
 
+    // A head transfer lands in kernel code, so a destination below the
+    // canonical kernel floor is not an address this layer may call a transfer
+    // target: the 32-bit immediate of a push/ret head sign-extends into the
+    // user half, and a thunk slot or an r/m the decoder read can hold anything.
+    // The mapper/pool stub counter drops the same values from its slots
+    // (KernelMonitorMapperPool.cpp, IsKernelDestination), so a value that is
+    // data there cannot be a hook destination here.
+    bool InlineTargetIsKernelCode(uint64_t target)
+    {
+        return target >= kKernelVaFloor;
+    }
+
     const wchar_t* ShapeName(KmonInlinePatchShape shape)
     {
         switch (shape)
@@ -285,6 +304,11 @@ KmonInlinePatchDecode KmonDecodeInlinePatchHead(
         decode.TargetKnown = true;
         return decode;
     }
+    // push imm32; ret: the ret sign-extends the pushed value, so this form only
+    // reaches kernel code for the top window of the kernel half (0xFFFFFFFF8..
+    // upwards, the only canonical kernel range a 32-bit immediate can express).
+    // The decode reports the sign-extended value as-is, and the classifier is
+    // what refuses a value below the canonical kernel floor.
     if (size >= 6 && bytes[0] == 0x68 && bytes[5] == 0xC3)
     {
         int32_t immediate = 0;
@@ -352,6 +376,15 @@ KmonInlinePatchKind KmonClassifyInlinePatch(const KmonInlinePatchInput& input)
     {
         return KmonInlinePatchKind::None;
     }
+    // A destination that is not kernel code is not what this layer reports as a
+    // head transfer: a push/ret head pushes a sign-extended 32-bit value, so an
+    // immediate below the kernel floor lands in the user half, and a thunk slot
+    // or an r/m the decoder read can hold anything. Reporting such a value as
+    // the transfer destination would name an address control flow cannot reach.
+    if (!InlineTargetIsKernelCode(input.TransferTarget))
+    {
+        return KmonInlinePatchKind::None;
+    }
     // Without the owner range and a usable module view an in-image hotpatch
     // cannot be ruled out, so the verdict is withheld.
     if (!input.OwnerRangeKnown || input.OwnerEnd <= input.OwnerBase ||
@@ -376,7 +409,12 @@ KmonInlinePatchKind KmonClassifyInlinePatch(const KmonInlinePatchInput& input)
     // The transfer leaves every loaded module. When the bytes there are
     // themselves a stub with a known continuation, the pool trampoline is
     // reported instead of the plain head transfer.
-    if (input.StubKnown && input.StubIsTransfer && input.StubDestinationKnown)
+    // The stub continuation has to be kernel code too, for the same reason: a
+    // stub body that pushes a 32-bit value continues into the user half, and
+    // naming that value as the trampoline destination would be wrong. The head
+    // transfer into the unbacked stub stays a verdict either way.
+    if (input.StubKnown && input.StubIsTransfer && input.StubDestinationKnown &&
+        InlineTargetIsKernelCode(input.StubDestination))
     {
         return KmonInlinePatchKind::TrampolineStub;
     }
@@ -864,6 +902,35 @@ bool KernelMonitorInlinePatchSelfTest()
             break;
         }
 
+        // The same shape with an immediate that sign-extends into the kernel
+        // half still decodes to a destination, so the guard below cannot be
+        // satisfied by rejecting the push/ret form itself.
+        uint8_t pushRetKernel[16] = {};
+        pushRetKernel[0] = 0x68;
+        const int32_t pushKernelImmediate = (std::numeric_limits<int32_t>::min)();
+        std::memcpy(pushRetKernel + 1, &pushKernelImmediate, sizeof(pushKernelImmediate));
+        pushRetKernel[5] = 0xC3;
+        const KmonInlinePatchDecode pushRetKernelDecode =
+            KmonDecodeInlinePatchHead(pushRetKernel, sizeof(pushRetKernel), 0x2000);
+        if (pushRetKernelDecode.Shape != KmonInlinePatchShape::PushRet ||
+            !pushRetKernelDecode.TargetKnown ||
+            pushRetKernelDecode.Target != 0xFFFFFFFF80000000ull)
+        {
+            break;
+        }
+
+        // A transfer destination has to be kernel code: the user half, the bare
+        // 32-bit immediate, and a zero read are all data, while a kernel address
+        // and the sign-extended top window are destinations.
+        if (InlineTargetIsKernelCode(0) ||
+            InlineTargetIsKernelCode(0x40) ||
+            InlineTargetIsKernelCode(0x00007FF600001000ull) ||
+            !InlineTargetIsKernelCode(0xFFFFF88000034000ull) ||
+            !InlineTargetIsKernelCode(0xFFFFFFFF80000000ull))
+        {
+            break;
+        }
+
         uint8_t trap[16] = {};
         trap[0] = 0xCC;
         decode = KmonDecodeInlinePatchHead(trap, sizeof(trap), 0x2000);
@@ -996,6 +1063,31 @@ bool KernelMonitorInlinePatchSelfTest()
             break;
         }
 
+        // A decoded destination below the canonical kernel floor is not a head
+        // transfer: the user half and the bare push immediate are data, so the
+        // entry stays quiet instead of naming a value the jump cannot reach.
+        KmonInlinePatchInput userTarget = head;
+        userTarget.TransferTarget = 0x00007FF600001000ull;
+        if (KmonClassifyInlinePatch(userTarget) != KmonInlinePatchKind::None)
+        {
+            break;
+        }
+        KmonInlinePatchInput shortImmediateTarget = head;
+        shortImmediateTarget.TransferTarget = 0x40ull;
+        if (KmonClassifyInlinePatch(shortImmediateTarget) != KmonInlinePatchKind::None)
+        {
+            break;
+        }
+        // The sign-extended top window is a kernel address, so the same shape
+        // with that destination is still the verdict.
+        KmonInlinePatchInput kernelImmediateTarget = head;
+        kernelImmediateTarget.TransferTarget = 0xFFFFFFFF80000000ull;
+        if (KmonClassifyInlinePatch(kernelImmediateTarget) !=
+            KmonInlinePatchKind::UnbackedHeadTransfer)
+        {
+            break;
+        }
+
         // The same transfer whose target bytes are a stub with a known
         // continuation is the pool trampoline.
         KmonInlinePatchInput trampoline = head;
@@ -1004,6 +1096,16 @@ bool KernelMonitorInlinePatchSelfTest()
         trampoline.StubDestinationKnown = true;
         trampoline.StubDestination = ownerBase + 0x1234;
         if (KmonClassifyInlinePatch(trampoline) != KmonInlinePatchKind::TrampolineStub)
+        {
+            break;
+        }
+
+        // A stub whose own continuation is not kernel code is not a trampoline
+        // into that value, while the head transfer into the unbacked stub still
+        // is: the verdict degrades instead of disappearing.
+        KmonInlinePatchInput userStub = trampoline;
+        userStub.StubDestination = 0x40ull;
+        if (KmonClassifyInlinePatch(userStub) != KmonInlinePatchKind::UnbackedHeadTransfer)
         {
             break;
         }

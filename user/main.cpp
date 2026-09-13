@@ -25068,14 +25068,15 @@ std::wcout << L"          pool.hidden / mapper.stub (pool stub bodies, see logge
     std::wcout << L"  hook.dataptr            ntoskrnl/win32k/dxgkrnl CFG mov rax,[rip]; call guard_dispatch_icall\n";
     std::wcout << L"                          whose .data slot points outside loaded modules (firmware/PTE VAs skipped)\n";
 std::wcout << L"  hook.inline             ntoskrnl/win32k hot entry head transfer (E9/FF25/mov+jmp/push+ret)\n";
-std::wcout << L"                          into a non-inbox module or onto a pool stub body; an in-module\n";
-std::wcout << L"                          hotpatch, an inbox win32k forwarder, and a register-indirect head\n";
-std::wcout << L"                          stay deferrals (2 passes must agree)\n";
+std::wcout << L"                          into code no loaded module owns, into a non-inbox module, or onto a\n";
+std::wcout << L"                          pool stub body (2 passes must agree); an in-module hotpatch, an inbox\n";
+std::wcout << L"                          win32k forwarder, and a register-indirect head stay deferrals, and a\n";
+std::wcout << L"                          destination below the canonical kernel floor is not reported\n";
 std::wcout << L"  hook.breakpoint         int3 trap on the same hot entry points (2 passes)\n";
 std::wcout << L"  hook.scan               entry prologue or thunk slot that could not be read (deferral)\n";
 std::wcout << L"  thread.unbacked         kernel thread whose start address no loaded module owns\n";
 std::wcout << L"  thread.hidden           thread in the kernel list that the host Toolhelp view lacks\n";
-std::wcout << L"                          (both views must be definitive)\n";
+std::wcout << L"                          (2 passes must agree and both views must be definitive)\n";
 std::wcout << L"  thread.dkom             _EPROCESS.ActiveThreads exceeds the walked ThreadListHead entries\n";
 std::wcout << L"                          (2 passes)\n";
 std::wcout << L"  thread.scan             ETHREAD/thread-list view that could not be read (deferral)\n";
@@ -31623,10 +31624,16 @@ static int RunConsoleSurfaceSelfTest()
                         std::wstring::npos &&
                     kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos &&
                     kmonHelp.find(L"hook.inline") != std::wstring::npos &&
+                    kmonHelp.find(L"into code no loaded module owns, into a non-inbox module, or onto a") !=
+                        std::wstring::npos &&
+                    kmonHelp.find(L"destination below the canonical kernel floor is not reported") !=
+                        std::wstring::npos &&
                     kmonHelp.find(L"hook.breakpoint") != std::wstring::npos &&
                     kmonHelp.find(L"hook.scan") != std::wstring::npos &&
                     kmonHelp.find(L"thread.unbacked") != std::wstring::npos &&
                     kmonHelp.find(L"thread.hidden") != std::wstring::npos &&
+                    kmonHelp.find(L"2 passes must agree and both views must be definitive") !=
+                        std::wstring::npos &&
                     kmonHelp.find(L"thread.dkom") != std::wstring::npos &&
                     kmonHelp.find(L"thread.scan") != std::wstring::npos &&
                     kmonHelp.find(L"pool.hidden") != std::wstring::npos &&
