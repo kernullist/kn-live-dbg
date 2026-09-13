@@ -4,6 +4,7 @@
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
 #include "TimelineStore.h"
+#include "OrphanKernelPageScanner.h"
 
 #include <atomic>
 #include <cstddef>
@@ -264,6 +265,15 @@ private:
     void ScanKernelThreads();
     // Stage 2: inline patches on hot ntoskrnl/win32k entry points.
     void ScanKernelInlinePatches();
+
+    // Stage 3: mapper-stub / pool-table-hiding residual verdict for one
+    // orphan-page region. Returns true when the region produced a signal.
+    bool EmitMapperPoolResidual(
+        DeviceClient* device,
+        SymbolEngine* symbols,
+        const std::vector<KernelModuleInfo>& modules,
+        const OrphanKernelPageRegion& region,
+        bool tableViewKnown);
     void NoteMapperWatchResidue(const std::wstring& layer, uint64_t physicalAddress);
     void NoteWatchTiWriteIfNeeded(const KmonEvent& event);
     bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
@@ -842,3 +852,71 @@ const wchar_t* KmonInlinePatchKindName(KmonInlinePatchKind kind);
 // (kmon-classification), which the console surface self-test already
 // registers, so the self-test surface stays unchanged.
 bool KernelMonitorInlinePatchSelfTest();
+
+// Stage 3: mapper-residual and pool-residual signals. A stub body that
+// transfers into code no loaded module owns is either a mapper stub inside an
+// allocation the big pool view still reports (mapper.stub), or the body of an
+// allocation that view no longer reports at all (pool.hidden) -- the
+// observable effect of hiding an allocation from nt!PoolBigPageTable. An
+// unavailable big pool view withholds both verdicts for the pass and is
+// reported once as scan_failed:mapperpool:table, because that view is the very
+// fact the two verdicts are separated by. Every field is a solved fact, so the
+// self-test drives the verdict without a live kernel.
+struct KmonStubModuleRange
+{
+    uint64_t Base = 0;
+    uint64_t End = 0;
+    bool KernelImport = false;
+};
+
+struct KmonMapperStubStats
+{
+    uint32_t Slots = 0;
+    uint32_t NearJumps = 0;
+    uint32_t InModule = 0;
+    uint32_t KernelImport = 0;
+    uint32_t Internal = 0;
+    uint32_t Unbacked = 0;
+    uint64_t FirstUnbacked = 0;
+};
+
+// Pure byte-level decode of one sampled region body: an import-slot indirect
+// jmp/call (FF 25 / FF 15), mov reg,imm64 followed by jmp/call reg, or a
+// near-jump head thunk (E9 rel32). A destination that is not a canonical
+// kernel address, a slot outside the sample, a destination inside the sample
+// itself, and a near jump that is not the body's first instruction or that
+// lands off a page boundary are all ignored, so ordinary data bytes cannot
+// invent a stub.
+void KmonCountMapperStubs(
+    const uint8_t* bytes,
+    size_t size,
+    uint64_t regionVa,
+    const std::vector<KmonStubModuleRange>& modules,
+    KmonMapperStubStats* stats);
+
+enum class KmonResidualSignalKind
+{
+    None = 0,
+    PoolHidden,
+    MapperStub,
+};
+
+struct KmonResidualSignalInput
+{
+    bool RegionKnown = false;
+    bool Executable = false;
+    bool SessionSpace = false;
+    bool InLoadedModule = false;
+    bool TableViewKnown = false;
+    bool InBigPoolTable = false;
+    bool BodyReadKnown = false;
+    uint32_t MapperStubs = 0;
+    uint32_t UnbackedStubs = 0;
+};
+
+KmonResidualSignalKind KmonClassifyResidualSignal(const KmonResidualSignalInput& input);
+const wchar_t* KmonResidualSignalKindName(KmonResidualSignalKind kind);
+// Stage 3 regression: drives the stub decoder and the residual verdict through
+// synthetic inputs. It runs inside KernelMonitorSelfTest, which the console
+// surface self-test already registers, so the self-test surface is unchanged.
+bool KernelMonitorMapperPoolSelfTest();

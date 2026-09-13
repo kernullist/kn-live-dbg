@@ -153,6 +153,7 @@
     <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
     <ClCompile Include="KernelMonitor.cpp" />    <ClCompile Include="KernelMonitorInlinePatch.cpp" />
+    <ClCompile Include="KernelMonitorMapperPool.cpp" />
     <ClCompile Include="TimelineDashboard.cpp" />
     <ClCompile Include="TimelineModel.cpp" />
     <ClCompile Include="TimelineSelfTest.cpp" />

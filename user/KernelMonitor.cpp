@@ -6131,6 +6131,8 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"driver.image_only" ||
             event.Kind == L"driver.short_lived" ||
             event.Kind == L"driver.mapped_residue" ||
+            event.Kind == L"pool.hidden" ||
+            event.Kind == L"mapper.stub" ||
             event.Kind == L"driver.vanished" ||
             event.Kind == L"driver.unnotified_load" ||
             event.Kind == L"driver.remap" ||
@@ -11342,6 +11344,20 @@ void KernelMonitor::ScanOrphanMappedPages()
         // Session space is full of win32k scratch W+X; keep PE hits so a
         // session-mapped image still shows, but drop the W+X noise.
         if (region.SessionSpace && !peHit)
+        {
+            continue;
+        }
+
+        // Stage 3: mapper-stub / pool-table-hiding residual verdict. It runs
+        // before the generic stub and W+X emits so a stub body that transfers
+        // into code no module owns is reported as its own signal, and it never
+        // touches a region that carries a PE header.
+        if (EmitMapperPoolResidual(
+                device,
+                symbols,
+                kernelModules,
+                region,
+                result.BigPoolQueried))
         {
             continue;
         }
@@ -19883,6 +19899,12 @@ bool KernelMonitorSelfTest()
 
         // Stage 2: inline-patch regression (entry decode + verdicts).
         if (!KernelMonitorInlinePatchSelfTest())
+        {
+            ok = false;
+        }
+
+        // Stage 3: mapper-stub / pool-table-hiding residual regression.
+        if (!KernelMonitorMapperPoolSelfTest())
         {
             ok = false;
         }
