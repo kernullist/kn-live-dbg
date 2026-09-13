@@ -36,15 +36,17 @@ the on-machine behavior that the self-test cannot prove.
    idle machine with no mapper load.
 2. Confirm the deferral path instead of a verdict when a view is unavailable
    (stop the driver or clear symbols mid-run): `scan_failed:thread:*`,
-   `scan_failed:patch:*`, and `scan_failed:mapperpool:table` each print once,
+   `scan_failed:patch:*`, `scan_failed:mapperpool:table`, and `scan_failed:mapperpool:modules` each print once,
    the matching verdicts stop instead of firing, and the diagnostics clear once
    the view is restored. `thread.scan`, `hook.scan`, and the
    `coverage:patch:*` markers record a deferred pass, while an unreadable region
    body in the stub layer simply produces no verdict.
 3. Confirm the two-pass rule: a mapper/watch window shorter than two scan
-   intervals must not produce `thread.dkom` or a `hook.inline` verdict, and an
-   ordinary kernel hotpatch (in-module destination) or an inbox win32k forwarder
-   must never print.
+   intervals must not produce `thread.hidden`, `thread.dkom`, or a `hook.inline`
+   verdict, and an ordinary kernel hotpatch (in-module destination) or an inbox
+   win32k forwarder must never print. A thread whose start address no loaded
+   module owns prints on its first confirming pass, so that form is expected
+   without waiting for a second interval.
 4. Confirm `help !kmon` lists `hook.inline`, `hook.breakpoint`, `hook.scan`,
    `thread.unbacked`, `thread.hidden`, `thread.dkom`, `thread.scan`,
    `pool.hidden`, and `mapper.stub`, and that `x64\Release\KnLiveDbg.exe
