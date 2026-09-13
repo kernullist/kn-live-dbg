@@ -166,6 +166,9 @@
     <ClCompile Include="KernelMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="KernelMonitorInlinePatch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="TimelineDashboard.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

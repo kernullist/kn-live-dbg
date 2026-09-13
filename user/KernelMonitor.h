@@ -262,6 +262,8 @@ private:
     void ScanHookDataPointers();
     void ScanUserModeHostility();
     void ScanKernelThreads();
+    // Stage 2: inline patches on hot ntoskrnl/win32k entry points.
+    void ScanKernelInlinePatches();
     void NoteMapperWatchResidue(const std::wstring& layer, uint64_t physicalAddress);
     void NoteWatchTiWriteIfNeeded(const KmonEvent& event);
     bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
@@ -538,6 +540,14 @@ private:
     // verdict compares a whole process thread list against its accounting.
     std::map<uint32_t, uint32_t> ThreadListDkomStrikes;
     std::atomic<uint64_t> ThreadScans{0};
+    // Stage 2: inline-patch scan cadence plus the two-scan confirmation that
+    // keeps a page-in or a hotpatch transition from printing a patch verdict.
+    // The intervals are class constants because the worker loop and the layer
+    // body both read them.
+    static constexpr uint32_t kInlinePatchScanIntervalMs = 20000;
+    static constexpr uint32_t kInlinePatchWatchScanIntervalMs = 10000;
+    uint64_t NextInlinePatchScanTickMs = 0;
+    std::map<std::wstring, uint32_t> InlinePatchStrikes;
 };
 
 std::wstring KmonBasenameLower(const std::wstring& path);
@@ -750,3 +760,85 @@ KmonKernelThreadKind KmonClassifyKernelThread(const KmonKernelThreadInput& input
 const wchar_t* KmonKernelThreadKindName(KmonKernelThreadKind kind);
 // Stage 1 regression: drives the thread verdict through synthetic inputs.
 bool KernelMonitorThreadSelfTest();
+// Stage 2: inline patches on hot ntoskrnl/win32k entry points. A mapper or
+// BYOVD driver that hides a process, reads a game, or blinds a syscall query
+// usually rewrites the first bytes of a hot entry point with a transfer or an
+// int3 trap instead of only hooking a callback table. The verdict is the entry
+// shape plus the ownership of the transfer target, so an in-image kernel
+// hotpatch, a win32k.sys forwarder, and an unreadable prologue all stay
+// deferrals instead of false positives.
+enum class KmonInlinePatchKind
+{
+    None = 0,
+    UnbackedHeadTransfer,
+    TrampolineStub,
+    ForeignModuleHeadTransfer,
+    Int3Breakpoint,
+};
+
+// Entry shapes the decoder recognises. Ordinary prologue bytes (push, sub rsp,
+// mov, call __chkstk) stay Plain, so a normal entry can never be a verdict.
+enum class KmonInlinePatchShape
+{
+    Plain = 0,
+    Trap,
+    NearJump,
+    RipIndirect,
+    RegisterImmediate,
+    PushRet,
+    RegisterIndirect,
+};
+
+// Pure byte-level decode of one entry prologue. RipIndirect carries the slot
+// address instead of a target because the destination is the qword in the slot
+// and needs one more read; RegisterIndirect has no static destination at all.
+// Pure, so the self-test can drive every accepted form.
+struct KmonInlinePatchDecode
+{
+    KmonInlinePatchShape Shape = KmonInlinePatchShape::Plain;
+    bool TargetKnown = false;
+    uint64_t Target = 0;
+    uint64_t SlotAddress = 0;
+};
+
+KmonInlinePatchDecode KmonDecodeInlinePatchHead(
+    const uint8_t* bytes,
+    size_t size,
+    uint64_t address);
+// A pool stub whose continuation is statically known: mov reg,imm64 / jmp reg,
+// a near jump, or push imm32 / ret. The rip-slot form needs a read this decoder
+// does not do, so it stays a plain unbacked head transfer.
+bool KmonDecodeInlinePatchStub(
+    const uint8_t* bytes,
+    size_t size,
+    uint64_t address,
+    uint64_t* destination);
+
+// Pure decision input: every field is a solved fact, so the self-test drives
+// all combinations without a live kernel.
+struct KmonInlinePatchInput
+{
+    bool PrologueKnown = false;
+    bool HeadIsTrap = false;
+    bool HeadIsTransfer = false;
+    bool TransferTargetKnown = false;
+    uint64_t TransferTarget = 0;
+    bool OwnerRangeKnown = false;
+    uint64_t OwnerBase = 0;
+    uint64_t OwnerEnd = 0;
+    bool ModuleViewKnown = false;
+    bool TargetInLoadedModule = false;
+    bool TargetModuleNonInbox = false;
+    bool StubKnown = false;
+    bool StubIsTransfer = false;
+    bool StubDestinationKnown = false;
+    uint64_t StubDestination = 0;
+};
+
+KmonInlinePatchKind KmonClassifyInlinePatch(const KmonInlinePatchInput& input);
+const wchar_t* KmonInlinePatchKindName(KmonInlinePatchKind kind);
+// Stage 2 regression: drives the entry decoder and the inline-patch verdict
+// through synthetic inputs. It runs inside KernelMonitorSelfTest
+// (kmon-classification), which the console surface self-test already
+// registers, so the self-test surface stays unchanged.
+bool KernelMonitorInlinePatchSelfTest();

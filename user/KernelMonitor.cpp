@@ -6143,6 +6143,9 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"mapper.watch" ||
             event.Kind == L"hook.unbacked" ||
             event.Kind == L"hook.dataptr" ||
+            event.Kind == L"hook.inline" ||
+            event.Kind == L"hook.breakpoint" ||
+            event.Kind == L"hook.scan" ||
             event.Kind == L"inject.kernel_phys" ||
             event.Kind == L"integrity.ci" ||
             event.Kind == L"integrity.cr" ||
@@ -7048,6 +7051,21 @@ void KernelMonitor::WorkerLoop()
             IngestLiveTimeline();
             IngestThreatIntel();
             NextUserScanTickMs = GetTickCount64() + kUserScanIntervalMs;
+        }
+
+        if (NextInlinePatchScanTickMs == 0)
+        {
+            NextInlinePatchScanTickMs = nowMs + 2000;
+        }
+        else if (nowMs >= NextInlinePatchScanTickMs)
+        {
+            ScanKernelInlinePatches();
+            IngestLiveTimeline();
+            IngestThreatIntel();
+            NextInlinePatchScanTickMs = GetTickCount64() +
+                (IsMapperWatchActive()
+                    ? kInlinePatchWatchScanIntervalMs
+                    : kInlinePatchScanIntervalMs);
         }
 
         if (NextThreadScanTickMs == 0)
@@ -19862,6 +19880,12 @@ bool KernelMonitorSelfTest()
         }
 
         ok = true;
+
+        // Stage 2: inline-patch regression (entry decode + verdicts).
+        if (!KernelMonitorInlinePatchSelfTest())
+        {
+            ok = false;
+        }
     } while (false);
 
     return ok;
