@@ -17841,6 +17841,13 @@ void KernelMonitor::ScanKernelThreads()
     bool walkComplete = true;
     while (link != head)
     {
+        // Shutdown: the walk is abandoned and the partial list is never used
+        // for a verdict, exactly like the inline-patch scan loop.
+        if (StopRequested.load())
+        {
+            walkComplete = false;
+            break;
+        }
         if (link < kThreadVaFloor ||
             visitedProcesses.size() >= kMaxKernelProcesses ||
             visitedProcesses.count(link) != 0)
@@ -17908,6 +17915,11 @@ void KernelMonitor::ScanKernelThreads()
         size_t walkedThreads = 0;
         while (threadLink != threadHead)
         {
+            if (StopRequested.load())
+            {
+                walkComplete = false;
+                break;
+            }
             if (threadLink < kThreadVaFloor ||
                 visitedThreads.size() >= kMaxKernelThreads ||
                 perProcess >= kMaxThreadsPerProcess ||

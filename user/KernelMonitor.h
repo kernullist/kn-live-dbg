@@ -910,6 +910,10 @@ struct KmonResidualSignalInput
     bool TableViewKnown = false;
     bool InBigPoolTable = false;
     bool BodyReadKnown = false;
+    // Without a usable module range set an unbacked destination cannot be told
+    // apart from a range the caller could not read, so the caller passes this
+    // false and both verdicts are withheld.
+    bool ModuleViewKnown = false;
     uint32_t MapperStubs = 0;
     uint32_t UnbackedStubs = 0;
 };

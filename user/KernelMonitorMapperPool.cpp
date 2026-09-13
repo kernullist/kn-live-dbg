@@ -38,6 +38,10 @@
 //     fact is per pass, so it is settled before any region gate and the
 //     diagnostic is tied to the layer being asked about a region;
 //   * a body that cannot be read is a deferral, never a verdict;
+//   * an empty module range set cannot separate "no loaded module owns this
+//     destination" from "the owner ranges were not readable", so both verdicts
+//     are withheld for that pass with one scan_failed:mapperpool:modules
+//     diagnostic instead of a guess;
 //   * a destination that is not a canonical kernel address, a slot whose
 //     address falls outside the sampled body, and a destination inside the
 //     sampled region itself are all ignored, so ordinary data bytes cannot
@@ -62,6 +66,7 @@ namespace
     constexpr size_t kMinStubBytes = 14;
     const wchar_t* const kLayer = L"mapper_pool";
     const wchar_t* const kTableDeferKey = L"scan_failed:mapperpool:table";
+    const wchar_t* const kModuleRangeDeferKey = L"scan_failed:mapperpool:modules";
 
     bool AddNoOverflow(uint64_t left, uint64_t right, uint64_t* result)
     {
@@ -286,7 +291,8 @@ KmonResidualSignalKind KmonClassifyResidualSignal(const KmonResidualSignalInput&
         input.SessionSpace ||
         input.InLoadedModule ||
         !input.TableViewKnown ||
-        !input.BodyReadKnown)
+        !input.BodyReadKnown ||
+        !input.ModuleViewKnown)
     {
         return KmonResidualSignalKind::None;
     }
@@ -359,6 +365,43 @@ bool KernelMonitor::EmitMapperPoolResidual(
     const uint32_t bodyBytes = region.Size > kMaxBodyBytes
         ? kMaxBodyBytes
         : static_cast<uint32_t>(region.Size);
+    // The module ranges decide whether a stub destination is backed by an
+    // image, so an empty range list cannot back the verdict: every destination
+    // would look unbacked. That is the same deferral the kernel-thread and
+    // inline-patch layers take on an empty inventory, and it is settled before
+    // the body read so an unreadable inventory is never reported as a stub.
+    std::vector<KmonStubModuleRange> ranges;
+    ranges.reserve(modules.size());
+    for (const KernelModuleInfo& module : modules)
+    {
+        if (module.Base == 0 || module.Size == 0)
+        {
+            continue;
+        }
+        KmonStubModuleRange range;
+        range.Base = module.Base;
+        if (!AddNoOverflow(module.Base, module.Size, &range.End))
+        {
+            continue;
+        }
+        const std::wstring leaf = KmonBasenameLower(
+            module.ImageName.empty() ? module.ImagePath : module.ImageName);
+        range.KernelImport = ResidualIsKernelImportLeaf(leaf);
+        ranges.push_back(range);
+    }
+    if (ranges.empty())
+    {
+        EmitUnique(
+            L"driver.mapped_residue",
+            kModuleRangeDeferKey,
+            std::wstring(),
+            kLayer,
+            L"mapper/pool residual verdict deferred; no kernel module range with a known size was available",
+            L"the stub destination check has no module range to compare against");
+        return false;
+    }
+    ClearEmittedKey(kModuleRangeDeferKey);
+
     bool bodyKnown = false;
     KmonMapperStubStats stats = {};
     if (bodyBytes >= kMinStubBytes)
@@ -368,25 +411,6 @@ bool KernelMonitor::EmitMapperPoolResidual(
         if (device->ReadMemory(region.Start, bodyBytes, &body, &ignored) &&
             body.size() >= kMinStubBytes)
         {
-            std::vector<KmonStubModuleRange> ranges;
-            ranges.reserve(modules.size());
-            for (const KernelModuleInfo& module : modules)
-            {
-                if (module.Base == 0 || module.Size == 0)
-                {
-                    continue;
-                }
-                KmonStubModuleRange range;
-                range.Base = module.Base;
-                if (!AddNoOverflow(module.Base, module.Size, &range.End))
-                {
-                    continue;
-                }
-                const std::wstring leaf = KmonBasenameLower(
-                    module.ImageName.empty() ? module.ImagePath : module.ImageName);
-                range.KernelImport = ResidualIsKernelImportLeaf(leaf);
-                ranges.push_back(range);
-            }
             KmonCountMapperStubs(body.data(), body.size(), region.Start, ranges, &stats);
             bodyKnown = true;
         }
@@ -403,6 +427,9 @@ bool KernelMonitor::EmitMapperPoolResidual(
     input.TableViewKnown = tableViewKnown;
     input.InBigPoolTable = region.InBigPool;
     input.BodyReadKnown = bodyKnown;
+    // The range set is non-empty here, because an empty one deferred above, so
+    // the "no loaded module owns this destination" claim has a usable view.
+    input.ModuleViewKnown = true;
     input.MapperStubs = stats.Slots;
     input.UnbackedStubs = stats.Unbacked;
 
@@ -719,6 +746,7 @@ bool KernelMonitorMapperPoolSelfTest()
         input.Executable = true;
         input.TableViewKnown = true;
         input.BodyReadKnown = true;
+        input.ModuleViewKnown = true;
         if (KmonClassifyResidualSignal(input) != KmonResidualSignalKind::None)
         {
             break;
@@ -742,9 +770,10 @@ bool KernelMonitorMapperPoolSelfTest()
             break;
         }
 
-        // Fail-closed: an unavailable table view, an unreadable body, an
-        // incomplete record, a non-executable region, session space, and a
-        // module-owned range each withhold both verdicts on their own.
+        // Fail-closed: an unavailable table view, an unreadable body, an empty
+        // module range view, an incomplete record, a non-executable region,
+        // session space, and a module-owned range each withhold both verdicts
+        // on their own.
         KmonResidualSignalInput noTable = stub;
         noTable.TableViewKnown = false;
         if (KmonClassifyResidualSignal(noTable) != KmonResidualSignalKind::None)
@@ -754,6 +783,14 @@ bool KernelMonitorMapperPoolSelfTest()
         KmonResidualSignalInput noBody = stub;
         noBody.BodyReadKnown = false;
         if (KmonClassifyResidualSignal(noBody) != KmonResidualSignalKind::None)
+        {
+            break;
+        }
+        // An empty module range set cannot tell "no module owns it" from "the
+        // owner range was not readable", so both verdicts are withheld.
+        KmonResidualSignalInput noModuleView = stub;
+        noModuleView.ModuleViewKnown = false;
+        if (KmonClassifyResidualSignal(noModuleView) != KmonResidualSignalKind::None)
         {
             break;
         }

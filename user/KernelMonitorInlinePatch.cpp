@@ -269,8 +269,14 @@ KmonInlinePatchDecode KmonDecodeInlinePatchHead(
         decode.SlotAddress = address + 6 + static_cast<int64_t>(relative);
         return decode;
     }
+    // mov reg,imm64 followed by jmp reg: the ModRM r/m field has to name the
+    // same register the mov loaded, because the immediate is only the target
+    // when that register is the one the jump consumes. A jump through any other
+    // register has no statically known destination, so it must not be reported
+    // with this immediate as its target.
     if (size >= 12 && bytes[0] == 0x48 && bytes[1] >= 0xB8 && bytes[1] <= 0xBF &&
-        bytes[10] == 0xFF && (bytes[11] & 0xF8) == 0xE0)
+        bytes[10] == 0xFF && (bytes[11] & 0xF8) == 0xE0 &&
+        (bytes[11] & 0x07) == (bytes[1] - 0xB8))
     {
         uint64_t immediate = 0;
         std::memcpy(&immediate, bytes + 2, sizeof(immediate));
@@ -912,6 +918,39 @@ bool KernelMonitorInlinePatchSelfTest()
         if (KmonDecodeInlinePatchStub(plain, sizeof(plain), 0x3000, &stubDestination) ||
             KmonDecodeInlinePatchStub(rip, sizeof(rip), 0x3000, &stubDestination) ||
             KmonDecodeInlinePatchStub(absolute, sizeof(absolute), 0x3000, nullptr))
+        {
+            break;
+        }
+
+        // mov rax,imm64 followed by a jump through another register: the
+        // immediate is not what that jump consumes, so it must be neither the
+        // head's target nor a stub continuation.
+        uint8_t mismatchedRegister[16] = {};
+        mismatchedRegister[0] = 0x48;
+        mismatchedRegister[1] = 0xB8;
+        std::memcpy(mismatchedRegister + 2, &absoluteTarget, sizeof(absoluteTarget));
+        mismatchedRegister[10] = 0xFF;
+        mismatchedRegister[11] = 0xE1;
+        decode = KmonDecodeInlinePatchHead(
+            mismatchedRegister, sizeof(mismatchedRegister), 0x2000);
+        if (decode.Shape != KmonInlinePatchShape::Plain || decode.TargetKnown)
+        {
+            break;
+        }
+        stubDestination = 0;
+        if (KmonDecodeInlinePatchStub(
+                mismatchedRegister,
+                sizeof(mismatchedRegister),
+                0x3000,
+                &stubDestination))
+        {
+            break;
+        }
+        // The matching-register form still decodes, so the guard above cannot
+        // be satisfied by rejecting every mov reg,imm64 head.
+        decode = KmonDecodeInlinePatchHead(absolute, sizeof(absolute), 0x2000);
+        if (decode.Shape != KmonInlinePatchShape::RegisterImmediate ||
+            !decode.TargetKnown || decode.Target != absoluteTarget)
         {
             break;
         }
