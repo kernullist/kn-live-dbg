@@ -25006,6 +25006,9 @@ static void PrintKmonHelp()
     std::wcout << L"          process.credscan, driver.captured (image auto-dump), gap.kernel_rw,\n";
     std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids,\n";
     std::wcout << L"          hook.window / process.impair from TI (see logged kinds)\n";
+std::wcout << L"          hook.inline / hook.breakpoint (hot kernel entry head transfer or int3),\n";
+std::wcout << L"          thread.unbacked / thread.hidden / thread.dkom (kernel thread view),\n";
+std::wcout << L"          pool.hidden / mapper.stub (pool stub bodies, see logged kinds)\n";
     std::wcout << L"  hidden: process create, local AllocVM, kernel R/W,\n";
     std::wcout << L"          ReadVM/suspend/resume alone\n";
     std::wcout << L"  Program Files anti-cheat .sys (EAC/BE/Vanguard) is non-inbox and will print.\n";
@@ -25064,6 +25067,21 @@ static void PrintKmonHelp()
     std::wcout << L"                          InstrumentationCallback outside modules (watch/builtin, PPL via VAD)\n";
     std::wcout << L"  hook.dataptr            ntoskrnl/win32k/dxgkrnl CFG mov rax,[rip]; call guard_dispatch_icall\n";
     std::wcout << L"                          whose .data slot points outside loaded modules (firmware/PTE VAs skipped)\n";
+std::wcout << L"  hook.inline             ntoskrnl/win32k hot entry head transfer (E9/FF25/mov+jmp/push+ret)\n";
+std::wcout << L"                          into a non-inbox module or onto a pool stub body; an in-module\n";
+std::wcout << L"                          hotpatch, an inbox win32k forwarder, and a register-indirect head\n";
+std::wcout << L"                          stay deferrals (2 passes must agree)\n";
+std::wcout << L"  hook.breakpoint         int3 trap on the same hot entry points (2 passes)\n";
+std::wcout << L"  hook.scan               entry prologue or thunk slot that could not be read (deferral)\n";
+std::wcout << L"  thread.unbacked         kernel thread whose start address no loaded module owns\n";
+std::wcout << L"  thread.hidden           thread in the kernel list that the host Toolhelp view lacks\n";
+std::wcout << L"                          (both views must be definitive)\n";
+std::wcout << L"  thread.dkom             _EPROCESS.ActiveThreads exceeds the walked ThreadListHead entries\n";
+std::wcout << L"                          (2 passes)\n";
+std::wcout << L"  thread.scan             ETHREAD/thread-list view that could not be read (deferral)\n";
+std::wcout << L"  pool.hidden             executable non-PE region the big-pool table does not report,\n";
+std::wcout << L"                          holding stubs whose destination no module owns\n";
+std::wcout << L"  mapper.stub             same stub body inside an allocation the big-pool table reports\n";
     std::wcout << L"  inject.kernel_phys      mapper.watch + hidden/protect-changed PTEs on a watch PID with\n";
     std::wcout << L"                          kpage/pool/dataptr residue or overlay_slot and no TI WriteVM/ProtectVM\n";
     std::wcout << L"  process.hidden          DKOM unlink / SPI hide / handle+CID-only; full PspCidTable walk (~5s)\n";
@@ -31603,7 +31621,16 @@ static int RunConsoleSurfaceSelfTest()
                     kmonHelp.find(L"_OBJECT_TYPE.TypeList sweep") != std::wstring::npos &&
                     kmonHelp.find(L"reports an explicit reason when it is skipped") !=
                         std::wstring::npos &&
-                    kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos,
+                    kmonHelp.find(L"ReadVM/suspend/resume alone") != std::wstring::npos &&
+                    kmonHelp.find(L"hook.inline") != std::wstring::npos &&
+                    kmonHelp.find(L"hook.breakpoint") != std::wstring::npos &&
+                    kmonHelp.find(L"hook.scan") != std::wstring::npos &&
+                    kmonHelp.find(L"thread.unbacked") != std::wstring::npos &&
+                    kmonHelp.find(L"thread.hidden") != std::wstring::npos &&
+                    kmonHelp.find(L"thread.dkom") != std::wstring::npos &&
+                    kmonHelp.find(L"thread.scan") != std::wstring::npos &&
+                    kmonHelp.find(L"pool.hidden") != std::wstring::npos &&
+                    kmonHelp.find(L"mapper.stub") != std::wstring::npos,
                 L"kmon-help-covers-drop-load-and-live-tail");
         }
         CheckCompletionCandidate(&context, {L"help", L"!byovd"}, L"fixture", L"help-byovd-fixture-completion");

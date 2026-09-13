@@ -23,6 +23,33 @@ before the feature is trusted.
    dashboard shows symbol state; if `symType=0 (SymNone)`, fix the symbol path
    before running symbol-dependent checks).
 
+## Kernel-driver hiding layers (`!kmon`)
+
+These checks need a live kernel, because the layers read kernel memory through
+the driver. Synthetic-input coverage lives in the console self-test
+(`kmon-thread-classification` and `kmon-classification`); the items below are
+the on-machine behavior that the self-test cannot prove.
+
+1. With `!kmon /background` armed on a clean host, confirm the new layers stay
+   quiet: no `hook.inline` / `hook.breakpoint`, no `thread.unbacked` /
+   `thread.hidden` / `thread.dkom`, and no `pool.hidden` / `mapper.stub` on an
+   idle machine with no mapper load.
+2. Confirm the deferral path instead of a verdict when a view is unavailable
+   (stop the driver or clear symbols mid-run): `scan_failed:thread:*`,
+   `scan_failed:patch:*`, and `scan_failed:mapperpool:table` each print once,
+   the matching verdicts stop instead of firing, and the diagnostics clear once
+   the view is restored. `thread.scan`, `hook.scan`, and the
+   `coverage:patch:*` markers record a deferred pass, while an unreadable region
+   body in the stub layer simply produces no verdict.
+3. Confirm the two-pass rule: a mapper/watch window shorter than two scan
+   intervals must not produce `thread.dkom` or a `hook.inline` verdict, and an
+   ordinary kernel hotpatch (in-module destination) or an inbox win32k forwarder
+   must never print.
+4. Confirm `help !kmon` lists `hook.inline`, `hook.breakpoint`, `hook.scan`,
+   `thread.unbacked`, `thread.hidden`, `thread.dkom`, `thread.scan`,
+   `pool.hidden`, and `mapper.stub`, and that `x64\Release\KnLiveDbg.exe
+   --self-test console` passes on the VM too.
+
 ## Whole-host hunt negative control
 
 From the repository root, the repeatable clean-host gate is:
