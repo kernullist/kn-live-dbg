@@ -261,6 +261,7 @@ private:
     void ScanCpuIntegrityHooks();
     void ScanHookDataPointers();
     void ScanUserModeHostility();
+    void ScanKernelThreads();
     void NoteMapperWatchResidue(const std::wstring& layer, uint64_t physicalAddress);
     void NoteWatchTiWriteIfNeeded(const KmonEvent& event);
     bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
@@ -529,6 +530,14 @@ private:
     uint64_t NextMapperScanTickMs = 0;
     uint64_t NextKpageScanTickMs = 0;
     uint64_t NextUserScanTickMs = 0;
+    // Stage 1: kernel-thread scan cadence and the two-scan confirmation that
+    // keeps a thread-creation race from printing a hidden-thread verdict.
+    uint64_t NextThreadScanTickMs = 0;
+    std::map<uint32_t, uint32_t> ThreadHiddenStrikes;
+    // Stage 1b: ETHREAD-list DKOM confirmation, keyed by pid because the
+    // verdict compares a whole process thread list against its accounting.
+    std::map<uint32_t, uint32_t> ThreadListDkomStrikes;
+    std::atomic<uint64_t> ThreadScans{0};
 };
 
 std::wstring KmonBasenameLower(const std::wstring& path);
@@ -686,3 +695,58 @@ bool KernelMonitorArtifactSelfTest(KmonArtifactSkipReason* skipReason = nullptr)
 // driver.vanished / driver.unnotified_load / driver.remap / driver.tampered
 // semantics are covered without a live kernel.
 bool KernelMonitorHiddenDriverSelfTest();
+// Stage 1: kernel-thread hiding. A driver that lands by mapper or by a DKOM
+// unlink can still create a system thread, and that thread keeps running after
+// the image is gone. The kernel-context view walks _EPROCESS.ThreadListHead
+// straight out of kernel memory while the host view is a Toolhelp thread
+// snapshot, so the two halves fail independently.
+enum class KmonKernelThreadKind
+{
+    None = 0,
+    UnbackedStart,
+    HiddenFromHostView,
+    UnlinkedFromThreadList,
+};
+
+// Pure decision input, so the self-test can drive every combination without a
+// live kernel. UnbackedStart needs a known kernel-mode start address that no
+// loaded image owns. HiddenFromHostView additionally needs both views to be
+// definitive, because a truncated walk or a failed host snapshot cannot prove
+// absence. Image is evidence only and never takes part in the verdict.
+struct KmonKernelThreadInput
+{
+    uint32_t ProcessId = 0;
+    uint32_t ThreadId = 0;
+    uint64_t StartAddress = 0;
+    bool StartAddressKnown = false;
+    bool StartInLoadedModule = false;
+    bool StartIsKernelAddress = false;
+    bool KernelListComplete = false;
+    bool HostViewKnown = false;
+    bool HostViewHasThread = false;
+    std::wstring Image;
+};
+
+// Stage 1b: ETHREAD-list DKOM. A complete walk of _EPROCESS.ThreadListHead can
+// still under-report, because the walk only sees what the list links point at.
+// _EPROCESS.ActiveThreads is the kernel's own count for the same process, so a
+// process whose accounting is larger than its walked list has threads that
+// were unlinked from the list while they keep running. The accounting pair
+// brackets the walk, so a thread that exits or starts inside the window cannot
+// become a verdict. Pure decision input as well, so the self-test drives the
+// comparison without a live kernel.
+struct KmonKernelThreadListInput
+{
+    uint32_t ProcessId = 0;
+    uint32_t WalkedThreads = 0;
+    uint32_t AccountingBefore = 0;
+    uint32_t AccountingAfter = 0;
+    bool AccountingKnown = false;
+    bool ListComplete = false;
+};
+
+KmonKernelThreadKind KmonClassifyKernelThreadList(const KmonKernelThreadListInput& input);
+KmonKernelThreadKind KmonClassifyKernelThread(const KmonKernelThreadInput& input);
+const wchar_t* KmonKernelThreadKindName(KmonKernelThreadKind kind);
+// Stage 1 regression: drives the thread verdict through synthetic inputs.
+bool KernelMonitorThreadSelfTest();

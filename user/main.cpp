@@ -31572,6 +31572,10 @@ static int RunConsoleSurfaceSelfTest()
             L"kmon-hidden-driver-regression");
         CheckConsoleSurfaceSelfTest(
             &context,
+            KernelMonitorThreadSelfTest(),
+            L"kmon-thread-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             IsNativeOwnedCommand(L"!kmon"),
             L"kmon-is-native-owned");
         {

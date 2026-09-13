@@ -58,6 +58,8 @@ namespace
     constexpr uint32_t kMapperWatchWindowMs = 30000;
     constexpr uint32_t kMapperWatchMaxMs = 90000;
     constexpr uint32_t kMapperWatchIntervalMs = 400;
+    constexpr uint32_t kThreadScanIntervalMs = 20000;
+    constexpr uint32_t kThreadWatchScanIntervalMs = 10000;
     constexpr uint32_t kMapperWatchKpageIntervalMs = 1500;
     constexpr uint32_t kMapperWatchEmitDebounceMs = 2000;
     constexpr uint16_t kImageFileMachineAmd64 = 0x8664;
@@ -6146,7 +6148,11 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"integrity.cr" ||
             event.Kind == L"process.masquerade" ||
             event.Kind == L"process.hollow" ||
-            event.Kind == L"process.implant")
+            event.Kind == L"process.implant" ||
+            event.Kind == L"thread.unbacked" ||
+            event.Kind == L"thread.hidden" ||
+            event.Kind == L"thread.dkom" ||
+            event.Kind == L"thread.scan")
         {
             matched = true;
             break;
@@ -7042,6 +7048,21 @@ void KernelMonitor::WorkerLoop()
             IngestLiveTimeline();
             IngestThreatIntel();
             NextUserScanTickMs = GetTickCount64() + kUserScanIntervalMs;
+        }
+
+        if (NextThreadScanTickMs == 0)
+        {
+            NextThreadScanTickMs = nowMs + 2000;
+        }
+        else if (nowMs >= NextThreadScanTickMs)
+        {
+            ScanKernelThreads();
+            IngestLiveTimeline();
+            IngestThreatIntel();
+            NextThreadScanTickMs = GetTickCount64() +
+                (IsMapperWatchActive()
+                    ? kThreadWatchScanIntervalMs
+                    : kThreadScanIntervalMs);
         }
 
         std::this_thread::sleep_for(
@@ -9158,6 +9179,11 @@ void KernelMonitor::EmitUnique(
         event.Evidence[L"followup"] = processId != 0
             ? L"!hiddenproc; !vad " + std::to_wstring(processId)
             : L"!hiddenproc";
+    }
+    else if (kind.rfind(L"thread.", 0) == 0)
+    {
+        event.Evidence[L"followup"] =
+            L"!hiddenproc; !callbacks; !kpage /pe";
     }
     else
     {
@@ -17445,6 +17471,852 @@ bool KernelMonitorHiddenDriverSelfTest()
         ok = ok && KmonDriverNameStem(L"\\Driver\\Foo") == L"foo";
         ok = ok && KmonDriverNameStem(L"jrvwfjhdyprtjeaf.sys") == L"jrvwfjhdyprtjeaf";
     }
+
+    return ok;
+}
+
+namespace
+{
+    // Stage 1: kernel-thread hiding. Every offset comes from the PDB through
+    // SymbolEngine::FindField. A build whose field cannot be resolved makes the
+    // walk fail-closed instead of guessing an offset, because a wrong offset
+    // would turn every thread into an unbacked-start verdict.
+    constexpr uint64_t kThreadVaFloor = 0xFFFF800000000000ull;
+    constexpr size_t kMaxKernelProcesses = 4096;
+    constexpr size_t kMaxKernelThreads = 8192;
+    constexpr size_t kMaxThreadsPerProcess = 1024;
+    constexpr size_t kMaxHostThreads = 65536;
+    constexpr uint32_t kThreadEmitCap = 16;
+    constexpr uint32_t kThreadStrikeThreshold = 2;
+
+    bool KmonFindKernelFieldOffset(
+        SymbolEngine* symbols,
+        const wchar_t* typeName,
+        const wchar_t* fieldName,
+        uint32_t* offset)
+    {
+        if (symbols == nullptr || typeName == nullptr || fieldName == nullptr ||
+            offset == nullptr)
+        {
+            return false;
+        }
+        TypeFieldInfo field = {};
+        std::wstring ignored;
+        const std::wstring qualified = std::wstring(L"nt!") + typeName;
+        if (symbols->FindField(qualified, fieldName, &field, &ignored) ||
+            symbols->FindField(typeName, fieldName, &field, &ignored))
+        {
+            *offset = field.Offset;
+            return true;
+        }
+        return false;
+    }
+
+    struct KmonThreadModuleRange
+    {
+        uint64_t Base = 0;
+        uint64_t End = 0;
+    };
+
+    void KmonBuildThreadModuleRanges(
+        SymbolEngine* symbols,
+        std::vector<KmonThreadModuleRange>* ranges)
+    {
+        ranges->clear();
+        if (symbols == nullptr)
+        {
+            return;
+        }
+        const std::vector<KernelModuleInfo> modules = symbols->CopyModules();
+        for (const KernelModuleInfo& module : modules)
+        {
+            if (module.Base == 0 || module.Size == 0)
+            {
+                continue;
+            }
+            KmonThreadModuleRange range = {};
+            range.Base = module.Base;
+            range.End = module.Base + static_cast<uint64_t>(module.Size);
+            if (range.End <= range.Base)
+            {
+                continue;
+            }
+            ranges->push_back(range);
+        }
+    }
+
+    // A plain range scan: the module list is short and the walk only tests one
+    // address per thread, so the predictable shape is worth more than a binary
+    // search over ranges that may nest.
+    bool KmonThreadRangeCovers(
+        const std::vector<KmonThreadModuleRange>& ranges,
+        uint64_t address)
+    {
+        for (const KmonThreadModuleRange& range : ranges)
+        {
+            if (address >= range.Base && address < range.End)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Host thread view. The caller takes one snapshot before the kernel walk
+    // and one after: a thread created between the two only ever appears in the
+    // kernel list, so a single snapshot would report every new thread as
+    // hidden. Empty or capped snapshots are not a verdict input.
+    bool KmonCollectHostThreads(std::unordered_set<uint32_t>* out)
+    {
+        if (out == nullptr)
+        {
+            return false;
+        }
+        out->clear();
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        THREADENTRY32 entry = {};
+        entry.dwSize = sizeof(entry);
+        size_t count = 0;
+        bool truncated = false;
+        for (BOOL more = Thread32First(snapshot, &entry);
+             more != FALSE;
+             more = Thread32Next(snapshot, &entry))
+        {
+            out->insert(static_cast<uint32_t>(entry.th32ThreadID));
+            if (++count >= kMaxHostThreads)
+            {
+                truncated = true;
+                break;
+            }
+        }
+        CloseHandle(snapshot);
+        return !out->empty() && !truncated;
+    }
+}
+
+KmonKernelThreadKind KmonClassifyKernelThread(const KmonKernelThreadInput& input)
+{
+    // The unbacked start is the stronger claim and wins outright: a kernel-mode
+    // start address that no loaded image owns is a thread whose code the loader
+    // list cannot explain, and that verdict does not depend on either view
+    // being complete.
+    if (input.StartAddressKnown &&
+        input.StartIsKernelAddress &&
+        input.StartAddress != 0 &&
+        !input.StartInLoadedModule)
+    {
+        return KmonKernelThreadKind::UnbackedStart;
+    }
+    // A thread that is only missing from the host view needs both views to be
+    // definitive: a truncated kernel walk or a failed host snapshot cannot
+    // prove absence, so it stays a deferral rather than a verdict.
+    if (input.KernelListComplete &&
+        input.HostViewKnown &&
+        !input.HostViewHasThread)
+    {
+        return KmonKernelThreadKind::HiddenFromHostView;
+    }
+    return KmonKernelThreadKind::None;
+}
+
+const wchar_t* KmonKernelThreadKindName(KmonKernelThreadKind kind)
+{
+    switch (kind)
+    {
+    case KmonKernelThreadKind::UnbackedStart:
+        return L"unbacked_start";
+    case KmonKernelThreadKind::HiddenFromHostView:
+        return L"hidden_from_host_view";
+    case KmonKernelThreadKind::UnlinkedFromThreadList:
+        return L"unlinked_from_thread_list";
+    default:
+        return L"";
+    }
+}
+
+KmonKernelThreadKind KmonClassifyKernelThreadList(
+    const KmonKernelThreadListInput& input)
+{
+    // Both accounting reads have to exceed the walk. A single read would turn
+    // a thread that exits inside the walk window into an unlinked thread.
+    if (input.AccountingKnown &&
+        input.ListComplete &&
+        input.AccountingBefore > input.WalkedThreads &&
+        input.AccountingAfter > input.WalkedThreads)
+    {
+        return KmonKernelThreadKind::UnlinkedFromThreadList;
+    }
+    return KmonKernelThreadKind::None;
+}
+
+void KernelMonitor::ScanKernelThreads()
+{
+    ThreadScans.fetch_add(1);
+
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || symbols == nullptr || !device->IsOpen())
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:device",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan skipped; kernel device is not open",
+            L"Device is null or closed");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:thread:device");
+    if (!EnsureLoadedKernelModules(symbols, true))
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:inventory",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan skipped; kernel module inventory unavailable",
+            L"EnsureLoadedKernelModules returned false");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:thread:inventory");
+
+    uint32_t processLinksOffset = 0;
+    uint32_t pidOffset = 0;
+    uint32_t threadListOffset = 0;
+    uint32_t imageNameOffset = 0;
+    uint32_t threadEntryOffset = 0;
+    uint32_t cidOffset = 0;
+    uint32_t tcbOffset = 0;
+    uint32_t startOffset = 0;
+    const bool offsetsResolved =
+        KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"ActiveProcessLinks", &processLinksOffset) &&
+        KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"UniqueProcessId", &pidOffset) &&
+        KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"ThreadListHead", &threadListOffset) &&
+        KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"ThreadListEntry", &threadEntryOffset) &&
+        KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"Cid", &cidOffset) &&
+        KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"Tcb", &tcbOffset) &&
+        KmonFindKernelFieldOffset(symbols, L"_KTHREAD", L"StartAddress", &startOffset);
+    if (!offsetsResolved)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:offsets",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan skipped; _EPROCESS/_ETHREAD/_KTHREAD field offsets were not resolvable",
+            L"SymbolEngine::FindField could not resolve the thread walk fields");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:thread:offsets");
+    const bool hasImageName = KmonFindKernelFieldOffset(
+        symbols,
+        L"_EPROCESS",
+        L"ImageFileName",
+        &imageNameOffset);
+
+    // Stage 1b: the ETHREAD-list DKOM half needs the kernel's own thread
+    // accounting. It stays a separate deferral, so a build without the field
+    // keeps the list-versus-host-view half alive instead of dropping the
+    // whole layer.
+    uint32_t activeThreadsOffset = 0;
+    const bool hasThreadAccounting =
+        KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"ActiveThreads", &activeThreadsOffset) ||
+        KmonFindKernelFieldOffset(symbols, L"_KPROCESS", L"ActiveThreads", &activeThreadsOffset);
+    if (!hasThreadAccounting)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:counts",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan has no ActiveThreads offset; the ETHREAD list DKOM verdict is withheld",
+            L"_EPROCESS.ActiveThreads and _KPROCESS.ActiveThreads were not resolvable");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:thread:counts");
+    }
+
+    std::unordered_set<uint32_t> hostBefore;
+    const bool hostBeforeKnown = KmonCollectHostThreads(&hostBefore);
+
+    uint64_t head = 0;
+    std::wstring ignored;
+    if (!symbols->ResolveSymbol(L"nt!PsActiveProcessHead", &head, &ignored) ||
+        head < kThreadVaFloor)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:list",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan skipped; nt!PsActiveProcessHead was not resolvable",
+            L"ResolveSymbol returned no kernel address");
+        return;
+    }
+
+    uint64_t firstProcess = 0;
+    if (!KmonReadKernelU64(device, head, &firstProcess) ||
+        firstProcess < kThreadVaFloor)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:list",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan skipped; the process list head was not readable",
+            L"the first ActiveProcessLinks entry was not a kernel address");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:thread:list");
+
+    std::vector<KmonThreadModuleRange> ranges;
+    KmonBuildThreadModuleRanges(symbols, &ranges);
+    if (ranges.empty())
+    {
+        // An empty inventory must not mark every kernel thread as unbacked;
+        // this is the same rule AddressOwnedByLoadedModule follows for
+        // pointers, and it keeps a failed solve a deferral, not a verdict.
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:modules",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan skipped; no kernel module range with a known size was available",
+            L"SymbolEngine::CopyModules returned no sized module");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:thread:modules");
+
+    std::vector<KmonKernelThreadInput> collected;
+    collected.reserve(1024);
+    std::set<uint32_t> dkomCandidates;
+    std::vector<KmonKernelThreadListInput> dkomVerdicts;
+    std::set<uint64_t> visitedProcesses;
+    std::set<uint64_t> visitedThreads;
+    uint64_t link = firstProcess;
+    bool walkComplete = true;
+    while (link != head)
+    {
+        if (link < kThreadVaFloor ||
+            visitedProcesses.size() >= kMaxKernelProcesses ||
+            visitedProcesses.count(link) != 0)
+        {
+            walkComplete = false;
+            break;
+        }
+        visitedProcesses.insert(link);
+        const uint64_t process = link - processLinksOffset;
+
+        uint64_t pidValue = 0;
+        if (!KmonReadKernelU64(device, process + pidOffset, &pidValue))
+        {
+            walkComplete = false;
+            break;
+        }
+        const uint32_t pid = static_cast<uint32_t>(pidValue & 0xFFFFFFFFu);
+
+        std::wstring image;
+        if (hasImageName)
+        {
+            std::vector<uint8_t> nameBytes;
+            if (KmonReadKernelBytes(device, process + imageNameOffset, 15, &nameBytes) &&
+                !nameBytes.empty())
+            {
+                std::string narrow(
+                    reinterpret_cast<const char*>(nameBytes.data()),
+                    nameBytes.size());
+                const size_t nul = narrow.find('\0');
+                if (nul != std::string::npos)
+                {
+                    narrow.resize(nul);
+                }
+                if (!narrow.empty())
+                {
+                    image = KmonBasenameLower(
+                        std::wstring(narrow.begin(), narrow.end()));
+                }
+            }
+        }
+
+        const uint64_t threadHead = process + threadListOffset;
+        uint64_t threadFirst = 0;
+        if (!KmonReadKernelU64(device, threadHead, &threadFirst))
+        {
+            walkComplete = false;
+            break;
+        }
+        uint64_t accountingBefore = 0;
+        bool accountingKnown = false;
+        if (hasThreadAccounting)
+        {
+            uint64_t rawAccounting = 0;
+            if (KmonReadKernelU64(
+                    device,
+                    process + activeThreadsOffset,
+                    &rawAccounting))
+            {
+                accountingBefore = rawAccounting & 0xFFFFFFFFu;
+                accountingKnown = true;
+            }
+        }
+        uint64_t threadLink = threadFirst;
+        size_t perProcess = 0;
+        size_t walkedThreads = 0;
+        while (threadLink != threadHead)
+        {
+            if (threadLink < kThreadVaFloor ||
+                visitedThreads.size() >= kMaxKernelThreads ||
+                perProcess >= kMaxThreadsPerProcess ||
+                visitedThreads.count(threadLink) != 0)
+            {
+                walkComplete = false;
+                break;
+            }
+            visitedThreads.insert(threadLink);
+            ++perProcess;
+            // Counted before the tid filter, so the number stays comparable
+            // with the kernel accounting, which counts the idle thread too.
+            ++walkedThreads;
+
+            const uint64_t thread = threadLink - threadEntryOffset;
+            uint64_t tidValue = 0;
+            uint64_t startAddress = 0;
+            if (!KmonReadKernelU64(device, thread + cidOffset + 8, &tidValue))
+            {
+                walkComplete = false;
+                break;
+            }
+            const bool startKnown = KmonReadKernelU64(
+                device,
+                thread + tcbOffset + startOffset,
+                &startAddress);
+
+            KmonKernelThreadInput input = {};
+            input.ProcessId = pid;
+            input.ThreadId = static_cast<uint32_t>(tidValue & 0xFFFFFFFFu);
+            input.StartAddress = startKnown ? startAddress : 0;
+            input.StartAddressKnown = startKnown;
+            input.StartIsKernelAddress = startKnown && startAddress >= kThreadVaFloor;
+            input.StartInLoadedModule = startKnown &&
+                KmonThreadRangeCovers(ranges, startAddress);
+            input.Image = image;
+            // The host half is decided after the walk, so both snapshots can
+            // bound the window the kernel list was read in.
+            input.KernelListComplete = false;
+            input.HostViewKnown = false;
+            input.HostViewHasThread = false;
+            if (input.ThreadId != 0)
+            {
+                collected.push_back(input);
+            }
+
+            uint64_t nextThread = 0;
+            if (!KmonReadKernelU64(device, threadLink, &nextThread) ||
+                nextThread < kThreadVaFloor)
+            {
+                walkComplete = false;
+                break;
+            }
+            threadLink = nextThread;
+        }
+
+        if (!walkComplete)
+        {
+            break;
+        }
+
+        // Stage 1b: this process thread list was walked to its head, so a
+        // short list against the kernel accounting is an unlinked thread.
+        if (accountingKnown)
+        {
+            uint64_t rawAccounting = 0;
+            const bool accountingAfterKnown = KmonReadKernelU64(
+                device,
+                process + activeThreadsOffset,
+                &rawAccounting);
+            KmonKernelThreadListInput listInput = {};
+            listInput.ProcessId = pid;
+            listInput.WalkedThreads = static_cast<uint32_t>(walkedThreads);
+            listInput.AccountingBefore = static_cast<uint32_t>(accountingBefore);
+            listInput.AccountingAfter = accountingAfterKnown
+                ? static_cast<uint32_t>(rawAccounting & 0xFFFFFFFFu)
+                : 0;
+            listInput.AccountingKnown = accountingAfterKnown;
+            listInput.ListComplete = true;
+            if (KmonClassifyKernelThreadList(listInput) ==
+                KmonKernelThreadKind::UnlinkedFromThreadList)
+            {
+                dkomCandidates.insert(pid);
+                dkomVerdicts.push_back(listInput);
+            }
+        }
+
+        uint64_t nextProcess = 0;
+        if (!KmonReadKernelU64(device, link, &nextProcess) ||
+            nextProcess < kThreadVaFloor)
+        {
+            walkComplete = false;
+            break;
+        }
+        link = nextProcess;
+    }
+
+    std::unordered_set<uint32_t> hostAfter;
+    const bool hostAfterKnown = KmonCollectHostThreads(&hostAfter);
+    const bool hostViewKnown = hostBeforeKnown && hostAfterKnown;
+
+    uint32_t emitted = 0;
+    bool capped = false;
+    std::set<uint32_t> hiddenCandidates;
+    for (const KmonKernelThreadInput& raw : collected)
+    {
+        KmonKernelThreadInput input = raw;
+        input.KernelListComplete = walkComplete;
+        input.HostViewKnown = hostViewKnown;
+        input.HostViewHasThread =
+            raw.ThreadId != 0 &&
+            (hostBefore.count(raw.ThreadId) != 0 || hostAfter.count(raw.ThreadId) != 0);
+
+        const KmonKernelThreadKind kind = KmonClassifyKernelThread(input);
+        if (kind == KmonKernelThreadKind::None)
+        {
+            continue;
+        }
+        if (kind == KmonKernelThreadKind::HiddenFromHostView)
+        {
+            hiddenCandidates.insert(input.ThreadId);
+            uint32_t strikes = 0;
+            {
+                std::lock_guard<std::mutex> lock(WatchMutex);
+                if (ThreadHiddenStrikes.size() > 4096)
+                {
+                    ThreadHiddenStrikes.clear();
+                }
+                strikes = ++ThreadHiddenStrikes[input.ThreadId];
+            }
+            if (strikes < kThreadStrikeThreshold)
+            {
+                continue;
+            }
+        }
+        if (emitted >= kThreadEmitCap)
+        {
+            capped = true;
+            continue;
+        }
+
+        const std::wstring pidText = std::to_wstring(input.ProcessId);
+        const std::wstring tidText = std::to_wstring(input.ThreadId);
+        const std::wstring driver = !input.Image.empty()
+            ? input.Image
+            : (input.ProcessId == 4 || input.ProcessId == 0
+                ? std::wstring(L"system")
+                : std::wstring());
+        std::wstring summary;
+        std::wstring notes;
+        std::wstring layer;
+        if (kind == KmonKernelThreadKind::UnbackedStart)
+        {
+            layer = L"thread_list";
+            summary = L"kernel thread tid=" + tidText + L" pid=" + pidText +
+                L" start=" + HexU64(input.StartAddress) +
+                L" is outside every loaded kernel module";
+            notes = L"start=" + HexU64(input.StartAddress);
+        }
+        else
+        {
+            layer = L"thread_view";
+            summary = L"kernel thread tid=" + tidText + L" pid=" + pidText +
+                L" is in the kernel thread list but no host view reports it";
+            notes = L"host_view=toolhelp strikes=" +
+                std::to_wstring(kThreadStrikeThreshold);
+        }
+        if (!input.Image.empty())
+        {
+            notes += L" owner=" + input.Image;
+        }
+
+        const std::wstring key = std::wstring(L"thread:") +
+            KmonKernelThreadKindName(kind) + L":" + pidText + L":" + tidText;
+        EmitUnique(
+            kind == KmonKernelThreadKind::UnbackedStart
+                ? L"thread.unbacked"
+                : L"thread.hidden",
+            key,
+            driver,
+            layer,
+            summary,
+            notes,
+            input.ProcessId);
+        emitted += 1;
+    }
+
+    for (const KmonKernelThreadListInput& raw : dkomVerdicts)
+    {
+        uint32_t strikes = 0;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            if (ThreadListDkomStrikes.size() > 4096)
+            {
+                ThreadListDkomStrikes.clear();
+            }
+            strikes = ++ThreadListDkomStrikes[raw.ProcessId];
+        }
+        if (strikes < kThreadStrikeThreshold)
+        {
+            continue;
+        }
+        if (emitted >= kThreadEmitCap)
+        {
+            capped = true;
+            continue;
+        }
+
+        const std::wstring pidText = std::to_wstring(raw.ProcessId);
+        EmitUnique(
+            L"thread.dkom",
+            std::wstring(L"thread:unlinked_from_thread_list:") + pidText,
+            std::wstring(),
+            L"thread_list",
+            L"process pid=" + pidText + L" accounts for " +
+                std::to_wstring(raw.AccountingBefore) +
+                L" threads but only " + std::to_wstring(raw.WalkedThreads) +
+                L" ThreadListHead entries were reachable",
+            L"walked=" + std::to_wstring(raw.WalkedThreads) +
+                L" accounted_before=" + std::to_wstring(raw.AccountingBefore) +
+                L" accounted_after=" + std::to_wstring(raw.AccountingAfter),
+            raw.ProcessId);
+        emitted += 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        for (auto it = ThreadHiddenStrikes.begin();
+             it != ThreadHiddenStrikes.end();)
+        {
+            if (hiddenCandidates.count(it->first) == 0)
+            {
+                it = ThreadHiddenStrikes.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        for (auto it = ThreadListDkomStrikes.begin();
+             it != ThreadListDkomStrikes.end();)
+        {
+            if (dkomCandidates.count(it->first) == 0)
+            {
+                it = ThreadListDkomStrikes.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    if (capped)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"reportcap:thread",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan capped at " + std::to_wstring(kThreadEmitCap) +
+                L" findings; more hidden threads or thread-list divergences exist in this pass",
+            L"reattach after the mapper watch window or raise the pass budget");
+    }
+    else
+    {
+        ClearEmittedKey(L"reportcap:thread");
+    }
+
+    if (!walkComplete)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:truncated",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread walk was truncated; the hidden-thread verdict is withheld",
+            L"a cap, a cycle, or an unreadable link ended the walk");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:thread:truncated");
+    }
+}
+
+bool KernelMonitorThreadSelfTest()
+{
+    bool ok = false;
+
+    do
+    {
+        KmonKernelThreadInput normal = {};
+        normal.ProcessId = 4;
+        normal.ThreadId = 0x1234;
+        normal.StartAddress = 0xFFFFF80212345678ull;
+        normal.StartAddressKnown = true;
+        normal.StartIsKernelAddress = true;
+        normal.StartInLoadedModule = true;
+        normal.KernelListComplete = true;
+        normal.HostViewKnown = true;
+        normal.HostViewHasThread = true;
+        normal.Image = L"ntoskrnl.exe";
+        if (KmonClassifyKernelThread(normal) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // A kernel start address outside every loaded module is the mapper
+        // signature, and it is reported even when both views are incomplete.
+        KmonKernelThreadInput unbacked = normal;
+        unbacked.StartInLoadedModule = false;
+        unbacked.KernelListComplete = false;
+        unbacked.HostViewKnown = false;
+        unbacked.HostViewHasThread = false;
+        if (KmonClassifyKernelThread(unbacked) != KmonKernelThreadKind::UnbackedStart)
+        {
+            break;
+        }
+
+        // A user-mode start address is never the unbacked kernel-thread verdict.
+        KmonKernelThreadInput userStart = normal;
+        userStart.StartAddress = 0x00007FF600001000ull;
+        userStart.StartIsKernelAddress = false;
+        userStart.StartInLoadedModule = false;
+        if (KmonClassifyKernelThread(userStart) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // Present in the kernel list, absent from both host snapshots.
+        KmonKernelThreadInput hidden = normal;
+        hidden.HostViewHasThread = false;
+        if (KmonClassifyKernelThread(hidden) != KmonKernelThreadKind::HiddenFromHostView)
+        {
+            break;
+        }
+
+        // An unresolved start address cannot become an unbacked start, but the
+        // missing-thread verdict still stands while both views are definitive.
+        KmonKernelThreadInput unknownStart = hidden;
+        unknownStart.StartAddressKnown = false;
+        unknownStart.StartIsKernelAddress = false;
+        unknownStart.StartAddress = 0;
+        if (KmonClassifyKernelThread(unknownStart) != KmonKernelThreadKind::HiddenFromHostView)
+        {
+            break;
+        }
+
+        // Fail-closed: a failed host view withholds the missing-thread verdict.
+        KmonKernelThreadInput noHostView = hidden;
+        noHostView.HostViewKnown = false;
+        if (KmonClassifyKernelThread(noHostView) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // Fail-closed: a truncated kernel walk withholds it as well.
+        KmonKernelThreadInput truncated = hidden;
+        truncated.KernelListComplete = false;
+        if (KmonClassifyKernelThread(truncated) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // The idle process has a known zero start address; a zero is absence of
+        // evidence, not code outside the loader list.
+        KmonKernelThreadInput idle = normal;
+        idle.ProcessId = 0;
+        idle.StartAddress = 0;
+        idle.StartInLoadedModule = false;
+        if (KmonClassifyKernelThread(idle) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // Stage 1b: the kernel accounting is larger than the walked list in
+        // both reads, so threads were unlinked from the list while running.
+        KmonKernelThreadListInput dkom = {};
+        dkom.ProcessId = 4;
+        dkom.WalkedThreads = 3;
+        dkom.AccountingBefore = 5;
+        dkom.AccountingAfter = 5;
+        dkom.AccountingKnown = true;
+        dkom.ListComplete = true;
+        if (KmonClassifyKernelThreadList(dkom) != KmonKernelThreadKind::UnlinkedFromThreadList)
+        {
+            break;
+        }
+
+        // A matching count is the ordinary case.
+        KmonKernelThreadListInput balanced = dkom;
+        balanced.AccountingBefore = 3;
+        balanced.AccountingAfter = 3;
+        if (KmonClassifyKernelThreadList(balanced) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // A later read that matches the walk means the difference was a
+        // thread that exited inside the window, not an unlinked thread.
+        KmonKernelThreadListInput exited = dkom;
+        exited.AccountingAfter = 3;
+        if (KmonClassifyKernelThreadList(exited) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // Fail-closed: an unresolved accounting field and a truncated walk
+        // both withhold the verdict instead of guessing.
+        KmonKernelThreadListInput unknownAccounting = dkom;
+        unknownAccounting.AccountingKnown = false;
+        if (KmonClassifyKernelThreadList(unknownAccounting) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+        KmonKernelThreadListInput truncatedList = dkom;
+        truncatedList.ListComplete = false;
+        if (KmonClassifyKernelThreadList(truncatedList) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+
+        // A process whose whole thread list is unlinked walks zero entries.
+        KmonKernelThreadListInput allUnlinked = dkom;
+        allUnlinked.WalkedThreads = 0;
+        if (KmonClassifyKernelThreadList(allUnlinked) != KmonKernelThreadKind::UnlinkedFromThreadList)
+        {
+            break;
+        }
+
+        if (KmonKernelThreadKindName(KmonKernelThreadKind::None)[0] != L'\0' ||
+            std::wstring(KmonKernelThreadKindName(KmonKernelThreadKind::UnbackedStart)) !=
+                L"unbacked_start" ||
+            std::wstring(KmonKernelThreadKindName(KmonKernelThreadKind::HiddenFromHostView)) !=
+                L"hidden_from_host_view" ||
+            std::wstring(KmonKernelThreadKindName(KmonKernelThreadKind::UnlinkedFromThreadList)) !=
+                L"unlinked_from_thread_list")
+        {
+            break;
+        }
+
+        ok = true;
+    } while (false);
 
     return ok;
 }
