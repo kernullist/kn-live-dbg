@@ -8873,6 +8873,11 @@ void KernelMonitor::NoteDriverLoad(const KmonEvent& event)
 {
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
+        const std::wstring stem = KmonDriverNameStem(event.Driver.empty() ? event.Image : event.Driver);
+        // The previous instance is invalid even when the new image cannot be read.
+        DriverTamperBaselines.erase(stem);
+        DriverTamperStrikes.erase(stem);
+        DriverTamperLastCheckMs.erase(stem);
         RecentDriverLoad load = {};
         load.Base = KmonBasenameLower(event.Driver);
         load.Path = event.Driver;

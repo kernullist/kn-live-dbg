@@ -877,6 +877,29 @@ bool KmonPipelineSelfTest()
                 std::fprintf(stderr, "FAIL kmon event evidence classification\n");
             }
             ok = claims && ok;
+            for (bool knownRange : {false, true})
+            {
+                KmonEvent load;
+                load.Kind = L"driver.official_load";
+                load.Driver = L"review-baseline.sys";
+                if (knownRange)
+                {
+                    load.Evidence[L"image_base"] = L"0xfffff80000100000";
+                    load.Evidence[L"image_size"] = L"0x4000";
+                }
+                const std::wstring stem = KmonDriverNameStem(load.Driver);
+                monitor.DriverTamperBaselines[stem].HasImage = true;
+                monitor.DriverTamperStrikes[stem].Image.Observe(L"old-image", 1, 10);
+                monitor.DriverTamperLastCheckMs[stem] = 1;
+                monitor.NoteDriverLoad(load);
+                const bool reset = monitor.DriverTamperBaselines.count(stem) == 0 &&
+                    monitor.DriverTamperStrikes.count(stem) == 0 && monitor.DriverTamperLastCheckMs.count(stem) == 0;
+                if (!reset)
+                {
+                    std::fprintf(stderr, "[kmon.review] FAIL load with unavailable baseline resets prior instance\n");
+                }
+                ok = reset && ok;
+            }
         } while (false);
     }
     catch (...)

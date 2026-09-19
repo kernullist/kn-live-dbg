@@ -600,7 +600,8 @@ void KernelMonitor::ScanExecutionReferences()
                     PhysicalTranslationInfo mapping = {};
                     if (UnexpectedExecutableImageAddress(image->Reference, address - module.Base) && executableMapping(address, &mapping))
                     {
-                        return CodeOwnership::OwnedUnexpectedExecutable;
+                        return QualifyExecutableReference(image->Reference, module.Base, reader, nullptr)
+                            ? CodeOwnership::OwnedUnexpectedExecutable : CodeOwnership::OwnedUnverified;
                     }
                     bool reusedCapture = false;
                     const ObservationReader captured = [&](uint64_t at, size_t count, std::vector<uint8_t>* out)
@@ -615,8 +616,7 @@ void KernelMonitor::ScanExecutionReferences()
                     };
                     const auto result = CompareExecutableRange(path, image->Reference, module.Base,
                         static_cast<uint32_t>(address - module.Base), static_cast<uint32_t>(bytes.size()), captured);
-                    return result.Ownership == CodeOwnership::OwnedModified &&
-                        !QualifyExecutableReference(image->Reference, module.Base, reader, nullptr)
+                    return !QualifyExecutableReference(image->Reference, module.Base, reader, nullptr)
                         ? CodeOwnership::OwnedUnverified : result.Ownership;
                 }
             }
