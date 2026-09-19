@@ -55,6 +55,7 @@ struct CodeTargetChain
 };
 
 using CodeTargetInspector = std::function<CodeOwnership(uint64_t, const std::vector<uint8_t>&)>;
+bool CodeTargetSlotMatches(uint64_t address, uint64_t slot, const ObservationReader& reader);
 CodeTargetChain ResolveCodeTarget(uint64_t address, const ObservationReader& reader,
     const CodeTargetInspector& inspect, size_t depthLimit = 8);
 CodeTargetChain ResolveReferencedCodeTarget(uint64_t address, uint64_t slot,

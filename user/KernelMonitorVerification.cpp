@@ -522,9 +522,12 @@ void KernelMonitor::ScanExecutionReferences()
             continue;
         }
         bool physicalPageRead = false;
-        const ObservationReader reader = [device, process, &work, &executableMapping, &physicalPageRead]
+        uint64_t lastReadPhysical = 0;
+        uint64_t pageHeadPhysical = 0;
+        const ObservationReader reader = [device, process, &work, &executableMapping, &physicalPageRead, &lastReadPhysical]
             (uint64_t address, size_t size, std::vector<uint8_t>* bytes)
         {
+            lastReadPhysical = 0;
             if (size > 4096 || address > UINT64_MAX - size)
             {
                 return false;
@@ -536,6 +539,7 @@ void KernelMonitor::ScanExecutionReferences()
                     device->ReadPhysical(mapping.PhysicalAddress, 4096, bytes, nullptr) && bytes->size() == 4096)
                 {
                     physicalPageRead = true;
+                    lastReadPhysical = mapping.PhysicalAddress;
                     return true;
                 }
             }
@@ -609,6 +613,7 @@ void KernelMonitor::ScanExecutionReferences()
             hop.Address = work.Target & ~4095ull;
             if (reader(hop.Address, 4096, &hop.Bytes) && hop.Bytes.size() == 4096)
             {
+                pageHeadPhysical = lastReadPhysical;
                 hop.Ownership = inspect(hop.Address, hop.Bytes);
                 chain.HasModifiedCode = hop.Ownership == CodeOwnership::OwnedModified;
                 chain.HasUnownedExecutable = hop.Ownership == CodeOwnership::UnownedExecutable;
@@ -656,16 +661,11 @@ void KernelMonitor::ScanExecutionReferences()
         event.Evidence[L"path_read_at"] = std::to_wstring(ObservationFileTime());
         size_t captures = 0;
         size_t acceptedReferences = 0;
+        bool referenceSnapshotValid = !chain.ReferenceChecked || chain.ReferenceStable;
+        std::vector<std::pair<size_t, KmonHuntReference>> pendingReferences;
         for (size_t i = 0; i < chain.Hops.size(); ++i)
         {
             const auto& hop = chain.Hops[i];
-            ExecutableRegionLink link;
-            if ((!chain.ReferenceChecked || chain.ReferenceStable) &&
-                RegionCatalog.LinkAddress(work.Identity, work.Slot, hop.Address, work.Role, GetTickCount64(), &link,
-                    chain.ReferenceStable ? GetTickCount64() : work.ObservedMs))
-            {
-                event.Evidence[L"hop_" + std::to_wstring(i) + L"_generation"] = std::to_wstring(link.ToGeneration);
-            }
             const std::wstring key = L"hop_" + std::to_wstring(i) + L"_";
             event.Evidence[key + L"address"] = std::to_wstring(hop.Address);
             event.Evidence[key + L"target"] = std::to_wstring(hop.Target);
@@ -693,9 +693,11 @@ void KernelMonitor::ScanExecutionReferences()
                 PhysicalTranslationInfo beforeMapping = {};
                 const bool executableBefore = executableMapping(base, &beforeMapping);
                 std::vector<uint8_t> page;
+                uint64_t capturePhysical = 0;
                 bool comparable = false;
                 if (captures < 2 && reader(base, 4096, &page) && page.size() == 4096)
                 {
+                    capturePhysical = lastReadPhysical;
                     ++captures;
                     const size_t offset = static_cast<size_t>(hop.Address - base);
                     comparable = hop.Bytes.size() <= page.size() - offset &&
@@ -713,12 +715,14 @@ void KernelMonitor::ScanExecutionReferences()
                     }
                     if (!reference.SlotStable)
                     {
+                        referenceSnapshotValid = false;
                         event.Evidence[L"capture_reference_consistency"] = L"changed_or_unreadable";
                         continue;
                     }
                 }
                 if (!sameProcess())
                 {
+                    referenceSnapshotValid = false;
                     continue;
                 }
                 if (pid != 0 && addressSpaceValid)
@@ -728,6 +732,7 @@ void KernelMonitor::ScanExecutionReferences()
                         current.Eprocess != addressSpace.Eprocess ||
                         current.DirectoryTableBase != addressSpace.DirectoryTableBase)
                     {
+                        referenceSnapshotValid = false;
                         event.Evidence[key + L"page_mapping"] = L"address_space_changed_or_unavailable";
                         continue;
                     }
@@ -746,15 +751,14 @@ void KernelMonitor::ScanExecutionReferences()
                     event.Evidence[key + L"page_mapping"] = L"page_bytes_changed_or_unreadable";
                     continue;
                 }
+                if (!KmonPhysicalPageSamplesAgree({candidateMapping.PhysicalAddress, pageHeadPhysical,
+                    beforeMapping.PhysicalAddress, capturePhysical, afterMapping.PhysicalAddress}))
+                {
+                    event.Evidence[key + L"page_mapping"] = L"physical_page_changed";
+                    continue;
+                }
                 if (beforeMapping.PhysicalAddress != 0 && afterMapping.PhysicalAddress != 0)
                 {
-                    if ((beforeMapping.PhysicalAddress >> 12) != (afterMapping.PhysicalAddress >> 12) ||
-                        (KmonPageRole(work.Role) && candidateMapping.PhysicalAddress != 0 &&
-                            (candidateMapping.PhysicalAddress >> 12) != (afterMapping.PhysicalAddress >> 12)))
-                    {
-                        event.Evidence[key + L"page_mapping"] = L"physical_page_changed";
-                        continue;
-                    }
                     reference.Context.PfnKnown = executableBefore && executableAfter;
                     reference.Context.Pfn = afterMapping.PhysicalAddress >> 12;
                 }
@@ -781,18 +785,45 @@ void KernelMonitor::ScanExecutionReferences()
                     event.Evidence[key + L"capture_id"] = std::to_wstring(
                         QueueCapturedBytes(L"hunt_reference", base, reference.Context, page));
                 }
+                pendingReferences.emplace_back(i, std::move(reference));
+            }
+        }
+        referenceSnapshotValid = referenceSnapshotValid && sameProcess() &&
+            (!pointerSlot || CodeTargetSlotMatches(work.Target, work.Slot, reader));
+        if (referenceSnapshotValid && pid != 0 && addressSpaceValid)
+        {
+            ProcessAddressContext current = {};
+            referenceSnapshotValid = ResolveHuntAddressSpace(*device, *symbols, work.Identity, &current) &&
+                current.Eprocess == addressSpace.Eprocess && current.DirectoryTableBase == addressSpace.DirectoryTableBase;
+        }
+        if (referenceSnapshotValid)
+        {
+            for (size_t i = 0; i < chain.Hops.size(); ++i)
+            {
+                ExecutableRegionLink link;
+                if (RegionCatalog.LinkAddress(work.Identity, work.Slot, chain.Hops[i].Address, work.Role, GetTickCount64(), &link,
+                    chain.ReferenceStable ? GetTickCount64() : work.ObservedMs))
                 {
-                    std::lock_guard<std::mutex> lock(HuntMutex);
-                    reference.Id = HuntIndex.Observe(reference);
+                    event.Evidence[L"hop_" + std::to_wstring(i) + L"_generation"] = std::to_wstring(link.ToGeneration);
                 }
+            }
+            std::lock_guard<std::mutex> lock(HuntMutex);
+            for (auto& pending : pendingReferences)
+            {
+                auto& reference = pending.second;
+                reference.Id = HuntIndex.Observe(reference);
                 if (reference.Id != 0)
                 {
                     ++acceptedReferences;
-                    event.Evidence[key + L"hunt_reference"] = KmonHuntReferenceJson(reference);
+                    event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_hunt_reference"] = KmonHuntReferenceJson(reference);
                 }
             }
         }
-        if (KmonPageRole(work.Role) && acceptedReferences == 0)
+        else
+        {
+            event.Evidence[L"capture_reference_consistency"] = L"changed_or_unreadable; path_references_withheld";
+        }
+        if (!referenceSnapshotValid || (KmonPageRole(work.Role) && acceptedReferences == 0))
         {
             event.Kind = L"coverage.execution_path";
         }

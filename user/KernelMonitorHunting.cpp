@@ -67,6 +67,7 @@ void KernelMonitor::ScanExecutablePageCandidates()
         event.Evidence[L"ranges_evicted"] = std::to_wstring(ExecutablePages.Evicted);
         event.Evidence[L"ranges_expired"] = std::to_wstring(ExecutablePages.Expired);
         event.Evidence[L"ranges_rejected"] = std::to_wstring(ExecutablePages.Rejected);
+        event.Evidence[L"ranges_deferred"] = std::to_wstring(ExecutablePages.Deferred);
         event.Evidence[L"reference_backpressure"] = ExecutionReferences.size() >= 64 ? L"true" : L"false";
         RecordEvent(std::move(event));
     }

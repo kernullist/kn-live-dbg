@@ -2,12 +2,32 @@
 
 #include "ObservationModel.h"
 #include <algorithm>
+#include <initializer_list>
+#include <tuple>
 #include <vector>
 
 inline bool KmonPageRole(const std::wstring& role)
 {
     return role == L"kernel_page_candidate" || role == L"user_page_candidate" ||
         role == L"user_hidden_pte_page" || role == L"image_page_candidate";
+}
+
+inline bool KmonPhysicalPageSamplesAgree(std::initializer_list<uint64_t> physicalAddresses)
+{
+    uint64_t known = 0;
+    for (const auto address : physicalAddresses)
+    {
+        if (address == 0)
+        {
+            continue;
+        }
+        if (known != 0 && (known >> 12) != (address >> 12))
+        {
+            return false;
+        }
+        known = address;
+    }
+    return true;
 }
 
 inline bool KmonHardwareExecutable(uint64_t pml5e, uint64_t pml4e, uint64_t pdpte,
@@ -17,14 +37,15 @@ inline bool KmonHardwareExecutable(uint64_t pml5e, uint64_t pml4e, uint64_t pdpt
     {
         return (entry & 1) != 0 && (entry >> 63) == 0 && (!user || (entry & 4) != 0);
     };
-    if ((levels != 4 && levels != 5) || (levels == 5 && !valid(pml5e)) ||
-        !valid(pml4e) || !valid(pdpte))
+    if ((levels != 4 && levels != 5) ||
+        (levels == 5 && (!valid(pml5e) || (pml5e & 0x80) != 0)) ||
+        !valid(pml4e) || (pml4e & 0x80) != 0 || !valid(pdpte))
     {
         return false;
     }
     if ((pdpte & 0x80) != 0)
     {
-        return pageSize == (1ull << 30);
+        return pageSize == (1ull << 30) && (pdpte & 0x3FFFE000ull) == 0;
     }
     if (!valid(pde))
     {
@@ -32,7 +53,7 @@ inline bool KmonHardwareExecutable(uint64_t pml5e, uint64_t pml4e, uint64_t pdpt
     }
     if ((pde & 0x80) != 0)
     {
-        return pageSize == (1ull << 21);
+        return pageSize == (1ull << 21) && (pde & 0x1FE000ull) == 0;
     }
     return pageSize == 4096 && valid(pte);
 }
@@ -80,11 +101,11 @@ public:
             }
         }
         LastMs = now;
-        Work.erase(std::remove_if(Work.begin(), Work.end(), [&](const auto& old)
+        RemoveIf([&](const auto& old)
         {
             return old.Identity.BootId != identity.BootId ||
                 (old.Identity.ProcessId == identity.ProcessId && old.Identity.CreateTime != identity.CreateTime);
-        }), Work.end());
+        });
         Expire(now);
         for (auto& old : Work)
         {
@@ -103,20 +124,30 @@ public:
         }
         if (Work.size() == Capacity)
         {
-            const auto victim = std::min_element(Work.begin(), Work.end(), [](const auto& a, const auto& b)
+            const AdmissionView incoming = {identity.ProcessId, identity.CreateTime, range.Address, role};
+            auto victim = Work.end();
+            for (auto row = Work.begin(); row != Work.end(); ++row)
             {
-                if ((a.Role == L"image_page_candidate") != (b.Role == L"image_page_candidate"))
+                const bool lowerPriority = row->Role == L"image_page_candidate" && role != L"image_page_candidate";
+                if ((!lowerPriority && (row->NextOffset != 0 || !PreferAdmission(incoming, Key(*row)))) ||
+                    (role == L"image_page_candidate" && row->Role != L"image_page_candidate"))
                 {
-                    return a.Role == L"image_page_candidate";
+                    continue;
                 }
-                return a.LastSeenMs < b.LastSeenMs;
-            });
-            if (role == L"image_page_candidate" && victim->Role != L"image_page_candidate")
+                if (victim == Work.end() ||
+                    (row->Role == L"image_page_candidate" && victim->Role != L"image_page_candidate") ||
+                    ((row->Role == L"image_page_candidate") == (victim->Role == L"image_page_candidate") &&
+                        PreferAdmission(Key(*victim), Key(*row))))
+                {
+                    victim = row;
+                }
+            }
+            if (victim == Work.end())
             {
-                ++Rejected;
+                ++Deferred;
                 return false;
             }
-            Work.erase(victim);
+            Erase(victim);
             ++Evicted;
         }
         Work.push_back({identity, range, allocation, 0, now, 0, role});
@@ -146,6 +177,8 @@ public:
             {
                 row.NextOffset = 0;
                 row.EligibleMs = now <= UINT64_MAX - 10000 ? now + 10000 : UINT64_MAX;
+                AdmissionAfter = Key(row);
+                AdmissionKnown = true;
                 ++CyclesScheduled;
             }
             ++PagesScheduled;
@@ -164,20 +197,67 @@ public:
     uint64_t Evicted = 0;
     uint64_t Expired = 0;
     uint64_t Rejected = 0;
+    uint64_t Deferred = 0;
 
 private:
+    using AdmissionKey = std::tuple<uint32_t, uint64_t, uint64_t, std::wstring>;
+    using AdmissionView = std::tuple<const uint32_t&, const uint64_t&, const uint64_t&, const std::wstring&>;
+
+    static AdmissionView Key(const KmonPageWork& row)
+    {
+        return {row.Identity.ProcessId, row.Identity.CreateTime, row.Range.Address, row.Role};
+    }
+
+    bool PreferAdmission(const AdmissionView& candidate, const AdmissionView& current) const
+    {
+        // Rotate after a completed range. Inventory order cannot always favor
+        // the first nonresident range when a slot becomes available.
+        if (AdmissionKnown && (candidate > AdmissionAfter) != (current > AdmissionAfter))
+        {
+            return candidate > AdmissionAfter;
+        }
+        return candidate < current;
+    }
+
+    std::vector<KmonPageWork>::iterator Erase(std::vector<KmonPageWork>::iterator row)
+    {
+        if (static_cast<size_t>(row - Work.begin()) < Cursor)
+        {
+            --Cursor;
+        }
+        return Work.erase(row);
+    }
+
+    template <typename Predicate>
+    void RemoveIf(const Predicate& predicate)
+    {
+        for (auto row = Work.begin(); row != Work.end();)
+        {
+            if (predicate(*row))
+            {
+                row = Erase(row);
+            }
+            else
+            {
+                ++row;
+            }
+        }
+    }
+
     void Expire(uint64_t now)
     {
         const size_t before = Work.size();
-        Work.erase(std::remove_if(Work.begin(), Work.end(), [now](const auto& row)
+        RemoveIf([now](const auto& row)
         {
             return now >= row.LastSeenMs && now - row.LastSeenMs > 300000;
-        }), Work.end());
+        });
         Expired += before - Work.size();
     }
 
     size_t Capacity;
     size_t Cursor = 0;
     uint64_t LastMs = 0;
+    AdmissionKey AdmissionAfter;
+    bool AdmissionKnown = false;
     std::vector<KmonPageWork> Work;
 };

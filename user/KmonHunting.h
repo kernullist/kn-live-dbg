@@ -146,14 +146,16 @@ public:
                 (old.Identity.SameInstance(identity) && (prior.Address & ~4095ull) == (reference.Address & ~4095ull) &&
                     old.MappingGeneration != 0 && context.MappingGeneration != 0 && old.MappingGeneration != context.MappingGeneration);
         }), References.end());
-        for (auto& prior : References)
+        for (auto prior = References.begin(); prior != References.end(); ++prior)
         {
-            if (prior.Context.Identity.SameInstance(identity) && prior.Address == reference.Address &&
-                prior.Root == reference.Root && prior.Slot == reference.Slot && prior.Role == reference.Role)
+            if (prior->Context.Identity.SameInstance(identity) && prior->Address == reference.Address &&
+                prior->Root == reference.Root && prior->Slot == reference.Slot && prior->Role == reference.Role)
             {
-                reference.Id = prior.Id;
-                prior = std::move(reference);
-                return prior.Id;
+                reference.Id = prior->Id;
+                const uint64_t id = reference.Id;
+                References.erase(prior);
+                References.push_back(std::move(reference));
+                return id;
             }
         }
         if (References.size() == Capacity)

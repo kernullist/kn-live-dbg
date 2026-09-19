@@ -174,26 +174,27 @@ CodeTargetChain ResolveCodeTarget(uint64_t address, const ObservationReader& rea
     return result;
 }
 
+bool CodeTargetSlotMatches(uint64_t address, uint64_t slot, const ObservationReader& reader)
+{
+    std::vector<uint8_t> bytes;
+    uint64_t target = 0;
+    if (!reader || slot == 0 || slot > UINT64_MAX - sizeof(target) ||
+        !reader(slot, sizeof(target), &bytes) || bytes.size() != sizeof(target))
+    {
+        return false;
+    }
+    std::memcpy(&target, bytes.data(), sizeof(target));
+    return target == address;
+}
+
 CodeTargetChain ResolveReferencedCodeTarget(uint64_t address, uint64_t slot,
     const ObservationReader& reader, const CodeTargetInspector& inspect, size_t depthLimit)
 {
-    const auto matches = [&]()
-    {
-        std::vector<uint8_t> bytes;
-        uint64_t target = 0;
-        if (!reader || slot == 0 || slot > UINT64_MAX - sizeof(target) ||
-            !reader(slot, sizeof(target), &bytes) || bytes.size() != sizeof(target))
-        {
-            return false;
-        }
-        std::memcpy(&target, bytes.data(), sizeof(target));
-        return target == address;
-    };
     CodeTargetChain result;
-    if (matches())
+    if (CodeTargetSlotMatches(address, slot, reader))
     {
         result = ResolveCodeTarget(address, reader, inspect, depthLimit);
-        result.ReferenceStable = matches();
+        result.ReferenceStable = CodeTargetSlotMatches(address, slot, reader);
     }
     result.ReferenceChecked = true;
     if (!result.ReferenceStable)
@@ -278,6 +279,9 @@ bool CodeTargetResolverSelfTest()
     };
     chain = ResolveReferencedCodeTarget(target, 0x9000, reader, unexpected);
     ok = ok && chain.ReferenceStable && chain.HasUnexpectedExecutable && !chain.HasModifiedCode;
+    memory[0x9000][0] ^= 1;
+    ok = ok && !CodeTargetSlotMatches(target, 0x9000, reader);
+    std::memcpy(memory[0x9000].data(), &target, sizeof(target));
     const CodeTargetInspector changingPermission = [&](uint64_t address, const std::vector<uint8_t>& bytes)
     {
         memory[0x9000][0] ^= 1;

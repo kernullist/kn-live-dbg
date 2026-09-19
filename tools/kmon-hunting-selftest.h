@@ -215,7 +215,8 @@ inline bool KmonHuntingSelfTest()
         boundedPages.Observe(identity, {0x10000, 4096}, 0, L"user_page_candidate", 100 + i);
         check(boundedPages.Size() <= 2, "range scheduler bounded under pressure");
     }
-    check(boundedPages.Evicted == 1022, "range eviction accounting");
+    check(boundedPages.Evicted == 0 && boundedPages.Deferred == 1022,
+        "unfinished ranges survive repeated admission pressure");
     const uint64_t presentUser = 7;
     const uint64_t nx = 1ull << 63;
     check(KmonHardwareExecutable(0, 7, 7, 7, 7, 4096, 4, true), "user 4K executable mapping");
